@@ -1,0 +1,3 @@
+[submodule "mlxcel"]
+	path = mlxcel
+	url = https://github.com/lablup/mlxcel
