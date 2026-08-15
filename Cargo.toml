@@ -1,9 +1,16 @@
 [workspace]
 resolver = "2"
-members = ["crates/cli", "crates/runtime"]
+members = ["crates/cli", "crates/mlxcel-core", "crates/runtime"]
 
 [workspace.dependencies]
-serde = "1.0.229"
+anyhow = "1.0.100"
+memmap2 = "0.9"
+minijinja = { version = "2.20", features = ["loop_controls", "fuel", "json", "preserve_order"] }
+mlxcel-core = { path = "crates/mlxcel-core", features = ["metal", "accelerate"] }
+safetensors = "0.7.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+tokenizers = "0.22.2"
 toml = "1.1.4"
-tracing = "0.1.44"
+tracing = "0.1"
 tracing-subscriber = "0.3.23"

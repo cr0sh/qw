@@ -1,0 +1,44 @@
+[package]
+name = "mlxcel-core"
+version = "0.5.1"
+edition = "2024"
+description = "Low-level MLX building blocks for mlxcel"
+license = "Apache-2.0"
+
+[lib]
+crate-type = ["lib"]
+
+[features]
+default = []
+metal = []
+accelerate = []
+cuda = []
+
+[dependencies]
+cxx = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+unicode-script = "0.5"
+smallvec = { version = "1.13", features = ["serde"] }
+sha2 = "0.11"
+thiserror = "2.0"
+tokenizers = "0.22.2"
+postcard = { version = "1", features = ["alloc"] }
+dirs = "6"
+libm = "0.2"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[build-dependencies]
+cxx-build = "1.0"
+cmake = "0.1"
+
+[[example]]
+name = "benchmark"
+path = "examples/benchmark.rs"
+
+[[example]]
+name = "wht_microbench"
+path = "examples/wht_microbench.rs"
