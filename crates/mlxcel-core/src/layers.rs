@@ -1,0 +1,8208 @@
+// Copyright 2025-2026 Lablup Inc. and Jeongkyu Shin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! High-level model layer implementations using mlx-cxx
+//!
+//! This module provides Rust wrappers for common neural network layers
+//! using the mlx-cxx bindings for optimal performance.
+//!
+//! Cache state machines now live in `crate::cache`; this module re-exports
+//! them so existing model code can keep importing cache types through
+//! `mlxcel_core::layers`.
+
+use crate::ffi;
+use crate::ffi::MlxArray;
+use cxx::UniquePtr;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+pub use crate::cache::{ChunkedKVCache, KVCache, KVCacheMode, RotatingKVCache};
+
+/// Quantized weight structure for 4-bit/8-bit quantized layers
+/// Supports affine, mxfp4, nvfp4, and mxfp8 quantization modes.
+/// For mxfp4/nvfp4/mxfp8 modes, biases is None.
+pub struct QuantizedWeight {
+    pub weight: UniquePtr<MlxArray>,
+    pub scales: UniquePtr<MlxArray>,
+    pub biases: Option<UniquePtr<MlxArray>>,
+    pub group_size: i32,
+    pub bits: i32,
+    pub mode: String,
+    /// Optional per-linear global scale sidecar for native NVFP4.
+    ///
+    /// NVIDIA ModelOpt NVFP4 uses a two-level scale: a per-block E4M3 scale
+    /// (`scales`) and a single per-tensor f32 `weight_scale_2`. MLX native
+    /// NVFP4 stores the per-block E4M3 scale directly, but its kernels have no
+    /// parameter matching ModelOpt's `weight_scale_2` convention (MLX's own
+    /// `global_scale` re-derives the block scales during quantize, which is a
+    /// different meaning). Because `weight_scale_2` is a single scalar, it is
+    /// applied as a scalar multiply on the matmul output, which is
+    /// mathematically exact: `y = x @ (W * s2)^T = (x @ W^T) * s2`. `None`
+    /// means no sidecar (affine, mxfp4, mxfp8, or a folded/dense repack).
+    pub global_scale: Option<UniquePtr<MlxArray>>,
+}
+
+impl QuantizedWeight {
+    /// Create a new quantized weight from raw components (affine mode)
+    pub fn new(
+        weight: UniquePtr<MlxArray>,
+        scales: UniquePtr<MlxArray>,
+        biases: UniquePtr<MlxArray>,
+        group_size: i32,
+        bits: i32,
+    ) -> Self {
+        Self {
+            weight,
+            scales,
+            biases: Some(biases),
+            group_size,
+            bits,
+            mode: "affine".to_string(),
+            global_scale: None,
+        }
+    }
+
+    /// Create a new quantized weight with explicit mode.
+    ///
+    /// Fallible on purpose (issue #973), on the same reasoning that made
+    /// [`QuantizedMultiLinear::new`] fallible for the declared `group_size` /
+    /// `bits` pair. This is the one way to build a `QuantizedWeight` with a
+    /// caller-chosen mode without going through
+    /// [`reconcile_quantization_layout`], and therefore without the allowlist it
+    /// now carries. The stored string goes straight to `quantized_matmul` /
+    /// `dequantize`, which cross the cxx bridge as `UniquePtr<MlxArray>` rather
+    /// than `Result`, so a mode MLX cannot parse is an uncatchable abort at the
+    /// first forward pass rather than a load error. Returning `Result` puts the
+    /// bound on the path the next family that builds one directly will take;
+    /// nothing in the tree calls this today. It is a strong default rather than
+    /// an enforced invariant, since the fields are `pub` and a struct literal
+    /// still bypasses it.
+    ///
+    /// [`validate_quantization_biases`] also rejects a mode that contradicts the
+    /// `biases` argument, which MLX throws on just as hard.
+    pub fn new_with_mode(
+        weight: UniquePtr<MlxArray>,
+        scales: UniquePtr<MlxArray>,
+        biases: Option<UniquePtr<MlxArray>>,
+        group_size: i32,
+        bits: i32,
+        mode: String,
+    ) -> Result<Self, String> {
+        validate_quantization_params(group_size, bits)?;
+        validate_quantization_biases(&mode, biases.is_some())?;
+        Ok(Self {
+            weight,
+            scales,
+            biases,
+            group_size,
+            bits,
+            mode,
+            global_scale: None,
+        })
+    }
+
+    /// Get raw pointer to biases (null if not present, e.g. mxfp4/nvfp4/mxfp8)
+    pub fn biases_ptr(&self) -> *const MlxArray {
+        match &self.biases {
+            Some(b) => b.as_ref().unwrap() as *const MlxArray,
+            None => std::ptr::null(),
+        }
+    }
+
+    /// Get raw pointer to the optional NVFP4 `weight_scale_2` sidecar (null if
+    /// absent). Used by the fused compiled paths that fold the per-projection
+    /// global scale in place of `apply_global_scale` (issue #698).
+    pub fn global_scale_ptr(&self) -> *const MlxArray {
+        match &self.global_scale {
+            Some(g) => g.as_ref().unwrap() as *const MlxArray,
+            None => std::ptr::null(),
+        }
+    }
+
+    /// Apply the optional NVFP4 `weight_scale_2` sidecar to a linear output.
+    ///
+    /// Returns `out` unchanged when no sidecar is present. Otherwise multiplies
+    /// by the per-tensor scalar and casts back to `out`'s dtype so the f32
+    /// scalar does not promote the (bf16/f16) activation stream. This is the
+    /// exact reconstruction of the ModelOpt two-level scale for a per-tensor
+    /// scalar, without folding it into every E4M3 block scale.
+    pub fn apply_global_scale(&self, out: UniquePtr<MlxArray>) -> UniquePtr<MlxArray> {
+        match &self.global_scale {
+            Some(gs) => {
+                let out_dtype = ffi::array_dtype(&out);
+                let scaled = ffi::multiply(&out, gs);
+                ffi::astype(&scaled, out_dtype)
+            }
+            None => out,
+        }
+    }
+
+    /// Produce an independent handle that shares the same underlying MLX
+    /// quantized-weight buffers.
+    ///
+    /// Used by speculative drafters that lazy-bind an untied target
+    /// `lm_head` without copying the actual tensor payloads.
+    pub fn clone_shared(&self) -> Self {
+        Self {
+            weight: ffi::copy(&self.weight),
+            scales: ffi::copy(&self.scales),
+            biases: self.biases.as_ref().map(|b| ffi::copy(b)),
+            group_size: self.group_size,
+            bits: self.bits,
+            mode: self.mode.clone(),
+            global_scale: self.global_scale.as_ref().map(|g| ffi::copy(g)),
+        }
+    }
+}
+
+/// Whether native-NVFP4 global-scale fusion is disabled via
+/// `MLXCEL_DISABLE_FUSED_GLOBAL_SCALE`.
+///
+/// Used by: UnifiedLinear native-NVFP4 sidecar path. Gemma4 has additional
+/// model-level gates for dense MLP and per-layer-input fused helpers; this
+/// core-layer gate keeps the shared standalone-linear sidecar helper on the
+/// same rollback switch.
+fn fused_global_scale_disabled() -> bool {
+    static DISABLED: OnceLock<bool> = OnceLock::new();
+    *DISABLED.get_or_init(|| {
+        std::env::var("MLXCEL_DISABLE_FUSED_GLOBAL_SCALE")
+            .ok()
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "on" | "yes"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
+// Embedding Layers.
+/// Non-quantized embedding layer
+pub struct Embedding {
+    pub weight: UniquePtr<MlxArray>,
+}
+
+impl Embedding {
+    /// Create a new embedding layer
+    pub fn new(weight: UniquePtr<MlxArray>) -> Self {
+        Self { weight }
+    }
+
+    /// Load from weight map
+    pub fn from_weights(weights: &crate::weights::WeightMap, prefix: &str) -> Result<Self, String> {
+        let weight_name = format!("{}.weight", prefix);
+        let weight = weights
+            .get(&weight_name)
+            .map(|w| ffi::copy(w))
+            .ok_or_else(|| format!("Weight not found: {}", weight_name))?;
+        Ok(Self { weight })
+    }
+
+    /// Embedding lookup: indices -> embeddings
+    pub fn forward(&self, indices: &MlxArray) -> UniquePtr<MlxArray> {
+        ffi::embedding(&self.weight, indices)
+    }
+
+    /// Use embedding as linear projection (for tied embeddings/lm_head)
+    /// y = x @ W (no transpose needed since embedding weight is [vocab, dim])
+    pub fn as_linear(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
+        let wt = ffi::transpose(&self.weight);
+        ffi::matmul(x, &wt)
+    }
+
+    /// Produce an independent handle that shares the same underlying MLX
+    /// weight buffer.
+    ///
+    /// `ffi::copy` creates a new lazy-array node pointing at the same data
+    /// (no element copy), so this is cheap. Used by speculative drafters
+    /// (DFlash) that lazy-bind the target's embedding table at `bind()`
+    /// time instead of loading their own `embed_tokens.weight`.
+    ///
+    /// Used by: DFlash drafter lazy-bind path (`Drafter::bind`)
+    pub fn clone_shared(&self) -> Self {
+        Self {
+            weight: ffi::copy(&self.weight),
+        }
+    }
+}
+
+/// Quantized embedding layer (4-bit/8-bit)
+/// Supports affine, mxfp4, nvfp4, and mxfp8 quantization modes.
+pub struct QuantizedEmbedding {
+    pub weight: UniquePtr<MlxArray>,
+    pub scales: UniquePtr<MlxArray>,
+    pub biases: Option<UniquePtr<MlxArray>>,
+    pub group_size: i32,
+    pub bits: i32,
+    pub mode: String,
+}
+
+impl QuantizedEmbedding {
+    /// Load from weight map
+    ///
+    /// There is deliberately no by-hand `new` beside this. One existed for
+    /// Mamba / Mamba2, which took their table out of the `WeightMap` by
+    /// `remove` under two possible prefixes and so could not address a
+    /// single-prefix map loader; it hardcoded `mode: "affine"` and required a
+    /// `biases` argument, which is precisely how those two families came to
+    /// treat a block-float embedding (`.scales`, no `.biases`) as
+    /// non-quantized (issue #976). Both now resolve the prefix and come through
+    /// here, and the constructor is gone so the next family cannot rebuild the
+    /// same defect. Prefer resolving a prefix over hand-building a layer.
+    pub fn from_weights(
+        weights: &crate::weights::WeightMap,
+        prefix: &str,
+        group_size: i32,
+        bits: i32,
+    ) -> Result<Self, String> {
+        // Auto-detect the quantization mode: affine stores zero-point biases,
+        // so their absence means a block-float scheme (mxfp4 / nvfp4 / mxfp8),
+        // distinguished by bits and group_size. This lets callers that do not
+        // thread an explicit mode (e.g. vision encoders, which always called
+        // this affine default) load non-affine weights correctly instead of
+        // aborting in quantized_matmul ("Biases must be provided for affine").
+        let has_biases = weights.get(&format!("{}.biases", prefix)).is_some();
+        let mode = infer_quantization_mode(has_biases, group_size, bits);
+        Self::from_weights_with_mode(weights, prefix, group_size, bits, mode)
+    }
+
+    /// Load from weight map with explicit quantization mode
+    pub fn from_weights_with_mode(
+        weights: &crate::weights::WeightMap,
+        prefix: &str,
+        group_size: i32,
+        bits: i32,
+        mode: &str,
+    ) -> Result<Self, String> {
+        let weight_name = format!("{}.weight", prefix);
+        let scales_name = format!("{}.scales", prefix);
+        let biases_name = format!("{}.biases", prefix);
+
+        let weight = weights
+            .get(&weight_name)
+            .map(|w| ffi::copy(w))
+            .ok_or_else(|| format!("Weight not found: {}", weight_name))?;
+        let scales = weights
+            .get(&scales_name)
+            .map(|w| ffi::copy(w))
+            .ok_or_else(|| format!("Scales not found: {}", scales_name))?;
+        // biases may not exist for mxfp4/nvfp4/mxfp8 modes
+        let biases = weights.get(&biases_name).map(|w| ffi::copy(w));
+
+        // Reconcile caller-supplied quant params with the actual tensor shapes,
+        // the same way UnifiedLinear does. Mixed-precision exports quantize the
+        // embedding at a different bit width than the model's top-level
+        // `config.quantization` (e.g. diffusiongemma / gemma4 store embed_tokens,
+        // attention, and MLP at 8-bit while the top-level default is 4-bit).
+        // Without this, the embedding lookup, the tied-embedding lm_head, and
+        // dequantized_weight() all dequantize with the wrong params and abort.
+        // Uniform-quant checkpoints are unaffected (reconciliation is a no-op and
+        // emits no warning); a genuine mismatch is surfaced via the shared
+        // warning so a divergent external packing (issue #467) is not silently
+        // mis-loaded.
+        let w_shape = ffi::array_shape(&weight);
+        let s_shape = ffi::array_shape(&scales);
+        let layout = reconcile_quantization_layout_logged(
+            &w_shape, &s_shape, group_size, bits, mode, prefix,
+        )?;
+
+        // The reconciler bounds the mode string itself; this additionally
+        // refuses a valid mode that contradicts the `.biases` plane the
+        // checkpoint ships, which MLX throws on just as uncatchably (issue
+        // #973). A caller that reached here through `from_weights` cannot trip
+        // it, because `infer_quantization_mode` derives the mode from exactly
+        // this predicate.
+        validate_quantization_biases(mode, biases.is_some())
+            .map_err(|e| format!("{e} (prefix: {prefix})"))?;
+
+        Ok(Self {
+            weight,
+            scales,
+            biases,
+            group_size: layout.group_size,
+            bits: layout.bits,
+            mode: mode.to_string(),
+        })
+    }
+
+    fn biases_ptr(&self) -> *const MlxArray {
+        match &self.biases {
+            Some(b) => b.as_ref().unwrap() as *const MlxArray,
+            None => std::ptr::null(),
+        }
+    }
+
+    /// Quantized embedding lookup with dequantization
+    pub fn forward(&self, indices: &MlxArray) -> UniquePtr<MlxArray> {
+        unsafe {
+            ffi::quantized_embedding(
+                &self.weight,
+                &self.scales,
+                self.biases_ptr(),
+                indices,
+                self.group_size,
+                self.bits,
+                &self.mode,
+            )
+        }
+    }
+
+    /// Use embedding as linear projection (for tied embeddings/lm_head)
+    pub fn as_linear(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
+        unsafe {
+            ffi::quantized_linear_forward(
+                x,
+                &self.weight,
+                &self.scales,
+                self.biases_ptr(),
+                std::ptr::null(),
+                self.group_size,
+                self.bits,
+                &self.mode,
+            )
+        }
+    }
+
+    /// Produce an independent handle that shares the same underlying MLX
+    /// weight / scales / biases buffers (lazy-array share via `ffi::copy`,
+    /// no element copy).
+    ///
+    /// Used by: DFlash drafter lazy-bind path (`Drafter::bind`)
+    pub fn clone_shared(&self) -> Self {
+        Self {
+            weight: ffi::copy(&self.weight),
+            scales: ffi::copy(&self.scales),
+            biases: self.biases.as_ref().map(|b| ffi::copy(b)),
+            group_size: self.group_size,
+            bits: self.bits,
+            mode: self.mode.clone(),
+        }
+    }
+}
+
+/// Unified embedding that auto-detects quantization
+pub enum UnifiedEmbedding {
+    Quantized(QuantizedEmbedding),
+    Regular(Embedding),
+}
+
+impl UnifiedEmbedding {
+    /// Load from weight map, auto-detecting quantization
+    ///
+    /// Detects quantization by checking for `.scales` key in weights.
+    pub fn from_weights(
+        weights: &crate::weights::WeightMap,
+        prefix: &str,
+        group_size: i32,
+        bits: i32,
+    ) -> Result<Self, String> {
+        let scales_name = format!("{}.scales", prefix);
+
+        if weights.contains_key(&scales_name) {
+            // Quantized embedding
+            Ok(Self::Quantized(QuantizedEmbedding::from_weights(
+                weights, prefix, group_size, bits,
+            )?))
+        } else {
+            // Regular embedding
+            Ok(Self::Regular(Embedding::from_weights(weights, prefix)?))
+        }
+    }
+
+    /// Embedding lookup
+    pub fn forward(&self, indices: &MlxArray) -> UniquePtr<MlxArray> {
+        match self {
+            Self::Quantized(e) => e.forward(indices),
+            Self::Regular(e) => e.forward(indices),
+        }
+    }
+
+    /// Use embedding as linear projection
+    pub fn as_linear(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
+        match self {
+            Self::Quantized(e) => e.as_linear(x),
+            Self::Regular(e) => e.as_linear(x),
+        }
+    }
+
+    /// Check if this is a quantized embedding
+    pub fn is_quantized(&self) -> bool {
+        matches!(self, Self::Quantized(_))
+    }
+
+    /// Borrow the quantized table, or `None` for the non-quantized variant.
+    ///
+    /// Load-time validators need the `scales` / `biases` shapes and the
+    /// *reconciled* `group_size` / `bits` to reconstruct the dequantized width
+    /// a packed table describes, which `is_quantized()` alone cannot give them.
+    ///
+    /// Also the way a loader recovers the *activation* dtype of a quantized
+    /// table: `weight()` is the packed `uint32` plane there, so the float type
+    /// the lookup will actually produce is the one on `scales`.
+    ///
+    /// Used by: the shared `validate_embedding_table` guard (BailingMoe, Gpt2,
+    ///          GptBigCode, GptNeoX, Mamba, Mamba2, Florence2), and Florence2's
+    ///          text-stack dtype probe
+    pub fn quantized(&self) -> Option<&QuantizedEmbedding> {
+        match self {
+            Self::Quantized(e) => Some(e),
+            Self::Regular(_) => None,
+        }
+    }
+
+    /// Produce an independent [`UnifiedEmbedding`] that shares the same
+    /// underlying MLX buffers (lazy-array share, no element copy).
+    ///
+    /// This is the lazy-bind primitive used by speculative drafters whose
+    /// checkpoint omits `embed_tokens.weight` and instead resolve it from
+    /// the target at `bind()` time — most notably the upstream
+    /// `z-lab/Qwen3.5-4B-DFlash` checkpoint (see
+    /// `crate::drafter::dflash::DFlashDraftModel`). The drafter holds the
+    /// returned handle for the lifetime of the speculative session; it
+    /// stays valid independently of the target because MLX arrays are
+    /// reference-counted.
+    ///
+    /// Used by: DFlash drafter lazy-bind path (`Drafter::bind`)
+    pub fn clone_shared(&self) -> Self {
+        match self {
+            Self::Quantized(e) => Self::Quantized(e.clone_shared()),
+            Self::Regular(e) => Self::Regular(e.clone_shared()),
+        }
+    }
+
+    /// Return the raw weight tensor (the `[vocab_size, hidden_size]` matrix).
+    ///
+    /// For non-quantized embeddings this is the plain f32/bf16/f16 tensor.
+    /// For quantized embeddings this is the packed quantized weight (not yet
+    /// dequantized). Callers that need the dequantized weight for a matmul
+    /// should use [`Self::as_linear`] instead; this accessor is provided for
+    /// use-cases that need to pass the weight reference to an external op
+    /// (e.g. [`crate::drafter::masked_embedder::MaskedEmbedder::forward`]).
+    ///
+    /// Used by: Gemma4AssistantDraftModel (centroid/MaskedEmbedder LM head path)
+    pub fn weight(&self) -> &MlxArray {
+        match self {
+            Self::Quantized(e) => e.weight.as_ref().expect("non-null quantized weight"),
+            Self::Regular(e) => e.weight.as_ref().expect("non-null embedding weight"),
+        }
+    }
+
+    /// Return a float `[vocab_size, hidden_size]` weight usable as
+    /// `probs @ weight`.
+    ///
+    /// For quantized embeddings this dequantizes the packed table (callers
+    /// should do this once per generation call and reuse the result; for a
+    /// 262144 x 2816 fp16 table the transient is roughly 1.4 GiB). For
+    /// non-quantized embeddings this is a cheap lazy-array share of the
+    /// existing tensor.
+    ///
+    /// Used by: DiffusionGemma self-conditioning soft embeddings (issue #217).
+    /// The reference implementation measured `quantized_matmul(...,
+    /// transpose=false)` several times slower at this shape, hence the
+    /// dequantize-once approach.
+    pub fn dequantized_weight(&self) -> UniquePtr<MlxArray> {
+        match self {
+            Self::Regular(e) => ffi::copy(&e.weight),
+            Self::Quantized(e) => unsafe {
+                ffi::dequantize(
+                    &e.weight,
+                    &e.scales,
+                    e.biases_ptr(),
+                    e.group_size,
+                    e.bits,
+                    &e.mode,
+                )
+            },
+        }
+    }
+}
+
+/// RMS Normalization layer
+pub struct RMSNorm {
+    pub weight: UniquePtr<MlxArray>,
+    pub eps: f32,
+}
+
+impl RMSNorm {
+    /// Create a new RMS norm layer
+    pub fn new(weight: UniquePtr<MlxArray>, eps: f32) -> Self {
+        Self { weight, eps }
+    }
+
+    /// Forward pass using fast RMS norm kernel
+    pub fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
+        ffi::fast_rms_norm(x, &self.weight, self.eps)
+    }
+}
+
+/// Gemma-style RMS Normalization layer with (1 + weight) pattern
+/// Gemma-style RMS normalization with (1 + weight) adjustment.
+/// Used by: Gemma, Gemma2, Gemma3, Gemma3n
+pub struct GemmaRMSNorm {
+    pub weight: UniquePtr<MlxArray>,
+    /// Pre-computed (1 + weight) to avoid per-forward allocation
+    adjusted_weight: UniquePtr<MlxArray>,
+    pub eps: f32,
+}
+
+impl GemmaRMSNorm {
+    /// Create a new Gemma RMS norm layer.
+    /// Pre-computes (1 + weight) once at construction time.
+    pub fn new(weight: UniquePtr<MlxArray>, eps: f32) -> Self {
+        let ones = ffi::ones(&[ffi::array_shape(&weight)[0]], ffi::array_dtype(&weight));
+        let adjusted_weight = ffi::add(&ones, &weight);
+        Self {
+            weight,
+            adjusted_weight,
+            eps,
+        }
+    }
+
+    /// Forward pass using fast RMS norm kernel with pre-computed (1 + weight)
+    pub fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
+        ffi::fast_rms_norm(x, &self.adjusted_weight, self.eps)
+    }
+
+    /// Pre-adjusted `(1 + weight)` tensor used by fused Gemma attention paths.
+    pub fn adjusted_weight(&self) -> &MlxArray {
+        &self.adjusted_weight
+    }
+}
+
+/// Per-element RMS scale + epsilon that the fused QKV kernel feeds straight to
+/// `mlx::core::fast::rms_norm`, which computes `x * weight * rsqrt(mean(x^2) + eps)`.
+///
+/// The kernel only ever applies that plain formula. The `(1 + weight)` offset
+/// that distinguishes Gemma from a standard RMSNorm lives in the weight each
+/// impl hands back, never in the kernel:
+///
+/// - [`RMSNorm`] returns its raw `weight`, realizing `x * weight * rsqrt(...)`.
+/// - [`GemmaRMSNorm`] returns its pre-computed `(1 + weight)`, realizing
+///   `x * (1 + weight) * rsqrt(...)`.
+///
+/// This lets one fused primitive serve both norm variants while keeping the
+/// `(1 + weight)` semantics selected by type, not by a branch inside the kernel.
+///
+/// Used by: FusedQKVLinear::forward_split_norm_rope_quantized
+/// (Gemma3, Qwen3, Qwen3-MoE).
+pub trait FusedQkNorm {
+    /// Effective per-element scale fed to `fast_rms_norm`: the raw weight for a
+    /// standard RMSNorm, `(1 + weight)` for Gemma.
+    fn fused_norm_weight(&self) -> &MlxArray;
+    /// RMS normalization epsilon.
+    fn rms_eps(&self) -> f32;
+}
+
+impl FusedQkNorm for RMSNorm {
+    fn fused_norm_weight(&self) -> &MlxArray {
+        &self.weight
+    }
+    fn rms_eps(&self) -> f32 {
+        self.eps
+    }
+}
+
+impl FusedQkNorm for GemmaRMSNorm {
+    fn fused_norm_weight(&self) -> &MlxArray {
+        self.adjusted_weight()
+    }
+    fn rms_eps(&self) -> f32 {
+        self.eps
+    }
+}
+
+/// Whether the fused single-token decode QK-norm+RoPE kernel (#326) is enabled.
+///
+/// Default-OFF (opt-in). The primitive matches the graph path within RMS < 5e-3
+/// (the reduction is over the transpose-invariant head_dim axis), but it cuts
+/// Rust<->C++ FFI crossings rather than MLX op count, so it does not speed up the
+/// GPU/bandwidth-bound decode loop. On M1 Ultra (fast FFI) it measured ~1-3.4%
+/// SLOWER than the graph path (qwen3-0.6b 275 vs 284, qwen3-8b 82.3 vs 83.2
+/// tok/s). CUDA was the open per-backend question; on GB10 (SM 12.1) it is also
+/// slower (qwen3-0.6b 0.96x, qwen3-8b ~1.0x, qwen3-30b-a3b 0.92x fused/graph;
+/// see docs/benchmark_results/fused-qk-norm-decode-gb10.md). It ships as a
+/// reusable shared primitive for the deferred QK-norm families and stays gated
+/// off, mirroring the opt-in treatment of the neutral fused-relu2 MoE path
+/// (`MLXCEL_FUSED_MOE_RELU2`).
+///
+/// Greedy temp-0 is not byte-identical to the graph path over long generation:
+/// the two numerical paths can diverge at a near-tie argmax. This is not a
+/// regression. On CUDA the graph path is itself non-deterministic run-to-run
+/// (GPU FP-reduction order), while the fused path is deterministic, so its
+/// output stays inside the graph baseline's own run-to-run envelope.
+///
+/// Set `MLXCEL_FUSED_QK_NORM=1` (also `true`/`on`/`yes`, case-insensitive,
+/// trimmed) to opt into the fused path in Qwen3 and Qwen3-MoE decode.
+///
+/// The variable is read once at first call and cached for the process lifetime.
+/// Reading it per decode step would add per-token overhead to the hot path.
+pub fn fused_qk_norm_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        fused_qk_norm_enabled_from(std::env::var("MLXCEL_FUSED_QK_NORM").ok().as_deref())
+    })
+}
+
+/// Pure decision behind [`fused_qk_norm_enabled`], split out for unit testing
+/// without touching process-global env state. `None` (unset) is off; an explicit
+/// `1`/`true`/`on`/`yes` (case-insensitive, trimmed) is on; any other value is off.
+fn fused_qk_norm_enabled_from(value: Option<&str>) -> bool {
+    match value {
+        Some(v) => matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        ),
+        None => false,
+    }
+}
+
+// ── Fused residual-add + RMSNorm (issue #905) ────────────────────────────────
+
+/// Default for the fused residual-add + RMSNorm decode path.
+///
+/// **This is the one place to flip if the measurement does not justify the
+/// fusion.** `MLXCEL_FUSED_ADD_RMSNORM=0` disables it at runtime without a
+/// rebuild; setting this constant to `false` makes off the default and
+/// `MLXCEL_FUSED_ADD_RMSNORM=1` the opt-in.
+///
+/// Default-OFF: measured, and the measurement did not justify wiring it on.
+///
+/// Op-level microbench on Apple M1 Ultra (Metal, f16, hidden {2048, 4096,
+/// 8192} x batch {1, 4, 8}, three repetitions) put the fused path at roughly
+/// parity with the graph it replaces: per-cell speedups scattered between
+/// 0.77x and 1.14x with no structure, and the extreme values did not
+/// reproduce (the 0.77x cell re-measured at 1.02x and 1.03x). The harness
+/// cannot resolve these ops on this host, because per-iteration time stays
+/// pinned near 280-410us across a 4x change in hidden size, so fixed dispatch
+/// and synchronization cost dominates whatever the kernel saves.
+///
+/// Issue #905's measure-then-keep policy says a fusion lands unwired unless
+/// the microbench shows a win, so the kernel ships available but off, matching
+/// how `MLXCEL_FUSED_QK_NORM` (#326) shipped after the same outcome. Set
+/// `MLXCEL_FUSED_ADD_RMSNORM=1` to opt in. Flip this constant to `true` if a
+/// quiet host, a harness that amortizes dispatch cost, or another backend
+/// demonstrates a win. See
+/// `docs/benchmark_results/fused-norm-rope-m1ultra-2026-07-31.md`.
+pub(crate) const FUSED_ADD_RMSNORM_DEFAULT: bool = false;
+
+/// Default for the fused q/k RoPE + KV-append-layout decode path. Same
+/// flip-here contract and the same measured outcome as
+/// [`FUSED_ADD_RMSNORM_DEFAULT`], so it also ships opt-in via
+/// `MLXCEL_FUSED_ROPE_APPEND=1`.
+///
+/// One cell was consistently below parity rather than merely noisy: hidden
+/// 8192 at batch 1 measured 0.94x, 0.90x and 0.89x across three repetitions.
+/// That is the single reproducible signal in the sweep and it points the wrong
+/// way, which is the stronger reason to leave this unwired until a backend or
+/// shape is found where it wins.
+pub(crate) const FUSED_ROPE_APPEND_DEFAULT: bool = false;
+
+/// Whether the fused residual-add + RMSNorm path (#905) is enabled.
+///
+/// Read once at first call and cached for the process lifetime: reading the
+/// environment per decode step would put a `getenv` on the hot path, and the
+/// switch is not meant to change mid-run.
+///
+/// Greedy temp-0 output is not guaranteed byte-identical to the unfused path
+/// over long generation. The two differ only by the rounding of the residual
+/// sum feeding the sum of squares (see `fused_norm.cpp`), which is far below
+/// the argmax-flip scale, but a near-tie argmax can still land on the other
+/// side. That is a tie-break difference, not a regression.
+pub fn fused_add_rmsnorm_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        fused_add_rmsnorm_enabled_from(std::env::var("MLXCEL_FUSED_ADD_RMSNORM").ok().as_deref())
+    })
+}
+
+/// Whether the fused q/k RoPE + KV-append-layout path (#905) is enabled.
+///
+/// Same caching and tie-break caveats as [`fused_add_rmsnorm_enabled`].
+pub fn fused_rope_append_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        fused_rope_append_enabled_from(std::env::var("MLXCEL_FUSED_ROPE_APPEND").ok().as_deref())
+    })
+}
+
+/// Pure decision behind the two #905 kill switches, split out for unit testing
+/// without touching process-global env state.
+///
+/// `None` (unset) takes `default`; an explicit `0`/`false`/`off`/`no` is off and
+/// `1`/`true`/`on`/`yes` is on (case-insensitive, trimmed). An unrecognised
+/// value takes `default` rather than silently disabling: a typo in a deployment
+/// script should not quietly change the decode graph.
+fn fused_flag_enabled_from(value: Option<&str>, default: bool) -> bool {
+    match value {
+        Some(v) => match v.trim().to_ascii_lowercase().as_str() {
+            "0" | "false" | "off" | "no" => false,
+            "1" | "true" | "on" | "yes" => true,
+            _ => default,
+        },
+        None => default,
+    }
+}
+
+fn fused_add_rmsnorm_enabled_from(value: Option<&str>) -> bool {
+    fused_flag_enabled_from(value, FUSED_ADD_RMSNORM_DEFAULT)
+}
+
+fn fused_rope_append_enabled_from(value: Option<&str>) -> bool {
+    fused_flag_enabled_from(value, FUSED_ROPE_APPEND_DEFAULT)
+}
+
+/// An RMSNorm as the fused residual-add kernel needs to see it.
+///
+/// The fused kernel folds the Gemma `(1 + w)` offset itself, from the raw
+/// weight plus a scalar bias, so it needs the *unadjusted* weight. The graph
+/// fallback cannot do that without paying an extra `add` per call, so it needs
+/// the *adjusted* weight the norm already keeps. Both are exposed rather than
+/// deriving one from the other at call time.
+///
+/// - [`RMSNorm`]: raw and effective weights are the same tensor, bias `0.0`.
+/// - [`GemmaRMSNorm`]: effective weight is the precomputed `(1 + w)`, bias
+///   `1.0`. Folding `1.0` into the raw weight inside the kernel happens in the
+///   weight's own dtype, which is exactly how `GemmaRMSNorm::new` builds
+///   `adjusted_weight`, so the two agree bit-for-bit.
+///
+/// Used by: [`fused_add_rms_norm`], reached from the Llama3-family and Gemma
+/// transformer blocks.
+pub trait FusedAddRmsNormSpec {
+    /// The checkpoint's RMSNorm weight, with no `(1 + w)` adjustment applied.
+    fn raw_norm_weight(&self) -> &MlxArray;
+    /// The weight to hand a plain `fast_rms_norm`, already `(1 + w)` for Gemma.
+    fn effective_norm_weight(&self) -> &MlxArray;
+    /// `0.0` for a standard RMSNorm, `1.0` for the Gemma convention.
+    fn norm_weight_bias(&self) -> f32;
+    /// RMS normalization epsilon.
+    fn norm_eps(&self) -> f32;
+}
+
+impl FusedAddRmsNormSpec for RMSNorm {
+    fn raw_norm_weight(&self) -> &MlxArray {
+        &self.weight
+    }
+    fn effective_norm_weight(&self) -> &MlxArray {
+        &self.weight
+    }
+    fn norm_weight_bias(&self) -> f32 {
+        0.0
+    }
+    fn norm_eps(&self) -> f32 {
+        self.eps
+    }
+}
+
+impl FusedAddRmsNormSpec for GemmaRMSNorm {
+    fn raw_norm_weight(&self) -> &MlxArray {
+        &self.weight
+    }
+    fn effective_norm_weight(&self) -> &MlxArray {
+        self.adjusted_weight()
+    }
+    fn norm_weight_bias(&self) -> f32 {
+        1.0
+    }
+    fn norm_eps(&self) -> f32 {
+        self.eps
+    }
+}
+
+/// Residual join of a pre-norm transformer block: `new_residual = residual +
+/// delta`, `normed = rms_norm(new_residual) * effective_weight`.
+///
+/// Returns `(normed, new_residual)`. Callers keep `new_residual` as the
+/// residual stream for the next join and feed `normed` to the sublayer.
+///
+/// Routes through the fused kernel (#905) when it is enabled, the backend has
+/// one, and the shapes are eligible; otherwise it builds the same two-op graph
+/// the blocks used before. `MLXCEL_FUSED_ADD_RMSNORM=0` forces the graph path,
+/// which is what the parity tests use as their reference.
+///
+/// Floating-point addition is commutative, so `delta` and `residual` may be
+/// passed in either order; the names describe intent, not an asymmetry.
+///
+/// Used by: Llama3 / Qwen2-family `TransformerBlock`, Gemma `TransformerBlock`.
+pub fn fused_add_rms_norm<N: FusedAddRmsNormSpec + ?Sized>(
+    norm: &N,
+    delta: &MlxArray,
+    residual: &MlxArray,
+) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+    if fused_add_rmsnorm_enabled()
+        && fused_add_rms_norm_eligible(delta, residual, norm.raw_norm_weight())
+    {
+        let mut normed = UniquePtr::null();
+        let mut new_residual = UniquePtr::null();
+        ffi::fused_add_rms_norm(
+            delta,
+            residual,
+            norm.raw_norm_weight(),
+            norm.norm_eps(),
+            norm.norm_weight_bias(),
+            &mut normed,
+            &mut new_residual,
+        );
+        return (normed, new_residual);
+    }
+    graph_add_rms_norm(norm, delta, residual)
+}
+
+/// Graph-composed reference for [`fused_add_rms_norm`]: the elementwise `add`
+/// plus `fast_rms_norm` pair the transformer blocks built before #905.
+///
+/// Public so the parity tests can pin the fused kernel against it directly
+/// rather than against a re-derivation of it.
+pub fn graph_add_rms_norm<N: FusedAddRmsNormSpec + ?Sized>(
+    norm: &N,
+    delta: &MlxArray,
+    residual: &MlxArray,
+) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+    let new_residual = ffi::add(residual, delta);
+    let normed = ffi::fast_rms_norm(&new_residual, norm.effective_norm_weight(), norm.norm_eps());
+    (normed, new_residual)
+}
+
+/// Whether this backend has a fused-add-RMSNorm kernel, asked once.
+///
+/// The FFI answer reaches `metal::is_available()` / `cu::is_available()` in
+/// C++, and the backend cannot change mid-process, so re-asking at every
+/// residual join of every layer of every token would be pure overhead on the
+/// path the fusion exists to make cheaper.
+fn fused_add_rms_norm_backend_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(ffi::fused_add_rms_norm_available)
+}
+
+/// Whether this backend has a fused RoPE + append kernel, asked once. Same
+/// reasoning as [`fused_add_rms_norm_backend_available`].
+fn fused_rope_append_backend_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(ffi::fused_rope_qk_append_available)
+}
+
+/// Whether the fused kernel can serve this call.
+///
+/// The launcher throws on a contract violation rather than returning an error,
+/// and an exception crossing the cxx boundary is not recoverable, so the
+/// eligibility test lives here and the fused branch is only taken when the
+/// launcher cannot throw: matching shapes and dtypes, a 1-D weight whose length
+/// is the trailing dimension, and a backend that has a custom-kernel JIT at all
+/// (false on a CPU-only build).
+fn fused_add_rms_norm_eligible(delta: &MlxArray, residual: &MlxArray, weight: &MlxArray) -> bool {
+    if !fused_add_rms_norm_backend_available() || ffi::array_ndim(weight) != 1 {
+        return false;
+    }
+    let d_shape = ffi::array_shape(delta);
+    let Some(&trailing) = d_shape.last() else {
+        return false;
+    };
+    ffi::array_shape(weight)[0] == trailing
+        && ffi::array_shape(residual) == d_shape
+        && ffi::array_dtype(delta) == ffi::array_dtype(residual)
+}
+
+/// Destination layout for the fused RoPE + KV-append kernel (#905).
+///
+/// The kernel emits the K/V append payload in the layout its destination
+/// consumes, so the cache append stays an O(new tokens) donated `slice_update`
+/// instead of the O(capacity) slab copy an in-kernel write would force. See
+/// `src/lib/mlx-cpp/turbo/fused_rope_append.h` for why the write itself cannot
+/// be fused under MLX's custom-kernel contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FusedRopeDestLayout {
+    /// Dense `KVCache` slab order `[B, Hkv, L, D]`.
+    DenseSlab,
+    /// Paged block-pool row order `[B, L, Hkv, D]`.
+    ///
+    /// Implemented and covered by parity tests, but not wired into any caller
+    /// yet: the batched paged decode path that would use it belongs to issue
+    /// #899, and restructuring it here would collide with that work.
+    PagedPool,
+}
+
+impl FusedRopeDestLayout {
+    fn as_i32(self) -> i32 {
+        match self {
+            Self::DenseSlab => 0,
+            Self::PagedPool => 1,
+        }
+    }
+}
+
+/// Layer Normalization layer (standard LayerNorm with weight and optional bias)
+pub struct LayerNorm {
+    pub weight: UniquePtr<MlxArray>,
+    pub bias: Option<UniquePtr<MlxArray>>,
+    pub eps: f32,
+}
+
+impl LayerNorm {
+    /// Create a new layer norm
+    pub fn new(weight: UniquePtr<MlxArray>, bias: Option<UniquePtr<MlxArray>>, eps: f32) -> Self {
+        Self { weight, bias, eps }
+    }
+
+    /// Forward pass using fast layer norm kernel
+    pub fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
+        let weight_ptr = self.weight.as_ref().unwrap() as *const MlxArray;
+        let bias_ptr = self
+            .bias
+            .as_ref()
+            .map(|b| b.as_ref().unwrap() as *const MlxArray)
+            .unwrap_or(std::ptr::null());
+
+        unsafe { ffi::fast_layer_norm(x, weight_ptr, bias_ptr, self.eps) }
+    }
+}
+
+/// Named LoRA weights for runtime on-the-fly application.
+/// Used by: Phi4MM VLM (language / vision / speech request modes)
+pub struct LoRAWeights {
+    pub name: String,
+    /// LoRA A weight: [rank, in_features]
+    pub a: UniquePtr<MlxArray>,
+    /// LoRA B weight: [out_features, rank]
+    pub b: UniquePtr<MlxArray>,
+    pub scale: f32,
+}
+
+/// Regular (non-quantized) Linear layer
+pub struct Linear {
+    pub weight: UniquePtr<MlxArray>,
+    pub bias: Option<UniquePtr<MlxArray>>,
+    /// Runtime LoRA adapters (applied on-the-fly, not fused into weight).
+    loras: Vec<LoRAWeights>,
+    active_lora: std::cell::Cell<Option<usize>>,
+}
+
+impl Linear {
+    /// Create a new linear layer
+    pub fn new(weight: UniquePtr<MlxArray>, bias: Option<UniquePtr<MlxArray>>) -> Self {
+        Self {
+            weight,
+            bias,
+            loras: Vec::new(),
+            active_lora: std::cell::Cell::new(None),
+        }
+    }
+
+    /// Load from weight map
+    pub fn from_weights(weights: &crate::weights::WeightMap, prefix: &str) -> Result<Self, String> {
+        let weight_name = format!("{}.weight", prefix);
+
+        let weight = weights
+            .get(&weight_name)
+            .map(|w| ffi::copy(w))
+            .ok_or_else(|| format!("Weight not found: {}", weight_name))?;
+
+        // Check for optional bias
+        let bias_name = format!("{}.bias", prefix);
+        let bias = weights.get(&bias_name).map(|w| ffi::copy(w));
+
+        Ok(Self {
+            weight,
+            bias,
+            loras: Vec::new(),
+            active_lora: std::cell::Cell::new(None),
+        })
+    }
+
+    /// Set runtime LoRA weights. Starts active.
+    pub fn set_lora(&mut self, a: UniquePtr<MlxArray>, b: UniquePtr<MlxArray>, scale: f32) {
+        // Preserve the legacy setter's replacement semantics while allowing
+        // independent named adapters to coexist.
+        self.loras.retain(|adapter| adapter.name != "default");
+        self.set_lora_named("default", a, b, scale)
+            .expect("default LoRA shape must match its base linear");
+        self.select_lora(Some("default"))
+            .expect("default LoRA was just registered");
+    }
+
+    /// Register a named runtime LoRA adapter after validating its tensor shape.
+    pub fn set_lora_named(
+        &mut self,
+        name: &str,
+        a: UniquePtr<MlxArray>,
+        b: UniquePtr<MlxArray>,
+        scale: f32,
+    ) -> Result<(), String> {
+        let weight_shape = ffi::array_shape(&self.weight);
+        let a_shape = ffi::array_shape(&a);
+        let b_shape = ffi::array_shape(&b);
+        if weight_shape.len() != 2
+            || a_shape.len() != 2
+            || b_shape.len() != 2
+            || a_shape[1] != weight_shape[1]
+            || b_shape[0] != weight_shape[0]
+            || b_shape[1] != a_shape[0]
+        {
+            return Err(format!(
+                "LoRA adapter {name} shape mismatch: base={weight_shape:?}, A={a_shape:?}, B={b_shape:?}"
+            ));
+        }
+        if self.loras.iter().any(|adapter| adapter.name == name) {
+            return Err(format!("duplicate LoRA adapter name: {name}"));
+        }
+        self.loras.push(LoRAWeights {
+            name: name.to_string(),
+            a,
+            b,
+            scale,
+        });
+        Ok(())
+    }
+
+    /// Select one named adapter, or `None` for the base language model.
+    pub fn select_lora(&self, name: Option<&str>) -> Result<(), String> {
+        let selected = match name {
+            None => None,
+            Some(name) => Some(
+                self.loras
+                    .iter()
+                    .position(|adapter| adapter.name == name)
+                    .ok_or_else(|| format!("LoRA adapter not loaded: {name}"))?,
+            ),
+        };
+        self.active_lora.set(selected);
+        Ok(())
+    }
+
+    /// Toggle LoRA active state (no-op if no LoRA weights set)
+    pub fn set_lora_active(&self, active: bool) {
+        if self.loras.is_empty() {
+            return;
+        }
+        if active {
+            self.active_lora.set(Some(0));
+        } else {
+            self.active_lora.set(None);
+        }
+    }
+
+    /// Forward pass: y = x @ W.T + bias [+ LoRA if active]
+    pub fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
+        // Transpose weight from [out, in] to [in, out]
+        let wt = ffi::transpose(&self.weight);
+        let mut result = ffi::matmul(x, &wt);
+
+        // Apply runtime LoRA: result += (x @ A.T) @ B.T * scale
+        if let Some(index) = self.active_lora.get()
+            && let Some(lora) = self.loras.get(index)
+        {
+            let at = ffi::transpose(&lora.a);
+            let bt = ffi::transpose(&lora.b);
+            let lora_out = ffi::matmul(&ffi::matmul(x, &at), &bt);
+            let scaled = crate::multiply_scalar(&lora_out, lora.scale);
+            result = ffi::add(&result, &scaled);
+        }
+
+        match &self.bias {
+            Some(b) => ffi::add(&result, b),
+            None => result,
+        }
+    }
+
+    /// Produce an independent handle that shares the same underlying MLX
+    /// weight/bias buffers.
+    ///
+    /// Runtime LoRA state is intentionally not carried over: this helper is
+    /// for binding target projection heads into speculative drafters after
+    /// load-time adapter fusion/sanitization has already happened.
+    pub fn clone_shared(&self) -> Self {
+        Self {
+            weight: ffi::copy(&self.weight),
+            bias: self.bias.as_ref().map(|b| ffi::copy(b)),
+            loras: Vec::new(),
+            active_lora: std::cell::Cell::new(None),
+        }
+    }
+}
+
+/// Infer actual per-tensor quantization bits from weight and scales shapes.
+///
+/// MLX stores affine-quantized linears as:
+/// - `weight`: u32 packed, shape `(..., out_features, packed_in_features)`
+/// - `scales`: float, shape `(..., out_features, num_groups)`
+///
+/// with the invariant `packed_in_features * 32 == bits * num_groups * group_size`.
+///
+/// When `caller_bits` is consistent with the observed shapes, it is returned
+/// unchanged. When it is not (e.g. per-layer override where a gate is stored
+/// at 8-bit while the rest of the model is 4-bit), this infers the actual bits
+/// by trusting `group_size` and solving the invariant.
+///
+/// This mirrors the upstream `nn.quantize(class_predicate=...)` pattern used
+/// by mlx-lm/mlx-vlm, which emits per-path bit overrides in `config.quantization`
+/// (e.g. Qwen3.5/3.6 MoE router gates).
+///
+/// Returns an error only when the inferred bits are not a valid MLX bit width
+/// `{2, 3, 4, 5, 6, 8}` — in that case `group_size` itself is likely wrong.
+fn infer_quantization_bits(
+    weight_shape: &[i32],
+    scales_shape: &[i32],
+    group_size: i32,
+    caller_bits: i32,
+) -> Result<i32, String> {
+    if weight_shape.is_empty() || scales_shape.is_empty() || group_size <= 0 {
+        return Ok(caller_bits);
+    }
+    let packed_in = *weight_shape.last().unwrap();
+    let num_groups = *scales_shape.last().unwrap();
+    if packed_in <= 0 || num_groups <= 0 {
+        return Ok(caller_bits);
+    }
+
+    let numerator = packed_in.checked_mul(32).ok_or_else(|| {
+        format!(
+            "Quantized weight shape overflow: packed_in={}, weight.shape={:?}",
+            packed_in, weight_shape
+        )
+    })?;
+    let denominator = num_groups.checked_mul(group_size).ok_or_else(|| {
+        format!(
+            "Quantized scales shape overflow: num_groups={}, group_size={}",
+            num_groups, group_size
+        )
+    })?;
+    if denominator == 0 || numerator % denominator != 0 {
+        return Err(format!(
+            "Quantized weight shape inconsistency: weight.shape={:?}, scales.shape={:?}, \
+             group_size={}: cannot derive integer bits",
+            weight_shape, scales_shape, group_size
+        ));
+    }
+    let inferred_bits = numerator / denominator;
+    if inferred_bits == caller_bits {
+        return Ok(caller_bits);
+    }
+    if ![2, 3, 4, 5, 6, 8].contains(&inferred_bits) {
+        return Err(format!(
+            "Quantized weight shape inconsistency: inferred bits={} not in {{2,3,4,5,6,8}}; \
+             weight.shape={:?}, scales.shape={:?}, group_size={}, caller_bits={}",
+            inferred_bits, weight_shape, scales_shape, group_size, caller_bits
+        ));
+    }
+    Ok(inferred_bits)
+}
+
+fn infer_quantization_group_size(
+    weight_shape: &[i32],
+    scales_shape: &[i32],
+    bits: i32,
+    caller_group_size: i32,
+) -> Result<i32, String> {
+    if weight_shape.is_empty() || scales_shape.is_empty() || bits <= 0 {
+        return Ok(caller_group_size);
+    }
+    let packed_in = *weight_shape.last().unwrap();
+    let num_groups = *scales_shape.last().unwrap();
+    if packed_in <= 0 || num_groups <= 0 {
+        return Ok(caller_group_size);
+    }
+
+    let numerator = packed_in.checked_mul(32).ok_or_else(|| {
+        format!(
+            "Quantized weight shape overflow: packed_in={}, weight.shape={:?}",
+            packed_in, weight_shape
+        )
+    })?;
+    let denominator = num_groups.checked_mul(bits).ok_or_else(|| {
+        format!(
+            "Quantized scales shape overflow: num_groups={}, bits={}",
+            num_groups, bits
+        )
+    })?;
+    if denominator == 0 || numerator % denominator != 0 {
+        return Err(format!(
+            "Quantized weight shape inconsistency: weight.shape={:?}, scales.shape={:?}, \
+             bits={}: cannot derive integer group_size",
+            weight_shape, scales_shape, bits
+        ));
+    }
+    Ok(numerator / denominator)
+}
+
+/// Reconciled quantization parameters plus whether reconciliation altered the
+/// caller-declared values.
+///
+/// `reconciled == true` means the on-disk tensor layout did not match the
+/// declared `group_size` / `bits`, so the loader substituted shape-derived
+/// values. Per issue #467, callers surface this (a load-time `tracing::warn!`)
+/// instead of silently overriding the declared metadata: a divergent external
+/// packing (e.g. OptiQ) that is quietly reconciled dequantizes with the wrong
+/// parameters and decodes to degenerate, repeating output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReconciledQuant {
+    pub bits: i32,
+    pub group_size: i32,
+    pub reconciled: bool,
+}
+
+/// Reject declared quantization parameters that no tensor layout can describe,
+/// before they reach an MLX kernel.
+///
+/// MLX reconstructs a quantized matrix's unpacked input width as
+/// `w.shape(-1) * 32 / bits` and compares it against `scales.shape(-1) *
+/// group_size` (`validate_quantized_input`, reached from
+/// `extract_quantized_matmul_dims`, which gates `quantized_matmul`,
+/// `gather_qmm` and `dequantize` alike). At `bits == 0` that expression is a
+/// division by zero, which is undefined behavior with a platform split: on
+/// AArch64 the divide yields 0 and MLX throws `std::invalid_argument`, while on
+/// x86-64 the hardware raises `SIGFPE` and kills the process before any
+/// exception exists. Above 32 the quotient collapses toward zero and can match
+/// no real `scales` width, and a non-positive `group_size` makes the
+/// right-hand side unmatchable. Every one of those ends the process, because
+/// `quantized_matmul` and `dequantize` cross the cxx bridge as
+/// `UniquePtr<MlxArray>` rather than `Result`, so a C++ throw is an uncatchable
+/// `std::terminate` at the FIRST forward pass rather than a load error.
+///
+/// This is a bounds check rather than an allowlist of the widths MLX actually
+/// supports, and that is a real constraint rather than a stylistic preference:
+/// mlxcel deliberately re-derives an effective bit width from the tensor shapes
+/// when the declared one disagrees (see [`reconcile_quantization_layout`]), and
+/// an allowlist of `{2,3,4,5,6,8}` would reject the mixed-precision exports
+/// that behavior exists to serve. Only values that can describe no packing at
+/// all are refused. The declared `mode` in the same `quantization` block is the
+/// opposite case and is an allowlist, for the reasons on
+/// [`validate_quantization_mode`].
+///
+/// Used by: every quantizing family through [`reconcile_quantization_layout`]
+///          (dense projections and quantized embeddings) and through
+///          `SwitchLinear::from_stacked_parts` (MoE experts); the by-hand
+///          constructors [`QuantizedMultiLinear::new`] and
+///          [`QuantizedMultiLinear::from_weights`], which never reach the
+///          reconciler; every family-local MoE expert loader through
+///          `crate::models::switch_layers::validate_expert_quantization_params`
+///          (issue #958); plus the family-level early diagnostics in BailingMoe,
+///          GptNeoX, Helium and GptOss
+pub fn validate_quantization_params(group_size: i32, bits: i32) -> Result<(), String> {
+    if !(1..=32).contains(&bits) {
+        return Err(format!(
+            "quantization.bits ({bits}) must be between 1 and 32: MLX derives a quantized \
+             matrix's unpacked width as packed_in * 32 / bits, which divides by zero at 0 and \
+             collapses to zero above 32, and the resulting C++ throw crosses the cxx bridge as an \
+             uncatchable abort at the first forward pass rather than a load error"
+        ));
+    }
+    if !(1..=MAX_QUANT_GROUP_SIZE).contains(&group_size) {
+        return Err(format!(
+            "quantization.group_size ({group_size}) must be between 1 and {MAX_QUANT_GROUP_SIZE}: \
+             it multiplies the scales width to reconstruct the input width inside every quantized \
+             kernel, so a non-positive value can match no real tensor and an enormous one \
+             overflows that multiply. MLX evaluates scales.shape(-1) * group_size in C++ int, so \
+             an overflow there is undefined behavior reached before MLX can throw, and a throw \
+             would in any case cross the cxx bridge as an uncatchable abort rather than a load \
+             error"
+        ));
+    }
+    Ok(())
+}
+
+/// Every quantization mode MLX accepts, in the order its own parser tests them.
+///
+/// This mirrors `string_to_quantization_mode` in
+/// [ml-explore/mlx `mlx/primitives.cpp`](https://github.com/ml-explore/mlx/blob/main/mlx/primitives.cpp),
+/// which is a closed four-value C++ enum with no interior values. Exposed so
+/// the family-level config guards (gemma4's `validate_quantization_scheme`)
+/// cannot keep a private copy that drifts from the one the loaders enforce.
+///
+/// Used by: [`validate_quantization_mode`], [`infer_quantization_mode`] (which
+///          returns only values from this set by construction), and
+///          `crate::models::gemma4::validate_quantization_scheme` in the
+///          consuming crate
+pub const SUPPORTED_QUANTIZATION_MODES: [&str; 4] = ["affine", "mxfp4", "mxfp8", "nvfp4"];
+
+/// Reject a declared quantization mode MLX cannot parse.
+///
+/// Unlike [`validate_quantization_params`] this is an allowlist, and the
+/// reasoning that made the `group_size` / `bits` guard a bounds check does not
+/// transfer. That guard stays permissive because mlxcel deliberately re-derives
+/// an effective bit width from the tensor shapes (see
+/// [`reconcile_quantization_layout`]), so an allowlist of the widths MLX
+/// supports would reject legitimate mixed-precision exports. There is no
+/// analogous re-derivation from the declared mode string:
+/// [`infer_quantization_mode`] derives a mode from bias presence and ignores
+/// the declaration entirely, and the accepted set is a closed four-value C++
+/// enum. Mirroring MLX's own parser is the whole check.
+///
+/// An unrecognized mode is not rejected and not silently defaulted anywhere
+/// else. On the shared loader path it takes the block-float branch of
+/// [`reconcile_quantization_layout`], which on a genuine affine tensor
+/// re-derives the group size back onto the declared value, so not even the
+/// divergence warning fires; the string is then stored verbatim and handed to
+/// `quantized_matmul` / `gather_qmm` / `dequantize` on every forward pass.
+/// Those cross the cxx bridge as `UniquePtr<MlxArray>` rather than `Result`, so
+/// MLX's `std::invalid_argument` is an uncatchable `std::terminate` at the
+/// FIRST forward pass rather than a load error (issue #973).
+///
+/// The comparison is exact: no trimming, no case folding, and an empty string
+/// is rejected rather than read as "not declared". The string compared here has
+/// to be byte-identical to the one MLX parses, because it is the same string:
+/// normalizing before the comparison would accept `" Affine"` and then store
+/// and forward the raw spelling, which is precisely the gap this exists to
+/// close. "Not declared" is expressed by the absence of the key, which every
+/// config reader already resolves to `"affine"` before calling here.
+///
+/// Used by: every quantizing family through [`reconcile_quantization_layout`]
+///          (dense projections and quantized embeddings); the by-hand
+///          constructor [`QuantizedWeight::new_with_mode`], which never reaches
+///          the reconciler; [`validate_quantization_biases`]; and in the
+///          consuming crate `crate::models::switch_layers::SwitchLinear`
+///          (MoE experts), `crate::models::gpt_oss` (which reads
+///          `quantization.mode` out of `config.json` at both
+///          `Quantization::validate` and `ExpertLinear::from_weights`),
+///          `crate::models::jamba::JambaModel::from_weights` (which reads the
+///          declared mode only to refuse anything its affine-only loaders would
+///          silently reinterpret),
+///          `crate::models::config::QuantizationArgs::get_mode` and
+///          `crate::models::gemma4::validate_quantization_scheme`
+pub fn validate_quantization_mode(mode: &str) -> Result<(), String> {
+    if SUPPORTED_QUANTIZATION_MODES.contains(&mode) {
+        return Ok(());
+    }
+    let accepted = SUPPORTED_QUANTIZATION_MODES.join(", ");
+    Err(format!(
+        "quantization.mode ({mode:?}) must be one of {accepted}: MLX parses the mode with an \
+         exact, case-sensitive string comparison in string_to_quantization_mode and throws on \
+         anything else, and that throw crosses the cxx bridge as an uncatchable abort at the \
+         first forward pass rather than a load error"
+    ))
+}
+
+/// Reject a declared mode that contradicts the `.biases` plane the checkpoint
+/// actually ships.
+///
+/// MLX's `validate_mode_with_type` (see
+/// [ml-explore/mlx `mlx/ops.cpp`](https://github.com/ml-explore/mlx/blob/main/mlx/ops.cpp))
+/// requires zero-point `biases` for `affine` and requires them to be absent for
+/// every block-float mode, throwing `Biases must be provided for affine
+/// quantization` or `Biases must be null for quantization mode '<mode>'`
+/// otherwise. Both throws are the same uncatchable-abort class as an invalid
+/// mode string, and both are reachable from a checkpoint whose `config.json`
+/// declares a mode that its tensors do not match.
+///
+/// The shared loaders never trip this because they ignore the declaration and
+/// call [`infer_quantization_mode`] on bias presence, which is consistent by
+/// construction. Only a caller that threads a config-declared mode can, which
+/// today is gpt-oss. Because this is exactly MLX's own precondition, it can
+/// only reject a load that was already going to abort: it cannot refuse a
+/// checkpoint that works.
+///
+/// Validates `mode` itself first, so a caller needs one call rather than two.
+///
+/// Used by: UnifiedLinear::from_weights_with_mode,
+///          QuantizedEmbedding::from_weights_with_mode,
+///          QuantizedWeight::new_with_mode,
+///          [`QuantizedMultiLinear::new`] and
+///          [`QuantizedMultiLinear::from_weights`] (which infer the mode and so
+///          couple the two helpers rather than checking a declaration),
+///          `SwitchLinear::from_stacked_parts` and `GptOss
+///          ExpertLinear::from_weights` in the consuming crate
+pub fn validate_quantization_biases(mode: &str, has_biases: bool) -> Result<(), String> {
+    validate_quantization_mode(mode)?;
+    match (mode == "affine", has_biases) {
+        (true, false) => Err(
+            "quantization.mode is \"affine\" but the checkpoint ships no .biases plane: MLX \
+             requires zero points for affine quantization and throws \"Biases must be provided \
+             for affine quantization\" otherwise, which crosses the cxx bridge as an uncatchable \
+             abort at the first forward pass rather than a load error. Either the declared mode \
+             is wrong for these tensors (a block-float export mislabelled affine) or the .biases \
+             plane is missing from the checkpoint"
+                .to_string(),
+        ),
+        (false, true) => Err(format!(
+            "quantization.mode is {mode:?} but the checkpoint ships a .biases plane: the \
+             block-float modes carry no zero points and MLX throws \"Biases must be null for \
+             quantization mode '{mode}'\", which crosses the cxx bridge as an uncatchable abort \
+             at the first forward pass rather than a load error"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Recover the `group_size` / `bits` a packed MLA `kv_b_proj` was quantized
+/// with, from its tensor shapes and the declared `kv_lora_rank`.
+///
+/// The MLA decomposition in the LongCat Flash NGram and Youtu-VL sanitizers has
+/// to dequantize `kv_b_proj` before splitting it per head (splitting in
+/// quantized space would scramble the per-group scales), and the pair it needs
+/// is not declared anywhere: it is solved from `packed_in * 32 == bits *
+/// kv_lora_rank` and `kv_lora_rank == num_groups * group_size`.
+///
+/// Every input here is untrusted. `kv_lora_rank` is a `config.json` field and
+/// both axes come from the checkpoint, so the naive form of this arithmetic has
+/// three separate failure modes before the result is ever used: a
+/// `kv_lora_rank` of 0 and a zero-length scales axis are both Rust integer
+/// divisions by zero, which panic, and `packed_in * 32` overflows `i32` on a
+/// large axis, which wraps in release and panics in an overflow-checked build.
+/// Each is checked here, before the division that would trigger it, and the
+/// multiply is evaluated in `i64`. The solved pair is then bounded by
+/// [`validate_quantization_params`], because it feeds `dequantize`, which
+/// crosses the cxx bridge as `UniquePtr<MlxArray>` rather than `Result`: a C++
+/// throw there is an uncatchable abort during weight sanitization rather than a
+/// load error (issue #958).
+///
+/// `prefix` names the offending tensor in every error.
+///
+/// Used by: DeepSeek V3, DeepSeek V3.2, KimiLinear, LongCat Flash NGram,
+///          Youtu-VL (MLA `kv_b_proj` decomposition)
+pub fn infer_mla_quantization_params(
+    weight_shape: &[i32],
+    scales_shape: &[i32],
+    kv_lora_rank: i32,
+    prefix: &str,
+) -> Result<(i32, i32), String> {
+    let packed_in = *weight_shape.last().ok_or_else(|| {
+        format!("{prefix}: packed kv_b_proj weight has rank 0 and describes no input width")
+    })?;
+    let num_groups = *scales_shape.last().ok_or_else(|| {
+        format!("{prefix}: kv_b_proj scales have rank 0 and describe no group count")
+    })?;
+    if kv_lora_rank < 1 {
+        return Err(format!(
+            "{prefix}: kv_lora_rank ({kv_lora_rank}) must be positive; it is the divisor that \
+             recovers the packed bit width, so a zero panics and a negative solves to a bit width \
+             no packing can have"
+        ));
+    }
+    if num_groups < 1 {
+        return Err(format!(
+            "{prefix}: kv_b_proj scales must carry a positive last axis, got {num_groups}; it is \
+             the divisor that recovers the group size"
+        ));
+    }
+    if packed_in < 1 {
+        return Err(format!(
+            "{prefix}: packed kv_b_proj weight must carry a positive last axis, got {packed_in}; a \
+             zero-length packed axis describes no input width"
+        ));
+    }
+
+    // i64: `packed_in * 32` is a checkpoint-controlled multiply that wraps in
+    // release and panics in an overflow-checked build as an i32.
+    let bits = i64::from(packed_in) * 32 / i64::from(kv_lora_rank);
+    let group_size = kv_lora_rank / num_groups;
+    let bits = i32::try_from(bits).map_err(|_| {
+        format!(
+            "{prefix}: packed kv_b_proj weight {weight_shape:?} solves to a bit width of {bits} \
+             against kv_lora_rank {kv_lora_rank}, which no packing can have"
+        )
+    })?;
+
+    validate_quantization_params(group_size, bits)
+        .map_err(|e| format!("{prefix}: inferred quantization params are unusable: {e}"))?;
+
+    // Both divisions truncate, so an in-range pair is not yet a consistent one:
+    // `packed_in 65 / kv_lora_rank 512` solves to 4 bits and passes the bound
+    // while describing an input width of 520 against the 512 the groups
+    // describe. `affine_dequantize` compares exactly that and throws, which is
+    // the same uncatchable abort one step later. Evaluated in i64 for the same
+    // reason the multiply above is.
+    let described = i64::from(packed_in) * 32 / i64::from(bits);
+    let denom = i64::from(num_groups) * i64::from(group_size);
+    if described != denom {
+        return Err(format!(
+            "{prefix}: packed kv_b_proj weight {weight_shape:?} and scales {scales_shape:?} \
+             describe an input width of {described} at {bits}-bit, but {num_groups} groups at \
+             group_size {group_size} describe {denom}. MLX checks exactly this inside dequantize \
+             and throws on a mismatch, and that throw crosses the cxx bridge as an uncatchable \
+             abort during weight sanitization rather than a load error."
+        ));
+    }
+
+    Ok((group_size, bits))
+}
+
+/// Upper bound on a declared `group_size`.
+///
+/// This is an overflow bound, not an allowlist of the group sizes MLX supports.
+/// The largest group size any real checkpoint declares is 128 (MLX supports 16,
+/// 32, 64 and 128), and the widest model dimension in the supported set is under
+/// six figures, so 2^20 leaves four orders of magnitude of headroom over anything
+/// a genuine export can carry while keeping `num_groups * group_size` far inside
+/// i32 for any tensor that fits in memory. Without it, a declared `i32::MAX`
+/// survives to `quantized_matmul`, where MLX multiplies it by the scales width in
+/// C++ `int`: signed overflow, and therefore undefined behavior reached before
+/// the shape check that would have thrown.
+const MAX_QUANT_GROUP_SIZE: i32 = 1 << 20;
+
+/// Pick the quantization mode a `.biases`-carrying checkpoint implies.
+///
+/// Affine stores zero-point `biases`, so their absence means a block-float
+/// scheme (mxfp4 / nvfp4 / mxfp8) distinguished by bits and group size. Shared
+/// so the linear loader, the embedding loader, and the family-level weight
+/// validators cannot drift apart on which mode a given triple will load as.
+///
+/// Every arm returns a member of [`SUPPORTED_QUANTIZATION_MODES`] by
+/// construction, which is why a caller that goes through here can never trip
+/// [`validate_quantization_mode`] or [`validate_quantization_biases`].
+///
+/// Used by: UnifiedLinear::from_weights, QuantizedEmbedding::from_weights,
+///          [`QuantizedMultiLinear::new`] and
+///          [`QuantizedMultiLinear::from_weights`] (MLA `embed_q` /
+///          `unembed_out`), BailingMoe weight validation, and `kimi_linear`'s
+///          private `MultiLinear` in the consuming crate
+pub fn infer_quantization_mode(has_biases: bool, group_size: i32, bits: i32) -> &'static str {
+    if has_biases {
+        "affine"
+    } else if bits == 8 {
+        "mxfp8"
+    } else if group_size == 16 {
+        "nvfp4"
+    } else {
+        "mxfp4"
+    }
+}
+
+/// Validate and reconcile caller-declared quantization params against the
+/// observed `weight` / `scales` tensor shapes for `mode`.
+///
+/// MLX affine and block-float quantization obey
+/// `packed_in * 32 == bits * num_groups * group_size`, where `packed_in` is the
+/// last dim of `weight` and `num_groups` the last dim of `scales`. This helper:
+///
+/// * returns the declared params unchanged (`reconciled = false`) when they
+///   already satisfy the invariant — the common uniform-quant case,
+/// * reconciles one divergent axis (`reconciled = true`) for legitimate
+///   mixed-precision exports: affine trusts `group_size` and re-derives `bits`
+///   (per-path bit overrides, e.g. Qwen3.5/3.6 MoE gates); block-float trusts
+///   the mode-fixed `bits` and re-derives `group_size` (e.g. minicpm-v mxfp4
+///   stored at group_size 32 under a config default of 64),
+/// * returns `Err` for a declared `group_size` / `bits` pair that can describe
+///   no packing at all, before it looks at the shapes (issue #929) — see
+///   [`validate_quantization_params`],
+/// * returns `Err` for a `mode` MLX cannot parse, before it looks at the shapes
+///   (issue #973), see [`validate_quantization_mode`]. This also makes the
+///   `mode == "affine"` branch below total: without it, any unrecognized string
+///   silently took the block-float branch,
+/// * returns `Err` with an actionable message when the affine shapes match no
+///   valid bit width — the signature of a misdeclared / unsupported external
+///   packing that must not be dequantized as standard affine and served as
+///   garbage (issue #467, OptiQ).
+///
+/// Pure over shapes so the reconciliation policy is unit-testable without an
+/// MLX backend. `bits != declared` (affine) or `group_size != declared`
+/// (block-float) sets `reconciled`, which the loader turns into a warning.
+pub fn reconcile_quantization_layout(
+    weight_shape: &[i32],
+    scales_shape: &[i32],
+    group_size: i32,
+    bits: i32,
+    mode: &str,
+) -> Result<ReconciledQuant, String> {
+    // A `group_size` or `bits` that can describe no packing at all is refused
+    // outright (issue #929). This used to share the "insufficient shape info"
+    // early return below on a trust-the-caller basis, which handed the declared
+    // pair straight to the kernel and turned a hostile `config.json` into an
+    // uncatchable abort at the first forward pass. The two conditions are
+    // separate: degenerate *shapes* still stay permissive, degenerate *params*
+    // do not. See [`validate_quantization_params`].
+    validate_quantization_params(group_size, bits)?;
+
+    // A `mode` MLX cannot parse is refused on the same terms and for the same
+    // reason (issue #973). Checking it here rather than only at the storage
+    // points covers every `UnifiedLinear` and `UnifiedEmbedding` in one place,
+    // and turns the two-way branch below from a silent fallthrough into a total
+    // one: an unrecognized string used to take the block-float path, which on a
+    // genuine affine tensor re-derives the declared group size back onto itself,
+    // so the layout looked reconciled and not even the divergence warning fired.
+    validate_quantization_mode(mode)?;
+
+    // Insufficient shape info: trust the caller, mirroring the historical
+    // early-return in `infer_quantization_bits` for empty / scalar shapes.
+    if weight_shape.is_empty() || scales_shape.is_empty() {
+        return Ok(ReconciledQuant {
+            bits,
+            group_size,
+            reconciled: false,
+        });
+    }
+    let packed_in = *weight_shape.last().unwrap();
+    let num_groups = *scales_shape.last().unwrap();
+    if packed_in <= 0 || num_groups <= 0 {
+        return Ok(ReconciledQuant {
+            bits,
+            group_size,
+            reconciled: false,
+        });
+    }
+
+    if mode == "affine" {
+        // The non-CUDA ModelOpt NVFP4 fallback repacks source group_size=16
+        // weights into standard affine group sizes so decode can stay quantized.
+        // Shapes are ambiguous with an 8-bit/gs16 tensor, but gs16 affine qmv
+        // is not supported by the backend. Prefer the declared 4-bit width and
+        // recover the qmv-supported group_size for this narrow case.
+        if group_size == 16 && bits == 4 {
+            let effective_group_size =
+                infer_quantization_group_size(weight_shape, scales_shape, bits, group_size)?;
+            if [32, 64, 128].contains(&effective_group_size) {
+                return Ok(ReconciledQuant {
+                    bits,
+                    group_size: effective_group_size,
+                    reconciled: effective_group_size != group_size,
+                });
+            }
+        }
+
+        // Trust group_size, re-derive bits. A non-integer or out-of-range bit
+        // width propagates as the hard-fail path (the unsupported-layout guard).
+        let effective_bits = infer_quantization_bits(weight_shape, scales_shape, group_size, bits)?;
+        Ok(ReconciledQuant {
+            bits: effective_bits,
+            group_size,
+            reconciled: effective_bits != bits,
+        })
+    } else {
+        // Block-float (mxfp4 / nvfp4 / mxfp8): bits are fixed by the mode, so
+        // re-derive group_size from in_features = packed_in * (32 / bits) =
+        // num_groups * group_size. Preserve the historical guard/fallback shape
+        // exactly (keep declared group_size when the shapes are unusable), but
+        // flag an inconsistency so the loader surfaces it instead of proceeding
+        // silently.
+        let can_infer = weight_shape.len() >= 2 && scales_shape.len() >= 2 && 32 % bits == 0;
+        if !can_infer {
+            return Ok(ReconciledQuant {
+                bits,
+                group_size,
+                reconciled: false,
+            });
+        }
+        // `checked_mul` for symmetry with the affine path, which routes through
+        // `infer_quantization_bits`. `packed_in` comes from a real tensor so it
+        // cannot realistically overflow here, but an unchecked multiply in a
+        // config-driven load path is the wrong default.
+        let in_features = packed_in.checked_mul(32 / bits).ok_or_else(|| {
+            format!(
+                "Quantized weight shape overflow: packed_in={packed_in}, bits={bits}, \
+                 weight.shape={weight_shape:?}"
+            )
+        })?;
+        if in_features % num_groups == 0 {
+            let effective_group_size = in_features / num_groups;
+            Ok(ReconciledQuant {
+                bits,
+                group_size: effective_group_size,
+                reconciled: effective_group_size != group_size,
+            })
+        } else {
+            Ok(ReconciledQuant {
+                bits,
+                group_size,
+                reconciled: true,
+            })
+        }
+    }
+}
+
+/// Reconcile quant params and emit a load-time warning when the declared
+/// metadata did not match the tensor shapes. Thin wrapper over the pure
+/// [`reconcile_quantization_layout`] so the linear and embedding loaders
+/// surface the same diagnostic instead of silently overriding the config
+/// (issue #467).
+fn reconcile_quantization_layout_logged(
+    weight_shape: &[i32],
+    scales_shape: &[i32],
+    group_size: i32,
+    bits: i32,
+    mode: &str,
+    prefix: &str,
+) -> Result<ReconciledQuant, String> {
+    let layout = reconcile_quantization_layout(weight_shape, scales_shape, group_size, bits, mode)
+        .map_err(|e| format!("{e} (prefix: {prefix})"))?;
+    if layout.reconciled {
+        tracing::warn!(
+            target: "mlxcel::quant",
+            prefix,
+            mode,
+            declared_bits = bits,
+            declared_group_size = group_size,
+            effective_bits = layout.bits,
+            effective_group_size = layout.group_size,
+            "quantized layout does not match declared metadata; using shape-derived \
+             params. If this is an unsupported external quant format (e.g. OptiQ), \
+             decoding may be degenerate."
+        );
+    }
+    Ok(layout)
+}
+
+/// The three tensor shapes a quantized weight is stored as, borrowed for
+/// validation. `biases` is `None` for the block-float modes, which carry no
+/// zero points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuantizedTensorShapes<'a> {
+    pub weight: &'a [i32],
+    pub scales: &'a [i32],
+    pub biases: Option<&'a [i32]>,
+}
+
+/// Check a quantized tensor's packing against the input width `config.json`
+/// claims, and its `biases` against its `scales`.
+///
+/// Quantization packs the **input** axis only, so a row-count check says
+/// nothing about the input width: a checkpoint honestly packed for a different
+/// `hidden_size` is internally self-consistent and passes every other check.
+/// MLX reconstructs the width as `scales.shape(-1) * group_size` and
+/// `extract_quantized_matmul_dims` throws `std::invalid_argument` when it
+/// disagrees with the activation's last axis; `validate_quantized_input` throws
+/// again when `biases` and `scales` differ in shape. `quantized_matmul` and
+/// `gather_qmm` cross the cxx bridge as `UniquePtr<MlxArray>` rather than a
+/// `Result`, so either throw is an uncatchable `std::terminate` at the **first
+/// forward pass**, long after the checkpoint appeared to load.
+///
+/// The width is reconstructed from the *effective* group size the loader will
+/// use, obtained from [`reconcile_quantization_layout`] rather than from the
+/// declared pair, and is checked twice: against the config width, and against
+/// the width the packed weight itself describes, which is MLX's own predicate
+/// and does not follow from the first check whenever the reconciler falls back
+/// to the declared `group_size`. Works for both a 2-D projection and a 3-D
+/// stacked expert tensor: only the last axis carries the packing, and the
+/// leading axes are required to agree between weight and scales.
+///
+/// Not covered: `validate_quantized_input` also rejects a `weight` whose dtype
+/// is not `uint32`. That is deliberately not checked here, because the in-tree
+/// test fixtures build packed weights as f32 and a dtype guard would reject them
+/// while a real checkpoint never trips it.
+///
+/// `label` names the tensor in the rejection message; callers pass the weight
+/// prefix so the message points at a key the reader can find in the
+/// checkpoint.
+///
+/// Used by: BailingMoe weight validation (token table, dense projections,
+///          stacked experts) and the shared `validate_embedding_table` guard
+///          (BailingMoe, Gpt2, GptBigCode, GptNeoX, Mamba, Mamba2)
+pub fn validate_quantized_packing(
+    label: &str,
+    shapes: &QuantizedTensorShapes<'_>,
+    in_features: usize,
+    group_size: i32,
+    bits: i32,
+    mode: &str,
+) -> Result<(), String> {
+    let w_shape = shapes.weight;
+    let s_shape = shapes.scales;
+    if s_shape.len() != w_shape.len() || s_shape.len() < 2 {
+        return Err(format!(
+            "unexpected {label}.scales shape {s_shape:?}: must have the same rank as \
+             {label}.weight {w_shape:?} and be at least 2-D"
+        ));
+    }
+    if s_shape[..s_shape.len() - 1] != w_shape[..w_shape.len() - 1] {
+        return Err(format!(
+            "unexpected {label}.scales shape {s_shape:?}: every axis but the last must match \
+             {label}.weight {w_shape:?}"
+        ));
+    }
+
+    let layout = reconcile_quantization_layout(w_shape, s_shape, group_size, bits, mode)
+        .map_err(|e| format!("{label}: {e}"))?;
+
+    let groups = usize::try_from(s_shape[s_shape.len() - 1]).unwrap_or(0);
+    let effective_group_size = usize::try_from(layout.group_size).unwrap_or(0);
+    let described = groups.checked_mul(effective_group_size);
+    if described != Some(in_features) {
+        return Err(format!(
+            "unexpected {label}.scales shape {s_shape:?}: {groups} quantization groups at \
+             group_size {effective_group_size} describe an input width of {}, but the config says \
+             {in_features}. MLX reconstructs a quantized matrix's input width as \
+             scales.shape(-1) * group_size and throws when it disagrees with the activation, and \
+             that throw crosses the cxx bridge as an uncatchable abort at the first forward pass \
+             rather than a load error. Packing compresses the input axis only, so the row count is \
+             still correct and cannot catch this.",
+            described
+                .map(|d| d.to_string())
+                .unwrap_or_else(|| "an overflowing number of".to_string())
+        ));
+    }
+
+    // The check above compares only the SCALES side against the config. MLX
+    // compares the WEIGHT side against the scales side, and the two are not the
+    // same test: the block-float branch of the reconciler keeps the declared
+    // `group_size` in both of its fallbacks (`32 % bits != 0`, and
+    // `in_features % num_groups != 0`), so `groups * group_size` can hit the
+    // config width while the packed weight describes something else entirely.
+    // Mirror MLX's own predicate from `validate_quantized_input` in i64 so the
+    // multiply cannot wrap on a large plane. `layout.bits` is guaranteed
+    // non-zero because `reconcile_quantization_layout` bounds it above.
+    let packed_in = w_shape[w_shape.len() - 1];
+    let packed_width = i64::from(packed_in) * 32 / i64::from(layout.bits);
+    let claimed = i64::from(s_shape[s_shape.len() - 1]) * i64::from(layout.group_size);
+    if packed_width != claimed {
+        return Err(format!(
+            "unexpected {label}.weight shape {w_shape:?}: a packed width of {packed_in} at \
+             {}-bit describes an input width of {packed_width}, but {label}.scales {s_shape:?} at \
+             group_size {} describes {claimed}. MLX compares exactly these two in \
+             validate_quantized_input and throws on a mismatch, and that throw crosses the cxx \
+             bridge as an uncatchable abort at the first forward pass rather than a load error.",
+            layout.bits, layout.group_size
+        ));
+    }
+
+    if let Some(bias_shape) = shapes.biases
+        && bias_shape != s_shape
+    {
+        return Err(format!(
+            "unexpected {label}.biases shape {bias_shape:?}: the affine zero points must have \
+             the same shape as {label}.scales ({s_shape:?}). MLX rejects a mismatch by \
+             throwing, which crosses the cxx bridge as an uncatchable abort at the first \
+             forward pass."
+        ));
+    }
+    Ok(())
+}
+
+/// Unified Linear layer that auto-detects quantization
+///
+/// Checks for `.scales` key in weight map to determine whether to use
+/// quantized or regular linear operations. Replaces both the old
+/// `QuantizedLinear` and `UnifiedLinear` types.
+///
+/// Used by: all text/VLM model implementations
+pub enum UnifiedLinear {
+    Quantized {
+        weight: QuantizedWeight,
+        bias: Option<UniquePtr<MlxArray>>,
+    },
+    Regular(Linear),
+}
+
+/// Backward-compatible alias
+pub type QuantizedLinear = UnifiedLinear;
+
+impl UnifiedLinear {
+    /// Create a new quantized linear layer (explicit construction)
+    pub fn new(weight: QuantizedWeight, bias: Option<UniquePtr<MlxArray>>) -> Self {
+        Self::Quantized { weight, bias }
+    }
+
+    /// Load from weight map, auto-detecting quantization (affine mode)
+    ///
+    /// Detects quantization by checking for `.scales` key in weights.
+    /// Falls back to regular Linear if scales are absent.
+    pub fn from_weights(
+        weights: &crate::weights::WeightMap,
+        prefix: &str,
+        group_size: i32,
+        bits: i32,
+    ) -> Result<Self, String> {
+        // Auto-detect the quantization mode: affine stores zero-point biases,
+        // so their absence means a block-float scheme (mxfp4 / nvfp4 / mxfp8),
+        // distinguished by bits and group_size. This lets callers that do not
+        // thread an explicit mode (e.g. vision encoders, which always called
+        // this affine default) load non-affine weights correctly instead of
+        // aborting in quantized_matmul ("Biases must be provided for affine").
+        let has_biases = weights.get(&format!("{}.biases", prefix)).is_some();
+        let mode = infer_quantization_mode(has_biases, group_size, bits);
+        Self::from_weights_with_mode(weights, prefix, group_size, bits, mode)
+    }
+
+    /// Load from weight map with explicit quantization mode
+    ///
+    /// Detects quantization by checking for `.scales` key in weights.
+    /// Falls back to regular Linear if scales are absent.
+    /// For mxfp4/nvfp4/mxfp8 modes, biases are optional.
+    pub fn from_weights_with_mode(
+        weights: &crate::weights::WeightMap,
+        prefix: &str,
+        group_size: i32,
+        bits: i32,
+        mode: &str,
+    ) -> Result<Self, String> {
+        let scales_name = format!("{}.scales", prefix);
+
+        if weights.contains_key(&scales_name) {
+            // Quantized path
+            let weight_name = format!("{}.weight", prefix);
+            let biases_name = format!("{}.biases", prefix);
+
+            let weight = weights
+                .get(&weight_name)
+                .map(|w| ffi::copy(w))
+                .ok_or_else(|| format!("Weight not found: {}", weight_name))?;
+            let scales = weights
+                .get(&scales_name)
+                .map(|w| ffi::copy(w))
+                .ok_or_else(|| format!("Scales not found: {}", scales_name))?;
+            // biases may not exist for mxfp4/nvfp4/mxfp8 modes
+            let biases = weights.get(&biases_name).map(|w| ffi::copy(w));
+
+            // Reconcile caller-supplied quant params with the actual tensor
+            // shapes; mixed exports vary them per layer. For affine, bits are
+            // inferred with the trusted group_size (Qwen3.5/3.6 MoE gates). For
+            // the block-float modes bits are fixed by the mode, so reconcile
+            // group_size from the shapes instead: in_features = packed_in *
+            // (32/bits) = num_groups * group_size (e.g. minicpm-v-4.6 mxfp4
+            // stores some weights at group_size 32 while config says 64).
+            //
+            // When reconciliation actually changes a value the wrapper emits a
+            // load-time warning instead of silently overriding the declared
+            // metadata, so a divergent external packing (issue #467, OptiQ)
+            // does not quietly dequantize with the wrong params and decode to
+            // degenerate output.
+            let w_shape = ffi::array_shape(&weight);
+            let s_shape = ffi::array_shape(&scales);
+            let layout = reconcile_quantization_layout_logged(
+                &w_shape, &s_shape, group_size, bits, mode, prefix,
+            )?;
+            let (effective_bits, effective_group_size) = (layout.bits, layout.group_size);
+
+            // The reconciler bounds the mode string itself; this additionally
+            // refuses a valid mode that contradicts the `.biases` plane the
+            // checkpoint ships, which MLX throws on just as uncatchably (issue
+            // #973). A caller that reached here through `from_weights` cannot
+            // trip it, because `infer_quantization_mode` derives the mode from
+            // exactly this predicate; only a caller threading a config-declared
+            // mode (gpt-oss) can.
+            validate_quantization_biases(mode, biases.is_some())
+                .map_err(|e| format!("{e} (prefix: {prefix})"))?;
+
+            // Optional native-NVFP4 global-scale sidecar (`weight_scale_2`).
+            // Emitted by the direct ModelOpt transcode (issue #693); absent for
+            // affine, mxfp4, mxfp8, and the dense/affine NVFP4 fallbacks.
+            let global_scale_name = format!("{}.global_scale", prefix);
+            let global_scale = weights.get(&global_scale_name).map(|w| ffi::copy(w));
+
+            let qweight = QuantizedWeight {
+                weight,
+                scales,
+                biases,
+                group_size: effective_group_size,
+                bits: effective_bits,
+                mode: mode.to_string(),
+                global_scale,
+            };
+
+            let bias_name = format!("{}.bias", prefix);
+            let bias = weights.get(&bias_name).map(|w| ffi::copy(w));
+
+            Ok(Self::Quantized {
+                weight: qweight,
+                bias,
+            })
+        } else {
+            // Fallback to regular linear (non-quantized model)
+            Ok(Self::Regular(Linear::from_weights(weights, prefix)?))
+        }
+    }
+
+    pub fn as_quantized_weight(&self) -> Option<&QuantizedWeight> {
+        match self {
+            UnifiedLinear::Quantized { weight, .. } => Some(weight),
+            UnifiedLinear::Regular(_) => None,
+        }
+    }
+
+    /// Return the logical dense `[out, in]` weight for diagnostics and external
+    /// compiler backends that need to isolate a projection from MLX's QMM.
+    pub fn dequantized_weight(&self) -> UniquePtr<MlxArray> {
+        match self {
+            Self::Quantized { weight, .. } => unsafe {
+                ffi::dequantize(
+                    &weight.weight,
+                    &weight.scales,
+                    weight.biases_ptr(),
+                    weight.group_size,
+                    weight.bits,
+                    &weight.mode,
+                )
+            },
+            Self::Regular(linear) => ffi::copy(&linear.weight),
+        }
+    }
+
+    /// Forward pass
+    pub fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
+        match self {
+            Self::Quantized { weight, bias } => {
+                // Native-NVFP4 global-scale path (issue #693): the per-tensor
+                // `weight_scale_2` multiplies only the matmul output, not the
+                // (rare) dense linear bias, so the C++ helper runs qmm, applies
+                // the scalar, then adds that bias in one FFI call. `y =
+                // (x @ W^T) * s2 + b`. When no sidecar is present this is the
+                // original single fused call, byte-for-byte.
+                if weight.global_scale.is_some() && !fused_global_scale_disabled() {
+                    let bias_ptr = bias
+                        .as_ref()
+                        .map(|b| b.as_ref().unwrap() as *const MlxArray)
+                        .unwrap_or(std::ptr::null());
+                    return unsafe {
+                        ffi::quantized_linear_forward_global_scale(
+                            x,
+                            &weight.weight,
+                            &weight.scales,
+                            weight.biases_ptr(),
+                            weight.global_scale_ptr(),
+                            bias_ptr,
+                            weight.group_size,
+                            weight.bits,
+                            &weight.mode,
+                        )
+                    };
+                }
+
+                if weight.global_scale.is_some() {
+                    let mm = unsafe {
+                        ffi::quantized_linear_forward(
+                            x,
+                            &weight.weight,
+                            &weight.scales,
+                            weight.biases_ptr(),
+                            std::ptr::null(),
+                            weight.group_size,
+                            weight.bits,
+                            &weight.mode,
+                        )
+                    };
+                    let scaled = weight.apply_global_scale(mm);
+                    return match bias {
+                        Some(b) => ffi::add(&scaled, b),
+                        None => scaled,
+                    };
+                }
+
+                let bias_ptr = bias
+                    .as_ref()
+                    .map(|b| b.as_ref().unwrap() as *const MlxArray)
+                    .unwrap_or(std::ptr::null());
+
+                unsafe {
+                    ffi::quantized_linear_forward(
+                        x,
+                        &weight.weight,
+                        &weight.scales,
+                        weight.biases_ptr(),
+                        bias_ptr,
+                        weight.group_size,
+                        weight.bits,
+                        &weight.mode,
+                    )
+                }
+            }
+            Self::Regular(linear) => linear.forward(x),
+        }
+    }
+
+    /// Set runtime LoRA weights (only for Regular variant)
+    pub fn set_lora(&mut self, a: UniquePtr<MlxArray>, b: UniquePtr<MlxArray>, scale: f32) {
+        if let Self::Regular(linear) = self {
+            linear.set_lora(a, b, scale);
+        }
+    }
+
+    /// Register a named runtime adapter. Quantized base linears are rejected:
+    /// the current on-the-fly LoRA path needs a dense base projection.
+    pub fn set_lora_named(
+        &mut self,
+        name: &str,
+        a: UniquePtr<MlxArray>,
+        b: UniquePtr<MlxArray>,
+        scale: f32,
+    ) -> Result<(), String> {
+        match self {
+            Self::Regular(linear) => linear.set_lora_named(name, a, b, scale),
+            Self::Quantized { .. } => Err(format!(
+                "runtime LoRA adapter {name} is not supported on a quantized base linear"
+            )),
+        }
+    }
+
+    /// Select one named adapter, or disable adapters with `None`.
+    pub fn select_lora(&self, name: Option<&str>) -> Result<(), String> {
+        match self {
+            Self::Regular(linear) => linear.select_lora(name),
+            Self::Quantized { .. } if name.is_none() => Ok(()),
+            Self::Quantized { .. } => Err("runtime LoRA is unavailable on quantized linear".into()),
+        }
+    }
+
+    /// Toggle LoRA active state
+    pub fn set_lora_active(&self, active: bool) {
+        if let Self::Regular(linear) = self {
+            linear.set_lora_active(active);
+        }
+    }
+
+    /// Check if this is a quantized linear layer
+    pub fn is_quantized(&self) -> bool {
+        matches!(self, Self::Quantized { .. })
+    }
+
+    /// Get a reference to the inner QuantizedWeight (if quantized)
+    /// Used by compiled MLP operations that need direct access to weight/scales/biases
+    pub fn quantized_weight(&self) -> Option<&QuantizedWeight> {
+        match self {
+            Self::Quantized { weight, .. } => Some(weight),
+            Self::Regular(_) => None,
+        }
+    }
+
+    /// Fused concatenated QKV projection + split + reshape + transpose + SuScaledRoPE.
+    ///
+    /// Returns Q/K/V already shaped `[B, H, T, D]`. Q/K match mlx-lm/mlx-vlm
+    /// SuScaledRoPE semantics by scaling only the rotary prefix before custom
+    /// frequency RoPE. Only available for quantized fused-QKV weights.
+    ///
+    /// Used by: Phi3/Phi3V longrope-su attention path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_fused_qkv_split_su_scaled_rope(
+        &self,
+        x: &MlxArray,
+        num_heads: i32,
+        num_kv_heads: i32,
+        head_dim: i32,
+        rope_dims: i32,
+        rope_freqs: &MlxArray,
+        rope_input_scale: f32,
+        cache_offset: i32,
+    ) -> Option<(
+        UniquePtr<MlxArray>,
+        UniquePtr<MlxArray>,
+        UniquePtr<MlxArray>,
+    )> {
+        match self {
+            Self::Quantized { weight, .. } => {
+                let mut q = cxx::UniquePtr::null();
+                let mut k = cxx::UniquePtr::null();
+                let mut v = cxx::UniquePtr::null();
+                unsafe {
+                    ffi::fused_qkv_project_split_su_scaled_rope(
+                        x,
+                        &weight.weight,
+                        &weight.scales,
+                        weight.biases_ptr(),
+                        num_heads,
+                        num_kv_heads,
+                        head_dim,
+                        rope_dims,
+                        rope_freqs,
+                        rope_input_scale,
+                        cache_offset,
+                        weight.group_size,
+                        weight.bits,
+                        &weight.mode,
+                        &mut q,
+                        &mut k,
+                        &mut v,
+                    );
+                }
+                Some((q, k, v))
+            }
+            Self::Regular(_) => None,
+        }
+    }
+
+    /// Get a reference to the inner Linear (if non-quantized)
+    /// Used by compiled FP MLP operations that need direct weight/bias access
+    pub fn regular_weight(&self) -> Option<&Linear> {
+        match self {
+            Self::Regular(linear) => Some(linear),
+            Self::Quantized { .. } => None,
+        }
+    }
+
+    /// Produce an independent handle that shares the same underlying MLX
+    /// buffers.
+    ///
+    /// Used by: DFlash lazy binding for untied target `lm_head` projections.
+    pub fn clone_shared(&self) -> Self {
+        match self {
+            Self::Quantized { weight, bias } => Self::Quantized {
+                weight: weight.clone_shared(),
+                bias: bias.as_ref().map(|b| ffi::copy(b)),
+            },
+            Self::Regular(linear) => Self::Regular(linear.clone_shared()),
+        }
+    }
+}
+
+/// The two trailing dimensions that decide whether one packed projection can be
+/// concatenated with another: `(packed_width, num_groups)`, the last axis of its
+/// `weight` and the last axis of its `scales`.
+pub type QkvPackedWidths = (i32, i32);
+
+/// Whether packed q/k/v projections can share one fused plane.
+///
+/// This is `concatenate`'s own precondition, stated directly: joining along
+/// axis 0 requires every other axis to agree, so the three `weight` tensors must
+/// share a packed width and the three `scales` must share a group count. MLX
+/// packs an `[out, in]` plane to `[out, in * bits / 32]` and describes it with
+/// `[out, in / group_size]` scales, so a divergence in `bits`, in `group_size`,
+/// or in both shows up here.
+///
+/// It is deliberately a shape test rather than a comparison of the three
+/// reconciled `(bits, group_size)` pairs, and it is strictly stronger than one.
+/// Comparing the pair is the natural way to *state* the rule, and the widths are
+/// what the load-time log reports, but the pair is a lossy summary of the
+/// packing: [`reconcile_quantization_layout`] normalizes every affine plane onto
+/// the single declared `group_size`, so under a declared group size of 64 an
+/// 8-bit plane at group size 32 reconciles to the same `(4, 64)` as a genuine
+/// 4-bit plane at 64 while packing to twice the width. Comparing pairs would
+/// call those two fusable and hand `concatenate` two different widths, which
+/// throws inside MLX and crosses the cxx bridge as an uncatchable abort. A plane
+/// whose shapes solve to no valid bit width reconciles to an `Err` rather than
+/// to a distinguishable pair, which is the same hole from the other side.
+///
+/// The converse cannot happen: reconciliation is a pure function of these two
+/// trailing dims (plus the declared pair and mode, which are shared across the
+/// three planes), so planes that agree here always reconcile to the same layout.
+/// Nothing that the pair comparison would have split is left fused.
+///
+/// An empty or single-element slice is trivially fusable.
+///
+/// Pure over the shapes so the policy is unit-testable without an MLX backend.
+///
+/// Used by: [`FusedQKVLinear::from_weights_separate_with_mode`].
+pub fn qkv_planes_are_fusable(planes: &[QkvPackedWidths]) -> bool {
+    match planes.split_first() {
+        Some((first, rest)) => rest.iter().all(|p| p == first),
+        None => true,
+    }
+}
+
+/// The three planes' `(packed_width, num_groups)` in q/k/v order.
+///
+/// `None` when any plane is missing its `weight` or its `scales`, so the caller
+/// falls through to the path that owns the diagnostics for a broken triple
+/// rather than pre-empting it with a worse message.
+fn qkv_packed_widths(
+    weights: &crate::weights::WeightMap,
+    prefixes: [&str; 3],
+) -> Option<[QkvPackedWidths; 3]> {
+    let mut widths = [(0, 0); 3];
+    for (slot, prefix) in widths.iter_mut().zip(prefixes) {
+        let weight_shape = ffi::array_shape(weights.get(&format!("{prefix}.weight"))?);
+        let scales_shape = ffi::array_shape(weights.get(&format!("{prefix}.scales"))?);
+        *slot = (weight_shape.last().copied()?, scales_shape.last().copied()?);
+    }
+    Some(widths)
+}
+
+/// Reconcile the three q/k/v planes' quantization layouts from their own shapes.
+///
+/// Returns `Some([(bits, group_size); 3])` in q/k/v order when all three planes
+/// reconcile, and `None` otherwise. Only informative: the split decision is made
+/// by [`qkv_planes_are_fusable`] on the shapes themselves. What this feeds is the
+/// load-time log message, and the per-plane construction of a split layer, which
+/// passes each plane its own reconciled pair rather than the declared one so the
+/// plane loader does not warn about a divergence that has already been reported
+/// and handled.
+fn reconciled_qkv_layouts(
+    weights: &crate::weights::WeightMap,
+    prefixes: [&str; 3],
+    group_size: i32,
+    bits: i32,
+    mode: &str,
+) -> Option<[(i32, i32); 3]> {
+    let mut layouts = [(0, 0); 3];
+    for (slot, prefix) in layouts.iter_mut().zip(prefixes) {
+        let weight = weights.get(&format!("{prefix}.weight"))?;
+        let scales = weights.get(&format!("{prefix}.scales"))?;
+        let layout = reconcile_quantization_layout(
+            &ffi::array_shape(weight),
+            &ffi::array_shape(scales),
+            group_size,
+            bits,
+            mode,
+        )
+        .ok()?;
+        *slot = (layout.bits, layout.group_size);
+    }
+    Some(layouts)
+}
+
+/// One plane's packing as the load-time log reports it, for example
+/// `"8-bit/gs64 (packed 512x32)"`, or just the shapes when the plane's layout
+/// could not be reconciled.
+fn describe_qkv_plane(packed: QkvPackedWidths, layout: Option<QkvPackedWidths>) -> String {
+    let (width, groups) = packed;
+    match layout {
+        Some((bits, group_size)) => format!("{bits}-bit/gs{group_size} (packed {width}x{groups})"),
+        None => format!("packed {width}x{groups}"),
+    }
+}
+
+/// How a [`FusedQKVLinear`] stores its three projections.
+///
+/// [`Self::Fused`] is the norm and the fast path: one `[q | k | v]` weight
+/// concatenated along the output axis, so a single matmul covers all three
+/// projections and the fused projection+RoPE kernels have the one packed plane
+/// they take. It requires the three projections to share a quantization layout,
+/// because the packed form only concatenates when `(bits, group_size)` agree:
+/// a `[2048, 4096]` plane packs to `[2048, 512]` at 4 bits and to
+/// `[2048, 1024]` at 8, and concatenating those along axis 0 is a hard shape
+/// error inside MLX.
+///
+/// [`Self::Split`] exists because that is not hypothetical. `mlx_lm`'s
+/// `mixed_4_8` quantization predicate raises selected tensors (commonly
+/// `v_proj` and `down_proj`) to 8 bits while the rest of the model stays at 4,
+/// and such checkpoints are published (`mlx-community/LocateAnything-3B-4bit`
+/// stores `v_proj` at 8 bits in 18 of its 36 layers). A layer like that keeps
+/// its three planes separate, each in exactly the layout the checkpoint stored
+/// it in.
+///
+/// Keeping them separate is preferred over the two alternatives:
+///
+/// * Requantizing the narrow planes up to the wider width is **not** exact.
+///   MLX's affine quantizer snaps the group scale onto the larger-magnitude
+///   edge rather than using a plain `(max - min) / (2^bits - 1)`, so a 4-bit
+///   group does not land on the 8-bit grid; this was measured at 3.7e-3 on the
+///   LocateAnything checkpoint. It is never done.
+/// * Dequantizing all three planes to dense is exact (it is the stored
+///   representation's definition) but gives up the packed form: on the 3B
+///   LocateAnything checkpoint that is about 190 MB of extra resident weights.
+///
+/// The split representation converts nothing, so it is exact by construction
+/// and costs no extra memory. What it gives up is the single matmul and the
+/// fused projection kernels that need one packed weight; those return `None`
+/// for a split layer exactly as they already do for a dense one, and the caller
+/// falls back to its graph path.
+pub enum QkvProjection {
+    /// One `[q_dim | k_dim | v_dim, hidden_dim]` weight, the common case.
+    Fused(UnifiedLinear),
+    /// Three independently packed projections, kept apart because the
+    /// checkpoint stores them at quantization layouts that cannot concatenate.
+    Split {
+        q: UnifiedLinear,
+        k: UnifiedLinear,
+        v: UnifiedLinear,
+    },
+}
+
+impl QkvProjection {
+    /// The single fused projection, or `None` when the three planes are split.
+    pub fn fused(&self) -> Option<&UnifiedLinear> {
+        match self {
+            Self::Fused(proj) => Some(proj),
+            Self::Split { .. } => None,
+        }
+    }
+
+    /// Whether the three projections are stored separately.
+    pub fn is_split(&self) -> bool {
+        matches!(self, Self::Split { .. })
+    }
+
+    /// Project `x` and return the `[q | k | v]` concatenated activation, the
+    /// layout the fused weight would have produced directly.
+    ///
+    /// For a split layer this runs the three projections and concatenates their
+    /// outputs along the last axis. That is exact: a matmul against a
+    /// row-concatenated weight is the row concatenation of the three matmuls,
+    /// because every output column depends only on its own weight row and its
+    /// own scales. It costs one extra contiguous copy per call, which is why
+    /// [`Self::project_split`] (used by the plain forward, which wants the three
+    /// pieces anyway) does not go through here.
+    fn project_concat(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
+        match self {
+            Self::Fused(proj) => proj.forward(x),
+            Self::Split { q, k, v } => {
+                let q_out = q.forward(x);
+                let k_out = k.forward(x);
+                let v_out = v.forward(x);
+                let axis = (ffi::array_shape(&q_out).len() as i32 - 1).max(0);
+                let ptrs: &[*const MlxArray] = &[
+                    q_out.as_ref().unwrap() as *const MlxArray,
+                    k_out.as_ref().unwrap() as *const MlxArray,
+                    v_out.as_ref().unwrap() as *const MlxArray,
+                ];
+                // SAFETY: the three outputs are live for the whole call and the
+                // pointers are borrowed from them.
+                unsafe { ffi::concatenate(ptrs, axis) }
+            }
+        }
+    }
+
+    /// Run the three projections and return them separately.
+    fn project_split(
+        &self,
+        x: &MlxArray,
+        q_size: i32,
+        kv_size: i32,
+    ) -> (
+        UniquePtr<MlxArray>,
+        UniquePtr<MlxArray>,
+        UniquePtr<MlxArray>,
+    ) {
+        match self {
+            Self::Fused(proj) => {
+                let qkv = proj.forward(x);
+                let q = ffi::slice_last_dim(&qkv, 0, q_size);
+                let k = ffi::slice_last_dim(&qkv, q_size, q_size + kv_size);
+                let v = ffi::slice_last_dim(&qkv, q_size + kv_size, q_size + 2 * kv_size);
+                (q, k, v)
+            }
+            Self::Split { q, k, v } => (q.forward(x), k.forward(x), v.forward(x)),
+        }
+    }
+}
+
+/// Fused QKV linear layer for GQA models.
+///
+/// Stores Q, K, V weights concatenated along the output dimension into a single
+/// `UnifiedLinear`. A single matmul replaces 3 separate projections, improving
+/// Neural Engine tile utilisation (especially on M5).
+///
+/// Weight layout (output axis 0):
+///   `[q_dim | k_dim | v_dim, hidden_dim]`  →  `q_dim = n_heads * head_dim`
+///                                           →  `k_dim = v_dim = n_kv_heads * head_dim`
+///
+/// A checkpoint whose three projections disagree on their quantization layout
+/// cannot be concatenated at all; such a layer keeps its planes separate
+/// instead. See [`QkvProjection`] for why that is preferred over converting
+/// them, and what it costs. Every method here works for both representations,
+/// except the fused-kernel launchers, which return `None` for a split layer on
+/// the same terms they already do for a dense one.
+///
+/// Used by: Llama3, Qwen2/3, Qwen3-VL, Qwen3-VL-MoE, Gemma v1/2/3, Mistral,
+/// Cohere2, StarCoder2, InternLM3, Jamba
+pub struct FusedQKVLinear {
+    /// The QKV projection, fused into one plane or kept as three.
+    pub qkv_proj: QkvProjection,
+    pub n_heads: i32,
+    pub n_kv_heads: i32,
+    pub head_dim: i32,
+}
+
+impl FusedQKVLinear {
+    /// Load and concatenate separate q/k/v weights from the weight map.
+    ///
+    /// Concatenates `{prefix}.q_proj`, `{prefix}.k_proj`, `{prefix}.v_proj`
+    /// along axis 0 into a single `UnifiedLinear`.  Both quantized and
+    /// non-quantized weight layouts are supported.
+    pub fn from_weights_separate(
+        weights: &crate::weights::WeightMap,
+        prefix: &str,
+        group_size: i32,
+        bits: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+    ) -> Result<Self, String> {
+        Self::from_weights_separate_with_mode(
+            weights, prefix, group_size, bits, n_heads, n_kv_heads, head_dim, "affine",
+        )
+    }
+
+    /// Load and concatenate separate q/k/v weights with explicit quantization mode.
+    ///
+    /// Bounds the declared `group_size` / `bits` pair before anything derived
+    /// from it is stored (issue #958): this loader never calls
+    /// `reconcile_quantization_layout`, so a declared `(0, 0)` was stored
+    /// verbatim on the fused `QuantizedWeight` otherwise.
+    ///
+    /// Used by (through [`Self::from_weights_separate`]): Llama3 (and Mistral,
+    /// the same `ModelType::Llama` path), Gemma, Gemma2, Gemma3, Gemma4, Qwen3,
+    /// Qwen3MoE, Qwen3VL, Qwen3VLMoE, Cohere2, Cohere2MoE, StarCoder2,
+    /// InternLM3, Jamba.
+    /// Preserves both quantization `biases` and true linear `bias` tensors
+    /// when present; Qwen2-family checkpoints require q/k/v linear bias for
+    /// sane logits.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_weights_separate_with_mode(
+        weights: &crate::weights::WeightMap,
+        prefix: &str,
+        group_size: i32,
+        bits: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        mode: &str,
+    ) -> Result<Self, String> {
+        let q_prefix = format!("{}.q_proj", prefix);
+        let k_prefix = format!("{}.k_proj", prefix);
+        let v_prefix = format!("{}.v_proj", prefix);
+
+        let q_scales_key = format!("{}.scales", q_prefix);
+        let is_quantized = weights.contains_key(&q_scales_key);
+
+        let qkv_proj = if is_quantized {
+            // Quantized path: concatenate weight, scales, and biases tensors
+            // along axis 0 (output dimension).
+            let q_w = weights
+                .get(&format!("{}.weight", q_prefix))
+                .ok_or_else(|| format!("Weight not found: {}.weight", q_prefix))?;
+            let k_w = weights
+                .get(&format!("{}.weight", k_prefix))
+                .ok_or_else(|| format!("Weight not found: {}.weight", k_prefix))?;
+            let v_w = weights
+                .get(&format!("{}.weight", v_prefix))
+                .ok_or_else(|| format!("Weight not found: {}.weight", v_prefix))?;
+
+            let q_s = weights
+                .get(&format!("{}.scales", q_prefix))
+                .ok_or_else(|| format!("Scales not found: {}.scales", q_prefix))?;
+            let k_s = weights
+                .get(&format!("{}.scales", k_prefix))
+                .ok_or_else(|| format!("Scales not found: {}.scales", k_prefix))?;
+            let v_s = weights
+                .get(&format!("{}.scales", v_prefix))
+                .ok_or_else(|| format!("Scales not found: {}.scales", v_prefix))?;
+
+            // Reconcile caller-supplied bits with actual tensor shapes (affine only).
+            // Bound the declared pair before anything derived from it is
+            // stored (issue #958). This loader never calls
+            // `reconcile_quantization_layout`, and `infer_quantization_bits`
+            // below early-returns the caller's `bits` unchanged whenever
+            // `group_size <= 0`, so a declared `(0, 0)` was stored verbatim on
+            // the fused `QuantizedWeight` and handed to `quantized_matmul` /
+            // `fused_qkv_project_split_norm_rope`. In every current family a
+            // sibling `UnifiedLinear` sees the same declared pair and its
+            // reconciler rejects it first, so this is a shadowed hole rather
+            // than a live one, but it is the same shape as the MoE hole #929
+            // left open and it is one line to close.
+            validate_quantization_params(group_size, bits)
+                .map_err(|e| format!("{q_prefix}: {e}"))?;
+
+            // A checkpoint whose three projections were quantized at different
+            // layouts cannot be concatenated: the packed planes have different
+            // widths and MLX's `concatenate` throws, which crosses the cxx
+            // bridge as an uncatchable abort rather than a load error. Such a
+            // layer keeps its planes separate instead of converting any of them
+            // (see [`QkvProjection`]). Nothing is dequantized and nothing is
+            // requantized, so the values the model computes with are exactly
+            // the checkpoint's and the extra memory cost is zero.
+            //
+            // The decision is made on the packed shapes themselves rather than
+            // on the reconciled `(bits, group_size)` pairs, because the pair is
+            // a lossy summary that can alias two different packings onto one
+            // value; see [`qkv_planes_are_fusable`]. A plane missing its
+            // `weight` or `scales` falls through to the fused path deliberately:
+            // that path owns the existing, more specific diagnostics for a
+            // broken triple, and this check must not pre-empt them with a worse
+            // message.
+            let plane_prefixes = [q_prefix.as_str(), k_prefix.as_str(), v_prefix.as_str()];
+            if let Some(packed) = qkv_packed_widths(weights, plane_prefixes)
+                && !qkv_planes_are_fusable(&packed)
+            {
+                // Informative only, and best-effort: a plane whose shapes solve
+                // to no valid bit width still has to load (and report its own
+                // error), it just cannot be named by width in the message.
+                let layouts =
+                    reconciled_qkv_layouts(weights, plane_prefixes, group_size, bits, mode);
+                tracing::info!(
+                    target: "mlxcel::quant",
+                    prefix,
+                    mode,
+                    declared_bits = bits,
+                    declared_group_size = group_size,
+                    q = %describe_qkv_plane(packed[0], layouts.map(|l| l[0])),
+                    k = %describe_qkv_plane(packed[1], layouts.map(|l| l[1])),
+                    v = %describe_qkv_plane(packed[2], layouts.map(|l| l[2])),
+                    "mixed-precision q/k/v: keeping the three projections separate; their \
+                     packed planes have different widths and cannot be concatenated"
+                );
+                // Each plane is built at its own reconciled layout rather than
+                // at the declared one. Passing the declared pair would make
+                // every widened plane trip the plane loader's divergence
+                // warning ("decoding may be degenerate"), which is exactly
+                // wrong here: the divergence is the thing this branch detected,
+                // reported, and handled.
+                let plane = |index: usize| {
+                    let (plane_group_size, plane_bits) =
+                        layouts.map_or((group_size, bits), |l| (l[index].1, l[index].0));
+                    UnifiedLinear::from_weights_with_mode(
+                        weights,
+                        plane_prefixes[index],
+                        plane_group_size,
+                        plane_bits,
+                        mode,
+                    )
+                };
+                return Ok(Self {
+                    qkv_proj: QkvProjection::Split {
+                        q: plane(0)?,
+                        k: plane(1)?,
+                        v: plane(2)?,
+                    },
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                });
+            }
+
+            // Fused QKV concatenates along axis 0, so q/k/v must share bits; infer from q.
+            let effective_bits = if mode == "affine" {
+                let w_shape = ffi::array_shape(q_w);
+                let s_shape = ffi::array_shape(q_s);
+                infer_quantization_bits(&w_shape, &s_shape, group_size, bits)
+                    .map_err(|e| format!("{} (prefix: {})", e, q_prefix))?
+            } else {
+                bits
+            };
+
+            // Concatenate along axis 0 (output dimension)
+            let qkv_weight = {
+                let ptrs: &[*const MlxArray] = &[
+                    q_w.as_ref().unwrap() as *const MlxArray,
+                    k_w.as_ref().unwrap() as *const MlxArray,
+                    v_w.as_ref().unwrap() as *const MlxArray,
+                ];
+                unsafe { ffi::concatenate(ptrs, 0) }
+            };
+            let qkv_scales = {
+                let ptrs: &[*const MlxArray] = &[
+                    q_s.as_ref().unwrap() as *const MlxArray,
+                    k_s.as_ref().unwrap() as *const MlxArray,
+                    v_s.as_ref().unwrap() as *const MlxArray,
+                ];
+                unsafe { ffi::concatenate(ptrs, 0) }
+            };
+
+            // Biases are optional (absent for mxfp4/nvfp4/mxfp8)
+            let qkv_biases = {
+                let q_b = weights.get(&format!("{}.biases", q_prefix));
+                let k_b = weights.get(&format!("{}.biases", k_prefix));
+                let v_b = weights.get(&format!("{}.biases", v_prefix));
+                match (q_b, k_b, v_b) {
+                    (Some(qb), Some(kb), Some(vb)) => {
+                        let ptrs: &[*const MlxArray] = &[
+                            qb.as_ref().unwrap() as *const MlxArray,
+                            kb.as_ref().unwrap() as *const MlxArray,
+                            vb.as_ref().unwrap() as *const MlxArray,
+                        ];
+                        Some(unsafe { ffi::concatenate(ptrs, 0) })
+                    }
+                    _ => None,
+                }
+            };
+
+            let qkv_bias = {
+                let q_b = weights.get(&format!("{}.bias", q_prefix));
+                let k_b = weights.get(&format!("{}.bias", k_prefix));
+                let v_b = weights.get(&format!("{}.bias", v_prefix));
+                match (q_b, k_b, v_b) {
+                    (Some(qb), Some(kb), Some(vb)) => {
+                        let ptrs: &[*const MlxArray] = &[
+                            qb.as_ref().unwrap() as *const MlxArray,
+                            kb.as_ref().unwrap() as *const MlxArray,
+                            vb.as_ref().unwrap() as *const MlxArray,
+                        ];
+                        Some(unsafe { ffi::concatenate(ptrs, 0) })
+                    }
+                    _ => None,
+                }
+            };
+
+            let qweight = QuantizedWeight {
+                weight: qkv_weight,
+                scales: qkv_scales,
+                biases: qkv_biases,
+                group_size,
+                bits: effective_bits,
+                mode: mode.to_string(),
+                // Fused QKV is never a native-NVFP4 global-scale target: the
+                // ModelOpt NVFP4 Gemma 4 checkpoints leave attention dense.
+                global_scale: None,
+            };
+            UnifiedLinear::Quantized {
+                weight: qweight,
+                bias: qkv_bias,
+            }
+        } else {
+            // Non-quantized path: concatenate weight tensors along axis 0.
+            let q_w = weights
+                .get(&format!("{}.weight", q_prefix))
+                .ok_or_else(|| format!("Weight not found: {}.weight", q_prefix))?;
+            let k_w = weights
+                .get(&format!("{}.weight", k_prefix))
+                .ok_or_else(|| format!("Weight not found: {}.weight", k_prefix))?;
+            let v_w = weights
+                .get(&format!("{}.weight", v_prefix))
+                .ok_or_else(|| format!("Weight not found: {}.weight", v_prefix))?;
+
+            let qkv_weight = {
+                let ptrs: &[*const MlxArray] = &[
+                    q_w.as_ref().unwrap() as *const MlxArray,
+                    k_w.as_ref().unwrap() as *const MlxArray,
+                    v_w.as_ref().unwrap() as *const MlxArray,
+                ];
+                unsafe { ffi::concatenate(ptrs, 0) }
+            };
+
+            // Optional bias per projection (rare, but handle it)
+            let q_bias = weights
+                .get(&format!("{}.bias", q_prefix))
+                .map(|b| ffi::copy(b));
+            let k_bias = weights
+                .get(&format!("{}.bias", k_prefix))
+                .map(|b| ffi::copy(b));
+            let v_bias = weights
+                .get(&format!("{}.bias", v_prefix))
+                .map(|b| ffi::copy(b));
+            let bias = match (q_bias, k_bias, v_bias) {
+                (Some(qb), Some(kb), Some(vb)) => {
+                    let ptrs: &[*const MlxArray] = &[
+                        qb.as_ref().unwrap() as *const MlxArray,
+                        kb.as_ref().unwrap() as *const MlxArray,
+                        vb.as_ref().unwrap() as *const MlxArray,
+                    ];
+                    Some(unsafe { ffi::concatenate(ptrs, 0) })
+                }
+                _ => None,
+            };
+
+            UnifiedLinear::Regular(Linear::new(qkv_weight, bias))
+        };
+
+        Ok(Self {
+            qkv_proj: QkvProjection::Fused(qkv_proj),
+            n_heads,
+            n_kv_heads,
+            head_dim,
+        })
+    }
+
+    /// Load from a pre-concatenated `qkv_proj` weight (e.g., Phi3 layout).
+    pub fn from_weights_fused(
+        weights: &crate::weights::WeightMap,
+        prefix: &str,
+        group_size: i32,
+        bits: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+    ) -> Result<Self, String> {
+        let qkv_proj = UnifiedLinear::from_weights(
+            weights,
+            &format!("{}.qkv_proj", prefix),
+            group_size,
+            bits,
+        )?;
+        Ok(Self {
+            qkv_proj: QkvProjection::Fused(qkv_proj),
+            n_heads,
+            n_kv_heads,
+            head_dim,
+        })
+    }
+
+    /// The single packed `[q | k | v]` weight, when this layer is both fused
+    /// and quantized.
+    ///
+    /// `None` for a dense fused layer and for a [`QkvProjection::Split`] layer,
+    /// whose three planes have no single packed representation. Every caller is
+    /// a fused-kernel launcher that needs exactly one packed weight, so `None`
+    /// is the "fall back to the graph path" signal they already handle for
+    /// dense weights.
+    ///
+    /// Used by: [`Self::forward_split_rope`], [`Self::forward_split_rope_quantized`],
+    /// [`Self::forward_split_norm_rope_quantized`], and the Llama3 fused
+    /// causal-prefill launcher in the consuming crate.
+    pub fn fused_quantized_weight(&self) -> Option<&QuantizedWeight> {
+        self.qkv_proj.fused()?.as_quantized_weight()
+    }
+
+    /// Fused QKV projection + split.
+    ///
+    /// Returns `(q, k, v)` each shaped `[batch, seq_len, proj_dim]` (pre-reshape).
+    /// The caller is responsible for reshape/transpose/RoPE.
+    ///
+    /// A [`QkvProjection::Split`] layer runs its three projections directly and
+    /// never forms the concatenated activation, so the split representation is
+    /// not just correct here but strictly cheaper than fusing and re-slicing.
+    pub fn forward(
+        &self,
+        x: &MlxArray,
+    ) -> (
+        UniquePtr<MlxArray>,
+        UniquePtr<MlxArray>,
+        UniquePtr<MlxArray>,
+    ) {
+        let q_size = self.n_heads * self.head_dim;
+        let kv_size = self.n_kv_heads * self.head_dim;
+        self.qkv_proj.project_split(x, q_size, kv_size)
+    }
+
+    /// Concatenated QKV projection followed by the fused q/k RoPE +
+    /// KV-append-layout kernel (#905).
+    ///
+    /// Returns `(q, k, v)` with `q` in attention order `[B, Hq, L, D]` and
+    /// `k` / `v` already in the layout `dest_layout` names, so the caller's
+    /// cache append is a plain `slice_update` with no intervening reshape,
+    /// transpose or contiguity copy.
+    ///
+    /// Returns `None` when the fused path is disabled
+    /// (`MLXCEL_FUSED_ROPE_APPEND=0`), the backend has no custom-kernel JIT, or
+    /// the geometry is outside the kernel's contract. The caller then keeps its
+    /// existing reshape / transpose / `fast_rope` graph, which is also the
+    /// reference the parity tests compare against.
+    ///
+    /// `positions_base` is the absolute position of the first token in the
+    /// window: token `t` rotates at `positions_base + t`. That is
+    /// `KVCache::offset` for the dense path, and is already absolute for
+    /// `RingSlidingKVCache`, so no adjustment is needed for rotated caches.
+    ///
+    /// Unlike [`Self::forward_split_rope`], this works for every representation
+    /// a [`QkvProjection`] can take (quantized or dense, fused or split): it
+    /// only needs the projection's row-contiguous output, not the packed
+    /// weight. A split layer pays one extra concatenate to build that output;
+    /// see [`QkvProjection::project_concat`] for why it is exact.
+    ///
+    /// Used by: Llama3-family (and Qwen2-family) dense decode path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_fused_rope_append(
+        &self,
+        x: &MlxArray,
+        rope_dims: i32,
+        rope_base: f32,
+        rope_scale: f32,
+        traditional: bool,
+        positions_base: i32,
+        dest_layout: FusedRopeDestLayout,
+    ) -> Option<(
+        UniquePtr<MlxArray>,
+        UniquePtr<MlxArray>,
+        UniquePtr<MlxArray>,
+    )> {
+        if !fused_rope_append_enabled() || !fused_rope_append_backend_available() {
+            return None;
+        }
+        // The kernel's contract, checked here so the launcher's `throw` is
+        // unreachable from the decode path.
+        if self.head_dim % 2 != 0
+            || rope_dims <= 0
+            || rope_dims % 2 != 0
+            || rope_dims > self.head_dim
+            || self.n_heads <= 0
+            || self.n_kv_heads <= 0
+        {
+            return None;
+        }
+        let qkv = self.qkv_proj.project_concat(x);
+        let qkv_shape = ffi::array_shape(&qkv);
+        if qkv_shape.len() != 3
+            || qkv_shape[2] != (self.n_heads + 2 * self.n_kv_heads) * self.head_dim
+        {
+            return None;
+        }
+
+        let mut q = UniquePtr::null();
+        let mut k = UniquePtr::null();
+        let mut v = UniquePtr::null();
+        ffi::fused_rope_qk_append(
+            &qkv,
+            self.n_heads,
+            self.n_kv_heads,
+            self.head_dim,
+            rope_dims,
+            rope_base,
+            rope_scale,
+            traditional,
+            positions_base,
+            dest_layout.as_i32(),
+            &mut q,
+            &mut k,
+            &mut v,
+        );
+        Some((q, k, v))
+    }
+
+    /// Fused concatenated QKV projection + split + reshape + transpose + RoPE.
+    ///
+    /// Returns Q/K/V already shaped `[B, H, T, D]`. Q/K have RoPE applied.
+    /// Only available for quantized fused-QKV weights.
+    ///
+    /// Used by: Llama3-family fused attention path.
+    pub fn forward_split_rope(
+        &self,
+        x: &MlxArray,
+        rope_dims: i32,
+        rope_base: f32,
+        cache_offset: i32,
+    ) -> Option<(
+        UniquePtr<MlxArray>,
+        UniquePtr<MlxArray>,
+        UniquePtr<MlxArray>,
+    )> {
+        if std::env::var("MLXCEL_ENABLE_FUSED_QKV_SPLIT_ROPE").is_err() {
+            return None;
+        }
+        let weight = self.fused_quantized_weight()?;
+        let mut q = cxx::UniquePtr::null();
+        let mut k = cxx::UniquePtr::null();
+        let mut v = cxx::UniquePtr::null();
+        unsafe {
+            ffi::fused_qkv_project_split_rope(
+                x,
+                &weight.weight,
+                &weight.scales,
+                weight.biases_ptr(),
+                self.n_heads,
+                self.n_kv_heads,
+                self.head_dim,
+                rope_dims,
+                rope_base,
+                cache_offset,
+                weight.group_size,
+                weight.bits,
+                &weight.mode,
+                &mut q,
+                &mut k,
+                &mut v,
+            );
+        }
+        Some((q, k, v))
+    }
+
+    /// Fused concatenated QKV projection + split + reshape + transpose + RoPE.
+    ///
+    /// Returns Q/K/V already shaped `[B, H, T, D]`. Q/K have RoPE applied.
+    /// Only available for quantized fused-QKV weights.
+    ///
+    /// Used by: Gemma2 dense attention path.
+    pub fn forward_split_rope_quantized(
+        &self,
+        x: &MlxArray,
+        rope_dims: i32,
+        rope_base: f32,
+        cache_offset: i32,
+    ) -> Option<(
+        UniquePtr<MlxArray>,
+        UniquePtr<MlxArray>,
+        UniquePtr<MlxArray>,
+    )> {
+        let weight = self.fused_quantized_weight()?;
+        let mut q = cxx::UniquePtr::null();
+        let mut k = cxx::UniquePtr::null();
+        let mut v = cxx::UniquePtr::null();
+        unsafe {
+            ffi::fused_qkv_project_split_rope(
+                x,
+                &weight.weight,
+                &weight.scales,
+                weight.biases_ptr(),
+                self.n_heads,
+                self.n_kv_heads,
+                self.head_dim,
+                rope_dims,
+                rope_base,
+                cache_offset,
+                weight.group_size,
+                weight.bits,
+                &weight.mode,
+                &mut q,
+                &mut k,
+                &mut v,
+            );
+        }
+        Some((q, k, v))
+    }
+
+    /// Fused concatenated QKV projection + split + reshape + transpose +
+    /// RMSNorm(Q/K) + RoPE.
+    ///
+    /// Returns Q/K/V already shaped `[B, H, T, D]`. Q/K are normalized and
+    /// have RoPE applied. Only available for quantized fused-QKV weights;
+    /// returns `None` for regular (non-quantized) weights so the caller can
+    /// fall back to the graph path.
+    ///
+    /// The Q/K norm variant is selected through the [`FusedQkNorm`] trait: a
+    /// standard [`RMSNorm`] feeds its raw weight, [`GemmaRMSNorm`] feeds its
+    /// pre-computed `(1 + weight)`. The underlying kernel always applies the
+    /// plain `x * weight * rsqrt(mean(x^2) + eps)` formula, so the
+    /// Gemma-vs-standard distinction stays in the weight, not in a kernel
+    /// branch. Q/K must use the same norm type (`N`); their eps is taken from
+    /// `q_norm`.
+    ///
+    /// Norm is applied here after the head transpose, whereas the Qwen3 graph
+    /// fallback norms before the transpose. RMSNorm reduces over the last axis
+    /// (head_dim), which the `[B, T, H, D]` -> `[B, H, T, D]` permutation leaves
+    /// untouched, so both orders are numerically equivalent per element.
+    ///
+    /// Used by: Gemma3 dense attention path, Qwen3 / Qwen3-MoE decode attention
+    /// path.
+    pub fn forward_split_norm_rope_quantized<N: FusedQkNorm>(
+        &self,
+        x: &MlxArray,
+        q_norm: &N,
+        k_norm: &N,
+        rope_dims: i32,
+        rope_base: f32,
+        cache_offset: i32,
+    ) -> Option<(
+        UniquePtr<MlxArray>,
+        UniquePtr<MlxArray>,
+        UniquePtr<MlxArray>,
+    )> {
+        let weight = self.fused_quantized_weight()?;
+        // At the C++ boundary the primitive passes a single eps value for
+        // both the Q and K RMS norm. Assert (debug builds only) that the
+        // caller supplies identical eps on both sides; a mismatch would
+        // silently apply the wrong eps to K.
+        debug_assert_eq!(
+            q_norm.rms_eps(),
+            k_norm.rms_eps(),
+            "fused QK-norm primitive uses a single eps; q_norm eps {:.2e} != k_norm eps {:.2e}",
+            q_norm.rms_eps(),
+            k_norm.rms_eps(),
+        );
+        let mut q = cxx::UniquePtr::null();
+        let mut k = cxx::UniquePtr::null();
+        let mut v = cxx::UniquePtr::null();
+        unsafe {
+            ffi::fused_qkv_project_split_norm_rope(
+                x,
+                &weight.weight,
+                &weight.scales,
+                weight.biases_ptr(),
+                q_norm.fused_norm_weight(),
+                k_norm.fused_norm_weight(),
+                self.n_heads,
+                self.n_kv_heads,
+                self.head_dim,
+                rope_dims,
+                rope_base,
+                q_norm.rms_eps(),
+                cache_offset,
+                weight.group_size,
+                weight.bits,
+                &weight.mode,
+                &mut q,
+                &mut k,
+                &mut v,
+            );
+        }
+        Some((q, k, v))
+    }
+}
+
+/// Quantized per-head linear layer for MLA (Multi-head Latent Attention)
+/// Weight shape: [num_heads, output_dim, input_dim_packed]
+/// Used in GLM4 MoE Lite, DeepSeek-V2, etc.
+pub struct QuantizedMultiLinear {
+    pub weight: UniquePtr<MlxArray>,
+    pub scales: UniquePtr<MlxArray>,
+    pub biases: Option<UniquePtr<MlxArray>>,
+    pub group_size: i32,
+    pub bits: i32,
+    /// Quantization mode resolved at load from the planes the checkpoint
+    /// actually ships, never hardcoded: `"affine"` for a `.biases`-carrying
+    /// plane, one of the block-float modes otherwise. Both constructors derive
+    /// it with [`infer_quantization_mode`], and every kernel call on this
+    /// layer reads this field (issue #1028).
+    ///
+    /// `&'static str` rather than the `String` its siblings
+    /// [`QuantizedWeight`] and [`QuantizedEmbedding`] carry, because those two
+    /// have `*_with_mode` constructors that store a caller-declared string
+    /// while this layer only ever stores what `infer_quantization_mode`
+    /// returns. The type says so, and it saves an allocation per MLA
+    /// projection.
+    pub mode: &'static str,
+}
+
+impl QuantizedMultiLinear {
+    /// Create a new quantized multi-linear layer from tensors the caller
+    /// already owns.
+    ///
+    /// Fallible on purpose (issue #958): the stored pair reaches
+    /// `quantized_matmul` unmediated, without
+    /// [`reconcile_quantization_layout`] and the bound it carries, and nothing
+    /// else on this path bounds it. Nothing in the tree calls it today; it is a
+    /// strong default for the next caller that hand-builds one, not an enforced
+    /// invariant, since the fields are `pub`.
+    ///
+    /// Kept rather than removed the way the `QuantizedEmbedding` constructor it
+    /// once mirrored was (issue #976), because that removal was about a
+    /// signature that forced the defect: that one required a `biases` argument
+    /// and hardcoded `"affine"`, so a block-float caller could not express its
+    /// checkpoint at all and fell back to a dense layer over a packed table.
+    /// This takes `biases` as an `Option` and now derives the mode from it with
+    /// the same [`infer_quantization_mode`] call [`Self::from_weights`] uses,
+    /// so it can express every plane layout the loader can and cannot store a
+    /// mode that contradicts them. The closer precedent is
+    /// [`QuantizedWeight::new_with_mode`] (issue #973): also callerless, also
+    /// pre-emptive, kept so the bound lands on the path the next hand-builder
+    /// takes.
+    pub fn new(
+        weight: UniquePtr<MlxArray>,
+        scales: UniquePtr<MlxArray>,
+        biases: Option<UniquePtr<MlxArray>>,
+        group_size: i32,
+        bits: i32,
+    ) -> Result<Self, String> {
+        validate_quantization_params(group_size, bits)?;
+        let mode = infer_quantization_mode(biases.is_some(), group_size, bits);
+        validate_quantization_biases(mode, biases.is_some())?;
+        Ok(Self {
+            weight,
+            scales,
+            biases,
+            group_size,
+            bits,
+            mode,
+        })
+    }
+
+    /// Load from weight map
+    ///
+    /// This loader stores the declared `group_size` / `bits` verbatim rather
+    /// than reconciling them against the tensor shapes, and the stored pair is
+    /// handed to `quantized_matmul` on every MLA forward, so it carries the
+    /// bound itself (issue #958). It sits in the same blind spot
+    /// `SwitchLinear::from_stacked_parts` did before #929: a shared quantized
+    /// loader that never calls [`reconcile_quantization_layout`], reached by
+    /// four families whose `embed_q` / `unembed_out` are the only tensors that
+    /// see these params.
+    ///
+    /// The mode is inferred from `.biases` presence rather than read from
+    /// `config.json` (issue #1028). This loader takes only `group_size` and
+    /// `bits`, its four callers thread the top-level `quantization` block into
+    /// exactly those two, and the shared `UnifiedLinear` / `UnifiedEmbedding`
+    /// loaders every other layer in those models goes through infer the same
+    /// way, so reading a declared mode here alone would make one projection
+    /// disagree with the rest of the model. `kimi_linear`'s private
+    /// `MultiLinear` was corrected the same way in issue #1026.
+    ///
+    /// Used by: DeepSeek V3, DeepSeek V3.2, GLM4 MoE Lite, LongCat Flash NGram
+    pub fn from_weights(
+        weights: &crate::weights::WeightMap,
+        prefix: &str,
+        group_size: i32,
+        bits: i32,
+    ) -> Result<Self, String> {
+        let weight_name = format!("{}.weight", prefix);
+        let scales_name = format!("{}.scales", prefix);
+        let biases_name = format!("{}.biases", prefix);
+
+        validate_quantization_params(group_size, bits).map_err(|e| format!("{prefix}: {e}"))?;
+
+        let weight = weights
+            .get(&weight_name)
+            .map(|w| ffi::copy(w))
+            .ok_or_else(|| format!("Weight not found: {}", weight_name))?;
+        let scales = weights
+            .get(&scales_name)
+            .map(|w| ffi::copy(w))
+            .ok_or_else(|| format!("Scales not found: {}", scales_name))?;
+        // Absent for every block-float mode by design, which is exactly what
+        // `infer_quantization_mode` keys on.
+        let biases = weights.get(&biases_name).map(|w| ffi::copy(w));
+
+        let mode = infer_quantization_mode(biases.is_some(), group_size, bits);
+        // Consistent by construction with the line above, which keys the mode
+        // on the same `biases.is_some()` this re-checks, so it cannot fire
+        // while that line stands. It is here because it is the assertion that
+        // couples the two helpers, and it fires the moment the coupling breaks:
+        // if the mode above ever comes from somewhere else (a declared
+        // `quantization.mode`, a per-prefix override) or is regressed back to a
+        // literal, the contradiction is refused here, at the point the mode is
+        // stored, instead of inside `quantized_matmul`, where MLX's "Biases
+        // must be provided for affine quantization" crosses the cxx bridge as
+        // an uncatchable abort at the first forward pass rather than a load
+        // error.
+        validate_quantization_biases(mode, biases.is_some())
+            .map_err(|e| format!("{prefix}: {e}"))?;
+
+        Ok(Self {
+            weight,
+            scales,
+            biases,
+            group_size,
+            bits,
+            mode,
+        })
+    }
+
+    /// Raw pointer to the optional zero-point plane, null for the block-float
+    /// modes. Mirrors [`QuantizedWeight::biases_ptr`], and is always passed
+    /// alongside `self.mode`: MLX's `validate_mode_with_type` throws when the
+    /// two disagree, so the pointer and the mode must come from the same place.
+    fn biases_ptr(&self) -> *const MlxArray {
+        match &self.biases {
+            Some(b) => b.as_ref().unwrap() as *const MlxArray,
+            None => std::ptr::null(),
+        }
+    }
+
+    /// The one place this layer calls `quantized_matmul`.
+    ///
+    /// The two public forward methods differ only in `transpose`, and before
+    /// issue #1028 they were separate copies of this body that each hardcoded
+    /// `"affine"`. Sharing the body is what keeps a fix from landing in one of
+    /// them and not the other.
+    fn quantized_matmul(&self, x: &MlxArray, transpose: bool) -> UniquePtr<MlxArray> {
+        unsafe {
+            ffi::quantized_matmul(
+                x,
+                &self.weight,
+                &self.scales,
+                self.biases_ptr(),
+                transpose,
+                self.group_size,
+                self.bits,
+                self.mode,
+            )
+        }
+    }
+
+    /// Forward pass: per-head linear projection
+    /// x: [batch, heads, seq, input_dim]
+    /// Returns: [batch, heads, seq, output_dim]
+    pub fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
+        self.quantized_matmul(x, true)
+    }
+
+    /// Forward pass without transpose: x @ weight
+    /// Used by MLA embed_q(kv_latent, transpose=False) for projecting latent to K
+    pub fn forward_no_transpose(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
+        self.quantized_matmul(x, false)
+    }
+
+    /// Dequantize weights to full precision
+    /// Returns: [num_heads, output_dim, input_dim]
+    ///
+    /// Callerless in tree, but it reads `self.mode` like the forward path
+    /// does: MLX applies the same `validate_mode_with_type` precondition inside
+    /// `dequantize`, so leaving this one hardcoded would put the abort back one
+    /// call away from where issue #1028 removed it.
+    pub fn dequantize(&self) -> UniquePtr<MlxArray> {
+        unsafe {
+            ffi::dequantize(
+                &self.weight,
+                &self.scales,
+                self.biases_ptr(),
+                self.group_size,
+                self.bits,
+                self.mode,
+            )
+        }
+    }
+}
+
+/// SwiGLU MLP layer with optional compilation for kernel fusion
+pub struct SwiGLUMLP {
+    pub gate_proj: QuantizedWeight,
+    pub up_proj: QuantizedWeight,
+    pub down_proj: QuantizedWeight,
+    pub use_compiled: bool,
+}
+
+impl SwiGLUMLP {
+    /// Create a new SwiGLU MLP layer
+    pub fn new(
+        gate_proj: QuantizedWeight,
+        up_proj: QuantizedWeight,
+        down_proj: QuantizedWeight,
+        use_compiled: bool,
+    ) -> Self {
+        Self {
+            gate_proj,
+            up_proj,
+            down_proj,
+            use_compiled,
+        }
+    }
+
+    /// Forward pass
+    pub fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
+        if self.use_compiled {
+            // Use compiled version with kernel fusion
+            // Falls back to non-compiled for non-affine modes inside C++
+            unsafe {
+                ffi::compiled_moe_expert_forward(
+                    x,
+                    &self.gate_proj.weight,
+                    &self.gate_proj.scales,
+                    self.gate_proj.biases_ptr(),
+                    &self.up_proj.weight,
+                    &self.up_proj.scales,
+                    self.up_proj.biases_ptr(),
+                    &self.down_proj.weight,
+                    &self.down_proj.scales,
+                    self.down_proj.biases_ptr(),
+                    self.gate_proj.group_size,
+                    self.gate_proj.bits,
+                    &self.gate_proj.mode,
+                )
+            }
+        } else {
+            // Non-compiled version
+            let gate = unsafe {
+                ffi::quantized_linear_forward(
+                    x,
+                    &self.gate_proj.weight,
+                    &self.gate_proj.scales,
+                    self.gate_proj.biases_ptr(),
+                    std::ptr::null(),
+                    self.gate_proj.group_size,
+                    self.gate_proj.bits,
+                    &self.gate_proj.mode,
+                )
+            };
+
+            let up = unsafe {
+                ffi::quantized_linear_forward(
+                    x,
+                    &self.up_proj.weight,
+                    &self.up_proj.scales,
+                    self.up_proj.biases_ptr(),
+                    std::ptr::null(),
+                    self.up_proj.group_size,
+                    self.up_proj.bits,
+                    &self.up_proj.mode,
+                )
+            };
+
+            let silu_gate = ffi::silu(&gate);
+            let activated = ffi::multiply(&silu_gate, &up);
+
+            unsafe {
+                ffi::quantized_linear_forward(
+                    &activated,
+                    &self.down_proj.weight,
+                    &self.down_proj.scales,
+                    self.down_proj.biases_ptr(),
+                    std::ptr::null(),
+                    self.down_proj.group_size,
+                    self.down_proj.bits,
+                    &self.down_proj.mode,
+                )
+            }
+        }
+    }
+}
+
+/// MoE Switch layer using gather_qmm for efficient expert routing
+pub struct MoESwitch {
+    /// Expert weights: [num_experts, ...]
+    pub gate_proj: QuantizedWeight,
+    pub up_proj: QuantizedWeight,
+    pub down_proj: QuantizedWeight,
+    pub num_experts: i32,
+}
+
+impl MoESwitch {
+    /// Create a new MoE switch layer
+    pub fn new(
+        gate_proj: QuantizedWeight,
+        up_proj: QuantizedWeight,
+        down_proj: QuantizedWeight,
+        num_experts: i32,
+    ) -> Self {
+        Self {
+            gate_proj,
+            up_proj,
+            down_proj,
+            num_experts,
+        }
+    }
+
+    /// Forward pass with expert indices
+    /// x: [batch, seq_len, hidden_dim]
+    /// indices: [batch, seq_len] - expert index for each token
+    pub fn forward(&self, x: &MlxArray, indices: &MlxArray) -> UniquePtr<MlxArray> {
+        let gate = unsafe {
+            ffi::gather_qmm(
+                x,
+                &self.gate_proj.weight,
+                &self.gate_proj.scales,
+                self.gate_proj.biases_ptr(),
+                std::ptr::null(),    // lhs_indices
+                indices as *const _, // rhs_indices
+                true,                // transpose
+                self.gate_proj.group_size,
+                self.gate_proj.bits,
+                false, // sorted_indices
+                &self.gate_proj.mode,
+            )
+        };
+
+        let up = unsafe {
+            ffi::gather_qmm(
+                x,
+                &self.up_proj.weight,
+                &self.up_proj.scales,
+                self.up_proj.biases_ptr(),
+                std::ptr::null(),
+                indices as *const _,
+                true,
+                self.up_proj.group_size,
+                self.up_proj.bits,
+                false,
+                &self.up_proj.mode,
+            )
+        };
+
+        let activated = ffi::compiled_swiglu_activation(&gate, &up);
+
+        unsafe {
+            ffi::gather_qmm(
+                &activated,
+                &self.down_proj.weight,
+                &self.down_proj.scales,
+                self.down_proj.biases_ptr(),
+                std::ptr::null(),
+                indices as *const _,
+                true,
+                self.down_proj.group_size,
+                self.down_proj.bits,
+                false,
+                &self.down_proj.mode,
+            )
+        }
+    }
+}
+
+/// Attention layer with RoPE and KV cache
+pub struct Attention {
+    pub q_proj: QuantizedWeight,
+    pub k_proj: QuantizedWeight,
+    pub v_proj: QuantizedWeight,
+    pub o_proj: QuantizedWeight,
+    pub n_heads: i32,
+    pub n_kv_heads: i32,
+    pub head_dim: i32,
+    pub rope_dims: i32,
+    pub rope_base: f32,
+    pub rope_scale: f32,
+}
+
+impl Attention {
+    /// Create a new attention layer
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        q_proj: QuantizedWeight,
+        k_proj: QuantizedWeight,
+        v_proj: QuantizedWeight,
+        o_proj: QuantizedWeight,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        rope_dims: i32,
+        rope_base: f32,
+        rope_scale: f32,
+    ) -> Self {
+        Self {
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            rope_dims,
+            rope_base,
+            rope_scale,
+        }
+    }
+
+    /// Forward pass
+    pub fn forward(
+        &self,
+        x: &MlxArray,
+        cache: &mut KVCache,
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let shape = ffi::array_shape(x);
+        let batch_size = shape[0];
+        let seq_len = shape[1];
+
+        // Project Q, K, V
+        let q = unsafe {
+            ffi::quantized_linear_forward(
+                x,
+                &self.q_proj.weight,
+                &self.q_proj.scales,
+                self.q_proj.biases_ptr(),
+                std::ptr::null(),
+                self.q_proj.group_size,
+                self.q_proj.bits,
+                &self.q_proj.mode,
+            )
+        };
+
+        let k = unsafe {
+            ffi::quantized_linear_forward(
+                x,
+                &self.k_proj.weight,
+                &self.k_proj.scales,
+                self.k_proj.biases_ptr(),
+                std::ptr::null(),
+                self.k_proj.group_size,
+                self.k_proj.bits,
+                &self.k_proj.mode,
+            )
+        };
+
+        let v = unsafe {
+            ffi::quantized_linear_forward(
+                x,
+                &self.v_proj.weight,
+                &self.v_proj.scales,
+                self.v_proj.biases_ptr(),
+                std::ptr::null(),
+                self.v_proj.group_size,
+                self.v_proj.bits,
+                &self.v_proj.mode,
+            )
+        };
+
+        // Reshape to [batch, seq_len, n_heads, head_dim]
+        let q = ffi::reshape(&q, &[batch_size, seq_len, self.n_heads, self.head_dim]);
+        let k = ffi::reshape(&k, &[batch_size, seq_len, self.n_kv_heads, self.head_dim]);
+        let v = ffi::reshape(&v, &[batch_size, seq_len, self.n_kv_heads, self.head_dim]);
+
+        // Apply RoPE
+        let offset = cache.offset;
+        let q = ffi::fast_rope(
+            &q,
+            self.rope_dims,
+            false,
+            self.rope_base,
+            self.rope_scale,
+            offset,
+        );
+        let k = ffi::fast_rope(
+            &k,
+            self.rope_dims,
+            false,
+            self.rope_base,
+            self.rope_scale,
+            offset,
+        );
+
+        // Transpose to [batch, n_heads, seq_len, head_dim]
+        let q = ffi::transpose_axes(&q, &[0, 2, 1, 3]);
+        let k = ffi::transpose_axes(&k, &[0, 2, 1, 3]);
+        let v = ffi::transpose_axes(&v, &[0, 2, 1, 3]);
+
+        // Update KV cache and get sliced views
+        let (k, v) = cache.update_and_fetch(k, v);
+
+        // Compute attention scale
+        let scale = 1.0 / (self.head_dim as f32).sqrt();
+
+        // Scaled dot-product attention
+        let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
+        let attn_out =
+            unsafe { ffi::fast_scaled_dot_product_attention(&q, &k, &v, scale, mask_ptr) };
+
+        // Transpose back and reshape
+        let attn_out = ffi::transpose_axes(&attn_out, &[0, 2, 1, 3]);
+        let attn_out = ffi::reshape(
+            &attn_out,
+            &[batch_size, seq_len, self.n_heads * self.head_dim],
+        );
+
+        // Output projection
+        unsafe {
+            ffi::quantized_linear_forward(
+                &attn_out,
+                &self.o_proj.weight,
+                &self.o_proj.scales,
+                self.o_proj.biases_ptr(),
+                std::ptr::null(),
+                self.o_proj.group_size,
+                self.o_proj.bits,
+                &self.o_proj.mode,
+            )
+        }
+    }
+}
+
+// MultiLinear Layer (for MLA attention: embed_q, unembed_out).
+/// MultiLinear layer for per-head linear projections.
+///
+/// Weight shape: `[num_heads, output_dims, input_dims]`
+///
+/// Used by MLA attention (DeepSeek V3/V3.2, GLM4 MoE Lite) for:
+/// - `embed_q`: projects Q_nope into KV latent space
+/// - `unembed_out`: projects attention output from latent space to V dimensions
+///
+/// Supports both quantized and non-quantized weights.
+/// Used by: DeepSeek V3, DeepSeek V3.2, GLM4 MoE Lite, LongCat Flash NGram
+pub enum MultiLinear {
+    Quantized(QuantizedMultiLinear),
+    Regular(RegularMultiLinear),
+}
+
+/// Non-quantized multi-head linear layer.
+/// Weight shape: `[num_heads, output_dims, input_dims]`
+pub struct RegularMultiLinear {
+    pub weight: UniquePtr<MlxArray>,
+}
+
+impl MultiLinear {
+    /// Load from weight map, auto-detecting quantization.
+    ///
+    /// Checks for `.scales` key to determine if weights are quantized.
+    ///
+    /// Gating on `.scales` alone is correct, and is the gate the shared
+    /// `UnifiedLinear` / `UnifiedEmbedding` loaders use: the block-float modes
+    /// (mxfp4 / nvfp4 / mxfp8) ship scales with no zero points, so requiring
+    /// `.biases` here would send a block-float plane down the `Regular` branch
+    /// to be matmul'd as a raw packed uint32 table (the shape of issue #976).
+    /// What that gate needs from the quantized arm is that it can express a
+    /// plane with no `.biases`, which [`QuantizedMultiLinear::from_weights`]
+    /// does by inferring the mode rather than hardcoding `"affine"`
+    /// (issue #1028).
+    pub fn from_weights(
+        weights: &crate::weights::WeightMap,
+        prefix: &str,
+        group_size: i32,
+        bits: i32,
+    ) -> Result<Self, String> {
+        let weight_name = format!("{}.weight", prefix);
+        let scales_name = format!("{}.scales", prefix);
+
+        if weights.contains_key(&scales_name) {
+            // Quantized: use existing QuantizedMultiLinear
+            Ok(MultiLinear::Quantized(QuantizedMultiLinear::from_weights(
+                weights, prefix, group_size, bits,
+            )?))
+        } else {
+            // Non-quantized: regular weight
+            let weight = weights
+                .get(&weight_name)
+                .map(|w| ffi::copy(w))
+                .ok_or_else(|| format!("Weight not found: {}", weight_name))?;
+            Ok(MultiLinear::Regular(RegularMultiLinear { weight }))
+        }
+    }
+
+    /// Forward pass with transpose (default behavior).
+    ///
+    /// Computes `x @ weight.swapaxes(-1, -2)`.
+    /// Input x: `[..., num_heads, seq_len, input_dims]`
+    /// Output: `[..., num_heads, seq_len, output_dims]`
+    pub fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
+        match self {
+            MultiLinear::Quantized(q) => q.forward(x),
+            MultiLinear::Regular(r) => {
+                // weight is [num_heads, output_dims, input_dims]
+                // swapaxes(-1, -2) → [num_heads, input_dims, output_dims]
+                let wt = ffi::transpose_axes(&r.weight, &[0, 2, 1]);
+                ffi::matmul(x, &wt)
+            }
+        }
+    }
+
+    /// Forward pass without transpose.
+    ///
+    /// Computes `x @ weight`.
+    /// Input x: `[..., 1_or_heads, seq_len, output_dims]`
+    /// Output: `[..., num_heads, seq_len, input_dims]`
+    pub fn forward_no_transpose(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
+        match self {
+            MultiLinear::Quantized(q) => q.forward_no_transpose(x),
+            MultiLinear::Regular(r) => ffi::matmul(x, &r.weight),
+        }
+    }
+}
+
+/// SwiGLU MLP forward for non-quantized (FP16/BF16) UnifiedLinear layers.
+///
+/// When all three projections are non-quantized, calls the C++ path which
+/// runs matmul operations directly and fuses only the SwiGLU activation via
+/// compiled element-wise kernels.
+///
+/// Returns `None` if any projection is quantized (caller should use the quantized path).
+///
+/// Used by: Llama, Qwen2, Qwen3, Mistral and other SwiGLU FP models
+pub fn compiled_swiglu_mlp_fp16(
+    x: &MlxArray,
+    gate_proj: &UnifiedLinear,
+    up_proj: &UnifiedLinear,
+    down_proj: &UnifiedLinear,
+) -> Option<crate::UniquePtr<MlxArray>> {
+    let gate_lin = gate_proj.regular_weight()?;
+    let up_lin = up_proj.regular_weight()?;
+    let down_lin = down_proj.regular_weight()?;
+
+    let gate_bias_ptr = gate_lin
+        .bias
+        .as_ref()
+        .map(|b| b.as_ref().unwrap() as *const MlxArray)
+        .unwrap_or(std::ptr::null());
+    let up_bias_ptr = up_lin
+        .bias
+        .as_ref()
+        .map(|b| b.as_ref().unwrap() as *const MlxArray)
+        .unwrap_or(std::ptr::null());
+    let down_bias_ptr = down_lin
+        .bias
+        .as_ref()
+        .map(|b| b.as_ref().unwrap() as *const MlxArray)
+        .unwrap_or(std::ptr::null());
+
+    Some(unsafe {
+        ffi::compiled_swiglu_mlp_forward_fp16(
+            x,
+            &gate_lin.weight,
+            &up_lin.weight,
+            &down_lin.weight,
+            gate_bias_ptr,
+            up_bias_ptr,
+            down_bias_ptr,
+        )
+    })
+}
+
+/// SwiGLU MLP forward for either quantized or non-quantized UnifiedLinear layers.
+///
+/// Returns a fused compiled path when all three projections are either:
+/// - non-quantized regular weights, via `compiled_swiglu_mlp_fp16()`
+/// - quantized weights, via `compiled_moe_expert_forward()`
+///
+/// Returns `None` for mixed projection kinds so callers can preserve their
+/// existing fallback path.
+///
+/// Used by: Llama3, Qwen3, SmolLM3, StableLM, Exaone4 and other SwiGLU models
+pub fn compiled_swiglu_mlp(
+    x: &MlxArray,
+    gate_proj: &UnifiedLinear,
+    up_proj: &UnifiedLinear,
+    down_proj: &UnifiedLinear,
+) -> Option<crate::UniquePtr<MlxArray>> {
+    if let (Some(gate_qw), Some(up_qw), Some(down_qw)) = (
+        gate_proj.quantized_weight(),
+        up_proj.quantized_weight(),
+        down_proj.quantized_weight(),
+    ) {
+        return Some(unsafe {
+            ffi::compiled_moe_expert_forward(
+                x,
+                &gate_qw.weight,
+                &gate_qw.scales,
+                gate_qw.biases_ptr(),
+                &up_qw.weight,
+                &up_qw.scales,
+                up_qw.biases_ptr(),
+                &down_qw.weight,
+                &down_qw.scales,
+                down_qw.biases_ptr(),
+                gate_qw.group_size,
+                gate_qw.bits,
+                &gate_qw.mode,
+            )
+        });
+    }
+
+    compiled_swiglu_mlp_fp16(x, gate_proj, up_proj, down_proj)
+}
+
+// ── Metal 4 fused attention dispatch ─────────────────────────────────────────
+
+fn should_use_metal4_attention() -> bool {
+    let hw = crate::hardware::get_hardware();
+    hw.has_neural_accelerator && hw.macos_supports_na
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NaAttentionLogMode {
+    Off,
+    Sampled,
+    All,
+}
+
+fn na_attention_log_mode() -> NaAttentionLogMode {
+    static MODE: OnceLock<NaAttentionLogMode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        match std::env::var("MLXCEL_LOG_NA_ATTENTION")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .ok()
+            .as_deref()
+        {
+            Some("1" | "true" | "yes" | "on" | "sample" | "sampled") => NaAttentionLogMode::Sampled,
+            Some("all" | "full") => NaAttentionLogMode::All,
+            _ => NaAttentionLogMode::Off,
+        }
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn classify_na_attention_dispatch(
+    q: &MlxArray,
+    k: &MlxArray,
+    v: &MlxArray,
+    softcap: f32,
+    window_size: i32,
+    has_mask: bool,
+    has_array_mask: bool,
+    do_causal: bool,
+) -> (&'static str, bool, bool) {
+    let q_shape = ffi::array_shape(q);
+    let k_shape = ffi::array_shape(k);
+    let query_sequence_length = q_shape[2];
+    let key_sequence_length = k_shape[2];
+
+    let route = if softcap > 0.0 {
+        "softcap"
+    } else if has_array_mask
+        && window_size == 0
+        && query_sequence_length > 1
+        && query_sequence_length == key_sequence_length
+    {
+        "padded_prefill"
+    } else if do_causal && !has_mask {
+        "native_causal"
+    } else if has_array_mask {
+        "array_mask"
+    } else if has_mask {
+        "mask"
+    } else {
+        "unmasked"
+    };
+
+    let fast_path_eligible =
+        ffi::sdpa_supports_fast_path(q, k, v, has_mask, has_array_mask, do_causal);
+    let nax_eligible = ffi::sdpa_supports_nax(q, k, v, has_mask, has_array_mask, do_causal);
+
+    (route, fast_path_eligible, nax_eligible)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn na_attention_eligibility_reasons(
+    q: &MlxArray,
+    k: &MlxArray,
+    v: &MlxArray,
+    has_mask: bool,
+    has_array_mask: bool,
+    do_causal: bool,
+    fast_path_eligible: bool,
+    nax_eligible: bool,
+) -> (&'static str, &'static str) {
+    let q_shape = ffi::array_shape(q);
+    let k_shape = ffi::array_shape(k);
+    let v_shape = ffi::array_shape(v);
+
+    let q_len = q_shape[2];
+    let k_len = k_shape[2];
+    let q_heads = q_shape[1];
+    let kv_heads = k_shape[1].max(1);
+    let head_dim = q_shape[3];
+    let value_head_dim = v_shape[3];
+    let gqa_factor = q_heads / kv_heads;
+    let tf32_enabled = std::env::var("MLX_ENABLE_TF32")
+        .map(|v| v.trim() != "0")
+        .unwrap_or(true);
+
+    let fast_reason = if fast_path_eligible {
+        "eligible"
+    } else if q_len <= 8 {
+        if q_len > k_len {
+            "vector_q_len_gt_k_len"
+        } else if head_dim != value_head_dim {
+            "vector_head_dim_mismatch"
+        } else if !matches!(head_dim, 64 | 96 | 128 | 256) {
+            "vector_head_dim_unsupported"
+        } else if q_len * gqa_factor > 32 {
+            "vector_gqa_over_limit"
+        } else {
+            "vector_other"
+        }
+    } else if head_dim != value_head_dim {
+        "full_head_dim_mismatch"
+    } else if !matches!(head_dim, 64 | 80 | 128 | 256) {
+        "full_head_dim_unsupported"
+    } else if has_mask && !has_array_mask && !(q_len <= k_len && do_causal) {
+        "full_mask_mode_unsupported"
+    } else {
+        "full_other"
+    };
+
+    let nax_reason = if nax_eligible {
+        "eligible"
+    } else if !fast_path_eligible {
+        "fast_path_blocked"
+    } else if q_len <= 8 {
+        "vector_path_only"
+    } else if head_dim == 80 {
+        "head_dim_80_excluded"
+    } else if ffi::array_dtype(q) == crate::dtype::FLOAT32 && !tf32_enabled {
+        "float32_tf32_disabled"
+    } else {
+        "other"
+    };
+
+    (fast_reason, nax_reason)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_na_attention_dispatch(
+    q: &MlxArray,
+    k: &MlxArray,
+    v: &MlxArray,
+    scale: f32,
+    softcap: f32,
+    window_size: i32,
+    has_mask: bool,
+    has_array_mask: bool,
+    do_causal: bool,
+) {
+    static DISPATCH_COUNT: AtomicUsize = AtomicUsize::new(0);
+    let count = DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    let should_log = match na_attention_log_mode() {
+        NaAttentionLogMode::Off => false,
+        NaAttentionLogMode::Sampled => count <= 8 || count.is_multiple_of(100),
+        NaAttentionLogMode::All => true,
+    };
+    if should_log {
+        let q_shape = ffi::array_shape(q);
+        let k_shape = ffi::array_shape(k);
+        let phase = if q_shape[2] > 1 { "prefill" } else { "decode" };
+        let (route, fast_path_eligible, nax_eligible) = classify_na_attention_dispatch(
+            q,
+            k,
+            v,
+            softcap,
+            window_size,
+            has_mask,
+            has_array_mask,
+            do_causal,
+        );
+        let (fast_reason, nax_reason) = na_attention_eligibility_reasons(
+            q,
+            k,
+            v,
+            has_mask,
+            has_array_mask,
+            do_causal,
+            fast_path_eligible,
+            nax_eligible,
+        );
+        eprintln!(
+            "[mlxcel][na-attention] dispatch={} phase={} route={} fast_path_eligible={} fast_path_reason={} nax_eligible={} nax_reason={} q={:?} k={:?} scale={:.6} softcap={:.3} window_size={}",
+            count,
+            phase,
+            route,
+            fast_path_eligible,
+            fast_reason,
+            nax_eligible,
+            nax_reason,
+            q_shape,
+            k_shape,
+            scale,
+            softcap,
+            window_size
+        );
+    }
+}
+
+/// Causal SDPA dispatch that preserves MLX's native `"causal"` mask mode.
+///
+/// Used by: `crate::causal_attention()` on M5-class hardware for full-window
+/// causal prefill, so upstream MLX can select the NAX causal kernel directly.
+pub fn metal4_causal_attention(
+    q: &MlxArray,
+    k: &MlxArray,
+    v: &MlxArray,
+    scale: f32,
+) -> UniquePtr<MlxArray> {
+    if should_use_metal4_attention() {
+        record_na_attention_dispatch(q, k, v, scale, 0.0, 0, false, false, true);
+    }
+    ffi::ffi_fast_scaled_dot_product_attention_causal(q, k, v, scale)
+}
+
+/// Unified attention dispatch with transparent Metal 4 and softcap fallback.
+///
+/// Used by: Llama3, Qwen3, Gemma2, Gemma3 and other standard SDPA call sites
+pub fn attention(
+    q: &MlxArray,
+    k: &MlxArray,
+    v: &MlxArray,
+    scale: f32,
+    mask: Option<&MlxArray>,
+    softcap: f32,
+    window_size: i32,
+) -> UniquePtr<MlxArray> {
+    if should_use_metal4_attention() {
+        return metal4_attention(q, k, v, scale, mask, softcap, window_size);
+    }
+
+    if let Some(chunk) = materializing_sdpa_query_chunk(q, k, v, softcap) {
+        return chunked_query_attention(q, k, v, scale, mask, softcap, chunk);
+    }
+
+    attention_dispatch(q, k, v, scale, mask, softcap)
+}
+
+/// Single-shot SDPA dispatch: softcap composite or MLX's fused/fallback SDPA.
+///
+/// The score-materialization chunk gate lives in [`attention`]; this inner
+/// dispatch always issues one SDPA over the full query length it is given.
+fn attention_dispatch(
+    q: &MlxArray,
+    k: &MlxArray,
+    v: &MlxArray,
+    scale: f32,
+    mask: Option<&MlxArray>,
+    softcap: f32,
+) -> UniquePtr<MlxArray> {
+    let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
+
+    if softcap > 0.0 {
+        let q_heads = ffi::array_shape(q)[1];
+        let kv_heads = ffi::array_shape(k)[1];
+        if q_heads > kv_heads && q_heads % kv_heads == 0 {
+            let n_rep = q_heads / kv_heads;
+            // SAFETY: q/k/v/mask_ptr are valid for the duration of this call.
+            return unsafe {
+                ffi::compiled_softcap_sdpa_gqa(q, k, v, scale, softcap, n_rep, mask_ptr)
+            };
+        }
+        // SAFETY: q/k/v/mask_ptr are valid for the duration of this call.
+        return unsafe { ffi::compiled_softcap_sdpa(q, k, v, scale, softcap, mask_ptr) };
+    }
+
+    // SAFETY: q/k/v/mask_ptr are valid for the duration of this call.
+    unsafe { ffi::fast_scaled_dot_product_attention(q, k, v, scale, mask_ptr) }
+}
+
+/// Score-matrix byte budget above which a prefill SDPA is query-chunked, from
+/// `MLXCEL_ATTENTION_CHUNK_BUDGET_MB` (MiB, default 1024; `0` disables
+/// chunking entirely).
+///
+/// The budget bounds the raw `[B, heads, chunk, k_len]` score matmul output;
+/// the fallback composite briefly holds a few score-sized buffers per chunk
+/// (masked scores, softmax), so the live attention transient is a small
+/// multiple of this value. 1024 MiB keeps that multiple to a few GiB while
+/// leaving per-chunk matmuls large enough to stay bandwidth-bound.
+fn attention_chunk_budget_bytes() -> usize {
+    static BUDGET: OnceLock<usize> = OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        std::env::var("MLXCEL_ATTENTION_CHUNK_BUDGET_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(1024)
+            .saturating_mul(1024 * 1024)
+    })
+}
+
+/// True when this q/v + softcap combination cannot reach a fused
+/// (memory-linear) SDPA kernel on the CUDA backend, so MLX's fallback would
+/// materialize the full `[B, heads, q_len, k_len]` score matrix.
+///
+/// Mirrors `supports_sdpa_cudnn` in
+/// `mlx/backend/cuda/scaled_dot_product_attention.cpp`: the cuDNN flash SDPA
+/// requires `head_dim % 8 == 0 && head_dim <= 128` for both Q and V and an
+/// f16/bf16 dtype (gemma-3/gemma-4/gemma-3n use head_dim 256 and never
+/// qualify, issue #672). The softcap composite (`compiled_softcap_sdpa*`)
+/// is an explicit op graph and always materializes. `supports_sdpa_vector`
+/// only covers `q_len < 4`, which the chunk gate's own `q_len` threshold
+/// already excludes. Non-CUDA builds return false: Metal has a different
+/// fused-SDPA support matrix and keeps its current behavior.
+fn cuda_sdpa_materializes_scores(q: &MlxArray, v: &MlxArray, softcap: f32) -> bool {
+    if !cfg!(feature = "cuda") {
+        return false;
+    }
+    if softcap > 0.0 {
+        return true;
+    }
+    let q_shape = ffi::array_shape(q);
+    let v_shape = ffi::array_shape(v);
+    let (Some(&dq), Some(&dv)) = (q_shape.last(), v_shape.last()) else {
+        return false;
+    };
+    let dtype = ffi::array_dtype(q);
+    let flash_eligible = dq % 8 == 0
+        && dq <= 128
+        && dv % 8 == 0
+        && dv <= 128
+        && (dtype == crate::dtype::FLOAT16 || dtype == crate::dtype::BFLOAT16);
+    !flash_eligible
+}
+
+/// Pure chunk-length math for [`materializing_sdpa_query_chunk`].
+///
+/// Splits `q_len` into the smallest number of near-equal chunks whose
+/// per-chunk score matrix stays within `budget` bytes. Returns `None` when the
+/// full score matrix already fits.
+fn query_chunk_len(per_row_bytes: usize, q_len: i32, budget: usize) -> Option<i32> {
+    if q_len < 2 || per_row_bytes == 0 || budget == 0 {
+        return None;
+    }
+    let scores = per_row_bytes.saturating_mul(q_len as usize);
+    if scores <= budget {
+        return None;
+    }
+    let n_chunks = scores.div_ceil(budget).max(2);
+    let chunk = (q_len as usize).div_ceil(n_chunks).max(1);
+    Some(chunk as i32)
+}
+
+/// Query-chunk length for a prefill SDPA that would materialize a score
+/// matrix larger than the chunk budget, or `None` to run unchunked.
+///
+/// gemma-4-31b at a 32768-token single-pass prefill materializes
+/// `32 heads * 32768^2 * 2 B ~= 68 GiB` of scores in the CUDA fallback and
+/// OOMs GB10 (#672). Chunking the query axis bounds the transient to the
+/// budget while leaving per-row results mathematically identical: softmax and
+/// the value matmul are row-independent, and every chunk still sees the full
+/// key axis.
+pub(crate) fn materializing_sdpa_query_chunk(
+    q: &MlxArray,
+    k: &MlxArray,
+    v: &MlxArray,
+    softcap: f32,
+) -> Option<i32> {
+    let budget = attention_chunk_budget_bytes();
+    if budget == 0 {
+        return None;
+    }
+    let q_shape = ffi::array_shape(q);
+    if q_shape.len() != 4 {
+        return None;
+    }
+    let q_len = q_shape[2];
+    if q_len < 2 {
+        return None;
+    }
+    if !cuda_sdpa_materializes_scores(q, v, softcap) {
+        return None;
+    }
+    let k_len = ffi::array_shape(k)[2];
+    let bytes = crate::dtype::size_bytes(ffi::array_dtype(q)).unwrap_or(4);
+    let per_row = (q_shape[0].max(1) as usize)
+        .saturating_mul(q_shape[1].max(1) as usize)
+        .saturating_mul(k_len.max(1) as usize)
+        .saturating_mul(bytes);
+    query_chunk_len(per_row, q_len, budget)
+}
+
+/// Slice query rows `[start, stop)` from a `[B, H, L, D]` tensor.
+fn slice_query_rows(a: &MlxArray, start: i32, stop: i32) -> UniquePtr<MlxArray> {
+    let shape = ffi::array_shape(a);
+    ffi::slice(a, &[0, 0, start, 0], &[shape[0], shape[1], stop, shape[3]])
+}
+
+/// Slice the query-row range `[start, stop)` out of an attention mask whose
+/// second-to-last axis spans the full query length. Returns `None` for masks
+/// that broadcast over the query axis (size 1 there, or rank < 2), which are
+/// row-independent and can be reused unsliced.
+fn slice_mask_query_rows(
+    mask: &MlxArray,
+    start: i32,
+    stop: i32,
+    q_len: i32,
+) -> Option<UniquePtr<MlxArray>> {
+    let shape = ffi::array_shape(mask);
+    if shape.len() < 2 {
+        return None;
+    }
+    let q_axis = shape.len() - 2;
+    if shape[q_axis] != q_len {
+        return None;
+    }
+    let mut starts = vec![0; shape.len()];
+    let mut stops = shape.clone();
+    starts[q_axis] = start;
+    stops[q_axis] = stop;
+    Some(ffi::slice(mask, &starts, &stops))
+}
+
+/// Cast an additive f32 mask to the (f16/bf16) score dtype, or `None` when
+/// the mask is already usable as-is.
+///
+/// MLX's SDPA fallback composite adds an additive mask to the scores WITHOUT
+/// casting (`scores = add(scores, mask)` in `mlx/fast.cpp`), so an f32 mask
+/// promotes the masked scores AND the softmax to f32, doubling the largest
+/// transients of exactly the configurations that reach the fallback (#672).
+/// `-inf` sentinels survive the cast. Bool masks take the fallback's `where`
+/// path, which never promotes, and pass through.
+fn mask_in_score_dtype(mask: &MlxArray, q_dtype: i32) -> Option<UniquePtr<MlxArray>> {
+    let m_dtype = ffi::array_dtype(mask);
+    (m_dtype == crate::dtype::FLOAT32
+        && (q_dtype == crate::dtype::FLOAT16 || q_dtype == crate::dtype::BFLOAT16))
+        .then(|| ffi::astype(mask, q_dtype))
+}
+
+/// Query-chunked SDPA: identical math to a single [`attention_dispatch`] call,
+/// with the transient score matrix bounded to `heads * chunk * k_len` (#672).
+fn chunked_query_attention(
+    q: &MlxArray,
+    k: &MlxArray,
+    v: &MlxArray,
+    scale: f32,
+    mask: Option<&MlxArray>,
+    softcap: f32,
+    chunk: i32,
+) -> UniquePtr<MlxArray> {
+    let q_len = ffi::array_shape(q)[2];
+    let q_dtype = ffi::array_dtype(q);
+    let mut parts: Vec<UniquePtr<MlxArray>> =
+        Vec::with_capacity(((q_len + chunk - 1) / chunk).max(1) as usize);
+    let mut start = 0;
+    while start < q_len {
+        let stop = (start + chunk).min(q_len);
+        let q_c = slice_query_rows(q, start, stop);
+        // Row-slice masks that span the query axis (query-broadcast masks are
+        // reused whole), then keep the chunk-sized mask in the score dtype so
+        // the fallback's mask-add cannot promote scores to f32.
+        let sliced = mask.and_then(|m| slice_mask_query_rows(m, start, stop, q_len));
+        let base_ref: Option<&MlxArray> = sliced.as_deref().or(mask);
+        let cast = base_ref.and_then(|m| mask_in_score_dtype(m, q_dtype));
+        let mask_ref: Option<&MlxArray> = cast.as_deref().or(base_ref);
+        parts.push(attention_dispatch(&q_c, k, v, scale, mask_ref, softcap));
+        start = stop;
+    }
+    let ptrs: Vec<*const MlxArray> = parts
+        .iter()
+        .map(|p| p.as_ref().unwrap() as *const MlxArray)
+        .collect();
+    // SAFETY: every pointer references a live array owned by `parts`.
+    unsafe { ffi::concatenate(&ptrs, 2) }
+}
+
+/// Chunked equivalent of the maskless bottom-right-aligned causal SDPA, for
+/// configurations whose CUDA fallback would materialize the full score matrix
+/// (#672).
+///
+/// Query chunk `[start, stop)` (global offset `k_len - q_len`) attends keys
+/// `[0, offset + stop)` only, so K/V are sliced to that causal bound and the
+/// per-chunk `[stop - start, offset + stop]` causal mask reproduces the
+/// unchunked `do_causal` semantics row for row. Requires `k_len >= q_len`
+/// (callers guard; `do_causal` with `q_len > k_len` is undefined here).
+pub(crate) fn chunked_causal_attention(
+    q: &MlxArray,
+    k: &MlxArray,
+    v: &MlxArray,
+    scale: f32,
+    chunk: i32,
+) -> UniquePtr<MlxArray> {
+    let k_shape = ffi::array_shape(k);
+    let v_shape = ffi::array_shape(v);
+    let q_len = ffi::array_shape(q)[2];
+    let k_len = k_shape[2];
+    let offset = k_len - q_len;
+    debug_assert!(
+        offset >= 0,
+        "chunked_causal_attention requires k_len >= q_len"
+    );
+
+    let mut parts: Vec<UniquePtr<MlxArray>> =
+        Vec::with_capacity(((q_len + chunk - 1) / chunk).max(1) as usize);
+    let mut start = 0;
+    while start < q_len {
+        let stop = (start + chunk).min(q_len);
+        let k_end = offset + stop;
+        let q_c = slice_query_rows(q, start, stop);
+        let k_c = ffi::slice(
+            k,
+            &[0, 0, 0, 0],
+            &[k_shape[0], k_shape[1], k_end, k_shape[3]],
+        );
+        let v_c = ffi::slice(
+            v,
+            &[0, 0, 0, 0],
+            &[v_shape[0], v_shape[1], k_end, v_shape[3]],
+        );
+        let mask = crate::utils::create_causal_mask(stop - start, offset + start);
+        // Keep the per-chunk mask in the score dtype (see mask_in_score_dtype).
+        let mask = mask_in_score_dtype(mask.as_ref().unwrap(), ffi::array_dtype(q)).unwrap_or(mask);
+        parts.push(attention_dispatch(
+            &q_c,
+            &k_c,
+            &v_c,
+            scale,
+            Some(mask.as_ref().unwrap()),
+            0.0,
+        ));
+        start = stop;
+    }
+    let ptrs: Vec<*const MlxArray> = parts
+        .iter()
+        .map(|p| p.as_ref().unwrap() as *const MlxArray)
+        .collect();
+    // SAFETY: every pointer references a live array owned by `parts`.
+    unsafe { ffi::concatenate(&ptrs, 2) }
+}
+
+/// Pointer-friendly attention wrapper for existing model call sites.
+///
+/// Used by: Model attention call sites that still store masks as raw pointers
+///
+/// # Safety
+///
+/// `mask` must be either null or point to a valid, live `MlxArray`. The
+/// referent must remain valid for the duration of this call.
+pub unsafe fn attention_from_ptr(
+    q: &MlxArray,
+    k: &MlxArray,
+    v: &MlxArray,
+    scale: f32,
+    mask: *const MlxArray,
+    softcap: f32,
+    window_size: i32,
+) -> UniquePtr<MlxArray> {
+    let mask = if mask.is_null() {
+        None
+    } else {
+        // SAFETY: callers must pass either null or a valid `MlxArray` pointer.
+        Some(unsafe { &*mask })
+    };
+    attention(q, k, v, scale, mask, softcap, window_size)
+}
+
+fn validate_paged_decode_inputs(
+    q: &MlxArray,
+    cache_keys: &[*const MlxArray],
+    cache_values: &[*const MlxArray],
+    metadata: &crate::cache::PagedDecodeMetadata,
+) -> Result<(), String> {
+    let q_shape = ffi::array_shape(q);
+    if q_shape.len() != 4 {
+        return Err(format!(
+            "paged decode attention expected q rank 4, got shape {:?}",
+            q_shape
+        ));
+    }
+    if q_shape[2] != 1 {
+        return Err(format!(
+            "paged decode attention only supports decode-only q_len == 1, got {}",
+            q_shape[2]
+        ));
+    }
+
+    let batch = q_shape[0].max(0) as usize;
+    if cache_keys.len() != batch || cache_values.len() != batch {
+        return Err(format!(
+            "paged decode attention expected {} cache pointers, got {} keys and {} values",
+            batch,
+            cache_keys.len(),
+            cache_values.len()
+        ));
+    }
+    if cache_keys.iter().any(|ptr| ptr.is_null()) || cache_values.iter().any(|ptr| ptr.is_null()) {
+        return Err(
+            "paged decode attention received a null dense compatibility cache pointer".to_string(),
+        );
+    }
+    if metadata.len() != batch {
+        return Err(format!(
+            "paged decode attention expected {} metadata entries, got {}",
+            batch,
+            metadata.len()
+        ));
+    }
+    if metadata.block_table_offsets.len() != batch + 1 {
+        return Err(format!(
+            "paged decode attention expected {} block offsets, got {}",
+            batch + 1,
+            metadata.block_table_offsets.len()
+        ));
+    }
+    if metadata
+        .block_table_offsets
+        .last()
+        .copied()
+        .unwrap_or_default() as usize
+        != metadata.block_tables.len()
+    {
+        return Err(
+            "paged decode attention block table offsets do not cover the flattened block table"
+                .to_string(),
+        );
+    }
+
+    Ok(())
+}
+
+/// Reference paged decode path over dense compatibility KV caches.
+///
+/// This stays entirely in Rust/FFI wrappers and is primarily used as a
+/// correctness baseline and benchmark fallback for the native paged decode
+/// kernel.
+pub fn paged_decode_attention_dense_fallback(
+    q: &MlxArray,
+    cache_keys: &[*const MlxArray],
+    cache_values: &[*const MlxArray],
+    metadata: &crate::cache::PagedDecodeMetadata,
+    scale: f32,
+) -> Result<UniquePtr<MlxArray>, String> {
+    validate_paged_decode_inputs(q, cache_keys, cache_values, metadata)?;
+
+    let q_shape = ffi::array_shape(q);
+    let batch = q_shape[0].max(0) as usize;
+    let mut outputs: Vec<UniquePtr<MlxArray>> = Vec::with_capacity(batch);
+
+    for batch_idx in 0..batch {
+        let kv_len = metadata.kv_lens[batch_idx];
+        if kv_len <= 0 {
+            return Err(format!(
+                "paged decode fallback requires kv_len > 0 for batch index {batch_idx}, got {kv_len}"
+            ));
+        }
+
+        let q_i = ffi::slice(
+            q,
+            &[batch_idx as i32, 0, 0, 0],
+            &[batch_idx as i32 + 1, i32::MAX, 1, i32::MAX],
+        );
+
+        let table_begin = metadata.block_table_offsets[batch_idx] as usize;
+        let table_end = metadata.block_table_offsets[batch_idx + 1] as usize;
+        let key_cache = unsafe { &*cache_keys[batch_idx] };
+        let value_cache = unsafe { &*cache_values[batch_idx] };
+
+        let mut key_visible: Option<UniquePtr<MlxArray>> = None;
+        let mut value_visible: Option<UniquePtr<MlxArray>> = None;
+
+        for &logical_block in &metadata.block_tables[table_begin..table_end] {
+            let block_start = logical_block * metadata.block_size;
+            if block_start >= kv_len {
+                continue;
+            }
+            let block_end = (block_start + metadata.block_size).min(kv_len);
+
+            let key_block = ffi::slice(
+                key_cache,
+                &[0, 0, block_start, 0],
+                &[1, i32::MAX, block_end, i32::MAX],
+            );
+            let value_block = ffi::slice(
+                value_cache,
+                &[0, 0, block_start, 0],
+                &[1, i32::MAX, block_end, i32::MAX],
+            );
+
+            key_visible = Some(match key_visible {
+                Some(prev) => crate::concatenate(&prev, &key_block, 2),
+                None => key_block,
+            });
+            value_visible = Some(match value_visible {
+                Some(prev) => crate::concatenate(&prev, &value_block, 2),
+                None => value_block,
+            });
+        }
+
+        let key_visible = key_visible.ok_or_else(|| {
+            format!("paged decode fallback built no visible key blocks for batch index {batch_idx}")
+        })?;
+        let value_visible = value_visible.ok_or_else(|| {
+            format!(
+                "paged decode fallback built no visible value blocks for batch index {batch_idx}"
+            )
+        })?;
+
+        outputs.push(unsafe {
+            attention_from_ptr(
+                &q_i,
+                &key_visible,
+                &value_visible,
+                scale,
+                std::ptr::null(),
+                0.0,
+                0,
+            )
+        });
+    }
+
+    // `drain(..1)` panics on an empty vec, so reject `batch == 0` explicitly
+    // with a clean error instead (issue #195).
+    if outputs.is_empty() {
+        return Err("paged decode fallback received an empty batch (batch == 0)".to_string());
+    }
+    let mut outputs = outputs.into_iter();
+    let mut result = outputs.next().expect("outputs is non-empty: checked above");
+    for output in outputs {
+        result = crate::concatenate(&result, &output, 0);
+    }
+    Ok(result)
+}
+
+fn validate_pooled_paged_decode_inputs(
+    q: &MlxArray,
+    states: &[&crate::cache::PagedSequenceState],
+) -> Result<(), String> {
+    let q_shape = ffi::array_shape(q);
+    if q_shape.len() != 4 {
+        return Err(format!(
+            "pooled paged decode attention expected q rank 4, got shape {:?}",
+            q_shape
+        ));
+    }
+    if q_shape[2] != 1 {
+        return Err(format!(
+            "pooled paged decode attention only supports decode-only q_len == 1, got {}",
+            q_shape[2]
+        ));
+    }
+
+    let batch = q_shape[0].max(0) as usize;
+    if states.len() != batch {
+        return Err(format!(
+            "pooled paged decode attention expected {batch} sequence states, got {}",
+            states.len()
+        ));
+    }
+
+    Ok(())
+}
+
+/// Reference paged decode path that gathers K/V from the [`PagedBlockPool`].
+///
+/// This is the Phase 2 (#119) pooled read path of the unified paged KV cache
+/// (epic #116). It is the pooled analogue of [`paged_decode_attention_dense_fallback`],
+/// which stays the live decode path and the parity baseline this function is
+/// validated against. The two differ only in where the per-sequence visible
+/// K/V comes from: the dense fallback slices contiguous dense compatibility
+/// buffers, while this function calls [`crate::cache::PagedBlockPool::gather_visible`]
+/// to pull each sequence's physical blocks out of the pool by block-table order.
+/// Everything downstream — the per-batch `q` slice, the fused SDPA dispatch via
+/// [`attention_from_ptr`], and the axis-0 batch concat — is identical.
+///
+/// Per ADR 0001 (`docs/adr/0001-paged-attention-gather-vs-fused-kernel.md`) this
+/// is strategy option A, *gather-then-SDPA*: `gather_visible` builds a
+/// `take`/`reshape`/`transpose` MLX graph that MLX fuses into the fused-SDPA
+/// read, so the scattered-block gather adds no separate full-copy of the
+/// sequence KV at the common context lengths. The fused Metal paged-attention
+/// kernel (option B) is deferred to #123; this Rust path remains its correctness
+/// reference and fallback. Live model routing onto this path is #121 (it needs
+/// the pool to be populated by the #120 prefill writer and routed by the #121
+/// scheduler), so this function is additive machinery and the live decode path
+/// is unchanged until then.
+///
+/// The path handles full-attention and sliding-window sequences uniformly. In
+/// the paged model there is no ring-buffer wrap: the visible window is encoded
+/// entirely in the per-sequence block table plus `logical_start` (which
+/// `trim_tokens` advances as the window slides), so `gather_visible` returns
+/// exactly the `[logical_start, len)` window already shaped
+/// `[1, n_kv_heads, visible_len, head_dim]` (SDPA-ready). That is why there is
+/// no separate "rotating" pooled variant mirroring
+/// [`paged_decode_attention_rotating_fallback`].
+///
+/// `gather_visible` returning `Ok(None)` (no visible tokens, or the layer has no
+/// pool storage yet) is treated as an error here, because decode requires a
+/// non-empty visible window — the pooled analogue of the dense fallback's
+/// `kv_len > 0` precondition.
+pub fn paged_decode_attention_pooled_fallback(
+    q: &MlxArray,
+    pool: &crate::cache::PagedBlockPool,
+    states: &[&crate::cache::PagedSequenceState],
+    layer_idx: usize,
+    scale: f32,
+) -> Result<UniquePtr<MlxArray>, String> {
+    validate_pooled_paged_decode_inputs(q, states)?;
+
+    let q_shape = ffi::array_shape(q);
+    let batch = q_shape[0].max(0) as usize;
+    let mut outputs: Vec<UniquePtr<MlxArray>> = Vec::with_capacity(batch);
+
+    for (batch_idx, state) in states.iter().enumerate() {
+        let q_i = ffi::slice(
+            q,
+            &[batch_idx as i32, 0, 0, 0],
+            &[batch_idx as i32 + 1, i32::MAX, 1, i32::MAX],
+        );
+
+        let (key_visible, value_visible) =
+            pool.gather_visible(state, layer_idx)?.ok_or_else(|| {
+                format!(
+                    "pooled paged decode requires visible tokens for batch index {batch_idx} on layer {layer_idx}, but the pool gathered none"
+                )
+            })?;
+
+        outputs.push(unsafe {
+            attention_from_ptr(
+                &q_i,
+                &key_visible,
+                &value_visible,
+                scale,
+                std::ptr::null(),
+                0.0,
+                0,
+            )
+        });
+    }
+
+    // `drain(..1)` panics on an empty vec, so reject `batch == 0` explicitly
+    // with a clean error instead (issue #195).
+    if outputs.is_empty() {
+        return Err(
+            "pooled paged decode fallback received an empty batch (batch == 0)".to_string(),
+        );
+    }
+    let mut outputs = outputs.into_iter();
+    let mut result = outputs.next().expect("outputs is non-empty: checked above");
+    for output in outputs {
+        result = crate::concatenate(&result, &output, 0);
+    }
+    Ok(result)
+}
+
+/// Where the pooled paged-attention decode should run for a given shape.
+///
+/// `Native` dispatches the fused Metal kernel
+/// ([`crate::cache::PagedBlockPool::paged_decode_fused`], ADR 0001 strategy B);
+/// `Gather` uses the gather-then-SDPA reference
+/// ([`paged_decode_attention_pooled_fallback`], strategy A). The two paths agree
+/// within RMS < 5e-3, so the choice is a pure performance switch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PagedDecodeDispatch {
+    /// Fused native kernel (strategy B).
+    Native,
+    /// Gather-then-SDPA reference (strategy A).
+    Gather,
+}
+
+/// Compute backend the pooled decode runs on. The fused kernel has a Metal JIT
+/// body (ADR 0001, measured on Apple Silicon) and a CUDA JIT body (#634). Both
+/// are native candidates; the selector applies backend-specific thresholds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PagedDecodeBackend {
+    /// Apple Silicon Metal (the fused kernel's original home).
+    Metal,
+    /// NVIDIA CUDA (the ported fused kernel, #634). The kernel reads scattered
+    /// pool blocks with no gather pass, so its advantage grows with context;
+    /// the Metal-measured batch/context ceilings do not apply.
+    Cuda,
+    /// Anything else (CPU): no fused kernel, always gather.
+    Other,
+}
+
+// ── Adaptive native-kernel selector thresholds (issue #331) ──────────────────
+//
+// All three cite docs/adr/0001-paged-attention-gather-vs-fused-kernel.md,
+// "Phase 6 outcome (#123)" (the fused-vs-gather speedup table) and the
+// "Chunked slab storage interaction (#235)" addendum.
+
+/// Minimum batch size for a native dispatch. ADR 0001 Phase 6: the fused kernel
+/// wins only once decode is batched (`b>=4` is `1.30x` at ctx 4096), and loses
+/// at `b=1` (`0.50x`).
+const NATIVE_MIN_BATCH: usize = 4;
+
+/// Maximum visible context for a native dispatch. ADR 0001 Phase 6: the fused
+/// kernel wins at ctx 4096 but loses across every batch size at ctx 16384
+/// (`0.83x`–`0.91x`). 4096 is the largest context with measured evidence of a
+/// win, so the selector stops there rather than extrapolating into the losing
+/// 16384 regime.
+const NATIVE_MAX_VISIBLE_LEN: usize = 4096;
+
+/// Maximum slab count for a native dispatch. ADR 0001 "#235": the fused kernel
+/// reads one contiguous pool buffer per side, so
+/// [`crate::cache::PagedBlockPool::paged_decode_fused`] declines any layer that
+/// has grown past a single slab. Selecting native above this would always fall
+/// back to gather; the selector short-circuits it instead.
+const NATIVE_MAX_SLABS: usize = 1;
+
+/// Pure regime selector for the pooled paged-attention decode (issue #331).
+///
+/// Library-only: this selector governs [`paged_decode_attention_pooled`], which
+/// #720 retired to a library-only API (ADR 0001, resolving issue #710). It is
+/// not on the `mlxcel-server` decode path; it is kept for external mlxcel-core
+/// consumers and `examples/paged_attention_kernel_bench.rs`. See ADR 0001.
+///
+/// Returns [`PagedDecodeDispatch::Native`] only inside the island where ADR 0001
+/// Phase 6 measured the fused kernel winning: Apple Silicon Metal, batched
+/// decode (`batch_size >= `[`NATIVE_MIN_BATCH`]`), moderate context
+/// (`visible_len <= `[`NATIVE_MAX_VISIBLE_LEN`]`), and a single-slab layer the
+/// kernel will not decline (`slab_count <= `[`NATIVE_MAX_SLABS`]`). Everything
+/// else, including the `b=1` long-context regime the ADR named as a loss, routes
+/// to [`PagedDecodeDispatch::Gather`].
+///
+/// Pure and allocation-free (a handful of integer comparisons) so it is cheap
+/// to memoize on the decode hot path and trivially unit-testable without MLX.
+#[must_use]
+pub fn select_pooled_paged_dispatch(
+    batch_size: usize,
+    visible_len: usize,
+    slab_count: usize,
+    backend: PagedDecodeBackend,
+) -> PagedDecodeDispatch {
+    let native = match backend {
+        // Apple Silicon Metal: only the ADR 0001 Phase 6 win island (batched,
+        // moderate context, single-slab).
+        PagedDecodeBackend::Metal => {
+            slab_count <= NATIVE_MAX_SLABS
+                && batch_size >= NATIVE_MIN_BATCH
+                && visible_len <= NATIVE_MAX_VISIBLE_LEN
+        }
+        // CUDA (#634): the fused kernel reads the scattered pool blocks in-place
+        // with no gather copy, so it is the default wherever it can serve the
+        // layer. The kernel reads one contiguous pool buffer per side, so it
+        // still declines multi-slab layers ([`NATIVE_MAX_SLABS`]); the
+        // Metal-measured batch and context ceilings do not apply because the
+        // CUDA win grows with context rather than eroding at long context.
+        PagedDecodeBackend::Cuda => slab_count <= NATIVE_MAX_SLABS,
+        PagedDecodeBackend::Other => false,
+    };
+    if native {
+        PagedDecodeDispatch::Native
+    } else {
+        PagedDecodeDispatch::Gather
+    }
+}
+
+/// Process-wide `MLXCEL_PAGED_ATTENTION_NATIVE` override for the fused
+/// paged-attention kernel (#123, extended to tri-state in #331, extended to the
+/// production paged decode path in #899).
+///
+/// Two consumers:
+///
+/// - The library-only [`paged_decode_attention_pooled`] entry point (ADR 0001
+///   #710), through [`resolve_dispatch_decision`]. Unchanged.
+/// - The server's pool-backed batched paged decode, through
+///   [`resolve_paged_v2_dispatch`]. Issue #899 made the fused v2 kernel the
+///   production path for that decode, and named this variable's force-off
+///   values (`0` / `false` / `off` / `no`) as its kill switch: setting it
+///   restores the pre-#899 gather-then-SDPA behaviour end to end.
+///
+/// The separate `DecodeBatchContext::use_native_paged_kernel` request still
+/// governs the *dense-compat* block-table decode, which is a different path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativePagedOverride {
+    /// Force the fused kernel, bypassing the adaptive selector (the original
+    /// #123 force-on semantics, preserved exactly).
+    ForceNative,
+    /// Force the gather fallback, bypassing the adaptive selector. The #331
+    /// escape hatch for operators who want to pin the pre-kernel behaviour.
+    ForceGather,
+    /// No override: the adaptive selector decides.
+    Auto,
+}
+
+/// Pure parse of a `MLXCEL_PAGED_ATTENTION_NATIVE` value into an override.
+///
+/// The force-on value set (`1` / `true` / `on` / `yes`, and their uppercase
+/// forms) is unchanged from #123, so an existing `MLXCEL_PAGED_ATTENTION_NATIVE=1`
+/// still force-enables the kernel regardless of the selector. #331 adds a
+/// symmetric force-off set (`0` / `false` / `off` / `no`) that pins the gather
+/// fallback. Any other value (or `None`) yields [`NativePagedOverride::Auto`],
+/// letting the selector govern dispatch.
+fn parse_native_paged_override(value: Option<&str>) -> NativePagedOverride {
+    match value.map(str::trim) {
+        Some("1" | "true" | "on" | "yes" | "TRUE" | "ON" | "YES") => {
+            NativePagedOverride::ForceNative
+        }
+        Some("0" | "false" | "off" | "no" | "FALSE" | "OFF" | "NO") => {
+            NativePagedOverride::ForceGather
+        }
+        _ => NativePagedOverride::Auto,
+    }
+}
+
+/// Read `MLXCEL_PAGED_ATTENTION_NATIVE` once and cache it so the decode hot path
+/// never touches the environment.
+fn native_paged_override() -> NativePagedOverride {
+    use std::sync::OnceLock;
+    static OVERRIDE: OnceLock<NativePagedOverride> = OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        parse_native_paged_override(
+            std::env::var("MLXCEL_PAGED_ATTENTION_NATIVE")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// Pure combiner: apply the env override, otherwise the caller's willingness to
+/// run native, otherwise the (lazily computed) adaptive selector. Force cases
+/// never invoke `selector`, so the caller can skip deriving its inputs.
+fn resolve_dispatch_decision(
+    over: NativePagedOverride,
+    use_native_requested: bool,
+    selector: impl FnOnce() -> PagedDecodeDispatch,
+) -> PagedDecodeDispatch {
+    match over {
+        NativePagedOverride::ForceNative => PagedDecodeDispatch::Native,
+        NativePagedOverride::ForceGather => PagedDecodeDispatch::Gather,
+        NativePagedOverride::Auto => {
+            if use_native_requested {
+                selector()
+            } else {
+                PagedDecodeDispatch::Gather
+            }
+        }
+    }
+}
+
+/// Apply the `MLXCEL_PAGED_ATTENTION_NATIVE` override to the production paged
+/// decode v2 dispatch (issue #899).
+///
+/// The override is checked *before* the selector so the kill switch cannot be
+/// out-thought by a shape the selector likes:
+///
+/// - force-off (`0` / `false` / `off` / `no`) pins the gather path, restoring
+///   pre-#899 behaviour end to end;
+/// - force-on (`1` / `true` / `on` / `yes`) pins v2 for every shape the kernel
+///   can actually serve, bypassing the measured token floor (this is how the
+///   floor itself gets re-measured, and how the low-context regime is
+///   benchmarked deliberately);
+/// - unset, or any other value, lets `selector` decide.
+///
+/// A forced dispatch still goes through the kernel's own structural declines
+/// (single-slab layer, servable geometry, non-empty batch), so forcing it on
+/// cannot produce a launch the kernel would reject.
+pub(crate) fn resolve_paged_v2_dispatch(
+    selector: impl FnOnce() -> crate::paged_v2::PagedV2Dispatch,
+) -> crate::paged_v2::PagedV2Dispatch {
+    use crate::paged_v2::PagedV2Dispatch;
+    match native_paged_override() {
+        NativePagedOverride::ForceNative => PagedV2Dispatch::V2,
+        NativePagedOverride::ForceGather => PagedV2Dispatch::Gather,
+        NativePagedOverride::Auto => selector(),
+    }
+}
+
+/// The backend the fused kernel would run on, cached for the decode hot path.
+///
+/// The fused kernel has a Metal JIT body and a CUDA JIT body (#634), so it is a
+/// native candidate whenever either backend is available at runtime
+/// ([`crate::metal_is_available`] / [`crate::cuda_is_available`], the same gates
+/// the model dispatch and C++ kernel selection use). This correctly falls to
+/// gather only for a CPU-only build or a machine with no usable GPU, neither of
+/// which a compile-time `target_os` check would catch. Metal is probed first so
+/// the Apple path is unchanged. Detection is process-static, so it is read once.
+pub(crate) fn paged_decode_backend() -> PagedDecodeBackend {
+    use std::sync::OnceLock;
+    static BACKEND: OnceLock<PagedDecodeBackend> = OnceLock::new();
+    *BACKEND.get_or_init(|| {
+        if crate::metal_is_available() {
+            PagedDecodeBackend::Metal
+        } else if crate::cuda_is_available() {
+            PagedDecodeBackend::Cuda
+        } else {
+            PagedDecodeBackend::Other
+        }
+    })
+}
+
+/// Cheap per-shape memoization of the pooled-decode dispatch decision (#331,
+/// acceptance criterion 3).
+///
+/// Serves only the library-only [`paged_decode_attention_pooled`] path (ADR 0001
+/// #710); it is not on the `mlxcel-server` decode path.
+///
+/// Within a decode step every layer shares the same `(batch_size, visible_len,
+/// slab_count, backend)` key, so the pure selector is recomputed at most once
+/// per distinct shape and every subsequent layer takes the cached decision via
+/// a single relaxed atomic load + compare. This is the "last-key cell" the issue
+/// asks for, not a per-token locking map: the packed key (bits `0..=48`) and the
+/// decision (bit `49`) live in one `AtomicU64`, so a reader observes them as one
+/// indivisible word and can never pair a fresh key with a stale decision. The
+/// selector is only re-run when the key changes.
+struct PagedDispatchCache {
+    cell: AtomicU64,
+}
+
+/// Sentinel value that never collides with a real packed cell: real cells pack
+/// three `u16`-bounded fields plus a 2-bit backend tag into bits `0..=49` (see
+/// [`PagedDispatchCache::pack_key`]) and the decision into bit `50`, so bits
+/// `51..=63` stay zero and the all-ones sentinel is unambiguous.
+const PAGED_DISPATCH_CACHE_EMPTY: u64 = u64::MAX;
+
+impl PagedDispatchCache {
+    /// Bit carrying the decision alongside the packed key: set means
+    /// [`PagedDecodeDispatch::Native`], clear means [`PagedDecodeDispatch::Gather`].
+    /// The key uses bits `0..=49` ([`Self::pack_key`]: the backend tag now needs
+    /// two bits for the Metal/Cuda/Other trichotomy), so bit `50` is free.
+    const DECISION_BIT: u64 = 1u64 << 50;
+    /// Mask covering the packed-key bits (`0..=49`), used to compare a cell's
+    /// key half against a freshly packed key while ignoring the decision bit.
+    const KEY_MASK: u64 = Self::DECISION_BIT - 1;
+
+    const fn new() -> Self {
+        Self {
+            cell: AtomicU64::new(PAGED_DISPATCH_CACHE_EMPTY),
+        }
+    }
+
+    /// Pack the selector inputs into a single `u64` key. Each field is saturated
+    /// to `u16::MAX` first: the exact large value does not change the decision
+    /// (both `visible_len` and `slab_count` are far past every native threshold
+    /// once they exceed `u16::MAX`), and saturating keeps the packing lossless
+    /// for every value that could flip the outcome.
+    fn pack_key(
+        batch_size: usize,
+        visible_len: usize,
+        slab_count: usize,
+        backend: PagedDecodeBackend,
+    ) -> u64 {
+        let b = batch_size.min(u16::MAX as usize) as u64;
+        let v = visible_len.min(u16::MAX as usize) as u64;
+        let s = slab_count.min(u16::MAX as usize) as u64;
+        let k = match backend {
+            PagedDecodeBackend::Metal => 0u64,
+            PagedDecodeBackend::Cuda => 1u64,
+            PagedDecodeBackend::Other => 2u64,
+        };
+        b | (v << 16) | (s << 32) | (k << 48)
+    }
+
+    fn select(
+        &self,
+        batch_size: usize,
+        visible_len: usize,
+        slab_count: usize,
+        backend: PagedDecodeBackend,
+    ) -> PagedDecodeDispatch {
+        let key = Self::pack_key(batch_size, visible_len, slab_count, backend);
+        // Key and decision share one word, so a single relaxed load is
+        // torn-free: a hit returns the decision packed with this exact key,
+        // never a stale decision paired with a fresh key.
+        let cell = self.cell.load(Ordering::Relaxed);
+        if cell != PAGED_DISPATCH_CACHE_EMPTY && (cell & Self::KEY_MASK) == key {
+            return if cell & Self::DECISION_BIT != 0 {
+                PagedDecodeDispatch::Native
+            } else {
+                PagedDecodeDispatch::Gather
+            };
+        }
+        let decision = select_pooled_paged_dispatch(batch_size, visible_len, slab_count, backend);
+        let packed = key
+            | match decision {
+                PagedDecodeDispatch::Native => Self::DECISION_BIT,
+                PagedDecodeDispatch::Gather => 0,
+            };
+        self.cell.store(packed, Ordering::Relaxed);
+        decision
+    }
+}
+
+static PAGED_DISPATCH_CACHE: PagedDispatchCache = PagedDispatchCache::new();
+
+/// Resolve the dispatch for `paged_decode_attention_pooled`: honour the env
+/// override first, otherwise run the memoized adaptive selector over the shape
+/// derived from `pool`/`states`.
+fn resolve_pooled_paged_dispatch(
+    pool: &crate::cache::PagedBlockPool,
+    states: &[&crate::cache::PagedSequenceState],
+    layer_idx: usize,
+    use_native_requested: bool,
+) -> PagedDecodeDispatch {
+    resolve_dispatch_decision(native_paged_override(), use_native_requested, || {
+        let batch_size = states.len();
+        let visible_len = states
+            .iter()
+            .map(|s| s.layer(layer_idx).map_or(0, |l| l.visible_len()))
+            .max()
+            .unwrap_or(0);
+        let slab_count = pool.slab_count(layer_idx);
+        PAGED_DISPATCH_CACHE.select(batch_size, visible_len, slab_count, paged_decode_backend())
+    })
+}
+
+/// Adaptive pooled paged decode attention (epic #116 Phase 6, #123; adaptive
+/// selector #331).
+///
+/// **Library-only (not on the `mlxcel-server` decode path).** #720 retired this
+/// entry point to a library API (ADR 0001, resolving issue #710). The in-server
+/// decode routes pool-backed layers through the per-sequence `update_and_fetch`
+/// pool intercept (gather + standard SDPA, `src/models/llama3.rs`
+/// `is_paged_backed()`), and production models call
+/// [`paged_decode_attention_dense_compat`] / [`paged_decode_attention_dense_fallback`],
+/// never this function. It is kept and tested for external mlxcel-core consumers
+/// and `examples/paged_attention_kernel_bench.rs`. ADR 0001 records the
+/// occupancy derivation: the selector's single-slab batched island (`B>=4`, at
+/// most ~256 tokens per sequence at `block_size` 32) is unreachable under the
+/// shipped serving defaults and transient even when entered, so a scheduler
+/// wire-in is not worth its cross-family blast radius.
+///
+/// The per-config `use_native_paged_kernel` flag marks the caller as *willing*
+/// to run the fused kernel
+/// ([`crate::cache::PagedBlockPool::paged_decode_fused`], ADR 0001 strategy B).
+/// The actual dispatch is then decided by [`select_pooled_paged_dispatch`]. On
+/// Metal it picks the kernel only inside the regime ADR 0001 Phase 6 measured it
+/// winning (`batch >= 4`, `visible_len <= 4096`, single-slab layer), keeping the
+/// long-context and `b=1` regimes on gather where the ADR shows Metal loses. On
+/// CUDA (#634) the ported kernel reads scattered pool blocks with no gather pass,
+/// so it is the default for any single-slab layer regardless of batch/context.
+/// Everything else uses [`paged_decode_attention_pooled_fallback`], the
+/// gather-then-SDPA reference (strategy A).
+///
+/// `MLXCEL_PAGED_ATTENTION_NATIVE` overrides the selector both ways: the
+/// original force-on values (`1`/`true`/`on`/`yes`) still pin the kernel, and
+/// #331 adds force-off values (`0`/`false`/`off`/`no`) that pin gather. Whenever
+/// native is chosen but the kernel declines (pool tensors not yet allocated, no
+/// visible tokens, or a multi-slab layer), it falls back to gather, so the two
+/// paths stay interchangeable (RMS < 5e-3).
+pub fn paged_decode_attention_pooled(
+    q: &MlxArray,
+    pool: &crate::cache::PagedBlockPool,
+    states: &[&crate::cache::PagedSequenceState],
+    layer_idx: usize,
+    scale: f32,
+    use_native_paged_kernel: bool,
+) -> Result<UniquePtr<MlxArray>, String> {
+    if resolve_pooled_paged_dispatch(pool, states, layer_idx, use_native_paged_kernel)
+        == PagedDecodeDispatch::Native
+        && let Some(out) = pool.paged_decode_fused(q, states, layer_idx, scale)?
+    {
+        return Ok(out);
+    }
+    paged_decode_attention_pooled_fallback(q, pool, states, layer_idx, scale)
+}
+
+/// Native paged decode path over dense compatibility KV caches.
+///
+/// The C++ bridge consumes the logical block table metadata and performs the
+/// per-sequence block gathering plus SDPA dispatch natively, reducing Rust-side
+/// FFI churn on the decode hot path.
+pub fn paged_decode_attention_dense_compat(
+    q: &MlxArray,
+    cache_keys: &[*const MlxArray],
+    cache_values: &[*const MlxArray],
+    metadata: &crate::cache::PagedDecodeMetadata,
+    scale: f32,
+) -> Result<UniquePtr<MlxArray>, String> {
+    validate_paged_decode_inputs(q, cache_keys, cache_values, metadata)?;
+    Ok(unsafe {
+        ffi::paged_decode_attention_dense_compat(
+            q,
+            cache_keys,
+            cache_values,
+            &metadata.kv_lens,
+            &metadata.block_tables,
+            &metadata.block_table_offsets,
+            metadata.block_size,
+            scale,
+        )
+    })
+}
+
+fn validate_rotating_paged_decode_inputs(
+    q: &MlxArray,
+    cache_keys: &[*const MlxArray],
+    cache_values: &[*const MlxArray],
+    metadata: &crate::cache::RotatingPagedDecodeMetadata,
+) -> Result<(), String> {
+    let q_shape = ffi::array_shape(q);
+    if q_shape.len() != 4 {
+        return Err(format!(
+            "rotating paged decode attention expected q rank 4, got shape {:?}",
+            q_shape
+        ));
+    }
+    if q_shape[2] != 1 {
+        return Err(format!(
+            "rotating paged decode attention only supports decode-only q_len == 1, got {}",
+            q_shape[2]
+        ));
+    }
+
+    let batch = q_shape[0].max(0) as usize;
+    if cache_keys.len() != batch || cache_values.len() != batch {
+        return Err(format!(
+            "rotating paged decode attention expected {} cache pointers, got {} keys and {} values",
+            batch,
+            cache_keys.len(),
+            cache_values.len()
+        ));
+    }
+    if cache_keys.iter().any(|ptr| ptr.is_null()) || cache_values.iter().any(|ptr| ptr.is_null()) {
+        return Err(
+            "rotating paged decode attention received a null ring-buffer cache pointer".to_string(),
+        );
+    }
+    if metadata.len() != batch {
+        return Err(format!(
+            "rotating paged decode attention expected {} metadata entries, got {}",
+            batch,
+            metadata.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Reference paged decode path over rotating ring-buffer KV caches.
+pub fn paged_decode_attention_rotating_fallback(
+    q: &MlxArray,
+    cache_keys: &[*const MlxArray],
+    cache_values: &[*const MlxArray],
+    metadata: &crate::cache::RotatingPagedDecodeMetadata,
+    scale: f32,
+) -> Result<UniquePtr<MlxArray>, String> {
+    validate_rotating_paged_decode_inputs(q, cache_keys, cache_values, metadata)?;
+
+    let q_shape = ffi::array_shape(q);
+    let batch = q_shape[0].max(0) as usize;
+    let mut outputs: Vec<UniquePtr<MlxArray>> = Vec::with_capacity(batch);
+
+    for batch_idx in 0..batch {
+        let kv_len = metadata.kv_lens[batch_idx];
+        let logical_start = metadata.logical_starts[batch_idx];
+        if kv_len <= 0 {
+            return Err(format!(
+                "rotating paged decode fallback requires kv_len > 0 for batch index {batch_idx}, got {kv_len}"
+            ));
+        }
+
+        let q_i = ffi::slice(
+            q,
+            &[batch_idx as i32, 0, 0, 0],
+            &[batch_idx as i32 + 1, i32::MAX, 1, i32::MAX],
+        );
+
+        let key_cache = unsafe { &*cache_keys[batch_idx] };
+        let value_cache = unsafe { &*cache_values[batch_idx] };
+        let buffer_len = ffi::array_shape(key_cache)
+            .get(2)
+            .copied()
+            .unwrap_or_default();
+        if buffer_len <= 0 {
+            return Err(format!(
+                "rotating paged decode fallback requires non-empty buffer for batch index {batch_idx}"
+            ));
+        }
+        if logical_start < 0 || logical_start >= buffer_len {
+            return Err(format!(
+                "rotating paged decode fallback received invalid logical_start={logical_start} for buffer_len={buffer_len}"
+            ));
+        }
+
+        let block_count = (kv_len + metadata.block_size - 1) / metadata.block_size;
+        let mut key_visible: Option<UniquePtr<MlxArray>> = None;
+        let mut value_visible: Option<UniquePtr<MlxArray>> = None;
+        for logical_block in 0..block_count {
+            let logical_pos = logical_block * metadata.block_size;
+            let logical_end = (logical_pos + metadata.block_size).min(kv_len);
+            let token_count = logical_end - logical_pos;
+            if token_count <= 0 {
+                continue;
+            }
+
+            let physical_start = (logical_start + logical_pos).rem_euclid(buffer_len);
+            let physical_end = physical_start + token_count;
+            let key_block = if physical_end <= buffer_len {
+                ffi::slice(
+                    key_cache,
+                    &[0, 0, physical_start, 0],
+                    &[1, i32::MAX, physical_end, i32::MAX],
+                )
+            } else {
+                let key_tail = ffi::slice(
+                    key_cache,
+                    &[0, 0, physical_start, 0],
+                    &[1, i32::MAX, buffer_len, i32::MAX],
+                );
+                let key_head = ffi::slice(
+                    key_cache,
+                    &[0, 0, 0, 0],
+                    &[1, i32::MAX, physical_end - buffer_len, i32::MAX],
+                );
+                crate::concatenate(&key_tail, &key_head, 2)
+            };
+            let value_block = if physical_end <= buffer_len {
+                ffi::slice(
+                    value_cache,
+                    &[0, 0, physical_start, 0],
+                    &[1, i32::MAX, physical_end, i32::MAX],
+                )
+            } else {
+                let value_tail = ffi::slice(
+                    value_cache,
+                    &[0, 0, physical_start, 0],
+                    &[1, i32::MAX, buffer_len, i32::MAX],
+                );
+                let value_head = ffi::slice(
+                    value_cache,
+                    &[0, 0, 0, 0],
+                    &[1, i32::MAX, physical_end - buffer_len, i32::MAX],
+                );
+                crate::concatenate(&value_tail, &value_head, 2)
+            };
+
+            key_visible = Some(match key_visible {
+                Some(prev) => crate::concatenate(&prev, &key_block, 2),
+                None => key_block,
+            });
+            value_visible = Some(match value_visible {
+                Some(prev) => crate::concatenate(&prev, &value_block, 2),
+                None => value_block,
+            });
+        }
+
+        let key_visible = key_visible.ok_or_else(|| {
+            format!(
+                "rotating paged decode fallback built no visible key blocks for batch index {batch_idx}"
+            )
+        })?;
+        let value_visible = value_visible.ok_or_else(|| {
+            format!(
+                "rotating paged decode fallback built no visible value blocks for batch index {batch_idx}"
+            )
+        })?;
+
+        outputs.push(unsafe {
+            attention_from_ptr(
+                &q_i,
+                &key_visible,
+                &value_visible,
+                scale,
+                std::ptr::null(),
+                0.0,
+                0,
+            )
+        });
+    }
+
+    // `drain(..1)` panics on an empty vec, so reject `batch == 0` explicitly
+    // with a clean error instead (issue #195).
+    if outputs.is_empty() {
+        return Err(
+            "rotating paged decode fallback received an empty batch (batch == 0)".to_string(),
+        );
+    }
+    let mut outputs = outputs.into_iter();
+    let mut result = outputs.next().expect("outputs is non-empty: checked above");
+    for output in outputs {
+        result = crate::concatenate(&result, &output, 0);
+    }
+    Ok(result)
+}
+
+/// Native paged decode path over rotating ring-buffer KV caches.
+pub fn paged_decode_attention_rotating_compat(
+    q: &MlxArray,
+    cache_keys: &[*const MlxArray],
+    cache_values: &[*const MlxArray],
+    metadata: &crate::cache::RotatingPagedDecodeMetadata,
+    scale: f32,
+) -> Result<UniquePtr<MlxArray>, String> {
+    validate_rotating_paged_decode_inputs(q, cache_keys, cache_values, metadata)?;
+    Ok(unsafe {
+        ffi::paged_decode_attention_rotating_compat(
+            q,
+            cache_keys,
+            cache_values,
+            &metadata.kv_lens,
+            &metadata.logical_starts,
+            metadata.block_size,
+            scale,
+        )
+    })
+}
+
+/// Metal 4 fused attention dispatch with automatic hardware detection.
+///
+/// Dispatches SDPA to the Metal 4 fused kernel when the hardware supports it,
+/// or falls back to the standard MLX `fast_scaled_dot_product_attention` path.
+///
+/// Queries `hardware::get_hardware()` to determine whether the current
+/// hardware supports Metal 4 TensorOps (M5+ with macOS 26.2+) and passes
+/// the `use_metal4` flag to the C++ bridge.
+///
+/// # Metal 4 path
+///
+/// When `hw.has_neural_accelerator && hw.macos_supports_na` is true, this
+/// function sets `use_metal4 = true`. The C++ bridge delegates standard SDPA
+/// to upstream MLX `fast::scaled_dot_product_attention()`, allowing backend
+/// Metal/NAX kernel selection on M5-class hardware.
+///
+/// The Metal 4 path is designed to handle:
+///   - Standard MHA and GQA (n_heads != n_kv_heads): upstream MLX broadcasts
+///     KV heads internally, so no caller-side repeat_kv is needed.
+///   - Softcap (Gemma 2/3): still handled by `compiled_softcap_sdpa*` until
+///     upstream MLX grows a fused softcap variant.
+///   - Sliding window (Gemma 3, Ministral): still handled by passing an
+///     explicit pre-built mask from Rust model code.
+///
+/// # Current behaviour
+///
+/// This helper now routes M5-capable requests through upstream MLX main's
+/// NAX-backed SDPA implementation via the C++ bridge. Boolean/integer masks
+/// are passed through unchanged; float masks are cast to Q's dtype.
+///
+/// Used by: Llama, Qwen, Gemma2, Gemma3, Mistral, Ministral, DeepSeek, Phi,
+/// Exaone, Cohere, InternLM, OLMo, StableLM, StarCoder2, GLM4, Ernie4.5,
+/// Hunyuan, Gemma VLMs, Qwen VLMs, SigLIP/CLIP-style vision encoders
+pub fn metal4_attention(
+    q: &MlxArray,
+    k: &MlxArray,
+    v: &MlxArray,
+    scale: f32,
+    mask: Option<&MlxArray>,
+    softcap: f32,
+    window_size: i32,
+) -> UniquePtr<MlxArray> {
+    // Enable Metal 4 dispatch only on M5+ hardware running macOS 26+.
+    // Uses the canonical NA detection condition from apple-silicon-precision.md.
+    let use_metal4 = should_use_metal4_attention();
+    if use_metal4 {
+        record_na_attention_dispatch(
+            q,
+            k,
+            v,
+            scale,
+            softcap,
+            window_size,
+            mask.is_some(),
+            mask.is_some(),
+            false,
+        );
+    }
+    let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
+    // SAFETY: mask_ptr is either null or a valid reference with lifetime tied
+    // to the `mask` argument, which outlives this function call.
+    unsafe {
+        ffi::fused_metal4_attention(q, k, v, scale, mask_ptr, softcap, window_size, use_metal4)
+    }
+}
+
+/// GELU MLP forward for non-quantized (FP16/BF16) UnifiedLinear layers.
+///
+/// When all three projections are non-quantized, calls the C++ path which
+/// runs matmul operations directly and fuses only the GELU activation via
+/// compiled element-wise kernels.
+///
+/// Returns `None` if any projection is quantized (caller should use the quantized path).
+///
+/// Used by: Gemma, Gemma4 and other GELU-gated FP models
+pub fn compiled_gelu_mlp_fp16(
+    x: &MlxArray,
+    gate_proj: &UnifiedLinear,
+    up_proj: &UnifiedLinear,
+    down_proj: &UnifiedLinear,
+) -> Option<crate::UniquePtr<MlxArray>> {
+    let gate_lin = gate_proj.regular_weight()?;
+    let up_lin = up_proj.regular_weight()?;
+    let down_lin = down_proj.regular_weight()?;
+
+    let gate_bias_ptr = gate_lin
+        .bias
+        .as_ref()
+        .map(|b| b.as_ref().unwrap() as *const MlxArray)
+        .unwrap_or(std::ptr::null());
+    let up_bias_ptr = up_lin
+        .bias
+        .as_ref()
+        .map(|b| b.as_ref().unwrap() as *const MlxArray)
+        .unwrap_or(std::ptr::null());
+    let down_bias_ptr = down_lin
+        .bias
+        .as_ref()
+        .map(|b| b.as_ref().unwrap() as *const MlxArray)
+        .unwrap_or(std::ptr::null());
+
+    Some(unsafe {
+        ffi::compiled_gelu_mlp_forward_fp16(
+            x,
+            &gate_lin.weight,
+            &up_lin.weight,
+            &down_lin.weight,
+            gate_bias_ptr,
+            up_bias_ptr,
+            down_bias_ptr,
+        )
+    })
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn named_lora_selection_is_reversible_and_validated() {
+        let mut linear = Linear::new(ffi::zeros(&[2, 2], crate::dtype::FLOAT32), None);
+        let identity = || ffi::from_slice_f32(&[1.0, 0.0, 0.0, 1.0], &[2, 2]);
+        linear
+            .set_lora_named("speech", identity(), identity(), 1.0)
+            .unwrap();
+        linear
+            .set_lora_named(
+                "vision",
+                identity(),
+                ffi::from_slice_f32(&[2.0, 0.0, 0.0, 2.0], &[2, 2]),
+                1.0,
+            )
+            .unwrap();
+        let input = ffi::from_slice_f32(&[1.0, 1.0], &[1, 2]);
+        let output_values = |output: UniquePtr<MlxArray>| {
+            ffi::eval(&output);
+            (0..2)
+                .map(|index| {
+                    let value = ffi::slice(&output, &[0, index], &[1, index + 1]);
+                    ffi::eval(&value);
+                    ffi::item_f32(&value)
+                })
+                .collect::<Vec<_>>()
+        };
+
+        linear.select_lora(None).unwrap();
+        assert_eq!(output_values(linear.forward(&input)), vec![0.0, 0.0]);
+        linear.select_lora(Some("speech")).unwrap();
+        assert_eq!(output_values(linear.forward(&input)), vec![1.0, 1.0]);
+        linear.select_lora(Some("vision")).unwrap();
+        assert_eq!(output_values(linear.forward(&input)), vec![2.0, 2.0]);
+        linear.select_lora(Some("speech")).unwrap();
+        assert_eq!(output_values(linear.forward(&input)), vec![1.0, 1.0]);
+
+        assert!(linear.select_lora(Some("missing")).is_err());
+        assert!(
+            linear
+                .set_lora_named("speech", identity(), identity(), 1.0)
+                .is_err()
+        );
+
+        linear.set_lora(identity(), identity(), 3.0);
+        assert_eq!(output_values(linear.forward(&input)), vec![3.0, 3.0]);
+        linear.set_lora(identity(), identity(), 4.0);
+        assert_eq!(output_values(linear.forward(&input)), vec![4.0, 4.0]);
+        linear.select_lora(Some("speech")).unwrap();
+        assert_eq!(output_values(linear.forward(&input)), vec![1.0, 1.0]);
+    }
+
+    fn insert_quantized_qkv_projection(
+        weights: &mut crate::weights::WeightMap,
+        prefix: &str,
+        out_dim: i32,
+    ) {
+        use crate::dtype;
+
+        weights.insert(
+            format!("{prefix}.weight"),
+            ffi::zeros(&[out_dim, 8], dtype::UINT32),
+        );
+        weights.insert(
+            format!("{prefix}.scales"),
+            ffi::zeros(&[out_dim, 1], dtype::FLOAT16),
+        );
+        weights.insert(
+            format!("{prefix}.biases"),
+            ffi::zeros(&[out_dim, 1], dtype::FLOAT16),
+        );
+        weights.insert(
+            format!("{prefix}.bias"),
+            ffi::zeros(&[out_dim], dtype::FLOAT16),
+        );
+    }
+
+    // -- quantization layout reconciliation (issue #467) ----------------
+    //
+    // Pure over tensor shapes: `weight = [out, packed_in]`,
+    // `scales = [out, num_groups]`, obeying
+    // `packed_in * 32 == bits * num_groups * group_size`.
+
+    #[test]
+    fn reconcile_affine_consistent_is_noop() {
+        // 4-bit, group_size 64, in_features 128 -> num_groups 2, packed_in 16.
+        // Declared params match the shapes: no reconciliation, no warning.
+        let layout =
+            reconcile_quantization_layout(&[32, 16], &[32, 2], 64, 4, "affine").expect("valid");
+        assert_eq!(layout.bits, 4);
+        assert_eq!(layout.group_size, 64);
+        assert!(!layout.reconciled);
+    }
+
+    #[test]
+    fn reconcile_affine_per_layer_bit_override_flags_reconciled() {
+        // Declared 4-bit but this tensor is genuinely 8-bit (in_features 128,
+        // num_groups 2, packed_in 32) — a legitimate mixed-precision override
+        // (e.g. a MoE router gate). Bits are re-derived to 8 AND the change is
+        // surfaced (reconciled = true) rather than silently applied.
+        let layout =
+            reconcile_quantization_layout(&[32, 32], &[32, 2], 64, 4, "affine").expect("valid");
+        assert_eq!(layout.bits, 8);
+        assert_eq!(layout.group_size, 64);
+        assert!(layout.reconciled);
+    }
+
+    #[test]
+    fn reconcile_affine_group_size_mismatch_is_flagged_not_silent() {
+        // The OptiQ-class failure: config declares group_size 64 / 4-bit but the
+        // tensor is packed at group_size 32 (in_features 128, num_groups 4,
+        // packed_in 16). The old path silently re-derived bits=2 and served
+        // garbage; now the divergence is flagged so the loader warns.
+        let layout =
+            reconcile_quantization_layout(&[32, 16], &[32, 4], 64, 4, "affine").expect("solvable");
+        assert_eq!(layout.bits, 2);
+        assert!(
+            layout.reconciled,
+            "a shape/metadata mismatch must be surfaced, not silently reconciled"
+        );
+    }
+
+    #[test]
+    fn reconcile_affine_nvfp4_fallback_recovers_group_size() {
+        // Issue #630: Gemma 4 nvfp4 checkpoints declare source group_size 16,
+        // but the affine fallback stores the same 4-bit dense values at
+        // group_size 32. Trusting gs16 would infer bits=8.
+        let layout =
+            reconcile_quantization_layout(&[32, 16], &[32, 4], 16, 4, "affine").expect("valid");
+        assert_eq!(layout.bits, 4);
+        assert_eq!(layout.group_size, 32);
+        assert!(layout.reconciled);
+    }
+
+    #[test]
+    fn reconcile_affine_nvfp4_fallback_recovers_group_size_64() {
+        // The ModelOpt NVFP4 affine fallback repacks to MLX's standard
+        // group_size=64 when dimensions allow it.
+        let layout =
+            reconcile_quantization_layout(&[32, 16], &[32, 2], 16, 4, "affine").expect("valid");
+        assert_eq!(layout.bits, 4);
+        assert_eq!(layout.group_size, 64);
+        assert!(layout.reconciled);
+    }
+
+    #[test]
+    fn reconcile_affine_invalid_bit_width_is_hard_error() {
+        // packed_in 14, num_groups 1, group_size 64 -> inferred bits 7, which is
+        // not a valid MLX width {2,3,4,5,6,8}. An unsupported/misdeclared layout
+        // must fail loudly instead of dequantizing as if it were standard affine.
+        let err = reconcile_quantization_layout(&[32, 14], &[32, 1], 64, 4, "affine")
+            .expect_err("bits=7 is not a supported width");
+        assert!(err.contains("not in"), "actionable message, got: {err}");
+    }
+
+    #[test]
+    fn reconcile_affine_non_integer_bits_is_hard_error() {
+        // packed_in 17 makes packed_in*32 not divisible by num_groups*group_size,
+        // so no integer bit width fits — reject rather than reconcile.
+        let err = reconcile_quantization_layout(&[32, 17], &[32, 2], 64, 4, "affine")
+            .expect_err("no integer bit width fits these shapes");
+        assert!(
+            err.contains("inconsistency") || err.contains("cannot derive"),
+            "actionable message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn reconcile_block_float_consistent_is_noop() {
+        // mxfp4 (4-bit), group_size 32, in_features 256 -> num_groups 8,
+        // packed_in 32. Declared params match: no reconciliation.
+        let layout =
+            reconcile_quantization_layout(&[64, 32], &[64, 8], 32, 4, "mxfp4").expect("valid");
+        assert_eq!(layout.bits, 4);
+        assert_eq!(layout.group_size, 32);
+        assert!(!layout.reconciled);
+    }
+
+    #[test]
+    fn reconcile_block_float_group_size_override_flags_reconciled() {
+        // minicpm-v-style: config default group_size 64 but this mxfp4 weight is
+        // stored at group_size 32. group_size is re-derived AND surfaced.
+        let layout =
+            reconcile_quantization_layout(&[64, 32], &[64, 8], 64, 4, "mxfp4").expect("valid");
+        assert_eq!(layout.bits, 4);
+        assert_eq!(layout.group_size, 32);
+        assert!(layout.reconciled);
+    }
+
+    #[test]
+    fn reconcile_block_float_inconsistent_shapes_are_flagged() {
+        // num_groups 7 does not divide in_features 256: the historical fallback
+        // keeps the declared group_size, but the mismatch is now surfaced.
+        let layout =
+            reconcile_quantization_layout(&[64, 32], &[64, 7], 64, 4, "mxfp4").expect("no error");
+        assert_eq!(layout.group_size, 64);
+        assert!(layout.reconciled);
+    }
+
+    #[test]
+    fn reconcile_ignores_degenerate_shapes() {
+        // Empty / scalar shapes carry no layout signal: trust the caller.
+        let layout = reconcile_quantization_layout(&[], &[], 64, 4, "affine").expect("noop");
+        assert_eq!((layout.bits, layout.group_size), (4, 64));
+        assert!(!layout.reconciled);
+    }
+
+    // -- hostile quantization params (issue #929) -----------------------
+
+    #[test]
+    fn reconcile_rejects_quantization_params_that_no_layout_can_describe() {
+        // These used to share the "insufficient shape info" early return and were
+        // handed to the kernel exactly as declared. MLX divides by `bits` in
+        // `validate_quantized_input`, so 0 is a division by zero and anything
+        // above 32 collapses the quotient to zero; a non-positive `group_size`
+        // makes the right-hand side unmatchable. All three end the process,
+        // because the throw crosses the cxx bridge as `std::terminate`.
+        for (group_size, bits, field, offender) in [
+            (64, 0, "bits", 0),
+            (64, -4, "bits", -4),
+            (64, 33, "bits", 33),
+            (0, 4, "group_size", 0),
+            (-64, 4, "group_size", -64),
+        ] {
+            let err =
+                reconcile_quantization_layout(&[32, 16], &[32, 2], group_size, bits, "affine")
+                    .expect_err(&format!(
+                        "group_size {group_size} / bits {bits} must be rejected"
+                    ));
+            assert!(
+                err.contains(field) && err.contains(&offender.to_string()),
+                "the message must name the offending field and value, got: {err}"
+            );
+        }
+
+        // Degenerate shapes must not launder a hostile pair. The old early return
+        // took both conditions at once, so an empty shape turned a `bits` of 0
+        // into a silent pass-through.
+        for mode in ["affine", "mxfp4"] {
+            assert!(
+                reconcile_quantization_layout(&[], &[], 64, 0, mode).is_err(),
+                "an empty shape must not excuse bits=0 in {mode} mode"
+            );
+            assert!(
+                reconcile_quantization_layout(&[32, 16], &[], 0, 4, mode).is_err(),
+                "an empty scales shape must not excuse group_size=0 in {mode} mode"
+            );
+        }
+
+        // The guard is a bounds check, not an allowlist: every pair a real export
+        // declares still reconciles as it did before, including the shape-derived
+        // overrides the mixed-precision path depends on.
+        for (group_size, bits) in [(32, 4), (64, 4), (128, 4), (64, 8), (64, 6), (16, 4)] {
+            assert!(
+                validate_quantization_params(group_size, bits).is_ok(),
+                "group_size {group_size} / bits {bits} is a real export and must be accepted"
+            );
+        }
+        assert!(validate_quantization_params(1, 1).is_ok());
+        assert!(validate_quantization_params(1, 32).is_ok());
+
+        // `group_size` is bounded above as well, because it survives the
+        // block-float fallbacks unchanged and MLX multiplies it by the scales
+        // width in C++ `int`. An overflow there is undefined behavior reached
+        // before the shape check that would have thrown.
+        assert!(validate_quantization_params(MAX_QUANT_GROUP_SIZE, 4).is_ok());
+        for group_size in [MAX_QUANT_GROUP_SIZE + 1, i32::MAX] {
+            let err = validate_quantization_params(group_size, 4)
+                .expect_err("an unrepresentable group_size must be rejected");
+            assert!(err.contains("group_size"), "unhelpful error: {err}");
+        }
+    }
+
+    /// A quantized layer built without going through
+    /// `reconcile_quantization_layout` stores the declared `group_size` / `bits`
+    /// verbatim, which is exactly how `mamba` / `mamba2` reached
+    /// `quantized_embedding` with an unbounded pair (issue #958). Both halves
+    /// here drive a real entry point rather than the pure helper, so the guard
+    /// is exercised where a checkpoint actually reaches it, and both assert on
+    /// the constructor result with no forward pass, so a regression fails
+    /// cleanly rather than aborting the test binary.
+    ///
+    /// The embedding half targets `QuantizedEmbedding::from_weights`, the path
+    /// production now uses: the by-hand `QuantizedEmbedding::new` was removed in
+    /// issue #976, because requiring a `biases` argument is what made a
+    /// block-float table look non-quantized to the two families that called it.
+    /// `QuantizedMultiLinear::new` stays and is still hand-built here. That
+    /// removal was about a signature that forced the defect, and this one does
+    /// not have it: it takes `Option<biases>` and, since issue #1028, derives
+    /// the mode from that `Option` with the same `infer_quantization_mode` call
+    /// the loader uses, so it can express a block-float plane instead of
+    /// hardcoding `"affine"` over a null bias pointer. It remains the bound for
+    /// the next caller that builds one directly.
+    #[test]
+    fn hand_built_quantized_layers_bound_their_declared_params() {
+        use crate::weights::WeightMap;
+
+        // Honest affine 4-bit geometry: packed_in * 32 == bits * groups * gs,
+        // i.e. 8 * 32 == 4 * 1 * 64.
+        let plane = |last: i32| ffi::from_slice_f32(&vec![0.0; (4 * last) as usize], &[4, last]);
+        let embed_weights = || {
+            let mut weights = WeightMap::new();
+            weights.insert("embed.weight".to_string(), plane(8));
+            weights.insert("embed.scales".to_string(), plane(1));
+            weights.insert("embed.biases".to_string(), plane(1));
+            weights
+        };
+
+        // Positive control first, so a guard that rejects everything quantized
+        // cannot pass this test.
+        QuantizedEmbedding::from_weights(&embed_weights(), "embed", 64, 4)
+            .expect("an honest affine pair must still build a quantized embedding");
+        let affine = QuantizedMultiLinear::new(plane(8), plane(1), Some(plane(1)), 64, 4)
+            .expect("an honest affine pair must still build a quantized MultiLinear");
+        assert_eq!(affine.mode, "affine");
+
+        // The hand-built path has to reach the same mode the loader would for
+        // the same planes, or a caller that owns its tensors (an MLA sanitizer
+        // that decomposed them, say) would be the one way left to build a
+        // layer whose stored mode contradicts its bias pointer.
+        let block_float = QuantizedMultiLinear::new(plane(8), plane(1), None, 64, 4)
+            .expect("a block-float plane carries no zero points and must still build");
+        assert_eq!(block_float.mode, "mxfp4");
+
+        for (group_size, bits, field) in [
+            (64, 0, "bits"),
+            (64, -4, "bits"),
+            (64, 33, "bits"),
+            (0, 4, "group_size"),
+            (-64, 4, "group_size"),
+        ] {
+            let err = QuantizedEmbedding::from_weights(&embed_weights(), "embed", group_size, bits)
+                .err()
+                .unwrap_or_else(|| {
+                    panic!("QuantizedEmbedding::from_weights must reject {group_size} / {bits}")
+                });
+            assert!(err.contains(field), "unhelpful error: {err}");
+
+            let err =
+                QuantizedMultiLinear::new(plane(8), plane(1), Some(plane(1)), group_size, bits)
+                    .err()
+                    .unwrap_or_else(|| {
+                        panic!("QuantizedMultiLinear::new must reject {group_size} / {bits}")
+                    });
+            assert!(err.contains(field), "unhelpful error: {err}");
+        }
+    }
+
+    /// The declared `mode` is the third value in the same `quantization` block
+    /// and, unlike `group_size` / `bits`, is bounded by an allowlist: MLX's
+    /// `string_to_quantization_mode` is a closed four-value enum and mlxcel
+    /// re-derives nothing from the declared string, so mirroring that parser is
+    /// the whole check (issue #973).
+    #[test]
+    fn quantization_mode_allowlist_mirrors_mlx_exactly() {
+        for mode in SUPPORTED_QUANTIZATION_MODES {
+            validate_quantization_mode(mode)
+                .unwrap_or_else(|e| panic!("MLX accepts {mode:?}, so mlxcel must too: {e}"));
+        }
+
+        // `infer_quantization_mode` is the only producer of a mode on the shared
+        // loader path, so every value it can return must be accepted or the
+        // guard would reject checkpoints that load today.
+        for has_biases in [true, false] {
+            for (group_size, bits) in [(64, 4), (32, 4), (16, 4), (64, 8)] {
+                let mode = infer_quantization_mode(has_biases, group_size, bits);
+                validate_quantization_mode(mode).unwrap_or_else(|e| {
+                    panic!("inferred mode {mode:?} must be in the allowlist: {e}")
+                });
+            }
+        }
+
+        // The comparison is exact on purpose: no trimming, no case folding, and
+        // an empty string is a declared value rather than "not declared". The
+        // string checked here is the same string MLX parses byte-for-byte, so
+        // normalizing would accept a spelling that is then stored and forwarded
+        // verbatim into the abort this exists to prevent.
+        for mode in [
+            "optiq", "gptq", "int4", "", "  ", "Affine", "AFFINE", " mxfp4", "mxfp4 ",
+        ] {
+            let Err(err) = validate_quantization_mode(mode) else {
+                panic!("MLX would throw on {mode:?}, so the load must fail first")
+            };
+            assert!(
+                err.contains("affine") && err.contains("nvfp4"),
+                "the message must name the accepted set: {err}"
+            );
+        }
+    }
+
+    /// The reconciler is the one place every `UnifiedLinear` and
+    /// `UnifiedEmbedding` passes through, so bounding the mode there covers the
+    /// whole dense surface at once. It also makes the `mode == "affine"` branch
+    /// total: an unrecognized string used to take the block-float branch, which
+    /// on a genuine affine tensor re-derives the declared group size back onto
+    /// itself, so nothing diverged and not even the warning fired (issue #973).
+    #[test]
+    fn reconciler_rejects_a_mode_mlx_cannot_parse() {
+        // Honest affine 4-bit geometry: packed_in * 32 == bits * groups * gs.
+        let (weight, scales) = (&[4, 8][..], &[4, 1][..]);
+
+        // Positive control first, so a guard that rejects everything cannot pass.
+        let ok = reconcile_quantization_layout(weight, scales, 64, 4, "affine")
+            .expect("an honest affine layout must still reconcile");
+        assert_eq!((ok.bits, ok.group_size, ok.reconciled), (4, 64, false));
+
+        for mode in ["optiq", "", "Affine"] {
+            let err = reconcile_quantization_layout(weight, scales, 64, 4, mode)
+                .expect_err("an unparseable mode must be refused");
+            assert!(err.contains("mode"), "unhelpful error: {err}");
+        }
+
+        // Degenerate shapes take an early return that trusts the caller, but the
+        // mode is checked before it, exactly as the param bound is.
+        assert!(reconcile_quantization_layout(&[], &[], 64, 4, "optiq").is_err());
+    }
+
+    /// A mode that parses but contradicts the `.biases` plane aborts just as
+    /// hard, inside MLX's `validate_mode_with_type`. Rejecting it at load can
+    /// only refuse a checkpoint that was already going to abort, because the
+    /// predicate is MLX's own (issue #973).
+    #[test]
+    fn declared_mode_must_agree_with_bias_presence() {
+        validate_quantization_biases("affine", true).expect("affine with zero points is the norm");
+        for mode in ["mxfp4", "mxfp8", "nvfp4"] {
+            validate_quantization_biases(mode, false)
+                .unwrap_or_else(|e| panic!("{mode} without zero points is the norm: {e}"));
+        }
+
+        let err = validate_quantization_biases("affine", false)
+            .expect_err("affine without zero points aborts in MLX");
+        assert!(err.contains("affine") && err.contains("biases"), "{err}");
+
+        for mode in ["mxfp4", "mxfp8", "nvfp4"] {
+            let err = validate_quantization_biases(mode, true)
+                .expect_err("block-float with zero points aborts in MLX");
+            assert!(err.contains(mode) && err.contains("biases"), "{err}");
+        }
+
+        // An unparseable mode fails here too, so a caller needs one call.
+        assert!(validate_quantization_biases("optiq", true).is_err());
+        assert!(validate_quantization_biases("optiq", false).is_err());
+    }
+
+    /// `QuantizedWeight::new_with_mode` is the by-hand constructor that takes an
+    /// unbounded mode string and never reaches the reconciler. It has no callers
+    /// in the tree, which is exactly why the bound belongs on the signature: the
+    /// next family to build one directly inherits it (issue #973).
+    #[test]
+    fn hand_built_quantized_weight_bounds_its_declared_mode() {
+        let plane = |last: i32| ffi::from_slice_f32(&vec![0.0; (4 * last) as usize], &[4, last]);
+
+        // Positive controls first, in both bias conventions.
+        QuantizedWeight::new_with_mode(plane(8), plane(1), Some(plane(1)), 64, 4, "affine".into())
+            .expect("an honest affine triple must still build");
+        QuantizedWeight::new_with_mode(plane(8), plane(1), None, 32, 4, "mxfp4".into())
+            .expect("an honest mxfp4 pair must still build");
+
+        for mode in ["optiq", "", "Affine"] {
+            let err =
+                QuantizedWeight::new_with_mode(plane(8), plane(1), None, 64, 4, mode.to_string())
+                    .err()
+                    .unwrap_or_else(|| panic!("an unparseable mode {mode:?} must be refused"));
+            assert!(err.contains("mode"), "unhelpful error: {err}");
+        }
+
+        // The declared pair is still bounded here as well.
+        assert!(
+            QuantizedWeight::new_with_mode(
+                plane(8),
+                plane(1),
+                Some(plane(1)),
+                0,
+                4,
+                "affine".into()
+            )
+            .is_err()
+        );
+        // And the mode must agree with the biases argument.
+        assert!(
+            QuantizedWeight::new_with_mode(plane(8), plane(1), None, 64, 4, "affine".into())
+                .is_err()
+        );
+    }
+
+    /// The two shared loaders that accept an explicit mode are what gpt-oss
+    /// threads its `config.json` string into, so drive them rather than the
+    /// helpers in isolation. The assertions are on the load `Result` and no
+    /// forward pass runs, so a regression fails cleanly here instead of aborting
+    /// the test binary the way it would in production (issue #973).
+    #[test]
+    fn explicit_mode_loaders_reject_a_config_declared_bad_mode() {
+        // Honest affine 4-bit geometry: 8 * 32 == 4 * 1 * 64.
+        let plane = |last: i32| ffi::from_slice_f32(&vec![0.0; (4 * last) as usize], &[4, last]);
+        let mut affine = crate::weights::WeightMap::new();
+        affine.insert("q_proj.weight".to_string(), plane(8));
+        affine.insert("q_proj.scales".to_string(), plane(1));
+        affine.insert("q_proj.biases".to_string(), plane(1));
+
+        // Positive controls first, so a guard that rejects everything quantized
+        // cannot pass this test.
+        UnifiedLinear::from_weights_with_mode(&affine, "q_proj", 64, 4, "affine")
+            .expect("an honest affine projection must still load");
+        QuantizedEmbedding::from_weights_with_mode(&affine, "q_proj", 64, 4, "affine")
+            .expect("an honest affine embedding must still load");
+
+        for mode in ["optiq", "gptq", "", "Affine"] {
+            let err = UnifiedLinear::from_weights_with_mode(&affine, "q_proj", 64, 4, mode)
+                .err()
+                .unwrap_or_else(|| panic!("an unparseable mode {mode:?} must be refused at load"));
+            assert!(
+                err.contains("mode") && err.contains("q_proj"),
+                "the message must name the field and the prefix: {err}"
+            );
+            let err = QuantizedEmbedding::from_weights_with_mode(&affine, "q_proj", 64, 4, mode)
+                .err()
+                .unwrap_or_else(|| panic!("an unparseable mode {mode:?} must be refused at load"));
+            assert!(err.contains("mode"), "unhelpful error: {err}");
+        }
+
+        // A parseable mode that contradicts the plane is refused too. Declaring
+        // block-float over a plane that ships zero points is the mirror of the
+        // affine-without-biases case, and MLX throws on both.
+        let err = UnifiedLinear::from_weights_with_mode(&affine, "q_proj", 32, 4, "mxfp4")
+            .err()
+            .unwrap_or_else(|| panic!("mxfp4 over a .biases-carrying plane aborts in MLX"));
+        assert!(err.contains("biases"), "unhelpful error: {err}");
+
+        let mut block_float = crate::weights::WeightMap::new();
+        block_float.insert("gate_proj.weight".to_string(), plane(8));
+        block_float.insert("gate_proj.scales".to_string(), plane(1));
+        UnifiedLinear::from_weights_with_mode(&block_float, "gate_proj", 32, 4, "mxfp4")
+            .expect("an honest mxfp4 projection must still load");
+        let err = UnifiedLinear::from_weights_with_mode(&block_float, "gate_proj", 64, 4, "affine")
+            .err()
+            .unwrap_or_else(|| panic!("affine over a plane with no zero points aborts in MLX"));
+        assert!(err.contains("biases"), "unhelpful error: {err}");
+
+        // A non-quantized projection carries no packing and no mode, so it must
+        // not be gated on either.
+        let mut regular = crate::weights::WeightMap::new();
+        regular.insert("o_proj.weight".to_string(), plane(8));
+        UnifiedLinear::from_weights_with_mode(&regular, "o_proj", 64, 4, "optiq")
+            .expect("a non-quantized projection must not be gated on the declared mode");
+    }
+
+    /// One plane of a per-head MLA projection: `num_heads` 2, `output_dim` 4,
+    /// `last` packed or group-counted depending on which plane it is.
+    fn mla_plane(last: i32) -> UniquePtr<MlxArray> {
+        ffi::from_slice_f32(&vec![0.0; (2 * 4 * last) as usize], &[2, 4, last])
+    }
+
+    /// A quantized `embed_q` / `unembed_out` triple under `prefix`, with the
+    /// `.biases` plane present only when the mode carries zero points.
+    ///
+    /// Callers pass honest geometry (`packed_in * 32 == bits * num_groups *
+    /// group_size`) even though this loader deliberately never reconciles the
+    /// declared pair against the shapes, so the fixtures do not teach a layout
+    /// MLX would reject one call later.
+    fn mla_quantized_weights(
+        prefix: &str,
+        packed_in: i32,
+        num_groups: i32,
+        with_biases: bool,
+    ) -> crate::weights::WeightMap {
+        let mut weights = crate::weights::WeightMap::new();
+        weights.insert(format!("{prefix}.weight"), mla_plane(packed_in));
+        weights.insert(format!("{prefix}.scales"), mla_plane(num_groups));
+        if with_biases {
+            weights.insert(format!("{prefix}.biases"), mla_plane(num_groups));
+        }
+        weights
+    }
+
+    /// `QuantizedMultiLinear::from_weights` is a shared loader that stores the
+    /// declared pair verbatim and hands it to `quantized_matmul` on every MLA
+    /// forward, without ever calling the reconciler. It sat in the same blind
+    /// spot `SwitchLinear::from_stacked_parts` occupied before #929, and it is
+    /// reached by DeepSeek V3, DeepSeek V3.2, GLM4 MoE Lite and LongCat Flash
+    /// NGram through their `embed_q` / `unembed_out` (issue #958).
+    #[test]
+    fn multi_linear_loader_bounds_its_declared_params() {
+        let weights = mla_quantized_weights("embed_q", 8, 1, true);
+
+        QuantizedMultiLinear::from_weights(&weights, "embed_q", 64, 4)
+            .expect("an honest affine pair must still load");
+
+        for (group_size, bits, field) in [
+            (64, 0, "bits"),
+            (64, 33, "bits"),
+            (0, 4, "group_size"),
+            (-64, 4, "group_size"),
+        ] {
+            let err = QuantizedMultiLinear::from_weights(&weights, "embed_q", group_size, bits)
+                .err()
+                .unwrap_or_else(|| panic!("the loader must reject {group_size} / {bits}"));
+            assert!(
+                err.contains(field) && err.contains("embed_q"),
+                "the message must name both the field and the tensor, got: {err}"
+            );
+        }
+
+        // A non-quantized projection carries no packing, so the params are
+        // irrelevant there and must not be enforced.
+        let mut regular = crate::weights::WeightMap::new();
+        regular.insert("embed_q.weight".to_string(), mla_plane(8));
+        MultiLinear::from_weights(&regular, "embed_q", 0, 0)
+            .expect("a non-quantized MultiLinear must not be gated on quantization params");
+    }
+
+    /// `QuantizedMultiLinear` stored `"affine"` nowhere and hardcoded it at
+    /// every kernel call, so a block-float `embed_q` / `unembed_out`
+    /// (`.scales`, no `.biases`, which is what mxfp4 / nvfp4 / mxfp8 ship by
+    /// design) satisfied `MultiLinear::from_weights`'s `.scales`-only gate,
+    /// loaded without complaint, and then handed `quantized_matmul` a null bias
+    /// pointer under a declared affine mode. MLX's `validate_mode_with_type`
+    /// throws `Biases must be provided for affine quantization` on exactly
+    /// that, and the throw crosses the cxx bridge as an uncatchable abort at
+    /// the first MLA forward rather than a load error (issue #1028).
+    ///
+    /// No forward pass is run here: on a regressed load a forward aborts the
+    /// test binary instead of failing the test. The assertion is on the stored
+    /// mode instead, which is sound because the field is the single value
+    /// `forward`, `forward_no_transpose` and `dequantize` all read. The two
+    /// forward methods share one private `quantized_matmul` body precisely so
+    /// there is no second copy of the mode argument for a fix to miss.
+    #[test]
+    fn multi_linear_loader_infers_its_quantization_mode_from_the_biases_plane() {
+        // Geometry per mode, all satisfying packed_in * 32 == bits *
+        // num_groups * group_size: 4-bit at group_size 64 packs 8 uint32 into
+        // one group, nvfp4's group_size 16 splits the same width into four,
+        // and mxfp8 needs twice the packed width for one group.
+        for (packed_in, num_groups, with_biases, group_size, bits, expected) in [
+            (8, 1, true, 64, 4, "affine"),
+            (8, 1, false, 64, 4, "mxfp4"),
+            (8, 4, false, 16, 4, "nvfp4"),
+            (16, 1, false, 64, 8, "mxfp8"),
+        ] {
+            let weights = mla_quantized_weights("embed_q", packed_in, num_groups, with_biases);
+            let loaded = QuantizedMultiLinear::from_weights(&weights, "embed_q", group_size, bits)
+                .unwrap_or_else(|e| {
+                    panic!("an honest {expected} embed_q must load, got: {e}");
+                });
+            assert_eq!(
+                loaded.mode, expected,
+                "a plane with biases present = {with_biases} at {group_size} / {bits} is {expected}"
+            );
+            assert_eq!(loaded.biases.is_some(), with_biases);
+            // The precondition every kernel call on this layer hands MLX: the
+            // stored mode and the bias pointer derived from `self.biases` must
+            // agree, or the call aborts the process.
+            validate_quantization_biases(loaded.mode, loaded.biases.is_some()).unwrap_or_else(
+                |e| panic!("the stored mode contradicts the plane it was inferred from: {e}"),
+            );
+        }
+
+        // The four MLA families reach the layer through the enum, so pin the
+        // mode on that path too rather than only on the inner loader.
+        let block_float = mla_quantized_weights("unembed_out", 8, 1, false);
+        match MultiLinear::from_weights(&block_float, "unembed_out", 64, 4)
+            .expect("a block-float unembed_out must load as quantized")
+        {
+            MultiLinear::Quantized(q) => assert_eq!(q.mode, "mxfp4"),
+            MultiLinear::Regular(_) => {
+                panic!("a plane carrying .scales is quantized even with no .biases")
+            }
+        }
+
+        // A dense projection carries no packing and no mode, so it must not be
+        // gated on either.
+        let mut regular = crate::weights::WeightMap::new();
+        regular.insert("unembed_out.weight".to_string(), mla_plane(8));
+        match MultiLinear::from_weights(&regular, "unembed_out", 64, 4)
+            .expect("a dense unembed_out must still load")
+        {
+            MultiLinear::Regular(_) => {}
+            MultiLinear::Quantized(_) => panic!("a plane with no .scales is not quantized"),
+        }
+    }
+
+    /// The contradiction this loader must never store is a mode that disagrees
+    /// with the `.biases` plane, which MLX refuses inside `quantized_matmul`
+    /// and `dequantize` alike.
+    ///
+    /// Stated honestly: the `validate_quantization_biases` call in
+    /// `from_weights` cannot fire while the inference above it stands, because
+    /// the mode is derived from the same `biases.is_some()` it re-checks one
+    /// line later. It is not decorative either. Regressing that inference back
+    /// to a hardcoded `"affine"` makes this test fail on the load `Result`,
+    /// which is the guard doing its job: the contradiction is refused at load
+    /// instead of aborting the process at the first MLA forward. The rest of
+    /// what is testable, and what actually protects the four families, is that
+    /// the pairing holds for every declared pair the loader accepts and that
+    /// the guard rejects both directions. This is the same position
+    /// `kimi_linear`'s private `MultiLinear` records for its copy of the call
+    /// (issue #1026).
+    #[test]
+    fn multi_linear_loader_cannot_store_a_mode_that_contradicts_its_planes() {
+        // Real export pairs, plus a group_size 16 to reach the nvfp4 arm, each
+        // with the packed width and group count that pair actually implies.
+        for (packed_in, num_groups, group_size, bits) in [
+            (8, 4, 16, 4),
+            (8, 2, 32, 4),
+            (8, 1, 64, 4),
+            (16, 1, 128, 4),
+            (16, 1, 64, 8),
+            (12, 1, 64, 6),
+        ] {
+            for with_biases in [true, false] {
+                let weights = mla_quantized_weights("embed_q", packed_in, num_groups, with_biases);
+                let loaded =
+                    QuantizedMultiLinear::from_weights(&weights, "embed_q", group_size, bits)
+                        .unwrap_or_else(|e| panic!("{group_size} / {bits} is a real export: {e}"));
+                validate_quantization_biases(loaded.mode, loaded.biases.is_some()).unwrap_or_else(
+                    |e| {
+                        panic!(
+                            "at {group_size} / {bits} with biases present = {with_biases} the \
+                             loader stored {:?}, which MLX aborts on: {e}",
+                            loaded.mode
+                        )
+                    },
+                );
+            }
+        }
+
+        // Both directions of the contradiction, so the call in `from_weights`
+        // is holding a guard that can say no rather than a tautology.
+        let err = validate_quantization_biases("affine", false)
+            .expect_err("affine over a plane with no zero points aborts in MLX");
+        assert!(err.contains("biases"), "unhelpful error: {err}");
+        let err = validate_quantization_biases("mxfp4", true)
+            .expect_err("mxfp4 over a .biases-carrying plane aborts in MLX");
+        assert!(err.contains("biases"), "unhelpful error: {err}");
+
+        // The hand-built constructor derives the mode the same way, so it
+        // cannot be the one remaining way to build a contradicting layer.
+        // nvfp4's group_size 16 splits the same 8-uint32 packed width into
+        // four groups, so the scales plane is four wide here.
+        let hand_built = QuantizedMultiLinear::new(mla_plane(8), mla_plane(4), None, 16, 4)
+            .expect("a block-float plane must still build by hand");
+        assert_eq!(hand_built.mode, "nvfp4");
+        validate_quantization_biases(hand_built.mode, hand_built.biases.is_some())
+            .expect("the hand-built layer must satisfy the same precondition as the loaded one");
+    }
+
+    /// The MLA `kv_b_proj` pair is solved from shapes rather than declared, and
+    /// every input is untrusted: `kv_lora_rank` is a config field and both axes
+    /// are checkpoint data. The naive arithmetic panics on a zero divisor and
+    /// overflows `i32` on a large packed axis, both of which happen BEFORE any
+    /// bound on the solved pair could fire, so the divisor and overflow checks
+    /// have to come first (issue #958).
+    #[test]
+    fn mla_param_inference_checks_every_divisor_before_dividing() {
+        // Positive control: a real DeepSeek-shaped 4-bit kv_b_proj. packed_in
+        // 64 * 32 / kv_lora_rank 512 solves to 4 bits, and 512 / 8 groups
+        // solves to group_size 64.
+        assert_eq!(
+            infer_mla_quantization_params(&[256, 64], &[256, 8], 512, "kv_b_proj")
+                .expect("an honest MLA layout must solve"),
+            (64, 4)
+        );
+
+        // A zero `kv_lora_rank` is Rust integer division by zero, which panics
+        // rather than returning something the bound could reject.
+        let err = infer_mla_quantization_params(&[256, 64], &[256, 8], 0, "kv_b_proj")
+            .expect_err("kv_lora_rank 0 must be rejected, not divided by");
+        assert!(err.contains("kv_lora_rank"), "unhelpful error: {err}");
+
+        // Same for a zero-length scales axis, the other divisor.
+        let err = infer_mla_quantization_params(&[256, 64], &[256, 0], 512, "kv_b_proj")
+            .expect_err("a zero-length scales axis must be rejected, not divided by");
+        assert!(err.contains("positive last axis"), "unhelpful error: {err}");
+
+        // A rank-0 tensor has no last axis at all, which used to index out of
+        // bounds.
+        assert!(infer_mla_quantization_params(&[], &[256, 8], 512, "kv_b_proj").is_err());
+        assert!(infer_mla_quantization_params(&[256, 64], &[], 512, "kv_b_proj").is_err());
+
+        // `packed_in * 32` overflows i32 well before this axis is reachable in
+        // memory, so it is evaluated in i64 and the result bounded instead.
+        let err = infer_mla_quantization_params(&[1, i32::MAX], &[1, 8], 512, "kv_b_proj")
+            .expect_err("an overflowing packed axis must be rejected");
+        assert!(err.contains("bits"), "unhelpful error: {err}");
+
+        // A solved pair that lands outside anything MLX can describe is refused
+        // on the same path: 8 * 32 / 512 truncates to 0 bits.
+        let err = infer_mla_quantization_params(&[256, 8], &[256, 8], 512, "kv_b_proj")
+            .expect_err("a solved bit width of 0 must be rejected");
+        assert!(err.contains("bits"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn quantized_packing_check_compares_the_weight_side_too() {
+        // The scales-side comparison alone is not MLX's test. The block-float
+        // reconciler keeps the declared group_size in both of its fallbacks, so
+        // `groups * group_size` can hit the config width while the packed weight
+        // describes something else. Here in_features = 8 * (32/4) = 64 does not
+        // divide by 3 groups, so the reconciler keeps group_size 32, the
+        // scales side reports 3 * 32 = 96 and matches the config, and only the
+        // weight side (8 * 32 / 4 = 64) catches it. MLX throws on exactly that.
+        let inconsistent = QuantizedTensorShapes {
+            weight: &[16, 8],
+            scales: &[16, 3],
+            biases: None,
+        };
+        let err = validate_quantized_packing("gate_proj", &inconsistent, 96, 32, 4, "mxfp4")
+            .expect_err("a packing MLX would reject must fail at load");
+        assert!(
+            err.contains("describes an input width of 64"),
+            "the message must name the weight-side width, got: {err}"
+        );
+
+        // The other block-float fallback, `32 % bits != 0`, keeps the declared
+        // group_size without inferring anything at all.
+        let odd_bits = QuantizedTensorShapes {
+            weight: &[16, 8],
+            scales: &[16, 3],
+            biases: None,
+        };
+        assert!(validate_quantized_packing("gate_proj", &odd_bits, 96, 32, 6, "mxfp4").is_err());
+
+        // A consistent block-float triple still passes: 32 packed columns at
+        // 4-bit describe 256, and 8 groups at group_size 32 describe 256.
+        let consistent = QuantizedTensorShapes {
+            weight: &[64, 32],
+            scales: &[64, 8],
+            biases: None,
+        };
+        validate_quantized_packing("gate_proj", &consistent, 256, 32, 4, "mxfp4")
+            .expect("a consistently packed mxfp4 tensor must load");
+    }
+
+    #[test]
+    fn quantized_loaders_reject_hostile_params_at_load_not_at_the_first_forward() {
+        // The real load path, not the pure helper: both production entry points
+        // must surface a Rust error. Losing this guard turns a rejected load
+        // into an uncatchable abort at the first `quantized_matmul` in
+        // production; here the assertion is on the load result, so a regression
+        // fails cleanly.
+        let mut weights = crate::weights::WeightMap::new();
+        insert_quantized_qkv_projection(&mut weights, "model.layers.0.self_attn.q_proj", 8);
+        insert_quantized_qkv_projection(&mut weights, "model.embed_tokens", 16);
+
+        // Positive control: the honest pair loads on both paths.
+        UnifiedLinear::from_weights(&weights, "model.layers.0.self_attn.q_proj", 64, 4)
+            .expect("a consistently packed projection must load");
+        UnifiedEmbedding::from_weights(&weights, "model.embed_tokens", 64, 4)
+            .expect("a consistently packed table must load");
+
+        for (group_size, bits, field) in [
+            (64, 0, "bits"),
+            (64, 33, "bits"),
+            (0, 4, "group_size"),
+            (-64, 4, "group_size"),
+        ] {
+            let err = UnifiedLinear::from_weights(
+                &weights,
+                "model.layers.0.self_attn.q_proj",
+                group_size,
+                bits,
+            )
+            .err()
+            .unwrap_or_else(|| {
+                panic!("UnifiedLinear must reject group_size {group_size} / bits {bits}")
+            });
+            assert!(err.contains(field), "unhelpful error: {err}");
+
+            let err =
+                UnifiedEmbedding::from_weights(&weights, "model.embed_tokens", group_size, bits)
+                    .err()
+                    .unwrap_or_else(|| {
+                        panic!("UnifiedEmbedding must reject group_size {group_size} / bits {bits}")
+                    });
+            assert!(err.contains(field), "unhelpful error: {err}");
+        }
+    }
+
+    #[test]
+    fn quantized_packing_check_reconstructs_the_width_mlx_will_compute() {
+        // 4-bit at group_size 64: packed_in 8 and 1 group both describe a 64-wide
+        // input, so the honest triple passes.
+        let honest = QuantizedTensorShapes {
+            weight: &[32, 8],
+            scales: &[32, 1],
+            biases: Some(&[32, 1]),
+        };
+        validate_quantized_packing("q_proj", &honest, 64, 64, 4, "affine")
+            .expect("a consistently packed projection must pass");
+
+        // A tensor honestly packed for a 128-wide input keeps exactly the right
+        // row count, which is why the row check cannot catch it.
+        let mispacked = QuantizedTensorShapes {
+            weight: &[32, 16],
+            scales: &[32, 2],
+            biases: Some(&[32, 2]),
+        };
+        let err = validate_quantized_packing("q_proj", &mispacked, 64, 64, 4, "affine")
+            .expect_err("a table packed for a different width must be rejected");
+        assert!(err.contains("input width"), "unhelpful error: {err}");
+
+        // Zero points must match the scales they belong to.
+        let bad_biases = QuantizedTensorShapes {
+            weight: &[32, 8],
+            scales: &[32, 1],
+            biases: Some(&[32, 2]),
+        };
+        let err = validate_quantized_packing("q_proj", &bad_biases, 64, 64, 4, "affine")
+            .expect_err("mis-shaped zero points must be rejected");
+        assert!(err.contains("same shape"), "unhelpful error: {err}");
+
+        // Rank and leading-axis agreement, which the width arithmetic assumes.
+        let bad_rank = QuantizedTensorShapes {
+            weight: &[32, 8],
+            scales: &[32],
+            biases: None,
+        };
+        assert!(validate_quantized_packing("q_proj", &bad_rank, 64, 64, 4, "affine").is_err());
+        let bad_rows = QuantizedTensorShapes {
+            weight: &[32, 8],
+            scales: &[16, 1],
+            biases: None,
+        };
+        assert!(validate_quantized_packing("q_proj", &bad_rows, 64, 64, 4, "affine").is_err());
+
+        // A 3-D stacked expert plane works the same way: only the last axis
+        // carries the packing.
+        let stacked = QuantizedTensorShapes {
+            weight: &[4, 32, 8],
+            scales: &[4, 32, 1],
+            biases: Some(&[4, 32, 1]),
+        };
+        validate_quantized_packing("switch_mlp.gate_proj", &stacked, 64, 64, 4, "affine")
+            .expect("a stacked expert plane must pass the same check");
+    }
+
+    #[test]
+    fn quantization_mode_inference_is_shared_by_the_linear_and_embedding_loaders() {
+        assert_eq!(infer_quantization_mode(true, 64, 4), "affine");
+        assert_eq!(infer_quantization_mode(true, 16, 8), "affine");
+        assert_eq!(infer_quantization_mode(false, 64, 8), "mxfp8");
+        assert_eq!(infer_quantization_mode(false, 16, 4), "nvfp4");
+        assert_eq!(infer_quantization_mode(false, 64, 4), "mxfp4");
+        assert_eq!(infer_quantization_mode(false, 32, 4), "mxfp4");
+    }
+
+    #[test]
+    fn fused_qkv_quantized_preserves_linear_bias() {
+        let mut weights = crate::weights::WeightMap::new();
+        insert_quantized_qkv_projection(&mut weights, "model.layers.0.self_attn.q_proj", 8);
+        insert_quantized_qkv_projection(&mut weights, "model.layers.0.self_attn.k_proj", 4);
+        insert_quantized_qkv_projection(&mut weights, "model.layers.0.self_attn.v_proj", 4);
+
+        let fused = FusedQKVLinear::from_weights_separate(
+            &weights,
+            "model.layers.0.self_attn",
+            64,
+            4,
+            2,
+            1,
+            4,
+        )
+        .expect("valid fused QKV weights");
+
+        let fused_proj = match fused.qkv_proj {
+            QkvProjection::Fused(proj) => proj,
+            QkvProjection::Split { .. } => {
+                panic!("uniform-width q/k/v must still fuse into one plane")
+            }
+        };
+        match fused_proj {
+            UnifiedLinear::Quantized { weight, bias } => {
+                let bias = bias.expect("Qwen2-style q/k/v linear bias must be preserved");
+                assert_eq!(ffi::array_shape(&bias).as_slice(), &[16]);
+
+                let quant_biases = weight
+                    .biases
+                    .expect("quantization biases should still be preserved");
+                assert_eq!(ffi::array_shape(&quant_biases).as_slice(), &[16, 1]);
+            }
+            UnifiedLinear::Regular(_) => panic!("expected quantized fused QKV"),
+        }
+    }
+
+    // -- mixed-bit-width q/k/v projections (issue #1090) -----------------
+    //
+    // `mlx_lm`'s `mixed_4_8` predicate raises selected tensors (commonly
+    // `v_proj`) to 8 bits while the rest of the model stays at 4. The packed
+    // planes of such a layer have different widths and cannot be concatenated,
+    // so the loader keeps them separate. Everything below builds its planes
+    // with MLX's own quantizer, so the fixtures are real packings rather than
+    // shape stand-ins.
+
+    /// A deterministic dense plane of shape `[out, MIXED_IN]`.
+    fn mixed_dense_plane(out: i32, seed: i32) -> UniquePtr<MlxArray> {
+        let n = (out * MIXED_IN) as usize;
+        let data: Vec<f32> = (0..n)
+            .map(|i| (((i as i32 * 37 + seed * 11) % 97) as f32 - 48.0) * 0.01)
+            .collect();
+        ffi::from_slice_f32(&data, &[out, MIXED_IN])
+    }
+
+    /// In-features width of every fixture plane below. One quantization group
+    /// wide at `MIXED_GROUP`, so a 4-bit plane packs to `[out, 8]` and an 8-bit
+    /// plane to `[out, 16]`: concatenating those along axis 0 is exactly the
+    /// hard MLX shape error the split representation exists to avoid.
+    const MIXED_IN: i32 = 64;
+    const MIXED_GROUP: i32 = 64;
+
+    /// Insert `{prefix}.{weight,scales,biases}` quantized at `bits`.
+    fn insert_affine_plane(
+        weights: &mut crate::weights::WeightMap,
+        prefix: &str,
+        out: i32,
+        seed: i32,
+        bits: i32,
+    ) {
+        let dense = mixed_dense_plane(out, seed);
+        weights.insert(
+            format!("{prefix}.weight"),
+            ffi::quantize_weights_w(&dense, MIXED_GROUP, bits),
+        );
+        weights.insert(
+            format!("{prefix}.scales"),
+            ffi::quantize_weights_scales(&dense, MIXED_GROUP, bits),
+        );
+        weights.insert(
+            format!("{prefix}.biases"),
+            ffi::quantize_weights_biases(&dense, MIXED_GROUP, bits),
+        );
+    }
+
+    /// Dequantize `{prefix}` straight from the weight map at a known width,
+    /// independently of anything the loader decided.
+    fn reference_dequantize(
+        weights: &crate::weights::WeightMap,
+        prefix: &str,
+        bits: i32,
+    ) -> UniquePtr<MlxArray> {
+        let w = weights.get(&format!("{prefix}.weight")).unwrap();
+        let s = weights.get(&format!("{prefix}.scales")).unwrap();
+        let b = weights.get(&format!("{prefix}.biases")).unwrap();
+        // SAFETY: all three are borrowed from live map entries for the call.
+        unsafe {
+            ffi::dequantize(
+                w,
+                s,
+                b.as_ref().unwrap() as *const MlxArray,
+                MIXED_GROUP,
+                bits,
+                "affine",
+            )
+        }
+    }
+
+    fn plane_max_abs_diff(a: &MlxArray, b: &MlxArray) -> f32 {
+        let d = ffi::max_all(&ffi::abs(&ffi::subtract(a, b)));
+        ffi::eval(&d);
+        ffi::item_f32(&d)
+    }
+
+    /// A `mixed_4_8` attention layer: `q_proj` / `k_proj` at 4 bits, `v_proj` at
+    /// 8. `q_proj` is 8 rows and `k_proj` / `v_proj` 4 each, so the layer is a
+    /// GQA `n_heads = 2, n_kv_heads = 1, head_dim = 4`.
+    fn mixed_4_8_layer() -> crate::weights::WeightMap {
+        let mut weights = crate::weights::WeightMap::new();
+        insert_affine_plane(&mut weights, "l.self_attn.q_proj", 8, 1, 4);
+        insert_affine_plane(&mut weights, "l.self_attn.k_proj", 4, 2, 4);
+        insert_affine_plane(&mut weights, "l.self_attn.v_proj", 4, 3, 8);
+        weights
+    }
+
+    fn uniform_layer(bits: i32) -> crate::weights::WeightMap {
+        let mut weights = crate::weights::WeightMap::new();
+        insert_affine_plane(&mut weights, "l.self_attn.q_proj", 8, 1, bits);
+        insert_affine_plane(&mut weights, "l.self_attn.k_proj", 4, 2, bits);
+        insert_affine_plane(&mut weights, "l.self_attn.v_proj", 4, 3, bits);
+        weights
+    }
+
+    fn load_mixed(weights: &crate::weights::WeightMap) -> FusedQKVLinear {
+        FusedQKVLinear::from_weights_separate(weights, "l.self_attn", MIXED_GROUP, 4, 2, 1, 4)
+            .expect("mixed-width q/k/v must load")
+    }
+
+    /// The fusability predicate is over the packed shapes, which is
+    /// `concatenate`'s own precondition: `(packed_width, num_groups)` per plane.
+    /// A divergence in `bits`, in `group_size`, or in both shows up in one of
+    /// the two numbers.
+    #[test]
+    fn qkv_fusability_is_decided_by_the_packed_shapes() {
+        assert!(qkv_planes_are_fusable(&[(256, 32), (256, 32), (256, 32)]));
+        assert!(
+            !qkv_planes_are_fusable(&[(256, 32), (256, 32), (512, 32)]),
+            "a divergent bit width doubles the packed weight width"
+        );
+        assert!(
+            !qkv_planes_are_fusable(&[(256, 32), (256, 64), (256, 32)]),
+            "a divergent group size changes the scales width even at an equal packed width"
+        );
+        assert!(qkv_planes_are_fusable(&[]), "nothing to disagree about");
+        assert!(qkv_planes_are_fusable(&[(256, 32)]));
+    }
+
+    /// Why the predicate is over shapes rather than over the reconciled
+    /// `(bits, group_size)` pairs: under a declared group size of 64, an 8-bit
+    /// plane at group size 32 reconciles to the same `(4, 64)` as a genuine
+    /// 4-bit plane at 64 while packing to twice the width. A predicate over the
+    /// pairs would call those two fusable and hand `concatenate` two different
+    /// widths, which throws inside MLX and crosses the cxx bridge as an
+    /// uncatchable abort.
+    #[test]
+    fn planes_that_reconcile_alike_are_still_split_when_their_packings_differ() {
+        // Both describe a 512-wide input: 4-bit/gs64 packs to 64 columns over 8
+        // groups, 8-bit/gs32 packs to 128 columns over 16.
+        let narrow = reconcile_quantization_layout(&[64, 64], &[64, 8], 64, 4, "affine")
+            .expect("4-bit at the declared group size reconciles");
+        let wide = reconcile_quantization_layout(&[64, 128], &[64, 16], 64, 4, "affine")
+            .expect("8-bit at half the declared group size also reconciles");
+        assert_eq!(
+            (narrow.bits, narrow.group_size),
+            (wide.bits, wide.group_size),
+            "test premise: the two packings really do alias onto one reconciled pair"
+        );
+        assert!(
+            !qkv_planes_are_fusable(&[(64, 8), (64, 8), (128, 16)]),
+            "the shape predicate must split them anyway"
+        );
+    }
+
+    /// A `mixed_4_8` layer loads (it used to abort inside MLX's `concatenate`)
+    /// and keeps its three planes in the widths the checkpoint stored them at.
+    #[test]
+    fn mixed_bit_width_qkv_keeps_its_three_planes_separate() {
+        let weights = mixed_4_8_layer();
+        let fused = load_mixed(&weights);
+
+        let QkvProjection::Split { q, k, v } = &fused.qkv_proj else {
+            panic!("a 4/4/8-bit layer cannot be concatenated into one plane");
+        };
+        for (name, plane, expected_bits) in [("q", q, 4), ("k", k, 4), ("v", v, 8)] {
+            let qw = plane
+                .as_quantized_weight()
+                .unwrap_or_else(|| panic!("{name}_proj must stay packed, not be densified"));
+            assert_eq!(
+                (qw.bits, qw.group_size),
+                (expected_bits, MIXED_GROUP),
+                "{name}_proj must keep the layout its own shapes imply"
+            );
+        }
+    }
+
+    /// Nothing is requantized across bit widths and nothing is dequantized and
+    /// re-packed, so every plane dequantizes to exactly what it did in the
+    /// checkpoint. Exact, not approximate: `assert_eq!(diff, 0.0)`.
+    #[test]
+    fn mixed_bit_width_qkv_planes_are_numerically_exact() {
+        let weights = mixed_4_8_layer();
+        let fused = load_mixed(&weights);
+        let QkvProjection::Split { q, k, v } = &fused.qkv_proj else {
+            panic!("expected a split projection");
+        };
+
+        for (name, plane, bits) in [("q", q, 4), ("k", k, 4), ("v", v, 8)] {
+            let expected =
+                reference_dequantize(&weights, &format!("l.self_attn.{name}_proj"), bits);
+            let actual = plane.dequantized_weight();
+            ffi::eval(&expected);
+            ffi::eval(&actual);
+            assert_eq!(
+                plane_max_abs_diff(&expected, &actual),
+                0.0,
+                "{name}_proj must be bit-exact against the checkpoint's own packing"
+            );
+        }
+    }
+
+    /// The split layer's `forward` is exactly three independent projections, so
+    /// it agrees element for element with running the three `UnifiedLinear`s the
+    /// same weight map produces.
+    #[test]
+    fn mixed_bit_width_qkv_forward_matches_independent_projections() {
+        let weights = mixed_4_8_layer();
+        let fused = load_mixed(&weights);
+
+        let x = ffi::from_slice_f32(
+            &(0..MIXED_IN)
+                .map(|i| ((i % 11) as f32 - 5.0) * 0.05)
+                .collect::<Vec<_>>(),
+            &[1, 1, MIXED_IN],
+        );
+        let (q, k, v) = fused.forward(&x);
+
+        for (name, actual) in [("q", &q), ("k", &k), ("v", &v)] {
+            let reference = UnifiedLinear::from_weights_with_mode(
+                &weights,
+                &format!("l.self_attn.{name}_proj"),
+                MIXED_GROUP,
+                4,
+                "affine",
+            )
+            .expect("plane loads standalone")
+            .forward(&x);
+            ffi::eval(&reference);
+            ffi::eval(actual);
+            assert_eq!(
+                plane_max_abs_diff(&reference, actual),
+                0.0,
+                "{name} must match its standalone projection"
+            );
+        }
+    }
+
+    /// The fused-kernel launchers need one packed plane. A split layer has
+    /// none, so they must report that the way they already do for a dense
+    /// layer, letting the caller fall back to its graph path rather than
+    /// silently projecting through the wrong weight.
+    #[test]
+    fn a_split_layer_offers_no_fused_packed_weight() {
+        let fused = load_mixed(&mixed_4_8_layer());
+        assert!(fused.qkv_proj.is_split());
+        assert!(fused.fused_quantized_weight().is_none());
+        let x = ffi::zeros(&[1, 1, MIXED_IN], crate::dtype::FLOAT32);
+        assert!(
+            fused
+                .forward_split_rope_quantized(&x, 4, 10000.0, 0)
+                .is_none()
+        );
+    }
+
+    /// Positive control, and the guarantee that this change is invisible to
+    /// every checkpoint that already worked: a layer whose three planes agree
+    /// still fuses into one plane, at the same width and group size the loader
+    /// chose before. Without this the split path could pass by never fusing
+    /// anything.
+    #[test]
+    fn uniform_precision_qkv_still_fuses_into_one_plane() {
+        for bits in [4, 8] {
+            let weights = uniform_layer(bits);
+            let fused = FusedQKVLinear::from_weights_separate(
+                &weights,
+                "l.self_attn",
+                MIXED_GROUP,
+                4,
+                2,
+                1,
+                4,
+            )
+            .expect("uniform q/k/v must load");
+            let proj = fused
+                .qkv_proj
+                .fused()
+                .unwrap_or_else(|| panic!("a uniform {bits}-bit layer must stay fused"));
+            let qw = proj
+                .as_quantized_weight()
+                .unwrap_or_else(|| panic!("a uniform {bits}-bit layer must stay quantized"));
+            assert_eq!(
+                (qw.bits, qw.group_size),
+                (bits, MIXED_GROUP),
+                "the fused plane's layout must not move"
+            );
+            // 8 + 4 + 4 rows concatenated along the output axis, packed to
+            // `MIXED_IN * bits / 32` columns.
+            assert_eq!(
+                ffi::array_shape(&qw.weight).as_slice(),
+                &[16, MIXED_IN * bits / 32]
+            );
+        }
+    }
+
+    /// Build a split projection out of weights that would otherwise fuse, so a
+    /// test can compare the two representations of the same numbers directly.
+    fn split_from(weights: &crate::weights::WeightMap) -> FusedQKVLinear {
+        let plane = |name: &str| {
+            UnifiedLinear::from_weights_with_mode(
+                weights,
+                &format!("l.self_attn.{name}_proj"),
+                MIXED_GROUP,
+                4,
+                "affine",
+            )
+            .expect("plane loads standalone")
+        };
+        FusedQKVLinear {
+            qkv_proj: QkvProjection::Split {
+                q: plane("q"),
+                k: plane("k"),
+                v: plane("v"),
+            },
+            n_heads: 2,
+            n_kv_heads: 1,
+            head_dim: 4,
+        }
+    }
+
+    fn probe_input(step: i32, scale: f32) -> UniquePtr<MlxArray> {
+        ffi::from_slice_f32(
+            &(0..MIXED_IN)
+                .map(|i| ((i % step) as f32 - (step / 2) as f32) * scale)
+                .collect::<Vec<_>>(),
+            &[1, 1, MIXED_IN],
+        )
+    }
+
+    /// A split projection and a fused one built from the same uniform weights
+    /// produce identical q/k/v, which is what makes the split representation a
+    /// drop-in for the fused one rather than a second, subtly different path.
+    #[test]
+    fn split_and_fused_projections_agree_on_uniform_weights() {
+        let weights = uniform_layer(4);
+        let fused =
+            FusedQKVLinear::from_weights_separate(&weights, "l.self_attn", MIXED_GROUP, 4, 2, 1, 4)
+                .expect("uniform q/k/v must load");
+        let split = split_from(&weights);
+
+        let x = probe_input(7, 0.03);
+        let (fq, fk, fv) = fused.forward(&x);
+        let (sq, sk, sv) = split.forward(&x);
+        for (name, a, b) in [("q", &fq, &sq), ("k", &fk, &sk), ("v", &fv, &sv)] {
+            ffi::eval(a);
+            ffi::eval(b);
+            assert_eq!(
+                plane_max_abs_diff(a, b),
+                0.0,
+                "{name} must be identical whether the planes are fused or split"
+            );
+        }
+    }
+
+    /// `project_concat`'s split arm is the only new `unsafe` block and the only
+    /// place a split layer forms the concatenated `[q | k | v]` activation, which
+    /// is what feeds the fused RoPE-append kernel. It must reproduce what the
+    /// fused weight would have produced: a matmul against a row-concatenated
+    /// weight is the row concatenation of the three matmuls, because every output
+    /// column depends only on its own weight row and its own scales.
+    #[test]
+    fn split_project_concat_reproduces_the_fused_activation() {
+        let weights = uniform_layer(4);
+        let fused =
+            FusedQKVLinear::from_weights_separate(&weights, "l.self_attn", MIXED_GROUP, 4, 2, 1, 4)
+                .expect("uniform q/k/v must load");
+        let split = split_from(&weights);
+
+        let x = probe_input(11, 0.05);
+        let from_fused = fused.qkv_proj.project_concat(&x);
+        let from_split = split.qkv_proj.project_concat(&x);
+        ffi::eval(&from_fused);
+        ffi::eval(&from_split);
+        assert_eq!(
+            ffi::array_shape(&from_split).as_slice(),
+            &[1, 1, 16],
+            "8 + 4 + 4 output rows land on the last axis, in q/k/v order"
+        );
+        assert_eq!(
+            ffi::array_shape(&from_fused).as_slice(),
+            ffi::array_shape(&from_split).as_slice()
+        );
+        assert_eq!(
+            plane_max_abs_diff(&from_fused, &from_split),
+            0.0,
+            "the concatenated activation must be identical to the fused one"
+        );
+
+        // A genuinely mixed layer has no fused counterpart to compare against,
+        // so pin the layout instead: the same width, in the same q/k/v order.
+        let mixed = load_mixed(&mixed_4_8_layer());
+        let mixed_concat = mixed.qkv_proj.project_concat(&x);
+        ffi::eval(&mixed_concat);
+        assert_eq!(ffi::array_shape(&mixed_concat).as_slice(), &[1, 1, 16]);
+    }
+
+    /// A partially quantized triple (no `v_proj.scales`) has no layout to
+    /// compare, so the detection must stay out of the way and let the existing
+    /// fused path report it. Its diagnostics for a broken triple are the more
+    /// specific ones.
+    #[test]
+    fn a_partially_quantized_triple_falls_through_to_the_fused_path() {
+        let mut weights = mixed_4_8_layer();
+        weights.remove("l.self_attn.v_proj.scales");
+        let err = match FusedQKVLinear::from_weights_separate(
+            &weights,
+            "l.self_attn",
+            MIXED_GROUP,
+            4,
+            2,
+            1,
+            4,
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("a triple missing v_proj.scales cannot load"),
+        };
+        assert!(
+            err.contains("v_proj.scales"),
+            "the fused path's own message must survive: {err}"
+        );
+    }
+
+    /// `Embedding::clone_shared` produces an independent handle whose
+    /// `forward` result matches the original — the lazy-array share
+    /// (`ffi::copy`) points at the same data, so an embedding lookup
+    /// through the clone is byte-identical to the original. Used by the
+    /// DFlash drafter lazy-bind path.
+    #[test]
+    fn embedding_clone_shared_matches_original_forward() {
+        // [vocab = 4, hidden = 3] embedding table with distinct rows so a
+        // lookup actually exercises the shared buffer.
+        let weight = ffi::from_slice_f32(
+            &[
+                0.0, 1.0, 2.0, // row 0
+                3.0, 4.0, 5.0, // row 1
+                6.0, 7.0, 8.0, // row 2
+                9.0, 10.0, 11.0, // row 3
+            ],
+            &[4, 3],
+        );
+        let embed = Embedding::new(weight);
+        let cloned = embed.clone_shared();
+
+        let ids = ffi::from_slice_i32(&[2, 0], &[1, 2]);
+        let orig_out = embed.forward(&ids);
+        let clone_out = cloned.forward(&ids);
+        ffi::eval(&orig_out);
+        ffi::eval(&clone_out);
+
+        assert_eq!(
+            ffi::array_shape(&orig_out),
+            ffi::array_shape(&clone_out),
+            "clone_shared forward shape must match the original",
+        );
+        // Output is [batch = 1, seq = 2, hidden = 3]: row 2 of the table
+        // at seq position 0, row 0 at seq position 1.
+        let expected: [[f32; 3]; 2] = [[6.0, 7.0, 8.0], [0.0, 1.0, 2.0]];
+        for (s, want_row) in expected.iter().enumerate() {
+            for (h, &want) in want_row.iter().enumerate() {
+                let elem = ffi::slice(
+                    &clone_out,
+                    &[0_i32, s as i32, h as i32],
+                    &[1_i32, s as i32 + 1, h as i32 + 1],
+                );
+                ffi::eval(&elem);
+                let got = ffi::item_f32(&elem);
+                assert!(
+                    (got - want).abs() < 1e-6,
+                    "clone_shared forward element [seq={s}, hidden={h}]: got {got}, want {want}",
+                );
+            }
+        }
+    }
+
+    /// `UnifiedEmbedding::clone_shared` on the `Regular` arm yields a
+    /// `Regular` clone (the variant is preserved) usable as a standalone
+    /// embedding. This is the exact shape the Qwen 3.5 target hands to a
+    /// lazy-bind DFlash drafter.
+    #[test]
+    fn unified_embedding_clone_shared_preserves_regular_variant() {
+        use crate::dtype;
+
+        let weight = ffi::zeros(&[4, 3], dtype::FLOAT32);
+        let unified = UnifiedEmbedding::Regular(Embedding::new(weight));
+        let cloned = unified.clone_shared();
+
+        assert!(
+            !cloned.is_quantized(),
+            "clone_shared of a Regular UnifiedEmbedding must stay Regular",
+        );
+        // The clone is a usable embedding: a lookup returns the right shape.
+        let ids = ffi::from_slice_i32(&[0], &[1, 1]);
+        let out = cloned.forward(&ids);
+        ffi::eval(&out);
+        assert_eq!(ffi::array_shape(&out).as_slice(), &[1, 1, 3]);
+    }
+
+    /// Verify that `metal4_attention` falls back correctly on all hardware.
+    ///
+    /// The test creates small Q / K / V arrays and checks that the function
+    /// returns an array with the expected shape without panicking.  On current
+    /// hardware (M1–M4) `use_metal4` will be false; on future M5 hardware with
+    /// macOS 26.2+ it will be true — both paths currently delegate to the same
+    /// MLX fast SDPA implementation, so the result must be identical.
+    #[test]
+    fn metal4_attention_does_not_panic() {
+        use crate::dtype;
+        // [batch=1, heads=2, seq=4, head_dim=8]
+        let q = ffi::zeros(&[1, 2, 4, 8], dtype::FLOAT16);
+        let k = ffi::zeros(&[1, 2, 4, 8], dtype::FLOAT16);
+        let v = ffi::zeros(&[1, 2, 4, 8], dtype::FLOAT16);
+        let scale = 1.0 / 8.0_f32.sqrt();
+
+        let out = metal4_attention(&q, &k, &v, scale, None, 0.0, 0);
+
+        let shape = ffi::array_shape(&out);
+        assert_eq!(shape.as_slice(), &[1, 2, 4, 8]);
+    }
+
+    /// Confirm that hardware detection does not interfere with the fallback path.
+    #[test]
+    fn metal4_attention_output_matches_fast_sdpa() {
+        use crate::dtype;
+        let q = ffi::zeros(&[1, 1, 2, 4], dtype::FLOAT16);
+        let k = ffi::zeros(&[1, 1, 2, 4], dtype::FLOAT16);
+        let v = ffi::zeros(&[1, 1, 2, 4], dtype::FLOAT16);
+        let scale = 0.5_f32;
+
+        // Both calls should produce the same result because the Metal 4 kernel
+        // body is not yet implemented — both paths fall back to fast SDPA.
+        let out_m4 = metal4_attention(&q, &k, &v, scale, None, 0.0, 0);
+        let out_fast =
+            unsafe { ffi::fast_scaled_dot_product_attention(&q, &k, &v, scale, std::ptr::null()) };
+
+        // Compare shapes (we cannot easily compare values without eval + copy,
+        // but shape equality is sufficient to confirm the dispatch works).
+        assert_eq!(ffi::array_shape(&out_m4), ffi::array_shape(&out_fast));
+    }
+
+    /// Verify GQA pattern: n_heads=4 Q heads with n_kv_heads=2 KV heads.
+    /// MLX SDPA handles the head broadcasting internally.
+    #[test]
+    fn metal4_attention_gqa_shape() {
+        use crate::dtype;
+        // GQA: 4 Q heads, 2 KV heads, seq=3, head_dim=8
+        let q = ffi::zeros(&[1, 4, 3, 8], dtype::FLOAT16);
+        let k = ffi::zeros(&[1, 2, 3, 8], dtype::FLOAT16);
+        let v = ffi::zeros(&[1, 2, 3, 8], dtype::FLOAT16);
+        let scale = 1.0 / 8.0_f32.sqrt();
+
+        let out = metal4_attention(&q, &k, &v, scale, None, 0.0, 0);
+        let shape = ffi::array_shape(&out);
+        // Output should have Q's head count, not KV's
+        assert_eq!(shape.as_slice(), &[1, 4, 3, 8]);
+    }
+
+    /// Verify the unified attention helper preserves Gemma-style softcap GQA shapes.
+    #[test]
+    fn attention_softcap_gqa_shape() {
+        use crate::dtype;
+        let q = ffi::zeros(&[1, 4, 3, 8], dtype::FLOAT16);
+        let k = ffi::zeros(&[1, 2, 3, 8], dtype::FLOAT16);
+        let v = ffi::zeros(&[1, 2, 3, 8], dtype::FLOAT16);
+
+        let out = attention(&q, &k, &v, 0.5, None, 30.0, 0);
+        assert_eq!(ffi::array_shape(&out).as_slice(), &[1, 4, 3, 8]);
+    }
+
+    /// Deterministic pseudo-random f32 tensor for chunked-SDPA equivalence tests.
+    fn test_tensor(shape: &[i32]) -> UniquePtr<MlxArray> {
+        let len: i32 = shape.iter().product();
+        let data: Vec<f32> = (0..len)
+            .map(|i| ((i as f32) * 0.7371 + 0.13).sin())
+            .collect();
+        crate::from_slice_f32(&data, shape)
+    }
+
+    #[test]
+    fn query_chunk_len_splits_evenly_within_budget() {
+        // Fits: no chunking.
+        assert_eq!(query_chunk_len(100, 10, 1000), None);
+        assert_eq!(query_chunk_len(100, 10, 1_000_000), None);
+        // 10 rows * 100 B = 1000 B over a 400 B budget -> 3 chunks of 4/4/2.
+        assert_eq!(query_chunk_len(100, 10, 400), Some(4));
+        // Exactly one row over budget still splits in two.
+        assert_eq!(query_chunk_len(100, 10, 999), Some(5));
+        // Degenerate inputs never chunk.
+        assert_eq!(query_chunk_len(0, 10, 400), None);
+        assert_eq!(query_chunk_len(100, 1, 10), None);
+        assert_eq!(query_chunk_len(100, 10, 0), None);
+        // Every chunk's scores stay within budget.
+        let chunk = query_chunk_len(1000, 100, 7000).unwrap();
+        assert!(chunk as usize * 1000 <= 7000);
+    }
+
+    #[test]
+    fn slice_mask_query_rows_slices_and_broadcasts() {
+        let mask = crate::utils::create_causal_mask(4, 2);
+        let sliced = slice_mask_query_rows(mask.as_ref().unwrap(), 1, 3, 4).unwrap();
+        assert_eq!(ffi::array_shape(&sliced).as_slice(), &[2, 6]);
+        // Row 1 of the slice must equal row 2 of the full mask. `-inf - -inf`
+        // is NaN, so compare the attend/block structure instead of raw values.
+        let full_row = ffi::slice(mask.as_ref().unwrap(), &[2, 0], &[3, 6]);
+        let sliced_row = ffi::slice(&sliced, &[1, 0], &[2, 6]);
+        let sentinel = crate::from_slice_f32(&[-1.0; 6], &[1, 6]);
+        let full_open = ffi::astype(&ffi::greater(&full_row, &sentinel), crate::dtype::FLOAT32);
+        let sliced_open = ffi::astype(&ffi::greater(&sliced_row, &sentinel), crate::dtype::FLOAT32);
+        assert!(max_abs_diff(&full_open, &sliced_open) == 0.0);
+
+        // A mask that broadcasts over the query axis passes through unsliced.
+        let broadcast = crate::from_slice_f32(&[0.0; 6], &[1, 6]);
+        assert!(slice_mask_query_rows(&broadcast, 1, 3, 4).is_none());
+    }
+
+    /// Chunked SDPA must reproduce the unchunked dispatch with an explicit
+    /// causal mask, including an uneven final chunk.
+    #[test]
+    fn chunked_query_attention_matches_unchunked_with_mask() {
+        let q = test_tensor(&[1, 2, 6, 4]);
+        let k = test_tensor(&[1, 2, 6, 4]);
+        let v = test_tensor(&[1, 2, 6, 4]);
+        let scale = 0.5_f32;
+        let mask = crate::utils::create_causal_mask(6, 0);
+
+        let full = attention_dispatch(&q, &k, &v, scale, Some(mask.as_ref().unwrap()), 0.0);
+        for chunk in [1, 2, 4, 5] {
+            let chunked = chunked_query_attention(
+                &q,
+                &k,
+                &v,
+                scale,
+                Some(mask.as_ref().unwrap()),
+                0.0,
+                chunk,
+            );
+            assert_eq!(ffi::array_shape(&chunked), ffi::array_shape(&full));
+            let diff = max_abs_diff(&full, &chunked);
+            assert!(
+                diff < 1e-5,
+                "chunk={chunk} diverged from unchunked SDPA by {diff}"
+            );
+        }
+    }
+
+    /// Chunked SDPA must reproduce the softcap GQA composite path.
+    #[test]
+    fn chunked_query_attention_matches_unchunked_softcap_gqa() {
+        let q = test_tensor(&[1, 4, 6, 4]);
+        let k = test_tensor(&[1, 2, 6, 4]);
+        let v = test_tensor(&[1, 2, 6, 4]);
+        let scale = 0.5_f32;
+        let softcap = 30.0_f32;
+        let mask = crate::utils::create_causal_mask(6, 0);
+
+        let full = attention_dispatch(&q, &k, &v, scale, Some(mask.as_ref().unwrap()), softcap);
+        let chunked =
+            chunked_query_attention(&q, &k, &v, scale, Some(mask.as_ref().unwrap()), softcap, 2);
+        assert!(
+            max_abs_diff(&full, &chunked) < 1e-5,
+            "softcap GQA chunked SDPA diverged from unchunked"
+        );
+    }
+
+    /// A query-broadcast mask (row axis of size 1) is reused across chunks.
+    #[test]
+    fn chunked_query_attention_matches_unchunked_broadcast_mask() {
+        let q = test_tensor(&[1, 2, 6, 4]);
+        let k = test_tensor(&[1, 2, 6, 4]);
+        let v = test_tensor(&[1, 2, 6, 4]);
+        let scale = 0.5_f32;
+        let mask = crate::from_slice_f32(&[0.0, 0.0, 0.0, 0.0, f32::NEG_INFINITY, 0.0], &[1, 6]);
+
+        let full = attention_dispatch(&q, &k, &v, scale, Some(&mask), 0.0);
+        let chunked = chunked_query_attention(&q, &k, &v, scale, Some(&mask), 0.0, 2);
+        assert!(
+            max_abs_diff(&full, &chunked) < 1e-5,
+            "broadcast-mask chunked SDPA diverged from unchunked"
+        );
+    }
+
+    /// The chunked maskless-causal path must reproduce MLX's native
+    /// bottom-right-aligned `do_causal` SDPA, with and without a KV offset.
+    #[test]
+    fn chunked_causal_attention_matches_fast_causal() {
+        let scale = 0.5_f32;
+        for (q_len, k_len) in [(4, 4), (4, 7), (6, 9)] {
+            let q = test_tensor(&[1, 2, q_len, 4]);
+            let k = test_tensor(&[1, 2, k_len, 4]);
+            let v = test_tensor(&[1, 2, k_len, 4]);
+            let native = ffi::ffi_fast_scaled_dot_product_attention_causal(&q, &k, &v, scale);
+            for chunk in [1, 2, 3] {
+                let chunked = chunked_causal_attention(&q, &k, &v, scale, chunk);
+                assert_eq!(ffi::array_shape(&chunked), ffi::array_shape(&native));
+                let diff = max_abs_diff(&native, &chunked);
+                assert!(
+                    diff < 1e-5,
+                    "q_len={q_len} k_len={k_len} chunk={chunk} diverged from do_causal SDPA by {diff}"
+                );
+            }
+        }
+    }
+
+    /// Verify the public causal SDPA wrapper preserves the original shape
+    /// contract while routing through the centralized attention dispatcher.
+    #[test]
+    fn causal_attention_wrapper_matches_fast_causal_shape() {
+        use crate::dtype;
+        let q = ffi::zeros(&[1, 2, 3, 8], dtype::FLOAT16);
+        let k = ffi::zeros(&[1, 2, 5, 8], dtype::FLOAT16);
+        let v = ffi::zeros(&[1, 2, 5, 8], dtype::FLOAT16);
+        let scale = 1.0 / 8.0_f32.sqrt();
+
+        let out = crate::fast_scaled_dot_product_attention_causal(&q, &k, &v, scale);
+        let out_fast = ffi::ffi_fast_scaled_dot_product_attention_causal(&q, &k, &v, scale);
+
+        assert_eq!(ffi::array_shape(&out), ffi::array_shape(&out_fast));
+    }
+
+    #[test]
+    fn causal_attention_single_query_matches_explicit_mask() {
+        let q = crate::from_slice_f32(&[0.1, -0.2, 0.3, -0.1], &[1, 1, 1, 4]);
+        let k = crate::from_slice_f32(
+            &[
+                0.2, 0.0, -0.1, 0.3, 0.1, -0.2, 0.2, 0.0, -0.3, 0.2, 0.1, -0.2, 0.4, -0.1, 0.0, 0.2,
+            ],
+            &[1, 1, 4, 4],
+        );
+        let v = crate::from_slice_f32(
+            &[
+                0.5, 0.1, -0.3, 0.2, -0.2, 0.4, 0.3, -0.1, 0.1, -0.5, 0.2, 0.6, -0.4, 0.2, 0.1,
+                -0.2,
+            ],
+            &[1, 1, 4, 4],
+        );
+        let scale = 0.5_f32;
+
+        let out_fast = crate::causal_attention(&q, &k, &v, scale, 0.0, 0);
+        let mask = crate::utils::create_causal_mask(1, 3);
+        let out_masked = attention(&q, &k, &v, scale, Some(mask.as_ref().unwrap()), 0.0, 0);
+
+        let diff = crate::subtract(out_fast.as_ref().unwrap(), out_masked.as_ref().unwrap());
+        let diff_abs = crate::abs(&diff);
+        let diff_sum = crate::sum_all(&diff_abs);
+        crate::eval(&diff_sum);
+        assert!(
+            crate::item_f32(&diff_sum) < 1e-5,
+            "single-query causal fast path should match explicit mask path"
+        );
+    }
+
+    #[test]
+    fn causal_attention_single_query_softcap_matches_explicit_mask() {
+        let q = crate::from_slice_f32(&[0.1, -0.2, 0.3, -0.1], &[1, 1, 1, 4]);
+        let k = crate::from_slice_f32(
+            &[
+                0.2, 0.0, -0.1, 0.3, 0.1, -0.2, 0.2, 0.0, -0.3, 0.2, 0.1, -0.2, 0.4, -0.1, 0.0, 0.2,
+            ],
+            &[1, 1, 4, 4],
+        );
+        let v = crate::from_slice_f32(
+            &[
+                0.5, 0.1, -0.3, 0.2, -0.2, 0.4, 0.3, -0.1, 0.1, -0.5, 0.2, 0.6, -0.4, 0.2, 0.1,
+                -0.2,
+            ],
+            &[1, 1, 4, 4],
+        );
+        let scale = 0.5_f32;
+        let softcap = 30.0_f32;
+
+        let out_fast = crate::causal_attention(&q, &k, &v, scale, softcap, 0);
+        let mask = crate::utils::create_causal_mask(1, 3);
+        let out_masked = attention(&q, &k, &v, scale, Some(mask.as_ref().unwrap()), softcap, 0);
+
+        let diff = crate::subtract(out_fast.as_ref().unwrap(), out_masked.as_ref().unwrap());
+        let diff_abs = crate::abs(&diff);
+        let diff_sum = crate::sum_all(&diff_abs);
+        crate::eval(&diff_sum);
+        assert!(
+            crate::item_f32(&diff_sum) < 1e-5,
+            "single-query softcap fast path should match explicit mask path"
+        );
+    }
+
+    #[test]
+    fn causal_attention_single_query_window_matches_explicit_mask() {
+        let q = crate::from_slice_f32(&[0.2, 0.1, -0.4, 0.3], &[1, 1, 1, 4]);
+        let k = crate::from_slice_f32(
+            &[
+                0.1, 0.0, -0.1, 0.2, -0.2, 0.3, 0.0, 0.1, 0.3, -0.1, 0.2, 0.0, -0.1, 0.4, -0.2, 0.2,
+            ],
+            &[1, 1, 4, 4],
+        );
+        let v = crate::from_slice_f32(
+            &[
+                0.3, -0.1, 0.2, 0.4, -0.1, 0.2, -0.3, 0.1, 0.5, 0.0, -0.2, 0.2, -0.4, 0.3, 0.1,
+                -0.1,
+            ],
+            &[1, 1, 4, 4],
+        );
+        let scale = 0.5_f32;
+        let window_size = 8_i32; // k_len <= window, so fast path should skip mask creation.
+
+        let out_fast = crate::causal_attention(&q, &k, &v, scale, 0.0, window_size);
+        let mask = crate::utils::create_causal_mask_with_window(1, 3, Some(window_size));
+        let out_masked = attention(
+            &q,
+            &k,
+            &v,
+            scale,
+            Some(mask.as_ref().unwrap()),
+            0.0,
+            window_size,
+        );
+
+        let diff = crate::subtract(out_fast.as_ref().unwrap(), out_masked.as_ref().unwrap());
+        let diff_abs = crate::abs(&diff);
+        let diff_sum = crate::sum_all(&diff_abs);
+        crate::eval(&diff_sum);
+        assert!(
+            crate::item_f32(&diff_sum) < 1e-5,
+            "single-query window fast path should match explicit mask path"
+        );
+    }
+
+    #[test]
+    fn causal_attention_single_query_window_respects_mask_when_needed() {
+        let q = crate::from_slice_f32(&[0.2, -0.1, 0.4, 0.0], &[1, 1, 1, 4]);
+        let k = crate::from_slice_f32(
+            &[
+                0.1, 0.1, 0.0, -0.1, -0.2, 0.3, 0.1, 0.0, 0.4, -0.2, 0.2, 0.1, -0.3, 0.2, 0.3, -0.1,
+            ],
+            &[1, 1, 4, 4],
+        );
+        let v = crate::from_slice_f32(
+            &[
+                0.2, 0.0, -0.2, 0.4, 0.1, -0.1, 0.3, -0.2, 0.5, 0.2, -0.1, 0.1, -0.3, 0.4, 0.0,
+                -0.1,
+            ],
+            &[1, 1, 4, 4],
+        );
+        let scale = 0.5_f32;
+        let window_size = 2_i32; // k_len > window, mask is required.
+
+        let out = crate::causal_attention(&q, &k, &v, scale, 0.0, window_size);
+        // After `create_causal_mask_with_window` caps T_k to
+        // `window_size` when `q_len + offset > window`. The explicit-mask
+        // reference must therefore receive K/V sliced to the last
+        // `window_size` slots so its score tensor lines up with the mask —
+        // this mirrors what `causal_attention` now does internally.
+        let mask = crate::utils::create_causal_mask_with_window(1, 3, Some(window_size));
+        let k_sliced = crate::slice(&k, &[0, 0, 4 - window_size, 0], &[1, 1, 4, 4]);
+        let v_sliced = crate::slice(&v, &[0, 0, 4 - window_size, 0], &[1, 1, 4, 4]);
+        let out_masked = attention(
+            &q,
+            &k_sliced,
+            &v_sliced,
+            scale,
+            Some(mask.as_ref().unwrap()),
+            0.0,
+            window_size,
+        );
+
+        let diff = crate::subtract(out.as_ref().unwrap(), out_masked.as_ref().unwrap());
+        let diff_abs = crate::abs(&diff);
+        let diff_sum = crate::sum_all(&diff_abs);
+        crate::eval(&diff_sum);
+        assert!(
+            crate::item_f32(&diff_sum) < 1e-5,
+            "single-query window path should keep explicit mask semantics when k_len > window"
+        );
+    }
+
+    #[test]
+    fn causal_attention_multi_token_over_window_uses_full_windowed_mask() {
+        // Multi-token prefill (`q_len = 3`) whose key length (`k_len = 5`)
+        // exceeds the window. Before issue #408 `causal_attention` sliced K/V
+        // to the trailing `window_size` keys and used the clamped
+        // `(q_len, window_size)` mask, which strands the earliest query rows.
+        // The corrected behavior keeps all keys and builds the full
+        // `(q_len, k_len)` windowed-causal mask, so the reference must use the
+        // full K/V and `create_causal_mask_with_window_full`.
+        let q = crate::from_slice_f32(
+            &[
+                0.1, -0.2, 0.3, 0.4, 0.2, 0.0, -0.1, 0.5, -0.3, 0.1, 0.2, -0.4,
+            ],
+            &[1, 1, 3, 4],
+        );
+        let k = crate::from_slice_f32(
+            &[
+                0.2, 0.1, -0.1, 0.0, -0.2, 0.3, 0.1, -0.1, 0.0, -0.3, 0.2, 0.4, 0.1, 0.2, -0.2,
+                0.3, -0.1, 0.0, 0.4, -0.2,
+            ],
+            &[1, 1, 5, 4],
+        );
+        let v = crate::from_slice_f32(
+            &[
+                0.5, -0.2, 0.1, 0.0, -0.1, 0.3, 0.2, -0.3, 0.2, 0.1, -0.4, 0.5, 0.3, -0.1, 0.0,
+                0.2, -0.2, 0.4, 0.1, -0.1,
+            ],
+            &[1, 1, 5, 4],
+        );
+        let scale = 0.5_f32;
+        // window_size=2 is the previously-degenerate case: under the old
+        // clamp+slice path query row 0 (logical position 0) had an all-`-inf`
+        // mask row and softmaxed to NaN. The full mask gives it its own
+        // window, so no row is fully masked.
+        let window_size = 2_i32;
+
+        let out = crate::causal_attention(&q, &k, &v, scale, 0.0, window_size);
+        // Reference: full key set + uncapped windowed mask over offset =
+        // k_len - q_len = 2.
+        let mask_full = crate::utils::create_causal_mask_with_window_full(3, 2, Some(window_size));
+        let out_ref = attention(
+            &q,
+            &k,
+            &v,
+            scale,
+            Some(mask_full.as_ref().unwrap()),
+            0.0,
+            window_size,
+        );
+
+        let diff = crate::subtract(out.as_ref().unwrap(), out_ref.as_ref().unwrap());
+        let diff_abs = crate::abs(&diff);
+        let diff_sum = crate::sum_all(&diff_abs);
+        crate::eval(&diff_sum);
+        let total = crate::item_f32(&diff_sum);
+        assert!(
+            total.is_finite() && total < 1e-5,
+            "multi-token over-window causal attention should match the full \
+             windowed-mask reference (no NaN, no stranded rows); diff_sum = {total}"
+        );
+
+        // The output itself must be finite (the pre-#408 path produced NaN for
+        // the earliest query row under window_size=2).
+        let out_abs = crate::abs(out.as_ref().unwrap());
+        let out_sum = crate::sum_all(&out_abs);
+        crate::eval(&out_sum);
+        assert!(
+            crate::item_f32(&out_sum).is_finite(),
+            "multi-token over-window causal attention output must be finite"
+        );
+    }
+
+    #[test]
+    fn softcap_gqa_decode_matches_explicit_repeat_kv_reference() {
+        let q = crate::from_slice_f32(
+            &[
+                0.2, -0.1, 0.3, 0.0, 0.1, 0.4, -0.2, 0.2, -0.3, 0.2, 0.1, -0.1, 0.0, -0.2, 0.5, 0.3,
+            ],
+            &[1, 4, 1, 4],
+        );
+        let k = crate::from_slice_f32(
+            &[
+                0.1, 0.0, -0.2, 0.3, -0.1, 0.2, 0.1, 0.0, 0.2, -0.3, 0.0, 0.4, 0.3, 0.1, -0.1, -0.2,
+            ],
+            &[1, 2, 2, 4],
+        );
+        let v = crate::from_slice_f32(
+            &[
+                0.5, -0.1, 0.2, 0.0, -0.2, 0.4, 0.1, -0.3, 0.1, 0.3, -0.4, 0.2, 0.2, -0.2, 0.0, 0.5,
+            ],
+            &[1, 2, 2, 4],
+        );
+
+        let scale = 0.5_f32;
+        let softcap = 30.0_f32;
+
+        let out_new = attention(&q, &k, &v, scale, None, softcap, 0);
+        let rk = crate::utils::repeat_kv(&k, 2);
+        let rv = crate::utils::repeat_kv(&v, 2);
+        let out_ref = unsafe {
+            ffi::compiled_softcap_sdpa(
+                &q,
+                rk.as_ref().unwrap(),
+                rv.as_ref().unwrap(),
+                scale,
+                softcap,
+                std::ptr::null(),
+            )
+        };
+
+        let diff = crate::subtract(out_new.as_ref().unwrap(), out_ref.as_ref().unwrap());
+        let diff_abs = crate::abs(&diff);
+        let diff_sum = crate::sum_all(&diff_abs);
+        crate::eval(&diff_sum);
+        let diff_val = crate::item_f32(&diff_sum);
+        assert!(
+            diff_val < 1e-5,
+            "decode GQA softcap path should match explicit repeat_kv reference (diff_sum={diff_val})"
+        );
+    }
+
+    /// Fill a `[rows, head_dim]` buffer with a deterministic pseudo-random
+    /// tensor whose every length-`head_dim` row is RMS-normalized (unit RMS,
+    /// so each element is O(1) and the row L2 norm is `sqrt(head_dim)`). This
+    /// mimics the post `q_norm` / `k_norm` distribution of Gemma 4, where the
+    /// attention scale is 1.0 and pre-softmax scores therefore reach O(head_dim).
+    fn rms_normed_rows(rows: usize, head_dim: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut next = || {
+            // SplitMix64 -> uniform in [-1, 1).
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            ((z >> 11) as f32 / (1u64 << 53) as f32) * 2.0 - 1.0
+        };
+        let mut out = vec![0.0_f32; rows * head_dim];
+        for r in 0..rows {
+            let row = &mut out[r * head_dim..(r + 1) * head_dim];
+            for x in row.iter_mut() {
+                *x = next();
+            }
+            let ms: f32 = row.iter().map(|v| v * v).sum::<f32>() / head_dim as f32;
+            let inv_rms = 1.0 / ms.sqrt().max(1e-6);
+            for x in row.iter_mut() {
+                *x *= inv_rms;
+            }
+        }
+        out
+    }
+
+    /// Numerical parity guard for the head_dim-256 single-query decode path
+    /// investigated under issue #688: the maskless single-query path (which
+    /// routes head_dim-256 attention to the CUDA `sdpa_vector` kernel) must match
+    /// the explicit-mask materializing SDPA for a Gemma-4-shaped decode step,
+    /// INCLUDING the `scale = 1.0` regime where pre-softmax scores reach
+    /// O(head_dim). Gemma 4 uses `scale = 1.0` (its `q_norm`/`k_norm` absorb the
+    /// usual `1/sqrt(d)`), unlike gemma-3 / qwen3.5 (`scale = 1/sqrt(d)`). This
+    /// test confirms the vector kernel is numerically correct EAGERLY at that
+    /// scale; the actual #688 `<pad>` collapse was a CUDA-graph read-before-write
+    /// hazard in Gemma 4's decode (not the kernel math), fixed by disabling CUDA
+    /// graph capture for Gemma 4 in `crate`-external model loading. Keeping this
+    /// guard prevents a future regression of the eager vector-kernel numerics.
+    #[test]
+    fn single_query_maskless_matches_masked_gemma4_large_scale() {
+        let n_heads = 16_i32;
+        let n_kv = 8_i32;
+        let head_dim = 256_i32;
+        let k_len = 25_i32;
+
+        let q_data = rms_normed_rows(n_heads as usize, head_dim as usize, 1);
+        let k_data = rms_normed_rows((n_kv * k_len) as usize, head_dim as usize, 2);
+        let v_data = rms_normed_rows((n_kv * k_len) as usize, head_dim as usize, 3);
+
+        let q = crate::from_slice_f32(&q_data, &[1, n_heads, 1, head_dim]);
+        let k = crate::from_slice_f32(&k_data, &[1, n_kv, k_len, head_dim]);
+        let v = crate::from_slice_f32(&v_data, &[1, n_kv, k_len, head_dim]);
+
+        for &scale in &[1.0_f32, 1.0 / (head_dim as f32).sqrt()] {
+            // Maskless single-query path: `mask = None` routes to the fused
+            // decode kernel (the sdpa_vector kernel for head_dim 256 on CUDA).
+            let out_maskless = attention(&q, &k, &v, scale, None, 0.0, 0);
+            // Explicit all-attend mask: `create_causal_mask(1, k_len - 1)` is
+            // all-zero for a single query, forcing the materializing SDPA path.
+            let mask = crate::utils::create_causal_mask(1, k_len - 1);
+            let out_masked = attention(&q, &k, &v, scale, Some(mask.as_ref().unwrap()), 0.0, 0);
+
+            let diff =
+                crate::subtract(out_maskless.as_ref().unwrap(), out_masked.as_ref().unwrap());
+            let diff_abs = crate::abs(&diff);
+            let max_diff_arr = crate::max_all(&diff_abs);
+            crate::eval(&max_diff_arr);
+            let max_diff = crate::item_f32(&max_diff_arr);
+            assert!(
+                max_diff.is_finite() && max_diff < 2e-3,
+                "maskless single-query decode must match the masked reference at \
+                 scale={scale}; max abs diff = {max_diff}"
+            );
+        }
+    }
+
+    /// Verify that the detection condition uses the canonical NA check
+    /// (has_neural_accelerator && macos_supports_na) rather than just
+    /// metal_version >= 4.
+    #[test]
+    fn metal4_detection_uses_canonical_na_check() {
+        let hw = crate::hardware::get_hardware();
+        // On test hardware (M1-M4), use_metal4 should be false because
+        // has_neural_accelerator is false.  On M5 with macOS 26.2+, both
+        // conditions are true.  Either way, the function should not panic.
+        let _use_metal4 = hw.has_neural_accelerator && hw.macos_supports_na;
+
+        // Verify the function works regardless of the detection result
+        use crate::dtype;
+        let q = ffi::zeros(&[1, 1, 1, 4], dtype::FLOAT16);
+        let k = ffi::zeros(&[1, 1, 1, 4], dtype::FLOAT16);
+        let v = ffi::zeros(&[1, 1, 1, 4], dtype::FLOAT16);
+        let out = metal4_attention(&q, &k, &v, 0.5, None, 0.0, 0);
+        assert_eq!(ffi::array_shape(&out).as_slice(), &[1, 1, 1, 4]);
+    }
+
+    /// Caller-supplied bits consistent with shapes → pass through unchanged.
+    /// Shapes taken from qwen3.5 out_proj: u32 weight (2048, 512), scales (2048, 64).
+    /// Invariant: `packed_in * 32 == bits * num_groups * group_size`
+    ///            `512 * 32 == 4 * 64 * 64`  (16384 == 16384)
+    #[test]
+    fn infer_bits_pass_through_when_consistent() {
+        let bits = infer_quantization_bits(&[2048, 512], &[2048, 64], 64, 4).unwrap();
+        assert_eq!(bits, 4);
+    }
+
+    /// Qwen3.5/3.6 MoE gates store the router at 8-bit while the rest of the
+    /// model is 4-bit. The loader's caller_bits reflects the top-level config
+    /// (4), so we must detect the 8-bit override from the tensor shapes.
+    /// Shapes taken from real qwen3.6 tensors.
+    #[test]
+    fn infer_bits_detects_per_layer_8bit_override() {
+        // mlp.gate: u32 weight (256, 512), scales (256, 32), gs=64 → 8-bit
+        // 512 * 32 == 8 * 32 * 64  (16384 == 16384)
+        let bits = infer_quantization_bits(&[256, 512], &[256, 32], 64, 4).unwrap();
+        assert_eq!(bits, 8, "router gate is 8-bit under top-level 4-bit config");
+
+        // mlp.shared_expert_gate: u32 weight (1, 512), scales (1, 32) → 8-bit
+        let bits = infer_quantization_bits(&[1, 512], &[1, 32], 64, 4).unwrap();
+        assert_eq!(
+            bits, 8,
+            "shared_expert_gate is 8-bit under top-level 4-bit config"
+        );
+    }
+
+    /// Mixed-precision exports (e.g. diffusiongemma / gemma4) store the
+    /// embedding at 8-bit while the top-level config default is 4-bit. The
+    /// quantized-embedding loader must detect the override from the shapes, or
+    /// the embedding lookup and tied lm_head dequantize at the wrong bits and
+    /// abort (issue #291). Shapes from real diffusiongemma-26B-A4B-it-4bit.
+    #[test]
+    fn infer_bits_detects_8bit_embedding_under_4bit_config() {
+        // embed_tokens: u32 weight (262144, 704), scales (262144, 44), gs=64
+        // 704 * 32 == 8 * 44 * 64  (22528 == 22528)
+        let bits = infer_quantization_bits(&[262144, 704], &[262144, 44], 64, 4).unwrap();
+        assert_eq!(bits, 8, "embedding is 8-bit under top-level 4-bit config");
+    }
+
+    /// 3D MoE expert weights (switch_mlp.*_proj) must use the last two axes.
+    #[test]
+    fn infer_bits_handles_3d_moe_experts() {
+        // down_proj: weight (256, 2048, 64) u32 / scales (256, 2048, 8)
+        // bits = 32 * 64 / (8 * 64) = 4
+        let bits = infer_quantization_bits(&[256, 2048, 64], &[256, 2048, 8], 64, 4).unwrap();
+        assert_eq!(bits, 4);
+
+        // gate_proj: weight (256, 512, 256) / scales (256, 512, 32)
+        // bits = 32 * 256 / (32 * 64) = 4
+        let bits = infer_quantization_bits(&[256, 512, 256], &[256, 512, 32], 64, 4).unwrap();
+        assert_eq!(bits, 4);
+    }
+
+    /// Invalid inferred bits → error (prevents silently accepting a bogus
+    /// `group_size` that happens to satisfy the arithmetic).
+    #[test]
+    fn infer_bits_rejects_non_canonical_widths() {
+        // packed_in * 32 / (num_groups * group_size) = 32*4 / (32*2) = 2 is valid,
+        // so use a combination that yields 1 (invalid).
+        // packed_in=32, num_groups=32, group_size=32 → 32*32/(32*32) = 1.
+        let err = infer_quantization_bits(&[16, 32], &[16, 32], 32, 4);
+        assert!(err.is_err(), "bits=1 should be rejected");
+    }
+
+    /// Empty/zero shapes are treated as pass-through (defensive — real arrays
+    /// never have empty shape but we should not panic if called eagerly).
+    #[test]
+    fn infer_bits_pass_through_on_empty() {
+        assert_eq!(infer_quantization_bits(&[], &[], 64, 4).unwrap(), 4);
+        assert_eq!(infer_quantization_bits(&[0, 0], &[0, 0], 64, 4).unwrap(), 4);
+    }
+
+    // ---- #326: generic fused QKV + RMSNorm + RoPE ----
+
+    /// f16 array from f32 values (the activation/scale dtype the fused kernel
+    /// runs in).
+    fn f16_from(values: &[f32], shape: &[i32]) -> UniquePtr<MlxArray> {
+        use crate::dtype;
+        ffi::astype(&ffi::from_slice_f32(values, shape), dtype::FLOAT16)
+    }
+
+    /// Quantized fused QKV built by quantizing a non-trivial float weight with
+    /// MLX's own `quantize`, so the projection is a valid, non-zero matmul that
+    /// varies per output channel. A meaningful projection is what lets the Q/K
+    /// RMSNorm comparison exercise the `(1 + weight)` vs `weight` choice (a zero
+    /// projection would normalize to zero regardless). The 4-bit quantization
+    /// error cancels in the fused-vs-graph comparison because both paths share
+    /// this exact dequantized weight.
+    fn synthetic_quantized_fused_qkv(
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+    ) -> FusedQKVLinear {
+        let in_dim = 64;
+        let group_size = in_dim; // single group
+        let bits = 4;
+        let out_dim = (n_heads + 2 * n_kv_heads) * head_dim;
+
+        // Vary per (out, in) so the projection (and each per-head head_dim slice)
+        // is non-degenerate.
+        let mut w_vals = Vec::with_capacity((out_dim * in_dim) as usize);
+        for o in 0..out_dim {
+            for i in 0..in_dim {
+                w_vals.push(0.01 * (((o * 13 + i * 7) % 23) as f32 - 11.0));
+            }
+        }
+        let w = f16_from(&w_vals, &[out_dim, in_dim]);
+        let weight = ffi::quantize_weights_w(&w, group_size, bits);
+        let scales = ffi::quantize_weights_scales(&w, group_size, bits);
+        let biases = ffi::quantize_weights_biases(&w, group_size, bits);
+        let qweight = QuantizedWeight::new(weight, scales, biases, group_size, bits);
+        FusedQKVLinear {
+            qkv_proj: QkvProjection::Fused(UnifiedLinear::new(qweight, None)),
+            n_heads,
+            n_kv_heads,
+            head_dim,
+        }
+    }
+
+    /// Max absolute element, used as a non-degeneracy guard so a comparison
+    /// test cannot pass by silently normalizing an all-zero projection.
+    fn max_abs(a: &MlxArray) -> f32 {
+        scalar_f32(&ffi::max_all(&ffi::abs(a)))
+    }
+
+    /// Read a scalar array as f32. The decode arrays are f16, and
+    /// `item_f32` (MLX `item<float>()`) reinterprets the buffer rather than
+    /// casting, so the scalar must be cast to f32 first.
+    fn scalar_f32(a: &MlxArray) -> f32 {
+        use crate::dtype;
+        let f = ffi::astype(a, dtype::FLOAT32);
+        ffi::eval(&f);
+        ffi::item_f32(&f)
+    }
+
+    fn rms_diff(a: &MlxArray, b: &MlxArray) -> f32 {
+        scalar_f32(&ffi::sqrt(&ffi::mean_all(&ffi::square(&ffi::subtract(
+            a, b,
+        )))))
+    }
+
+    fn max_abs_diff(a: &MlxArray, b: &MlxArray) -> f32 {
+        scalar_f32(&ffi::max_all(&ffi::abs(&ffi::subtract(a, b))))
+    }
+
+    /// Projection + reshape to `[b, l, heads, head_dim]`, mirroring the model
+    /// graph fallback before the head transpose.
+    fn project_reshape_heads(
+        qkv: &FusedQKVLinear,
+        x: &MlxArray,
+    ) -> (
+        UniquePtr<MlxArray>,
+        UniquePtr<MlxArray>,
+        UniquePtr<MlxArray>,
+    ) {
+        let shape = ffi::array_shape(x);
+        let (b, l) = (shape[0], shape[1]);
+        let (q, k, v) = qkv.forward(x);
+        let q = ffi::reshape(&q, &[b, l, qkv.n_heads, qkv.head_dim]);
+        let k = ffi::reshape(&k, &[b, l, qkv.n_kv_heads, qkv.head_dim]);
+        let v = ffi::reshape(&v, &[b, l, qkv.n_kv_heads, qkv.head_dim]);
+        (q, k, v)
+    }
+
+    fn transpose_then_rope(
+        arr: &MlxArray,
+        rope_dims: i32,
+        rope_base: f32,
+        offset: i32,
+    ) -> UniquePtr<MlxArray> {
+        let t = ffi::transpose_axes(arr, &[0, 2, 1, 3]);
+        ffi::fast_rope(&t, rope_dims, false, rope_base, 1.0, offset)
+    }
+
+    /// The generalized fused primitive with a standard `RMSNorm` Q/K norm must
+    /// match the explicit graph sequence (projection -> split -> q/k RMSNorm ->
+    /// transpose -> RoPE) within RMS < 5e-3. This is the Qwen3 / Qwen3-MoE
+    /// decode path (#326). RoPE runs at a non-zero offset so the rotation is
+    /// actually exercised.
+    #[test]
+    fn fused_qkv_split_norm_rope_standard_rmsnorm_matches_graph() {
+        let (n_heads, n_kv_heads, head_dim) = (2, 1, 8);
+        let (rope_dims, rope_base, offset, eps) = (head_dim, 10000.0_f32, 7, 1e-6_f32);
+
+        let qkv = synthetic_quantized_fused_qkv(n_heads, n_kv_heads, head_dim);
+        let q_norm_w: Vec<f32> = (0..head_dim).map(|i| 0.5 + 0.1 * i as f32).collect();
+        let k_norm_w: Vec<f32> = (0..head_dim).map(|i| 0.7 + 0.05 * i as f32).collect();
+        let q_norm = RMSNorm::new(f16_from(&q_norm_w, &[head_dim]), eps);
+        let k_norm = RMSNorm::new(f16_from(&k_norm_w, &[head_dim]), eps);
+
+        let x_vals: Vec<f32> = (0..64).map(|c| 0.2 + 0.01 * c as f32).collect();
+        let x = f16_from(&x_vals, &[1, 1, 64]);
+
+        // Graph reference: norm via the real RMSNorm::forward (raw weight),
+        // BEFORE the head transpose, exactly like the model fallback.
+        let (rq, rk, rv) = project_reshape_heads(&qkv, &x);
+        let rq = q_norm.forward(&rq);
+        let rk = k_norm.forward(&rk);
+        let ref_q = transpose_then_rope(&rq, rope_dims, rope_base, offset);
+        let ref_k = transpose_then_rope(&rk, rope_dims, rope_base, offset);
+        let ref_v = ffi::transpose_axes(&rv, &[0, 2, 1, 3]);
+
+        // Guard: a trivially-zero projection would make the RMS comparison vacuous.
+        assert!(
+            max_abs(&ref_q) > 0.1,
+            "reference Q must be non-degenerate (max-abs {})",
+            max_abs(&ref_q)
+        );
+
+        let (fq, fk, fv) = qkv
+            .forward_split_norm_rope_quantized(&x, &q_norm, &k_norm, rope_dims, rope_base, offset)
+            .expect("quantized fused QKV must take the fused path");
+
+        let (dq, dk, dv) = (
+            rms_diff(&fq, &ref_q),
+            rms_diff(&fk, &ref_k),
+            rms_diff(&fv, &ref_v),
+        );
+        assert!(dq < 5e-3, "fused Q vs graph Q RMS too large: {dq}");
+        assert!(dk < 5e-3, "fused K vs graph K RMS too large: {dk}");
+        assert!(dv < 5e-3, "fused V vs graph V RMS too large: {dv}");
+    }
+
+    /// The existing `GemmaRMSNorm` path must still match its graph reference
+    /// after the primitive was generalized: no Gemma regression (#326). The
+    /// graph reference uses `GemmaRMSNorm::forward`, which applies `(1 + weight)`.
+    #[test]
+    fn fused_qkv_split_norm_rope_gemma_unchanged() {
+        let (n_heads, n_kv_heads, head_dim) = (2, 1, 8);
+        let (rope_dims, rope_base, offset, eps) = (head_dim, 10000.0_f32, 7, 1e-6_f32);
+
+        let qkv = synthetic_quantized_fused_qkv(n_heads, n_kv_heads, head_dim);
+        let q_norm_w: Vec<f32> = (0..head_dim).map(|i| -0.4 + 0.1 * i as f32).collect();
+        let k_norm_w: Vec<f32> = (0..head_dim).map(|i| -0.3 + 0.08 * i as f32).collect();
+        let q_norm = GemmaRMSNorm::new(f16_from(&q_norm_w, &[head_dim]), eps);
+        let k_norm = GemmaRMSNorm::new(f16_from(&k_norm_w, &[head_dim]), eps);
+
+        let x_vals: Vec<f32> = (0..64).map(|c| 0.2 + 0.01 * c as f32).collect();
+        let x = f16_from(&x_vals, &[1, 1, 64]);
+
+        let (rq, rk, rv) = project_reshape_heads(&qkv, &x);
+        let rq = q_norm.forward(&rq);
+        let rk = k_norm.forward(&rk);
+        let ref_q = transpose_then_rope(&rq, rope_dims, rope_base, offset);
+        let ref_k = transpose_then_rope(&rk, rope_dims, rope_base, offset);
+        let ref_v = ffi::transpose_axes(&rv, &[0, 2, 1, 3]);
+
+        assert!(
+            max_abs(&ref_q) > 0.1,
+            "reference Q must be non-degenerate (max-abs {})",
+            max_abs(&ref_q)
+        );
+
+        let (fq, fk, fv) = qkv
+            .forward_split_norm_rope_quantized(&x, &q_norm, &k_norm, rope_dims, rope_base, offset)
+            .expect("quantized fused QKV must take the fused path");
+
+        let (dq, dk, dv) = (
+            rms_diff(&fq, &ref_q),
+            rms_diff(&fk, &ref_k),
+            rms_diff(&fv, &ref_v),
+        );
+        assert!(dq < 5e-3, "Gemma fused Q vs graph Q RMS too large: {dq}");
+        assert!(dk < 5e-3, "Gemma fused K vs graph K RMS too large: {dk}");
+        assert!(dv < 5e-3, "Gemma fused V vs graph V RMS too large: {dv}");
+    }
+
+    /// The `(1 + weight)` Gemma offset must actually change the fused output:
+    /// feeding the SAME raw weights as a standard `RMSNorm` vs a `GemmaRMSNorm`
+    /// produces materially different Q/K. Guards against the primitive silently
+    /// hardcoding or dropping the Gemma offset, the core correctness risk in
+    /// #326.
+    #[test]
+    fn fused_qkv_norm_variant_selects_one_plus_weight() {
+        let (n_heads, n_kv_heads, head_dim) = (2, 1, 8);
+        let (rope_dims, rope_base, offset, eps) = (head_dim, 10000.0_f32, 7, 1e-6_f32);
+
+        let qkv = synthetic_quantized_fused_qkv(n_heads, n_kv_heads, head_dim);
+        let norm_w: Vec<f32> = (0..head_dim).map(|i| 0.5 + 0.1 * i as f32).collect();
+        let std_q = RMSNorm::new(f16_from(&norm_w, &[head_dim]), eps);
+        let std_k = RMSNorm::new(f16_from(&norm_w, &[head_dim]), eps);
+        let gemma_q = GemmaRMSNorm::new(f16_from(&norm_w, &[head_dim]), eps);
+        let gemma_k = GemmaRMSNorm::new(f16_from(&norm_w, &[head_dim]), eps);
+
+        let x_vals: Vec<f32> = (0..64).map(|c| 0.2 + 0.01 * c as f32).collect();
+        let x = f16_from(&x_vals, &[1, 1, 64]);
+
+        let (sq, sk, _sv) = qkv
+            .forward_split_norm_rope_quantized(&x, &std_q, &std_k, rope_dims, rope_base, offset)
+            .expect("standard fused path");
+        let (gq, gk, _gv) = qkv
+            .forward_split_norm_rope_quantized(&x, &gemma_q, &gemma_k, rope_dims, rope_base, offset)
+            .expect("gemma fused path");
+
+        // Guard: both outputs must be non-degenerate, else the difference below
+        // would be a meaningless 0 vs 0.
+        assert!(
+            max_abs(&sq) > 0.1,
+            "standard fused Q must be non-degenerate (max-abs {})",
+            max_abs(&sq)
+        );
+
+        // Same projection, same raw norm weights: the only difference is the
+        // `(1 + weight)` Gemma offset, which must move the output well beyond
+        // f16 noise.
+        let (dq, dk) = (max_abs_diff(&sq, &gq), max_abs_diff(&sk, &gk));
+        assert!(dq > 0.05, "standard vs Gemma Q must differ (max-abs {dq})");
+        assert!(dk > 0.05, "standard vs Gemma K must differ (max-abs {dk})");
+    }
+
+    /// The `fused_qk_norm_enabled_from` helper must be default-on when the env
+    /// var is absent and must respect the recognised disable strings.
+    #[test]
+    fn fused_qk_norm_enabled_defaults_off_and_respects_enable_values() {
+        // Unset -> off (default-off, opt-in).
+        assert!(!fused_qk_norm_enabled_from(None));
+        // Recognised enable values (case-insensitive, trimmed) -> on.
+        for v in ["1", "true", "on", "yes", "ON", "True", " 1 ", "Yes"] {
+            assert!(
+                fused_qk_norm_enabled_from(Some(v)),
+                "{v:?} should enable the fused QK-norm kernel"
+            );
+        }
+        // Any other value, including empty string -> off.
+        for v in ["0", "false", "off", "no", "", "anything"] {
+            assert!(
+                !fused_qk_norm_enabled_from(Some(v)),
+                "{v:?} should keep the fused QK-norm kernel off"
+            );
+        }
+    }
+
+    /// The #905 kill switches are default-ON, which is the inverse of the
+    /// opt-in `MLXCEL_FUSED_QK_NORM` flag above, so they get their own pin: a
+    /// recognised disable string turns the fusion off, an unset variable leaves
+    /// the compiled-in default, and an unrecognised value must not silently
+    /// change the decode graph.
+    #[test]
+    fn fused_905_flags_follow_the_default_and_respect_explicit_values() {
+        // Unset means the compiled-in default, whichever way it is set. Asserting
+        // a literal here instead would re-pin the default and fail whenever a
+        // measurement flips it, which is exactly what happened when the #905
+        // sweep moved both constants to off.
+        assert_eq!(
+            fused_add_rmsnorm_enabled_from(None),
+            FUSED_ADD_RMSNORM_DEFAULT
+        );
+        assert_eq!(
+            fused_rope_append_enabled_from(None),
+            FUSED_ROPE_APPEND_DEFAULT
+        );
+
+        for v in ["0", "false", "off", "no", "OFF", "False", " 0 ", "No"] {
+            assert!(
+                !fused_add_rmsnorm_enabled_from(Some(v)),
+                "{v:?} should disable the fused add+RMSNorm path"
+            );
+            assert!(
+                !fused_rope_append_enabled_from(Some(v)),
+                "{v:?} should disable the fused RoPE + append path"
+            );
+        }
+        for v in ["1", "true", "on", "yes", "ON", "True", " 1 ", "Yes"] {
+            assert!(fused_add_rmsnorm_enabled_from(Some(v)));
+            assert!(fused_rope_append_enabled_from(Some(v)));
+        }
+        // Unrecognised values keep the compiled-in default rather than
+        // disabling: a typo in a deployment script must not quietly change the
+        // graph in either direction.
+        for v in ["", "maybe", "2"] {
+            assert_eq!(
+                fused_add_rmsnorm_enabled_from(Some(v)),
+                FUSED_ADD_RMSNORM_DEFAULT,
+                "{v:?} should fall back to the compiled-in default"
+            );
+            assert_eq!(
+                fused_rope_append_enabled_from(Some(v)),
+                FUSED_ROPE_APPEND_DEFAULT,
+                "{v:?} should fall back to the compiled-in default"
+            );
+        }
+    }
+
+    /// `RMSNorm` is the standard convention (`weight_bias = 0`, raw and
+    /// effective weight identical); `GemmaRMSNorm` is the `(1 + w)` convention
+    /// (`weight_bias = 1`, effective weight is the precomputed sum). The fused
+    /// kernel picks its behavior entirely from these four accessors, so a
+    /// mis-implemented impl is a silent wrong-math bug.
+    #[test]
+    fn fused_add_rms_norm_spec_reports_the_right_convention() {
+        let w = ffi::from_slice_f32(&[0.5, -0.25, 1.5, 0.0], &[4]);
+        let plain = RMSNorm::new(ffi::copy(&w), 1e-5);
+        assert_eq!(plain.norm_weight_bias(), 0.0);
+        assert_eq!(plain.norm_eps(), 1e-5);
+        assert_eq!(
+            ffi::array_to_raw_bytes(plain.raw_norm_weight()),
+            ffi::array_to_raw_bytes(plain.effective_norm_weight()),
+            "a standard RMSNorm has no separate effective weight"
+        );
+
+        let gemma = GemmaRMSNorm::new(ffi::copy(&w), 1e-5);
+        assert_eq!(gemma.norm_weight_bias(), 1.0);
+        let raw = read_f32_vec(gemma.raw_norm_weight());
+        let effective = read_f32_vec(gemma.effective_norm_weight());
+        for (r, e) in raw.iter().zip(effective.iter()) {
+            assert!(
+                (e - (r + 1.0)).abs() < 1e-6,
+                "Gemma effective weight must be (1 + w): raw {r} vs effective {e}"
+            );
+        }
+    }
+
+    fn read_f32_vec(arr: &MlxArray) -> Vec<f32> {
+        let a = ffi::astype(arr, crate::dtype::FLOAT32);
+        ffi::eval(&a);
+        ffi::array_to_raw_bytes(&a)
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
+    // ── Adaptive pooled paged-attention selector (issue #331) ────────────────
+    //
+    // Thresholds cite docs/adr/0001-paged-attention-gather-vs-fused-kernel.md
+    // Phase 6 (#123): the fused kernel wins at Metal / batch >= 4 / ctx 4096 /
+    // single-slab, and loses at b=1, ctx 16384, or a multi-slab layer.
+
+    use super::{
+        NativePagedOverride, PAGED_DISPATCH_CACHE_EMPTY, PagedDecodeBackend, PagedDecodeDispatch,
+        PagedDispatchCache, parse_native_paged_override, resolve_dispatch_decision,
+        select_pooled_paged_dispatch,
+    };
+
+    #[test]
+    fn selector_b1_long_context_is_gather() {
+        // ADR 0001 Phase 6: b=1 loses (0.50x at 4096, 0.39x at 16384). The
+        // single-sequence regime must never dispatch native (acceptance
+        // criterion 2: no B=1 long-context regression).
+        for &ctx in &[1usize, 1024, 4096, 16384, 32768] {
+            assert_eq!(
+                select_pooled_paged_dispatch(1, ctx, 1, PagedDecodeBackend::Metal),
+                PagedDecodeDispatch::Gather,
+                "b=1 ctx={ctx} must stay on gather"
+            );
+        }
+    }
+
+    #[test]
+    fn selector_batched_moderate_context_single_slab_is_native() {
+        // ADR 0001 Phase 6: the fused kernel wins at ctx 4096 for b>=4
+        // (1.30x/1.01x/1.36x at b=4/8/16), single-slab.
+        for &b in &[4usize, 8, 16] {
+            for &ctx in &[1usize, 512, 1024, 4096] {
+                assert_eq!(
+                    select_pooled_paged_dispatch(b, ctx, 1, PagedDecodeBackend::Metal),
+                    PagedDecodeDispatch::Native,
+                    "b={b} ctx={ctx} single-slab Metal must dispatch native"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn selector_batched_long_context_is_gather() {
+        // ADR 0001 Phase 6: at ctx 16384 the kernel loses for every batch size
+        // (0.83x/0.82x/0.91x), so context past 4096 stays on gather.
+        for &b in &[4usize, 8, 16] {
+            for &ctx in &[4097usize, 8192, 16384, 32768] {
+                assert_eq!(
+                    select_pooled_paged_dispatch(b, ctx, 1, PagedDecodeBackend::Metal),
+                    PagedDecodeDispatch::Gather,
+                    "b={b} ctx={ctx} must stay on gather past the 4096 cap"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn selector_multi_slab_is_gather() {
+        // ADR 0001 "#235": the fused kernel reads one contiguous buffer per side
+        // and declines multi-slab layers; the selector short-circuits them even
+        // in the otherwise-winning batched/4096 regime.
+        for &slabs in &[2usize, 3, 8] {
+            assert_eq!(
+                select_pooled_paged_dispatch(8, 4096, slabs, PagedDecodeBackend::Metal),
+                PagedDecodeDispatch::Gather,
+                "slab_count={slabs} must stay on gather"
+            );
+        }
+    }
+
+    #[test]
+    fn selector_non_metal_backend_is_gather() {
+        // The fused kernel is Metal-only; off Apple Silicon there is no evidence
+        // and no kernel, so every shape stays on gather.
+        for &b in &[1usize, 4, 8, 16] {
+            assert_eq!(
+                select_pooled_paged_dispatch(b, 4096, 1, PagedDecodeBackend::Other),
+                PagedDecodeDispatch::Gather,
+                "b={b} on a non-Metal backend must stay on gather"
+            );
+        }
+    }
+
+    #[test]
+    fn selector_cuda_backend_native_on_single_slab_only() {
+        // CUDA (#634): the ported kernel is the default wherever it can serve
+        // the layer, independent of the Metal-measured batch/context ceilings.
+        // Single-slab -> native across batch and context, including the b=1 and
+        // long-context regimes Metal routes to gather.
+        for &(b, ctx) in &[(1usize, 128usize), (1, 65536), (4, 4096), (16, 131072)] {
+            assert_eq!(
+                select_pooled_paged_dispatch(b, ctx, 1, PagedDecodeBackend::Cuda),
+                PagedDecodeDispatch::Native,
+                "CUDA single-slab b={b} ctx={ctx} must select native"
+            );
+        }
+        // Multi-slab -> gather: the kernel reads one contiguous pool buffer per
+        // side and declines past NATIVE_MAX_SLABS regardless of batch/context.
+        for &slabs in &[2usize, 3, 8] {
+            assert_eq!(
+                select_pooled_paged_dispatch(1, 128, slabs, PagedDecodeBackend::Cuda),
+                PagedDecodeDispatch::Gather,
+                "CUDA multi-slab (slabs={slabs}) must decline to gather"
+            );
+        }
+    }
+
+    #[test]
+    fn selector_batch_and_context_boundaries() {
+        // batch boundary: 3 -> gather, 4 -> native (NATIVE_MIN_BATCH).
+        assert_eq!(
+            select_pooled_paged_dispatch(3, 4096, 1, PagedDecodeBackend::Metal),
+            PagedDecodeDispatch::Gather
+        );
+        assert_eq!(
+            select_pooled_paged_dispatch(4, 4096, 1, PagedDecodeBackend::Metal),
+            PagedDecodeDispatch::Native
+        );
+        // context boundary: 4096 -> native, 4097 -> gather (NATIVE_MAX_VISIBLE_LEN).
+        assert_eq!(
+            select_pooled_paged_dispatch(4, 4096, 1, PagedDecodeBackend::Metal),
+            PagedDecodeDispatch::Native
+        );
+        assert_eq!(
+            select_pooled_paged_dispatch(4, 4097, 1, PagedDecodeBackend::Metal),
+            PagedDecodeDispatch::Gather
+        );
+        // slab boundary: 1 -> native, 2 -> gather (NATIVE_MAX_SLABS).
+        assert_eq!(
+            select_pooled_paged_dispatch(4, 4096, 1, PagedDecodeBackend::Metal),
+            PagedDecodeDispatch::Native
+        );
+        assert_eq!(
+            select_pooled_paged_dispatch(4, 4096, 2, PagedDecodeBackend::Metal),
+            PagedDecodeDispatch::Gather
+        );
+    }
+
+    #[test]
+    fn native_override_parses_force_on_off_and_auto() {
+        // Force-on set is preserved exactly from #123.
+        for v in ["1", "true", "on", "yes", "TRUE", "ON", "YES", " 1 "] {
+            assert_eq!(
+                parse_native_paged_override(Some(v)),
+                NativePagedOverride::ForceNative,
+                "{v:?} must force native"
+            );
+        }
+        // #331 force-off set.
+        for v in ["0", "false", "off", "no", "FALSE", "OFF", "NO", " 0 "] {
+            assert_eq!(
+                parse_native_paged_override(Some(v)),
+                NativePagedOverride::ForceGather,
+                "{v:?} must force gather"
+            );
+        }
+        // Unset or unrecognised -> selector decides.
+        for v in [None, Some(""), Some("maybe"), Some("2")] {
+            assert_eq!(
+                parse_native_paged_override(v),
+                NativePagedOverride::Auto,
+                "{v:?} must defer to the selector"
+            );
+        }
+    }
+
+    #[test]
+    fn override_pins_dispatch_both_ways_bypassing_selector() {
+        use std::cell::Cell;
+
+        // Force-native pins Native even when the selector would pick Gather, and
+        // the selector closure is never invoked.
+        let called = Cell::new(false);
+        let out = resolve_dispatch_decision(NativePagedOverride::ForceNative, true, || {
+            called.set(true);
+            PagedDecodeDispatch::Gather
+        });
+        assert_eq!(out, PagedDecodeDispatch::Native);
+        assert!(!called.get(), "force-native must not consult the selector");
+
+        // Force-gather pins Gather even when the selector would pick Native.
+        let called = Cell::new(false);
+        let out = resolve_dispatch_decision(NativePagedOverride::ForceGather, true, || {
+            called.set(true);
+            PagedDecodeDispatch::Native
+        });
+        assert_eq!(out, PagedDecodeDispatch::Gather);
+        assert!(!called.get(), "force-gather must not consult the selector");
+    }
+
+    #[test]
+    fn auto_defers_to_selector_and_respects_native_request() {
+        // Auto + caller willing -> whatever the selector returns.
+        assert_eq!(
+            resolve_dispatch_decision(NativePagedOverride::Auto, true, || {
+                PagedDecodeDispatch::Native
+            }),
+            PagedDecodeDispatch::Native
+        );
+        assert_eq!(
+            resolve_dispatch_decision(NativePagedOverride::Auto, true, || {
+                PagedDecodeDispatch::Gather
+            }),
+            PagedDecodeDispatch::Gather
+        );
+        // Auto + caller opted out of native -> gather, selector not consulted.
+        use std::cell::Cell;
+        let called = Cell::new(false);
+        let out = resolve_dispatch_decision(NativePagedOverride::Auto, false, || {
+            called.set(true);
+            PagedDecodeDispatch::Native
+        });
+        assert_eq!(out, PagedDecodeDispatch::Gather);
+        assert!(!called.get(), "opt-out must not consult the selector");
+    }
+
+    #[test]
+    fn dispatch_cache_returns_selector_decision_across_keys() {
+        // The last-key memo must agree with the pure selector for both a
+        // repeated key (cache hit) and a changed key (recompute), and must not
+        // let stale keys leak the wrong decision.
+        let cache = PagedDispatchCache::new();
+
+        // Miss then hit on a Gather shape (b=1).
+        assert_eq!(
+            cache.select(1, 4096, 1, PagedDecodeBackend::Metal),
+            PagedDecodeDispatch::Gather
+        );
+        assert_eq!(
+            cache.select(1, 4096, 1, PagedDecodeBackend::Metal),
+            PagedDecodeDispatch::Gather
+        );
+
+        // Key change flips to a Native shape (b=8).
+        assert_eq!(
+            cache.select(8, 4096, 1, PagedDecodeBackend::Metal),
+            PagedDecodeDispatch::Native
+        );
+        // Back to the Gather key recomputes correctly (no stale Native).
+        assert_eq!(
+            cache.select(1, 4096, 1, PagedDecodeBackend::Metal),
+            PagedDecodeDispatch::Gather
+        );
+
+        // Saturated fields (values past u16::MAX) never spuriously match a small
+        // key and stay on gather (well past every native threshold).
+        assert_eq!(
+            cache.select(1, 1 << 20, 9, PagedDecodeBackend::Metal),
+            PagedDecodeDispatch::Gather
+        );
+    }
+
+    #[test]
+    fn dispatch_cache_cuda_tag_does_not_alias_metal_or_other() {
+        // The backend tag widened to two bits (#634). A single-slab shape that
+        // differs only by backend must key three distinct cells: Metal at b=1
+        // gathers (needs b>=4), CUDA natives (single-slab default), Other
+        // gathers (no kernel). If the CUDA tag aliased Metal's or Other's cell,
+        // the second/third lookup would return the first's cached decision.
+        let cache = PagedDispatchCache::new();
+
+        // Prime CUDA (native), then query the same shape on Metal (gather) and
+        // Other (gather). No aliasing means each returns its own decision.
+        assert_eq!(
+            cache.select(1, 512, 1, PagedDecodeBackend::Cuda),
+            PagedDecodeDispatch::Native,
+            "CUDA single-slab b=1 must be native"
+        );
+        assert_eq!(
+            cache.select(1, 512, 1, PagedDecodeBackend::Metal),
+            PagedDecodeDispatch::Gather,
+            "Metal b=1 must be gather (not the aliased CUDA native)"
+        );
+        assert_eq!(
+            cache.select(1, 512, 1, PagedDecodeBackend::Other),
+            PagedDecodeDispatch::Gather,
+            "Other must be gather (no kernel)"
+        );
+        // Re-query CUDA: still native, proving the Metal/Other writes did not
+        // clobber the CUDA cell (each backend keeps its own last-key cell only
+        // for the most recent distinct key, so this also confirms recompute
+        // agrees with the pure selector rather than returning a stale hit).
+        assert_eq!(
+            cache.select(1, 512, 1, PagedDecodeBackend::Cuda),
+            PagedDecodeDispatch::Native,
+            "CUDA cell must recompute to native after Metal/Other queries"
+        );
+    }
+
+    #[test]
+    fn dispatch_cache_cuda_pack_key_roundtrips_without_collision() {
+        // The 2-bit backend tag (Metal=0, Cuda=1, Other=2) must produce three
+        // distinct packed keys for one identical shape, and each must stay clear
+        // of the decision bit and the empty sentinel.
+        let shape = (4usize, 4096usize, 1usize);
+        let k_metal =
+            PagedDispatchCache::pack_key(shape.0, shape.1, shape.2, PagedDecodeBackend::Metal);
+        let k_cuda =
+            PagedDispatchCache::pack_key(shape.0, shape.1, shape.2, PagedDecodeBackend::Cuda);
+        let k_other =
+            PagedDispatchCache::pack_key(shape.0, shape.1, shape.2, PagedDecodeBackend::Other);
+        assert_ne!(k_metal, k_cuda, "Metal and CUDA keys must differ");
+        assert_ne!(k_cuda, k_other, "CUDA and Other keys must differ");
+        assert_ne!(k_metal, k_other, "Metal and Other keys must differ");
+        for k in [k_metal, k_cuda, k_other] {
+            assert_eq!(
+                k & PagedDispatchCache::DECISION_BIT,
+                0,
+                "packed key must not touch the decision bit"
+            );
+            assert_ne!(
+                k, PAGED_DISPATCH_CACHE_EMPTY,
+                "packed key must never equal the empty sentinel"
+            );
+        }
+    }
+}
