@@ -661,12 +661,11 @@ mod tests {
     // -----------------------------------------------------------------------
     #[test]
     fn full_fixture_comparison_all_bit_width_head_dim_pairs() {
-        // CARGO_MANIFEST_DIR = .../src/lib/mlxcel-core, project root is three
-        // levels up: .../src/lib/mlxcel-core/../../.. → project root, then
-        // tests/fixtures/turbo_codebooks/.
+        // CARGO_MANIFEST_DIR = .../crates/mlxcel-core, so the workspace
+        // fixture directory is two levels up.
         let fixture_path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../../tests/fixtures/turbo_codebooks/codebooks_hex.json"
+            "/../../tests/fixtures/turbo_codebooks/codebooks_hex.json"
         );
         let content = std::fs::read_to_string(fixture_path)
             .unwrap_or_else(|e| panic!("Failed to read fixture {fixture_path}: {e}"));
