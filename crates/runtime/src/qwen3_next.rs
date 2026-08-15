@@ -1,0 +1,306 @@
+// Copyright 2025-2026 Lablup Inc. and Jeongkyu Shin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Shared dense Qwen3.5 attention, MLP, quantization, and cache primitives.
+
+use crate::gated_delta::GatedDeltaCache;
+use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedLinear};
+use mlxcel_core::utils::silu;
+use mlxcel_core::weights::WeightMap;
+use mlxcel_core::{MlxArray, UniquePtr};
+use serde::Deserialize;
+use std::collections::HashMap;
+
+// Configuration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct TensorQuantization {
+    pub group_size: i32,
+    pub bits: i32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Quantization {
+    pub group_size: i32,
+    pub bits: i32,
+    pub mode: String,
+    #[serde(flatten)]
+    pub overrides: HashMap<String, TensorQuantization>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Qwen3NextConfig {
+    pub num_attention_heads: usize,
+    pub num_key_value_heads: usize,
+    pub head_dim: usize,
+    pub rms_norm_eps: f32,
+    pub rope_theta: f32,
+    pub partial_rotary_factor: f32,
+    pub quantization: Option<Quantization>,
+}
+
+impl Qwen3NextConfig {
+    pub fn quant_params(&self, prefix: &str) -> (i32, i32) {
+        let Some(quantization) = &self.quantization else {
+            return (64, 4);
+        };
+        debug_assert_eq!(quantization.mode, "affine");
+        let language_model_prefix = format!("language_model.{prefix}");
+        quantization
+            .overrides
+            .get(prefix)
+            .or_else(|| quantization.overrides.get(&language_model_prefix))
+            .map(|value| (value.group_size, value.bits))
+            .unwrap_or((quantization.group_size, quantization.bits))
+    }
+
+
+    pub fn rope_dims(&self) -> i32 {
+        (self.head_dim as f32 * self.partial_rotary_factor) as i32
+    }
+
+
+}
+
+// Cache Types.
+/// Mixed cache type for Qwen3Next layers
+pub enum Qwen3NextCache {
+    Attention(KVCache),
+    Linear(GatedDeltaCache),
+}
+
+impl Qwen3NextCache {
+    pub fn offset(&self) -> i32 {
+        match self {
+            Self::Attention(kv) => kv.offset,
+            Self::Linear(gd) => gd.offset,
+        }
+    }
+}
+
+
+// Attention with Gated Output.
+pub(crate) struct Qwen3NextAttention {
+    q_proj: UnifiedLinear,
+    k_proj: UnifiedLinear,
+    v_proj: UnifiedLinear,
+    o_proj: UnifiedLinear,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
+    num_heads: i32,
+    num_kv_heads: i32,
+    head_dim: i32,
+    scale: f32,
+    rope_dims: i32,
+    rope_base: f32,
+}
+
+impl Qwen3NextAttention {
+    pub(crate) fn forward(
+        &self,
+        x: &MlxArray,
+        cache: &mut KVCache,
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let output = self.forward_hidden_with_position_ids(x, cache, mask);
+        self.o_proj.forward(&output)
+    }
+
+
+
+    fn forward_hidden_with_position_ids(
+        &self,
+        x: &MlxArray,
+        cache: &mut KVCache,
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let shape = mlxcel_core::array_shape(x);
+        let b = shape[0];
+        let l = shape[1];
+
+        // Q projection with gating: [B, L, D] -> [B, L, 2 * num_heads * head_dim]
+        let q_proj_output = self.q_proj.forward(x);
+        let q_proj_reshaped = mlxcel_core::reshape(&q_proj_output, &[b, l, self.num_heads, -1]);
+
+        // Split into queries and gate
+        let queries = mlxcel_core::slice(
+            &q_proj_reshaped,
+            &[0, 0, 0, 0],
+            &[b, l, self.num_heads, self.head_dim],
+        );
+        // Note: MLX slice stop=-1 means dim_size-1 (excludes last), not "to end"
+        let q_last_dim = mlxcel_core::array_shape(&q_proj_reshaped)[3];
+        let gate = mlxcel_core::slice(
+            &q_proj_reshaped,
+            &[0, 0, 0, self.head_dim],
+            &[b, l, self.num_heads, q_last_dim],
+        );
+        let gate = mlxcel_core::reshape(&gate, &[b, l, -1]);
+
+        let keys = self.k_proj.forward(x);
+        let values = self.v_proj.forward(x);
+
+        // Reshape and apply Q/K norms
+        let queries = mlxcel_core::reshape(&queries, &[b, l, self.num_heads, self.head_dim]);
+        let keys = mlxcel_core::reshape(&keys, &[b, l, self.num_kv_heads, self.head_dim]);
+        let values = mlxcel_core::reshape(&values, &[b, l, self.num_kv_heads, self.head_dim]);
+
+        let queries = self.q_norm.forward(&queries);
+        let keys = self.k_norm.forward(&keys);
+
+        // Transpose to [B, H, L, D]
+        let mut queries = mlxcel_core::transpose_axes(&queries, &[0, 2, 1, 3]);
+        let mut keys = mlxcel_core::transpose_axes(&keys, &[0, 2, 1, 3]);
+        let values = mlxcel_core::transpose_axes(&values, &[0, 2, 1, 3]);
+
+        let offset = cache.offset;
+
+        // Dense text checkpoints use standard RoPE with the cache offset.
+        queries = mlxcel_core::fast_rope(
+            &queries,
+            self.rope_dims,
+            false,
+            self.rope_base,
+            1.0,
+            offset,
+        );
+        keys = mlxcel_core::fast_rope(
+            &keys,
+            self.rope_dims,
+            false,
+            self.rope_base,
+            1.0,
+            offset,
+        );
+
+        // Update KV cache
+        let (cache_k, cache_v) = cache.update_and_fetch(keys, values);
+
+        let attn_out = if l > 1 && mask.is_none() {
+            mlxcel_core::causal_attention(&queries, &cache_k, &cache_v, self.scale, 0.0, 0)
+        } else {
+            let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
+            unsafe {
+                mlxcel_core::layers::attention_from_ptr(
+                    &queries, &cache_k, &cache_v, self.scale, mask_ptr, 0.0, 0,
+                )
+            }
+        };
+
+        // Transpose back and reshape
+        let output = mlxcel_core::transpose_axes(&attn_out, &[0, 2, 1, 3]);
+        let output = mlxcel_core::reshape(&output, &[b, l, -1]);
+
+        // Apply sigmoid gating to output
+        let gate_sigmoid = mlxcel_core::sigmoid(&gate);
+        mlxcel_core::multiply(&output, &gate_sigmoid)
+    }
+
+
+    pub(crate) fn from_weights(
+        weights: &WeightMap,
+        config: &Qwen3NextConfig,
+        prefix: &str,
+    ) -> Result<Self, String> {
+        let q_prefix = format!("{}.q_proj", prefix);
+        let k_prefix = format!("{}.k_proj", prefix);
+        let v_prefix = format!("{}.v_proj", prefix);
+        let o_prefix = format!("{}.o_proj", prefix);
+        let (q_group_size, q_bits) = config.quant_params(&q_prefix);
+        let (k_group_size, k_bits) = config.quant_params(&k_prefix);
+        let (v_group_size, v_bits) = config.quant_params(&v_prefix);
+        let (o_group_size, o_bits) = config.quant_params(&o_prefix);
+
+        let q_proj = UnifiedLinear::from_weights(weights, &q_prefix, q_group_size, q_bits)?;
+        let k_proj = UnifiedLinear::from_weights(weights, &k_prefix, k_group_size, k_bits)?;
+        let v_proj = UnifiedLinear::from_weights(weights, &v_prefix, v_group_size, v_bits)?;
+        let o_proj = UnifiedLinear::from_weights(weights, &o_prefix, o_group_size, o_bits)?;
+
+        let q_norm_weight = weights
+            .get(&format!("{}.q_norm.weight", prefix))
+            .map(|w| mlxcel_core::copy(w))
+            .ok_or_else(|| format!("Missing q_norm weight: {}", prefix))?;
+        let k_norm_weight = weights
+            .get(&format!("{}.k_norm.weight", prefix))
+            .map(|w| mlxcel_core::copy(w))
+            .ok_or_else(|| format!("Missing k_norm weight: {}", prefix))?;
+
+        let head_dim = config.head_dim as i32;
+
+        Ok(Self {
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            q_norm: RMSNorm::new(q_norm_weight, config.rms_norm_eps),
+            k_norm: RMSNorm::new(k_norm_weight, config.rms_norm_eps),
+            num_heads: config.num_attention_heads as i32,
+            num_kv_heads: config.num_key_value_heads as i32,
+            head_dim,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+            rope_dims: config.rope_dims(),
+            rope_base: config.rope_theta,
+        })
+    }
+}
+
+// Dense MLP.
+/// Dense MLP layer
+pub(crate) struct MLP {
+    gate_proj: UnifiedLinear,
+    up_proj: UnifiedLinear,
+    down_proj: UnifiedLinear,
+}
+
+impl MLP {
+    pub(crate) fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
+        let gated = self.forward_hidden(x);
+        self.down_proj.forward(&gated)
+    }
+
+    pub(crate) fn forward_hidden(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
+        let gate = silu(&self.gate_proj.forward(x));
+        let up = self.up_proj.forward(x);
+        mlxcel_core::multiply(&gate, &up)
+    }
+
+    pub(crate) fn from_weights(
+        weights: &WeightMap,
+        config: &Qwen3NextConfig,
+        prefix: &str,
+    ) -> Result<Self, String> {
+        let gate_prefix = format!("{}.gate_proj", prefix);
+        let up_prefix = format!("{}.up_proj", prefix);
+        let down_prefix = format!("{}.down_proj", prefix);
+        let (gate_group_size, gate_bits) = config.quant_params(&gate_prefix);
+        let (up_group_size, up_bits) = config.quant_params(&up_prefix);
+        let (down_group_size, down_bits) = config.quant_params(&down_prefix);
+
+        Ok(Self {
+            gate_proj: UnifiedLinear::from_weights(
+                weights,
+                &gate_prefix,
+                gate_group_size,
+                gate_bits,
+            )?,
+            up_proj: UnifiedLinear::from_weights(weights, &up_prefix, up_group_size, up_bits)?,
+            down_proj: UnifiedLinear::from_weights(
+                weights,
+                &down_prefix,
+                down_group_size,
+                down_bits,
+            )?,
+        })
+    }
+}
+

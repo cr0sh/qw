@@ -1,14 +1,10 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+mod chat_template;
+mod gated_delta;
+mod model_owned;
+mod qwen3_5;
+mod qwen3_next;
+mod qwen_mrope_state;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+pub mod provider;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub use provider::{GenerationOutput, GenerationRequest, Qwen35Provider};
