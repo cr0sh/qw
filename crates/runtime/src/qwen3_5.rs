@@ -1472,7 +1472,7 @@ fn sanitize_mtp_weights(mut weights: WeightMap, raw_layout: bool) -> WeightMap {
 }
 
 fn materialize_i32(array: &MlxArray, expected_len: usize) -> Vec<i32> {
-    let bytes = mlxcel_core::array_to_raw_bytes(array);
+    let bytes = mlxcel_core::array_evaluated_bytes(array);
     match mlxcel_core::array_itemsize(array) {
         4 => bytes
             .chunks_exact(4)
