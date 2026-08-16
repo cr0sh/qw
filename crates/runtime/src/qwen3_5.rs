@@ -20,6 +20,7 @@ use crate::gated_delta::{
     GatedDeltaCache, RMSNormGated, gated_delta_update, scaled_fast_rms_norm_no_weight,
 };
 use crate::model_owned::ModelOwnedSequenceState;
+use crate::qwen3_5_mtp::Qwen35MtpDraftModel;
 use crate::qwen_mrope_state::MRopeState;
 use crate::qwen3_next::{
     MLP, Quantization, Qwen3NextAttention, Qwen3NextCache, Qwen3NextConfig,
@@ -74,6 +75,10 @@ pub struct Qwen35Config {
     pub vocab_size: usize,
     #[serde(default)]
     pub quantization: Option<Quantization>,
+    #[serde(default)]
+    pub mtp_num_hidden_layers: Option<usize>,
+    #[serde(default)]
+    pub mtp_use_dedicated_embeddings: Option<bool>,
 }
 
 fn default_rms_norm_eps() -> f32 {
@@ -154,6 +159,78 @@ impl Qwen35Config {
             quantization: self.quantization.clone(),
         }
     }
+
+    fn validate_mtp_metadata(&self, config_path: &Path) -> Result<()> {
+        match (
+            self.mtp_num_hidden_layers,
+            self.mtp_use_dedicated_embeddings,
+        ) {
+            (None, None) => Ok(()),
+            (Some(1), Some(false)) => Ok(()),
+            (Some(layers), Some(false)) => anyhow::bail!(
+                "text_config.mtp_num_hidden_layers in {} must be exactly 1, got {layers}",
+                config_path.display()
+            ),
+            (_, Some(true)) => anyhow::bail!(
+                "text_config.mtp_use_dedicated_embeddings in {} must be false",
+                config_path.display()
+            ),
+            _ => anyhow::bail!(
+                "incomplete MTP metadata in {}; text_config.mtp_num_hidden_layers and \
+                 text_config.mtp_use_dedicated_embeddings must be declared together",
+                config_path.display()
+            ),
+        }
+    }
+
+    pub(crate) fn has_mtp_metadata(&self) -> bool {
+        self.mtp_num_hidden_layers == Some(1)
+            && self.mtp_use_dedicated_embeddings == Some(false)
+    }
+}
+
+pub(crate) struct GdnRollbackSnapshot {
+    layer_idx: usize,
+    q: UniquePtr<MlxArray>,
+    k: UniquePtr<MlxArray>,
+    v: UniquePtr<MlxArray>,
+    a: UniquePtr<MlxArray>,
+    b: UniquePtr<MlxArray>,
+    init_state: Option<UniquePtr<MlxArray>>,
+    conv_input: UniquePtr<MlxArray>,
+}
+
+pub(crate) struct Qwen35MtpPrefill {
+    pub(crate) hidden: UniquePtr<MlxArray>,
+    pub(crate) first_token: i32,
+}
+
+pub(crate) struct Qwen35MtpVerifyOutput {
+    pub(crate) hidden: UniquePtr<MlxArray>,
+    pub(crate) target_tokens: Vec<i32>,
+    pub(crate) gdn_states: Vec<GdnRollbackSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Qwen35RollbackPlan {
+    pub(crate) accepted_block_len: i32,
+    pub(crate) trim: i32,
+    pub(crate) final_offset: i32,
+}
+
+pub(crate) fn rollback_plan(
+    verify_offset: i32,
+    accepted: usize,
+    block_size: usize,
+) -> Qwen35RollbackPlan {
+    let accepted_block_len = i32::try_from(accepted.saturating_add(1)).unwrap_or(i32::MAX);
+    let block_size = i32::try_from(block_size).unwrap_or(i32::MAX);
+    let trim = (block_size - accepted_block_len).max(0);
+    Qwen35RollbackPlan {
+        accepted_block_len,
+        trim,
+        final_offset: verify_offset - trim,
+    }
 }
 
 // GatedDeltaNet - Qwen3.5 variant with separate projections.
@@ -189,7 +266,24 @@ impl Qwen35GatedDeltaNet {
         mask: Option<&MlxArray>,
         cache: Option<&mut GatedDeltaCache>,
     ) -> UniquePtr<MlxArray> {
-        let out = self.forward_hidden_internal(inputs, mask, cache);
+        let out = self.forward_hidden_internal(inputs, mask, cache, None);
+        self.out_proj.forward(&out)
+    }
+
+    fn forward_with_capture(
+        &self,
+        layer_idx: usize,
+        inputs: &MlxArray,
+        mask: Option<&MlxArray>,
+        cache: Option<&mut GatedDeltaCache>,
+        snapshots: &mut Vec<GdnRollbackSnapshot>,
+    ) -> UniquePtr<MlxArray> {
+        let out = self.forward_hidden_internal(
+            inputs,
+            mask,
+            cache,
+            Some((layer_idx, snapshots)),
+        );
         self.out_proj.forward(&out)
     }
 
@@ -198,6 +292,7 @@ impl Qwen35GatedDeltaNet {
         inputs: &MlxArray,
         mask: Option<&MlxArray>,
         mut cache: Option<&mut GatedDeltaCache>,
+        snapshot: Option<(usize, &mut Vec<GdnRollbackSnapshot>)>,
     ) -> UniquePtr<MlxArray> {
         let shape = mlxcel_core::array_shape(inputs);
         let b = shape[0];
@@ -338,6 +433,19 @@ impl Qwen35GatedDeltaNet {
         let inv_scale = (self.head_k_dim as f32).powf(-0.5);
         let q = scaled_fast_rms_norm_no_weight(&q, inv_scale * inv_scale, 1e-6);
         let k = scaled_fast_rms_norm_no_weight(&k, inv_scale, 1e-6);
+
+        if let Some((layer_idx, snapshots)) = snapshot {
+            snapshots.push(GdnRollbackSnapshot {
+                layer_idx,
+                q: mlxcel_core::copy(&q),
+                k: mlxcel_core::copy(&k),
+                v: mlxcel_core::copy(&v),
+                a: mlxcel_core::copy(&a),
+                b: mlxcel_core::copy(&b_proj),
+                init_state: state.as_ref().map(|value| mlxcel_core::copy(value)),
+                conv_input: mlxcel_core::copy(&conv_input),
+            });
+        }
 
         // Run gated delta update (use guarded_mask which is None if batch dims mismatch)
         let (out, new_state) = gated_delta_update(
@@ -496,6 +604,59 @@ impl Qwen35DecoderLayer {
         mlxcel_core::add(&h, &mlp_out)
     }
 
+    fn forward_with_capture(
+        &self,
+        layer_idx: usize,
+        x: &MlxArray,
+        mask: Option<&MlxArray>,
+        cache: &mut Qwen3NextCache,
+        snapshots: &mut Vec<GdnRollbackSnapshot>,
+    ) -> UniquePtr<MlxArray> {
+        let normed = self.input_layernorm.forward(x);
+        let residual = match (&self.attention, cache) {
+            (Qwen35AttentionVariant::Linear(attn), Qwen3NextCache::Linear(cache)) => {
+                attn.forward_with_capture(layer_idx, &normed, mask, Some(cache), snapshots)
+            }
+            (Qwen35AttentionVariant::Linear(attn), _) => {
+                attn.forward_with_capture(layer_idx, &normed, mask, None, snapshots)
+            }
+            (Qwen35AttentionVariant::FullAttention(attn), Qwen3NextCache::Attention(cache)) => {
+                attn.forward_verify(&normed, cache, mask)
+            }
+            (Qwen35AttentionVariant::FullAttention(attn), _) => {
+                let mut temporary = KVCache::new();
+                attn.forward_verify(&normed, &mut temporary, mask)
+            }
+        };
+        let hidden = mlxcel_core::add(x, &residual);
+        let mlp = self
+            .mlp
+            .forward(&self.post_attention_layernorm.forward(&hidden));
+        mlxcel_core::add(&hidden, &mlp)
+    }
+
+    pub(crate) fn forward_full_attention(
+        &self,
+        x: &MlxArray,
+        mask: Option<&MlxArray>,
+        cache: &mut KVCache,
+    ) -> UniquePtr<MlxArray> {
+        let normed = self.input_layernorm.forward(x);
+        let residual = match &self.attention {
+            Qwen35AttentionVariant::FullAttention(attention) => {
+                attention.forward(&normed, cache, mask)
+            }
+            Qwen35AttentionVariant::Linear(_) => {
+                unreachable!("the bundled MTP layer must use full attention")
+            }
+        };
+        let hidden = mlxcel_core::add(x, &residual);
+        let mlp = self
+            .mlp
+            .forward(&self.post_attention_layernorm.forward(&hidden));
+        mlxcel_core::add(&hidden, &mlp)
+    }
+
 
     fn from_weights(
         weights: &WeightMap,
@@ -503,9 +664,22 @@ impl Qwen35DecoderLayer {
         qn_config: &Qwen3NextConfig,
         layer_idx: usize,
     ) -> Result<Self, String> {
-        let prefix = format!("model.layers.{}", layer_idx);
-        let is_linear = config.is_linear_layer(layer_idx);
+        Self::from_weights_at_prefix(
+            weights,
+            config,
+            qn_config,
+            &format!("model.layers.{layer_idx}"),
+            config.is_linear_layer(layer_idx),
+        )
+    }
 
+    pub(crate) fn from_weights_at_prefix(
+        weights: &WeightMap,
+        config: &Qwen35Config,
+        qn_config: &Qwen3NextConfig,
+        prefix: &str,
+        is_linear: bool,
+    ) -> Result<Self, String> {
         let attention = if is_linear {
             Qwen35AttentionVariant::Linear(Qwen35GatedDeltaNet::from_weights(
                 weights,
@@ -549,6 +723,7 @@ pub struct Qwen35Model {
     pub(crate) norm: RMSNorm,
     pub(crate) lm_head: Option<UnifiedLinear>,
     pub(crate) config: Qwen35Config,
+    mtp: Option<Qwen35MtpDraftModel>,
     /// Model-owned heterogeneous cache state used by one synchronous sequence.
     sequence_state: ModelOwnedSequenceState<Qwen3NextCache>,
     /// MRoPE position state retained for the Qwen3.5 text path.
@@ -556,7 +731,7 @@ pub struct Qwen35Model {
 }
 
 impl Qwen35Model {
-    fn forward_hidden(
+    fn forward_backbone(
         &self,
         input_ids: &MlxArray,
         caches: &mut [Qwen3NextCache],
@@ -582,10 +757,18 @@ impl Qwen35Model {
             };
             hidden = layer.forward(&hidden, mask, cache);
         }
-        self.norm.forward(&hidden)
+        hidden
     }
 
-    fn project_logits(&self, hidden: &MlxArray) -> UniquePtr<MlxArray> {
+    fn forward_hidden(
+        &self,
+        input_ids: &MlxArray,
+        caches: &mut [Qwen3NextCache],
+    ) -> UniquePtr<MlxArray> {
+        self.norm.forward(&self.forward_backbone(input_ids, caches))
+    }
+
+    pub(crate) fn project_logits(&self, hidden: &MlxArray) -> UniquePtr<MlxArray> {
         if let Some(lm_head) = &self.lm_head {
             lm_head.forward(hidden)
         } else {
@@ -635,6 +818,175 @@ impl Qwen35Model {
             })
             .collect()
     }
+
+    pub(crate) fn has_mtp(&self) -> bool {
+        self.mtp.is_some()
+    }
+
+    pub(crate) fn mtp(&self) -> Option<&Qwen35MtpDraftModel> {
+        self.mtp.as_ref()
+    }
+
+    pub(crate) fn forward_mtp_prefill(&self, input_ids: &MlxArray) -> Qwen35MtpPrefill {
+        let (hidden, first_token, offset) = self.sequence_state.with_internal(|caches| {
+            let hidden = self.forward_backbone(input_ids, caches);
+            let shape = mlxcel_core::array_shape(&hidden);
+            let last_position = shape[1] - 1;
+            let last_hidden = mlxcel_core::slice(
+                &hidden,
+                &[0, last_position, 0],
+                &[shape[0], last_position + 1, shape[2]],
+            );
+            let normalized = self.norm.forward(&last_hidden);
+            let logits = self.project_logits(&normalized);
+            let token = mlxcel_core::argmax_last_axis(&logits);
+            mlxcel_core::eval(&token);
+            let first_token = mlxcel_core::item_i32(&token);
+            let offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
+            (hidden, first_token, offset)
+        });
+        self.mrope_state.set_position(offset);
+        Qwen35MtpPrefill {
+            hidden,
+            first_token,
+        }
+    }
+
+    pub(crate) fn forward_mtp_verify(
+        &self,
+        input_ids: &MlxArray,
+    ) -> Qwen35MtpVerifyOutput {
+        let (output, offset) = self.sequence_state.with_internal(|caches| {
+            let mut hidden = self.embed_tokens.forward(input_ids);
+            let shape = mlxcel_core::array_shape(&hidden);
+            let seq_len = shape[1];
+            let attention_layer = self.config.full_attention_interval.saturating_sub(1);
+            let attention_mask = if seq_len > 1 {
+                let offset = caches
+                    .get(attention_layer)
+                    .map(Qwen3NextCache::offset)
+                    .unwrap_or(0);
+                Some(create_causal_mask(seq_len, offset))
+            } else {
+                None
+            };
+            let mut gdn_states = Vec::new();
+            for (layer_idx, (layer, cache)) in
+                self.layers.iter().zip(caches.iter_mut()).enumerate()
+            {
+                let mask = if layer.is_linear {
+                    None
+                } else {
+                    attention_mask.as_deref()
+                };
+                hidden =
+                    layer.forward_with_capture(layer_idx, &hidden, mask, cache, &mut gdn_states);
+            }
+            let normalized = self.norm.forward(&hidden);
+            let logits = self.project_logits(&normalized);
+            let argmax = mlxcel_core::argmax_last_axis(&logits);
+            let target_tokens = materialize_i32(&argmax, seq_len as usize);
+            let offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
+            (
+                Qwen35MtpVerifyOutput {
+                    hidden,
+                    target_tokens,
+                    gdn_states,
+                },
+                offset,
+            )
+        });
+        self.mrope_state.set_position(offset);
+        output
+    }
+
+    pub(crate) fn rollback_mtp_verify(
+        &self,
+        gdn_states: &[GdnRollbackSnapshot],
+        accepted: usize,
+        block_size: usize,
+    ) -> Qwen35RollbackPlan {
+        let plan = self.sequence_state.with_internal(|caches| {
+            let verify_offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
+            let plan = rollback_plan(verify_offset, accepted, block_size);
+            for cache in caches.iter_mut() {
+                if let Qwen3NextCache::Attention(cache) = cache {
+                    if plan.trim > 0 {
+                        cache.trim(plan.trim);
+                    }
+                }
+            }
+
+            for snapshot in gdn_states {
+                let Some(Qwen3NextCache::Linear(cache)) = caches.get_mut(snapshot.layer_idx) else {
+                    continue;
+                };
+                let Qwen35AttentionVariant::Linear(layer) =
+                    &self.layers[snapshot.layer_idx].attention
+                else {
+                    continue;
+                };
+                let replay_len = plan.accepted_block_len;
+                let q_shape = mlxcel_core::array_shape(&snapshot.q);
+                let k_shape = mlxcel_core::array_shape(&snapshot.k);
+                let v_shape = mlxcel_core::array_shape(&snapshot.v);
+                let a_shape = mlxcel_core::array_shape(&snapshot.a);
+                let b_shape = mlxcel_core::array_shape(&snapshot.b);
+                let q = mlxcel_core::slice(
+                    &snapshot.q,
+                    &[0, 0, 0, 0],
+                    &[q_shape[0], replay_len, q_shape[2], q_shape[3]],
+                );
+                let k = mlxcel_core::slice(
+                    &snapshot.k,
+                    &[0, 0, 0, 0],
+                    &[k_shape[0], replay_len, k_shape[2], k_shape[3]],
+                );
+                let v = mlxcel_core::slice(
+                    &snapshot.v,
+                    &[0, 0, 0, 0],
+                    &[v_shape[0], replay_len, v_shape[2], v_shape[3]],
+                );
+                let a = mlxcel_core::slice(
+                    &snapshot.a,
+                    &[0, 0, 0],
+                    &[a_shape[0], replay_len, a_shape[2]],
+                );
+                let b = mlxcel_core::slice(
+                    &snapshot.b,
+                    &[0, 0, 0],
+                    &[b_shape[0], replay_len, b_shape[2]],
+                );
+                let (_, replayed_state) = gated_delta_update(
+                    &q,
+                    &k,
+                    &v,
+                    &a,
+                    &b,
+                    &layer.a_log,
+                    &layer.dt_bias,
+                    snapshot.init_state.as_deref(),
+                    None,
+                );
+                cache.state_cache = Some(replayed_state);
+
+                let conv_shape = mlxcel_core::array_shape(&snapshot.conv_input);
+                let start = plan.accepted_block_len;
+                let end = start + layer.conv_kernel_size as i32 - 1;
+                let conv_state = mlxcel_core::slice(
+                    &snapshot.conv_input,
+                    &[0, start, 0],
+                    &[conv_shape[0], end, conv_shape[2]],
+                );
+                cache.conv_state = Some(mlxcel_core::contiguous(&conv_state, false));
+                cache.offset = plan.final_offset;
+            }
+            plan
+        });
+        self.mrope_state.set_position(plan.final_offset);
+        plan
+    }
+
 
     fn parse_config(model_dir: &Path) -> Result<Qwen35Config> {
         let config_path = model_dir.join("config.json");
@@ -718,6 +1070,7 @@ impl Qwen35Model {
             "num_hidden_layers must be greater than zero in {}",
             config_path.display()
         );
+        config.validate_mtp_metadata(&config_path)?;
         Ok(config)
     }
 
@@ -776,15 +1129,28 @@ impl Qwen35Model {
             "checkpoint {} contains no language_model.* tensors",
             model_dir.display()
         );
-        let weights = sanitize_language_model_weights(weights, &config);
-        Self::from_weights(&weights, &config)
+        let weights = sanitize_language_model_weights(weights, &config, model_dir)?;
+        let mut model = Self::from_weights(&weights.target, &config)
             .map_err(anyhow::Error::msg)
             .with_context(|| {
                 format!(
                     "failed to construct dense model from checkpoint {}",
                     model_dir.display()
                 )
-            })
+            })?;
+        if let Some(mtp_weights) = weights.mtp.as_ref() {
+            model.mtp = Some(
+                Qwen35MtpDraftModel::from_weights(mtp_weights, &config)
+                    .map_err(anyhow::Error::msg)
+                    .with_context(|| {
+                        format!(
+                            "failed to construct bundled MTP head from checkpoint {}",
+                            model_dir.display()
+                        )
+                    })?,
+            );
+        }
+        Ok(model)
     }
 
     pub(crate) fn from_weights(
@@ -839,6 +1205,7 @@ impl Qwen35Model {
             norm: RMSNorm::new(norm_weight, config.rms_norm_eps),
             lm_head,
             config: config.clone(),
+            mtp: None,
             sequence_state: ModelOwnedSequenceState::new(internal_caches),
             mrope_state: MRopeState::new(),
         })
@@ -973,21 +1340,169 @@ pub(crate) fn sanitize_weights(mut weights: WeightMap, config: &Qwen35Config) ->
     weights
 }
 
+struct SanitizedLanguageWeights {
+    target: WeightMap,
+    mtp: Option<WeightMap>,
+}
+
 fn sanitize_language_model_weights(
     weights: WeightMap,
     config: &Qwen35Config,
-) -> WeightMap {
-    let mut language_weights = WeightMap::new();
+    checkpoint_path: &Path,
+) -> Result<SanitizedLanguageWeights> {
+    let mut target = WeightMap::new();
+    let mut mtp = WeightMap::new();
     for (name, value) in weights {
         let Some(name) = name.strip_prefix("language_model.") else {
             continue;
         };
-        if name.starts_with("visual.") || name.starts_with("vision_tower.") || name.starts_with("mtp.") {
+        if name.starts_with("visual.") || name.starts_with("vision_tower.") {
             continue;
         }
-        language_weights.insert(name.to_string(), value);
+        if name.starts_with("mtp.") {
+            mtp.insert(name.to_string(), value);
+        } else {
+            target.insert(name.to_string(), value);
+        }
     }
-    sanitize_weights(language_weights, config)
+
+    let declared = config.has_mtp_metadata();
+    ensure!(
+        declared || mtp.is_empty(),
+        "checkpoint {} contains language_model.mtp.* tensors but text_config does not declare \
+         mtp_num_hidden_layers and mtp_use_dedicated_embeddings",
+        checkpoint_path.display()
+    );
+    ensure!(
+        !declared || !mtp.is_empty(),
+        "checkpoint {} declares a bundled MTP head but contains no language_model.mtp.* tensors",
+        checkpoint_path.display()
+    );
+
+    let raw_layout = target.iter().any(|(name, value)| {
+        name.contains("conv1d.weight")
+            && is_raw_conv1d_layout(&mlxcel_core::array_shape(value))
+    });
+    let mtp = if declared {
+        validate_mtp_weights(&mtp, checkpoint_path)?;
+        Some(sanitize_mtp_weights(mtp, raw_layout))
+    } else {
+        None
+    };
+    Ok(SanitizedLanguageWeights {
+        target: sanitize_weights(target, config),
+        mtp,
+    })
+}
+
+fn validate_mtp_weights(weights: &WeightMap, checkpoint_path: &Path) -> Result<()> {
+    const REQUIRED: &[&str] = &[
+        "mtp.fc.weight",
+        "mtp.pre_fc_norm_embedding.weight",
+        "mtp.pre_fc_norm_hidden.weight",
+        "mtp.layers.0.input_layernorm.weight",
+        "mtp.layers.0.post_attention_layernorm.weight",
+        "mtp.layers.0.self_attn.q_proj.weight",
+        "mtp.layers.0.self_attn.k_proj.weight",
+        "mtp.layers.0.self_attn.v_proj.weight",
+        "mtp.layers.0.self_attn.o_proj.weight",
+        "mtp.layers.0.self_attn.q_norm.weight",
+        "mtp.layers.0.self_attn.k_norm.weight",
+        "mtp.layers.0.mlp.gate_proj.weight",
+        "mtp.layers.0.mlp.up_proj.weight",
+        "mtp.layers.0.mlp.down_proj.weight",
+        "mtp.norm.weight",
+    ];
+    for name in REQUIRED {
+        ensure!(
+            weights.contains_key(*name),
+            "checkpoint {} is missing required tensor language_model.{name}",
+            checkpoint_path.display()
+        );
+    }
+    if let Some(name) = weights
+        .keys()
+        .find(|name| name.starts_with("mtp.embed_tokens."))
+    {
+        anyhow::bail!(
+            "checkpoint {} contains dedicated MTP embedding tensor language_model.{name} \
+             while text_config.mtp_use_dedicated_embeddings is false",
+            checkpoint_path.display()
+        );
+    }
+    if let Some(name) = weights
+        .keys()
+        .find(|name| name.starts_with("mtp.layers.") && !name.starts_with("mtp.layers.0."))
+    {
+        anyhow::bail!(
+            "checkpoint {} contains unsupported extra MTP layer tensor language_model.{name}",
+            checkpoint_path.display()
+        );
+    }
+    Ok(())
+}
+
+fn sanitize_mtp_weights(mut weights: WeightMap, raw_layout: bool) -> WeightMap {
+    if !raw_layout {
+        return weights;
+    }
+    const NORM_SUFFIXES: &[&str] = &[
+        ".input_layernorm.weight",
+        ".post_attention_layernorm.weight",
+        ".q_norm.weight",
+        ".k_norm.weight",
+        "mtp.norm.weight",
+        "mtp.pre_fc_norm_embedding.weight",
+        "mtp.pre_fc_norm_hidden.weight",
+    ];
+    let names: Vec<String> = weights.keys().cloned().collect();
+    for name in names {
+        if !NORM_SUFFIXES.iter().any(|suffix| name.ends_with(suffix)) {
+            continue;
+        }
+        let value = weights
+            .get(&name)
+            .expect("name collected from the same MTP weight map");
+        if mlxcel_core::array_shape(value).len() == 1 {
+            let one = mlxcel_core::full_f32(&[1], 1.0, mlxcel_core::array_dtype(value));
+            weights.insert(name, mlxcel_core::add(value, &one));
+        }
+    }
+    weights
+}
+
+fn materialize_i32(array: &MlxArray, expected_len: usize) -> Vec<i32> {
+    let bytes = mlxcel_core::array_to_raw_bytes(array);
+    match mlxcel_core::array_itemsize(array) {
+        4 => bytes
+            .chunks_exact(4)
+            .take(expected_len)
+            .map(|chunk| i32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect(),
+        8 => bytes
+            .chunks_exact(8)
+            .take(expected_len)
+            .map(|chunk| {
+                i64::from_ne_bytes([
+                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6],
+                    chunk[7],
+                ]) as i32
+            })
+            .collect(),
+        _ => {
+            let flat = mlxcel_core::reshape(array, &[expected_len as i32]);
+            (0..expected_len)
+                .map(|index| {
+                    let cell = mlxcel_core::slice(
+                        &flat,
+                        &[index as i32],
+                        &[(index + 1) as i32],
+                    );
+                    mlxcel_core::item_i32(&mlxcel_core::reshape(&cell, &[]))
+                })
+                .collect()
+        }
+    }
 }
 
 // LanguageModel trait implementation.
@@ -998,8 +1513,13 @@ impl LanguageModel for Qwen35Model {
         _caches: &mut [KVCache],
         _mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        self.sequence_state
-            .with_internal(|caches| self.forward_internal(input, caches))
+        let (logits, offset) = self.sequence_state.with_internal(|caches| {
+            let logits = self.forward_internal(input, caches);
+            let offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
+            (logits, offset)
+        });
+        self.mrope_state.set_position(offset);
+        logits
     }
 
     fn forward_last_logits(
@@ -1009,8 +1529,13 @@ impl LanguageModel for Qwen35Model {
         _mask: Option<&MlxArray>,
         last_pos: usize,
     ) -> UniquePtr<MlxArray> {
-        self.sequence_state
-            .with_internal(|caches| self.forward_last_internal(input_ids, caches, last_pos))
+        let (logits, offset) = self.sequence_state.with_internal(|caches| {
+            let logits = self.forward_last_internal(input_ids, caches, last_pos);
+            let offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
+            (logits, offset)
+        });
+        self.mrope_state.set_position(offset);
+        logits
     }
 
     fn make_caches(&self) -> Vec<KVCache> {
@@ -1029,8 +1554,10 @@ impl LanguageModel for Qwen35Model {
         self.sequence_state
             .replace_internal(self.make_internal_caches());
         self.mrope_state.clear();
+        if let Some(mtp) = &self.mtp {
+            mtp.reset();
+        }
     }
-
     fn eos_token_ids(&self) -> Vec<i32> {
         vec![248046, 248044]
     }
@@ -1061,6 +1588,38 @@ mod tests {
                 .insert("quantization".to_string(), quantization);
         }
         serde_json::from_value(value).expect("minimal dense config")
+    }
+
+    fn mtp_config() -> Qwen35Config {
+        let mut config = dense_config(None);
+        config.mtp_num_hidden_layers = Some(1);
+        config.mtp_use_dedicated_embeddings = Some(false);
+        config
+    }
+
+    fn insert_required_mtp_weights(weights: &mut WeightMap) {
+        for name in [
+            "mtp.fc.weight",
+            "mtp.pre_fc_norm_embedding.weight",
+            "mtp.pre_fc_norm_hidden.weight",
+            "mtp.layers.0.input_layernorm.weight",
+            "mtp.layers.0.post_attention_layernorm.weight",
+            "mtp.layers.0.self_attn.q_proj.weight",
+            "mtp.layers.0.self_attn.k_proj.weight",
+            "mtp.layers.0.self_attn.v_proj.weight",
+            "mtp.layers.0.self_attn.o_proj.weight",
+            "mtp.layers.0.self_attn.q_norm.weight",
+            "mtp.layers.0.self_attn.k_norm.weight",
+            "mtp.layers.0.mlp.gate_proj.weight",
+            "mtp.layers.0.mlp.up_proj.weight",
+            "mtp.layers.0.mlp.down_proj.weight",
+            "mtp.norm.weight",
+        ] {
+            weights.insert(
+                format!("language_model.{name}"),
+                mlxcel_core::from_slice_f32(&[0.0; 4], &[4]),
+            );
+        }
     }
 
     struct TestDir(std::path::PathBuf);
@@ -1182,18 +1741,85 @@ mod tests {
     }
 
     #[test]
-    fn sanitization_preserves_mixed_quantization_and_excludes_vision_and_mtp() {
-        let config = dense_config(Some(serde_json::json!({
-            "group_size": 64,
-            "bits": 4,
-            "mode": "affine",
-            "language_model.model.layers.0.linear_attn.in_proj_qkv": {
-                "group_size": 64,
-                "bits": 5,
-                "mode": "affine"
-            }
-        })));
+    fn mtp_metadata_accepts_absent_and_valid_and_rejects_incompatible_forms() {
+        let path = Path::new("/checkpoint/config.json");
+        dense_config(None)
+            .validate_mtp_metadata(path)
+            .expect("absent MTP metadata is valid");
+        mtp_config()
+            .validate_mtp_metadata(path)
+            .expect("one shared-embedding MTP layer is valid");
+
+        for (layers, dedicated, expected) in [
+            (Some(1), None, "incomplete MTP metadata"),
+            (Some(2), Some(false), "must be exactly 1"),
+            (Some(1), Some(true), "must be false"),
+        ] {
+            let mut config = dense_config(None);
+            config.mtp_num_hidden_layers = layers;
+            config.mtp_use_dedicated_embeddings = dedicated;
+            let error = config
+                .validate_mtp_metadata(path)
+                .expect_err("incompatible MTP metadata must fail")
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+    }
+
+    #[test]
+    fn declared_mtp_requires_the_complete_exact_tensor_set() {
+        let config = mtp_config();
+        let error = sanitize_language_model_weights(
+            WeightMap::new(),
+            &config,
+            Path::new("/checkpoint"),
+        )
+        .err()
+        .expect("declared MTP without tensors must fail")
+        .to_string();
+        assert!(error.contains("/checkpoint"), "{error}");
+        assert!(error.contains("contains no language_model.mtp.* tensors"), "{error}");
+
+        let mut incomplete = WeightMap::new();
+        incomplete.insert(
+            "language_model.mtp.fc.weight".to_string(),
+            mlxcel_core::from_slice_f32(&[0.0; 4], &[4]),
+        );
+        let error = sanitize_language_model_weights(
+            incomplete,
+            &config,
+            Path::new("/checkpoint"),
+        )
+        .err()
+        .expect("incomplete MTP tensors must fail")
+        .to_string();
+        assert!(error.contains("language_model.mtp.pre_fc_norm_embedding.weight"), "{error}");
+    }
+
+    #[test]
+    fn sanitizer_splits_mtp_and_converts_its_norms_only_for_raw_layout() {
+        let config = mtp_config();
         let mut weights = WeightMap::new();
+        weights.insert(
+            "language_model.model.layers.0.linear_attn.conv1d.weight".to_string(),
+            mlxcel_core::from_slice_f32(&[0.0; 12], &[4, 1, 3]),
+        );
+
+        let mut undeclared = WeightMap::new();
+        undeclared.insert(
+            "language_model.mtp.fc.weight".to_string(),
+            mlxcel_core::from_slice_f32(&[0.0; 4], &[4]),
+        );
+        let error = sanitize_language_model_weights(
+            undeclared,
+            &dense_config(None),
+            Path::new("/undeclared"),
+        )
+        .err()
+        .expect("MTP tensors without metadata must fail")
+        .to_string();
+        assert!(error.contains("/undeclared"), "{error}");
+        assert!(error.contains("does not declare"), "{error}");
         weights.insert(
             "language_model.model.layers.0.linear_attn.in_proj_qkv.scales".to_string(),
             mlxcel_core::from_slice_f32(&[1.0], &[1]),
@@ -1202,21 +1828,48 @@ mod tests {
             "language_model.visual.patch_embed.weight".to_string(),
             mlxcel_core::from_slice_f32(&[2.0], &[1]),
         );
-        weights.insert(
-            "language_model.mtp.layers.0.weight".to_string(),
-            mlxcel_core::from_slice_f32(&[3.0], &[1]),
-        );
+        insert_required_mtp_weights(&mut weights);
 
-        let sanitized = sanitize_language_model_weights(weights, &config);
+        let sanitized = sanitize_language_model_weights(
+            weights,
+            &config,
+            Path::new("/checkpoint"),
+        )
+        .expect("valid bundled MTP weights");
         assert!(
-            sanitized.contains_key("model.layers.0.linear_attn.in_proj_qkv.scales")
+            sanitized
+                .target
+                .contains_key("model.layers.0.linear_attn.in_proj_qkv.scales")
         );
-        assert!(!sanitized.keys().any(|name| name.contains("visual")));
-        assert!(!sanitized.keys().any(|name| name.contains("mtp")));
-        assert_eq!(
-            config.quant_params("model.layers.0.linear_attn.in_proj_qkv"),
-            (64, 5)
+        assert!(!sanitized.target.keys().any(|name| name.contains("visual")));
+        let mtp = sanitized.mtp.expect("retained MTP partition");
+        assert!(mtp.contains_key("mtp.fc.weight"));
+        let expected = mlxcel_core::from_slice_f32(&[1.0; 4], &[4]);
+        let shifted = mlxcel_core::allclose(
+            mtp.get("mtp.pre_fc_norm_hidden.weight")
+                .expect("MTP hidden norm"),
+            &expected,
+            0.0,
+            0.0,
         );
+        mlxcel_core::eval(&shifted);
+        assert!(mlxcel_core::item_bool(&shifted));
+
+        let mut converted = WeightMap::new();
+        converted.insert(
+            "mtp.norm.weight".to_string(),
+            mlxcel_core::from_slice_f32(&[0.0; 4], &[4]),
+        );
+        let converted = sanitize_mtp_weights(converted, false);
+        let expected_zero = mlxcel_core::from_slice_f32(&[0.0; 4], &[4]);
+        let unchanged = mlxcel_core::allclose(
+            converted.get("mtp.norm.weight").expect("MTP final norm"),
+            &expected_zero,
+            0.0,
+            0.0,
+        );
+        mlxcel_core::eval(&unchanged);
+        assert!(mlxcel_core::item_bool(&unchanged));
     }
 
     #[test]

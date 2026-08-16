@@ -112,17 +112,28 @@ impl Qwen3NextAttention {
         cache: &mut KVCache,
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        let output = self.forward_hidden_with_position_ids(x, cache, mask);
-        self.o_proj.forward(&output)
+        self.forward_impl(x, cache, mask, false)
     }
 
-
-
-    fn forward_hidden_with_position_ids(
+    /// Verify-only path from the checked-in mlxcel commit 4038da96. Each
+    /// query attends through its own sequential-decode prefix.
+    pub(crate) fn forward_verify(
         &self,
         x: &MlxArray,
         cache: &mut KVCache,
         mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        self.forward_impl(x, cache, mask, true)
+    }
+
+
+
+    fn forward_impl(
+        &self,
+        x: &MlxArray,
+        cache: &mut KVCache,
+        mask: Option<&MlxArray>,
+        target_verify: bool,
     ) -> UniquePtr<MlxArray> {
         let shape = mlxcel_core::array_shape(x);
         let b = shape[0];
@@ -186,7 +197,9 @@ impl Qwen3NextAttention {
         // Update KV cache
         let (cache_k, cache_v) = cache.update_and_fetch(keys, values);
 
-        let attn_out = if l > 1 && mask.is_none() {
+        let attn_out = if target_verify && l > 1 {
+            self.attend_per_position(&queries, &cache_k, &cache_v)
+        } else if l > 1 && mask.is_none() {
             mlxcel_core::causal_attention(&queries, &cache_k, &cache_v, self.scale, 0.0, 0)
         } else {
             let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
@@ -204,6 +217,57 @@ impl Qwen3NextAttention {
         // Apply sigmoid gating to output
         let gate_sigmoid = mlxcel_core::sigmoid(&gate);
         mlxcel_core::multiply(&output, &gate_sigmoid)
+    }
+
+    fn attend_per_position(
+        &self,
+        queries: &MlxArray,
+        keys: &MlxArray,
+        values: &MlxArray,
+    ) -> UniquePtr<MlxArray> {
+        let q_shape = mlxcel_core::array_shape(queries);
+        let k_shape = mlxcel_core::array_shape(keys);
+        let v_shape = mlxcel_core::array_shape(values);
+        let batch = q_shape[0];
+        let query_heads = q_shape[1];
+        let query_len = q_shape[2];
+        let head_dim = q_shape[3];
+        let kv_heads = k_shape[1];
+        let prefix_len = k_shape[2] - query_len;
+
+        let mut output: Option<UniquePtr<MlxArray>> = None;
+        for position in 0..query_len {
+            let query = mlxcel_core::slice(
+                queries,
+                &[0, 0, position, 0],
+                &[batch, query_heads, position + 1, head_dim],
+            );
+            let kv_len = prefix_len + position + 1;
+            let key = mlxcel_core::slice(
+                keys,
+                &[0, 0, 0, 0],
+                &[batch, kv_heads, kv_len, head_dim],
+            );
+            let value = mlxcel_core::slice(
+                values,
+                &[0, 0, 0, 0],
+                &[batch, kv_heads, kv_len, v_shape[3]],
+            );
+            let attended = mlxcel_core::layers::attention(
+                &query,
+                &key,
+                &value,
+                self.scale,
+                None,
+                0.0,
+                0,
+            );
+            output = Some(match output {
+                None => attended,
+                Some(previous) => mlxcel_core::concatenate(&previous, &attended, 2),
+            });
+        }
+        output.expect("verify attention requires at least one query position")
     }
 
 

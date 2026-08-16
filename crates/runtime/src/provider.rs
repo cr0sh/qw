@@ -8,6 +8,7 @@ use tokenizers::Tokenizer;
 
 use crate::chat_template::ChatTemplateProcessor;
 use crate::qwen3_5::Qwen35Model;
+use crate::qwen3_5_mtp::Qwen35MtpGenerator;
 
 #[derive(Debug, Clone)]
 pub struct GenerationRequest {
@@ -25,12 +26,21 @@ pub struct GenerationOutput {
     pub token_ids: Vec<i32>,
 }
 
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Qwen35GenerationMode {
+    Automatic,
+    Baseline,
+    Mtp,
+}
+
 pub struct Qwen35Provider {
     model: Qwen35Model,
     tokenizer: Tokenizer,
     chat_template: ChatTemplateProcessor,
     defaults: GenerationDefaults,
     generator: CxxGenerator,
+    mtp_generator: Option<Qwen35MtpGenerator>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -82,6 +92,7 @@ impl Qwen35Provider {
         let defaults = load_generation_defaults(model_dir)?;
         let model = Qwen35Model::load(model_dir)?;
         let generator = CxxGenerator::new(model.num_layers());
+        let mtp_generator = model.has_mtp().then(Qwen35MtpGenerator::new);
 
         Ok(Self {
             model,
@@ -89,14 +100,23 @@ impl Qwen35Provider {
             chat_template,
             defaults,
             generator,
+            mtp_generator,
         })
     }
 
     pub fn generate(&mut self, request: &GenerationRequest) -> Result<GenerationOutput> {
         let (prompt_ids, sampling) = self.prepare_generation(request)?;
-        let token_ids =
+        let use_mtp = self.resolve_generation_mode(Qwen35GenerationMode::Automatic, &sampling)?;
+        let token_ids = if use_mtp {
+            self.mtp_generator
+                .as_mut()
+                .expect("MTP mode requires an initialized generator")
+                .generate(&self.model, &prompt_ids, request.max_tokens, &sampling)
+                .0
+        } else {
             self.generator
-                .generate(&self.model, &prompt_ids, request.max_tokens, &sampling);
+                .generate(&self.model, &prompt_ids, request.max_tokens, &sampling)
+        };
         self.output_from_token_ids(token_ids)
     }
 
@@ -106,14 +126,55 @@ impl Qwen35Provider {
         &mut self,
         request: &GenerationRequest,
     ) -> Result<(GenerationOutput, GenerationStats)> {
+        self.generate_with_stats_in_mode(request, Qwen35GenerationMode::Automatic)
+    }
+
+    #[doc(hidden)]
+    pub fn generate_with_stats_in_mode(
+        &mut self,
+        request: &GenerationRequest,
+        mode: Qwen35GenerationMode,
+    ) -> Result<(GenerationOutput, GenerationStats)> {
         let (prompt_ids, sampling) = self.prepare_generation(request)?;
-        let (token_ids, stats) = self.generator.generate_with_stats(
-            &self.model,
-            &prompt_ids,
-            request.max_tokens,
-            &sampling,
-        );
+        let use_mtp = self.resolve_generation_mode(mode, &sampling)?;
+        let (token_ids, stats) = if use_mtp {
+            self.mtp_generator
+                .as_mut()
+                .expect("MTP mode requires an initialized generator")
+                .generate(&self.model, &prompt_ids, request.max_tokens, &sampling)
+        } else {
+            self.generator.generate_with_stats(
+                &self.model,
+                &prompt_ids,
+                request.max_tokens,
+                &sampling,
+            )
+        };
         Ok((self.output_from_token_ids(token_ids)?, stats))
+    }
+
+    fn resolve_generation_mode(
+        &self,
+        mode: Qwen35GenerationMode,
+        sampling: &SamplingConfig,
+    ) -> Result<bool> {
+        match mode {
+            Qwen35GenerationMode::Automatic => {
+                Ok(self.mtp_generator.is_some() && sampling.temperature == 0.0)
+            }
+            Qwen35GenerationMode::Baseline => Ok(false),
+            Qwen35GenerationMode::Mtp => {
+                ensure!(
+                    self.mtp_generator.is_some(),
+                    "the loaded checkpoint does not contain a bundled Qwen 3.5 MTP head"
+                );
+                ensure!(
+                    sampling.temperature == 0.0,
+                    "Qwen 3.5 MTP decoding is available only for greedy requests"
+                );
+                Ok(true)
+            }
+        }
     }
 
     fn prepare_generation(
@@ -293,5 +354,31 @@ mod tests {
         assert!(error.contains("missing chat template"), "{error}");
         assert!(error.contains("chat_template.jinja"), "{error}");
         assert!(error.contains("tokenizer_config.json"), "{error}");
+    }
+
+    #[test]
+    #[ignore = "requires QW_BENCH_MODEL pointing at a real bundled-MTP checkpoint"]
+    fn real_model_baseline_and_mtp_greedy_outputs_match() {
+        let model_dir = std::env::var_os("QW_BENCH_MODEL")
+            .map(PathBuf::from)
+            .expect("QW_BENCH_MODEL must point at a real checkpoint");
+        let mut provider = Qwen35Provider::load(&model_dir).expect("load real Qwen checkpoint");
+        let request = GenerationRequest {
+            prompt: "Continue counting upward from one, writing each integer on its own line without stopping."
+                .to_string(),
+            max_tokens: 32,
+            temperature: Some(0.0),
+            top_k: Some(1),
+            top_p: Some(1.0),
+            seed: Some(0),
+        };
+        let (baseline, _) = provider
+            .generate_with_stats_in_mode(&request, Qwen35GenerationMode::Baseline)
+            .expect("baseline greedy generation");
+        let (mtp, _) = provider
+            .generate_with_stats_in_mode(&request, Qwen35GenerationMode::Mtp)
+            .expect("MTP greedy generation");
+        assert_eq!(baseline.token_ids, mtp.token_ids);
+        assert_eq!(baseline.text, mtp.text);
     }
 }

@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use qw_runtime::provider::Qwen35GenerationMode;
 use qw_runtime::{GenerationRequest, Qwen35Provider};
 
 const MODEL_ENV: &str = "QW_BENCH_MODEL";
@@ -66,31 +67,62 @@ fn single_user_throughput(criterion: &mut Criterion) {
     }
 
     let decode_request = request(DECODE_MAX_TOKENS);
-    let (_, decode_probe) = provider
-        .generate_with_stats(&decode_request)
-        .expect("warm up single-user decode");
-    let decoded_tokens = decode_probe.generated_tokens.saturating_sub(1);
+    let (baseline_output, baseline_probe) = provider
+        .generate_with_stats_in_mode(&decode_request, Qwen35GenerationMode::Baseline)
+        .expect("warm up baseline single-user decode");
+    let (mtp_output, mtp_probe) = provider
+        .generate_with_stats_in_mode(&decode_request, Qwen35GenerationMode::Mtp)
+        .expect("warm up MTP single-user decode");
+    assert_eq!(
+        baseline_output.token_ids, mtp_output.token_ids,
+        "baseline and bundled-MTP greedy token IDs diverged"
+    );
+    let baseline_tokens = baseline_probe.generated_tokens.saturating_sub(1);
+    let mtp_tokens = mtp_probe.generated_tokens.saturating_sub(1);
     assert!(
-        decoded_tokens > 0,
+        baseline_tokens > 0 && mtp_tokens > 0,
         "the deterministic prompt must produce at least one autoregressive decode token"
     );
 
     {
         let mut group = criterion.benchmark_group("single_user_decode");
-        group.throughput(Throughput::Elements(decoded_tokens as u64));
-        group.bench_function("qwen", |bencher| {
-            // The first generated token belongs to prefill. Criterion receives
-            // only the following autoregressive decode interval and token count.
+        group.throughput(Throughput::Elements(baseline_tokens as u64));
+        group.bench_function("baseline", |bencher| {
             bencher.iter_custom(|iterations| {
                 let mut elapsed = Duration::ZERO;
                 for _ in 0..iterations {
                     let (output, stats) = provider
-                        .generate_with_stats(&decode_request)
-                        .expect("benchmark single-user decode");
+                        .generate_with_stats_in_mode(
+                            &decode_request,
+                            Qwen35GenerationMode::Baseline,
+                        )
+                        .expect("benchmark baseline single-user decode");
                     assert_eq!(
                         stats.generated_tokens.saturating_sub(1),
-                        decoded_tokens,
-                        "deterministic decode length changed"
+                        baseline_tokens,
+                        "deterministic baseline decode length changed"
+                    );
+                    elapsed += measured_duration(stats.decode_time_ms);
+                    black_box(output);
+                }
+                elapsed
+            });
+        });
+        group.throughput(Throughput::Elements(mtp_tokens as u64));
+        group.bench_function("mtp", |bencher| {
+            bencher.iter_custom(|iterations| {
+                let mut elapsed = Duration::ZERO;
+                for _ in 0..iterations {
+                    let (output, stats) = provider
+                        .generate_with_stats_in_mode(
+                            &decode_request,
+                            Qwen35GenerationMode::Mtp,
+                        )
+                        .expect("benchmark MTP single-user decode");
+                    assert_eq!(
+                        stats.generated_tokens.saturating_sub(1),
+                        mtp_tokens,
+                        "deterministic MTP decode length changed"
                     );
                     elapsed += measured_duration(stats.decode_time_ms);
                     black_box(output);

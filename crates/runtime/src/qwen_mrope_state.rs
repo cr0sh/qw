@@ -14,7 +14,7 @@
 
 //! Single-sequence MRoPE position state retained by the dense text model.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use mlxcel_core::{MlxArray, UniquePtr};
 
@@ -44,12 +44,14 @@ impl MRopeEntry {
 /// but retaining it preserves the position-state path used by Qwen3.5.
 pub(crate) struct MRopeState {
     fallback: RefCell<MRopeEntry>,
+    position: Cell<i32>,
 }
 
 impl MRopeState {
     pub(crate) fn new() -> Self {
         Self {
             fallback: RefCell::new(MRopeEntry::empty()),
+            position: Cell::new(0),
         }
     }
 
@@ -57,6 +59,16 @@ impl MRopeState {
         let mut entry = self.fallback.borrow_mut();
         entry.position_ids = None;
         entry.rope_deltas = None;
+        self.position.set(0);
+    }
+
+    pub(crate) fn set_position(&self, position: i32) {
+        self.position.set(position);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn position(&self) -> i32 {
+        self.position.get()
     }
 }
 
