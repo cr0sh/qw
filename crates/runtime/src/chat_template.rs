@@ -14,7 +14,7 @@
 
 use std::path::Path;
 use anyhow::{Context, Result};
-use minijinja::value::{Value, ValueKind};
+use minijinja::value::{Value, ValueKind, from_args};
 use minijinja::{Environment, Error, ErrorKind, context};
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -321,6 +321,39 @@ mod tests {
 {%- if add_generation_prompt %}assistant:{% endif -%}
 "#;
 
+    const IMAGE_TOOL_REPLAY_TEMPLATE: &str = r#"
+{%- macro render_content(content) -%}
+{%- if content is string -%}
+{{- content -}}
+{%- else -%}
+{%- for item in content -%}
+{%- if 'image_url' in item -%}
+{{- '<|vision_start|><|image_pad|><|vision_end|>' -}}
+{%- elif 'text' in item -%}
+{{- item.text -}}
+{%- endif -%}
+{%- endfor -%}
+{%- endif -%}
+{%- endmacro -%}
+{%- for message in messages -%}
+{%- set content = render_content(message.content) | trim -%}
+{%- if message.role == 'assistant' -%}
+assistant:{{ content }}
+{%- for call in message.tool_calls -%}
+<tool_call><function={{ call.function.name }}>
+{%- for key, value in call.function.arguments.items() -%}
+<parameter={{ key }}>{{ value }}</parameter>
+{%- endfor -%}
+</function></tool_call>
+{%- endfor -%}
+{%- elif message.role == 'tool' -%}
+<tool_response>{{ content }}</tool_response>
+{%- else -%}
+{{ message.role }}:{{ content }}
+{%- endif -%}
+{%- endfor -%}
+"#;
+
     fn processor() -> ChatTemplateProcessor {
         ChatTemplateProcessor {
             template: TOOL_TEMPLATE.to_string(),
@@ -465,6 +498,74 @@ mod tests {
         assert!(rendered.contains("\"detail\":\"auto\""));
     }
 
+    #[test]
+    fn qwen_image_turn_survives_tool_call_replay() {
+        let processor = ChatTemplateProcessor {
+            template: IMAGE_TOOL_REPLAY_TEMPLATE.to_string(),
+            bos_token: String::new(),
+            eos_token: String::new(),
+        };
+        let image_message = ChatMessage {
+            role: "user".to_string(),
+            content: Some(ChatMessageContent::Parts(vec![
+                ChatContentPart::Text {
+                    text: "before".to_string(),
+                },
+                ChatContentPart::ImageUrl {
+                    image_url: ChatImageUrl {
+                        url: "data:image/png;base64,AA==".to_string(),
+                        detail: "auto".to_string(),
+                    },
+                },
+                ChatContentPart::Text {
+                    text: "after".to_string(),
+                },
+            ])),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        };
+        let vision_placeholder = "<|vision_start|><|image_pad|><|vision_end|>";
+        let initial = processor
+            .render_messages(std::slice::from_ref(&image_message), &[tool()])
+            .expect("render initial image turn");
+        assert_eq!(initial.matches(vision_placeholder).count(), 1);
+
+        let replayed = processor
+            .render_messages(
+                &[
+                    image_message,
+                    ChatMessage {
+                        role: "assistant".to_string(),
+                        content: None,
+                        tool_calls: vec![ChatToolCall {
+                            id: "call_1".to_string(),
+                            tool_type: "function".to_string(),
+                            function: ChatToolCallFunction {
+                                name: "weather".to_string(),
+                                arguments: json!({"city":"Paris"}),
+                            },
+                        }],
+                        tool_call_id: None,
+                    },
+                    ChatMessage {
+                        role: "tool".to_string(),
+                        content: Some(ChatMessageContent::Text("sunny".to_string())),
+                        tool_calls: Vec::new(),
+                        tool_call_id: Some("call_1".to_string()),
+                    },
+                ],
+                &[tool()],
+            )
+            .expect("render image and tool replay");
+        let before = replayed.find("before").expect("leading text");
+        let image = replayed.find(vision_placeholder).expect("image placeholder");
+        let after = replayed.find("after").expect("trailing text");
+        assert!(before < image && image < after);
+        assert_eq!(replayed.matches(vision_placeholder).count(), 1);
+        assert!(replayed.contains("<parameter=city>Paris</parameter>"));
+        assert!(replayed.contains("<tool_response>sunny</tool_response>"));
+    }
+
 }
 
 fn extract_token(config: &JsonValue, name: &str) -> String {
@@ -492,7 +593,11 @@ fn configure_environment(environment: &mut Environment<'_>) {
             Err(Error::new(ErrorKind::InvalidOperation, message))
         },
     );
-    environment.set_unknown_method_callback(|_state, value, method, args| {
+    environment.set_unknown_method_callback(|state, value, method, args| {
+        if value.kind() == ValueKind::Map && method == "items" {
+            let _: () = from_args(args)?;
+            return state.apply_filter("items", &[value.clone()]);
+        }
         if value.kind() != ValueKind::String {
             return Err(Error::new(
                 ErrorKind::UnknownMethod,
