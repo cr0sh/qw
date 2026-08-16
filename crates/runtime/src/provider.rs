@@ -94,11 +94,13 @@ fn advance_decoded_text(
         "incremental tokenizer decoding changed text already emitted"
     );
     let remaining = &decoded[emitted.len()..];
-    let stable_len = if final_chunk {
-        remaining.len()
-    } else {
-        remaining.find('\u{fffd}').unwrap_or(remaining.len())
-    };
+    if final_chunk {
+        ensure!(
+            !remaining.contains('\u{fffd}'),
+            "generated token sequence ended with incomplete UTF-8"
+        );
+    }
+    let stable_len = remaining.find('\u{fffd}').unwrap_or(remaining.len());
     let delta = remaining[..stable_len].to_string();
     emitted.push_str(&delta);
     Ok(delta)

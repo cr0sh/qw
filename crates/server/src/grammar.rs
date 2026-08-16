@@ -144,7 +144,7 @@ impl TokenConstraint for GuidanceConstraint {
                     .to_string(),
             );
         }
-        Ok(if result.stop {
+        Ok(if result.stop || self.inner.parser.is_accepting() {
             ConstraintCommit::Accept
         } else {
             ConstraintCommit::Continue
