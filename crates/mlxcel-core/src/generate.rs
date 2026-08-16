@@ -91,6 +91,7 @@ pub struct ModelStateSnapshot {
     family: String,
     token_len: usize,
     tensors: Vec<ModelStateTensor>,
+    continuation_logits: Option<UniquePtr<MlxArray>>,
 }
 
 impl ModelStateSnapshot {
@@ -100,6 +101,7 @@ impl ModelStateSnapshot {
             family: family.into(),
             token_len,
             tensors: Vec::new(),
+            continuation_logits: None,
         }
     }
 
@@ -126,6 +128,29 @@ impl ModelStateSnapshot {
             .map(ModelStateTensor::array)
     }
 
+    /// Attach the prefill logits that predict the first token after this prefix.
+    ///
+    /// This is kept outside the model-defined tensor namespace so model restore
+    /// validation remains concerned only with recurrent/cache layout.
+    pub fn set_continuation_logits(&mut self, logits: &MlxArray) {
+        self.continuation_logits = Some(ffi::copy(logits));
+    }
+
+    /// Borrow the prefill logits associated with this exact prefix.
+    pub fn continuation_logits(&self) -> Option<&MlxArray> {
+        self.continuation_logits.as_deref()
+    }
+
+    /// Number of named tensors stored in this snapshot.
+    pub fn tensor_count(&self) -> usize {
+        self.tensors.len()
+    }
+
+    /// Iterate over model-defined tensor names.
+    pub fn tensor_names(&self) -> impl Iterator<Item = &str> {
+        self.tensors.iter().map(ModelStateTensor::name)
+    }
+
     /// Whether no tensor payload was captured.
     pub fn is_empty(&self) -> bool {
         self.tensors.is_empty()
@@ -133,8 +158,66 @@ impl ModelStateSnapshot {
 
     /// Sum of all captured tensor byte footprints.
     pub fn nbytes(&self) -> usize {
-        self.tensors.iter().map(ModelStateTensor::nbytes).sum()
+        self.tensors.iter().map(ModelStateTensor::nbytes).sum::<usize>()
+            + self
+                .continuation_logits
+                .as_deref()
+                .map(ffi::array_nbytes)
+                .unwrap_or(0)
     }
+}
+
+/// Per-step vocabulary decision returned by a generation constraint.
+pub enum ConstraintMask {
+    /// Continue generation with exactly these token IDs enabled.
+    Allow(Vec<i32>),
+    /// The grammar is accepting and no further token is required.
+    Accept,
+}
+
+/// Result of committing a sampled token to a generation constraint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstraintCommit {
+    Continue,
+    Accept,
+}
+
+/// Engine-neutral constraint interface for single-sequence generation.
+///
+/// Implementations compute a vocabulary mask before sampling and advance only
+/// after the selected token has been committed to the output stream.
+pub trait TokenConstraint {
+    fn compute_mask(
+        &mut self,
+        logits: &MlxArray,
+        token_history: &[i32],
+    ) -> Result<ConstraintMask, String>;
+
+    fn commit_token(&mut self, token_id: i32) -> Result<ConstraintCommit, String>;
+}
+
+/// Why a single-sequence generation loop stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenerationStopReason {
+    Eos,
+    MaxTokens,
+    CallbackCancelled,
+    ConstraintAccepted,
+    RepetitionLoop,
+}
+
+/// Complete result from an incrementally controlled generation.
+pub struct ControlledGeneration {
+    pub token_ids: Vec<i32>,
+    pub stop_reason: GenerationStopReason,
+    pub prompt_snapshot: Option<ModelStateSnapshot>,
+    pub cached_tokens: usize,
+}
+
+/// Exact-prefix state supplied to a controlled generation call.
+pub struct PrefixReuse<'a> {
+    pub snapshot: &'a ModelStateSnapshot,
+    pub cached_tokens: usize,
 }
 
 /// Returns true when the current hardware is M5+ with a Neural Accelerator
@@ -324,6 +407,34 @@ fn chunked_prefill_last_logits<M: LanguageModel + ?Sized>(
         logits = Some(piece_logits);
     }
     logits.expect("chunked_prefill_last_logits requires a non-empty prompt")
+}
+
+fn mask_logits_to_allowed(
+    logits: &MlxArray,
+    allowed_token_ids: &[i32],
+) -> Result<UniquePtr<MlxArray>, String> {
+    if allowed_token_ids.is_empty() {
+        return Err("generation constraint returned an empty token mask".to_string());
+    }
+    let shape = ffi::array_shape(logits);
+    let Some(&vocab_size) = shape.last() else {
+        return Err("generation logits have no vocabulary dimension".to_string());
+    };
+    if allowed_token_ids
+        .iter()
+        .any(|&token| token < 0 || token >= vocab_size)
+    {
+        return Err(format!(
+            "generation constraint returned a token outside vocabulary 0..{vocab_size}"
+        ));
+    }
+    let indices = ffi::from_slice_i32(
+        allowed_token_ids,
+        &[1, 1, allowed_token_ids.len() as i32],
+    );
+    let values = ffi::take_along_axis(logits, &indices, -1);
+    let masked = ffi::full_f32(&shape, f32::NEG_INFINITY, ffi::array_dtype(logits));
+    Ok(ffi::put_along_axis(&masked, &indices, &values, -1))
 }
 
 /// Trait for language models that can be used for generation
@@ -1181,6 +1292,186 @@ impl CxxGenerator {
         for (cache, mode) in self.caches.iter_mut().zip(layer_modes) {
             cache.mode = mode;
         }
+    }
+
+    /// Baseline single-sequence generation with optional exact-prefix reuse and
+    /// an engine-neutral token constraint.
+    ///
+    /// The constrained path is intentionally sequential: a token is committed
+    /// to the constraint before logits for the following token are sampled.
+    /// The ordinary [`Self::generate_streaming`] path retains its lookahead
+    /// pipeline and does not allocate a constraint mask.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_streaming_controlled<M: LanguageModel, F: FnMut(i32) -> bool>(
+        &mut self,
+        model: &M,
+        prompt_tokens: &[i32],
+        prefix_reuse: Option<PrefixReuse<'_>>,
+        max_tokens: usize,
+        sampling: &SamplingConfig,
+        mut constraint: Option<&mut dyn TokenConstraint>,
+        capture_prompt_snapshot: bool,
+        mut on_token: F,
+    ) -> Result<ControlledGeneration, String> {
+        if prompt_tokens.is_empty() {
+            return Err("prompt token sequence must not be empty".to_string());
+        }
+        if max_tokens == 0 {
+            return Err("max_tokens must be greater than zero".to_string());
+        }
+
+        self.reset_with_model(model);
+        ensure_model_caches(&mut self.caches, model);
+        self.apply_kv_cache_mode_with_boundary_policy();
+        install_thread_local_default_stream(self.generation_stream.as_ref());
+
+        let sampling_cow = self.compose_sampling(sampling);
+        let sampling = sampling_cow.as_ref();
+        seed_rng_if_needed(sampling);
+        let eos_tokens = merged_eos_token_ids(model.eos_token_ids(), &sampling.stop_token_ids);
+        let sequence_id = SequenceId::from_raw(0);
+
+        let mut cached_tokens = 0;
+        let mut cached_logits = None;
+        if let Some(reuse) = prefix_reuse
+            && reuse.cached_tokens > 0
+            && reuse.cached_tokens <= prompt_tokens.len()
+            && reuse.snapshot.token_len() == reuse.cached_tokens
+            && (reuse.cached_tokens < prompt_tokens.len()
+                || reuse.snapshot.continuation_logits().is_some())
+        {
+            model.restore_sequence_state(sequence_id, reuse.snapshot)?;
+            cached_tokens = reuse.cached_tokens;
+            if cached_tokens == prompt_tokens.len() {
+                cached_logits = reuse.snapshot.continuation_logits().map(ffi::copy);
+            }
+        }
+        let prefill_tokens = &prompt_tokens[cached_tokens..];
+        let mut logits = if let Some(logits) = cached_logits {
+            logits
+        } else {
+            let prefill_chunk = effective_prefill_chunk(
+                prefill_chunk_len(),
+                model.supports_chunked_prefill(),
+                prefill_tokens.len(),
+            );
+            if let Some(chunk) = prefill_chunk {
+                chunked_prefill_last_logits(model, &mut self.caches, prefill_tokens, chunk)
+            } else {
+                let input =
+                    ffi::from_slice_i32(prefill_tokens, &[1, prefill_tokens.len() as i32]);
+                model.forward_last_logits(
+                    &input,
+                    &mut self.caches,
+                    None,
+                    prefill_tokens.len().saturating_sub(1),
+                )
+            }
+        };
+        ffi::eval(&logits);
+        let mut prompt_snapshot = if capture_prompt_snapshot && model.supports_snapshot_reuse() {
+            model.snapshot_sequence_state(sequence_id, prompt_tokens.len())
+        } else {
+            None
+        };
+        if let Some(snapshot) = prompt_snapshot.as_mut() {
+            snapshot.set_continuation_logits(
+                logits
+                    .as_ref()
+                    .expect("generation logits must not be null"),
+            );
+        }
+        ffi::clear_memory_cache();
+
+        let needs_history = sampling.needs_token_history() || constraint.is_some();
+        let mut token_history = initial_token_history(prompt_tokens, needs_history);
+        let mut sampler_state: Option<SamplerState> = None;
+        let mut stop_reason = GenerationStopReason::MaxTokens;
+
+        while self.generated_tokens.len() < max_tokens {
+            let constrained_logits;
+            let logits_for_sample = if let Some(active) = constraint.as_deref_mut() {
+                match active.compute_mask(
+                    logits
+                        .as_ref()
+                        .expect("generation logits must not be null"),
+                    &token_history,
+                )? {
+                    ConstraintMask::Allow(allowed) => {
+                        constrained_logits = mask_logits_to_allowed(
+                            logits
+                                .as_ref()
+                                .expect("generation logits must not be null"),
+                            &allowed,
+                        )?;
+                        constrained_logits
+                            .as_ref()
+                            .expect("masked generation logits must not be null")
+                    }
+                    ConstraintMask::Accept => {
+                        stop_reason = GenerationStopReason::ConstraintAccepted;
+                        break;
+                    }
+                }
+            } else {
+                logits
+                    .as_ref()
+                    .expect("generation logits must not be null")
+            };
+
+            let (token, _) = if needs_history {
+                sample_token_optimized_with_state(
+                    logits_for_sample,
+                    sampling,
+                    &token_history,
+                    &mut sampler_state,
+                )
+            } else {
+                sample_token_optimized(logits_for_sample, sampling, &token_history)
+            };
+            ffi::eval(&token);
+            let token_id = ffi::item_i32(&token);
+            if eos_tokens.contains(&token_id) {
+                stop_reason = GenerationStopReason::Eos;
+                break;
+            }
+
+            self.generated_tokens.push(token_id);
+            if needs_history {
+                token_history.push(token_id);
+            }
+            let constraint_accepted = if let Some(active) = constraint.as_deref_mut() {
+                active.commit_token(token_id)? == ConstraintCommit::Accept
+            } else {
+                false
+            };
+            if !on_token(token_id) {
+                stop_reason = GenerationStopReason::CallbackCancelled;
+                break;
+            }
+            if constraint_accepted {
+                stop_reason = GenerationStopReason::ConstraintAccepted;
+                break;
+            }
+            if detect_repetition_loop(&self.generated_tokens, &sampling.loop_detection) {
+                stop_reason = GenerationStopReason::RepetitionLoop;
+                break;
+            }
+            if self.generated_tokens.len() == max_tokens {
+                stop_reason = GenerationStopReason::MaxTokens;
+                break;
+            }
+
+            let next_input = ffi::reshape_token_for_forward(&token);
+            logits = model.forward_last_logits(&next_input, &mut self.caches, None, 0);
+        }
+
+        Ok(ControlledGeneration {
+            token_ids: self.generated_tokens.clone(),
+            stop_reason,
+            prompt_snapshot,
+            cached_tokens,
+        })
     }
 
     /// Generate tokens from the model (original implementation)
@@ -3040,5 +3331,76 @@ mod tests {
         assert_eq!(composed.token_bias.len(), 1);
         assert!(composed.token_bias.contains(99));
         assert!(!composed.token_bias.contains(1));
+    }
+
+    struct AllowOnly(i32);
+
+    impl TokenConstraint for AllowOnly {
+        fn compute_mask(
+            &mut self,
+            _logits: &MlxArray,
+            _token_history: &[i32],
+        ) -> Result<ConstraintMask, String> {
+            Ok(ConstraintMask::Allow(vec![self.0]))
+        }
+
+        fn commit_token(&mut self, _token_id: i32) -> Result<ConstraintCommit, String> {
+            Ok(ConstraintCommit::Continue)
+        }
+    }
+
+    #[test]
+    fn controlled_generation_mask_changes_the_winning_token() {
+        let model = StubModel;
+        let sampling = SamplingConfig::greedy();
+        let mut baseline_generator = CxxGenerator::new(1);
+        let baseline = baseline_generator.generate(&model, &[1], 1, &sampling);
+        assert_eq!(baseline, vec![1]);
+
+        let mut constraint = AllowOnly(2);
+        let mut constrained_generator = CxxGenerator::new(1);
+        let constrained = constrained_generator
+            .generate_streaming_controlled(
+                &model,
+                &[1],
+                None,
+                1,
+                &sampling,
+                Some(&mut constraint),
+                false,
+                |_| true,
+            )
+            .expect("constrained generation");
+        assert_eq!(constrained.token_ids, vec![2]);
+        assert_eq!(constrained.stop_reason, GenerationStopReason::MaxTokens);
+    }
+
+    #[test]
+    fn controlled_generation_reports_callback_cancellation_after_one_emission() {
+        let model = StubModel;
+        let sampling = SamplingConfig::greedy();
+        let mut generator = CxxGenerator::new(1);
+        let mut emissions = 0;
+        let result = generator
+            .generate_streaming_controlled(
+                &model,
+                &[1],
+                None,
+                4,
+                &sampling,
+                None,
+                false,
+                |_| {
+                    emissions += 1;
+                    false
+                },
+            )
+            .expect("cancelled generation");
+        assert_eq!(emissions, 1);
+        assert_eq!(result.token_ids.len(), 1);
+        assert_eq!(
+            result.stop_reason,
+            GenerationStopReason::CallbackCancelled
+        );
     }
 }

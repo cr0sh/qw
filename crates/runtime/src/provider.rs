@@ -2,10 +2,14 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use anyhow::{ensure, Context, Result};
-use mlxcel_core::generate::{CxxGenerator, GenerationStats, LanguageModel, SamplingConfig};
+use mlxcel_core::generate::{
+    ControlledGeneration, CxxGenerator, GenerationStats, GenerationStopReason, LanguageModel,
+    ModelStateSnapshot, PrefixReuse, SamplingConfig, TokenConstraint,
+};
 use serde::Deserialize;
 use tokenizers::Tokenizer;
 
+pub use crate::chat_template::ChatMessage;
 use crate::chat_template::ChatTemplateProcessor;
 use crate::qwen3_5::Qwen35Model;
 pub use crate::qwen3_5_mtp::MtpGenerationStats;
@@ -27,6 +31,79 @@ pub struct GenerationRequest {
 pub struct GenerationOutput {
     pub text: String,
     pub token_ids: Vec<i32>,
+}
+
+pub struct BaselineGeneration {
+    pub text: String,
+    pub token_ids: Vec<i32>,
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub cached_tokens: usize,
+    pub finish_outcome: GenerationStopReason,
+    pub prompt_snapshot: Option<ModelStateSnapshot>,
+}
+
+struct IncrementalTextDecoder<'a> {
+    tokenizer: &'a Tokenizer,
+    token_ids: Vec<u32>,
+    emitted: String,
+}
+
+impl<'a> IncrementalTextDecoder<'a> {
+    fn new(tokenizer: &'a Tokenizer) -> Self {
+        Self {
+            tokenizer,
+            token_ids: Vec::new(),
+            emitted: String::new(),
+        }
+    }
+
+    fn push(&mut self, token_id: i32) -> Result<String> {
+        self.token_ids.push(
+            u32::try_from(token_id).context("generated a negative token identifier")?,
+        );
+        let decoded = self
+            .tokenizer
+            .decode(&self.token_ids, false)
+            .map_err(anyhow::Error::msg)
+            .context("failed to incrementally decode generated tokens")?;
+        self.advance(decoded, false)
+    }
+
+    fn finish(&mut self) -> Result<String> {
+        let decoded = self
+            .tokenizer
+            .decode(&self.token_ids, false)
+            .map_err(anyhow::Error::msg)
+            .context("failed to decode generated tokens")?;
+        self.advance(decoded, true)
+    }
+
+    fn advance(&mut self, decoded: String, final_chunk: bool) -> Result<String> {
+        advance_decoded_text(&mut self.emitted, &decoded, final_chunk)
+    }
+}
+
+fn advance_decoded_text(
+    emitted: &mut String,
+    decoded: &str,
+    final_chunk: bool,
+) -> Result<String> {
+    ensure!(
+        decoded.starts_with(emitted.as_str()),
+        "incremental tokenizer decoding changed text already emitted"
+    );
+    let remaining = &decoded[emitted.len()..];
+    if final_chunk {
+        ensure!(
+            !remaining.contains('\u{fffd}'),
+            "generated token sequence ended with incomplete UTF-8"
+        );
+    }
+    let stable_len = remaining.find('\u{fffd}').unwrap_or(remaining.len());
+    let delta = remaining[..stable_len].to_string();
+    emitted.push_str(&delta);
+    Ok(delta)
 }
 
 #[doc(hidden)]
@@ -104,6 +181,110 @@ impl Qwen35Provider {
             defaults,
             generator,
             mtp_generator,
+        })
+    }
+
+    pub fn tokenizer(&self) -> &Tokenizer {
+        &self.tokenizer
+    }
+
+    pub fn logits_vocab_size(&self) -> usize {
+        self.model.vocab_size()
+    }
+
+    pub fn eos_token_id(&self) -> u32 {
+        self.defaults.stop_token_ids[0] as u32
+    }
+
+    pub fn render_messages(&self, messages: &[ChatMessage]) -> Result<String> {
+        self.chat_template.render_messages(messages)
+    }
+
+    pub fn tokenize_messages(&self, messages: &[ChatMessage]) -> Result<Vec<i32>> {
+        let rendered = self.render_messages(messages)?;
+        let encoded = self
+            .tokenizer
+            .encode(rendered, true)
+            .map_err(anyhow::Error::msg)
+            .context("failed to tokenize rendered messages")?;
+        let prompt_ids: Vec<i32> = encoded
+            .get_ids()
+            .iter()
+            .map(|&token| token as i32)
+            .collect();
+        ensure!(
+            !prompt_ids.is_empty(),
+            "rendered messages tokenized to an empty sequence"
+        );
+        Ok(prompt_ids)
+    }
+
+    pub fn baseline_sampling(
+        &self,
+        temperature: Option<f32>,
+        top_p: Option<f32>,
+        seed: Option<u64>,
+    ) -> SamplingConfig {
+        SamplingConfig {
+            temperature: temperature.unwrap_or(self.defaults.temperature),
+            top_k: self.defaults.top_k,
+            top_p: top_p.unwrap_or(self.defaults.top_p),
+            seed,
+            stop_token_ids: self.defaults.stop_token_ids.clone(),
+            ..SamplingConfig::default()
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_baseline_streaming<F: FnMut(&str) -> bool>(
+        &mut self,
+        prompt_ids: &[i32],
+        max_tokens: usize,
+        sampling: &SamplingConfig,
+        prefix_reuse: Option<PrefixReuse<'_>>,
+        constraint: Option<&mut dyn TokenConstraint>,
+        capture_prompt_snapshot: bool,
+        mut on_delta: F,
+    ) -> Result<BaselineGeneration> {
+        let mut decoder = IncrementalTextDecoder::new(&self.tokenizer);
+        let mut decode_error = None;
+        let controlled: ControlledGeneration = self
+            .generator
+            .generate_streaming_controlled(
+                &self.model,
+                prompt_ids,
+                prefix_reuse,
+                max_tokens,
+                sampling,
+                constraint,
+                capture_prompt_snapshot,
+                |token_id| match decoder.push(token_id) {
+                    Ok(delta) => on_delta(&delta),
+                    Err(error) => {
+                        decode_error = Some(error);
+                        false
+                    }
+                },
+            )
+            .map_err(anyhow::Error::msg)
+            .context("baseline generation failed")?;
+        if let Some(error) = decode_error {
+            return Err(error);
+        }
+        let final_delta = decoder.finish()?;
+        if !final_delta.is_empty() {
+            let _ = on_delta(&final_delta);
+        }
+        let text = decoder.emitted;
+        let completion_tokens = controlled.token_ids.len();
+        Ok(BaselineGeneration {
+            text,
+            token_ids: controlled.token_ids,
+            prompt_tokens: prompt_ids.len(),
+            completion_tokens,
+            cached_tokens: controlled.cached_tokens,
+            finish_outcome: controlled.stop_reason,
+            prompt_snapshot: controlled.prompt_snapshot,
         })
     }
 
@@ -396,6 +577,44 @@ mod tests {
         assert!(error.contains("tokenizer_config.json"), "{error}");
     }
 
+
+    #[test]
+    fn incremental_decoder_withholds_split_utf8_replacement_text() {
+        let mut emitted = String::new();
+        let mut deltas = Vec::new();
+        deltas.push(
+            advance_decoded_text(&mut emitted, "\u{fffd}", false)
+                .expect("first byte-fallback token"),
+        );
+        deltas.push(
+            advance_decoded_text(&mut emitted, "\u{fffd}", false)
+                .expect("second byte-fallback token"),
+        );
+        deltas.push(
+            advance_decoded_text(&mut emitted, "你", false)
+                .expect("completed UTF-8 sequence"),
+        );
+        assert_eq!(deltas.concat(), "你");
+        assert_eq!(emitted, "你");
+        assert!(!emitted.contains('\u{fffd}'));
+    }
+
+    #[test]
+    fn incremental_decoder_deltas_equal_final_ordinary_bpe_decode() {
+        let mut emitted = String::new();
+        let mut deltas = Vec::new();
+        for decoded in ["Hello", "Hello, ", "Hello, world"] {
+            deltas.push(
+                advance_decoded_text(&mut emitted, decoded, false)
+                    .expect("monotonic BPE decode"),
+            );
+        }
+        let final_delta =
+            advance_decoded_text(&mut emitted, "Hello, world!", true).expect("final decode");
+        deltas.push(final_delta);
+        assert_eq!(deltas.concat(), "Hello, world!");
+        assert_eq!(emitted, "Hello, world!");
+    }
     #[test]
     #[ignore = "requires QW_BENCH_MODEL pointing at a real bundled-MTP checkpoint"]
     fn real_model_baseline_and_mtp_greedy_outputs_match() {

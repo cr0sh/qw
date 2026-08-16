@@ -19,10 +19,10 @@ use minijinja::{Environment, Error, ErrorKind, context};
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 
-#[derive(Serialize)]
-struct ChatMessage<'a> {
-    role: &'static str,
-    content: &'a str,
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
 }
 
 pub(crate) struct ChatTemplateProcessor {
@@ -76,26 +76,40 @@ impl ChatTemplateProcessor {
     }
 
     pub(crate) fn render_user(&self, prompt: &str) -> Result<String> {
+        self.render_messages(&[ChatMessage {
+            role: "user".to_string(),
+            content: prompt.to_string(),
+        }])
+    }
+
+    pub(crate) fn render_messages(&self, messages: &[ChatMessage]) -> Result<String> {
+        anyhow::ensure!(!messages.is_empty(), "messages must not be empty");
+        for (index, message) in messages.iter().enumerate() {
+            anyhow::ensure!(
+                matches!(
+                    message.role.as_str(),
+                    "system" | "user" | "assistant" | "tool"
+                ),
+                "message {index} has unsupported role {:?}",
+                message.role
+            );
+        }
         let mut environment = Environment::new();
         configure_environment(&mut environment);
         environment
             .add_template("chat", &self.template)
             .context("failed to parse chat template")?;
         let template = environment.get_template("chat")?;
-        let messages = [ChatMessage {
-            role: "user",
-            content: prompt,
-        }];
         template
             .render(context! {
-                messages => Value::from_serialize(&messages),
+                messages => Value::from_serialize(messages),
                 tools => Value::from_serialize(Vec::<JsonValue>::new()),
                 bos_token => self.bos_token.as_str(),
                 eos_token => self.eos_token.as_str(),
                 add_generation_prompt => true,
                 enable_thinking => true,
             })
-            .context("failed to render one-user chat template")
+            .context("failed to render chat messages")
     }
 }
 

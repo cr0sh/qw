@@ -1,14 +1,22 @@
 [workspace]
 resolver = "2"
-members = ["crates/cli", "crates/mlxcel-core", "crates/runtime"]
+members = ["crates/cli", "crates/mlxcel-core", "crates/runtime", "crates/server"]
 
 [workspace.dependencies]
 anyhow = "1.0.100"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
+clap = "4.6.6"
+clap_derive = "4.6.4"
 criterion = "0.8.2"
+futures-util = { version = "0.3.31", default-features = false, features = ["std"] }
+llguidance = { version = "1.8.0", features = ["jsonschema_validation"] }
 memmap2 = "0.9"
 minijinja = { version = "2.20", features = ["loop_controls", "fuel", "json", "preserve_order"] }
 mlxcel-core = { path = "crates/mlxcel-core", features = ["metal", "accelerate"] }
 safetensors = "0.7.0"
 serde = { version = "1.0", features = ["derive"] }
+tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "sync"] }
+toktrie = "1.8.0"
+tower = { version = "0.5.2", features = ["util"] }
 serde_json = { version = "1.0", features = ["preserve_order"] }
 tokenizers = "0.22.2"
