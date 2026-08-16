@@ -8,4 +8,6 @@ mod qwen_mrope_state;
 
 pub mod provider;
 
-pub use provider::{GenerationOutput, GenerationRequest, Qwen35Provider};
+pub use provider::{
+    BaselineGeneration, ChatMessage, GenerationOutput, GenerationRequest, Qwen35Provider,
+};

@@ -66,9 +66,32 @@ impl MRopeState {
         self.position.set(position);
     }
 
-    #[cfg(test)]
     pub(crate) fn position(&self) -> i32 {
         self.position.get()
+    }
+
+    pub(crate) fn rope_delta(&self) -> Option<i32> {
+        self.fallback.borrow().rope_deltas
+    }
+
+    pub(crate) fn with_position_ids<R>(
+        &self,
+        f: impl FnOnce(Option<&MlxArray>) -> R,
+    ) -> R {
+        let entry = self.fallback.borrow();
+        f(entry.position_ids.as_deref())
+    }
+
+    pub(crate) fn restore(
+        &self,
+        position: i32,
+        position_ids: Option<&MlxArray>,
+        rope_delta: Option<i32>,
+    ) {
+        let mut entry = self.fallback.borrow_mut();
+        entry.position_ids = position_ids.map(mlxcel_core::copy);
+        entry.rope_deltas = rope_delta;
+        self.position.set(position);
     }
 }
 

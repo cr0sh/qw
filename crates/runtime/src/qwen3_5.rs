@@ -26,11 +26,11 @@ use crate::qwen3_next::{
     MLP, Quantization, Qwen3NextAttention, Qwen3NextCache, Qwen3NextConfig,
 };
 use anyhow::{Context, Result, ensure};
-use mlxcel_core::generate::LanguageModel;
+use mlxcel_core::generate::{LanguageModel, ModelStateSnapshot};
 use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::utils::{create_causal_mask, silu};
 use mlxcel_core::weights::WeightMap;
-use mlxcel_core::{MlxArray, UniquePtr, concatenate};
+use mlxcel_core::{MlxArray, SequenceId, UniquePtr, concatenate};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -1505,6 +1505,53 @@ fn materialize_i32(array: &MlxArray, expected_len: usize) -> Vec<i32> {
     }
 }
 
+const QWEN35_SNAPSHOT_FAMILY: &str = "qwen3.5-target-v1";
+
+fn snapshot_i32(snapshot: &ModelStateSnapshot, name: &str) -> std::result::Result<i32, String> {
+    let value = snapshot
+        .tensor(name)
+        .ok_or_else(|| format!("Qwen3.5 snapshot is missing {name}"))?;
+    if mlxcel_core::array_size(value) != 1 {
+        return Err(format!("Qwen3.5 snapshot field {name} must be scalar"));
+    }
+    Ok(mlxcel_core::item_i32(&mlxcel_core::reshape(value, &[])))
+}
+
+fn push_snapshot_i32(snapshot: &mut ModelStateSnapshot, name: &str, value: i32) {
+    let array = mlxcel_core::from_slice_i32(&[value], &[1]);
+    snapshot.push_tensor(name, &array);
+}
+
+fn validate_snapshot_tensor_names(
+    snapshot: &ModelStateSnapshot,
+    layers: &[Qwen35DecoderLayer],
+) -> std::result::Result<(), String> {
+    let mut expected = BTreeSet::from([
+        "meta.layer_count".to_string(),
+        "mrope.position".to_string(),
+        "mrope.rope_delta".to_string(),
+    ]);
+    if snapshot.tensor("mrope.position_ids").is_some() {
+        expected.insert("mrope.position_ids".to_string());
+    }
+    for (index, layer) in layers.iter().enumerate() {
+        expected.insert(format!("layer.{index}.kind"));
+        expected.insert(format!("layer.{index}.offset"));
+        if layer.is_linear {
+            expected.insert(format!("layer.{index}.conv_state"));
+            expected.insert(format!("layer.{index}.state_cache"));
+        } else {
+            expected.insert(format!("layer.{index}.keys"));
+            expected.insert(format!("layer.{index}.values"));
+        }
+    }
+    let actual: BTreeSet<String> = snapshot.tensor_names().map(str::to_owned).collect();
+    if actual.len() != snapshot.tensor_count() || actual != expected {
+        return Err("Qwen3.5 snapshot tensor layout does not match the loaded model".to_string());
+    }
+    Ok(())
+}
+
 // LanguageModel trait implementation.
 impl LanguageModel for Qwen35Model {
     fn forward(
@@ -1557,6 +1604,187 @@ impl LanguageModel for Qwen35Model {
         if let Some(mtp) = &self.mtp {
             mtp.reset();
         }
+    }
+
+    fn supports_snapshot_reuse(&self) -> bool {
+        true
+    }
+
+    fn snapshot_sequence_state(
+        &self,
+        _seq_id: SequenceId,
+        token_len: usize,
+    ) -> Option<ModelStateSnapshot> {
+        let token_len_i32 = i32::try_from(token_len).ok()?;
+        let mut snapshot = ModelStateSnapshot::new(QWEN35_SNAPSHOT_FAMILY, token_len);
+        push_snapshot_i32(
+            &mut snapshot,
+            "meta.layer_count",
+            i32::try_from(self.layers.len()).ok()?,
+        );
+        push_snapshot_i32(&mut snapshot, "mrope.position", self.mrope_state.position());
+        push_snapshot_i32(
+            &mut snapshot,
+            "mrope.rope_delta",
+            self.mrope_state.rope_delta().unwrap_or(i32::MIN),
+        );
+        self.mrope_state.with_position_ids(|position_ids| {
+            if let Some(position_ids) = position_ids {
+                snapshot.push_tensor("mrope.position_ids", position_ids);
+            }
+        });
+
+        let complete = self.sequence_state.with_internal(|caches| {
+            if caches.len() != self.layers.len() {
+                return false;
+            }
+            for (index, (layer, cache)) in self.layers.iter().zip(caches.iter()).enumerate() {
+                if cache.offset() != token_len_i32 {
+                    return false;
+                }
+                push_snapshot_i32(
+                    &mut snapshot,
+                    &format!("layer.{index}.kind"),
+                    i32::from(layer.is_linear),
+                );
+                push_snapshot_i32(
+                    &mut snapshot,
+                    &format!("layer.{index}.offset"),
+                    cache.offset(),
+                );
+                match cache {
+                    Qwen3NextCache::Attention(cache) => {
+                        let (Some(keys), Some(values)) =
+                            (cache.keys.as_deref(), cache.values.as_deref())
+                        else {
+                            return false;
+                        };
+                        snapshot.push_tensor(format!("layer.{index}.keys"), keys);
+                        snapshot.push_tensor(format!("layer.{index}.values"), values);
+                    }
+                    Qwen3NextCache::Linear(cache) => {
+                        let (Some(conv_state), Some(state_cache)) =
+                            (cache.conv_state.as_deref(), cache.state_cache.as_deref())
+                        else {
+                            return false;
+                        };
+                        snapshot.push_tensor(format!("layer.{index}.conv_state"), conv_state);
+                        snapshot.push_tensor(format!("layer.{index}.state_cache"), state_cache);
+                    }
+                }
+            }
+            true
+        });
+        complete.then_some(snapshot)
+    }
+
+    fn restore_sequence_state(
+        &self,
+        _seq_id: SequenceId,
+        snapshot: &ModelStateSnapshot,
+    ) -> std::result::Result<(), String> {
+        if snapshot.family() != QWEN35_SNAPSHOT_FAMILY {
+            return Err(format!(
+                "Qwen3.5 snapshot family mismatch: expected {QWEN35_SNAPSHOT_FAMILY}, got {}",
+                snapshot.family()
+            ));
+        }
+        let token_len = i32::try_from(snapshot.token_len())
+            .map_err(|_| "Qwen3.5 snapshot token length exceeds i32".to_string())?;
+        if snapshot_i32(snapshot, "meta.layer_count")?
+            != i32::try_from(self.layers.len()).unwrap_or(i32::MAX)
+        {
+            return Err("Qwen3.5 snapshot layer count does not match the loaded model".to_string());
+        }
+        validate_snapshot_tensor_names(snapshot, &self.layers)?;
+
+        let mut restored = Vec::with_capacity(self.layers.len());
+        for (index, layer) in self.layers.iter().enumerate() {
+            let expected_kind = i32::from(layer.is_linear);
+            if snapshot_i32(snapshot, &format!("layer.{index}.kind"))? != expected_kind {
+                return Err(format!("Qwen3.5 snapshot layer {index} cache variant mismatch"));
+            }
+            if snapshot_i32(snapshot, &format!("layer.{index}.offset"))? != token_len {
+                return Err(format!("Qwen3.5 snapshot layer {index} offset mismatch"));
+            }
+            if layer.is_linear {
+                let conv_state = snapshot
+                    .tensor(&format!("layer.{index}.conv_state"))
+                    .ok_or_else(|| format!("Qwen3.5 snapshot is missing layer {index} conv state"))?;
+                let state_cache = snapshot
+                    .tensor(&format!("layer.{index}.state_cache"))
+                    .ok_or_else(|| format!("Qwen3.5 snapshot is missing layer {index} recurrent state"))?;
+                if mlxcel_core::array_shape(conv_state).len() != 3
+                    || mlxcel_core::array_shape(state_cache).len() != 4
+                {
+                    return Err(format!("Qwen3.5 snapshot layer {index} linear cache layout mismatch"));
+                }
+                restored.push(Qwen3NextCache::Linear(GatedDeltaCache {
+                    conv_state: Some(mlxcel_core::copy(conv_state)),
+                    state_cache: Some(mlxcel_core::copy(state_cache)),
+                    offset: token_len,
+                }));
+            } else {
+                let keys = snapshot
+                    .tensor(&format!("layer.{index}.keys"))
+                    .ok_or_else(|| format!("Qwen3.5 snapshot is missing layer {index} keys"))?;
+                let values = snapshot
+                    .tensor(&format!("layer.{index}.values"))
+                    .ok_or_else(|| format!("Qwen3.5 snapshot is missing layer {index} values"))?;
+                let key_shape = mlxcel_core::array_shape(keys);
+                let value_shape = mlxcel_core::array_shape(values);
+                if key_shape.len() != 4
+                    || key_shape != value_shape
+                    || key_shape[0] != 1
+                    || key_shape[2] < token_len
+                {
+                    return Err(format!("Qwen3.5 snapshot layer {index} attention cache layout mismatch"));
+                }
+                let mut cache = KVCache::new();
+                cache.keys = Some(mlxcel_core::copy(keys));
+                cache.values = Some(mlxcel_core::copy(values));
+                cache.offset = token_len;
+                restored.push(Qwen3NextCache::Attention(cache));
+            }
+        }
+
+        let position = snapshot_i32(snapshot, "mrope.position")?;
+        if position != token_len {
+            return Err("Qwen3.5 snapshot MRoPE position does not match token length".to_string());
+        }
+        let rope_delta = match snapshot_i32(snapshot, "mrope.rope_delta")? {
+            i32::MIN => None,
+            value => Some(value),
+        };
+        self.sequence_state.replace_internal(restored);
+        self.mrope_state.restore(
+            position,
+            snapshot.tensor("mrope.position_ids"),
+            rope_delta,
+        );
+        Ok(())
+    }
+
+    fn snapshot_truncatable_to(
+        &self,
+        snapshot: &ModelStateSnapshot,
+        target_len: usize,
+    ) -> bool {
+        snapshot.family() == QWEN35_SNAPSHOT_FAMILY && target_len == snapshot.token_len()
+    }
+
+    fn restore_sequence_state_truncated(
+        &self,
+        seq_id: SequenceId,
+        snapshot: &ModelStateSnapshot,
+        target_len: usize,
+    ) -> std::result::Result<(), String> {
+        if !self.snapshot_truncatable_to(snapshot, target_len) {
+            return Err(
+                "Qwen3.5 recurrent snapshots cannot be truncated to an earlier token".to_string(),
+            );
+        }
+        self.restore_sequence_state(seq_id, snapshot)
     }
     fn eos_token_ids(&self) -> Vec<i32> {
         vec![248046, 248044]
@@ -1917,5 +2145,64 @@ mod tests {
         );
         mlxcel_core::eval(&close);
         assert!(mlxcel_core::item_bool(&close));
+    }
+
+    #[test]
+    #[ignore = "requires QW_BENCH_MODEL pointing at a real dense Qwen3.5 checkpoint"]
+    fn restored_mixed_target_snapshot_matches_uninterrupted_next_token_and_text() {
+        let model_dir = std::env::var_os("QW_BENCH_MODEL")
+            .map(std::path::PathBuf::from)
+            .expect("QW_BENCH_MODEL must point at a real checkpoint");
+        let tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
+            .expect("load tokenizer");
+        let model = Qwen35Model::load(&model_dir).expect("load Qwen3.5 model");
+        let prompt = tokenizer
+            .encode("Snapshot restore invariant", true)
+            .expect("encode prompt");
+        let prompt_ids: Vec<i32> = prompt.get_ids().iter().map(|&id| id as i32).collect();
+        assert!(!prompt_ids.is_empty());
+
+        model.reset_runtime_state();
+        let prompt_array =
+            mlxcel_core::from_slice_i32(&prompt_ids, &[1, prompt_ids.len() as i32]);
+        let prompt_logits = model.forward_last_logits(
+            &prompt_array,
+            &mut [],
+            None,
+            prompt_ids.len() - 1,
+        );
+        let first = mlxcel_core::argmax_last_axis(&prompt_logits);
+        mlxcel_core::eval(&first);
+        let first_id = mlxcel_core::item_i32(&first);
+        let snapshot = model
+            .snapshot_sequence_state(SequenceId::from_raw(7), prompt_ids.len())
+            .expect("capture complete mixed-state snapshot");
+
+        let first_array = mlxcel_core::from_slice_i32(&[first_id], &[1, 1]);
+        let uninterrupted_logits =
+            model.forward_last_logits(&first_array, &mut [], None, 0);
+        let uninterrupted = mlxcel_core::argmax_last_axis(&uninterrupted_logits);
+        mlxcel_core::eval(&uninterrupted);
+        let uninterrupted_id = mlxcel_core::item_i32(&uninterrupted);
+
+        model.reset_runtime_state();
+        model
+            .restore_sequence_state(SequenceId::from_raw(9), &snapshot)
+            .expect("restore complete mixed-state snapshot");
+        let restored_logits = model.forward_last_logits(&first_array, &mut [], None, 0);
+        let restored = mlxcel_core::argmax_last_axis(&restored_logits);
+        mlxcel_core::eval(&restored);
+        let restored_id = mlxcel_core::item_i32(&restored);
+
+        assert_eq!(restored_id, uninterrupted_id);
+        let uninterrupted_text = tokenizer
+            .decode(&[uninterrupted_id as u32], false)
+            .expect("decode uninterrupted token");
+        let restored_text = tokenizer
+            .decode(&[restored_id as u32], false)
+            .expect("decode restored token");
+        assert_eq!(restored_text, uninterrupted_text);
+        assert!(model.layers.iter().any(|layer| layer.is_linear));
+        assert!(model.layers.iter().any(|layer| !layer.is_linear));
     }
 }
