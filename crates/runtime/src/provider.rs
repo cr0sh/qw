@@ -1,14 +1,17 @@
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{ensure, Context, Result};
 use mlxcel_core::generate::{CxxGenerator, GenerationStats, LanguageModel, SamplingConfig};
 use serde::Deserialize;
 use tokenizers::Tokenizer;
 
 use crate::chat_template::ChatTemplateProcessor;
 use crate::qwen3_5::Qwen35Model;
+pub use crate::qwen3_5_mtp::MtpGenerationStats;
 use crate::qwen3_5_mtp::Qwen35MtpGenerator;
+
+const PRODUCTION_MTP_BLOCK_SIZE: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct GenerationRequest {
@@ -111,7 +114,13 @@ impl Qwen35Provider {
             self.mtp_generator
                 .as_mut()
                 .expect("MTP mode requires an initialized generator")
-                .generate(&self.model, &prompt_ids, request.max_tokens, &sampling)
+                .generate(
+                    &self.model,
+                    &prompt_ids,
+                    request.max_tokens,
+                    &sampling,
+                    PRODUCTION_MTP_BLOCK_SIZE,
+                )
                 .0
         } else {
             self.generator
@@ -138,10 +147,18 @@ impl Qwen35Provider {
         let (prompt_ids, sampling) = self.prepare_generation(request)?;
         let use_mtp = self.resolve_generation_mode(mode, &sampling)?;
         let (token_ids, stats) = if use_mtp {
-            self.mtp_generator
+            let (token_ids, stats, _) = self
+                .mtp_generator
                 .as_mut()
                 .expect("MTP mode requires an initialized generator")
-                .generate(&self.model, &prompt_ids, request.max_tokens, &sampling)
+                .generate(
+                    &self.model,
+                    &prompt_ids,
+                    request.max_tokens,
+                    &sampling,
+                    PRODUCTION_MTP_BLOCK_SIZE,
+                );
+            (token_ids, stats)
         } else {
             self.generator.generate_with_stats(
                 &self.model,
@@ -151,6 +168,29 @@ impl Qwen35Provider {
             )
         };
         Ok((self.output_from_token_ids(token_ids)?, stats))
+    }
+
+    #[doc(hidden)]
+    pub fn generate_with_mtp_stats(
+        &mut self,
+        request: &GenerationRequest,
+        block_size: usize,
+    ) -> Result<(GenerationOutput, GenerationStats, MtpGenerationStats)> {
+        let (prompt_ids, sampling) = self.prepare_generation(request)?;
+        self.resolve_generation_mode(Qwen35GenerationMode::Mtp, &sampling)?;
+        ensure!(block_size >= 2, "MTP block size must be at least 2");
+        let (token_ids, stats, mtp_stats) = self
+            .mtp_generator
+            .as_mut()
+            .expect("MTP mode requires an initialized generator")
+            .generate(
+                &self.model,
+                &prompt_ids,
+                request.max_tokens,
+                &sampling,
+                block_size,
+            );
+        Ok((self.output_from_token_ids(token_ids)?, stats, mtp_stats))
     }
 
     fn resolve_generation_mode(

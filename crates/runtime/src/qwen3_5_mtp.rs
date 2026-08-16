@@ -31,7 +31,21 @@ use mlxcel_core::{MlxArray, UniquePtr};
 
 use crate::qwen3_5::{Qwen35Config, Qwen35DecoderLayer, Qwen35Model};
 
-const MTP_BLOCK_SIZE: usize = 4;
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MtpGenerationStats {
+    pub accepted_draft_tokens: usize,
+    pub proposed_draft_tokens: usize,
+}
+
+impl MtpGenerationStats {
+    pub fn acceptance_percentage(self) -> f64 {
+        if self.proposed_draft_tokens == 0 {
+            0.0
+        } else {
+            self.accepted_draft_tokens as f64 / self.proposed_draft_tokens as f64 * 100.0
+        }
+    }
+}
 
 struct Qwen35MtpDraftState {
     cache: KVCache,
@@ -65,10 +79,7 @@ pub(crate) struct Qwen35MtpDraftModel {
 }
 
 impl Qwen35MtpDraftModel {
-    pub(crate) fn from_weights(
-        weights: &WeightMap,
-        config: &Qwen35Config,
-    ) -> Result<Self, String> {
+    pub(crate) fn from_weights(weights: &WeightMap, config: &Qwen35Config) -> Result<Self, String> {
         let embedding_norm = weights
             .get("mtp.pre_fc_norm_embedding.weight")
             .map(|weight| mlxcel_core::copy(weight))
@@ -227,8 +238,7 @@ impl Qwen35MtpDraftModel {
     ) {
         let mut state = self.state.borrow_mut();
         let round_appended = state.round_appended;
-        let keep_appended =
-            trim_draft_cache(&mut state.cache, round_appended, accepted);
+        let keep_appended = trim_draft_cache(&mut state.cache, round_appended, accepted);
         state.next_position = state.cache.offset;
 
         let mut tokens = draft_tokens[keep_appended..accepted.min(draft_tokens.len())].to_vec();
@@ -256,7 +266,6 @@ impl Qwen35MtpDraftModel {
         }
         state.round_appended = 0;
     }
-
 }
 
 fn trim_draft_cache(cache: &mut KVCache, round_appended: usize, accepted: usize) -> usize {
@@ -288,9 +297,11 @@ impl Qwen35MtpGenerator {
         prompt_tokens: &[i32],
         max_tokens: usize,
         sampling: &SamplingConfig,
-    ) -> (Vec<i32>, GenerationStats) {
+        block_size: usize,
+    ) -> (Vec<i32>, GenerationStats, MtpGenerationStats) {
         assert!(!prompt_tokens.is_empty(), "MTP prompt must not be empty");
         assert_eq!(sampling.temperature, 0.0, "Qwen MTP is greedy-only");
+        assert!(block_size >= 2, "MTP block size must be at least 2");
         model.reset_runtime_state();
         let drafter = model
             .mtp()
@@ -307,6 +318,7 @@ impl Qwen35MtpGenerator {
         mlxcel_core::eval(&prefill.hidden);
 
         let mut generated = Vec::with_capacity(max_tokens);
+        let mut mtp_stats = MtpGenerationStats::default();
         let first_is_eos = eos_tokens.contains(&first_token);
         if max_tokens > 0 && !first_is_eos {
             generated.push(first_token);
@@ -329,13 +341,13 @@ impl Qwen35MtpGenerator {
 
             while generated.len() < max_tokens {
                 let remaining = max_tokens - generated.len();
-                let block_size = MTP_BLOCK_SIZE.min(remaining + 1);
-                if block_size <= 1 {
+                let round_block_size = block_size.min(remaining + 1);
+                if round_block_size <= 1 {
                     break;
                 }
                 let draft_tokens =
-                    drafter.draft_block(model, bonus, &next_hidden, block_size);
-                let mut verify_tokens = Vec::with_capacity(block_size);
+                    drafter.draft_block(model, bonus, &next_hidden, round_block_size);
+                let mut verify_tokens = Vec::with_capacity(round_block_size);
                 verify_tokens.push(bonus);
                 verify_tokens.extend_from_slice(&draft_tokens);
                 let verify_input = mlxcel_core::from_slice_i32(
@@ -343,11 +355,9 @@ impl Qwen35MtpGenerator {
                     &[1, i32::try_from(verify_tokens.len()).unwrap_or(i32::MAX)],
                 );
                 let verify = model.forward_mtp_verify(&verify_input);
-                let walk = speculative_walk(
-                    &draft_tokens,
-                    &verify.target_tokens,
-                    remaining,
-                );
+                let walk = speculative_walk(&draft_tokens, &verify.target_tokens, remaining);
+                mtp_stats.accepted_draft_tokens += walk.accepted;
+                mtp_stats.proposed_draft_tokens += draft_tokens.len();
                 let (emitted, hit_eos) = visible_tokens(&walk.new_tokens, &eos_tokens);
                 generated.extend_from_slice(&emitted);
 
@@ -363,7 +373,7 @@ impl Qwen35MtpGenerator {
                     &walk.new_tokens,
                 );
                 if walk.accepted < draft_tokens.len() {
-                    model.rollback_mtp_verify(&verify.gdn_states, walk.accepted, block_size);
+                    model.rollback_mtp_verify(&verify.gdn_states, walk.accepted, round_block_size);
                 }
                 let hidden_shape = mlxcel_core::array_shape(&verify.hidden);
                 let accepted = i32::try_from(walk.accepted).unwrap_or(i32::MAX);
@@ -399,7 +409,7 @@ impl Qwen35MtpGenerator {
                 0.0
             },
         };
-        (generated, stats)
+        (generated, stats, mtp_stats)
     }
 }
 
@@ -410,6 +420,18 @@ mod tests {
     use crate::qwen3_5::rollback_plan;
     use crate::qwen3_next::Qwen3NextCache;
     use crate::qwen_mrope_state::MRopeState;
+
+    #[test]
+    fn acceptance_percentage_handles_zero_proposals_and_partial_acceptance() {
+        let no_proposals = MtpGenerationStats::default();
+        assert_eq!(no_proposals.acceptance_percentage(), 0.0);
+
+        let partial = MtpGenerationStats {
+            accepted_draft_tokens: 1,
+            proposed_draft_tokens: 4,
+        };
+        assert_eq!(partial.acceptance_percentage(), 25.0);
+    }
 
     #[test]
     fn speculative_walk_covers_acceptance_rejection_and_limits() {

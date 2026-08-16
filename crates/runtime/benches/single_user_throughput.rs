@@ -2,7 +2,7 @@ use std::hint::black_box;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use qw_runtime::provider::Qwen35GenerationMode;
 use qw_runtime::{GenerationRequest, Qwen35Provider};
 
@@ -70,19 +70,41 @@ fn single_user_throughput(criterion: &mut Criterion) {
     let (baseline_output, baseline_probe) = provider
         .generate_with_stats_in_mode(&decode_request, Qwen35GenerationMode::Baseline)
         .expect("warm up baseline single-user decode");
-    let (mtp_output, mtp_probe) = provider
-        .generate_with_stats_in_mode(&decode_request, Qwen35GenerationMode::Mtp)
-        .expect("warm up MTP single-user decode");
-    assert_eq!(
-        baseline_output.token_ids, mtp_output.token_ids,
-        "baseline and bundled-MTP greedy token IDs diverged"
-    );
+    let baseline_token_ids = baseline_output.token_ids;
     let baseline_tokens = baseline_probe.generated_tokens.saturating_sub(1);
-    let mtp_tokens = mtp_probe.generated_tokens.saturating_sub(1);
     assert!(
-        baseline_tokens > 0 && mtp_tokens > 0,
+        baseline_tokens > 0,
         "the deterministic prompt must produce at least one autoregressive decode token"
     );
+
+    let mut mtp_decode_tokens = Vec::with_capacity(3);
+    for block_size in [2, 3, 4] {
+        let (output, stats, mtp_stats) = provider
+            .generate_with_mtp_stats(&decode_request, block_size)
+            .unwrap_or_else(|error| panic!("warm up MTP k={block_size}: {error:#}"));
+        assert_eq!(
+            &output.token_ids, &baseline_token_ids,
+            "baseline and bundled-MTP k={block_size} greedy token IDs diverged"
+        );
+        let decode_tokens = stats.generated_tokens.saturating_sub(1);
+        assert!(
+            decode_tokens > 0,
+            "the deterministic MTP k={block_size} prompt must produce at least one autoregressive decode token"
+        );
+        assert!(
+            mtp_stats.proposed_draft_tokens > 0,
+            "MTP k={block_size} must propose draft tokens"
+        );
+        println!(
+            "MTP_BENCH_SUMMARY k={block_size} accepted_draft_tokens={} proposed_draft_tokens={} acceptance_percentage={:.6} decode_tokens={decode_tokens} decode_milliseconds={:.6} decode_tokens_per_second={:.6}",
+            mtp_stats.accepted_draft_tokens,
+            mtp_stats.proposed_draft_tokens,
+            mtp_stats.acceptance_percentage(),
+            stats.decode_time_ms,
+            stats.decode_tok_per_sec,
+        );
+        mtp_decode_tokens.push((block_size, decode_tokens));
+    }
 
     {
         let mut group = criterion.benchmark_group("single_user_decode");
@@ -102,27 +124,9 @@ fn single_user_throughput(criterion: &mut Criterion) {
                         baseline_tokens,
                         "deterministic baseline decode length changed"
                     );
-                    elapsed += measured_duration(stats.decode_time_ms);
-                    black_box(output);
-                }
-                elapsed
-            });
-        });
-        group.throughput(Throughput::Elements(mtp_tokens as u64));
-        group.bench_function("mtp", |bencher| {
-            bencher.iter_custom(|iterations| {
-                let mut elapsed = Duration::ZERO;
-                for _ in 0..iterations {
-                    let (output, stats) = provider
-                        .generate_with_stats_in_mode(
-                            &decode_request,
-                            Qwen35GenerationMode::Mtp,
-                        )
-                        .expect("benchmark MTP single-user decode");
                     assert_eq!(
-                        stats.generated_tokens.saturating_sub(1),
-                        mtp_tokens,
-                        "deterministic MTP decode length changed"
+                        &output.token_ids, &baseline_token_ids,
+                        "deterministic baseline token IDs changed"
                     );
                     elapsed += measured_duration(stats.decode_time_ms);
                     black_box(output);
@@ -130,6 +134,33 @@ fn single_user_throughput(criterion: &mut Criterion) {
                 elapsed
             });
         });
+        for (block_size, decode_tokens) in mtp_decode_tokens {
+            group.throughput(Throughput::Elements(decode_tokens as u64));
+            group.bench_function(format!("mtp_k{block_size}"), |bencher| {
+                bencher.iter_custom(|iterations| {
+                    let mut elapsed = Duration::ZERO;
+                    for _ in 0..iterations {
+                        let (output, stats, _) = provider
+                            .generate_with_mtp_stats(&decode_request, block_size)
+                            .unwrap_or_else(|error| {
+                                panic!("benchmark MTP k={block_size}: {error:#}")
+                            });
+                        assert_eq!(
+                            stats.generated_tokens.saturating_sub(1),
+                            decode_tokens,
+                            "deterministic MTP k={block_size} decode length changed"
+                        );
+                        assert_eq!(
+                            &output.token_ids, &baseline_token_ids,
+                            "baseline and bundled-MTP k={block_size} greedy token IDs diverged"
+                        );
+                        elapsed += measured_duration(stats.decode_time_ms);
+                        black_box(output);
+                    }
+                    elapsed
+                });
+            });
+        }
         group.finish();
     }
 }
