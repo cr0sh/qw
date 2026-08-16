@@ -561,7 +561,7 @@ namespace {
 
         float state[n_per_t];
         for (int i = 0; i < n_per_t; ++i) {
-            auto s_idx = n_per_t * dk_idx + i;
+            auto s_idx = 32 * i + dk_idx;
             state[i] = static_cast<float>(i_state[s_idx]);
         }
 
@@ -573,7 +573,7 @@ namespace {
             if (true) {
                 float kv_mem = 0.0f;
                 for (int i = 0; i < n_per_t; ++i) {
-                    auto s_idx = n_per_t * dk_idx + i;
+                    auto s_idx = 32 * i + dk_idx;
                     state[i] = state[i] * g_[hv_idx];
                     kv_mem += state[i] * k_[s_idx];
                 }
@@ -583,7 +583,7 @@ namespace {
 
                 float out = 0.0f;
                 for (int i = 0; i < n_per_t; ++i) {
-                    auto s_idx = n_per_t * dk_idx + i;
+                    auto s_idx = 32 * i + dk_idx;
                     state[i] = state[i] + k_[s_idx] * delta;
                     out += state[i] * q_[s_idx];
                 }
@@ -600,7 +600,7 @@ namespace {
             beta_ += Hv;
         }
         for (int i = 0; i < n_per_t; ++i) {
-            auto s_idx = n_per_t * dk_idx + i;
+            auto s_idx = 32 * i + dk_idx;
             o_state[s_idx] = static_cast<InT>(state[i]);
         }
     )";
@@ -980,7 +980,7 @@ void metal_gated_delta_forward(
     };
     std::vector<Dtype> output_dtypes = {input_type, input_type};
 
-    // Grid: (32, Dv, B * Hv), Threadgroup: (32, 4, 1)
+    // Four SIMD groups maximize occupancy with coalesced Dk accesses.
     auto results = kernel(
         inputs,
         output_shapes,

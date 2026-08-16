@@ -91,9 +91,14 @@ fn single_user_throughput(criterion: &mut Criterion) {
         baseline_tokens > 0,
         "the deterministic prompt must produce at least one autoregressive decode token"
     );
+    println!(
+        "DECODE_BENCH_SUMMARY mode=baseline k=1 decode_tokens={baseline_tokens} decode_milliseconds={:.6} decode_tokens_per_second={:.6}",
+        baseline_probe.decode_time_ms,
+        baseline_probe.decode_tok_per_sec,
+    );
 
-    let mut mtp_decode_tokens = Vec::with_capacity(3);
-    for block_size in [2, 3, 4] {
+    let mut mtp_decode_tokens = Vec::with_capacity(7);
+    for block_size in 2..=8 {
         let (output, stats, mtp_stats) = provider
             .generate_with_mtp_stats(&decode_request, block_size)
             .unwrap_or_else(|error| panic!("warm up MTP k={block_size}: {error:#}"));

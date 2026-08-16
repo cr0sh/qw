@@ -204,16 +204,14 @@ impl Qwen35MtpDraftModel {
         let mut state = self.state.borrow_mut();
         state.round_appended = 0;
         let mut tokens = Vec::with_capacity(block_size.saturating_sub(1));
-        let mut token = last_bonus;
-        let mut hidden = mlxcel_core::copy(target_hidden);
-
-        if let (Some(seed_token), Some(seed_hidden)) =
+        let (mut token, mut hidden) = if let (Some(seed_token), Some(seed_hidden)) =
             (state.seed_token.take(), state.seed_hidden.take())
         {
-            token = seed_token;
-            hidden = seed_hidden;
-            tokens.push(token);
-        }
+            tokens.push(seed_token);
+            (seed_token, seed_hidden)
+        } else {
+            (last_bonus, mlxcel_core::copy(target_hidden))
+        };
 
         while tokens.len() < block_size.saturating_sub(1) {
             let token_array = mlxcel_core::from_slice_i32(&[token], &[1, 1]);
