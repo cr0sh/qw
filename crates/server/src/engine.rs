@@ -13,9 +13,7 @@ use tokio::sync::mpsc;
 use crate::grammar::GrammarFactory;
 use crate::media::DecodedImage;
 use crate::prefix_cache::PrefixCache;
-use crate::protocol::{
-    CompletionRequest, Endpoint, OutputFormat, ReasoningEffort, ToolChoice,
-};
+use crate::protocol::{CompletionRequest, Endpoint, OutputFormat, ReasoningEffort, ToolChoice};
 use crate::tool_calls::{ToolCallGate, parse_assistant_output};
 
 const JOB_QUEUE_CAPACITY: usize = 8;
@@ -101,6 +99,7 @@ struct ReasoningTraceParser {
     state: TraceState,
     pending: String,
     checking_opener: bool,
+    strip_opening_line_break: bool,
 }
 
 impl Default for ReasoningTraceParser {
@@ -109,6 +108,7 @@ impl Default for ReasoningTraceParser {
             state: TraceState::Reasoning,
             pending: String::new(),
             checking_opener: true,
+            strip_opening_line_break: false,
         }
     }
 }
@@ -126,15 +126,24 @@ impl ReasoningTraceParser {
 
         self.pending.push_str(fragment);
         if self.checking_opener {
-            if self.pending.len() < THINK_OPEN.len()
-                && THINK_OPEN.starts_with(&self.pending)
-            {
+            if self.pending.len() < THINK_OPEN.len() && THINK_OPEN.starts_with(&self.pending) {
                 return Vec::new();
             }
             if self.pending.starts_with(THINK_OPEN) {
                 self.pending.drain(..THINK_OPEN.len());
+                self.strip_opening_line_break = true;
             }
             self.checking_opener = false;
+        }
+        if self.strip_opening_line_break {
+            let content = self.pending.trim_start_matches(['\r', '\n']);
+            if content.len() != self.pending.len() {
+                self.pending = content.to_string();
+            }
+            if self.pending.is_empty() {
+                return Vec::new();
+            }
+            self.strip_opening_line_break = false;
         }
 
         if let Some(marker_start) = self.pending.find(THINK_CLOSE) {
@@ -189,11 +198,7 @@ fn split_reasoning_trace(text: &str) -> (String, String) {
     let mut parser = ReasoningTraceParser::default();
     let mut reasoning = String::new();
     let mut content = String::new();
-    for delta in parser
-        .feed(text)
-        .into_iter()
-        .chain(parser.finish())
-    {
+    for delta in parser.feed(text).into_iter().chain(parser.finish()) {
         match delta {
             WorkerDelta::Reasoning(fragment) => reasoning.push_str(&fragment),
             WorkerDelta::Content(fragment) => content.push_str(&fragment),
@@ -250,18 +255,18 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn start_qwen(
-        model_path: PathBuf,
-        prefix_cache_max_tokens: usize,
-    ) -> Result<Self> {
-        ensure!(prefix_cache_max_tokens > 0, "prefix cache capacity must be nonzero");
+    pub fn start_qwen(model_path: PathBuf, prefix_cache_max_tokens: usize) -> Result<Self> {
+        ensure!(
+            prefix_cache_max_tokens > 0,
+            "prefix cache capacity must be nonzero"
+        );
         let model_id = checkpoint_model_id(&model_path)?;
         let (jobs_tx, jobs_rx) = mpsc::channel(JOB_QUEUE_CAPACITY);
         let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
         thread::Builder::new()
             .name("qw-generation".to_string())
-            .spawn(move || {
-                match QwenWorker::load(&model_path, prefix_cache_max_tokens) {
+            .spawn(
+                move || match QwenWorker::load(&model_path, prefix_cache_max_tokens) {
                     Ok(mut worker) => {
                         let supports_image_inputs = worker.provider.supports_image_inputs();
                         let _ = ready_tx.send(Ok(supports_image_inputs));
@@ -270,8 +275,8 @@ impl Engine {
                     Err(error) => {
                         let _ = ready_tx.send(Err(error));
                     }
-                }
-            })
+                },
+            )
             .context("failed to spawn generation thread")?;
         let supports_image_inputs = ready_rx
             .recv()
@@ -286,7 +291,6 @@ impl Engine {
     pub fn model_id(&self) -> &str {
         &self.model_id
     }
-
 
     pub fn supports_image_inputs(&self) -> bool {
         self.supports_image_inputs
@@ -349,10 +353,8 @@ impl Engine {
                     continue;
                 }
                 let has_images = !job.request.decoded_images.is_empty();
-                let prompt = fake_prompt_observation(
-                    &job.request.messages,
-                    &job.request.decoded_images,
-                );
+                let prompt =
+                    fake_prompt_observation(&job.request.messages, &job.request.decoded_images);
                 let cached_tokens = if has_images {
                     0
                 } else {
@@ -392,16 +394,16 @@ impl Engine {
                 let fake_tool_turn = tool_results.is_empty()
                     && matches!(
                         latest_user.as_deref(),
-                        Some(
-                            "call-tool"
-                                | "call-tool-with-preamble"
-                                | "call-tool-with-reasoning"
-                        )
+                        Some("call-tool" | "call-tool-with-preamble" | "call-tool-with-reasoning")
                     )
                     && job.request.tool_choice == ToolChoice::Auto
                     && !job.request.tools.is_empty();
                 let (content, tool_calls, finish_reason) = if fake_tool_turn {
-                    let count = if job.request.parallel_tool_calls { 2 } else { 1 };
+                    let count = if job.request.parallel_tool_calls {
+                        2
+                    } else {
+                        1
+                    };
                     let tool_calls = (0..count)
                         .map(|index| {
                             let tool = &job.request.tools[index % job.request.tools.len()];
@@ -451,14 +453,10 @@ impl Engine {
                 let generated_text = format!("{reasoning}{THINK_CLOSE}\n\n{content}");
                 let mut trace_parser = ReasoningTraceParser::default();
                 for fragment in generated_text.as_bytes().chunks(4) {
-                    let fragment =
-                        String::from_utf8(fragment.to_vec()).expect("ASCII fake output");
+                    let fragment = String::from_utf8(fragment.to_vec()).expect("ASCII fake output");
                     for delta in trace_parser.feed(&fragment) {
                         if job.cancelled.load(Ordering::Acquire)
-                            || job
-                                .events
-                                .blocking_send(WorkerEvent::Delta(delta))
-                                .is_err()
+                            || job.events.blocking_send(WorkerEvent::Delta(delta)).is_err()
                         {
                             job.cancelled.store(true, Ordering::Release);
                             break;
@@ -481,7 +479,8 @@ impl Engine {
                 let completion_tokens = if job.request.max_tokens == 1 {
                     1
                 } else {
-                    content.len()
+                    reasoning.len()
+                        + content.len()
                         + tool_calls
                             .iter()
                             .map(|call| call.arguments.len())
@@ -618,10 +617,7 @@ impl QwenWorker {
                         &job,
                         FailureKind::InvalidRequest,
                         format!("failed to preprocess image: {error}"),
-                        job.request
-                            .image_params
-                            .get(prepared_images.len())
-                            .cloned(),
+                        job.request.image_params.get(prepared_images.len()).cloned(),
                     );
                     return;
                 }
@@ -633,10 +629,7 @@ impl QwenWorker {
             job.request.tools.as_slice()
         };
         let tool_enabled = !effective_tools.is_empty();
-        let reasoning_effort = job
-            .request
-            .reasoning_effort
-            .map(ReasoningEffort::as_str);
+        let reasoning_effort = job.request.reasoning_effort.map(ReasoningEffort::as_str);
         let multimodal_prefill = if has_images {
             match self.provider.prepare_multimodal_prefill(
                 &job.request.messages,
@@ -661,10 +654,11 @@ impl QwenWorker {
         let prompt_ids = if let Some(prefill) = &multimodal_prefill {
             prefill.prompt_ids.clone()
         } else {
-            match self
-                .provider
-                .tokenize_messages(&job.request.messages, effective_tools, reasoning_effort)
-            {
+            match self.provider.tokenize_messages(
+                &job.request.messages,
+                effective_tools,
+                reasoning_effort,
+            ) {
                 Ok(tokens) => tokens,
                 Err(error) => {
                     send_failure(
@@ -824,12 +818,7 @@ impl QwenWorker {
                 .into_iter()
                 .enumerate()
                 .map(|(index, call)| {
-                    generated_tool_call(
-                        &job.admission,
-                        index,
-                        call.name,
-                        call.arguments,
-                    )
+                    generated_tool_call(&job.admission, index, call.name, call.arguments)
                 })
                 .collect();
             (
@@ -842,11 +831,7 @@ impl QwenWorker {
                 },
             )
         } else {
-            (
-                visible_content,
-                Vec::new(),
-                core_finish_reason,
-            )
+            (visible_content, Vec::new(), core_finish_reason)
         };
         if !tool_enabled
             && !matches!(job.request.output_format, OutputFormat::Text)
@@ -938,5 +923,96 @@ fn new_admission(endpoint: Endpoint) -> Admission {
         response_id,
         message_id: format!("msg_{suffix}"),
         created: (nanos / 1_000_000_000) as u64,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_fragments(fragments: &[&str]) -> (String, String) {
+        let mut parser = ReasoningTraceParser::default();
+        let mut reasoning = String::new();
+        let mut content = String::new();
+        let mut append = |delta| match delta {
+            WorkerDelta::Reasoning(fragment) => reasoning.push_str(&fragment),
+            WorkerDelta::Content(fragment) => content.push_str(&fragment),
+        };
+        for fragment in fragments {
+            for delta in parser.feed(fragment) {
+                append(delta);
+            }
+        }
+        for delta in parser.finish() {
+            append(delta);
+        }
+        (reasoning, content)
+    }
+
+    #[test]
+    fn splits_normal_qwen_reasoning_trace() {
+        assert_eq!(
+            split_reasoning_trace("private trace</think>\nfinal answer"),
+            ("private trace".to_string(), "final answer".to_string())
+        );
+    }
+
+    #[test]
+    fn removes_echoed_think_opener() {
+        assert_eq!(
+            parse_fragments(&["<thi", "nk>", "\nprivate trace", "</think>", "\nanswer"]),
+            ("private trace".to_string(), "answer".to_string())
+        );
+    }
+
+    #[test]
+    fn closing_marker_split_at_every_byte_boundary_never_leaks() {
+        for boundary in 0..=THINK_CLOSE.len() {
+            let (reasoning, content) = parse_fragments(&[
+                "private trace",
+                &THINK_CLOSE[..boundary],
+                &THINK_CLOSE[boundary..],
+                "\n\nfinal answer",
+            ]);
+            assert_eq!(reasoning, "private trace", "boundary {boundary}");
+            assert_eq!(content, "final answer", "boundary {boundary}");
+            assert!(!reasoning.contains("<think"), "boundary {boundary}");
+            assert!(!content.contains("</think"), "boundary {boundary}");
+        }
+    }
+
+    #[test]
+    fn removes_only_line_breaks_between_trace_and_visible_content() {
+        assert_eq!(
+            split_reasoning_trace("trace</think>\r\n\nanswer"),
+            ("trace".to_string(), "answer".to_string())
+        );
+        assert_eq!(
+            split_reasoning_trace("trace</think>  answer"),
+            ("trace".to_string(), "  answer".to_string())
+        );
+    }
+
+    #[test]
+    fn unfinished_generation_remains_reasoning() {
+        assert_eq!(
+            parse_fragments(&["unfinished trace", "</thi"]),
+            ("unfinished trace</thi".to_string(), String::new())
+        );
+    }
+
+    #[test]
+    fn closing_marker_before_tool_call_exposes_only_tool_xml() {
+        let tool_xml =
+            "<tool_call><function=weather><parameter=city>Paris</parameter></function></tool_call>";
+        let (reasoning, content) =
+            split_reasoning_trace(&format!("use the weather tool</think>\n{tool_xml}"));
+        assert_eq!(reasoning, "use the weather tool");
+        assert_eq!(content, tool_xml);
+        let parsed = parse_assistant_output(&content, &["weather"], 10, 128)
+            .expect("visible tool call parses");
+        assert!(parsed.content.is_empty());
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].name, "weather");
     }
 }

@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-use anyhow::{ensure, Context, Result};
+use anyhow::{Context, Result, ensure};
 use mlxcel_core::generate::{
     ControlledGeneration, CxxGenerator, GenerationStats, GenerationStopReason, LanguageModel,
     ModelStateSnapshot, PrefixReuse, SamplingConfig, TokenConstraint,
@@ -10,17 +10,17 @@ use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use tokenizers::Tokenizer;
 
+use crate::chat_template::ChatTemplateProcessor;
 pub use crate::chat_template::{
     ChatContentPart, ChatContentRef, ChatImageUrl, ChatMessage, ChatMessageContent, ChatTool,
     ChatToolCall, ChatToolCallFunction, ChatToolFunction,
 };
-use crate::chat_template::ChatTemplateProcessor;
-use crate::qwen3_5::Qwen35Model;
-pub use crate::qwen3_5_mtp::MtpGenerationStats;
 use crate::qwen_vl::insert_qwen_vl_image_tokens;
 use crate::qwen_vl_merge::merge_llava;
 use crate::qwen_vl_position::compute_rope_index;
 use crate::qwen_vl_processor::{PreparedImage, QwenVLProcessor};
+use crate::qwen3_5::Qwen35Model;
+pub use crate::qwen3_5_mtp::MtpGenerationStats;
 use crate::qwen3_5_mtp::Qwen35MtpGenerator;
 
 const PRODUCTION_MTP_BLOCK_SIZE: usize = 4;
@@ -74,9 +74,8 @@ impl<'a> IncrementalTextDecoder<'a> {
     }
 
     fn push(&mut self, token_id: i32) -> Result<String> {
-        self.token_ids.push(
-            u32::try_from(token_id).context("generated a negative token identifier")?,
-        );
+        self.token_ids
+            .push(u32::try_from(token_id).context("generated a negative token identifier")?);
         let decoded = self
             .tokenizer
             .decode(&self.token_ids, false)
@@ -99,11 +98,7 @@ impl<'a> IncrementalTextDecoder<'a> {
     }
 }
 
-fn advance_decoded_text(
-    emitted: &mut String,
-    decoded: &str,
-    final_chunk: bool,
-) -> Result<String> {
+fn advance_decoded_text(emitted: &mut String, decoded: &str, final_chunk: bool) -> Result<String> {
     ensure!(
         decoded.starts_with(emitted.as_str()),
         "incremental tokenizer decoding changed text already emitted"
@@ -261,12 +256,7 @@ impl Qwen35Provider {
         Ok(prompt_ids)
     }
 
-    pub fn prepare_image(
-        &self,
-        width: u32,
-        height: u32,
-        rgb: Vec<u8>,
-    ) -> Result<PreparedImage> {
+    pub fn prepare_image(&self, width: u32, height: u32, rgb: Vec<u8>) -> Result<PreparedImage> {
         self.vision_processor
             .as_ref()
             .context("model does not support image inputs")?
@@ -280,15 +270,15 @@ impl Qwen35Provider {
         reasoning_effort: Option<&str>,
         images: &[PreparedImage],
     ) -> Result<PreparedMultimodalPrefill> {
-        ensure!(!images.is_empty(), "image prefill requires at least one image");
+        ensure!(
+            !images.is_empty(),
+            "image prefill requires at least one image"
+        );
         ensure!(
             self.supports_image_inputs(),
             "model does not support image inputs"
         );
-        let declared_images = messages
-            .iter()
-            .flat_map(ChatMessage::image_urls)
-            .count();
+        let declared_images = messages.iter().flat_map(ChatMessage::image_urls).count();
         ensure!(
             declared_images == images.len(),
             "prepared image count does not match rendered image count"
@@ -301,7 +291,10 @@ impl Qwen35Provider {
             .model
             .multimodal_token_ids()
             .context("model does not support image inputs")?;
-        let grids = images.iter().map(|image| image.grid_thw).collect::<Vec<_>>();
+        let grids = images
+            .iter()
+            .map(|image| image.grid_thw)
+            .collect::<Vec<_>>();
         let mut prompt_ids = self.tokenize_messages(messages, tools, reasoning_effort)?;
         let expansion = insert_qwen_vl_image_tokens(
             &mut prompt_ids,
@@ -310,28 +303,20 @@ impl Qwen35Provider {
             vision_start_token_id,
             image_token_id,
         )?;
-        let input_ids =
-            mlxcel_core::from_slice_i32(&prompt_ids, &[1, prompt_ids.len() as i32]);
+        let input_ids = mlxcel_core::from_slice_i32(&prompt_ids, &[1, prompt_ids.len() as i32]);
         let text_embeddings = self
             .model
             .embed_tokens(&input_ids)
             .context("Qwen3.5 input embeddings are unavailable")?;
         let mut pixel_values = images[0].to_mlx();
         for image in &images[1..] {
-            pixel_values = mlxcel_core::concatenate(
-                &pixel_values,
-                &image.to_mlx(),
-                0,
-            );
+            pixel_values = mlxcel_core::concatenate(&pixel_values, &image.to_mlx(), 0);
         }
-        let pixel_values = mlxcel_core::astype(
-            &pixel_values,
-            mlxcel_core::array_dtype(&text_embeddings),
-        );
+        let pixel_values =
+            mlxcel_core::astype(&pixel_values, mlxcel_core::array_dtype(&text_embeddings));
         let vision_features = self.model.encode_vision(&pixel_values, &grids)?;
         ensure!(
-            mlxcel_core::array_shape(&vision_features)[0] as usize
-                == expansion.total_image_tokens,
+            mlxcel_core::array_shape(&vision_features)[0] as usize == expansion.total_image_tokens,
             "vision encoder output count does not match expanded image token count"
         );
         let input_embeddings = merge_llava(
@@ -675,8 +660,7 @@ fn load_vision_processor(
             serde_json::Value::Object(Default::default())
         }
         Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed to read {}", path.display()));
+            return Err(error).with_context(|| format!("failed to read {}", path.display()));
         }
     };
     let min_pixels = value
@@ -811,7 +795,6 @@ mod tests {
         assert!(error.contains("tokenizer_config.json"), "{error}");
     }
 
-
     #[test]
     fn incremental_decoder_withholds_split_utf8_replacement_text() {
         let mut emitted = String::new();
@@ -825,8 +808,7 @@ mod tests {
                 .expect("second byte-fallback token"),
         );
         deltas.push(
-            advance_decoded_text(&mut emitted, "你", false)
-                .expect("completed UTF-8 sequence"),
+            advance_decoded_text(&mut emitted, "你", false).expect("completed UTF-8 sequence"),
         );
         assert_eq!(deltas.concat(), "你");
         assert_eq!(emitted, "你");
@@ -839,8 +821,7 @@ mod tests {
         let mut deltas = Vec::new();
         for decoded in ["Hello", "Hello, ", "Hello, world"] {
             deltas.push(
-                advance_decoded_text(&mut emitted, decoded, false)
-                    .expect("monotonic BPE decode"),
+                advance_decoded_text(&mut emitted, decoded, false).expect("monotonic BPE decode"),
             );
         }
         let final_delta =

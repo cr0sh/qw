@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::path::Path;
 use anyhow::{Context, Result};
 use minijinja::value::{Value, ValueKind, from_args};
 use minijinja::{Environment, Error, ErrorKind, context};
 use serde::Serialize;
 use serde_json::Value as JsonValue;
+use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ChatMessage {
@@ -246,8 +246,7 @@ impl ChatTemplateProcessor {
                     );
                     for (call_index, call) in message.tool_calls.iter().enumerate() {
                         anyhow::ensure!(
-                            call.tool_type == "function"
-                                && call.function.arguments.is_object(),
+                            call.tool_type == "function" && call.function.arguments.is_object(),
                             "message {index} tool call {call_index} is invalid"
                         );
                     }
@@ -262,10 +261,7 @@ impl ChatTemplateProcessor {
                     );
                 }
                 _ => {
-                    anyhow::bail!(
-                        "message {index} has unsupported role {:?}",
-                        message.role
-                    );
+                    anyhow::bail!("message {index} has unsupported role {:?}", message.role);
                 }
             }
         }
@@ -297,10 +293,8 @@ impl ChatTemplateProcessor {
     pub(crate) fn supports_image_content(&self) -> bool {
         self.template.contains("image_url")
             || (self.template.contains("content")
-                && (self.template.contains("\"image\"")
-                    || self.template.contains("'image'"))
-                && (self.template.contains("vision_start")
-                    || self.template.contains("image_pad")))
+                && (self.template.contains("\"image\"") || self.template.contains("'image'"))
+                && (self.template.contains("vision_start") || self.template.contains("image_pad")))
     }
 }
 
@@ -458,9 +452,11 @@ assistant:{{ content }}
         let rendered = processor()
             .render_messages(&messages, &[tool()], None)
             .expect("render tool results");
-        assert!(rendered.contains(
-            "<tool_response>sunny</tool_response><tool_response>warm</tool_response>"
-        ));
+        assert!(
+            rendered.contains(
+                "<tool_response>sunny</tool_response><tool_response>warm</tool_response>"
+            )
+        );
     }
 
     #[test]
@@ -577,7 +573,9 @@ assistant:{{ content }}
             )
             .expect("render image and tool replay");
         let before = replayed.find("before").expect("leading text");
-        let image = replayed.find(vision_placeholder).expect("image placeholder");
+        let image = replayed
+            .find(vision_placeholder)
+            .expect("image placeholder");
         let after = replayed.find("after").expect("trailing text");
         assert!(before < image && image < after);
         assert_eq!(replayed.matches(vision_placeholder).count(), 1);
@@ -585,6 +583,37 @@ assistant:{{ content }}
         assert!(replayed.contains("<tool_response>sunny</tool_response>"));
     }
 
+    #[test]
+    fn renders_reasoning_effort_and_replays_assistant_reasoning_separately() {
+        let processor = ChatTemplateProcessor {
+            template: "{{ reasoning_effort }}|{{ messages|tojson }}".to_string(),
+            bos_token: String::new(),
+            eos_token: String::new(),
+        };
+        let message = ChatMessage {
+            role: "assistant".to_string(),
+            content: Some(ChatMessageContent::Text("final answer".to_string())),
+            reasoning_content: Some("private trace".to_string()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        };
+
+        for (effort, expected) in [
+            (Some("low"), "low"),
+            (Some("medium"), "medium"),
+            (Some("xhigh"), "xhigh"),
+            (None, "xhigh"),
+        ] {
+            let rendered = processor
+                .render_messages(std::slice::from_ref(&message), &[], effort)
+                .expect("render reasoning replay");
+            let (rendered_effort, messages) = rendered.split_once('|').expect("effort delimiter");
+            assert_eq!(rendered_effort, expected);
+            let messages: JsonValue = serde_json::from_str(messages).expect("serialized messages");
+            assert_eq!(messages[0]["content"], "final answer");
+            assert_eq!(messages[0]["reasoning_content"], "private trace");
+        }
+    }
 }
 
 fn extract_token(config: &JsonValue, name: &str) -> String {

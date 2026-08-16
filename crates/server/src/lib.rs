@@ -1,7 +1,7 @@
 mod engine;
 mod grammar;
-mod prefix_cache;
 mod media;
+mod prefix_cache;
 pub mod protocol;
 mod tool_calls;
 
@@ -11,21 +11,21 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::Json;
+use axum::Router;
 use axum::extract::{State, rejection::JsonRejection};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
-use axum::Router;
 use futures_util::stream;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-pub use engine::{Engine, SubmitError};
 use engine::{
     Admission, CompletionRecord, FailureKind, FinishReason, GeneratedToolCall, WorkerDelta,
     WorkerEvent, WorkerFailure,
 };
+pub use engine::{Engine, SubmitError};
 use protocol::{Endpoint, RequestError};
 
 #[derive(Clone)]
@@ -92,7 +92,9 @@ async fn handle(
     let submission = match state.engine.submit(request) {
         Ok(submission) => submission,
         Err(SubmitError::Full) => return ApiError::queue_full().into_response(),
-        Err(SubmitError::Closed) => return ApiError::server("generation worker is unavailable").into_response(),
+        Err(SubmitError::Closed) => {
+            return ApiError::server("generation worker is unavailable").into_response();
+        }
     };
     if stream_requested {
         streaming_response(endpoint, model_id, submission).await
@@ -143,9 +145,12 @@ async fn streaming_response(
             return Json(buffered_json(&record)).into_response();
         }
         Some(WorkerEvent::Delta(_)) => {
-            return ApiError::server("generation worker emitted output before admission").into_response();
+            return ApiError::server("generation worker emitted output before admission")
+                .into_response();
         }
-        None => return ApiError::server("generation worker closed during admission").into_response(),
+        None => {
+            return ApiError::server("generation worker closed during admission").into_response();
+        }
     }
 
     let state = SseState::new(
@@ -766,12 +771,7 @@ impl IntoResponse for ApiError {
     }
 }
 
-fn error_json(
-    message: &str,
-    error_type: &str,
-    param: Option<&str>,
-    code: Option<&str>,
-) -> Value {
+fn error_json(message: &str, error_type: &str, param: Option<&str>, code: Option<&str>) -> Value {
     json!({
         "error": {
             "message": message,
