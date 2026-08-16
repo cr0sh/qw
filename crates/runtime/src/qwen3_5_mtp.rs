@@ -31,7 +31,7 @@ use mlxcel_core::{MlxArray, UniquePtr};
 
 use crate::qwen3_5::{Qwen35Config, Qwen35DecoderLayer, Qwen35Model};
 
-const MTP_BLOCK_SIZE: usize = 8;
+const MTP_BLOCK_SIZE: usize = 4;
 
 struct Qwen35MtpDraftState {
     cache: KVCache,
