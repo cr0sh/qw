@@ -26,11 +26,12 @@ use crate::qwen3_next::{
     MLP, Quantization, Qwen3NextAttention, Qwen3NextCache, Qwen3NextConfig,
 };
 use anyhow::{Context, Result, ensure};
+use mlxcel_core::cache::SequenceId;
 use mlxcel_core::generate::{LanguageModel, ModelStateSnapshot};
 use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::utils::{create_causal_mask, silu};
 use mlxcel_core::weights::WeightMap;
-use mlxcel_core::{MlxArray, SequenceId, UniquePtr, concatenate};
+use mlxcel_core::{MlxArray, UniquePtr, concatenate};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeSet;
