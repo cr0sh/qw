@@ -980,13 +980,14 @@ void metal_gated_delta_forward(
     };
     std::vector<Dtype> output_dtypes = {input_type, input_type};
 
-    // Grid: (32, Dv, B * Hv), Threadgroup: (32, 4, 1)
+    // Eight SIMD groups amortize dispatch and state input residency across
+    // more value dimensions while remaining below Metal's threadgroup limit.
     auto results = kernel(
         inputs,
         output_shapes,
         output_dtypes,
         std::make_tuple(32, Dv, B * Hv),   // grid
-        std::make_tuple(32, 4, 1),          // threadgroup
+        std::make_tuple(32, 8, 1),          // threadgroup
         template_args,
         std::nullopt,  // init_value
         false,         // verbose
