@@ -23,8 +23,8 @@ use tokio::sync::mpsc;
 
 pub use engine::{Engine, SubmitError};
 use engine::{
-    Admission, CompletionRecord, FailureKind, FinishReason, GeneratedToolCall, WorkerEvent,
-    WorkerFailure,
+    Admission, CompletionRecord, FailureKind, FinishReason, GeneratedToolCall, WorkerDelta,
+    WorkerEvent, WorkerFailure,
 };
 use protocol::{Endpoint, RequestError};
 
@@ -218,7 +218,10 @@ impl SseState {
             }
             match self.receiver.recv().await {
                 Some(WorkerEvent::Started) => continue,
-                Some(WorkerEvent::Delta(delta)) => self.enqueue_delta(delta),
+                Some(WorkerEvent::Delta(WorkerDelta::Reasoning(_))) => {}
+                Some(WorkerEvent::Delta(WorkerDelta::Content(delta))) => {
+                    self.enqueue_delta(delta);
+                }
                 Some(WorkerEvent::Complete(record)) => {
                     self.enqueue_complete(record);
                     self.guard.armed = false;
