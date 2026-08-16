@@ -2,6 +2,7 @@ mod engine;
 mod grammar;
 mod prefix_cache;
 pub mod protocol;
+mod tool_calls;
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
