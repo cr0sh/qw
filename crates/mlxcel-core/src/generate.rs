@@ -91,6 +91,7 @@ pub struct ModelStateSnapshot {
     family: String,
     token_len: usize,
     tensors: Vec<ModelStateTensor>,
+    continuation_logits: Option<UniquePtr<MlxArray>>,
 }
 
 impl ModelStateSnapshot {
@@ -100,6 +101,7 @@ impl ModelStateSnapshot {
             family: family.into(),
             token_len,
             tensors: Vec::new(),
+            continuation_logits: None,
         }
     }
 
@@ -126,6 +128,19 @@ impl ModelStateSnapshot {
             .map(ModelStateTensor::array)
     }
 
+    /// Attach the prefill logits that predict the first token after this prefix.
+    ///
+    /// This is kept outside the model-defined tensor namespace so model restore
+    /// validation remains concerned only with recurrent/cache layout.
+    pub fn set_continuation_logits(&mut self, logits: &MlxArray) {
+        self.continuation_logits = Some(ffi::copy(logits));
+    }
+
+    /// Borrow the prefill logits associated with this exact prefix.
+    pub fn continuation_logits(&self) -> Option<&MlxArray> {
+        self.continuation_logits.as_deref()
+    }
+
     /// Number of named tensors stored in this snapshot.
     pub fn tensor_count(&self) -> usize {
         self.tensors.len()
@@ -143,7 +158,12 @@ impl ModelStateSnapshot {
 
     /// Sum of all captured tensor byte footprints.
     pub fn nbytes(&self) -> usize {
-        self.tensors.iter().map(ModelStateTensor::nbytes).sum()
+        self.tensors.iter().map(ModelStateTensor::nbytes).sum::<usize>()
+            + self
+                .continuation_logits
+                .as_deref()
+                .map(ffi::array_nbytes)
+                .unwrap_or(0)
     }
 }
 
@@ -1312,38 +1332,55 @@ impl CxxGenerator {
         let sequence_id = SequenceId::from_raw(0);
 
         let mut cached_tokens = 0;
+        let mut cached_logits = None;
         if let Some(reuse) = prefix_reuse
             && reuse.cached_tokens > 0
-            && reuse.cached_tokens < prompt_tokens.len()
+            && reuse.cached_tokens <= prompt_tokens.len()
             && reuse.snapshot.token_len() == reuse.cached_tokens
+            && (reuse.cached_tokens < prompt_tokens.len()
+                || reuse.snapshot.continuation_logits().is_some())
         {
             model.restore_sequence_state(sequence_id, reuse.snapshot)?;
             cached_tokens = reuse.cached_tokens;
+            if cached_tokens == prompt_tokens.len() {
+                cached_logits = reuse.snapshot.continuation_logits().map(ffi::copy);
+            }
         }
         let prefill_tokens = &prompt_tokens[cached_tokens..];
-        let prefill_chunk = effective_prefill_chunk(
-            prefill_chunk_len(),
-            model.supports_chunked_prefill(),
-            prefill_tokens.len(),
-        );
-        let mut logits = if let Some(chunk) = prefill_chunk {
-            chunked_prefill_last_logits(model, &mut self.caches, prefill_tokens, chunk)
+        let mut logits = if let Some(logits) = cached_logits {
+            logits
         } else {
-            let input =
-                ffi::from_slice_i32(prefill_tokens, &[1, prefill_tokens.len() as i32]);
-            model.forward_last_logits(
-                &input,
-                &mut self.caches,
-                None,
-                prefill_tokens.len().saturating_sub(1),
-            )
+            let prefill_chunk = effective_prefill_chunk(
+                prefill_chunk_len(),
+                model.supports_chunked_prefill(),
+                prefill_tokens.len(),
+            );
+            if let Some(chunk) = prefill_chunk {
+                chunked_prefill_last_logits(model, &mut self.caches, prefill_tokens, chunk)
+            } else {
+                let input =
+                    ffi::from_slice_i32(prefill_tokens, &[1, prefill_tokens.len() as i32]);
+                model.forward_last_logits(
+                    &input,
+                    &mut self.caches,
+                    None,
+                    prefill_tokens.len().saturating_sub(1),
+                )
+            }
         };
         ffi::eval(&logits);
-        let prompt_snapshot = if capture_prompt_snapshot && model.supports_snapshot_reuse() {
+        let mut prompt_snapshot = if capture_prompt_snapshot && model.supports_snapshot_reuse() {
             model.snapshot_sequence_state(sequence_id, prompt_tokens.len())
         } else {
             None
         };
+        if let Some(snapshot) = prompt_snapshot.as_mut() {
+            snapshot.set_continuation_logits(
+                logits
+                    .as_ref()
+                    .expect("generation logits must not be null"),
+            );
+        }
         ffi::clear_memory_cache();
 
         let needs_history = sampling.needs_token_history() || constraint.is_some();
