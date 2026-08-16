@@ -162,13 +162,13 @@ impl Engine {
                     job.cancelled.store(true, Ordering::Release);
                     continue;
                 }
-                if job.request.messages[0].content == "hold" {
+                if job.request.messages[0].content.as_deref() == Some("hold") {
                     while !job.cancelled.load(Ordering::Acquire) {
                         std::thread::sleep(std::time::Duration::from_millis(5));
                     }
                     continue;
                 }
-                if job.request.messages[0].content == "fail-after-start" {
+                if job.request.messages[0].content.as_deref() == Some("fail-after-start") {
                     send_failure(
                         &job,
                         FailureKind::Server,
@@ -181,7 +181,7 @@ impl Engine {
                     .request
                     .messages
                     .iter()
-                    .map(|message| message.content.as_str())
+                    .map(|message| message.content.as_deref().unwrap_or_default())
                     .collect::<Vec<_>>()
                     .join("|");
                 let cached_tokens = cached_prompt
@@ -278,7 +278,7 @@ impl QwenWorker {
     }
 
     fn process(&mut self, job: Job) {
-        let prompt_ids = match self.provider.tokenize_messages(&job.request.messages) {
+        let prompt_ids = match self.provider.tokenize_messages(&job.request.messages, &[]) {
             Ok(tokens) => tokens,
             Err(error) => {
                 send_failure(

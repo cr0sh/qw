@@ -217,7 +217,9 @@ pub fn parse_responses(value: Value) -> Result<CompletionRequest, RequestError> 
     let messages = match wire.input {
         ResponsesInput::String(content) => vec![ChatMessage {
             role: "user".to_string(),
-            content,
+            content: Some(content),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
         }],
         ResponsesInput::Messages(messages) => convert_messages(messages)?,
     };
@@ -320,7 +322,9 @@ fn convert_messages(messages: Vec<WireMessage>) -> Result<Vec<ChatMessage>, Requ
             }
             Ok(ChatMessage {
                 role: message.role,
-                content: message.content,
+                content: Some(message.content),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
             })
         })
         .collect()

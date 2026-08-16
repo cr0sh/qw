@@ -9,7 +9,9 @@ use mlxcel_core::generate::{
 use serde::Deserialize;
 use tokenizers::Tokenizer;
 
-pub use crate::chat_template::ChatMessage;
+pub use crate::chat_template::{
+    ChatMessage, ChatTool, ChatToolCall, ChatToolCallFunction, ChatToolFunction,
+};
 use crate::chat_template::ChatTemplateProcessor;
 use crate::qwen3_5::Qwen35Model;
 pub use crate::qwen3_5_mtp::MtpGenerationStats;
@@ -196,12 +198,20 @@ impl Qwen35Provider {
         self.defaults.stop_token_ids[0] as u32
     }
 
-    pub fn render_messages(&self, messages: &[ChatMessage]) -> Result<String> {
-        self.chat_template.render_messages(messages)
+    pub fn render_messages(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ChatTool],
+    ) -> Result<String> {
+        self.chat_template.render_messages(messages, tools)
     }
 
-    pub fn tokenize_messages(&self, messages: &[ChatMessage]) -> Result<Vec<i32>> {
-        let rendered = self.render_messages(messages)?;
+    pub fn tokenize_messages(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ChatTool],
+    ) -> Result<Vec<i32>> {
+        let rendered = self.render_messages(messages, tools)?;
         let encoded = self
             .tokenizer
             .encode(rendered, true)
@@ -217,6 +227,10 @@ impl Qwen35Provider {
             "rendered messages tokenized to an empty sequence"
         );
         Ok(prompt_ids)
+    }
+
+    pub fn supports_qwen35_tool_calls(&self) -> bool {
+        self.chat_template.supports_qwen35_tool_calls()
     }
 
     pub fn baseline_sampling(
