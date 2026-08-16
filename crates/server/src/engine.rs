@@ -460,6 +460,7 @@ impl QwenWorker {
             match self.provider.prepare_multimodal_prefill(
                 &job.request.messages,
                 effective_tools,
+                None,
                 &prepared_images,
             ) {
                 Ok(prefill) => Some(prefill),
@@ -481,7 +482,7 @@ impl QwenWorker {
         } else {
             match self
                 .provider
-                .tokenize_messages(&job.request.messages, effective_tools)
+                .tokenize_messages(&job.request.messages, effective_tools, None)
             {
                 Ok(tokens) => tokens,
                 Err(error) => {

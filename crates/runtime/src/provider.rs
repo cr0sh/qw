@@ -231,16 +231,19 @@ impl Qwen35Provider {
         &self,
         messages: &[ChatMessage],
         tools: &[ChatTool],
+        reasoning_effort: Option<&str>,
     ) -> Result<String> {
-        self.chat_template.render_messages(messages, tools)
+        self.chat_template
+            .render_messages(messages, tools, reasoning_effort)
     }
 
     pub fn tokenize_messages(
         &self,
         messages: &[ChatMessage],
         tools: &[ChatTool],
+        reasoning_effort: Option<&str>,
     ) -> Result<Vec<i32>> {
-        let rendered = self.render_messages(messages, tools)?;
+        let rendered = self.render_messages(messages, tools, reasoning_effort)?;
         let encoded = self
             .tokenizer
             .encode(rendered, true)
@@ -274,6 +277,7 @@ impl Qwen35Provider {
         &self,
         messages: &[ChatMessage],
         tools: &[ChatTool],
+        reasoning_effort: Option<&str>,
         images: &[PreparedImage],
     ) -> Result<PreparedMultimodalPrefill> {
         ensure!(!images.is_empty(), "image prefill requires at least one image");
@@ -298,7 +302,7 @@ impl Qwen35Provider {
             .multimodal_token_ids()
             .context("model does not support image inputs")?;
         let grids = images.iter().map(|image| image.grid_thw).collect::<Vec<_>>();
-        let mut prompt_ids = self.tokenize_messages(messages, tools)?;
+        let mut prompt_ids = self.tokenize_messages(messages, tools, reasoning_effort)?;
         let expansion = insert_qwen_vl_image_tokens(
             &mut prompt_ids,
             &grids,

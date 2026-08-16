@@ -298,6 +298,7 @@ pub fn parse_responses(value: Value) -> Result<CompletionRequest, RequestError> 
             vec![ChatMessage {
                 role: "user".to_string(),
                 content: Some(ChatMessageContent::Text(content)),
+                reasoning_content: None,
                 tool_calls: Vec::new(),
                 tool_call_id: None,
             }]
@@ -527,16 +528,14 @@ fn parse_chat_messages(
             ChatWireMessage::System { content } => {
                 ordinary_message("system", content, &base)?
             }
-            ChatWireMessage::User { content } => ChatMessage {
-                role: "user".to_string(),
-                content: Some(parse_chat_user_content(
-                    &content,
-                    &format!("{base}.content"),
-                    image_params,
-                )?),
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-            },
+            ChatWireMessage::User { content } => ChatMessage { reasoning_content: None, role: "user".to_string(),
+            content: Some(parse_chat_user_content(
+                &content,
+                &format!("{base}.content"),
+                image_params,
+            )?),
+            tool_calls: Vec::new(),
+            tool_call_id: None, },
             ChatWireMessage::Assistant {
                 content,
                 tool_calls,
@@ -579,12 +578,10 @@ fn parse_chat_messages(
                         format!("{base}.content"),
                     ));
                 }
-                ChatMessage {
-                    role: "assistant".to_string(),
-                    content,
-                    tool_calls: calls,
-                    tool_call_id: None,
-                }
+                ChatMessage { reasoning_content: None, role: "assistant".to_string(),
+                content,
+                tool_calls: calls,
+                tool_call_id: None, }
             }
             ChatWireMessage::Tool {
                 content,
@@ -599,12 +596,10 @@ fn parse_chat_messages(
                     &format!("{base}.tool_call_id"),
                 )?;
                 history.resolve(&call_id, format!("{base}.tool_call_id"))?;
-                ChatMessage {
-                    role: "tool".to_string(),
-                    content: Some(ChatMessageContent::Text(content)),
-                    tool_calls: Vec::new(),
-                    tool_call_id: Some(call_id),
-                }
+                ChatMessage { reasoning_content: None, role: "tool".to_string(),
+                content: Some(ChatMessageContent::Text(content)),
+                tool_calls: Vec::new(),
+                tool_call_id: Some(call_id), }
             }
         };
         messages.push(message);
@@ -813,16 +808,14 @@ fn parse_responses_items(
                     ));
                 }
                 history.add(&call_id, format!("{base}.call_id"))?;
-                messages.push(ChatMessage {
-                    role: "assistant".to_string(),
-                    content: None,
-                    tool_calls: vec![ChatToolCall {
-                        id: call_id.clone(),
-                        tool_type: "function".to_string(),
-                        function: ChatToolCallFunction { name, arguments },
-                    }],
-                    tool_call_id: None,
-                });
+                messages.push(ChatMessage { reasoning_content: None, role: "assistant".to_string(),
+                content: None,
+                tool_calls: vec![ChatToolCall {
+                    id: call_id.clone(),
+                    tool_type: "function".to_string(),
+                    function: ChatToolCallFunction { name, arguments },
+                }],
+                tool_call_id: None, });
             }
             Some("function_call_output") => {
                 let wire: ResponsesFunctionOutputWire =
@@ -836,12 +829,10 @@ fn parse_responses_items(
                 )?;
                 let output = require_string_value(&wire.output, &format!("{base}.output"))?;
                 history.resolve(&call_id, format!("{base}.call_id"))?;
-                messages.push(ChatMessage {
-                    role: "tool".to_string(),
-                    content: Some(ChatMessageContent::Text(output)),
-                    tool_calls: Vec::new(),
-                    tool_call_id: Some(call_id),
-                });
+                messages.push(ChatMessage { reasoning_content: None, role: "tool".to_string(),
+                content: Some(ChatMessageContent::Text(output)),
+                tool_calls: Vec::new(),
+                tool_call_id: Some(call_id), });
             }
             Some(_) => {
                 return Err(RequestError::at(
@@ -887,12 +878,10 @@ fn parse_responses_items(
                         require_nonempty_string_value(&wire.content, &format!("{base}.content"))?;
                     ChatMessageContent::Text(text)
                 };
-                messages.push(ChatMessage {
-                    role: wire.role,
-                    content: Some(content),
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                });
+                messages.push(ChatMessage { reasoning_content: None, role: wire.role,
+                content: Some(content),
+                tool_calls: Vec::new(),
+                tool_call_id: None, });
             }
         }
     }
@@ -1039,14 +1028,12 @@ fn reject_chat_role_images(content: Option<&Value>, base: &str) -> Result<(), Re
 }
 
 fn ordinary_message(role: &str, content: Value, base: &str) -> Result<ChatMessage, RequestError> {
-    Ok(ChatMessage {
-        role: role.to_string(),
-        content: Some(ChatMessageContent::Text(
-            require_nonempty_string_value(&content, &format!("{base}.content"))?,
-        )),
-        tool_calls: Vec::new(),
-        tool_call_id: None,
-    })
+    Ok(ChatMessage { reasoning_content: None, role: role.to_string(),
+    content: Some(ChatMessageContent::Text(
+        require_nonempty_string_value(&content, &format!("{base}.content"))?,
+    )),
+    tool_calls: Vec::new(),
+    tool_call_id: None, })
 }
 
 #[derive(Default)]
