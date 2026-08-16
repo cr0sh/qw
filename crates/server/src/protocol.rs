@@ -1,7 +1,11 @@
+use std::collections::{HashMap, HashSet};
+
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use qw_runtime::ChatMessage;
+use qw_runtime::{
+    ChatMessage, ChatTool, ChatToolCall, ChatToolCallFunction, ChatToolFunction,
+};
 
 pub const DEFAULT_MAX_TOKENS: usize = 128;
 
@@ -18,12 +22,22 @@ pub enum OutputFormat {
     JsonSchema { name: String, schema: Value },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolChoice {
+    Auto,
+    None,
+}
+
 #[derive(Debug, Clone)]
 pub struct CompletionRequest {
     pub endpoint: Endpoint,
     pub model: String,
     pub messages: Vec<ChatMessage>,
+    pub tools: Vec<ChatTool>,
+    pub tool_choice: ToolChoice,
+    pub parallel_tool_calls: bool,
     pub stream: bool,
+    pub stream_include_usage: bool,
     pub max_tokens: usize,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
@@ -44,22 +58,36 @@ impl RequestError {
             param,
         }
     }
+
+    fn at(message: impl Into<String>, param: impl Into<String>) -> Self {
+        Self::new(message, Some(param.into()))
+    }
 }
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WireMessage {
-    role: String,
-    content: String,
+#[serde(tag = "role", rename_all = "lowercase", deny_unknown_fields)]
+enum ChatWireMessage {
+    System { content: Value },
+    User { content: Value },
+    Assistant {
+        #[serde(default)]
+        content: Value,
+        tool_calls: Option<Vec<Value>>,
+    },
+    Tool {
+        content: Value,
+        tool_call_id: Value,
+    },
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ChatWire {
     model: String,
-    messages: Vec<WireMessage>,
+    messages: Vec<Value>,
     #[serde(default)]
     stream: bool,
+    stream_options: Option<ChatStreamOptions>,
     max_completion_tokens: Option<usize>,
     max_tokens: Option<usize>,
     temperature: Option<f32>,
@@ -67,9 +95,17 @@ struct ChatWire {
     seed: Option<u64>,
     response_format: Option<ChatFormat>,
     n: Option<usize>,
-    logprobs: Option<Value>,
     stop: Option<Value>,
-    tools: Option<Value>,
+    tools: Option<Vec<Value>>,
+    tool_choice: Option<Value>,
+    parallel_tool_calls: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChatStreamOptions {
+    #[serde(default)]
+    include_usage: bool,
 }
 
 #[derive(Deserialize)]
@@ -92,7 +128,7 @@ struct ChatJsonSchema {
 #[serde(untagged)]
 enum ResponsesInput {
     String(String),
-    Messages(Vec<WireMessage>),
+    Items(Vec<Value>),
 }
 
 #[derive(Deserialize)]
@@ -106,11 +142,9 @@ struct ResponsesWire {
     temperature: Option<f32>,
     top_p: Option<f32>,
     text: Option<ResponsesText>,
-    store: Option<Value>,
-    conversation: Option<Value>,
-    tools: Option<Value>,
-    include: Option<Value>,
-    parallel_tool_calls: Option<Value>,
+    tools: Option<Vec<Value>>,
+    tool_choice: Option<Value>,
+    parallel_tool_calls: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -131,37 +165,60 @@ enum ResponsesFormat {
     },
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResponsesMessageWire {
+    role: String,
+    content: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResponsesFunctionCallWire {
+    #[serde(rename = "type")]
+    item_type: String,
+    id: Value,
+    call_id: Value,
+    name: Value,
+    arguments: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResponsesFunctionOutputWire {
+    #[serde(rename = "type")]
+    item_type: String,
+    call_id: Value,
+    output: Value,
+}
+
 pub fn parse_chat(value: Value) -> Result<CompletionRequest, RequestError> {
     let object = require_object(&value)?;
-    reject_present(object, "tools", "tools are not supported")?;
     reject_present(object, "logprobs", "logprobs are not supported")?;
     let wire: ChatWire = serde_json::from_value(value).map_err(|error| {
         RequestError::new(format!("invalid Chat Completions request: {error}"), None)
     })?;
     if wire.messages.is_empty() {
-        return Err(RequestError::new(
+        return Err(RequestError::at(
             "messages must contain at least one message",
-            Some("messages".to_string()),
+            "messages",
         ));
     }
     if wire.max_completion_tokens.is_some() && wire.max_tokens.is_some() {
-        return Err(RequestError::new(
+        return Err(RequestError::at(
             "max_completion_tokens and max_tokens cannot both be provided",
-            Some("max_completion_tokens".to_string()),
+            "max_completion_tokens",
         ));
     }
     if wire.n.is_some_and(|n| n != 1) {
-        return Err(RequestError::new(
-            "only n=1 is supported",
-            Some("n".to_string()),
-        ));
+        return Err(RequestError::at("only n=1 is supported", "n"));
     }
     if let Some(stop) = wire.stop.as_ref()
         && stop_is_nonempty(stop)
     {
-        return Err(RequestError::new(
+        return Err(RequestError::at(
             "stop sequences are not supported",
-            Some("stop".to_string()),
+            "stop",
         ));
     }
     let max_tokens = wire
@@ -169,28 +226,27 @@ pub fn parse_chat(value: Value) -> Result<CompletionRequest, RequestError> {
         .or(wire.max_tokens)
         .unwrap_or(DEFAULT_MAX_TOKENS);
     validate_sampling(max_tokens, wire.temperature, wire.top_p)?;
-    let output_format = match wire.response_format.unwrap_or(ChatFormat::Text) {
-        ChatFormat::Text => OutputFormat::Text,
-        ChatFormat::JsonObject => OutputFormat::JsonObject,
-        ChatFormat::JsonSchema { json_schema } => {
-            if !json_schema.strict {
-                return Err(RequestError::new(
-                    "json_schema.strict must be true",
-                    Some("response_format.json_schema.strict".to_string()),
-                ));
-            }
-            require_schema_object(&json_schema.schema, "response_format.json_schema.schema")?;
-            OutputFormat::JsonSchema {
-                name: json_schema.name,
-                schema: json_schema.schema,
-            }
-        }
-    };
+    let output_format = parse_chat_format(wire.response_format)?;
+    let tools = parse_tools(wire.tools.as_deref().unwrap_or_default(), ToolDialect::Chat)?;
+    if !tools.is_empty() && !matches!(output_format, OutputFormat::Text) {
+        return Err(RequestError::at(
+            "tools cannot be combined with structured response formats",
+            "response_format",
+        ));
+    }
+    let tool_choice = parse_tool_choice(wire.tool_choice.as_ref())?;
+    let messages = parse_chat_messages(wire.messages, &tools)?;
     Ok(CompletionRequest {
         endpoint: Endpoint::Chat,
         model: wire.model,
-        messages: convert_messages(wire.messages)?,
+        messages,
+        tools,
+        tool_choice,
+        parallel_tool_calls: wire.parallel_tool_calls.unwrap_or(true),
         stream: wire.stream,
+        stream_include_usage: wire
+            .stream_options
+            .is_some_and(|options| options.include_usage),
         max_tokens,
         temperature: wire.temperature,
         top_p: wire.top_p,
@@ -204,9 +260,7 @@ pub fn parse_responses(value: Value) -> Result<CompletionRequest, RequestError> 
     for (field, message) in [
         ("store", "stored responses are not supported"),
         ("conversation", "conversation IDs are not supported"),
-        ("tools", "tools are not supported"),
         ("include", "include fields are not supported"),
-        ("parallel_tool_calls", "parallel tool calls are not supported"),
     ] {
         reject_present(object, field, message)?;
     }
@@ -214,40 +268,41 @@ pub fn parse_responses(value: Value) -> Result<CompletionRequest, RequestError> 
         .map_err(|error| RequestError::new(format!("invalid Responses request: {error}"), None))?;
     let max_tokens = wire.max_output_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
     validate_sampling(max_tokens, wire.temperature, wire.top_p)?;
-    let messages = match wire.input {
-        ResponsesInput::String(content) => vec![ChatMessage {
-            role: "user".to_string(),
-            content: Some(content),
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-        }],
-        ResponsesInput::Messages(messages) => convert_messages(messages)?,
-    };
-    if messages.is_empty() {
-        return Err(RequestError::new(
-            "input messages must not be empty",
-            Some("input".to_string()),
+    let output_format = parse_responses_format(wire.text.and_then(|text| text.format))?;
+    let tools = parse_tools(
+        wire.tools.as_deref().unwrap_or_default(),
+        ToolDialect::Responses,
+    )?;
+    if !tools.is_empty() && !matches!(output_format, OutputFormat::Text) {
+        return Err(RequestError::at(
+            "tools cannot be combined with structured response formats",
+            "text.format",
         ));
     }
-    let output_format = match wire.text.and_then(|text| text.format).unwrap_or(ResponsesFormat::Text) {
-        ResponsesFormat::Text => OutputFormat::Text,
-        ResponsesFormat::JsonObject => OutputFormat::JsonObject,
-        ResponsesFormat::JsonSchema { name, strict, schema } => {
-            if !strict {
-                return Err(RequestError::new(
-                    "text.format.strict must be true",
-                    Some("text.format.strict".to_string()),
-                ));
+    let tool_choice = parse_tool_choice(wire.tool_choice.as_ref())?;
+    let messages = match wire.input {
+        ResponsesInput::String(content) => {
+            if content.is_empty() {
+                return Err(RequestError::at("input must not be empty", "input"));
             }
-            require_schema_object(&schema, "text.format.schema")?;
-            OutputFormat::JsonSchema { name, schema }
+            vec![ChatMessage {
+                role: "user".to_string(),
+                content: Some(content),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            }]
         }
+        ResponsesInput::Items(items) => parse_responses_items(items, &tools)?,
     };
     Ok(CompletionRequest {
         endpoint: Endpoint::Responses,
         model: wire.model,
         messages,
+        tools,
+        tool_choice,
+        parallel_tool_calls: wire.parallel_tool_calls.unwrap_or(true),
         stream: wire.stream,
+        stream_include_usage: false,
         max_tokens,
         temperature: wire.temperature,
         top_p: wire.top_p,
@@ -256,10 +311,518 @@ pub fn parse_responses(value: Value) -> Result<CompletionRequest, RequestError> 
     })
 }
 
-fn require_object(value: &Value) -> Result<&Map<String, Value>, RequestError> {
-    value.as_object().ok_or_else(|| {
-        RequestError::new("request body must be a JSON object", None)
+fn parse_chat_format(format: Option<ChatFormat>) -> Result<OutputFormat, RequestError> {
+    match format.unwrap_or(ChatFormat::Text) {
+        ChatFormat::Text => Ok(OutputFormat::Text),
+        ChatFormat::JsonObject => Ok(OutputFormat::JsonObject),
+        ChatFormat::JsonSchema { json_schema } => {
+            if !json_schema.strict {
+                return Err(RequestError::at(
+                    "json_schema.strict must be true",
+                    "response_format.json_schema.strict",
+                ));
+            }
+            require_schema_object(&json_schema.schema, "response_format.json_schema.schema")?;
+            Ok(OutputFormat::JsonSchema {
+                name: json_schema.name,
+                schema: json_schema.schema,
+            })
+        }
+    }
+}
+
+fn parse_responses_format(format: Option<ResponsesFormat>) -> Result<OutputFormat, RequestError> {
+    match format.unwrap_or(ResponsesFormat::Text) {
+        ResponsesFormat::Text => Ok(OutputFormat::Text),
+        ResponsesFormat::JsonObject => Ok(OutputFormat::JsonObject),
+        ResponsesFormat::JsonSchema {
+            name,
+            strict,
+            schema,
+        } => {
+            if !strict {
+                return Err(RequestError::at(
+                    "text.format.strict must be true",
+                    "text.format.strict",
+                ));
+            }
+            require_schema_object(&schema, "text.format.schema")?;
+            Ok(OutputFormat::JsonSchema { name, schema })
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ToolDialect {
+    Chat,
+    Responses,
+}
+
+fn parse_tools(values: &[Value], dialect: ToolDialect) -> Result<Vec<ChatTool>, RequestError> {
+    let mut tools = Vec::with_capacity(values.len());
+    let mut names = HashSet::with_capacity(values.len());
+    for (index, value) in values.iter().enumerate() {
+        let base = format!("tools[{index}]");
+        let object = value
+            .as_object()
+            .ok_or_else(|| RequestError::at("tool definition must be an object", &base))?;
+        let (function, function_path) = match dialect {
+            ToolDialect::Chat => {
+                reject_unknown_fields(object, &["type", "function"], &base)?;
+                require_function_type(object.get("type"), &format!("{base}.type"))?;
+                let path = format!("{base}.function");
+                let function = object
+                    .get("function")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| {
+                        RequestError::at("tool function must be an object", path.clone())
+                    })?;
+                (function, path)
+            }
+            ToolDialect::Responses => {
+                reject_unknown_fields(
+                    object,
+                    &["type", "name", "description", "parameters", "strict"],
+                    &base,
+                )?;
+                require_function_type(object.get("type"), &format!("{base}.type"))?;
+                (object, base.clone())
+            }
+        };
+        reject_unknown_fields(
+            function,
+            &["name", "description", "parameters", "strict"],
+            &function_path,
+        )?;
+        let name_path = format!("{function_path}.name");
+        let name = require_nonempty_string(function.get("name"), &name_path)?.to_string();
+        if !names.insert(name.clone()) {
+            return Err(RequestError::at("tool names must be unique", name_path));
+        }
+        let description = match function.get("description") {
+            None => None,
+            Some(Value::String(value)) => Some(value.clone()),
+            Some(_) => {
+                return Err(RequestError::at(
+                    "tool description must be a string",
+                    format!("{function_path}.description"),
+                ));
+            }
+        };
+        let parameters_path = format!("{function_path}.parameters");
+        let parameters = function
+            .get("parameters")
+            .filter(|value| value.is_object())
+            .cloned()
+            .ok_or_else(|| {
+                RequestError::at("tool parameters must be an object", parameters_path)
+            })?;
+        let strict = match function.get("strict") {
+            None => None,
+            Some(Value::Bool(value)) => Some(*value),
+            Some(_) => {
+                return Err(RequestError::at(
+                    "tool strict must be a boolean",
+                    format!("{function_path}.strict"),
+                ));
+            }
+        };
+        tools.push(ChatTool {
+            tool_type: "function".to_string(),
+            function: ChatToolFunction {
+                name,
+                description,
+                parameters,
+                strict,
+            },
+        });
+    }
+    Ok(tools)
+}
+
+fn require_function_type(value: Option<&Value>, param: &str) -> Result<(), RequestError> {
+    if value.and_then(Value::as_str) == Some("function") {
+        Ok(())
+    } else {
+        Err(RequestError::at(
+            "only function tools are supported",
+            param,
+        ))
+    }
+}
+
+fn parse_tool_choice(value: Option<&Value>) -> Result<ToolChoice, RequestError> {
+    match value {
+        None => Ok(ToolChoice::Auto),
+        Some(Value::String(value)) if value == "auto" => Ok(ToolChoice::Auto),
+        Some(Value::String(value)) if value == "none" => Ok(ToolChoice::None),
+        _ => Err(RequestError::at(
+            "tool_choice must be \"auto\" or \"none\"",
+            "tool_choice",
+        )),
+    }
+}
+
+fn parse_chat_messages(
+    values: Vec<Value>,
+    tools: &[ChatTool],
+) -> Result<Vec<ChatMessage>, RequestError> {
+    let declared = declared_names(tools);
+    let mut history = HistoryState::default();
+    let mut messages = Vec::with_capacity(values.len());
+    for (index, value) in values.into_iter().enumerate() {
+        let base = format!("messages[{index}]");
+        let role = value
+            .as_object()
+            .and_then(|object| object.get("role"))
+            .and_then(Value::as_str)
+            .ok_or_else(|| RequestError::at("message role must be a string", format!("{base}.role")))?;
+        if role == "system" && index != 0 {
+            return Err(RequestError::at(
+                "system messages are only allowed at index zero",
+                format!("{base}.role"),
+            ));
+        }
+        let wire: ChatWireMessage = serde_json::from_value(value).map_err(|error| {
+            RequestError::at(format!("invalid chat message: {error}"), base.clone())
+        })?;
+        let message = match wire {
+            ChatWireMessage::System { content } => ordinary_message("system", content, &base)?,
+            ChatWireMessage::User { content } => ordinary_message("user", content, &base)?,
+            ChatWireMessage::Assistant {
+                content,
+                tool_calls,
+            } => {
+                let calls_present = tool_calls.is_some();
+                let calls = parse_chat_tool_calls(
+                    tool_calls.unwrap_or_default(),
+                    index,
+                    &declared,
+                    &mut history,
+                )?;
+                if calls_present && calls.is_empty() {
+                    return Err(RequestError::at(
+                        "assistant tool_calls must not be empty",
+                        format!("{base}.tool_calls"),
+                    ));
+                }
+                let content = match content {
+                    Value::Null => None,
+                    Value::String(value) => Some(value),
+                    _ => {
+                        return Err(RequestError::at(
+                            "assistant content must be a string or null",
+                            format!("{base}.content"),
+                        ));
+                    }
+                };
+                if content.as_deref().unwrap_or_default().is_empty() && calls.is_empty() {
+                    return Err(RequestError::at(
+                        "assistant content may be empty only when tool_calls are present",
+                        format!("{base}.content"),
+                    ));
+                }
+                ChatMessage {
+                    role: "assistant".to_string(),
+                    content,
+                    tool_calls: calls,
+                    tool_call_id: None,
+                }
+            }
+            ChatWireMessage::Tool {
+                content,
+                tool_call_id,
+            } => {
+                let content = require_string_value(&content, &format!("{base}.content"))?;
+                let call_id = require_nonempty_string_value(
+                    &tool_call_id,
+                    &format!("{base}.tool_call_id"),
+                )?;
+                history.resolve(&call_id, format!("{base}.tool_call_id"))?;
+                ChatMessage {
+                    role: "tool".to_string(),
+                    content: Some(content),
+                    tool_calls: Vec::new(),
+                    tool_call_id: Some(call_id),
+                }
+            }
+        };
+        messages.push(message);
+    }
+    history.finish()?;
+    Ok(messages)
+}
+
+fn parse_chat_tool_calls(
+    values: Vec<Value>,
+    message_index: usize,
+    declared: &HashSet<&str>,
+    history: &mut HistoryState,
+) -> Result<Vec<ChatToolCall>, RequestError> {
+    let mut calls = Vec::with_capacity(values.len());
+    for (call_index, value) in values.into_iter().enumerate() {
+        let base = format!("messages[{message_index}].tool_calls[{call_index}]");
+        let object = value
+            .as_object()
+            .ok_or_else(|| RequestError::at("tool call must be an object", &base))?;
+        reject_unknown_fields(object, &["id", "type", "function"], &base)?;
+        let id = require_nonempty_string(object.get("id"), &format!("{base}.id"))?.to_string();
+        require_function_type(object.get("type"), &format!("{base}.type"))?;
+        let function_path = format!("{base}.function");
+        let function = object
+            .get("function")
+            .and_then(Value::as_object)
+            .ok_or_else(|| RequestError::at("tool call function must be an object", &function_path))?;
+        reject_unknown_fields(function, &["name", "arguments"], &function_path)?;
+        let name_path = format!("{function_path}.name");
+        let name = require_nonempty_string(function.get("name"), &name_path)?.to_string();
+        require_declared(&name, declared, &name_path)?;
+        let arguments_path = format!("{function_path}.arguments");
+        let arguments_text = require_nonempty_string(function.get("arguments"), &arguments_path)?;
+        let arguments: Value = serde_json::from_str(arguments_text).map_err(|_| {
+            RequestError::at("tool call arguments must be valid JSON", &arguments_path)
+        })?;
+        if !arguments.is_object() {
+            return Err(RequestError::at(
+                "tool call arguments must decode to an object",
+                arguments_path,
+            ));
+        }
+        history.add(&id, format!("{base}.id"))?;
+        calls.push(ChatToolCall {
+            id,
+            tool_type: "function".to_string(),
+            function: ChatToolCallFunction { name, arguments },
+        });
+    }
+    Ok(calls)
+}
+
+fn parse_responses_items(
+    values: Vec<Value>,
+    tools: &[ChatTool],
+) -> Result<Vec<ChatMessage>, RequestError> {
+    if values.is_empty() {
+        return Err(RequestError::at(
+            "input messages must not be empty",
+            "input",
+        ));
+    }
+    let declared = declared_names(tools);
+    let mut history = HistoryState::default();
+    let mut messages = Vec::with_capacity(values.len());
+    for (index, value) in values.into_iter().enumerate() {
+        let base = format!("input[{index}]");
+        let object = value
+            .as_object()
+            .ok_or_else(|| RequestError::at("input item must be an object", &base))?;
+        match object.get("type").and_then(Value::as_str) {
+            Some("function_call") => {
+                let wire: ResponsesFunctionCallWire = serde_json::from_value(Value::Object(object.clone()))
+                    .map_err(|error| RequestError::at(format!("invalid function call item: {error}"), &base))?;
+                debug_assert_eq!(wire.item_type, "function_call");
+                let id = require_nonempty_string_value(&wire.id, &format!("{base}.id"))?;
+                let call_id = require_nonempty_string_value(
+                    &wire.call_id,
+                    &format!("{base}.call_id"),
+                )?;
+                let name = require_nonempty_string_value(&wire.name, &format!("{base}.name"))?;
+                require_declared(&name, &declared, &format!("{base}.name"))?;
+                let arguments_text = require_nonempty_string_value(
+                    &wire.arguments,
+                    &format!("{base}.arguments"),
+                )?;
+                let arguments: Value = serde_json::from_str(&arguments_text).map_err(|_| {
+                    RequestError::at(
+                        "function call arguments must be valid JSON",
+                        format!("{base}.arguments"),
+                    )
+                })?;
+                if !arguments.is_object() {
+                    return Err(RequestError::at(
+                        "function call arguments must decode to an object",
+                        format!("{base}.arguments"),
+                    ));
+                }
+                history.add(&call_id, format!("{base}.call_id"))?;
+                messages.push(ChatMessage {
+                    role: "assistant".to_string(),
+                    content: None,
+                    tool_calls: vec![ChatToolCall {
+                        id,
+                        tool_type: "function".to_string(),
+                        function: ChatToolCallFunction { name, arguments },
+                    }],
+                    tool_call_id: None,
+                });
+            }
+            Some("function_call_output") => {
+                let wire: ResponsesFunctionOutputWire = serde_json::from_value(Value::Object(object.clone()))
+                    .map_err(|error| RequestError::at(format!("invalid function output item: {error}"), &base))?;
+                debug_assert_eq!(wire.item_type, "function_call_output");
+                let call_id = require_nonempty_string_value(
+                    &wire.call_id,
+                    &format!("{base}.call_id"),
+                )?;
+                let output = require_string_value(&wire.output, &format!("{base}.output"))?;
+                history.resolve(&call_id, format!("{base}.call_id"))?;
+                messages.push(ChatMessage {
+                    role: "tool".to_string(),
+                    content: Some(output),
+                    tool_calls: Vec::new(),
+                    tool_call_id: Some(call_id),
+                });
+            }
+            Some(_) => {
+                return Err(RequestError::at(
+                    "unsupported input item type",
+                    format!("{base}.type"),
+                ));
+            }
+            None => {
+                let wire: ResponsesMessageWire = serde_json::from_value(Value::Object(object.clone()))
+                    .map_err(|error| RequestError::at(format!("invalid input message: {error}"), &base))?;
+                if wire.role == "system" && index != 0 {
+                    return Err(RequestError::at(
+                        "system messages are only allowed at index zero",
+                        format!("{base}.role"),
+                    ));
+                }
+                if !matches!(wire.role.as_str(), "system" | "user" | "assistant") {
+                    return Err(RequestError::at(
+                        "unsupported input message role",
+                        format!("{base}.role"),
+                    ));
+                }
+                let content = require_string_value(&wire.content, &format!("{base}.content"))?;
+                if wire.role == "assistant" && content.is_empty() {
+                    return Err(RequestError::at(
+                        "assistant content must not be empty",
+                        format!("{base}.content"),
+                    ));
+                }
+                messages.push(ChatMessage {
+                    role: wire.role,
+                    content: Some(content),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                });
+            }
+        }
+    }
+    history.finish()?;
+    Ok(messages)
+}
+
+fn ordinary_message(role: &str, content: Value, base: &str) -> Result<ChatMessage, RequestError> {
+    Ok(ChatMessage {
+        role: role.to_string(),
+        content: Some(require_string_value(
+            &content,
+            &format!("{base}.content"),
+        )?),
+        tool_calls: Vec::new(),
+        tool_call_id: None,
     })
+}
+
+#[derive(Default)]
+struct HistoryState {
+    seen: HashSet<String>,
+    unresolved: HashMap<String, String>,
+}
+
+impl HistoryState {
+    fn add(&mut self, id: &str, param: String) -> Result<(), RequestError> {
+        if !self.seen.insert(id.to_string()) {
+            return Err(RequestError::at("tool call IDs must be unique", param));
+        }
+        self.unresolved.insert(id.to_string(), param);
+        Ok(())
+    }
+
+    fn resolve(&mut self, id: &str, param: String) -> Result<(), RequestError> {
+        if self.unresolved.remove(id).is_some() {
+            return Ok(());
+        }
+        if self.seen.contains(id) {
+            Err(RequestError::at("duplicate tool result", param))
+        } else {
+            Err(RequestError::at("orphan tool result", param))
+        }
+    }
+
+    fn finish(self) -> Result<(), RequestError> {
+        if let Some((_, param)) = self.unresolved.into_iter().next() {
+            Err(RequestError::at("tool call is missing a result", param))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn declared_names(tools: &[ChatTool]) -> HashSet<&str> {
+    tools
+        .iter()
+        .map(|tool| tool.function.name.as_str())
+        .collect()
+}
+
+fn require_declared(
+    name: &str,
+    declared: &HashSet<&str>,
+    param: &str,
+) -> Result<(), RequestError> {
+    if declared.contains(name) {
+        Ok(())
+    } else {
+        Err(RequestError::at(
+            "replayed tool call names must reference a declared function",
+            param,
+        ))
+    }
+}
+
+fn require_nonempty_string<'a>(
+    value: Option<&'a Value>,
+    param: &str,
+) -> Result<&'a str, RequestError> {
+    value
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| RequestError::at("value must be a non-empty string", param))
+}
+
+fn require_string_value(value: &Value, param: &str) -> Result<String, RequestError> {
+    value
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| RequestError::at("content must be a string", param))
+}
+
+fn require_nonempty_string_value(value: &Value, param: &str) -> Result<String, RequestError> {
+    require_nonempty_string(Some(value), param).map(str::to_string)
+}
+
+fn reject_unknown_fields(
+    object: &Map<String, Value>,
+    allowed: &[&str],
+    base: &str,
+) -> Result<(), RequestError> {
+    if let Some(field) = object.keys().find(|field| !allowed.contains(&field.as_str())) {
+        Err(RequestError::at(
+            "unknown field",
+            format!("{base}.{field}"),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn require_object(value: &Value) -> Result<&Map<String, Value>, RequestError> {
+    value
+        .as_object()
+        .ok_or_else(|| RequestError::new("request body must be a JSON object", None))
 }
 
 fn reject_present(
@@ -268,7 +831,7 @@ fn reject_present(
     message: &str,
 ) -> Result<(), RequestError> {
     if object.contains_key(field) {
-        Err(RequestError::new(message, Some(field.to_string())))
+        Err(RequestError::at(message, field))
     } else {
         Ok(())
     }
@@ -289,54 +852,30 @@ fn validate_sampling(
     top_p: Option<f32>,
 ) -> Result<(), RequestError> {
     if max_tokens == 0 {
-        return Err(RequestError::new(
+        return Err(RequestError::at(
             "maximum output tokens must be greater than zero",
-            Some("max_tokens".to_string()),
+            "max_tokens",
         ));
     }
     if temperature.is_some_and(|value| !value.is_finite() || !(0.0..=2.0).contains(&value)) {
-        return Err(RequestError::new(
+        return Err(RequestError::at(
             "temperature must be finite and between 0 and 2",
-            Some("temperature".to_string()),
+            "temperature",
         ));
     }
     if top_p.is_some_and(|value| !value.is_finite() || value <= 0.0 || value > 1.0) {
-        return Err(RequestError::new(
+        return Err(RequestError::at(
             "top_p must be finite and greater than 0 and at most 1",
-            Some("top_p".to_string()),
+            "top_p",
         ));
     }
     Ok(())
-}
-
-fn convert_messages(messages: Vec<WireMessage>) -> Result<Vec<ChatMessage>, RequestError> {
-    messages
-        .into_iter()
-        .enumerate()
-        .map(|(index, message)| {
-            if !matches!(message.role.as_str(), "system" | "user" | "assistant" | "tool") {
-                return Err(RequestError::new(
-                    format!("unsupported message role {:?}", message.role),
-                    Some(format!("messages.{index}.role")),
-                ));
-            }
-            Ok(ChatMessage {
-                role: message.role,
-                content: Some(message.content),
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-            })
-        })
-        .collect()
 }
 
 fn require_schema_object(schema: &Value, param: &str) -> Result<(), RequestError> {
     if schema.is_object() {
         Ok(())
     } else {
-        Err(RequestError::new(
-            "JSON Schema must be an object",
-            Some(param.to_string()),
-        ))
+        Err(RequestError::at("JSON Schema must be an object", param))
     }
 }

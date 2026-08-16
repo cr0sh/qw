@@ -21,7 +21,7 @@ use tokio::sync::mpsc;
 
 pub use engine::{Engine, SubmitError};
 use engine::{Admission, CompletionRecord, FailureKind, FinishReason, WorkerEvent, WorkerFailure};
-use protocol::{CompletionRequest, Endpoint, RequestError};
+use protocol::{Endpoint, RequestError};
 
 #[derive(Clone)]
 struct AppState {

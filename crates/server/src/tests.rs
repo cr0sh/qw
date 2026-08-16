@@ -144,7 +144,6 @@ async fn malformed_and_unsupported_fields_are_rejected() {
     for request in [
         json!({"model": MODEL, "messages": []}),
         json!({"model": MODEL, "messages": [{"role":"user","content":[]}]}),
-        json!({"model": MODEL, "messages": [{"role":"user","content":"x"}], "tools": []}),
         json!({"model": MODEL, "messages": [{"role":"user","content":"x"}], "n": 2}),
         json!({"model": MODEL, "messages": [{"role":"user","content":"x"}], "logprobs": true}),
         json!({"model": MODEL, "messages": [{"role":"user","content":"x"}], "stop": ["x"]}),
@@ -159,7 +158,6 @@ async fn malformed_and_unsupported_fields_are_rejected() {
         json!({"model": MODEL, "input": "x", "store": false}),
         json!({"model": MODEL, "input": "x", "conversation": "c"}),
         json!({"model": MODEL, "input": "x", "include": []}),
-        json!({"model": MODEL, "input": "x", "tools": []}),
     ] {
         let (status, _, body) = post(app.clone(), "/v1/responses", request).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
