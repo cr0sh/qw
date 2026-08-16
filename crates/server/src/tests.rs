@@ -969,10 +969,11 @@ async fn chat_and_responses_preserve_mixed_image_order_buffered_and_streamed() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let (frames, done) = parse_sse(&body);
     assert!(done);
-    assert!(
-        frames.iter().any(|frame| frame.data.to_string().contains("[image:png]")),
-        "{body}"
-    );
+    let content = frames
+        .iter()
+        .filter_map(|frame| frame.data["choices"][0]["delta"]["content"].as_str())
+        .collect::<String>();
+    assert_eq!(content, "echo:before[image:png]after", "{body}");
     assert!(frames.iter().any(|frame| !frame.data["usage"].is_null()));
 
     let mut responses_stream = responses;
@@ -981,10 +982,12 @@ async fn chat_and_responses_preserve_mixed_image_order_buffered_and_streamed() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let (frames, done) = parse_sse(&body);
     assert!(!done);
-    assert!(
-        frames.iter().any(|frame| frame.data.to_string().contains("[image:png]")),
-        "{body}"
-    );
+    let text = frames
+        .iter()
+        .filter(|frame| frame.event.as_deref() == Some("response.output_text.delta"))
+        .filter_map(|frame| frame.data["delta"].as_str())
+        .collect::<String>();
+    assert_eq!(text, "echo:before[image:png]after", "{body}");
     assert!(
         frames.windows(2).all(|pair| {
             pair[1].data["sequence_number"].as_u64()
@@ -1159,8 +1162,6 @@ async fn image_requests_keep_structured_output_and_tool_choice_none_contracts() 
         "messages": [{"role":"user","content":[
             {"type":"image_url","image_url":{"url":tiny_png_data_uri()}}
         ]}],
-        "tools": chat_tools(),
-        "tool_choice": "none",
         "response_format": {"type":"json_object"}
     });
     let (status, _, body) = post(app.clone(), "/v1/chat/completions", chat).await;
@@ -1174,15 +1175,51 @@ async fn image_requests_keep_structured_output_and_tool_choice_none_contracts() 
         "input": [{"role":"user","content":[
             {"type":"input_image","image_url":tiny_png_data_uri()}
         ]}],
-        "tools": responses_tools(),
-        "tool_choice": "none",
         "text": {"format":{"type":"json_schema","name":"answer","strict":true,
             "schema":{"type":"object","properties":{"answer":{"type":"integer"}},"required":["answer"],"additionalProperties":false}}}
     });
-    let (status, _, body) = post(app, "/v1/responses", responses).await;
+    let (status, _, body) = post(app.clone(), "/v1/responses", responses).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let value: Value = serde_json::from_str(&body).expect("structured Responses response");
     assert_eq!(value["output"][0]["content"][0]["text"], "{\"answer\":1}");
+
+    let chat_with_tools = json!({
+        "model": MODEL,
+        "messages": [{"role":"user","content":[
+            {"type":"text","text":"call-tool"},
+            {"type":"image_url","image_url":{"url":tiny_png_data_uri()}}
+        ]}],
+        "tools": chat_tools(),
+        "tool_choice": "none"
+    });
+    let (status, _, body) =
+        post(app.clone(), "/v1/chat/completions", chat_with_tools).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let value: Value = serde_json::from_str(&body).expect("tool-free chat response");
+    assert_eq!(
+        value["choices"][0]["message"]["content"],
+        "echo:call-tool[image:png]"
+    );
+    assert!(value["choices"][0]["message"].get("tool_calls").is_none());
+
+    let responses_with_tools = json!({
+        "model": MODEL,
+        "input": [{"role":"user","content":[
+            {"type":"input_text","text":"call-tool"},
+            {"type":"input_image","image_url":tiny_png_data_uri()}
+        ]}],
+        "tools": responses_tools(),
+        "tool_choice": "none"
+    });
+    let (status, _, body) = post(app, "/v1/responses", responses_with_tools).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let value: Value = serde_json::from_str(&body).expect("tool-free Responses response");
+    let output = value["output"].as_array().expect("Responses output");
+    assert_eq!(
+        output[0]["content"][0]["text"],
+        "echo:call-tool[image:png]"
+    );
+    assert!(output.iter().all(|item| item["type"] != "function_call"));
 }
 
 #[tokio::test]
