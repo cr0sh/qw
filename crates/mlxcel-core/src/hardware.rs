@@ -155,7 +155,7 @@ pub fn metal_ops_per_buffer_default(
     has_neural_accelerator: bool,
 ) -> Option<u32> {
     if r#gen != AppleSiliconGen::Unknown && !has_neural_accelerator {
-        Some(1000)
+        Some(750)
     } else {
         None
     }
