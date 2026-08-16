@@ -113,6 +113,19 @@ impl Default for ReasoningTraceParser {
     }
 }
 impl ReasoningTraceParser {
+    fn new(enable_thinking: bool) -> Self {
+        if enable_thinking {
+            Self::default()
+        } else {
+            Self {
+                state: TraceState::Content,
+                pending: String::new(),
+                checking_opener: false,
+                strip_opening_line_break: false,
+            }
+        }
+    }
+
     fn feed(&mut self, fragment: &str) -> Vec<WorkerDelta> {
         if fragment.is_empty() {
             return Vec::new();
@@ -635,6 +648,7 @@ impl QwenWorker {
                 &job.request.messages,
                 effective_tools,
                 reasoning_effort,
+                job.request.enable_thinking,
                 &prepared_images,
             ) {
                 Ok(prefill) => Some(prefill),
@@ -658,6 +672,7 @@ impl QwenWorker {
                 &job.request.messages,
                 effective_tools,
                 reasoning_effort,
+                job.request.enable_thinking,
             ) {
                 Ok(tokens) => tokens,
                 Err(error) => {
@@ -706,7 +721,7 @@ impl QwenWorker {
             snapshot: hit.snapshot,
             cached_tokens: hit.token_count,
         });
-        let mut trace_parser = ReasoningTraceParser::default();
+        let mut trace_parser = ReasoningTraceParser::new(job.request.enable_thinking);
         let mut gate = ToolCallGate::default();
         let mut emit_delta = |fragment: &str| {
             for delta in trace_parser.feed(fragment) {
@@ -779,7 +794,11 @@ impl QwenWorker {
             | GenerationStopReason::RepetitionLoop => FinishReason::Stop,
             GenerationStopReason::CallbackCancelled => return,
         };
-        let (reasoning_content, visible_content) = split_reasoning_trace(&generated.text);
+        let (reasoning_content, visible_content) = if job.request.enable_thinking {
+            split_reasoning_trace(&generated.text)
+        } else {
+            (String::new(), generated.text.clone())
+        };
         let (content, tool_calls, finish_reason) = if tool_enabled {
             let declared_names = effective_tools
                 .iter()
@@ -991,6 +1010,18 @@ mod tests {
             split_reasoning_trace("trace</think>  answer"),
             ("trace".to_string(), "  answer".to_string())
         );
+    }
+
+    #[test]
+    fn disabled_thinking_keeps_all_output_visible() {
+        let mut parser = ReasoningTraceParser::new(false);
+        assert_eq!(
+            parser.feed("The capital of France is Paris."),
+            vec![WorkerDelta::Content(
+                "The capital of France is Paris.".to_string()
+            )]
+        );
+        assert!(parser.finish().is_empty());
     }
 
     #[test]

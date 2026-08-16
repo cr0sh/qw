@@ -193,6 +193,7 @@ impl ChatTemplateProcessor {
             }],
             &[],
             None,
+            true,
         )
     }
 
@@ -201,6 +202,7 @@ impl ChatTemplateProcessor {
         messages: &[ChatMessage],
         tools: &[ChatTool],
         reasoning_effort: Option<&str>,
+        enable_thinking: bool,
     ) -> Result<String> {
         anyhow::ensure!(!messages.is_empty(), "messages must not be empty");
         for (index, message) in messages.iter().enumerate() {
@@ -279,7 +281,7 @@ impl ChatTemplateProcessor {
                 eos_token => self.eos_token.as_str(),
                 add_generation_prompt => true,
                 reasoning_effort => reasoning_effort.unwrap_or("xhigh"),
-                enable_thinking => true,
+                enable_thinking,
             })
             .context("failed to render chat messages")
     }
@@ -407,7 +409,7 @@ assistant:{{ content }}
             },
         ];
         let rendered = processor()
-            .render_messages(&messages, &[tool()], None)
+            .render_messages(&messages, &[tool()], None, true)
             .expect("render tools");
         assert!(rendered.contains("<tools>"));
         assert!(rendered.contains(r#""name":"weather""#));
@@ -450,7 +452,7 @@ assistant:{{ content }}
             },
         ];
         let rendered = processor()
-            .render_messages(&messages, &[tool()], None)
+            .render_messages(&messages, &[tool()], None, true)
             .expect("render tool results");
         assert!(
             rendered.contains(
@@ -463,7 +465,7 @@ assistant:{{ content }}
     fn empty_tools_and_render_user_keep_ordinary_chat() {
         let processor = processor();
         let rendered = processor
-            .render_messages(&[user("hello")], &[], None)
+            .render_messages(&[user("hello")], &[], None, true)
             .expect("render without tools");
         assert_eq!(rendered, "user:helloassistant:");
         assert!(!rendered.contains("<tools>"));
@@ -500,7 +502,7 @@ assistant:{{ content }}
             tool_call_id: None,
         };
         let rendered = processor
-            .render_messages(&[message], &[], None)
+            .render_messages(&[message], &[], None, true)
             .expect("render image parts");
         let before = rendered.find("\"before\"").expect("leading text");
         let image = rendered.find("\"image_url\"").expect("image part");
@@ -538,7 +540,7 @@ assistant:{{ content }}
         };
         let vision_placeholder = "<|vision_start|><|image_pad|><|vision_end|>";
         let initial = processor
-            .render_messages(std::slice::from_ref(&image_message), &[tool()], None)
+            .render_messages(std::slice::from_ref(&image_message), &[tool()], None, true)
             .expect("render initial image turn");
         assert_eq!(initial.matches(vision_placeholder).count(), 1);
 
@@ -570,6 +572,7 @@ assistant:{{ content }}
                 ],
                 &[tool()],
                 None,
+                true,
             )
             .expect("render image and tool replay");
         let before = replayed.find("before").expect("leading text");
@@ -605,7 +608,7 @@ assistant:{{ content }}
             (None, "xhigh"),
         ] {
             let rendered = processor
-                .render_messages(std::slice::from_ref(&message), &[], effort)
+                .render_messages(std::slice::from_ref(&message), &[], effort, true)
                 .expect("render reasoning replay");
             let (rendered_effort, messages) = rendered.split_once('|').expect("effort delimiter");
             assert_eq!(rendered_effort, expected);
@@ -613,6 +616,21 @@ assistant:{{ content }}
             assert_eq!(messages[0]["content"], "final answer");
             assert_eq!(messages[0]["reasoning_content"], "private trace");
         }
+    }
+
+    #[test]
+    fn renders_disabled_thinking_flag() {
+        let processor = ChatTemplateProcessor {
+            template: "{{ enable_thinking }}".to_string(),
+            bos_token: String::new(),
+            eos_token: String::new(),
+        };
+        assert_eq!(
+            processor
+                .render_messages(&[user("hello")], &[], None, false)
+                .expect("render disabled thinking"),
+            "False"
+        );
     }
 }
 
