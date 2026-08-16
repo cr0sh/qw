@@ -583,6 +583,12 @@ pub trait LanguageModel {
         None // default: tied or unsupported
     }
 
+    /// Activate request-owned state after generator reset and immediately
+    /// before an embedding prefill.
+    fn prepare_embedding_prefill(&self) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Called once after prefill completes and before decode starts.
     /// Used by models that need to adjust internal state between phases.
     fn after_prefill(&self) {}
@@ -1508,6 +1514,9 @@ impl CxxGenerator {
         }
 
         self.reset_with_model(model);
+        if input_embeddings.is_some() {
+            model.prepare_embedding_prefill()?;
+        }
         ensure_model_caches(&mut self.caches, model);
         self.apply_kv_cache_mode_with_boundary_policy();
         install_thread_local_default_stream(self.generation_stream.as_ref());

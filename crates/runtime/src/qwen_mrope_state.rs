@@ -44,6 +44,7 @@ impl MRopeEntry {
 /// but retaining it preserves the position-state path used by Qwen3.5.
 pub(crate) struct MRopeState {
     fallback: RefCell<MRopeEntry>,
+    pending: RefCell<Option<MRopeEntry>>,
     position: Cell<i32>,
 }
 
@@ -51,6 +52,7 @@ impl MRopeState {
     pub(crate) fn new() -> Self {
         Self {
             fallback: RefCell::new(MRopeEntry::empty()),
+            pending: RefCell::new(None),
             position: Cell::new(0),
         }
     }
@@ -60,6 +62,32 @@ impl MRopeState {
         entry.position_ids = None;
         entry.rope_deltas = None;
         self.position.set(0);
+    }
+
+    pub(crate) fn prepare(&self, position_ids: &MlxArray, rope_delta: i32) {
+        *self.pending.borrow_mut() = Some(MRopeEntry {
+            position_ids: Some(mlxcel_core::copy(position_ids)),
+            rope_deltas: Some(rope_delta),
+        });
+    }
+
+    pub(crate) fn clear_prepared(&self) {
+        *self.pending.borrow_mut() = None;
+    }
+
+    pub(crate) fn activate_prepared(&self) -> Result<(), String> {
+        let entry = self
+            .pending
+            .borrow_mut()
+            .take()
+            .ok_or_else(|| "embedding prefill is missing prepared MRoPE state".to_string())?;
+        *self.fallback.borrow_mut() = entry;
+        self.position.set(0);
+        Ok(())
+    }
+
+    pub(crate) fn finish_prefill(&self) {
+        self.fallback.borrow_mut().position_ids = None;
     }
 
     pub(crate) fn set_position(&self, position: i32) {
@@ -88,6 +116,7 @@ impl MRopeState {
         position_ids: Option<&MlxArray>,
         rope_delta: Option<i32>,
     ) {
+        *self.pending.borrow_mut() = None;
         let mut entry = self.fallback.borrow_mut();
         entry.position_ids = position_ids.map(mlxcel_core::copy);
         entry.rope_deltas = rope_delta;

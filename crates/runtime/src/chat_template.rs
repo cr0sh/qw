@@ -429,6 +429,42 @@ mod tests {
             rendered
         );
     }
+    #[test]
+    fn ordered_openai_image_parts_are_serialized_losslessly() {
+        let processor = ChatTemplateProcessor {
+            template: "{{ messages|tojson }}".to_string(),
+            bos_token: String::new(),
+            eos_token: String::new(),
+        };
+        let message = ChatMessage {
+            role: "user".to_string(),
+            content: Some(ChatMessageContent::Parts(vec![
+                ChatContentPart::Text {
+                    text: "before".to_string(),
+                },
+                ChatContentPart::ImageUrl {
+                    image_url: ChatImageUrl {
+                        url: "data:image/png;base64,AA==".to_string(),
+                        detail: "auto".to_string(),
+                    },
+                },
+                ChatContentPart::Text {
+                    text: "after".to_string(),
+                },
+            ])),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        };
+        let rendered = processor
+            .render_messages(&[message], &[])
+            .expect("render image parts");
+        let before = rendered.find("\"before\"").expect("leading text");
+        let image = rendered.find("\"image_url\"").expect("image part");
+        let after = rendered.find("\"after\"").expect("trailing text");
+        assert!(before < image && image < after);
+        assert!(rendered.contains("\"detail\":\"auto\""));
+    }
+
 }
 
 fn extract_token(config: &JsonValue, name: &str) -> String {
