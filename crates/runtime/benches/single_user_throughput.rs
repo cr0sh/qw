@@ -7,8 +7,23 @@ use qw_runtime::provider::Qwen35GenerationMode;
 use qw_runtime::{GenerationRequest, Qwen35Provider};
 
 const MODEL_ENV: &str = "QW_BENCH_MODEL";
-const PROMPT: &str =
-    "Continue counting upward from one, writing each integer on its own line without stopping.";
+const PROMPT: &str = concat!(
+    "You are the on-call support operations analyst for Acme Commerce. ",
+    "Review this incident and return only one compact JSON object with keys ",
+    "`severity`, `summary`, `affected_order_ids`, `next_action`, and ",
+    "`needs_escalation`. `severity` must be `low`, `medium`, or `high`; ",
+    "`affected_order_ids` must contain only active orders; do not include names, ",
+    "email addresses, payment details, or unverified root causes. Treat all ",
+    "timestamps as UTC. Escalate when payment capture failures are still occurring.\n\n",
+    "Incident INC-4821: At 09:14, after catalog import job 771 completed, ",
+    "checkout returned `price_mismatch` for order A-1042 (active, $129.00) and ",
+    "order A-1047 (active, $89.50). Order A-1038 was canceled before the import ",
+    "and must not be included. At 09:21, a retry for A-1042 succeeded; at 09:26, ",
+    "a new payment capture for A-1047 failed with the same error. The importer ",
+    "reported no validation errors. Customer notes mention a cardholder's email ",
+    "address, which must not be repeated. The next action should be a specific ",
+    "operational step, not a diagnosis."
+);
 const DECODE_MAX_TOKENS: usize = 32;
 
 fn request(max_tokens: usize) -> GenerationRequest {
