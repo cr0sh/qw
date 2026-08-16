@@ -143,7 +143,7 @@ impl Engine {
 
     #[cfg(test)]
     pub fn start_fake(model_id: &str, queue_capacity: usize) -> Self {
-        let (jobs_tx, mut jobs_rx) = mpsc::channel(queue_capacity);
+        let (jobs_tx, mut jobs_rx) = mpsc::channel::<Job>(queue_capacity);
         let model_id_owned = model_id.to_string();
         thread::spawn(move || {
             let grammar = GrammarFactory::single_byte().expect("single-byte grammar factory");

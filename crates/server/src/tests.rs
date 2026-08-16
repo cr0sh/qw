@@ -281,10 +281,13 @@ async fn over_budget_prefix_is_not_cached() {
 #[tokio::test]
 async fn full_generation_queue_returns_503() {
     let engine = Engine::start_fake(MODEL, 1);
-    let held = engine
+    let mut held = engine
         .submit(protocol::parse_chat(chat_request("hold")).expect("held request"))
         .expect("submit held job");
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), held.events.recv()).await,
+        Ok(Some(WorkerEvent::Started))
+    ));
     let queued = engine
         .submit(protocol::parse_chat(chat_request("queued")).expect("queued request"))
         .expect("submit queued job");
