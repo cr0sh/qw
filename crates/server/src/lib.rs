@@ -81,29 +81,47 @@ async fn handle(
     if stream_requested {
         streaming_response(endpoint, submission).await
     } else {
-        buffered_response(submission.events).await
+        buffered_response(submission).await
     }
 }
 
-async fn buffered_response(mut events: mpsc::Receiver<WorkerEvent>) -> Response {
-    while let Some(event) = events.recv().await {
+async fn buffered_response(mut submission: engine::Submission) -> Response {
+    let mut guard = CancelGuard {
+        cancelled: submission.cancelled.clone(),
+        armed: true,
+    };
+    while let Some(event) = submission.events.recv().await {
         match event {
             WorkerEvent::Started | WorkerEvent::Delta(_) => {}
             WorkerEvent::Complete(record) => {
+                guard.armed = false;
                 return Json(buffered_json(&record)).into_response();
             }
-            WorkerEvent::Failed(failure) => return ApiError::from_worker(failure).into_response(),
+            WorkerEvent::Failed(failure) => {
+                guard.armed = false;
+                return ApiError::from_worker(failure).into_response();
+            }
         }
     }
     ApiError::server("generation worker closed without a result").into_response()
 }
 
 async fn streaming_response(endpoint: Endpoint, mut submission: engine::Submission) -> Response {
+    let mut admission_guard = CancelGuard {
+        cancelled: submission.cancelled.clone(),
+        armed: true,
+    };
     let first = submission.events.recv().await;
     match first {
-        Some(WorkerEvent::Started) => {}
-        Some(WorkerEvent::Failed(failure)) => return ApiError::from_worker(failure).into_response(),
-        Some(WorkerEvent::Complete(record)) => return Json(buffered_json(&record)).into_response(),
+        Some(WorkerEvent::Started) => admission_guard.armed = false,
+        Some(WorkerEvent::Failed(failure)) => {
+            admission_guard.armed = false;
+            return ApiError::from_worker(failure).into_response();
+        }
+        Some(WorkerEvent::Complete(record)) => {
+            admission_guard.armed = false;
+            return Json(buffered_json(&record)).into_response();
+        }
         Some(WorkerEvent::Delta(_)) => {
             return ApiError::server("generation worker emitted output before admission").into_response();
         }
