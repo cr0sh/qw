@@ -73,13 +73,14 @@ async fn handle(
         return ApiError::model_not_found(&request.model).into_response();
     }
     let stream_requested = request.stream;
+    let model_id = state.engine.model_id().to_string();
     let submission = match state.engine.submit(request) {
         Ok(submission) => submission,
         Err(SubmitError::Full) => return ApiError::queue_full().into_response(),
         Err(SubmitError::Closed) => return ApiError::server("generation worker is unavailable").into_response(),
     };
     if stream_requested {
-        streaming_response(endpoint, submission).await
+        streaming_response(endpoint, model_id, submission).await
     } else {
         buffered_response(submission).await
     }
@@ -106,7 +107,11 @@ async fn buffered_response(mut submission: engine::Submission) -> Response {
     ApiError::server("generation worker closed without a result").into_response()
 }
 
-async fn streaming_response(endpoint: Endpoint, mut submission: engine::Submission) -> Response {
+async fn streaming_response(
+    endpoint: Endpoint,
+    model: String,
+    mut submission: engine::Submission,
+) -> Response {
     let mut admission_guard = CancelGuard {
         cancelled: submission.cancelled.clone(),
         armed: true,
@@ -131,6 +136,7 @@ async fn streaming_response(endpoint: Endpoint, mut submission: engine::Submissi
     let state = SseState::new(
         endpoint,
         submission.admission,
+        model,
         submission.events,
         submission.cancelled,
     );
@@ -157,6 +163,7 @@ impl Drop for CancelGuard {
 struct SseState {
     endpoint: Endpoint,
     admission: Admission,
+    model: String,
     receiver: mpsc::Receiver<WorkerEvent>,
     pending: VecDeque<Event>,
     sequence: u64,
@@ -167,11 +174,13 @@ impl SseState {
     fn new(
         endpoint: Endpoint,
         admission: Admission,
+        model: String,
         receiver: mpsc::Receiver<WorkerEvent>,
         cancelled: Arc<AtomicBool>,
     ) -> Self {
         let mut state = Self {
             endpoint,
+            model,
             admission,
             receiver,
             pending: VecDeque::new(),
@@ -216,6 +225,7 @@ impl SseState {
                     "id": self.admission.response_id,
                     "object": "chat.completion.chunk",
                     "created": self.admission.created,
+                    "model": self.model,
                     "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]
                 });
                 self.pending.push_back(data_event(chunk));
@@ -228,6 +238,7 @@ impl SseState {
                         "id": self.admission.response_id,
                         "object": "response",
                         "created_at": self.admission.created,
+                        "model": self.model,
                         "status": "in_progress",
                         "output": []
                     }
@@ -263,6 +274,7 @@ impl SseState {
                     "id": self.admission.response_id,
                     "object": "chat.completion.chunk",
                     "created": self.admission.created,
+                    "model": self.model,
                     "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": null}]
                 })));
             }
@@ -350,6 +362,7 @@ impl SseState {
                     "response": {
                         "id": self.admission.response_id,
                         "object": "response",
+                        "model": self.model,
                         "status": "failed",
                         "error": error["error"].clone()
                     }
