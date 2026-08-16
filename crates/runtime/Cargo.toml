@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 anyhow.workspace = true
+image.workspace = true
 memmap2.workspace = true
 minijinja.workspace = true
 mlxcel-core.workspace = true

@@ -6,11 +6,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};
 use mlxcel_core::generate::{GenerationStopReason, PrefixReuse};
-use qw_runtime::Qwen35Provider;
+use qw_runtime::{ChatContentRef, ChatMessage, Qwen35Provider};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::grammar::GrammarFactory;
+use crate::media::DecodedImage;
 use crate::prefix_cache::PrefixCache;
 use crate::protocol::{CompletionRequest, Endpoint, OutputFormat, ToolChoice};
 use crate::tool_calls::{ToolCallGate, parse_assistant_output};
@@ -174,13 +175,13 @@ impl Engine {
                     job.cancelled.store(true, Ordering::Release);
                     continue;
                 }
-                if job.request.messages[0].content.as_deref() == Some("hold") {
+                if job.request.messages[0].text_content() == Some("hold") {
                     while !job.cancelled.load(Ordering::Acquire) {
                         std::thread::sleep(std::time::Duration::from_millis(5));
                     }
                     continue;
                 }
-                if job.request.messages[0].content.as_deref() == Some("fail-after-start") {
+                if job.request.messages[0].text_content() == Some("fail-after-start") {
                     send_failure(
                         &job,
                         FailureKind::Server,
@@ -189,23 +190,25 @@ impl Engine {
                     );
                     continue;
                 }
-                let prompt = job
-                    .request
-                    .messages
-                    .iter()
-                    .map(|message| message.content.as_deref().unwrap_or_default())
-                    .collect::<Vec<_>>()
-                    .join("|");
-                let cached_tokens = cached_prompt
-                    .as_ref()
-                    .filter(|cached| prompt.starts_with(cached.as_str()))
-                    .map_or(0, |cached| cached.len());
+                let has_images = !job.request.decoded_images.is_empty();
+                let prompt = fake_prompt_observation(
+                    &job.request.messages,
+                    &job.request.decoded_images,
+                );
+                let cached_tokens = if has_images {
+                    0
+                } else {
+                    cached_prompt
+                        .as_ref()
+                        .filter(|cached| prompt.starts_with(cached.as_str()))
+                        .map_or(0, |cached| cached.len())
+                };
                 let tool_results = job
                     .request
                     .messages
                     .iter()
                     .filter(|message| message.role == "tool")
-                    .filter_map(|message| message.content.as_deref())
+                    .filter_map(ChatMessage::text_content)
                     .collect::<Vec<_>>();
                 let latest_user = job
                     .request
@@ -213,8 +216,8 @@ impl Engine {
                     .iter()
                     .rev()
                     .find(|message| message.role == "user")
-                    .and_then(|message| message.content.as_deref());
-                if latest_user == Some("call-tool-parallel-violation")
+                    .map(message_text);
+                if latest_user.as_deref() == Some("call-tool-parallel-violation")
                     && job.request.tool_choice == ToolChoice::Auto
                     && !job.request.parallel_tool_calls
                     && !job.request.tools.is_empty()
@@ -230,7 +233,7 @@ impl Engine {
                 }
                 let fake_tool_turn = tool_results.is_empty()
                     && matches!(
-                        latest_user,
+                        latest_user.as_deref(),
                         Some("call-tool" | "call-tool-with-preamble")
                     )
                     && job.request.tool_choice == ToolChoice::Auto
@@ -254,7 +257,7 @@ impl Engine {
                         })
                         .collect();
                     (
-                        (latest_user == Some("call-tool-with-preamble"))
+                        (latest_user.as_deref() == Some("call-tool-with-preamble"))
                             .then(|| "I will use tools.".to_string())
                             .unwrap_or_default(),
                         tool_calls,
@@ -293,7 +296,7 @@ impl Engine {
                 if job.cancelled.load(Ordering::Acquire) {
                     continue;
                 }
-                cached_prompt = (prompt.len() <= 16).then_some(prompt.clone());
+                cached_prompt = (!has_images && prompt.len() <= 16).then_some(prompt.clone());
                 let completion_tokens = if job.request.max_tokens == 1 {
                     1
                 } else {
@@ -323,6 +326,44 @@ impl Engine {
             model_id: model_id.into(),
         }
     }
+}
+
+fn message_text(message: &ChatMessage) -> String {
+    let mut text = String::new();
+    message.visit_content(|part| {
+        if let ChatContentRef::Text(part) = part {
+            text.push_str(part);
+        }
+    });
+    text
+}
+
+fn fake_prompt_observation(messages: &[ChatMessage], images: &[DecodedImage]) -> String {
+    let mut prompt = String::new();
+    let mut image_index = 0;
+    for (message_index, message) in messages.iter().enumerate() {
+        if message_index != 0 {
+            prompt.push('|');
+        }
+        message.visit_content(|part| match part {
+            ChatContentRef::Text(text) => prompt.push_str(text),
+            ChatContentRef::Image(_) => {
+                let image = images
+                    .get(image_index)
+                    .expect("decoded image order must match normalized content");
+                prompt.push_str("[image:");
+                prompt.push_str(image.format.as_str());
+                prompt.push(']');
+                image_index += 1;
+            }
+        });
+    }
+    assert_eq!(
+        image_index,
+        images.len(),
+        "decoded image order must match normalized content"
+    );
+    prompt
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

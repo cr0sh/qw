@@ -10,7 +10,8 @@ use serde::Deserialize;
 use tokenizers::Tokenizer;
 
 pub use crate::chat_template::{
-    ChatMessage, ChatTool, ChatToolCall, ChatToolCallFunction, ChatToolFunction,
+    ChatContentPart, ChatContentRef, ChatImageUrl, ChatMessage, ChatMessageContent, ChatTool,
+    ChatToolCall, ChatToolCallFunction, ChatToolFunction,
 };
 use crate::chat_template::ChatTemplateProcessor;
 use crate::qwen3_5::Qwen35Model;

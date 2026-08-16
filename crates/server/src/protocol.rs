@@ -4,10 +4,14 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use qw_runtime::{
-    ChatMessage, ChatTool, ChatToolCall, ChatToolCallFunction, ChatToolFunction,
+    ChatContentPart, ChatImageUrl, ChatMessage, ChatMessageContent, ChatTool, ChatToolCall,
+    ChatToolCallFunction, ChatToolFunction,
 };
 
+use crate::media::DecodedImage;
+
 pub const DEFAULT_MAX_TOKENS: usize = 128;
+pub const MAX_IMAGES_PER_REQUEST: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Endpoint {
@@ -43,6 +47,8 @@ pub struct CompletionRequest {
     pub top_p: Option<f32>,
     pub seed: Option<u64>,
     pub output_format: OutputFormat,
+    pub image_params: Vec<String>,
+    pub decoded_images: Vec<DecodedImage>,
 }
 
 #[derive(Debug, Clone)]
@@ -52,14 +58,14 @@ pub struct RequestError {
 }
 
 impl RequestError {
-    fn new(message: impl Into<String>, param: Option<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>, param: Option<String>) -> Self {
         Self {
             message: message.into(),
             param,
         }
     }
 
-    fn at(message: impl Into<String>, param: impl Into<String>) -> Self {
+    pub(crate) fn at(message: impl Into<String>, param: impl Into<String>) -> Self {
         Self::new(message, Some(param.into()))
     }
 }
@@ -235,7 +241,8 @@ pub fn parse_chat(value: Value) -> Result<CompletionRequest, RequestError> {
         ));
     }
     let tool_choice = parse_tool_choice(wire.tool_choice.as_ref())?;
-    let messages = parse_chat_messages(wire.messages, &tools)?;
+    let mut image_params = Vec::new();
+    let messages = parse_chat_messages(wire.messages, &tools, &mut image_params)?;
     Ok(CompletionRequest {
         endpoint: Endpoint::Chat,
         model: wire.model,
@@ -252,6 +259,8 @@ pub fn parse_chat(value: Value) -> Result<CompletionRequest, RequestError> {
         top_p: wire.top_p,
         seed: wire.seed,
         output_format,
+        image_params,
+        decoded_images: Vec::new(),
     })
 }
 
@@ -280,6 +289,7 @@ pub fn parse_responses(value: Value) -> Result<CompletionRequest, RequestError> 
         ));
     }
     let tool_choice = parse_tool_choice(wire.tool_choice.as_ref())?;
+    let mut image_params = Vec::new();
     let messages = match wire.input {
         ResponsesInput::String(content) => {
             if content.is_empty() {
@@ -287,12 +297,14 @@ pub fn parse_responses(value: Value) -> Result<CompletionRequest, RequestError> 
             }
             vec![ChatMessage {
                 role: "user".to_string(),
-                content: Some(content),
+                content: Some(ChatMessageContent::Text(content)),
                 tool_calls: Vec::new(),
                 tool_call_id: None,
             }]
         }
-        ResponsesInput::Items(items) => parse_responses_items(items, &tools)?,
+        ResponsesInput::Items(items) => {
+            parse_responses_items(items, &tools, &mut image_params)?
+        }
     };
     Ok(CompletionRequest {
         endpoint: Endpoint::Responses,
@@ -308,6 +320,8 @@ pub fn parse_responses(value: Value) -> Result<CompletionRequest, RequestError> 
         top_p: wire.top_p,
         seed: None,
         output_format,
+        image_params,
+        decoded_images: Vec::new(),
     })
 }
 
@@ -466,6 +480,7 @@ fn parse_tool_choice(value: Option<&Value>) -> Result<ToolChoice, RequestError> 
 fn parse_chat_messages(
     values: Vec<Value>,
     tools: &[ChatTool],
+    image_params: &mut Vec<String>,
 ) -> Result<Vec<ChatMessage>, RequestError> {
     let declared = declared_names(tools);
     let mut history = HistoryState::default();
@@ -498,15 +513,24 @@ fn parse_chat_messages(
             }
         };
         reject_unknown_fields(message_object, allowed_fields, &base)?;
-        let tool_calls_field_present = value
-            .as_object()
-            .is_some_and(|object| object.contains_key("tool_calls"));
+        let tool_calls_field_present = message_object.contains_key("tool_calls");
         let wire: ChatWireMessage = serde_json::from_value(value).map_err(|error| {
             RequestError::at(format!("invalid chat message: {error}"), base.clone())
         })?;
         let message = match wire {
-            ChatWireMessage::System { content } => ordinary_message("system", content, &base)?,
-            ChatWireMessage::User { content } => ordinary_message("user", content, &base)?,
+            ChatWireMessage::System { content } => {
+                ordinary_message("system", content, &base)?
+            }
+            ChatWireMessage::User { content } => ChatMessage {
+                role: "user".to_string(),
+                content: Some(parse_chat_user_content(
+                    &content,
+                    &format!("{base}.content"),
+                    image_params,
+                )?),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            },
             ChatWireMessage::Assistant {
                 content,
                 tool_calls,
@@ -526,7 +550,7 @@ fn parse_chat_messages(
                 }
                 let content = match content {
                     Value::Null => None,
-                    Value::String(value) => Some(value),
+                    Value::String(value) => Some(ChatMessageContent::Text(value)),
                     _ => {
                         return Err(RequestError::at(
                             "assistant content must be a string or null",
@@ -534,7 +558,16 @@ fn parse_chat_messages(
                         ));
                     }
                 };
-                if content.as_deref().unwrap_or_default().is_empty() && calls.is_empty() {
+                if content
+                    .as_ref()
+                    .and_then(|content| match content {
+                        ChatMessageContent::Text(text) => Some(text.as_str()),
+                        ChatMessageContent::Parts(_) => None,
+                    })
+                    .unwrap_or_default()
+                    .is_empty()
+                    && calls.is_empty()
+                {
                     return Err(RequestError::at(
                         "assistant content may be empty only when tool_calls are present",
                         format!("{base}.content"),
@@ -551,7 +584,10 @@ fn parse_chat_messages(
                 content,
                 tool_call_id,
             } => {
-                let content = require_string_value(&content, &format!("{base}.content"))?;
+                let content = require_nonempty_string_value(
+                    &content,
+                    &format!("{base}.content"),
+                )?;
                 let call_id = require_nonempty_string_value(
                     &tool_call_id,
                     &format!("{base}.tool_call_id"),
@@ -559,7 +595,7 @@ fn parse_chat_messages(
                 history.resolve(&call_id, format!("{base}.tool_call_id"))?;
                 ChatMessage {
                     role: "tool".to_string(),
-                    content: Some(content),
+                    content: Some(ChatMessageContent::Text(content)),
                     tool_calls: Vec::new(),
                     tool_call_id: Some(call_id),
                 }
@@ -569,6 +605,99 @@ fn parse_chat_messages(
     }
     history.finish()?;
     Ok(messages)
+}
+
+fn parse_chat_user_content(
+    content: &Value,
+    base: &str,
+    image_params: &mut Vec<String>,
+) -> Result<ChatMessageContent, RequestError> {
+    match content {
+        Value::String(text) if !text.is_empty() => {
+            Ok(ChatMessageContent::Text(text.clone()))
+        }
+        Value::String(_) => Err(RequestError::at(
+            "user content must not be empty",
+            base,
+        )),
+        Value::Array(parts) => {
+            if parts.is_empty() {
+                return Err(RequestError::at(
+                    "user content parts must not be empty",
+                    base,
+                ));
+            }
+            let mut normalized = Vec::with_capacity(parts.len());
+            for (index, part) in parts.iter().enumerate() {
+                let part_base = format!("{base}[{index}]");
+                let object = part.as_object().ok_or_else(|| {
+                    RequestError::at("content part must be an object", &part_base)
+                })?;
+                let part_type = require_nonempty_string(
+                    object.get("type"),
+                    &format!("{part_base}.type"),
+                )?;
+                match part_type {
+                    "text" => {
+                        reject_unknown_fields(object, &["type", "text"], &part_base)?;
+                        let text = require_nonempty_string(
+                            object.get("text"),
+                            &format!("{part_base}.text"),
+                        )?;
+                        normalized.push(ChatContentPart::Text {
+                            text: text.to_string(),
+                        });
+                    }
+                    "image_url" => {
+                        reject_unknown_fields(object, &["type", "image_url"], &part_base)?;
+                        let image_base = format!("{part_base}.image_url");
+                        let image = object
+                            .get("image_url")
+                            .and_then(Value::as_object)
+                            .ok_or_else(|| {
+                                RequestError::at(
+                                    "image_url must be an object",
+                                    &image_base,
+                                )
+                            })?;
+                        reject_unknown_fields(image, &["url", "detail"], &image_base)?;
+                        let url_path = format!("{image_base}.url");
+                        let url = require_nonempty_string(image.get("url"), &url_path)?;
+                        validate_data_image_uri(url, &url_path)?;
+                        let detail_path = format!("{image_base}.detail");
+                        let detail = match image.get("detail") {
+                            None => "auto",
+                            Some(Value::String(detail)) if detail == "auto" => "auto",
+                            _ => {
+                                return Err(RequestError::at(
+                                    "image detail must be \"auto\"",
+                                    detail_path,
+                                ));
+                            }
+                        };
+                        record_image_param(image_params, &url_path)?;
+                        normalized.push(ChatContentPart::ImageUrl {
+                            image_url: ChatImageUrl {
+                                url: url.to_string(),
+                                detail: detail.to_string(),
+                            },
+                        });
+                    }
+                    _ => {
+                        return Err(RequestError::at(
+                            "unsupported content part type",
+                            format!("{part_base}.type"),
+                        ));
+                    }
+                }
+            }
+            Ok(ChatMessageContent::Parts(normalized))
+        }
+        _ => Err(RequestError::at(
+            "user content must be a string or an array of content parts",
+            base,
+        )),
+    }
 }
 
 fn parse_chat_tool_calls(
@@ -619,6 +748,7 @@ fn parse_chat_tool_calls(
 fn parse_responses_items(
     values: Vec<Value>,
     tools: &[ChatTool],
+    image_params: &mut Vec<String>,
 ) -> Result<Vec<ChatMessage>, RequestError> {
     if values.is_empty() {
         return Err(RequestError::at(
@@ -646,15 +776,19 @@ fn parse_responses_items(
         reject_unknown_fields(object, allowed_fields, &base)?;
         match item_type {
             Some("function_call") => {
-                let wire: ResponsesFunctionCallWire = serde_json::from_value(Value::Object(object.clone()))
-                    .map_err(|error| RequestError::at(format!("invalid function call item: {error}"), &base))?;
+                let wire: ResponsesFunctionCallWire =
+                    serde_json::from_value(Value::Object(object.clone())).map_err(|error| {
+                        RequestError::at(format!("invalid function call item: {error}"), &base)
+                    })?;
                 debug_assert_eq!(wire.item_type, "function_call");
-                let _item_id = require_nonempty_string_value(&wire.id, &format!("{base}.id"))?;
+                let _item_id =
+                    require_nonempty_string_value(&wire.id, &format!("{base}.id"))?;
                 let call_id = require_nonempty_string_value(
                     &wire.call_id,
                     &format!("{base}.call_id"),
                 )?;
-                let name = require_nonempty_string_value(&wire.name, &format!("{base}.name"))?;
+                let name =
+                    require_nonempty_string_value(&wire.name, &format!("{base}.name"))?;
                 require_declared(&name, &declared, &format!("{base}.name"))?;
                 let arguments_text = require_nonempty_string_value(
                     &wire.arguments,
@@ -685,8 +819,10 @@ fn parse_responses_items(
                 });
             }
             Some("function_call_output") => {
-                let wire: ResponsesFunctionOutputWire = serde_json::from_value(Value::Object(object.clone()))
-                    .map_err(|error| RequestError::at(format!("invalid function output item: {error}"), &base))?;
+                let wire: ResponsesFunctionOutputWire =
+                    serde_json::from_value(Value::Object(object.clone())).map_err(|error| {
+                        RequestError::at(format!("invalid function output item: {error}"), &base)
+                    })?;
                 debug_assert_eq!(wire.item_type, "function_call_output");
                 let call_id = require_nonempty_string_value(
                     &wire.call_id,
@@ -696,7 +832,7 @@ fn parse_responses_items(
                 history.resolve(&call_id, format!("{base}.call_id"))?;
                 messages.push(ChatMessage {
                     role: "tool".to_string(),
-                    content: Some(output),
+                    content: Some(ChatMessageContent::Text(output)),
                     tool_calls: Vec::new(),
                     tool_call_id: Some(call_id),
                 });
@@ -708,8 +844,10 @@ fn parse_responses_items(
                 ));
             }
             None => {
-                let wire: ResponsesMessageWire = serde_json::from_value(Value::Object(object.clone()))
-                    .map_err(|error| RequestError::at(format!("invalid input message: {error}"), &base))?;
+                let wire: ResponsesMessageWire =
+                    serde_json::from_value(Value::Object(object.clone())).map_err(|error| {
+                        RequestError::at(format!("invalid input message: {error}"), &base)
+                    })?;
                 if wire.role == "system" && index != 0 {
                     return Err(RequestError::at(
                         "system messages are only allowed at index zero",
@@ -722,13 +860,27 @@ fn parse_responses_items(
                         format!("{base}.role"),
                     ));
                 }
-                let content = require_string_value(&wire.content, &format!("{base}.content"))?;
-                if wire.role == "assistant" && content.is_empty() {
-                    return Err(RequestError::at(
-                        "assistant content must not be empty",
-                        format!("{base}.content"),
-                    ));
-                }
+                let content = if wire.role == "user" {
+                    parse_responses_user_content(
+                        &wire.content,
+                        &format!("{base}.content"),
+                        image_params,
+                    )?
+                } else {
+                    if let Value::Array(parts) = &wire.content
+                        && let Some((part_index, _)) = parts.iter().enumerate().find(|(_, part)| {
+                            part.get("type").and_then(Value::as_str) == Some("input_image")
+                        })
+                    {
+                        return Err(RequestError::at(
+                            "image inputs are only allowed on user messages",
+                            format!("{base}.content[{part_index}].image_url"),
+                        ));
+                    }
+                    let text =
+                        require_nonempty_string_value(&wire.content, &format!("{base}.content"))?;
+                    ChatMessageContent::Text(text)
+                };
                 messages.push(ChatMessage {
                     role: wire.role,
                     content: Some(content),
@@ -742,13 +894,135 @@ fn parse_responses_items(
     Ok(messages)
 }
 
+fn parse_responses_user_content(
+    content: &Value,
+    base: &str,
+    image_params: &mut Vec<String>,
+) -> Result<ChatMessageContent, RequestError> {
+    match content {
+        Value::String(text) if !text.is_empty() => {
+            Ok(ChatMessageContent::Text(text.clone()))
+        }
+        Value::String(_) => Err(RequestError::at(
+            "user content must not be empty",
+            base,
+        )),
+        Value::Array(parts) => {
+            if parts.is_empty() {
+                return Err(RequestError::at(
+                    "user content parts must not be empty",
+                    base,
+                ));
+            }
+            let mut normalized = Vec::with_capacity(parts.len());
+            for (index, part) in parts.iter().enumerate() {
+                let part_base = format!("{base}[{index}]");
+                let object = part.as_object().ok_or_else(|| {
+                    RequestError::at("content part must be an object", &part_base)
+                })?;
+                let part_type = require_nonempty_string(
+                    object.get("type"),
+                    &format!("{part_base}.type"),
+                )?;
+                match part_type {
+                    "input_text" => {
+                        reject_unknown_fields(object, &["type", "text"], &part_base)?;
+                        let text = require_nonempty_string(
+                            object.get("text"),
+                            &format!("{part_base}.text"),
+                        )?;
+                        normalized.push(ChatContentPart::Text {
+                            text: text.to_string(),
+                        });
+                    }
+                    "input_image" => {
+                        reject_unknown_fields(
+                            object,
+                            &["type", "image_url", "detail"],
+                            &part_base,
+                        )?;
+                        let url_path = format!("{part_base}.image_url");
+                        let url = require_nonempty_string(object.get("image_url"), &url_path)?;
+                        validate_data_image_uri(url, &url_path)?;
+                        let detail_path = format!("{part_base}.detail");
+                        let detail = match object.get("detail") {
+                            None => "auto",
+                            Some(Value::String(detail)) if detail == "auto" => "auto",
+                            _ => {
+                                return Err(RequestError::at(
+                                    "image detail must be \"auto\"",
+                                    detail_path,
+                                ));
+                            }
+                        };
+                        record_image_param(image_params, &url_path)?;
+                        normalized.push(ChatContentPart::ImageUrl {
+                            image_url: ChatImageUrl {
+                                url: url.to_string(),
+                                detail: detail.to_string(),
+                            },
+                        });
+                    }
+                    _ => {
+                        return Err(RequestError::at(
+                            "unsupported content part type",
+                            format!("{part_base}.type"),
+                        ));
+                    }
+                }
+            }
+            Ok(ChatMessageContent::Parts(normalized))
+        }
+        _ => Err(RequestError::at(
+            "user content must be a string or an array of input parts",
+            base,
+        )),
+    }
+}
+
+fn validate_data_image_uri(url: &str, param: &str) -> Result<(), RequestError> {
+    let payload = [
+        "data:image/png;base64,",
+        "data:image/jpeg;base64,",
+        "data:image/webp;base64,",
+    ]
+    .into_iter()
+    .find_map(|prefix| url.strip_prefix(prefix))
+    .ok_or_else(|| {
+        RequestError::at(
+            "image_url must be a base64 data URI for PNG, JPEG, or WebP",
+            param,
+        )
+    })?;
+    if payload.is_empty() {
+        return Err(RequestError::at(
+            "image data URI payload must not be empty",
+            param,
+        ));
+    }
+    Ok(())
+}
+
+fn record_image_param(
+    image_params: &mut Vec<String>,
+    param: &str,
+) -> Result<(), RequestError> {
+    if image_params.len() == MAX_IMAGES_PER_REQUEST {
+        return Err(RequestError::at(
+            format!("requests may contain at most {MAX_IMAGES_PER_REQUEST} images"),
+            param,
+        ));
+    }
+    image_params.push(param.to_string());
+    Ok(())
+}
+
 fn ordinary_message(role: &str, content: Value, base: &str) -> Result<ChatMessage, RequestError> {
     Ok(ChatMessage {
         role: role.to_string(),
-        content: Some(require_string_value(
-            &content,
-            &format!("{base}.content"),
-        )?),
+        content: Some(ChatMessageContent::Text(
+            require_nonempty_string_value(&content, &format!("{base}.content"))?,
+        )),
         tool_calls: Vec::new(),
         tool_call_id: None,
     })

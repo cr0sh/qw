@@ -9,6 +9,8 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
+image.workspace = true
 axum.workspace = true
 clap.workspace = true
 clap_derive.workspace = true

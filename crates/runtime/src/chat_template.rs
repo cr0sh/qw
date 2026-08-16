@@ -23,11 +23,80 @@ use serde_json::Value as JsonValue;
 pub struct ChatMessage {
     pub role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub content: Option<String>,
+    pub content: Option<ChatMessageContent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ChatToolCall>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum ChatMessageContent {
+    Text(String),
+    Parts(Vec<ChatContentPart>),
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ChatContentPart {
+    Text { text: String },
+    ImageUrl { image_url: ChatImageUrl },
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ChatImageUrl {
+    pub url: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatContentRef<'a> {
+    Text(&'a str),
+    Image(&'a ChatImageUrl),
+}
+
+impl ChatMessage {
+    pub fn text_content(&self) -> Option<&str> {
+        match self.content.as_ref()? {
+            ChatMessageContent::Text(text) => Some(text),
+            ChatMessageContent::Parts(_) => None,
+        }
+    }
+
+    pub fn image_urls(&self) -> impl Iterator<Item = &ChatImageUrl> {
+        self.content
+            .as_ref()
+            .and_then(|content| match content {
+                ChatMessageContent::Text(_) => None,
+                ChatMessageContent::Parts(parts) => Some(parts.as_slice()),
+            })
+            .into_iter()
+            .flatten()
+            .filter_map(|part| match part {
+                ChatContentPart::Text { .. } => None,
+                ChatContentPart::ImageUrl { image_url } => Some(image_url),
+            })
+    }
+
+    pub fn visit_content(&self, mut visitor: impl FnMut(ChatContentRef<'_>)) {
+        match self.content.as_ref() {
+            None => {}
+            Some(ChatMessageContent::Text(text)) => visitor(ChatContentRef::Text(text)),
+            Some(ChatMessageContent::Parts(parts)) => {
+                for part in parts {
+                    match part {
+                        ChatContentPart::Text { text } => {
+                            visitor(ChatContentRef::Text(text));
+                        }
+                        ChatContentPart::ImageUrl { image_url } => {
+                            visitor(ChatContentRef::Image(image_url));
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -115,7 +184,7 @@ impl ChatTemplateProcessor {
         self.render_messages(
             &[ChatMessage {
                 role: "user".to_string(),
-                content: Some(prompt.to_string()),
+                content: Some(ChatMessageContent::Text(prompt.to_string())),
                 tool_calls: Vec::new(),
                 tool_call_id: None,
             }],
@@ -131,18 +200,40 @@ impl ChatTemplateProcessor {
         anyhow::ensure!(!messages.is_empty(), "messages must not be empty");
         for (index, message) in messages.iter().enumerate() {
             match message.role.as_str() {
-                "system" | "user" => {
+                "system" => {
                     anyhow::ensure!(
-                        message.content.is_some()
+                        matches!(&message.content, Some(ChatMessageContent::Text(text)) if !text.is_empty())
                             && message.tool_calls.is_empty()
                             && message.tool_call_id.is_none(),
-                        "message {index} has fields incompatible with role {:?}",
-                        message.role
+                        "message {index} has fields incompatible with role \"system\""
+                    );
+                }
+                "user" => {
+                    let valid_content = match message.content.as_ref() {
+                        Some(ChatMessageContent::Text(text)) => !text.is_empty(),
+                        Some(ChatMessageContent::Parts(parts)) => {
+                            !parts.is_empty()
+                                && parts.iter().all(|part| match part {
+                                    ChatContentPart::Text { text } => !text.is_empty(),
+                                    ChatContentPart::ImageUrl { image_url } => {
+                                        !image_url.url.is_empty() && image_url.detail == "auto"
+                                    }
+                                })
+                        }
+                        None => false,
+                    };
+                    anyhow::ensure!(
+                        valid_content
+                            && message.tool_calls.is_empty()
+                            && message.tool_call_id.is_none(),
+                        "message {index} has fields incompatible with role \"user\""
                     );
                 }
                 "assistant" => {
                     anyhow::ensure!(
-                        (message.content.is_some() || !message.tool_calls.is_empty())
+                        (matches!(&message.content, Some(ChatMessageContent::Text(text)) if !text.is_empty())
+                            || !message.tool_calls.is_empty())
+                            && !matches!(&message.content, Some(ChatMessageContent::Parts(_)))
                             && message.tool_call_id.is_none(),
                         "message {index} has fields incompatible with role \"assistant\""
                     );
@@ -156,7 +247,7 @@ impl ChatTemplateProcessor {
                 }
                 "tool" => {
                     anyhow::ensure!(
-                        message.content.is_some()
+                        matches!(&message.content, Some(ChatMessageContent::Text(text)) if !text.is_empty())
                             && message.tool_calls.is_empty()
                             && message.tool_call_id.is_some(),
                         "message {index} has fields incompatible with role \"tool\""
@@ -192,6 +283,15 @@ impl ChatTemplateProcessor {
         self.template.contains("<tool_call>")
             && self.template.contains("<function=")
             && self.template.contains("<parameter=")
+    }
+
+    pub(crate) fn supports_image_content(&self) -> bool {
+        self.template.contains("image_url")
+            || (self.template.contains("content")
+                && (self.template.contains("\"image\"")
+                    || self.template.contains("'image'"))
+                && (self.template.contains("vision_start")
+                    || self.template.contains("image_pad")))
     }
 }
 
@@ -232,7 +332,7 @@ mod tests {
     fn user(content: &str) -> ChatMessage {
         ChatMessage {
             role: "user".to_string(),
-            content: Some(content.to_string()),
+            content: Some(ChatMessageContent::Text(content.to_string())),
             tool_calls: Vec::new(),
             tool_call_id: None,
         }
@@ -297,13 +397,13 @@ mod tests {
             },
             ChatMessage {
                 role: "tool".to_string(),
-                content: Some("sunny".to_string()),
+                content: Some(ChatMessageContent::Text("sunny".to_string())),
                 tool_calls: Vec::new(),
                 tool_call_id: Some("call_1".to_string()),
             },
             ChatMessage {
                 role: "tool".to_string(),
-                content: Some("warm".to_string()),
+                content: Some(ChatMessageContent::Text("warm".to_string())),
                 tool_calls: Vec::new(),
                 tool_call_id: Some("call_2".to_string()),
             },
