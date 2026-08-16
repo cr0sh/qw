@@ -22,18 +22,17 @@ function value(prefix,    i, parts) {
     }
     return ""
 }
-/^DECODE_BENCH_SUMMARY / || /^MTP_BENCH_SUMMARY / {
+/^MTP_BENCH_SUMMARY / && value("k") == "3" {
+    found = 1
     tps = value("decode_tokens_per_second") + 0
-    k = value("k") + 0
-    if (!found || tps > best_tps) {
-        found = 1
-        best_tps = tps
-        best_k = k
-    }
+    milliseconds = value("decode_milliseconds") + 0
+    acceptance = value("acceptance_percentage") + 0
 }
 END {
-    if (!found || best_tps <= 0) exit 1
-    printf "METRIC decode_tps=%.6f\n", best_tps
-    printf "METRIC best_block_size=%d\n", best_k
+    if (!found || tps <= 0 || milliseconds <= 0) exit 1
+    printf "METRIC single_stream_decode_tps=%.6f\n", tps
+    printf "METRIC decode_milliseconds=%.6f\n", milliseconds
+    printf "METRIC acceptance_percentage=%.6f\n", acceptance
+    printf "METRIC block_size=3\n"
 }
 ' "$output"

@@ -25,6 +25,7 @@ const PROMPT: &str = concat!(
     "operational step, not a diagnosis."
 );
 const DECODE_MAX_TOKENS: usize = 32;
+const MTP_BLOCK_SIZE: usize = 3;
 
 fn request(max_tokens: usize) -> GenerationRequest {
     GenerationRequest {
@@ -97,34 +98,30 @@ fn single_user_throughput(criterion: &mut Criterion) {
         baseline_probe.decode_tok_per_sec,
     );
 
-    let mut mtp_decode_tokens = Vec::with_capacity(7);
-    for block_size in 2..=8 {
-        let (output, stats, mtp_stats) = provider
-            .generate_with_mtp_stats(&decode_request, block_size)
-            .unwrap_or_else(|error| panic!("warm up MTP k={block_size}: {error:#}"));
-        assert_eq!(
-            &output.token_ids, &baseline_token_ids,
-            "baseline and bundled-MTP k={block_size} greedy token IDs diverged"
-        );
-        let decode_tokens = stats.generated_tokens.saturating_sub(1);
-        assert!(
-            decode_tokens > 0,
-            "the deterministic MTP k={block_size} prompt must produce at least one autoregressive decode token"
-        );
-        assert!(
-            mtp_stats.proposed_draft_tokens > 0,
-            "MTP k={block_size} must propose draft tokens"
-        );
-        println!(
-            "MTP_BENCH_SUMMARY k={block_size} accepted_draft_tokens={} proposed_draft_tokens={} acceptance_percentage={:.6} decode_tokens={decode_tokens} decode_milliseconds={:.6} decode_tokens_per_second={:.6}",
-            mtp_stats.accepted_draft_tokens,
-            mtp_stats.proposed_draft_tokens,
-            mtp_stats.acceptance_percentage(),
-            stats.decode_time_ms,
-            stats.decode_tok_per_sec,
-        );
-        mtp_decode_tokens.push((block_size, decode_tokens));
-    }
+    let (mtp_output, mtp_probe, mtp_stats) = provider
+        .generate_with_mtp_stats(&decode_request, MTP_BLOCK_SIZE)
+        .unwrap_or_else(|error| panic!("warm up MTP k={MTP_BLOCK_SIZE}: {error:#}"));
+    assert_eq!(
+        &mtp_output.token_ids, &baseline_token_ids,
+        "baseline and bundled-MTP k={MTP_BLOCK_SIZE} greedy token IDs diverged"
+    );
+    let mtp_decode_tokens = mtp_probe.generated_tokens.saturating_sub(1);
+    assert!(
+        mtp_decode_tokens > 0,
+        "the deterministic MTP prompt must produce at least one autoregressive decode token"
+    );
+    assert!(
+        mtp_stats.proposed_draft_tokens > 0,
+        "MTP k={MTP_BLOCK_SIZE} must propose draft tokens"
+    );
+    println!(
+        "MTP_BENCH_SUMMARY k={MTP_BLOCK_SIZE} accepted_draft_tokens={} proposed_draft_tokens={} acceptance_percentage={:.6} decode_tokens={mtp_decode_tokens} decode_milliseconds={:.6} decode_tokens_per_second={:.6}",
+        mtp_stats.accepted_draft_tokens,
+        mtp_stats.proposed_draft_tokens,
+        mtp_stats.acceptance_percentage(),
+        mtp_probe.decode_time_ms,
+        mtp_probe.decode_tok_per_sec,
+    );
 
     {
         let mut group = criterion.benchmark_group("single_user_decode");
@@ -154,33 +151,31 @@ fn single_user_throughput(criterion: &mut Criterion) {
                 elapsed
             });
         });
-        for (block_size, decode_tokens) in mtp_decode_tokens {
-            group.throughput(Throughput::Elements(decode_tokens as u64));
-            group.bench_function(format!("mtp_k{block_size}"), |bencher| {
-                bencher.iter_custom(|iterations| {
-                    let mut elapsed = Duration::ZERO;
-                    for _ in 0..iterations {
-                        let (output, stats, _) = provider
-                            .generate_with_mtp_stats(&decode_request, block_size)
-                            .unwrap_or_else(|error| {
-                                panic!("benchmark MTP k={block_size}: {error:#}")
-                            });
-                        assert_eq!(
-                            stats.generated_tokens.saturating_sub(1),
-                            decode_tokens,
-                            "deterministic MTP k={block_size} decode length changed"
-                        );
-                        assert_eq!(
-                            &output.token_ids, &baseline_token_ids,
-                            "baseline and bundled-MTP k={block_size} greedy token IDs diverged"
-                        );
-                        elapsed += measured_duration(stats.decode_time_ms);
-                        black_box(output);
-                    }
-                    elapsed
-                });
+        group.throughput(Throughput::Elements(mtp_decode_tokens as u64));
+        group.bench_function("mtp_k3", |bencher| {
+            bencher.iter_custom(|iterations| {
+                let mut elapsed = Duration::ZERO;
+                for _ in 0..iterations {
+                    let (output, stats, _) = provider
+                        .generate_with_mtp_stats(&decode_request, MTP_BLOCK_SIZE)
+                        .unwrap_or_else(|error| {
+                            panic!("benchmark MTP k={MTP_BLOCK_SIZE}: {error:#}")
+                        });
+                    assert_eq!(
+                        stats.generated_tokens.saturating_sub(1),
+                        mtp_decode_tokens,
+                        "deterministic MTP k={MTP_BLOCK_SIZE} decode length changed"
+                    );
+                    assert_eq!(
+                        &output.token_ids, &baseline_token_ids,
+                        "baseline and bundled-MTP k={MTP_BLOCK_SIZE} greedy token IDs diverged"
+                    );
+                    elapsed += measured_duration(stats.decode_time_ms);
+                    black_box(output);
+                }
+                elapsed
             });
-        }
+        });
         group.finish();
     }
 }
