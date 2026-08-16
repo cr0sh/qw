@@ -217,10 +217,12 @@ impl ToolCallGate {
         }
     }
 
+    #[cfg(test)]
     pub fn entered(&self) -> bool {
         self.entered
     }
 
+    #[cfg(test)]
     pub fn has_partial_marker(&self) -> bool {
         !self.entered && !self.retained.is_empty()
     }

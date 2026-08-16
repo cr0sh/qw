@@ -377,6 +377,11 @@ fn parse_tools(values: &[Value], dialect: ToolDialect) -> Result<Vec<ChatTool>, 
                     .ok_or_else(|| {
                         RequestError::at("tool function must be an object", path.clone())
                     })?;
+                reject_unknown_fields(
+                    function,
+                    &["name", "description", "parameters", "strict"],
+                    &path,
+                )?;
                 (function, path)
             }
             ToolDialect::Responses => {
@@ -389,11 +394,6 @@ fn parse_tools(values: &[Value], dialect: ToolDialect) -> Result<Vec<ChatTool>, 
                 (object, base.clone())
             }
         };
-        reject_unknown_fields(
-            function,
-            &["name", "description", "parameters", "strict"],
-            &function_path,
-        )?;
         let name_path = format!("{function_path}.name");
         let name = require_nonempty_string(function.get("name"), &name_path)?.to_string();
         if !names.insert(name.clone()) {
@@ -483,6 +483,24 @@ fn parse_chat_messages(
                 format!("{base}.role"),
             ));
         }
+        let message_object = value
+            .as_object()
+            .expect("role lookup already required an object");
+        let allowed_fields = match role {
+            "system" | "user" => &["role", "content"][..],
+            "assistant" => &["role", "content", "tool_calls"][..],
+            "tool" => &["role", "content", "tool_call_id"][..],
+            _ => {
+                return Err(RequestError::at(
+                    "unsupported message role",
+                    format!("{base}.role"),
+                ));
+            }
+        };
+        reject_unknown_fields(message_object, allowed_fields, &base)?;
+        let tool_calls_field_present = value
+            .as_object()
+            .is_some_and(|object| object.contains_key("tool_calls"));
         let wire: ChatWireMessage = serde_json::from_value(value).map_err(|error| {
             RequestError::at(format!("invalid chat message: {error}"), base.clone())
         })?;
@@ -493,7 +511,7 @@ fn parse_chat_messages(
                 content,
                 tool_calls,
             } => {
-                let calls_present = tool_calls.is_some();
+                let calls_present = tool_calls_field_present;
                 let calls = parse_chat_tool_calls(
                     tool_calls.unwrap_or_default(),
                     index,
@@ -616,12 +634,22 @@ fn parse_responses_items(
         let object = value
             .as_object()
             .ok_or_else(|| RequestError::at("input item must be an object", &base))?;
-        match object.get("type").and_then(Value::as_str) {
+        let item_type = object.get("type").and_then(Value::as_str);
+        let allowed_fields = match item_type {
+            Some("function_call") => {
+                &["type", "id", "call_id", "name", "arguments"][..]
+            }
+            Some("function_call_output") => &["type", "call_id", "output"][..],
+            Some(_) => &["type"][..],
+            None => &["role", "content"][..],
+        };
+        reject_unknown_fields(object, allowed_fields, &base)?;
+        match item_type {
             Some("function_call") => {
                 let wire: ResponsesFunctionCallWire = serde_json::from_value(Value::Object(object.clone()))
                     .map_err(|error| RequestError::at(format!("invalid function call item: {error}"), &base))?;
                 debug_assert_eq!(wire.item_type, "function_call");
-                let id = require_nonempty_string_value(&wire.id, &format!("{base}.id"))?;
+                let _item_id = require_nonempty_string_value(&wire.id, &format!("{base}.id"))?;
                 let call_id = require_nonempty_string_value(
                     &wire.call_id,
                     &format!("{base}.call_id"),
@@ -649,7 +677,7 @@ fn parse_responses_items(
                     role: "assistant".to_string(),
                     content: None,
                     tool_calls: vec![ChatToolCall {
-                        id,
+                        id: call_id.clone(),
                         tool_type: "function".to_string(),
                         function: ChatToolCallFunction { name, arguments },
                     }],

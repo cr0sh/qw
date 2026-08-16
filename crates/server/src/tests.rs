@@ -35,6 +35,102 @@ fn responses_request(prompt: &str) -> Value {
     json!({"model": MODEL, "input": prompt})
 }
 
+fn chat_tools() -> Value {
+    json!([
+        {
+            "type": "function",
+            "function": {
+                "name": "weather",
+                "description": "Look up weather",
+                "parameters": {"type":"object"},
+                "strict": true
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "time",
+                "parameters": {"type":"object"}
+            }
+        }
+    ])
+}
+
+fn responses_tools() -> Value {
+    json!([
+        {
+            "type": "function",
+            "name": "weather",
+            "description": "Look up weather",
+            "parameters": {"type":"object"},
+            "strict": true
+        },
+        {
+            "type": "function",
+            "name": "time",
+            "parameters": {"type":"object"}
+        }
+    ])
+}
+
+fn chat_tool_request(prompt: &str) -> Value {
+    json!({
+        "model": MODEL,
+        "messages": [{"role":"user","content":prompt}],
+        "tools": chat_tools()
+    })
+}
+
+fn responses_tool_request(prompt: &str) -> Value {
+    json!({
+        "model": MODEL,
+        "input": [{"role":"user","content":prompt}],
+        "tools": responses_tools()
+    })
+}
+
+#[derive(Debug)]
+struct SseFrame {
+    event: Option<String>,
+    data: Value,
+}
+
+fn parse_sse(body: &str) -> (Vec<SseFrame>, bool) {
+    let mut frames = Vec::new();
+    let mut done = false;
+    for block in body.split("\n\n").filter(|block| !block.is_empty()) {
+        let event = block
+            .lines()
+            .find_map(|line| line.strip_prefix("event: "))
+            .map(str::to_string);
+        let Some(data) = block
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+        else {
+            continue;
+        };
+        if data == "[DONE]" {
+            done = true;
+        } else {
+            frames.push(SseFrame {
+                event,
+                data: serde_json::from_str(data).expect("SSE JSON"),
+            });
+        }
+    }
+    (frames, done)
+}
+
+fn responses_replay_call(item: &Value) -> Value {
+    json!({
+        "type": "function_call",
+        "id": item["id"],
+        "call_id": item["call_id"],
+        "name": item["name"],
+        "arguments": item["arguments"]
+    })
+}
+
 #[tokio::test]
 async fn buffered_chat_completion_has_openai_shape_and_usage() {
     let app = router(Engine::start_fake(MODEL, 8));
@@ -335,4 +431,474 @@ async fn post_header_failures_use_endpoint_terminal_frames() {
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("event: response.failed"), "{body}");
     assert!(body.contains("\"type\":\"response.failed\""), "{body}");
+}
+
+#[tokio::test]
+async fn buffered_chat_completes_a_two_turn_tool_loop() {
+    let app = router(Engine::start_fake(MODEL, 8));
+    let (status, _, body) = post(
+        app.clone(),
+        "/v1/chat/completions",
+        chat_tool_request("call-tool"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let first: Value = serde_json::from_str(&body).expect("first response");
+    let message = &first["choices"][0]["message"];
+    assert_eq!(message["content"], Value::Null);
+    assert_eq!(first["choices"][0]["finish_reason"], "tool_calls");
+    let calls = message["tool_calls"].as_array().expect("tool calls");
+    assert_eq!(calls.len(), 2);
+    for (index, call) in calls.iter().enumerate() {
+        assert!(call["id"].as_str().unwrap().starts_with("call_"));
+        assert_eq!(call["type"], "function");
+        assert_eq!(call["function"]["name"], if index == 0 { "weather" } else { "time" });
+        assert!(
+            serde_json::from_str::<Value>(call["function"]["arguments"].as_str().unwrap())
+                .unwrap()
+                .is_object()
+        );
+    }
+
+    let mut replay = chat_tool_request("unused");
+    replay["messages"] = json!([
+        {"role":"user","content":"call-tool"},
+        message,
+        {"role":"tool","tool_call_id":calls[0]["id"],"content":"sunny"},
+        {"role":"tool","tool_call_id":calls[1]["id"],"content":"noon"}
+    ]);
+    let (status, _, body) = post(app, "/v1/chat/completions", replay).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let second: Value = serde_json::from_str(&body).expect("second response");
+    assert_eq!(second["choices"][0]["finish_reason"], "stop");
+    let content = second["choices"][0]["message"]["content"]
+        .as_str()
+        .expect("final content");
+    assert!(content.contains("sunny") && content.contains("noon"), "{content}");
+}
+
+#[tokio::test]
+async fn streamed_chat_emits_stable_indexed_calls_separate_usage_and_replays() {
+    let app = router(Engine::start_fake(MODEL, 8));
+    let mut request = chat_tool_request("call-tool");
+    request["stream"] = json!(true);
+    request["stream_options"] = json!({"include_usage":true});
+    let (status, _, body) = post(app.clone(), "/v1/chat/completions", request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body.contains("<tool_call>"));
+    let (frames, done) = parse_sse(&body);
+    assert!(done);
+    assert_eq!(frames[0].data["choices"][0]["delta"]["role"], "assistant");
+    assert!(frames.iter().all(|frame| frame.data["model"] == MODEL));
+    let call_headers = frames
+        .iter()
+        .filter(|frame| {
+            frame.data["choices"][0]["delta"]["tool_calls"][0]["id"]
+                .as_str()
+                .is_some()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(call_headers.len(), 2);
+    let argument_frames = frames
+        .iter()
+        .filter(|frame| {
+            frame.data["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
+                .as_str()
+                .is_some_and(|arguments| !arguments.is_empty())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(argument_frames.len(), 2);
+    for index in 0..2 {
+        assert_eq!(
+            call_headers[index].data["choices"][0]["delta"]["tool_calls"][0]["index"],
+            index
+        );
+        assert_eq!(
+            argument_frames[index].data["choices"][0]["delta"]["tool_calls"][0]["index"],
+            index
+        );
+    }
+    let terminal = frames
+        .iter()
+        .find(|frame| frame.data["choices"][0]["finish_reason"] == "tool_calls")
+        .expect("terminal tool reason");
+    assert!(terminal.data.get("usage").is_none());
+    let usage = frames.last().expect("usage frame");
+    assert_eq!(usage.data["choices"], json!([]));
+    assert!(usage.data["usage"]["completion_tokens"].as_u64().is_some());
+
+    let calls = call_headers
+        .iter()
+        .zip(argument_frames.iter())
+        .map(|(header, arguments)| {
+            json!({
+                "id": header.data["choices"][0]["delta"]["tool_calls"][0]["id"],
+                "type": "function",
+                "function": {
+                    "name": header.data["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
+                    "arguments": arguments.data["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"]
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut replay = chat_tool_request("unused");
+    replay["stream"] = json!(true);
+    replay["messages"] = json!([
+        {"role":"user","content":"call-tool"},
+        {"role":"assistant","content":null,"tool_calls":calls},
+        {"role":"tool","tool_call_id":calls[0]["id"],"content":"sunny"},
+        {"role":"tool","tool_call_id":calls[1]["id"],"content":"noon"}
+    ]);
+    let (status, _, body) = post(app, "/v1/chat/completions", replay).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (frames, done) = parse_sse(&body);
+    assert!(done);
+    let content = frames
+        .iter()
+        .filter_map(|frame| frame.data["choices"][0]["delta"]["content"].as_str())
+        .collect::<String>();
+    assert!(content.contains("sunny") && content.contains("noon"), "{content}");
+}
+
+#[tokio::test]
+async fn buffered_responses_completes_a_two_turn_tool_loop() {
+    let app = router(Engine::start_fake(MODEL, 8));
+    let (status, _, body) = post(
+        app.clone(),
+        "/v1/responses",
+        responses_tool_request("call-tool"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let first: Value = serde_json::from_str(&body).expect("first response");
+    assert_eq!(first["status"], "completed");
+    let calls = first["output"].as_array().expect("outputs");
+    assert_eq!(calls.len(), 2);
+    for call in calls {
+        assert_eq!(call["type"], "function_call");
+        assert_eq!(call["status"], "completed");
+        assert!(call["id"].as_str().unwrap().starts_with("fc_"));
+        assert!(call["call_id"].as_str().unwrap().starts_with("call_"));
+    }
+
+    let mut replay = responses_tool_request("unused");
+    replay["input"] = json!([
+        {"role":"user","content":"call-tool"},
+        responses_replay_call(&calls[0]),
+        responses_replay_call(&calls[1]),
+        {"type":"function_call_output","call_id":calls[0]["call_id"],"output":"sunny"},
+        {"type":"function_call_output","call_id":calls[1]["call_id"],"output":"noon"}
+    ]);
+    let (status, _, body) = post(app, "/v1/responses", replay).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let second: Value = serde_json::from_str(&body).expect("second response");
+    let content = second["output"][0]["content"][0]["text"]
+        .as_str()
+        .expect("final content");
+    assert!(content.contains("sunny") && content.contains("noon"), "{content}");
+}
+
+#[tokio::test]
+async fn streamed_responses_has_lazy_exact_function_lifecycle_and_replays() {
+    let app = router(Engine::start_fake(MODEL, 8));
+    let mut request = responses_tool_request("call-tool");
+    request["stream"] = json!(true);
+    let (status, _, body) = post(app.clone(), "/v1/responses", request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!body.contains("<tool_call>"));
+    let (frames, done) = parse_sse(&body);
+    assert!(!done);
+    let names = frames
+        .iter()
+        .map(|frame| frame.event.as_deref().expect("named Responses event"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        [
+            "response.created",
+            "response.output_item.added",
+            "response.function_call_arguments.delta",
+            "response.function_call_arguments.done",
+            "response.output_item.done",
+            "response.output_item.added",
+            "response.function_call_arguments.delta",
+            "response.function_call_arguments.done",
+            "response.output_item.done",
+            "response.completed",
+        ]
+    );
+    assert!(
+        names
+            .iter()
+            .all(|name| !name.contains("content_part") && !name.contains("output_text"))
+    );
+    for (sequence, frame) in frames.iter().enumerate() {
+        assert_eq!(frame.data["sequence_number"], sequence);
+        assert_eq!(frame.data["type"], frame.event.as_deref().unwrap());
+    }
+    let added = frames
+        .iter()
+        .filter(|frame| frame.event.as_deref() == Some("response.output_item.added"))
+        .collect::<Vec<_>>();
+    assert_eq!(added[0].data["output_index"], 0);
+    assert_eq!(added[1].data["output_index"], 1);
+    let completed = &frames.last().unwrap().data["response"];
+    assert_eq!(completed["output"].as_array().unwrap().len(), 2);
+    for (index, item) in completed["output"].as_array().unwrap().iter().enumerate() {
+        assert_eq!(item["id"], added[index].data["item"]["id"]);
+        assert_eq!(item["call_id"], added[index].data["item"]["call_id"]);
+    }
+
+    let calls = completed["output"].as_array().unwrap();
+    let mut replay = responses_tool_request("unused");
+    replay["stream"] = json!(true);
+    replay["input"] = json!([
+        {"role":"user","content":"call-tool"},
+        responses_replay_call(&calls[0]),
+        responses_replay_call(&calls[1]),
+        {"type":"function_call_output","call_id":calls[0]["call_id"],"output":"sunny"},
+        {"type":"function_call_output","call_id":calls[1]["call_id"],"output":"noon"}
+    ]);
+    let (status, _, body) = post(app, "/v1/responses", replay).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (frames, _) = parse_sse(&body);
+    let text = frames
+        .iter()
+        .filter(|frame| frame.event.as_deref() == Some("response.output_text.delta"))
+        .filter_map(|frame| frame.data["delta"].as_str())
+        .collect::<String>();
+    assert!(text.contains("sunny") && text.contains("noon"), "{text}");
+}
+
+#[tokio::test]
+async fn streamed_responses_closes_preamble_before_function_items() {
+    let app = router(Engine::start_fake(MODEL, 8));
+    let mut request = responses_tool_request("call-tool-with-preamble");
+    request["stream"] = json!(true);
+    let (status, _, body) = post(app, "/v1/responses", request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (frames, _) = parse_sse(&body);
+    let first_function = frames
+        .iter()
+        .position(|frame| {
+            frame.event.as_deref() == Some("response.output_item.added")
+                && frame.data["item"]["type"] == "function_call"
+        })
+        .expect("function added");
+    let message_done = frames
+        .iter()
+        .position(|frame| {
+            frame.event.as_deref() == Some("response.output_item.done")
+                && frame.data["item"]["type"] == "message"
+        })
+        .expect("message done");
+    assert!(message_done < first_function);
+    assert_eq!(frames[first_function].data["output_index"], 1);
+    let completed = &frames.last().unwrap().data["response"];
+    assert_eq!(completed["output"][0]["type"], "message");
+    assert_eq!(completed["output"][1]["type"], "function_call");
+    assert_eq!(completed["output"][2]["type"], "function_call");
+}
+
+#[tokio::test]
+async fn tool_choice_parallel_policy_and_tool_free_shapes_are_preserved() {
+    let app = router(Engine::start_fake(MODEL, 8));
+    let mut none = chat_tool_request("call-tool");
+    none["tool_choice"] = json!("none");
+    let (status, _, body) = post(app.clone(), "/v1/chat/completions", none).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let value: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["choices"][0]["finish_reason"], "stop");
+    assert_eq!(value["choices"][0]["message"]["content"], "echo:call-tool");
+    assert!(value["choices"][0]["message"].get("tool_calls").is_none());
+
+    let mut serial = chat_tool_request("call-tool");
+    serial["parallel_tool_calls"] = json!(false);
+    let (status, _, body) = post(app.clone(), "/v1/chat/completions", serial).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let value: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        value["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let mut violation = chat_tool_request("call-tool-parallel-violation");
+    violation["parallel_tool_calls"] = json!(false);
+    let (status, _, body) = post(app, "/v1/chat/completions", violation).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+
+    let ordinary = router(Engine::start_fake(MODEL, 8));
+    let (status, _, body) = post(
+        ordinary,
+        "/v1/chat/completions",
+        chat_request("shape"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let value: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        value["choices"][0]["message"],
+        json!({"role":"assistant","content":"echo:shape"})
+    );
+}
+
+#[tokio::test]
+async fn chat_tool_validation_reports_exact_paths() {
+    let app = router(Engine::start_fake(MODEL, 8));
+    let valid_tool = chat_tools()[0].clone();
+    let cases = [
+        (
+            json!({"model":MODEL,"messages":[{"role":"user","content":"x"}],"tools":[{"type":"code_interpreter","function":{"name":"x","parameters":{}}}]}),
+            "tools[0].type",
+        ),
+        (
+            json!({"model":MODEL,"messages":[{"role":"user","content":"x"}],"tools":[{"type":"function","function":{"name":"","parameters":{}}}]}),
+            "tools[0].function.name",
+        ),
+        (
+            json!({"model":MODEL,"messages":[{"role":"user","content":"x"}],"tools":[valid_tool.clone(),valid_tool.clone()]}),
+            "tools[1].function.name",
+        ),
+        (
+            json!({"model":MODEL,"messages":[{"role":"user","content":"x"}],"tools":[{"type":"function","function":{"name":"x","parameters":[]}}]}),
+            "tools[0].function.parameters",
+        ),
+        (
+            json!({"model":MODEL,"messages":[{"role":"user","content":"x"}],"tools":[{"type":"function","function":{"name":"x","description":null,"parameters":{}}}]}),
+            "tools[0].function.description",
+        ),
+        (
+            json!({"model":MODEL,"messages":[{"role":"user","content":"x"}],"tools":[{"type":"function","function":{"name":"x","parameters":{},"strict":"yes"}}]}),
+            "tools[0].function.strict",
+        ),
+        (
+            json!({"model":MODEL,"messages":[{"role":"user","content":"x"}],"tools":[{"type":"function","function":{"name":"x","parameters":{},"extra":1}}]}),
+            "tools[0].function.extra",
+        ),
+        (
+            json!({"model":MODEL,"messages":[{"role":"user","content":"x"}],"tools":chat_tools(),"tool_choice":"required"}),
+            "tool_choice",
+        ),
+        (
+            json!({"model":MODEL,"messages":[{"role":"user","content":"x"}],"tools":chat_tools(),"tool_choice":{"type":"function","function":{"name":"weather"}}}),
+            "tool_choice",
+        ),
+        (
+            json!({"model":MODEL,"messages":[{"role":"user","content":"x"}],"tools":chat_tools(),"response_format":{"type":"json_object"}}),
+            "response_format",
+        ),
+        (
+            json!({"model":MODEL,"messages":[{"role":"user","content":null}]}),
+            "messages[0].content",
+        ),
+        (
+            json!({"model":MODEL,"messages":[{"role":"user","content":"x"},{"role":"assistant","content":null}]}),
+            "messages[1].content",
+        ),
+        (
+            json!({"model":MODEL,"messages":[{"role":"user","content":"x","extra":1}]}),
+            "messages[0].extra",
+        ),
+        (
+            json!({"model":MODEL,"messages":[{"role":"user","content":"x"},{"role":"system","content":"late"}]}),
+            "messages[1].role",
+        ),
+        (
+            json!({"model":MODEL,"tools":chat_tools(),"messages":[{"role":"user","content":"x"},{"role":"assistant","tool_calls":[{"id":"c","type":"function","function":{"name":"weather","arguments":"bad"}}]},{"role":"tool","tool_call_id":"c","content":"x"}]}),
+            "messages[1].tool_calls[0].function.arguments",
+        ),
+        (
+            json!({"model":MODEL,"tools":chat_tools(),"messages":[{"role":"user","content":"x"},{"role":"assistant","tool_calls":[{"id":"c","type":"function","function":{"name":"weather","arguments":"[]"}}]},{"role":"tool","tool_call_id":"c","content":"x"}]}),
+            "messages[1].tool_calls[0].function.arguments",
+        ),
+        (
+            json!({"model":MODEL,"tools":chat_tools(),"messages":[{"role":"user","content":"x"},{"role":"assistant","tool_calls":[{"id":"c","type":"function","function":{"name":"missing","arguments":"{}"}}]},{"role":"tool","tool_call_id":"c","content":"x"}]}),
+            "messages[1].tool_calls[0].function.name",
+        ),
+        (
+            json!({"model":MODEL,"tools":chat_tools(),"messages":[{"role":"user","content":"x"},{"role":"tool","tool_call_id":"orphan","content":"x"}]}),
+            "messages[1].tool_call_id",
+        ),
+        (
+            json!({"model":MODEL,"tools":chat_tools(),"messages":[{"role":"user","content":"x"},{"role":"assistant","tool_calls":[{"id":"c","type":"function","function":{"name":"weather","arguments":"{}"}}]}]}),
+            "messages[1].tool_calls[0].id",
+        ),
+        (
+            json!({"model":MODEL,"tools":chat_tools(),"messages":[{"role":"user","content":"x"},{"role":"assistant","tool_calls":[{"id":"c","type":"function","function":{"name":"weather","arguments":"{}"}},{"id":"c","type":"function","function":{"name":"time","arguments":"{}"}}]},{"role":"tool","tool_call_id":"c","content":"x"}]}),
+            "messages[1].tool_calls[1].id",
+        ),
+        (
+            json!({"model":MODEL,"tools":chat_tools(),"messages":[{"role":"user","content":"x"},{"role":"assistant","tool_calls":[{"id":"c","type":"function","function":{"name":"weather","arguments":"{}"}}]},{"role":"tool","tool_call_id":"c","content":"x"},{"role":"tool","tool_call_id":"c","content":"again"}]}),
+            "messages[3].tool_call_id",
+        ),
+    ];
+    for (request, expected_param) in cases {
+        let (status, _, body) = post(app.clone(), "/v1/chat/completions", request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{expected_param}: {body}");
+        let error: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(error["error"]["param"], expected_param, "{body}");
+    }
+}
+
+#[tokio::test]
+async fn responses_tool_validation_reports_exact_paths() {
+    let app = router(Engine::start_fake(MODEL, 8));
+    let calls = json!([
+        {"type":"function_call","id":"fc_1","call_id":"c","name":"weather","arguments":"{}"}
+    ]);
+    let cases = [
+        (
+            json!({"model":MODEL,"input":"x","tools":[{"type":"code","name":"x","parameters":{}}]}),
+            "tools[0].type",
+        ),
+        (
+            json!({"model":MODEL,"input":"x","tools":[{"type":"function","name":"x","parameters":{},"extra":1}]}),
+            "tools[0].extra",
+        ),
+        (
+            json!({"model":MODEL,"input":"x","tools":responses_tools(),"text":{"format":{"type":"json_object"}}}),
+            "text.format",
+        ),
+        (
+            json!({"model":MODEL,"input":[{"role":"user","content":null}]}),
+            "input[0].content",
+        ),
+        (
+            json!({"model":MODEL,"tools":responses_tools(),"input":[{"role":"user","content":"x"},{"type":"function_call","id":"fc_1","call_id":"","name":"weather","arguments":"{}"}]}),
+            "input[1].call_id",
+        ),
+        (
+            json!({"model":MODEL,"tools":responses_tools(),"input":[{"role":"user","content":"x"},{"type":"function_call","id":"fc_1","call_id":"c","name":"weather","arguments":"[]"},{"type":"function_call_output","call_id":"c","output":"x"}]}),
+            "input[1].arguments",
+        ),
+        (
+            json!({"model":MODEL,"tools":responses_tools(),"input":[{"role":"user","content":"x"},{"type":"function_call","id":"fc_1","call_id":"c","name":"missing","arguments":"{}"},{"type":"function_call_output","call_id":"c","output":"x"}]}),
+            "input[1].name",
+        ),
+        (
+            json!({"model":MODEL,"tools":responses_tools(),"input":[{"role":"user","content":"x"},{"type":"function_call_output","call_id":"orphan","output":"x"}]}),
+            "input[1].call_id",
+        ),
+        (
+            json!({"model":MODEL,"tools":responses_tools(),"input":[{"role":"user","content":"x"},calls[0].clone()]}),
+            "input[1].call_id",
+        ),
+        (
+            json!({"model":MODEL,"tools":responses_tools(),"input":[{"role":"user","content":"x"},{"type":"function_call","id":"fc_1","call_id":"c","name":"weather","arguments":"{}","extra":1},{"type":"function_call_output","call_id":"c","output":"x"}]}),
+            "input[1].extra",
+        ),
+        (
+            json!({"model":MODEL,"tools":responses_tools(),"input":[{"role":"user","content":"x"},{"type":"unknown"}]}),
+            "input[1].type",
+        ),
+    ];
+    for (request, expected_param) in cases {
+        let (status, _, body) = post(app.clone(), "/v1/responses", request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{expected_param}: {body}");
+        let error: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(error["error"]["param"], expected_param, "{body}");
+    }
 }
