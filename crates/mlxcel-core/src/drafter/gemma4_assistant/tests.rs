@@ -553,6 +553,7 @@ fn validate_target_compat_rejects_target_without_embed_tokens() {
 /// `MaskedEmbedder` scatter fills with equal values → `argmax` (greedy) is
 /// deterministic but not meaningful. Shape and range suffice for this test.
 #[test]
+#[ignore = "runs an end-to-end GPU drafter forward path"]
 fn centroid_path_bind_set_shared_kv_draft_block_end_to_end() {
     // Build a config where hidden_size == backbone_hidden_size so that
     // pre_projection's matmul shapes are consistent with the forward call.
@@ -682,6 +683,7 @@ fn gemma4_assistant_drafter_is_object_safe_via_box_dyn() {
 /// breaks the `pre_projection` matmul. We rebuild a corrected weight
 /// set sized for `hidden == backbone` so the forward runs.
 #[test]
+#[ignore = "runs an end-to-end batched GPU drafter forward path"]
 fn draft_block_batched_returns_b_rows_of_k_minus_one_proposals() {
     // Build a corrected config where `hidden_size == backbone_hidden_size`
     // so pre_projection in_dim = 2 * backbone matches `tok_embed + h_prev`.
