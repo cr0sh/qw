@@ -513,6 +513,12 @@ fn parse_chat_messages(
             }
         };
         reject_unknown_fields(message_object, allowed_fields, &base)?;
+        if role != "user" {
+            reject_chat_role_images(
+                message_object.get("content"),
+                &format!("{base}.content"),
+            )?;
+        }
         let tool_calls_field_present = message_object.contains_key("tool_calls");
         let wire: ChatWireMessage = serde_json::from_value(value).map_err(|error| {
             RequestError::at(format!("invalid chat message: {error}"), base.clone())
@@ -1014,6 +1020,21 @@ fn record_image_param(
         ));
     }
     image_params.push(param.to_string());
+    Ok(())
+}
+
+fn reject_chat_role_images(content: Option<&Value>, base: &str) -> Result<(), RequestError> {
+    let Some(Value::Array(parts)) = content else {
+        return Ok(());
+    };
+    if let Some((index, _)) = parts.iter().enumerate().find(|(_, part)| {
+        part.get("type").and_then(Value::as_str) == Some("image_url")
+    }) {
+        return Err(RequestError::at(
+            "image inputs are only allowed on user messages",
+            format!("{base}[{index}].image_url.url"),
+        ));
+    }
     Ok(())
 }
 

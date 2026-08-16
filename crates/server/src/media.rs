@@ -135,6 +135,18 @@ pub fn decode_data_image(url: &str, param: &str) -> Result<DecodedImage, Request
             param,
         ));
     }
+    let rgb_allocation = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(3))
+        .ok_or_else(|| RequestError::at("image allocation size overflow", param))?;
+    if rgb_allocation > MAX_DECODER_ALLOCATION {
+        return Err(RequestError::at(
+            format!(
+                "decoded image allocation must not exceed {MAX_DECODER_ALLOCATION} bytes"
+            ),
+            param,
+        ));
+    }
     let rgb = image.into_rgb8().into_raw();
     Ok(DecodedImage {
         format,

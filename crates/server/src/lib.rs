@@ -74,6 +74,13 @@ async fn handle(
         Ok(request) => request,
         Err(error) => return ApiError::from_request(error).into_response(),
     };
+    if !request.image_params.is_empty() && !state.engine.supports_image_inputs() {
+        return ApiError::invalid(
+            "model does not support image inputs",
+            request.image_params.first().cloned(),
+        )
+        .into_response();
+    }
     if request.model != state.engine.model_id() {
         return ApiError::model_not_found(&request.model).into_response();
     }
