@@ -6,11 +6,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};
 use mlxcel_core::generate::{GenerationStopReason, PrefixReuse};
-use qw_runtime::Qwen35Provider;
+use qw_runtime::{ChatContentRef, ChatMessage, Qwen35Provider};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::grammar::GrammarFactory;
+use crate::media::DecodedImage;
 use crate::prefix_cache::PrefixCache;
 use crate::protocol::{CompletionRequest, Endpoint, OutputFormat, ToolChoice};
 use crate::tool_calls::{ToolCallGate, parse_assistant_output};
@@ -93,6 +94,7 @@ pub struct Submission {
 pub struct Engine {
     jobs: mpsc::Sender<Job>,
     model_id: Arc<str>,
+    supports_image_inputs: bool,
 }
 
 impl Engine {
@@ -107,10 +109,10 @@ impl Engine {
         thread::Builder::new()
             .name("qw-generation".to_string())
             .spawn(move || {
-                let initialized = QwenWorker::load(&model_path, prefix_cache_max_tokens);
-                match initialized {
+                match QwenWorker::load(&model_path, prefix_cache_max_tokens) {
                     Ok(mut worker) => {
-                        let _ = ready_tx.send(Ok(()));
+                        let supports_image_inputs = worker.provider.supports_image_inputs();
+                        let _ = ready_tx.send(Ok(supports_image_inputs));
                         worker.run(jobs_rx);
                     }
                     Err(error) => {
@@ -119,12 +121,13 @@ impl Engine {
                 }
             })
             .context("failed to spawn generation thread")?;
-        ready_rx
+        let supports_image_inputs = ready_rx
             .recv()
             .context("generation thread exited during startup")??;
         Ok(Self {
             jobs: jobs_tx,
             model_id: model_id.into(),
+            supports_image_inputs,
         })
     }
 
@@ -132,6 +135,10 @@ impl Engine {
         &self.model_id
     }
 
+
+    pub fn supports_image_inputs(&self) -> bool {
+        self.supports_image_inputs
+    }
     pub fn submit(&self, request: CompletionRequest) -> Result<Submission, SubmitError> {
         let admission = new_admission(request.endpoint);
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -174,13 +181,13 @@ impl Engine {
                     job.cancelled.store(true, Ordering::Release);
                     continue;
                 }
-                if job.request.messages[0].content.as_deref() == Some("hold") {
+                if message_text(&job.request.messages[0]) == "hold" {
                     while !job.cancelled.load(Ordering::Acquire) {
                         std::thread::sleep(std::time::Duration::from_millis(5));
                     }
                     continue;
                 }
-                if job.request.messages[0].content.as_deref() == Some("fail-after-start") {
+                if message_text(&job.request.messages[0]) == "fail-after-start" {
                     send_failure(
                         &job,
                         FailureKind::Server,
@@ -189,23 +196,25 @@ impl Engine {
                     );
                     continue;
                 }
-                let prompt = job
-                    .request
-                    .messages
-                    .iter()
-                    .map(|message| message.content.as_deref().unwrap_or_default())
-                    .collect::<Vec<_>>()
-                    .join("|");
-                let cached_tokens = cached_prompt
-                    .as_ref()
-                    .filter(|cached| prompt.starts_with(cached.as_str()))
-                    .map_or(0, |cached| cached.len());
+                let has_images = !job.request.decoded_images.is_empty();
+                let prompt = fake_prompt_observation(
+                    &job.request.messages,
+                    &job.request.decoded_images,
+                );
+                let cached_tokens = if has_images {
+                    0
+                } else {
+                    cached_prompt
+                        .as_ref()
+                        .filter(|cached| prompt.starts_with(cached.as_str()))
+                        .map_or(0, |cached| cached.len())
+                };
                 let tool_results = job
                     .request
                     .messages
                     .iter()
                     .filter(|message| message.role == "tool")
-                    .filter_map(|message| message.content.as_deref())
+                    .filter_map(ChatMessage::text_content)
                     .collect::<Vec<_>>();
                 let latest_user = job
                     .request
@@ -213,8 +222,8 @@ impl Engine {
                     .iter()
                     .rev()
                     .find(|message| message.role == "user")
-                    .and_then(|message| message.content.as_deref());
-                if latest_user == Some("call-tool-parallel-violation")
+                    .map(message_text);
+                if latest_user.as_deref() == Some("call-tool-parallel-violation")
                     && job.request.tool_choice == ToolChoice::Auto
                     && !job.request.parallel_tool_calls
                     && !job.request.tools.is_empty()
@@ -230,7 +239,7 @@ impl Engine {
                 }
                 let fake_tool_turn = tool_results.is_empty()
                     && matches!(
-                        latest_user,
+                        latest_user.as_deref(),
                         Some("call-tool" | "call-tool-with-preamble")
                     )
                     && job.request.tool_choice == ToolChoice::Auto
@@ -254,7 +263,7 @@ impl Engine {
                         })
                         .collect();
                     (
-                        (latest_user == Some("call-tool-with-preamble"))
+                        (latest_user.as_deref() == Some("call-tool-with-preamble"))
                             .then(|| "I will use tools.".to_string())
                             .unwrap_or_default(),
                         tool_calls,
@@ -293,7 +302,7 @@ impl Engine {
                 if job.cancelled.load(Ordering::Acquire) {
                     continue;
                 }
-                cached_prompt = (prompt.len() <= 16).then_some(prompt.clone());
+                cached_prompt = (!has_images && prompt.len() <= 16).then_some(prompt.clone());
                 let completion_tokens = if job.request.max_tokens == 1 {
                     1
                 } else {
@@ -321,8 +330,47 @@ impl Engine {
         Self {
             jobs: jobs_tx,
             model_id: model_id.into(),
+            supports_image_inputs: true,
         }
     }
+}
+
+fn message_text(message: &ChatMessage) -> String {
+    let mut text = String::new();
+    message.visit_content(|part| {
+        if let ChatContentRef::Text(part) = part {
+            text.push_str(part);
+        }
+    });
+    text
+}
+
+fn fake_prompt_observation(messages: &[ChatMessage], images: &[DecodedImage]) -> String {
+    let mut prompt = String::new();
+    let mut image_index = 0;
+    for (message_index, message) in messages.iter().enumerate() {
+        if message_index != 0 {
+            prompt.push('|');
+        }
+        message.visit_content(|part| match part {
+            ChatContentRef::Text(text) => prompt.push_str(text),
+            ChatContentRef::Image(_) => {
+                let image = images
+                    .get(image_index)
+                    .expect("decoded image order must match normalized content");
+                prompt.push_str("[image:");
+                prompt.push_str(image.format.as_str());
+                prompt.push(']');
+                image_index += 1;
+            }
+        });
+    }
+    assert_eq!(
+        image_index,
+        images.len(),
+        "decoded image order must match normalized content"
+    );
+    prompt
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -370,26 +418,81 @@ impl QwenWorker {
         }
     }
 
-    fn process(&mut self, job: Job) {
+    fn process(&mut self, mut job: Job) {
+        let has_images = !job.request.decoded_images.is_empty();
+        if has_images && !self.provider.supports_image_inputs() {
+            send_failure(
+                &job,
+                FailureKind::InvalidRequest,
+                "model does not support image inputs".to_string(),
+                job.request.image_params.first().cloned(),
+            );
+            return;
+        }
+        let mut prepared_images = Vec::with_capacity(job.request.decoded_images.len());
+        for image in std::mem::take(&mut job.request.decoded_images) {
+            match self
+                .provider
+                .prepare_image(image.width, image.height, image.rgb)
+            {
+                Ok(image) => prepared_images.push(image),
+                Err(error) => {
+                    send_failure(
+                        &job,
+                        FailureKind::InvalidRequest,
+                        format!("failed to preprocess image: {error}"),
+                        job.request
+                            .image_params
+                            .get(prepared_images.len())
+                            .cloned(),
+                    );
+                    return;
+                }
+            }
+        }
         let effective_tools = if job.request.tool_choice == ToolChoice::None {
             &[][..]
         } else {
             job.request.tools.as_slice()
         };
         let tool_enabled = !effective_tools.is_empty();
-        let prompt_ids = match self
-            .provider
-            .tokenize_messages(&job.request.messages, effective_tools)
-        {
-            Ok(tokens) => tokens,
-            Err(error) => {
-                send_failure(
-                    &job,
-                    FailureKind::InvalidRequest,
-                    format!("failed to render messages: {error}"),
-                    Some("messages".to_string()),
-                );
-                return;
+        let multimodal_prefill = if has_images {
+            match self.provider.prepare_multimodal_prefill(
+                &job.request.messages,
+                effective_tools,
+                &prepared_images,
+            ) {
+                Ok(prefill) => Some(prefill),
+                Err(error) => {
+                    send_failure(
+                        &job,
+                        FailureKind::InvalidRequest,
+                        format!("failed to prepare image prompt: {error}"),
+                        job.request.image_params.first().cloned(),
+                    );
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let prompt_ids = if let Some(prefill) = &multimodal_prefill {
+            prefill.prompt_ids.clone()
+        } else {
+            match self
+                .provider
+                .tokenize_messages(&job.request.messages, effective_tools)
+            {
+                Ok(tokens) => tokens,
+                Err(error) => {
+                    send_failure(
+                        &job,
+                        FailureKind::InvalidRequest,
+                        format!("failed to render messages: {error}"),
+                        Some("messages".to_string()),
+                    );
+                    return;
+                }
             }
         };
         let mut constraint = match self.grammar.compile(&job.request.output_format) {
@@ -418,47 +521,64 @@ impl QwenWorker {
             job.request.seed,
         );
         let (provider, cache) = (&mut self.provider, &mut self.prefix_cache);
-        let hit = cache.lookup(&prompt_ids);
+        let hit = if has_images {
+            None
+        } else {
+            cache.lookup(&prompt_ids)
+        };
         let prefix_reuse = hit.map(|hit| PrefixReuse {
             snapshot: hit.snapshot,
             cached_tokens: hit.token_count,
         });
         let mut gate = ToolCallGate::default();
-        let generated = provider.generate_baseline_streaming(
-            &prompt_ids,
-            job.request.max_tokens,
-            &sampling,
-            prefix_reuse,
-            constraint
-                .as_mut()
-                .map(|constraint| constraint as &mut dyn mlxcel_core::generate::TokenConstraint),
-            true,
-            |delta| {
-                if job.cancelled.load(Ordering::Acquire) {
-                    return false;
-                }
-                let released = if tool_enabled {
-                    gate.feed(delta)
-                } else if delta.is_empty() {
-                    None
-                } else {
-                    Some(delta.to_string())
-                };
-                let Some(released) = released else {
-                    return true;
-                };
-                if job
-                    .events
-                    .blocking_send(WorkerEvent::Delta(released))
-                    .is_err()
-                {
-                    job.cancelled.store(true, Ordering::Release);
-                    false
-                } else {
-                    true
-                }
-            },
-        );
+        let mut emit_delta = |delta: &str| {
+            if job.cancelled.load(Ordering::Acquire) {
+                return false;
+            }
+            let released = if tool_enabled {
+                gate.feed(delta)
+            } else if delta.is_empty() {
+                None
+            } else {
+                Some(delta.to_string())
+            };
+            let Some(released) = released else {
+                return true;
+            };
+            if job
+                .events
+                .blocking_send(WorkerEvent::Delta(released))
+                .is_err()
+            {
+                job.cancelled.store(true, Ordering::Release);
+                false
+            } else {
+                true
+            }
+        };
+        let generated = if let Some(prefill) = multimodal_prefill {
+            provider.generate_multimodal_streaming(
+                prefill,
+                job.request.max_tokens,
+                &sampling,
+                constraint
+                    .as_mut()
+                    .map(|value| value as &mut dyn mlxcel_core::generate::TokenConstraint),
+                &mut emit_delta,
+            )
+        } else {
+            provider.generate_baseline_streaming(
+                &prompt_ids,
+                job.request.max_tokens,
+                &sampling,
+                prefix_reuse,
+                constraint
+                    .as_mut()
+                    .map(|value| value as &mut dyn mlxcel_core::generate::TokenConstraint),
+                true,
+                &mut emit_delta,
+            )
+        };
         let generated = match generated {
             Ok(generated) => generated,
             Err(_) => {
@@ -565,7 +685,7 @@ impl QwenWorker {
             );
             return;
         }
-        if let Some(snapshot) = generated.prompt_snapshot {
+        if !has_images && let Some(snapshot) = generated.prompt_snapshot {
             cache.insert(prompt_ids, snapshot);
         }
         let record = CompletionRecord {

@@ -583,6 +583,12 @@ pub trait LanguageModel {
         None // default: tied or unsupported
     }
 
+    /// Activate request-owned state after generator reset and immediately
+    /// before an embedding prefill.
+    fn prepare_embedding_prefill(&self) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Called once after prefill completes and before decode starts.
     /// Used by models that need to adjust internal state between phases.
     fn after_prefill(&self) {}
@@ -1374,6 +1380,211 @@ impl CxxGenerator {
         } else {
             None
         };
+        if let Some(snapshot) = prompt_snapshot.as_mut() {
+            snapshot.set_continuation_logits(
+                logits
+                    .as_ref()
+                    .expect("generation logits must not be null"),
+            );
+        }
+        ffi::clear_memory_cache();
+
+        let needs_history = sampling.needs_token_history() || constraint.is_some();
+        let mut token_history = initial_token_history(prompt_tokens, needs_history);
+        let mut sampler_state: Option<SamplerState> = None;
+        let mut stop_reason = GenerationStopReason::MaxTokens;
+
+        while self.generated_tokens.len() < max_tokens {
+            let constrained_logits;
+            let logits_for_sample = if let Some(active) = constraint.as_deref_mut() {
+                match active.compute_mask(
+                    logits
+                        .as_ref()
+                        .expect("generation logits must not be null"),
+                    &token_history,
+                )? {
+                    ConstraintMask::Allow(allowed) => {
+                        constrained_logits = mask_logits_to_allowed(
+                            logits
+                                .as_ref()
+                                .expect("generation logits must not be null"),
+                            &allowed,
+                        )?;
+                        constrained_logits
+                            .as_ref()
+                            .expect("masked generation logits must not be null")
+                    }
+                    ConstraintMask::Accept => {
+                        stop_reason = GenerationStopReason::ConstraintAccepted;
+                        break;
+                    }
+                }
+            } else {
+                logits
+                    .as_ref()
+                    .expect("generation logits must not be null")
+            };
+
+            let (token, _) = if needs_history {
+                sample_token_optimized_with_state(
+                    logits_for_sample,
+                    sampling,
+                    &token_history,
+                    &mut sampler_state,
+                )
+            } else {
+                sample_token_optimized(logits_for_sample, sampling, &token_history)
+            };
+            ffi::eval(&token);
+            let token_id = ffi::item_i32(&token);
+            if eos_tokens.contains(&token_id) {
+                stop_reason = GenerationStopReason::Eos;
+                break;
+            }
+
+            self.generated_tokens.push(token_id);
+            if needs_history {
+                token_history.push(token_id);
+            }
+            let constraint_accepted = if let Some(active) = constraint.as_deref_mut() {
+                active.commit_token(token_id)? == ConstraintCommit::Accept
+            } else {
+                false
+            };
+            if !on_token(token_id) {
+                stop_reason = GenerationStopReason::CallbackCancelled;
+                break;
+            }
+            if constraint_accepted {
+                stop_reason = GenerationStopReason::ConstraintAccepted;
+                break;
+            }
+            if detect_repetition_loop(&self.generated_tokens, &sampling.loop_detection) {
+                stop_reason = GenerationStopReason::RepetitionLoop;
+                break;
+            }
+            if self.generated_tokens.len() == max_tokens {
+                stop_reason = GenerationStopReason::MaxTokens;
+                break;
+            }
+
+            let next_input = ffi::reshape_token_for_forward(&token);
+            logits = model.forward_last_logits(&next_input, &mut self.caches, None, 0);
+        }
+
+        Ok(ControlledGeneration {
+            token_ids: self.generated_tokens.clone(),
+            stop_reason,
+            prompt_snapshot,
+            cached_tokens,
+        })
+    }
+
+    /// Baseline controlled generation with optional pre-computed embeddings for
+    /// the prefill. Embeddings are consumed exactly once; decode remains
+    /// token-based and preserves the ordinary controlled path's constraints,
+    /// callbacks, stop reasons, usage, and snapshot contract.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_streaming_controlled_with_embeddings<
+        M: LanguageModel,
+        F: FnMut(i32) -> bool,
+    >(
+        &mut self,
+        model: &M,
+        prompt_tokens: &[i32],
+        input_embeddings: Option<&MlxArray>,
+        mask: Option<&MlxArray>,
+        prefix_reuse: Option<PrefixReuse<'_>>,
+        max_tokens: usize,
+        sampling: &SamplingConfig,
+        mut constraint: Option<&mut dyn TokenConstraint>,
+        capture_prompt_snapshot: bool,
+        mut on_token: F,
+    ) -> Result<ControlledGeneration, String> {
+        if prompt_tokens.is_empty() {
+            return Err("prompt token sequence must not be empty".to_string());
+        }
+        if max_tokens == 0 {
+            return Err("max_tokens must be greater than zero".to_string());
+        }
+        if input_embeddings.is_some() && prefix_reuse.is_some() {
+            return Err(
+                "embedding prefill cannot reuse a token-only prefix snapshot".to_string(),
+            );
+        }
+
+        self.reset_with_model(model);
+        if input_embeddings.is_some() {
+            model.prepare_embedding_prefill()?;
+        }
+        ensure_model_caches(&mut self.caches, model);
+        self.apply_kv_cache_mode_with_boundary_policy();
+        install_thread_local_default_stream(self.generation_stream.as_ref());
+
+        let sampling_cow = self.compose_sampling(sampling);
+        let sampling = sampling_cow.as_ref();
+        seed_rng_if_needed(sampling);
+        let eos_tokens = merged_eos_token_ids(model.eos_token_ids(), &sampling.stop_token_ids);
+        let sequence_id = SequenceId::from_raw(0);
+
+        let mut cached_tokens = 0;
+        let mut cached_logits = None;
+        if let Some(reuse) = prefix_reuse
+            && reuse.cached_tokens > 0
+            && reuse.cached_tokens <= prompt_tokens.len()
+            && reuse.snapshot.token_len() == reuse.cached_tokens
+            && (reuse.cached_tokens < prompt_tokens.len()
+                || reuse.snapshot.continuation_logits().is_some())
+        {
+            model.restore_sequence_state(sequence_id, reuse.snapshot)?;
+            cached_tokens = reuse.cached_tokens;
+            if cached_tokens == prompt_tokens.len() {
+                cached_logits = reuse.snapshot.continuation_logits().map(ffi::copy);
+            }
+        }
+
+        let prefill_tokens = &prompt_tokens[cached_tokens..];
+        let mut logits = if let Some(logits) = cached_logits {
+            logits
+        } else if input_embeddings.is_some() || mask.is_some() {
+            let input =
+                ffi::from_slice_i32(prefill_tokens, &[1, prefill_tokens.len() as i32]);
+            let logits = model.forward_with_embeddings(
+                &input,
+                input_embeddings,
+                &mut self.caches,
+                mask,
+            );
+            logits_at_position(&logits, prefill_tokens.len().saturating_sub(1))
+        } else {
+            let prefill_chunk = effective_prefill_chunk(
+                prefill_chunk_len(),
+                model.supports_chunked_prefill(),
+                prefill_tokens.len(),
+            );
+            if let Some(chunk) = prefill_chunk {
+                chunked_prefill_last_logits(model, &mut self.caches, prefill_tokens, chunk)
+            } else {
+                let input =
+                    ffi::from_slice_i32(prefill_tokens, &[1, prefill_tokens.len() as i32]);
+                model.forward_last_logits(
+                    &input,
+                    &mut self.caches,
+                    None,
+                    prefill_tokens.len().saturating_sub(1),
+                )
+            }
+        };
+        ffi::eval(&logits);
+        if input_embeddings.is_some() {
+            model.after_prefill();
+        }
+        let mut prompt_snapshot =
+            if capture_prompt_snapshot && model.supports_snapshot_reuse() {
+                model.snapshot_sequence_state(sequence_id, prompt_tokens.len())
+            } else {
+                None
+            };
         if let Some(snapshot) = prompt_snapshot.as_mut() {
             snapshot.set_continuation_logits(
                 logits
@@ -3333,6 +3544,57 @@ mod tests {
         assert!(!composed.token_bias.contains(1));
     }
 
+    struct EmbeddingTrackingModel {
+        embedding_prefills: std::cell::Cell<usize>,
+        token_forwards: std::cell::Cell<usize>,
+    }
+
+    impl EmbeddingTrackingModel {
+        fn new() -> Self {
+            Self {
+                embedding_prefills: std::cell::Cell::new(0),
+                token_forwards: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl LanguageModel for EmbeddingTrackingModel {
+        fn forward(
+            &self,
+            input_ids: &MlxArray,
+            caches: &mut [KVCache],
+            mask: Option<&MlxArray>,
+        ) -> UniquePtr<MlxArray> {
+            self.token_forwards
+                .set(self.token_forwards.get().saturating_add(1));
+            StubModel.forward(input_ids, caches, mask)
+        }
+
+        fn forward_with_embeddings(
+            &self,
+            input_ids: &MlxArray,
+            input_embeddings: Option<&MlxArray>,
+            caches: &mut [KVCache],
+            mask: Option<&MlxArray>,
+        ) -> UniquePtr<MlxArray> {
+            assert!(input_embeddings.is_some());
+            self.embedding_prefills
+                .set(self.embedding_prefills.get().saturating_add(1));
+            StubModel.forward(input_ids, caches, mask)
+        }
+
+        fn make_caches(&self) -> Vec<KVCache> {
+            vec![KVCache::new()]
+        }
+
+        fn num_layers(&self) -> usize {
+            1
+        }
+
+        fn eos_token_ids(&self) -> Vec<i32> {
+            vec![99]
+        }
+    }
     struct AllowOnly(i32);
 
     impl TokenConstraint for AllowOnly {
@@ -3402,5 +3664,101 @@ mod tests {
             result.stop_reason,
             GenerationStopReason::CallbackCancelled
         );
+    }
+
+    #[test]
+    fn controlled_embedding_generation_uses_embeddings_only_for_prefill() {
+        let model = EmbeddingTrackingModel::new();
+        let embeddings = ffi::from_slice_f32(&[0.0; 4], &[1, 1, 4]);
+        let mut generator = CxxGenerator::new(1);
+        let result = generator
+            .generate_streaming_controlled_with_embeddings(
+                &model,
+                &[1],
+                Some(&embeddings),
+                None,
+                None,
+                3,
+                &SamplingConfig::greedy(),
+                None,
+                false,
+                |_| true,
+            )
+            .expect("embedding generation");
+        assert_eq!(result.token_ids, vec![1, 1, 1]);
+        assert_eq!(model.embedding_prefills.get(), 1);
+        assert_eq!(model.token_forwards.get(), 2);
+    }
+
+    #[test]
+    fn controlled_embedding_generation_applies_constraints_after_prefill() {
+        let model = EmbeddingTrackingModel::new();
+        let embeddings = ffi::from_slice_f32(&[0.0; 4], &[1, 1, 4]);
+        let mut constraint = AllowOnly(2);
+        let result = CxxGenerator::new(1)
+            .generate_streaming_controlled_with_embeddings(
+                &model,
+                &[1],
+                Some(&embeddings),
+                None,
+                None,
+                1,
+                &SamplingConfig::greedy(),
+                Some(&mut constraint),
+                false,
+                |_| true,
+            )
+            .expect("constrained embedding generation");
+        assert_eq!(result.token_ids, vec![2]);
+    }
+
+    #[test]
+    fn controlled_embedding_generation_reports_callback_cancellation() {
+        let model = EmbeddingTrackingModel::new();
+        let embeddings = ffi::from_slice_f32(&[0.0; 4], &[1, 1, 4]);
+        let mut emissions = 0;
+        let result = CxxGenerator::new(1)
+            .generate_streaming_controlled_with_embeddings(
+                &model,
+                &[1],
+                Some(&embeddings),
+                None,
+                None,
+                4,
+                &SamplingConfig::greedy(),
+                None,
+                false,
+                |_| {
+                    emissions += 1;
+                    false
+                },
+            )
+            .expect("cancelled embedding generation");
+        assert_eq!(emissions, 1);
+        assert_eq!(result.token_ids.len(), 1);
+        assert_eq!(
+            result.stop_reason,
+            GenerationStopReason::CallbackCancelled
+        );
+    }
+
+    #[test]
+    fn original_controlled_generation_remains_token_only() {
+        let model = EmbeddingTrackingModel::new();
+        let result = CxxGenerator::new(1)
+            .generate_streaming_controlled(
+                &model,
+                &[1],
+                None,
+                2,
+                &SamplingConfig::greedy(),
+                None,
+                false,
+                |_| true,
+            )
+            .expect("token controlled generation");
+        assert_eq!(result.token_ids, vec![1, 1]);
+        assert_eq!(model.embedding_prefills.get(), 0);
+        assert!(model.token_forwards.get() > 0);
     }
 }

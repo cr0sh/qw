@@ -6,15 +6,21 @@ use mlxcel_core::generate::{
     ControlledGeneration, CxxGenerator, GenerationStats, GenerationStopReason, LanguageModel,
     ModelStateSnapshot, PrefixReuse, SamplingConfig, TokenConstraint,
 };
+use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use tokenizers::Tokenizer;
 
 pub use crate::chat_template::{
-    ChatMessage, ChatTool, ChatToolCall, ChatToolCallFunction, ChatToolFunction,
+    ChatContentPart, ChatContentRef, ChatImageUrl, ChatMessage, ChatMessageContent, ChatTool,
+    ChatToolCall, ChatToolCallFunction, ChatToolFunction,
 };
 use crate::chat_template::ChatTemplateProcessor;
 use crate::qwen3_5::Qwen35Model;
 pub use crate::qwen3_5_mtp::MtpGenerationStats;
+use crate::qwen_vl::insert_qwen_vl_image_tokens;
+use crate::qwen_vl_merge::merge_llava;
+use crate::qwen_vl_position::compute_rope_index;
+use crate::qwen_vl_processor::{PreparedImage, QwenVLProcessor};
 use crate::qwen3_5_mtp::Qwen35MtpGenerator;
 
 const PRODUCTION_MTP_BLOCK_SIZE: usize = 4;
@@ -43,6 +49,13 @@ pub struct BaselineGeneration {
     pub cached_tokens: usize,
     pub finish_outcome: GenerationStopReason,
     pub prompt_snapshot: Option<ModelStateSnapshot>,
+}
+
+pub struct PreparedMultimodalPrefill {
+    pub prompt_ids: Vec<i32>,
+    input_embeddings: UniquePtr<MlxArray>,
+    position_ids: UniquePtr<MlxArray>,
+    rope_delta: i32,
 }
 
 struct IncrementalTextDecoder<'a> {
@@ -123,6 +136,7 @@ pub struct Qwen35Provider {
     defaults: GenerationDefaults,
     generator: CxxGenerator,
     mtp_generator: Option<Qwen35MtpGenerator>,
+    vision_processor: Option<QwenVLProcessor>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -173,6 +187,16 @@ impl Qwen35Provider {
         let chat_template = ChatTemplateProcessor::from_model_path(model_dir)?;
         let defaults = load_generation_defaults(model_dir)?;
         let model = Qwen35Model::load(model_dir)?;
+        if model.has_vision() {
+            ensure!(
+                chat_template.supports_image_content(),
+                "unsupported Qwen3.5-VL chat template: expected image/vision marker behavior"
+            );
+        }
+        let vision_processor = model
+            .vision_config()
+            .map(|vision| load_vision_processor(model_dir, vision))
+            .transpose()?;
         let generator = CxxGenerator::new(model.num_layers());
         let mtp_generator = model.has_mtp().then(Qwen35MtpGenerator::new);
 
@@ -183,6 +207,7 @@ impl Qwen35Provider {
             defaults,
             generator,
             mtp_generator,
+            vision_processor,
         })
     }
 
@@ -196,6 +221,10 @@ impl Qwen35Provider {
 
     pub fn eos_token_id(&self) -> u32 {
         self.defaults.stop_token_ids[0] as u32
+    }
+
+    pub fn supports_image_inputs(&self) -> bool {
+        self.vision_processor.is_some() && self.model.has_vision()
     }
 
     pub fn render_messages(
@@ -229,6 +258,100 @@ impl Qwen35Provider {
         Ok(prompt_ids)
     }
 
+    pub fn prepare_image(
+        &self,
+        width: u32,
+        height: u32,
+        rgb: Vec<u8>,
+    ) -> Result<PreparedImage> {
+        self.vision_processor
+            .as_ref()
+            .context("model does not support image inputs")?
+            .prepare_rgb_bytes(width, height, rgb)
+    }
+
+    pub fn prepare_multimodal_prefill(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ChatTool],
+        images: &[PreparedImage],
+    ) -> Result<PreparedMultimodalPrefill> {
+        ensure!(!images.is_empty(), "image prefill requires at least one image");
+        ensure!(
+            self.supports_image_inputs(),
+            "model does not support image inputs"
+        );
+        let declared_images = messages
+            .iter()
+            .flat_map(ChatMessage::image_urls)
+            .count();
+        ensure!(
+            declared_images == images.len(),
+            "prepared image count does not match rendered image count"
+        );
+        let vision_config = self
+            .model
+            .vision_config()
+            .context("model does not support image inputs")?;
+        let (image_token_id, video_token_id, vision_start_token_id) = self
+            .model
+            .multimodal_token_ids()
+            .context("model does not support image inputs")?;
+        let grids = images.iter().map(|image| image.grid_thw).collect::<Vec<_>>();
+        let mut prompt_ids = self.tokenize_messages(messages, tools)?;
+        let expansion = insert_qwen_vl_image_tokens(
+            &mut prompt_ids,
+            &grids,
+            vision_config.spatial_merge_size,
+            vision_start_token_id,
+            image_token_id,
+        )?;
+        let input_ids =
+            mlxcel_core::from_slice_i32(&prompt_ids, &[1, prompt_ids.len() as i32]);
+        let text_embeddings = self
+            .model
+            .embed_tokens(&input_ids)
+            .context("Qwen3.5 input embeddings are unavailable")?;
+        let mut pixel_values = images[0].to_mlx();
+        for image in &images[1..] {
+            pixel_values = mlxcel_core::concatenate(
+                &pixel_values,
+                &image.to_mlx(),
+                0,
+            );
+        }
+        let pixel_values = mlxcel_core::astype(
+            &pixel_values,
+            mlxcel_core::array_dtype(&text_embeddings),
+        );
+        let vision_features = self.model.encode_vision(&pixel_values, &grids)?;
+        ensure!(
+            mlxcel_core::array_shape(&vision_features)[0] as usize
+                == expansion.total_image_tokens,
+            "vision encoder output count does not match expanded image token count"
+        );
+        let input_embeddings = merge_llava(
+            image_token_id,
+            &vision_features,
+            &text_embeddings,
+            &input_ids,
+        )?;
+        let positions = compute_rope_index(
+            &prompt_ids,
+            &grids,
+            vision_config.spatial_merge_size,
+            image_token_id,
+            video_token_id,
+        )?;
+        let position_ids = positions.to_mlx();
+        Ok(PreparedMultimodalPrefill {
+            prompt_ids,
+            input_embeddings,
+            position_ids,
+            rope_delta: positions.rope_delta,
+        })
+    }
+
     pub fn supports_qwen35_tool_calls(&self) -> bool {
         self.chat_template.supports_qwen35_tool_calls()
     }
@@ -260,6 +383,7 @@ impl Qwen35Provider {
         capture_prompt_snapshot: bool,
         mut on_delta: F,
     ) -> Result<BaselineGeneration> {
+        self.model.clear_prepared_mrope();
         let mut decoder = IncrementalTextDecoder::new(&self.tokenizer);
         let mut decode_error = None;
         let controlled: ControlledGeneration = self
@@ -299,6 +423,60 @@ impl Qwen35Provider {
             cached_tokens: controlled.cached_tokens,
             finish_outcome: controlled.stop_reason,
             prompt_snapshot: controlled.prompt_snapshot,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_multimodal_streaming<F: FnMut(&str) -> bool>(
+        &mut self,
+        prefill: PreparedMultimodalPrefill,
+        max_tokens: usize,
+        sampling: &SamplingConfig,
+        constraint: Option<&mut dyn TokenConstraint>,
+        mut on_delta: F,
+    ) -> Result<BaselineGeneration> {
+        self.model
+            .prepare_mrope(&prefill.position_ids, prefill.rope_delta);
+        let mut decoder = IncrementalTextDecoder::new(&self.tokenizer);
+        let mut decode_error = None;
+        let controlled = self
+            .generator
+            .generate_streaming_controlled_with_embeddings(
+                &self.model,
+                &prefill.prompt_ids,
+                Some(&prefill.input_embeddings),
+                None,
+                None,
+                max_tokens,
+                sampling,
+                constraint,
+                false,
+                |token_id| match decoder.push(token_id) {
+                    Ok(delta) => on_delta(&delta),
+                    Err(error) => {
+                        decode_error = Some(error);
+                        false
+                    }
+                },
+            )
+            .map_err(anyhow::Error::msg)
+            .context("multimodal generation failed")?;
+        if let Some(error) = decode_error {
+            return Err(error);
+        }
+        let final_delta = decoder.finish()?;
+        if !final_delta.is_empty() {
+            let _ = on_delta(&final_delta);
+        }
+        let completion_tokens = controlled.token_ids.len();
+        Ok(BaselineGeneration {
+            text: decoder.emitted,
+            token_ids: controlled.token_ids,
+            prompt_tokens: prefill.prompt_ids.len(),
+            completion_tokens,
+            cached_tokens: 0,
+            finish_outcome: controlled.stop_reason,
+            prompt_snapshot: None,
         })
     }
 
@@ -476,6 +654,44 @@ fn initialize_runtime() -> Result<()> {
         Ok(())
     });
     (*INITIALIZED).clone().map_err(anyhow::Error::msg)
+}
+
+fn load_vision_processor(
+    model_dir: &Path,
+    config: &crate::qwen3_vl_vision::Qwen3VLVisionConfig,
+) -> Result<QwenVLProcessor> {
+    let factor = config.patch_size * config.spatial_merge_size;
+    let default_min = 4 * factor * factor;
+    let default_max = 16_384 * factor * factor;
+    let path = model_dir.join("preprocessor_config.json");
+    let value = match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
+            .with_context(|| format!("failed to parse {}", path.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            serde_json::Value::Object(Default::default())
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    let min_pixels = value
+        .get("min_pixels")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(default_min);
+    let max_pixels = value
+        .get("max_pixels")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(default_max);
+    QwenVLProcessor::new(
+        config.patch_size,
+        config.temporal_patch_size,
+        config.spatial_merge_size,
+        min_pixels,
+        max_pixels,
+    )
 }
 
 fn load_generation_defaults(model_dir: &Path) -> Result<GenerationDefaults> {

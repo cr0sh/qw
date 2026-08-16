@@ -1,6 +1,7 @@
 mod engine;
 mod grammar;
 mod prefix_cache;
+mod media;
 pub mod protocol;
 mod tool_calls;
 
@@ -69,12 +70,22 @@ async fn handle(
         Endpoint::Chat => protocol::parse_chat(value),
         Endpoint::Responses => protocol::parse_responses(value),
     };
-    let request = match request {
+    let mut request = match request {
         Ok(request) => request,
         Err(error) => return ApiError::from_request(error).into_response(),
     };
+    if !request.image_params.is_empty() && !state.engine.supports_image_inputs() {
+        return ApiError::invalid(
+            "model does not support image inputs",
+            request.image_params.first().cloned(),
+        )
+        .into_response();
+    }
     if request.model != state.engine.model_id() {
         return ApiError::model_not_found(&request.model).into_response();
+    }
+    if let Err(error) = media::decode_request_images(&mut request) {
+        return ApiError::from_request(error).into_response();
     }
     let stream_requested = request.stream;
     let model_id = state.engine.model_id().to_string();

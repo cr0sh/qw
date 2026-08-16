@@ -22,6 +22,8 @@ use crate::gated_delta::{
 use crate::model_owned::ModelOwnedSequenceState;
 use crate::qwen3_5_mtp::Qwen35MtpDraftModel;
 use crate::qwen_mrope_state::MRopeState;
+use crate::qwen3_vl_vision::{Qwen3VLVisionConfig, Qwen3VLVisionEncoder};
+use crate::qwen_vl_position::decode_rope_positions;
 use crate::qwen3_next::{
     MLP, Quantization, Qwen3NextAttention, Qwen3NextCache, Qwen3NextConfig,
 };
@@ -74,12 +76,20 @@ pub struct Qwen35Config {
     #[serde(default)]
     pub tie_word_embeddings: bool,
     pub vocab_size: usize,
-    #[serde(default)]
+    #[serde(default, alias = "quantization_config")]
     pub quantization: Option<Quantization>,
     #[serde(default)]
     pub mtp_num_hidden_layers: Option<usize>,
     #[serde(default)]
     pub mtp_use_dedicated_embeddings: Option<bool>,
+    #[serde(default)]
+    pub vision_config: Option<Qwen3VLVisionConfig>,
+    #[serde(default)]
+    pub image_token_id: Option<i32>,
+    #[serde(default)]
+    pub video_token_id: Option<i32>,
+    #[serde(default)]
+    pub vision_start_token_id: Option<i32>,
 }
 
 fn default_rms_norm_eps() -> f32 {
@@ -137,6 +147,22 @@ impl Qwen35Config {
             .unwrap_or(0.25)
     }
 
+    pub(crate) fn mrope_section(&self) -> Vec<i32> {
+        self.rope_parameters
+            .as_ref()
+            .and_then(|parameters| parameters.get("mrope_section"))
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_i64)
+                    .map(|value| value as i32)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|sections| sections.len() == 3)
+            .unwrap_or_else(|| vec![11, 11, 10])
+    }
+
     fn head_dim_resolved(&self) -> usize {
         self.head_dim
             .unwrap_or(self.hidden_size / self.num_attention_heads)
@@ -158,6 +184,7 @@ impl Qwen35Config {
             rope_theta: self.rope_theta(),
             partial_rotary_factor: self.partial_rotary_factor(),
             quantization: self.quantization.clone(),
+            mrope_section: self.mrope_section(),
         }
     }
 
@@ -567,7 +594,6 @@ pub(crate) enum Qwen35AttentionVariant {
     Linear(Qwen35GatedDeltaNet),
 }
 
-
 pub(crate) struct Qwen35DecoderLayer {
     pub(crate) is_linear: bool,
     pub(crate) attention: Qwen35AttentionVariant,
@@ -582,27 +608,36 @@ impl Qwen35DecoderLayer {
         x: &MlxArray,
         mask: Option<&MlxArray>,
         cache: &mut Qwen3NextCache,
+        position_ids: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
         let normed = self.input_layernorm.forward(x);
 
-        let r = match (&self.attention, cache) {
-            (Qwen35AttentionVariant::Linear(attn), Qwen3NextCache::Linear(c)) => {
-                attn.forward(&normed, mask, Some(c))
+        let residual = match (&self.attention, cache) {
+            (Qwen35AttentionVariant::Linear(attention), Qwen3NextCache::Linear(cache)) => {
+                attention.forward(&normed, mask, Some(cache))
             }
-            (Qwen35AttentionVariant::Linear(attn), _) => attn.forward(&normed, mask, None),
-            (Qwen35AttentionVariant::FullAttention(attn), Qwen3NextCache::Attention(c)) => {
-                attn.forward(&normed, c, mask)
+            (Qwen35AttentionVariant::Linear(attention), _) => {
+                attention.forward(&normed, mask, None)
             }
-            (Qwen35AttentionVariant::FullAttention(attn), _) => {
-                let mut temp_cache = KVCache::new();
-                attn.forward(&normed, &mut temp_cache, mask)
+            (
+                Qwen35AttentionVariant::FullAttention(attention),
+                Qwen3NextCache::Attention(cache),
+            ) => attention.forward_with_position_ids(&normed, cache, mask, position_ids),
+            (Qwen35AttentionVariant::FullAttention(attention), _) => {
+                let mut temporary = KVCache::new();
+                attention.forward_with_position_ids(
+                    &normed,
+                    &mut temporary,
+                    mask,
+                    position_ids,
+                )
             }
         };
-
-        let h = mlxcel_core::add(x, &r);
-
-        let mlp_out = self.mlp.forward(&self.post_attention_layernorm.forward(&h));
-        mlxcel_core::add(&h, &mlp_out)
+        let hidden = mlxcel_core::add(x, &residual);
+        let mlp = self
+            .mlp
+            .forward(&self.post_attention_layernorm.forward(&hidden));
+        mlxcel_core::add(&hidden, &mlp)
     }
 
     fn forward_with_capture(
@@ -725,6 +760,7 @@ pub struct Qwen35Model {
     pub(crate) lm_head: Option<UnifiedLinear>,
     pub(crate) config: Qwen35Config,
     mtp: Option<Qwen35MtpDraftModel>,
+    vision: Option<Qwen3VLVisionEncoder>,
     /// Model-owned heterogeneous cache state used by one synchronous sequence.
     sequence_state: ModelOwnedSequenceState<Qwen3NextCache>,
     /// MRoPE position state retained for the Qwen3.5 text path.
@@ -737,15 +773,27 @@ impl Qwen35Model {
         input_ids: &MlxArray,
         caches: &mut [Qwen3NextCache],
     ) -> UniquePtr<MlxArray> {
-        let mut hidden = self.embed_tokens.forward(input_ids);
-        let seq_len = mlxcel_core::array_shape(&hidden)[1];
+        self.forward_backbone_with_inputs(input_ids, None, caches, None)
+    }
+
+    fn forward_backbone_with_inputs(
+        &self,
+        input_ids: &MlxArray,
+        input_embeddings: Option<&MlxArray>,
+        caches: &mut [Qwen3NextCache],
+        position_ids: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let mut hidden = input_embeddings
+            .map(mlxcel_core::copy)
+            .unwrap_or_else(|| self.embed_tokens.forward(input_ids));
+        let sequence_length = mlxcel_core::array_shape(&hidden)[1];
         let attention_layer = self.config.full_attention_interval.saturating_sub(1);
-        let attention_mask = if seq_len > 1 {
+        let attention_mask = if sequence_length > 1 {
             let offset = caches
                 .get(attention_layer)
                 .map(Qwen3NextCache::offset)
                 .unwrap_or(0);
-            Some(create_causal_mask(seq_len, offset))
+            Some(create_causal_mask(sequence_length, offset))
         } else {
             None
         };
@@ -756,7 +804,7 @@ impl Qwen35Model {
             } else {
                 attention_mask.as_deref()
             };
-            hidden = layer.forward(&hidden, mask, cache);
+            hidden = layer.forward(&hidden, mask, cache, position_ids);
         }
         hidden
     }
@@ -826,6 +874,47 @@ impl Qwen35Model {
 
     pub(crate) fn vocab_size(&self) -> usize {
         self.config.vocab_size
+    }
+
+    pub(crate) fn has_vision(&self) -> bool {
+        self.vision.is_some()
+    }
+
+    pub(crate) fn vision_config(&self) -> Option<&Qwen3VLVisionConfig> {
+        self.config.vision_config.as_ref()
+    }
+
+    pub(crate) fn multimodal_token_ids(&self) -> Option<(i32, i32, i32)> {
+        Some((
+            self.config.image_token_id?,
+            self.config.video_token_id?,
+            self.config.vision_start_token_id?,
+        ))
+    }
+
+    pub(crate) fn encode_vision(
+        &self,
+        pixel_values: &MlxArray,
+        grids: &[(i32, i32, i32)],
+    ) -> Result<UniquePtr<MlxArray>> {
+        let vision = self
+            .vision
+            .as_ref()
+            .context("model does not support image inputs")?;
+        let output = vision.forward_with_grid(pixel_values, grids);
+        ensure!(
+            output.deepstack_features.is_empty(),
+            "Qwen3.5 DeepStack vision features are not supported"
+        );
+        Ok(output.hidden_states)
+    }
+
+    pub(crate) fn prepare_mrope(&self, position_ids: &MlxArray, rope_delta: i32) {
+        self.mrope_state.prepare(position_ids, rope_delta);
+    }
+
+    pub(crate) fn clear_prepared_mrope(&self) {
+        self.mrope_state.clear_prepared();
     }
 
     pub(crate) fn mtp(&self) -> Option<&Qwen35MtpDraftModel> {
@@ -1041,14 +1130,32 @@ impl Qwen35Model {
             }
         }
 
-        if let Some(quantization) = root_object.get("quantization") {
+        if let Some(quantization) = root_object
+            .get("quantization")
+            .or_else(|| root_object.get("quantization_config"))
+        {
             validate_quantization(quantization, &config_path)?;
             text_object.insert("quantization".to_string(), quantization.clone());
-        } else if let Some(quantization) = text_object.get("quantization") {
+        } else if let Some(quantization) = text_object
+            .get("quantization")
+            .or_else(|| text_object.get("quantization_config"))
+        {
             validate_quantization(quantization, &config_path)?;
         }
 
-        let config: Qwen35Config = serde_json::from_value(text_config)
+        for key in [
+            "vision_config",
+            "image_token_id",
+            "video_token_id",
+            "vision_start_token_id",
+            "rope_parameters",
+        ] {
+            if let Some(value) = root_object.get(key) {
+                text_object.insert(key.to_string(), value.clone());
+            }
+        }
+
+        let mut config: Qwen35Config = serde_json::from_value(text_config)
             .with_context(|| format!("failed to parse dense text config in {}", config_path.display()))?;
         ensure!(
             config.model_type == "qwen3_5" || config.model_type == "qwen3_5_text",
@@ -1076,6 +1183,64 @@ impl Qwen35Model {
             config_path.display()
         );
         config.validate_mtp_metadata(&config_path)?;
+        let root_quantization = config.quantization.clone();
+        if let Some(vision) = config.vision_config.as_mut() {
+            if let Some(quantization) = vision
+                .quantization_config
+                .as_ref()
+                .or(root_quantization.as_ref())
+            {
+                ensure!(
+                    quantization.mode == "affine",
+                    "unsupported vision quantization mode {:?} in {}",
+                    quantization.mode,
+                    config_path.display()
+                );
+                vision.quant_group_size = quantization.group_size;
+                vision.quant_bits = quantization.bits;
+            }
+        }
+        if let Some(vision) = config.vision_config.as_ref() {
+            ensure!(
+                vision.deepstack_visual_indexes.is_empty(),
+                "Qwen3.5-VL checkpoints with DeepStack visual indexes are not supported"
+            );
+            ensure!(
+                vision.out_hidden_size == config.hidden_size,
+                "vision output width must match the text hidden size in {}",
+                config_path.display()
+            );
+            ensure!(
+                config.image_token_id.is_some()
+                    && config.video_token_id.is_some()
+                    && config.vision_start_token_id.is_some(),
+                "Qwen3.5-VL config in {} is missing multimodal token identifiers",
+                config_path.display()
+            );
+            if let Some(raw_sections) = config
+                .rope_parameters
+                .as_ref()
+                .and_then(|parameters| parameters.get("mrope_section"))
+            {
+                ensure!(
+                    raw_sections.as_array().is_some_and(|values| {
+                        values.len() == 3 && values.iter().all(|value| value.as_i64().is_some())
+                    }),
+                    "rope_parameters.mrope_section must contain three integers in {}",
+                    config_path.display()
+                );
+            }
+            let sections = config.mrope_section();
+            let rotary_half = ((config.head_dim_resolved() as f32
+                * config.partial_rotary_factor()) as i32)
+                / 2;
+            ensure!(
+                sections.iter().all(|&section| section > 0)
+                    && sections.iter().sum::<i32>() == rotary_half,
+                "rope_parameters.mrope_section is incompatible with the rotary dimension in {}",
+                config_path.display()
+            );
+        }
         Ok(config)
     }
 
@@ -1126,12 +1291,17 @@ impl Qwen35Model {
 
         let weights = mlxcel_core::weights::load_weights_from_dir_filtered(model_dir, |name| {
             name.starts_with("language_model.")
+                || name.starts_with("model.language_model.")
+                || name.starts_with("model.visual.")
+                || name.starts_with("visual.")
+                || name.starts_with("vision_tower.")
+                || name.starts_with("lm_head.")
         })
         .map_err(anyhow::Error::msg)
         .with_context(|| format!("failed to load checkpoint shards from {}", model_dir.display()))?;
         ensure!(
             !weights.is_empty(),
-            "checkpoint {} contains no language_model.* tensors",
+            "checkpoint {} contains no Qwen3.5 model tensors",
             model_dir.display()
         );
         let weights = sanitize_language_model_weights(weights, &config, model_dir)?;
@@ -1153,6 +1323,27 @@ impl Qwen35Model {
                             model_dir.display()
                         )
                     })?,
+            );
+        }
+        if let Some(mut vision_config) = config.vision_config.clone() {
+            if vision_config.quantization_config.is_none() {
+                let (group_size, bits) = config.quant_params("model.visual");
+                vision_config.quant_group_size = group_size;
+                vision_config.quant_bits = bits;
+            }
+            model.vision = Some(
+                Qwen3VLVisionEncoder::from_weights(
+                    &weights.vision,
+                    &vision_config,
+                    "vision_tower",
+                )
+                .map_err(anyhow::Error::msg)
+                .with_context(|| {
+                    format!(
+                        "failed to construct Qwen3.5 vision encoder from checkpoint {}",
+                        model_dir.display()
+                    )
+                })?,
             );
         }
         Ok(model)
@@ -1211,6 +1402,7 @@ impl Qwen35Model {
             lm_head,
             config: config.clone(),
             mtp: None,
+            vision: None,
             sequence_state: ModelOwnedSequenceState::new(internal_caches),
             mrope_state: MRopeState::new(),
         })
@@ -1347,6 +1539,7 @@ pub(crate) fn sanitize_weights(mut weights: WeightMap, config: &Qwen35Config) ->
 
 struct SanitizedLanguageWeights {
     target: WeightMap,
+    vision: WeightMap,
     mtp: Option<WeightMap>,
 }
 
@@ -1356,20 +1549,40 @@ fn sanitize_language_model_weights(
     checkpoint_path: &Path,
 ) -> Result<SanitizedLanguageWeights> {
     let mut target = WeightMap::new();
+    let mut vision = WeightMap::new();
     let mut mtp = WeightMap::new();
     for (name, value) in weights {
-        let Some(name) = name.strip_prefix("language_model.") else {
-            continue;
-        };
-        if name.starts_with("visual.") || name.starts_with("vision_tower.") {
-            continue;
-        }
-        if name.starts_with("mtp.") {
-            mtp.insert(name.to_string(), value);
+        let normalized = if let Some(rest) = name.strip_prefix("model.language_model.") {
+            format!("model.{rest}")
+        } else if let Some(rest) = name.strip_prefix("language_model.") {
+            rest.to_string()
         } else {
-            target.insert(name.to_string(), value);
+            name
+        };
+        if let Some(rest) = normalized
+            .strip_prefix("model.visual.")
+            .or_else(|| normalized.strip_prefix("visual."))
+            .or_else(|| normalized.strip_prefix("vision_tower."))
+        {
+            vision.insert(format!("vision_tower.{rest}"), value);
+        } else if let Some(rest) = normalized.strip_prefix("model.mtp.") {
+            mtp.insert(format!("mtp.{rest}"), value);
+        } else if normalized.starts_with("mtp.") {
+            mtp.insert(normalized, value);
+        } else {
+            target.insert(normalized, value);
         }
     }
+    ensure!(
+        config.vision_config.is_some() || vision.is_empty(),
+        "checkpoint {} contains vision tensors but config.json has no vision_config",
+        checkpoint_path.display()
+    );
+    ensure!(
+        config.vision_config.is_none() || !vision.is_empty(),
+        "checkpoint {} declares vision_config but contains no vision tensors",
+        checkpoint_path.display()
+    );
 
     let declared = config.has_mtp_metadata();
     ensure!(
@@ -1396,6 +1609,7 @@ fn sanitize_language_model_weights(
     };
     Ok(SanitizedLanguageWeights {
         target: sanitize_weights(target, config),
+        vision,
         mtp,
     })
 }
@@ -1565,8 +1779,19 @@ impl LanguageModel for Qwen35Model {
         _caches: &mut [KVCache],
         _mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
+        let sequence_length = mlxcel_core::array_shape(input)[1];
+        let rope_delta = self.mrope_state.rope_delta();
         let (logits, offset) = self.sequence_state.with_internal(|caches| {
-            let logits = self.forward_internal(input, caches);
+            let cache_offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
+            let position_ids = rope_delta
+                .map(|delta| decode_rope_positions(cache_offset, sequence_length, delta));
+            let hidden = self.forward_backbone_with_inputs(
+                input,
+                None,
+                caches,
+                position_ids.as_deref(),
+            );
+            let logits = self.project_logits(&self.norm.forward(&hidden));
             let offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
             (logits, offset)
         });
@@ -1581,13 +1806,78 @@ impl LanguageModel for Qwen35Model {
         _mask: Option<&MlxArray>,
         last_pos: usize,
     ) -> UniquePtr<MlxArray> {
+        let sequence_length = mlxcel_core::array_shape(input_ids)[1];
+        let rope_delta = self.mrope_state.rope_delta();
         let (logits, offset) = self.sequence_state.with_internal(|caches| {
-            let logits = self.forward_last_internal(input_ids, caches, last_pos);
+            let cache_offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
+            let position_ids = rope_delta
+                .map(|delta| decode_rope_positions(cache_offset, sequence_length, delta));
+            let hidden = self.forward_backbone_with_inputs(
+                input_ids,
+                None,
+                caches,
+                position_ids.as_deref(),
+            );
+            let shape = mlxcel_core::array_shape(&hidden);
+            let position = i32::try_from(last_pos).unwrap_or(i32::MAX);
+            assert!(
+                position < shape[1],
+                "last logits position is outside the input sequence"
+            );
+            let hidden = mlxcel_core::slice(
+                &hidden,
+                &[0, position, 0],
+                &[shape[0], position + 1, shape[2]],
+            );
+            let logits = self.project_logits(&self.norm.forward(&hidden));
             let offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
             (logits, offset)
         });
         self.mrope_state.set_position(offset);
         logits
+    }
+
+    fn forward_with_embeddings(
+        &self,
+        input_ids: &MlxArray,
+        input_embeddings: Option<&MlxArray>,
+        _caches: &mut [KVCache],
+        _mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let (logits, offset) = self.sequence_state.with_internal(|caches| {
+            let hidden = self.mrope_state.with_position_ids(|position_ids| {
+                self.forward_backbone_with_inputs(
+                    input_ids,
+                    input_embeddings,
+                    caches,
+                    position_ids,
+                )
+            });
+            let logits = self.project_logits(&self.norm.forward(&hidden));
+            let offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
+            (logits, offset)
+        });
+        self.mrope_state.set_position(offset);
+        logits
+    }
+
+    fn embed_tokens(&self, input_ids: &MlxArray) -> Option<UniquePtr<MlxArray>> {
+        Some(self.embed_tokens.forward(input_ids))
+    }
+
+    fn output_suppressed_token_ids(&self) -> Vec<i32> {
+        [self.config.image_token_id, self.config.video_token_id]
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    fn prepare_embedding_prefill(&self) -> std::result::Result<(), String> {
+        self.mrope_state.activate_prepared()
+    }
+
+    fn after_prefill(&self) {
+        self.mrope_state.finish_prefill();
     }
 
     fn make_caches(&self) -> Vec<KVCache> {
@@ -2150,6 +2440,37 @@ mod tests {
         );
         mlxcel_core::eval(&close);
         assert!(mlxcel_core::item_bool(&close));
+    }
+
+    #[test]
+    fn sanitizer_partitions_visual_weights_without_dropping_text_weights() {
+        let mut config = dense_config(None);
+        config.vision_config = Some(
+            serde_json::from_value(serde_json::json!({
+                "hidden_size": 8,
+                "out_hidden_size": 16,
+                "deepstack_visual_indexes": []
+            }))
+            .expect("vision config"),
+        );
+        let mut weights = WeightMap::new();
+        weights.insert(
+            "model.visual.patch_embed.proj.weight".to_string(),
+            mlxcel_core::from_slice_f32(&[1.0], &[1]),
+        );
+        weights.insert(
+            "model.language_model.embed_tokens.weight".to_string(),
+            mlxcel_core::from_slice_f32(&[2.0], &[1]),
+        );
+        let sanitized =
+            sanitize_language_model_weights(weights, &config, Path::new("/checkpoint"))
+                .expect("partition weights");
+        assert!(
+            sanitized
+                .vision
+                .contains_key("vision_tower.patch_embed.proj.weight")
+        );
+        assert!(sanitized.target.contains_key("model.embed_tokens.weight"));
     }
 
     #[test]

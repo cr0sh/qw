@@ -15,6 +15,7 @@
 //! Shared dense Qwen3.5 attention, MLP, quantization, and cache primitives.
 
 use crate::gated_delta::GatedDeltaCache;
+use crate::qwen_mrope::{InterleavedMRoPE, apply_multimodal_rotary_pos_emb};
 use mlxcel_core::layers::{FusedQKVLinear, KVCache, RMSNorm, UnifiedLinear};
 use mlxcel_core::utils::silu;
 use mlxcel_core::weights::WeightMap;
@@ -47,6 +48,7 @@ pub struct Qwen3NextConfig {
     pub rope_theta: f32,
     pub partial_rotary_factor: f32,
     pub quantization: Option<Quantization>,
+    pub mrope_section: Vec<i32>,
 }
 
 impl Qwen3NextConfig {
@@ -101,6 +103,7 @@ pub(crate) struct Qwen3NextAttention {
     scale: f32,
     rope_dims: i32,
     rope_base: f32,
+    mrope: InterleavedMRoPE,
 }
 
 impl Qwen3NextAttention {
@@ -110,7 +113,17 @@ impl Qwen3NextAttention {
         cache: &mut KVCache,
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        let output = self.forward_impl(x, cache, mask, false);
+        self.forward_with_position_ids(x, cache, mask, None)
+    }
+
+    pub(crate) fn forward_with_position_ids(
+        &self,
+        x: &MlxArray,
+        cache: &mut KVCache,
+        mask: Option<&MlxArray>,
+        position_ids: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let output = self.forward_impl(x, cache, mask, position_ids, false);
         self.o_proj.forward(&output)
     }
 
@@ -122,7 +135,7 @@ impl Qwen3NextAttention {
         cache: &mut KVCache,
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        let output = self.forward_impl(x, cache, mask, true);
+        let output = self.forward_impl(x, cache, mask, None, true);
         self.o_proj.forward(&output)
     }
 
@@ -133,6 +146,7 @@ impl Qwen3NextAttention {
         x: &MlxArray,
         cache: &mut KVCache,
         mask: Option<&MlxArray>,
+        position_ids: Option<&MlxArray>,
         target_verify: bool,
     ) -> UniquePtr<MlxArray> {
         let shape = mlxcel_core::array_shape(x);
@@ -173,24 +187,57 @@ impl Qwen3NextAttention {
         let values = mlxcel_core::transpose_axes(&values, &[0, 2, 1, 3]);
 
         let offset = cache.offset;
-
-        // Dense text checkpoints use standard RoPE with the cache offset.
-        queries = mlxcel_core::fast_rope(
-            &queries,
-            self.rope_dims,
-            false,
-            self.rope_base,
-            1.0,
-            offset,
-        );
-        keys = mlxcel_core::fast_rope(
-            &keys,
-            self.rope_dims,
-            false,
-            self.rope_base,
-            1.0,
-            offset,
-        );
+        if let Some(position_ids) = position_ids {
+            let (cosine, sine) = self.mrope.forward(position_ids);
+            let dtype = mlxcel_core::array_dtype(&queries);
+            let cosine = mlxcel_core::astype(&cosine, dtype);
+            let sine = mlxcel_core::astype(&sine, dtype);
+            let query_rotary = mlxcel_core::slice(
+                &queries,
+                &[0, 0, 0, 0],
+                &[b, self.num_heads, l, self.rope_dims],
+            );
+            let query_pass = mlxcel_core::slice(
+                &queries,
+                &[0, 0, 0, self.rope_dims],
+                &[b, self.num_heads, l, self.head_dim],
+            );
+            let key_rotary = mlxcel_core::slice(
+                &keys,
+                &[0, 0, 0, 0],
+                &[b, self.num_kv_heads, l, self.rope_dims],
+            );
+            let key_pass = mlxcel_core::slice(
+                &keys,
+                &[0, 0, 0, self.rope_dims],
+                &[b, self.num_kv_heads, l, self.head_dim],
+            );
+            let (query_rotary, key_rotary) = apply_multimodal_rotary_pos_emb(
+                &query_rotary,
+                &key_rotary,
+                &cosine,
+                &sine,
+            );
+            queries = mlxcel_core::concatenate(&query_rotary, &query_pass, -1);
+            keys = mlxcel_core::concatenate(&key_rotary, &key_pass, -1);
+        } else {
+            queries = mlxcel_core::fast_rope(
+                &queries,
+                self.rope_dims,
+                false,
+                self.rope_base,
+                1.0,
+                offset,
+            );
+            keys = mlxcel_core::fast_rope(
+                &keys,
+                self.rope_dims,
+                false,
+                self.rope_base,
+                1.0,
+                offset,
+            );
+        }
 
         // Update KV cache
         let (cache_k, cache_v) = cache.update_and_fetch(keys, values);
@@ -312,6 +359,11 @@ impl Qwen3NextAttention {
             scale: 1.0 / (head_dim as f32).sqrt(),
             rope_dims: config.rope_dims(),
             rope_base: config.rope_theta,
+            mrope: InterleavedMRoPE::new(
+                config.rope_dims() as usize,
+                config.rope_theta,
+                config.mrope_section.clone(),
+            ),
         })
     }
 }
@@ -433,6 +485,7 @@ mod tests {
                 rope_theta: 10_000.0,
                 partial_rotary_factor: 1.0,
                 quantization: None,
+                mrope_section: vec![1, 1, 1],
             },
             "self_attn",
         )
