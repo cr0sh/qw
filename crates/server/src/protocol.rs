@@ -58,6 +58,7 @@ pub struct CompletionRequest {
     pub tool_choice: ToolChoice,
     pub parallel_tool_calls: bool,
     pub reasoning_effort: Option<ReasoningEffort>,
+    pub enable_thinking: bool,
     pub stream: bool,
     pub stream_include_usage: bool,
     pub max_tokens: usize,
@@ -120,6 +121,11 @@ struct ChatWire {
     max_completion_tokens: Option<usize>,
     max_tokens: Option<usize>,
     reasoning_effort: Option<String>,
+    #[serde(rename = "preserve_thinking")]
+    _preserve_thinking: Option<bool>,
+    enable_thinking: Option<bool>,
+    #[serde(rename = "chat_template_kwargs")]
+    _chat_template_kwargs: Option<Map<String, Value>>,
     temperature: Option<f32>,
     top_p: Option<f32>,
     seed: Option<u64>,
@@ -262,6 +268,20 @@ pub fn parse_chat(value: Value) -> Result<CompletionRequest, RequestError> {
         .unwrap_or(DEFAULT_MAX_TOKENS);
     validate_sampling(max_tokens, wire.temperature, wire.top_p)?;
     let reasoning_effort = parse_reasoning_effort(wire.reasoning_effort.as_deref())?;
+    let template_enable_thinking = wire
+        ._chat_template_kwargs
+        .as_ref()
+        .and_then(|kwargs| kwargs.get("enable_thinking"))
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                RequestError::at(
+                    "chat_template_kwargs.enable_thinking must be a boolean",
+                    "chat_template_kwargs.enable_thinking",
+                )
+            })
+        })
+        .transpose()?;
+    let enable_thinking = wire.enable_thinking.or(template_enable_thinking).unwrap_or(true);
     let output_format = parse_chat_format(wire.response_format)?;
     let tools = parse_tools(wire.tools.as_deref().unwrap_or_default(), ToolDialect::Chat)?;
     if !tools.is_empty() && !matches!(output_format, OutputFormat::Text) {
@@ -280,6 +300,7 @@ pub fn parse_chat(value: Value) -> Result<CompletionRequest, RequestError> {
         tools,
         tool_choice,
         reasoning_effort,
+        enable_thinking,
         parallel_tool_calls: wire.parallel_tool_calls.unwrap_or(true),
         stream: wire.stream,
         stream_include_usage: wire
@@ -343,6 +364,7 @@ pub fn parse_responses(value: Value) -> Result<CompletionRequest, RequestError> 
         tools,
         tool_choice,
         reasoning_effort: None,
+        enable_thinking: true,
         parallel_tool_calls: wire.parallel_tool_calls.unwrap_or(true),
         stream: wire.stream,
         stream_include_usage: false,

@@ -227,9 +227,10 @@ impl Qwen35Provider {
         messages: &[ChatMessage],
         tools: &[ChatTool],
         reasoning_effort: Option<&str>,
+        enable_thinking: bool,
     ) -> Result<String> {
         self.chat_template
-            .render_messages(messages, tools, reasoning_effort)
+            .render_messages(messages, tools, reasoning_effort, enable_thinking)
     }
 
     pub fn tokenize_messages(
@@ -237,8 +238,10 @@ impl Qwen35Provider {
         messages: &[ChatMessage],
         tools: &[ChatTool],
         reasoning_effort: Option<&str>,
+        enable_thinking: bool,
     ) -> Result<Vec<i32>> {
-        let rendered = self.render_messages(messages, tools, reasoning_effort)?;
+        let rendered =
+            self.render_messages(messages, tools, reasoning_effort, enable_thinking)?;
         let encoded = self
             .tokenizer
             .encode(rendered, true)
@@ -268,6 +271,7 @@ impl Qwen35Provider {
         messages: &[ChatMessage],
         tools: &[ChatTool],
         reasoning_effort: Option<&str>,
+        enable_thinking: bool,
         images: &[PreparedImage],
     ) -> Result<PreparedMultimodalPrefill> {
         ensure!(
@@ -295,7 +299,8 @@ impl Qwen35Provider {
             .iter()
             .map(|image| image.grid_thw)
             .collect::<Vec<_>>();
-        let mut prompt_ids = self.tokenize_messages(messages, tools, reasoning_effort)?;
+        let mut prompt_ids =
+            self.tokenize_messages(messages, tools, reasoning_effort, enable_thinking)?;
         let expansion = insert_qwen_vl_image_tokens(
             &mut prompt_ids,
             &grids,
