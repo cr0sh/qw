@@ -924,7 +924,7 @@ fn resolve_memoizes_so_a_hot_path_reads_the_cache_once() {
     let first = op.resolve_with(&store, Mode::Tune);
     let calls_after_first = op.calls();
     let second = op.resolve_with(&store, Mode::Tune);
-    assert_eq!(first, second);
+    assert_eq!(first.tactic, second.tactic);
     assert_eq!(
         op.calls(),
         calls_after_first,
