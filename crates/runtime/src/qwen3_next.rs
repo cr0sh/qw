@@ -112,7 +112,8 @@ impl Qwen3NextAttention {
         cache: &mut KVCache,
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        self.forward_impl(x, cache, mask, false)
+        let output = self.forward_impl(x, cache, mask, false);
+        self.o_proj.forward(&output)
     }
 
     /// Verify-only path from the checked-in mlxcel commit 4038da96. Each
@@ -123,7 +124,8 @@ impl Qwen3NextAttention {
         cache: &mut KVCache,
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        self.forward_impl(x, cache, mask, true)
+        let output = self.forward_impl(x, cache, mask, true);
+        self.o_proj.forward(&output)
     }
 
 
@@ -368,3 +370,90 @@ impl MLP {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn insert_f32(weights: &mut WeightMap, name: &str, shape: &[i32], value: f32) {
+        let len = shape.iter().map(|&dim| dim as usize).product();
+        weights.insert(
+            name.to_string(),
+            mlxcel_core::from_slice_f32(&vec![value; len], shape),
+        );
+    }
+
+    fn unequal_width_attention() -> Qwen3NextAttention {
+        const HIDDEN_SIZE: i32 = 3;
+        const NUM_HEADS: i32 = 2;
+        const NUM_KV_HEADS: i32 = 1;
+        const HEAD_DIM: i32 = 2;
+        const ATTENTION_WIDTH: i32 = NUM_HEADS * HEAD_DIM;
+
+        let mut weights = WeightMap::new();
+        insert_f32(
+            &mut weights,
+            "self_attn.q_proj.weight",
+            &[2 * ATTENTION_WIDTH, HIDDEN_SIZE],
+            0.0,
+        );
+        insert_f32(
+            &mut weights,
+            "self_attn.k_proj.weight",
+            &[NUM_KV_HEADS * HEAD_DIM, HIDDEN_SIZE],
+            0.0,
+        );
+        insert_f32(
+            &mut weights,
+            "self_attn.v_proj.weight",
+            &[NUM_KV_HEADS * HEAD_DIM, HIDDEN_SIZE],
+            0.0,
+        );
+        insert_f32(
+            &mut weights,
+            "self_attn.o_proj.weight",
+            &[HIDDEN_SIZE, ATTENTION_WIDTH],
+            0.0,
+        );
+        insert_f32(
+            &mut weights,
+            "self_attn.q_norm.weight",
+            &[HEAD_DIM],
+            1.0,
+        );
+        insert_f32(
+            &mut weights,
+            "self_attn.k_norm.weight",
+            &[HEAD_DIM],
+            1.0,
+        );
+
+        Qwen3NextAttention::from_weights(
+            &weights,
+            &Qwen3NextConfig {
+                num_attention_heads: NUM_HEADS as usize,
+                num_key_value_heads: NUM_KV_HEADS as usize,
+                head_dim: HEAD_DIM as usize,
+                rms_norm_eps: 1e-6,
+                rope_theta: 10_000.0,
+                partial_rotary_factor: 1.0,
+                quantization: None,
+            },
+            "self_attn",
+        )
+        .expect("synthetic attention weights")
+    }
+
+    #[test]
+    fn attention_projects_head_width_back_to_hidden_size() {
+        let attention = unequal_width_attention();
+        let input = mlxcel_core::from_slice_f32(&[0.0; 6], &[1, 2, 3]);
+
+        let mut ordinary_cache = KVCache::new();
+        let ordinary = attention.forward(&input, &mut ordinary_cache, None);
+        assert_eq!(mlxcel_core::array_shape(&ordinary), vec![1, 2, 3]);
+
+        let mut verify_cache = KVCache::new();
+        let verify = attention.forward_verify(&input, &mut verify_cache, None);
+        assert_eq!(mlxcel_core::array_shape(&verify), vec![1, 2, 3]);
+    }
+}
