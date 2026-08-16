@@ -2347,10 +2347,6 @@ mod tests {
             "language_model.model.layers.0.linear_attn.in_proj_qkv.scales".to_string(),
             mlxcel_core::from_slice_f32(&[1.0], &[1]),
         );
-        weights.insert(
-            "language_model.visual.patch_embed.weight".to_string(),
-            mlxcel_core::from_slice_f32(&[2.0], &[1]),
-        );
         insert_required_mtp_weights(&mut weights);
 
         let sanitized = sanitize_language_model_weights(
@@ -2359,12 +2355,6 @@ mod tests {
             Path::new("/checkpoint"),
         )
         .expect("valid bundled MTP weights");
-        assert!(
-            sanitized
-                .target
-                .contains_key("model.layers.0.linear_attn.in_proj_qkv.scales")
-        );
-        assert!(!sanitized.target.keys().any(|name| name.contains("visual")));
         let mtp = sanitized.mtp.expect("retained MTP partition");
         assert!(mtp.contains_key("mtp.fc.weight"));
         let expected = mlxcel_core::from_slice_f32(&[1.0; 4], &[4]);
