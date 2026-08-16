@@ -186,6 +186,14 @@ impl Qwen35Provider {
         &self.tokenizer
     }
 
+    pub fn logits_vocab_size(&self) -> usize {
+        self.model.vocab_size()
+    }
+
+    pub fn eos_token_id(&self) -> u32 {
+        self.defaults.stop_token_ids[0] as u32
+    }
+
     pub fn render_messages(&self, messages: &[ChatMessage]) -> Result<String> {
         self.chat_template.render_messages(messages)
     }

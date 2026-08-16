@@ -823,6 +823,10 @@ impl Qwen35Model {
         self.mtp.is_some()
     }
 
+    pub(crate) fn vocab_size(&self) -> usize {
+        self.config.vocab_size
+    }
+
     pub(crate) fn mtp(&self) -> Option<&Qwen35MtpDraftModel> {
         self.mtp.as_ref()
     }
@@ -1645,7 +1649,7 @@ impl LanguageModel for Qwen35Model {
                 push_snapshot_i32(
                     &mut snapshot,
                     &format!("layer.{index}.kind"),
-                    i32::from(layer.is_linear),
+                    if layer.is_linear { 1 } else { 0 },
                 );
                 push_snapshot_i32(
                     &mut snapshot,
@@ -1700,7 +1704,7 @@ impl LanguageModel for Qwen35Model {
 
         let mut restored = Vec::with_capacity(self.layers.len());
         for (index, layer) in self.layers.iter().enumerate() {
-            let expected_kind = i32::from(layer.is_linear);
+            let expected_kind = if layer.is_linear { 1 } else { 0 };
             if snapshot_i32(snapshot, &format!("layer.{index}.kind"))? != expected_kind {
                 return Err(format!("Qwen3.5 snapshot layer {index} cache variant mismatch"));
             }
