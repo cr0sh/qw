@@ -437,13 +437,13 @@ impl Qwen35GatedDeltaNet {
         if let Some((layer_idx, snapshots)) = snapshot {
             snapshots.push(GdnRollbackSnapshot {
                 layer_idx,
-                q: mlxcel_core::copy(&q),
-                k: mlxcel_core::copy(&k),
-                v: mlxcel_core::copy(&v),
-                a: mlxcel_core::copy(&a),
-                b: mlxcel_core::copy(&b_proj),
-                init_state: state.as_ref().map(|value| mlxcel_core::copy(value)),
-                conv_input: mlxcel_core::copy(&conv_input),
+                q: mlxcel_core::share(&q),
+                k: mlxcel_core::share(&k),
+                v: mlxcel_core::share(&v),
+                a: mlxcel_core::share(&a),
+                b: mlxcel_core::share(&b_proj),
+                init_state: state.as_ref().map(|value| mlxcel_core::share(value)),
+                conv_input: mlxcel_core::share(&conv_input),
             });
         }
 

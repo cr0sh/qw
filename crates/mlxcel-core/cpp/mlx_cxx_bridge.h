@@ -328,6 +328,7 @@ std::unique_ptr<MlxArray> astype(const MlxArray& a, int32_t dtype);
 
 // Copy.
 std::unique_ptr<MlxArray> copy(const MlxArray& a);
+std::unique_ptr<MlxArray> share(const MlxArray& a);
 
 // High-level operations for LLM inference.
 // Softmax along axis

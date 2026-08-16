@@ -826,6 +826,10 @@ std::unique_ptr<MlxArray> copy(const MlxArray& a) {
     return std::make_unique<MlxArray>(mlx::core::copy(a.inner));
 }
 
+std::unique_ptr<MlxArray> share(const MlxArray& a) {
+    return std::make_unique<MlxArray>(a.inner);
+}
+
 // High-level operations for LLM inference.
 std::unique_ptr<MlxArray> softmax(const MlxArray& a, int32_t axis) {
     return std::make_unique<MlxArray>(mlx::core::softmax(a.inner, axis));

@@ -484,6 +484,8 @@ mod ffi {
         // Copy.
         /// Copy array
         fn copy(a: &MlxArray) -> UniquePtr<MlxArray>;
+        /// Clone an immutable array handle without inserting a copy operation.
+        fn share(a: &MlxArray) -> UniquePtr<MlxArray>;
 
         // High-level operations for LLM inference.
         /// Softmax along axis
