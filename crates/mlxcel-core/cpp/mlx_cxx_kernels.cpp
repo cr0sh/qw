@@ -980,14 +980,14 @@ void metal_gated_delta_forward(
     };
     std::vector<Dtype> output_dtypes = {input_type, input_type};
 
-    // Single-token decode favors occupancy; multi-token verification benefits
-    // from amortizing dispatch over more value dimensions.
+    // Eight SIMD groups amortize dispatch and state input residency across
+    // more value dimensions while remaining below Metal's threadgroup limit.
     auto results = kernel(
         inputs,
         output_shapes,
         output_dtypes,
         std::make_tuple(32, Dv, B * Hv),   // grid
-        std::make_tuple(32, T_val == 1 ? 4 : 8, 1), // threadgroup
+        std::make_tuple(32, 8, 1),          // threadgroup
         template_args,
         std::nullopt,  // init_value
         false,         // verbose
