@@ -15,7 +15,7 @@
 //! Shared dense Qwen3.5 attention, MLP, quantization, and cache primitives.
 
 use crate::gated_delta::GatedDeltaCache;
-use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedLinear};
+use mlxcel_core::layers::{FusedQKVLinear, KVCache, RMSNorm, UnifiedLinear};
 use mlxcel_core::utils::silu;
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
@@ -91,9 +91,7 @@ impl Qwen3NextCache {
 
 // Attention with Gated Output.
 pub(crate) struct Qwen3NextAttention {
-    q_proj: UnifiedLinear,
-    k_proj: UnifiedLinear,
-    v_proj: UnifiedLinear,
+    qkv_proj: FusedQKVLinear,
     o_proj: UnifiedLinear,
     q_norm: RMSNorm,
     k_norm: RMSNorm,
@@ -141,8 +139,8 @@ impl Qwen3NextAttention {
         let b = shape[0];
         let l = shape[1];
 
-        // Q projection with gating: [B, L, D] -> [B, L, 2 * num_heads * head_dim]
-        let q_proj_output = self.q_proj.forward(x);
+        // Q includes the learned gate plane, followed by K and V.
+        let (q_proj_output, keys, values) = self.qkv_proj.forward(x);
         let q_proj_reshaped = mlxcel_core::reshape(&q_proj_output, &[b, l, self.num_heads, -1]);
 
         // Split into queries and gate
@@ -160,8 +158,6 @@ impl Qwen3NextAttention {
         );
         let gate = mlxcel_core::reshape(&gate, &[b, l, -1]);
 
-        let keys = self.k_proj.forward(x);
-        let values = self.v_proj.forward(x);
 
         // Reshape and apply Q/K norms
         let queries = mlxcel_core::reshape(&queries, &[b, l, self.num_heads, self.head_dim]);
@@ -279,17 +275,19 @@ impl Qwen3NextAttention {
         prefix: &str,
     ) -> Result<Self, String> {
         let q_prefix = format!("{}.q_proj", prefix);
-        let k_prefix = format!("{}.k_proj", prefix);
-        let v_prefix = format!("{}.v_proj", prefix);
         let o_prefix = format!("{}.o_proj", prefix);
         let (q_group_size, q_bits) = config.quant_params(&q_prefix);
-        let (k_group_size, k_bits) = config.quant_params(&k_prefix);
-        let (v_group_size, v_bits) = config.quant_params(&v_prefix);
         let (o_group_size, o_bits) = config.quant_params(&o_prefix);
 
-        let q_proj = UnifiedLinear::from_weights(weights, &q_prefix, q_group_size, q_bits)?;
-        let k_proj = UnifiedLinear::from_weights(weights, &k_prefix, k_group_size, k_bits)?;
-        let v_proj = UnifiedLinear::from_weights(weights, &v_prefix, v_group_size, v_bits)?;
+        let qkv_proj = FusedQKVLinear::from_weights_separate(
+            weights,
+            prefix,
+            q_group_size,
+            q_bits,
+            (config.num_attention_heads * 2) as i32,
+            config.num_key_value_heads as i32,
+            config.head_dim as i32,
+        )?;
         let o_proj = UnifiedLinear::from_weights(weights, &o_prefix, o_group_size, o_bits)?;
 
         let q_norm_weight = weights
@@ -304,9 +302,7 @@ impl Qwen3NextAttention {
         let head_dim = config.head_dim as i32;
 
         Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
+            qkv_proj,
             o_proj,
             q_norm: RMSNorm::new(q_norm_weight, config.rms_norm_eps),
             k_norm: RMSNorm::new(k_norm_weight, config.rms_norm_eps),
