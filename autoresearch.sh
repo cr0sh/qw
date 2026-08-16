@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ -f .autoresearch.env ]]; then
+    # Local checkpoint configuration; this file is intentionally ignored.
+    source .autoresearch.env
+fi
+
 
 : "${QW_BENCH_MODEL:?set QW_BENCH_MODEL to the local Qwen3.8 27B checkpoint}"
 export LC_ALL=C
