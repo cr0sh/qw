@@ -58,7 +58,7 @@ pub fn insert_qwen_vl_image_tokens(
         );
     }
 
-    let total_image_tokens = counts.iter().sum();
+    let total_image_tokens: usize = counts.iter().sum();
     let mut expanded = Vec::with_capacity(
         prompt_tokens.len() + total_image_tokens.saturating_sub(grid_thw.len()),
     );
