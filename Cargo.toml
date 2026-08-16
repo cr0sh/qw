@@ -4,6 +4,7 @@ members = ["crates/cli", "crates/mlxcel-core", "crates/runtime"]
 
 [workspace.dependencies]
 anyhow = "1.0.100"
+criterion = "0.8.2"
 memmap2 = "0.9"
 minijinja = { version = "2.20", features = ["loop_controls", "fuel", "json", "preserve_order"] }
 mlxcel-core = { path = "crates/mlxcel-core", features = ["metal", "accelerate"] }

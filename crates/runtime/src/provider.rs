@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use anyhow::{Context, Result, ensure};
-use mlxcel_core::generate::{CxxGenerator, LanguageModel, SamplingConfig};
+use mlxcel_core::generate::{CxxGenerator, GenerationStats, LanguageModel, SamplingConfig};
 use serde::Deserialize;
 use tokenizers::Tokenizer;
 
@@ -93,8 +93,38 @@ impl Qwen35Provider {
     }
 
     pub fn generate(&mut self, request: &GenerationRequest) -> Result<GenerationOutput> {
+        let (prompt_ids, sampling) = self.prepare_generation(request)?;
+        let token_ids =
+            self.generator
+                .generate(&self.model, &prompt_ids, request.max_tokens, &sampling);
+        self.output_from_token_ids(token_ids)
+    }
+
+    /// Generate one response and return phase timings from the canonical
+    /// prefill/decode loop.
+    pub fn generate_with_stats(
+        &mut self,
+        request: &GenerationRequest,
+    ) -> Result<(GenerationOutput, GenerationStats)> {
+        let (prompt_ids, sampling) = self.prepare_generation(request)?;
+        let (token_ids, stats) = self.generator.generate_with_stats(
+            &self.model,
+            &prompt_ids,
+            request.max_tokens,
+            &sampling,
+        );
+        Ok((self.output_from_token_ids(token_ids)?, stats))
+    }
+
+    fn prepare_generation(
+        &self,
+        request: &GenerationRequest,
+    ) -> Result<(Vec<i32>, SamplingConfig)> {
         ensure!(!request.prompt.is_empty(), "prompt must not be empty");
-        ensure!(request.max_tokens > 0, "max_tokens must be greater than zero");
+        ensure!(
+            request.max_tokens > 0,
+            "max_tokens must be greater than zero"
+        );
 
         let rendered = self.chat_template.render_user(&request.prompt)?;
         let encoded = self
@@ -107,7 +137,10 @@ impl Qwen35Provider {
             .iter()
             .map(|&token| token as i32)
             .collect();
-        ensure!(!prompt_ids.is_empty(), "rendered prompt tokenized to an empty sequence");
+        ensure!(
+            !prompt_ids.is_empty(),
+            "rendered prompt tokenized to an empty sequence"
+        );
 
         let sampling = SamplingConfig {
             temperature: request.temperature.unwrap_or(self.defaults.temperature),
@@ -117,14 +150,10 @@ impl Qwen35Provider {
             stop_token_ids: self.defaults.stop_token_ids.clone(),
             ..SamplingConfig::default()
         };
+        Ok((prompt_ids, sampling))
+    }
 
-        self.generator.reset_with_model(&self.model);
-        let mut token_ids = self.generator.generate(
-            &self.model,
-            &prompt_ids,
-            request.max_tokens,
-            &sampling,
-        );
+    fn output_from_token_ids(&self, mut token_ids: Vec<i32>) -> Result<GenerationOutput> {
         if token_ids
             .last()
             .is_some_and(|token| self.defaults.stop_token_ids.contains(token))
