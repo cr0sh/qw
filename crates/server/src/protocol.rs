@@ -32,6 +32,23 @@ pub enum ToolChoice {
     None,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    XHigh,
+}
+
+impl ReasoningEffort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::XHigh => "xhigh",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CompletionRequest {
     pub endpoint: Endpoint,
@@ -40,6 +57,7 @@ pub struct CompletionRequest {
     pub tools: Vec<ChatTool>,
     pub tool_choice: ToolChoice,
     pub parallel_tool_calls: bool,
+    pub reasoning_effort: Option<ReasoningEffort>,
     pub stream: bool,
     pub stream_include_usage: bool,
     pub max_tokens: usize,
@@ -78,6 +96,7 @@ enum ChatWireMessage {
     Assistant {
         #[serde(default)]
         content: Value,
+        reasoning_content: Option<String>,
         tool_calls: Option<Vec<Value>>,
     },
     Tool {
@@ -96,6 +115,7 @@ struct ChatWire {
     stream_options: Option<ChatStreamOptions>,
     max_completion_tokens: Option<usize>,
     max_tokens: Option<usize>,
+    reasoning_effort: Option<String>,
     temperature: Option<f32>,
     top_p: Option<f32>,
     seed: Option<u64>,
@@ -232,6 +252,7 @@ pub fn parse_chat(value: Value) -> Result<CompletionRequest, RequestError> {
         .or(wire.max_tokens)
         .unwrap_or(DEFAULT_MAX_TOKENS);
     validate_sampling(max_tokens, wire.temperature, wire.top_p)?;
+    let reasoning_effort = parse_reasoning_effort(wire.reasoning_effort.as_deref())?;
     let output_format = parse_chat_format(wire.response_format)?;
     let tools = parse_tools(wire.tools.as_deref().unwrap_or_default(), ToolDialect::Chat)?;
     if !tools.is_empty() && !matches!(output_format, OutputFormat::Text) {
@@ -249,6 +270,7 @@ pub fn parse_chat(value: Value) -> Result<CompletionRequest, RequestError> {
         messages,
         tools,
         tool_choice,
+        reasoning_effort,
         parallel_tool_calls: wire.parallel_tool_calls.unwrap_or(true),
         stream: wire.stream,
         stream_include_usage: wire
@@ -313,6 +335,7 @@ pub fn parse_responses(value: Value) -> Result<CompletionRequest, RequestError> 
         messages,
         tools,
         tool_choice,
+        reasoning_effort: None,
         parallel_tool_calls: wire.parallel_tool_calls.unwrap_or(true),
         stream: wire.stream,
         stream_include_usage: false,
@@ -478,6 +501,21 @@ fn parse_tool_choice(value: Option<&Value>) -> Result<ToolChoice, RequestError> 
     }
 }
 
+fn parse_reasoning_effort(
+    value: Option<&str>,
+) -> Result<Option<ReasoningEffort>, RequestError> {
+    match value {
+        None => Ok(None),
+        Some("low") => Ok(Some(ReasoningEffort::Low)),
+        Some("medium") => Ok(Some(ReasoningEffort::Medium)),
+        Some("xhigh") => Ok(Some(ReasoningEffort::XHigh)),
+        Some(_) => Err(RequestError::at(
+            "reasoning_effort must be \"low\", \"medium\", or \"xhigh\"",
+            "reasoning_effort",
+        )),
+    }
+}
+
 fn parse_chat_messages(
     values: Vec<Value>,
     tools: &[ChatTool],
@@ -504,7 +542,7 @@ fn parse_chat_messages(
             .expect("role lookup already required an object");
         let allowed_fields = match role {
             "system" | "user" => &["role", "content"][..],
-            "assistant" => &["role", "content", "tool_calls"][..],
+            "assistant" => &["role", "content", "reasoning_content", "tool_calls"][..],
             "tool" => &["role", "content", "tool_call_id"][..],
             _ => {
                 return Err(RequestError::at(
@@ -514,6 +552,14 @@ fn parse_chat_messages(
             }
         };
         reject_unknown_fields(message_object, allowed_fields, &base)?;
+        if let Some(reasoning_content) = message_object.get("reasoning_content")
+            && !reasoning_content.is_string()
+        {
+            return Err(RequestError::at(
+                "assistant reasoning_content must be a string",
+                format!("{base}.reasoning_content"),
+            ));
+        }
         if role != "user" {
             reject_chat_role_images(
                 message_object.get("content"),
@@ -539,6 +585,7 @@ fn parse_chat_messages(
             ChatWireMessage::Assistant {
                 content,
                 tool_calls,
+                reasoning_content,
             } => {
                 let calls_present = tool_calls_field_present;
                 let calls = parse_chat_tool_calls(
@@ -578,7 +625,7 @@ fn parse_chat_messages(
                         format!("{base}.content"),
                     ));
                 }
-                ChatMessage { reasoning_content: None, role: "assistant".to_string(),
+                ChatMessage { reasoning_content, role: "assistant".to_string(),
                 content,
                 tool_calls: calls,
                 tool_call_id: None, }
