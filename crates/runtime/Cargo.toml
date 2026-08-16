@@ -1,5 +1,5 @@
 [package]
-name = "qwr-runtime"
+name = "qw-runtime"
 version = "0.1.0"
 edition = "2024"
 

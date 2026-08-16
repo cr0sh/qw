@@ -3,10 +3,10 @@ use std::process::Command;
 #[test]
 fn nonexistent_local_model_exits_nonzero_with_its_path() {
     let missing = std::env::temp_dir().join(format!(
-        "qwr-missing-model-{}",
+        "qw-missing-model-{}",
         std::process::id()
     ));
-    let output = Command::new(env!("CARGO_BIN_EXE_qwr"))
+    let output = Command::new(env!("CARGO_BIN_EXE_qw"))
         .args([
             "generate",
             "--model",
@@ -15,7 +15,7 @@ fn nonexistent_local_model_exits_nonzero_with_its_path() {
             "hello",
         ])
         .output()
-        .expect("run qwr");
+        .expect("run qw");
 
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());

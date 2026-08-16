@@ -1,9 +1,9 @@
-# QuasarWave Runtime
+# QuasarWave
 
-QWR is an inference runtime targeting MLX-only, single-user
+QW is an inference runtime targeting MLX-only, single-user
 deployments.
 
-QWR aims to be explicitly "focused", to achieve these goals below:
+QW aims to be explicitly "focused", to achieve these goals below:
 
 - Fixed model: Qwen3.8 27B(dense model) only. No generalization over
   different model structures.

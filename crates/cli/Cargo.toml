@@ -1,13 +1,13 @@
 [package]
-name = "qwr-cli"
+name = "qw-cli"
 version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-name = "qwr"
+name = "qw"
 path = "src/main.rs"
 
 [dependencies]
 clap = "4.6.6"
 clap_derive = "4.6.4"
-qwr-runtime = { path = "../runtime" }
+qw-runtime = { path = "../runtime" }

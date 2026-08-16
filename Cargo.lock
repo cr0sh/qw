@@ -998,16 +998,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "qwr-cli"
+name = "qw-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
  "clap_derive",
- "qwr-runtime",
+ "qw-runtime",
 ]
 
 [[package]]
-name = "qwr-runtime"
+name = "qw-runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",

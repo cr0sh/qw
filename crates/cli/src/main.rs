@@ -2,11 +2,11 @@ use std::path::PathBuf;
 
 use clap::Parser as _;
 use clap_derive::{Args, Parser, Subcommand};
-use qwr_runtime::{GenerationRequest, Qwen35Provider};
+use qw_runtime::{GenerationRequest, Qwen35Provider};
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "qwr",
+    name = "qw",
     about = "Local dense Qwen3.5 inference",
     disable_help_subcommand = true
 )]
@@ -87,19 +87,19 @@ mod tests {
 
     #[test]
     fn generate_requires_model_and_prompt() {
-        assert!(Cli::try_parse_from(["qwr", "generate"]).is_err());
+        assert!(Cli::try_parse_from(["qw", "generate"]).is_err());
         assert!(
-            Cli::try_parse_from(["qwr", "generate", "--model", "/tmp/model"]).is_err()
+            Cli::try_parse_from(["qw", "generate", "--model", "/tmp/model"]).is_err()
         );
         assert!(
-            Cli::try_parse_from(["qwr", "generate", "--prompt", "hello"]).is_err()
+            Cli::try_parse_from(["qw", "generate", "--prompt", "hello"]).is_err()
         );
     }
 
     #[test]
     fn omitted_sampling_flags_use_checkpoint_defaults() {
         let cli = Cli::try_parse_from([
-            "qwr",
+            "qw",
             "generate",
             "--model",
             "/tmp/model",
@@ -119,7 +119,7 @@ mod tests {
     #[test]
     fn all_generation_flags_map_to_the_request() {
         let cli = Cli::try_parse_from([
-            "qwr",
+            "qw",
             "generate",
             "--model",
             "/tmp/model",
