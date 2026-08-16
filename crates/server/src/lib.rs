@@ -2,6 +2,7 @@ mod engine;
 mod grammar;
 mod prefix_cache;
 pub mod protocol;
+mod tool_calls;
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
@@ -20,8 +21,11 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 pub use engine::{Engine, SubmitError};
-use engine::{Admission, CompletionRecord, FailureKind, FinishReason, WorkerEvent, WorkerFailure};
-use protocol::{CompletionRequest, Endpoint, RequestError};
+use engine::{
+    Admission, CompletionRecord, FailureKind, FinishReason, GeneratedToolCall, WorkerEvent,
+    WorkerFailure,
+};
+use protocol::{Endpoint, RequestError};
 
 #[derive(Clone)]
 struct AppState {
@@ -167,6 +171,7 @@ struct SseState {
     receiver: mpsc::Receiver<WorkerEvent>,
     pending: VecDeque<Event>,
     sequence: u64,
+    response_message_open: bool,
     guard: CancelGuard,
 }
 
@@ -185,6 +190,7 @@ impl SseState {
             receiver,
             pending: VecDeque::new(),
             sequence: 0,
+            response_message_open: false,
             guard: CancelGuard {
                 cancelled,
                 armed: true,
@@ -243,23 +249,8 @@ impl SseState {
                         "output": []
                     }
                 });
-                self.pending.push_back(named_event("response.created", created));
-                let added = json!({
-                    "type": "response.output_item.added",
-                    "sequence_number": self.next_sequence(),
-                    "output_index": 0,
-                    "item": {"id": self.admission.message_id, "type": "message", "status": "in_progress", "role": "assistant", "content": []}
-                });
-                self.pending.push_back(named_event("response.output_item.added", added));
-                let part = json!({
-                    "type": "response.content_part.added",
-                    "sequence_number": self.next_sequence(),
-                    "item_id": self.admission.message_id,
-                    "output_index": 0,
-                    "content_index": 0,
-                    "part": {"type": "output_text", "text": "", "annotations": []}
-                });
-                self.pending.push_back(named_event("response.content_part.added", part));
+                self.pending
+                    .push_back(named_event("response.created", created));
             }
         }
     }
@@ -279,6 +270,7 @@ impl SseState {
                 })));
             }
             Endpoint::Responses => {
+                self.ensure_response_message_open();
                 let event = json!({
                     "type": "response.output_text.delta",
                     "sequence_number": self.next_sequence(),
@@ -287,57 +279,201 @@ impl SseState {
                     "content_index": 0,
                     "delta": delta
                 });
-                self.pending.push_back(named_event("response.output_text.delta", event));
+                self.pending
+                    .push_back(named_event("response.output_text.delta", event));
             }
         }
     }
 
+    fn ensure_response_message_open(&mut self) {
+        if self.response_message_open {
+            return;
+        }
+        let added = json!({
+            "type": "response.output_item.added",
+            "sequence_number": self.next_sequence(),
+            "output_index": 0,
+            "item": {
+                "id": self.admission.message_id,
+                "type": "message",
+                "status": "in_progress",
+                "role": "assistant",
+                "content": []
+            }
+        });
+        self.pending
+            .push_back(named_event("response.output_item.added", added));
+        let part = json!({
+            "type": "response.content_part.added",
+            "sequence_number": self.next_sequence(),
+            "item_id": self.admission.message_id,
+            "output_index": 0,
+            "content_index": 0,
+            "part": {"type": "output_text", "text": "", "annotations": []}
+        });
+        self.pending
+            .push_back(named_event("response.content_part.added", part));
+        self.response_message_open = true;
+    }
+
     fn enqueue_complete(&mut self, record: CompletionRecord) {
         match self.endpoint {
-            Endpoint::Chat => {
-                self.pending.push_back(data_event(json!({
-                    "id": record.admission.response_id,
-                    "object": "chat.completion.chunk",
-                    "created": record.admission.created,
-                    "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason_string(record.finish_reason)}],
-                    "usage": chat_usage(&record)
-                })));
-                self.pending.push_back(Event::default().data("[DONE]"));
-            }
-            Endpoint::Responses => {
-                let text_done = json!({
-                    "type": "response.output_text.done",
-                    "sequence_number": self.next_sequence(),
-                    "item_id": record.admission.message_id,
-                    "output_index": 0,
-                    "content_index": 0,
-                    "text": record.text
-                });
-                self.pending.push_back(named_event("response.output_text.done", text_done));
-                let part_done = json!({
-                    "type": "response.content_part.done",
-                    "sequence_number": self.next_sequence(),
-                    "item_id": record.admission.message_id,
-                    "output_index": 0,
-                    "content_index": 0,
-                    "part": {"type": "output_text", "text": record.text, "annotations": []}
-                });
-                self.pending.push_back(named_event("response.content_part.done", part_done));
-                let item_done = json!({
-                    "type": "response.output_item.done",
-                    "sequence_number": self.next_sequence(),
-                    "output_index": 0,
-                    "item": response_output_item(&record)
-                });
-                self.pending.push_back(named_event("response.output_item.done", item_done));
-                let completed = json!({
-                    "type": "response.completed",
-                    "sequence_number": self.next_sequence(),
-                    "response": responses_json(&record)
-                });
-                self.pending.push_back(named_event("response.completed", completed));
-            }
+            Endpoint::Chat => self.enqueue_chat_complete(&record),
+            Endpoint::Responses => self.enqueue_responses_complete(&record),
         }
+    }
+
+    fn enqueue_chat_complete(&mut self, record: &CompletionRecord) {
+        for (index, call) in record.tool_calls.iter().enumerate() {
+            self.pending.push_back(data_event(json!({
+                "id": record.admission.response_id,
+                "object": "chat.completion.chunk",
+                "created": record.admission.created,
+                "model": record.model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": index,
+                            "id": call.id,
+                            "type": "function",
+                            "function": {"name": call.name, "arguments": ""}
+                        }]
+                    },
+                    "finish_reason": null
+                }]
+            })));
+            self.pending.push_back(data_event(json!({
+                "id": record.admission.response_id,
+                "object": "chat.completion.chunk",
+                "created": record.admission.created,
+                "model": record.model,
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": index,
+                            "function": {"arguments": call.arguments}
+                        }]
+                    },
+                    "finish_reason": null
+                }]
+            })));
+        }
+        let mut terminal = json!({
+            "id": record.admission.response_id,
+            "object": "chat.completion.chunk",
+            "created": record.admission.created,
+            "model": record.model,
+            "choices": [{
+                "index": 0,
+                "delta": {},
+                "finish_reason": finish_reason_string(record.finish_reason)
+            }]
+        });
+        if !record.stream_include_usage {
+            terminal
+                .as_object_mut()
+                .expect("terminal chunk is an object")
+                .insert("usage".to_string(), chat_usage(record));
+        }
+        self.pending.push_back(data_event(terminal));
+        if record.stream_include_usage {
+            self.pending.push_back(data_event(json!({
+                "id": record.admission.response_id,
+                "object": "chat.completion.chunk",
+                "created": record.admission.created,
+                "model": record.model,
+                "choices": [],
+                "usage": chat_usage(record)
+            })));
+        }
+        self.pending.push_back(Event::default().data("[DONE]"));
+    }
+
+    fn enqueue_responses_complete(&mut self, record: &CompletionRecord) {
+        if !record.content.is_empty() || record.tool_calls.is_empty() {
+            self.ensure_response_message_open();
+        }
+        if self.response_message_open {
+            let text_done = json!({
+                "type": "response.output_text.done",
+                "sequence_number": self.next_sequence(),
+                "item_id": record.admission.message_id,
+                "output_index": 0,
+                "content_index": 0,
+                "text": record.content
+            });
+            self.pending
+                .push_back(named_event("response.output_text.done", text_done));
+            let part_done = json!({
+                "type": "response.content_part.done",
+                "sequence_number": self.next_sequence(),
+                "item_id": record.admission.message_id,
+                "output_index": 0,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": record.content, "annotations": []}
+            });
+            self.pending
+                .push_back(named_event("response.content_part.done", part_done));
+            let item_done = json!({
+                "type": "response.output_item.done",
+                "sequence_number": self.next_sequence(),
+                "output_index": 0,
+                "item": response_message_item(record)
+            });
+            self.pending
+                .push_back(named_event("response.output_item.done", item_done));
+        }
+        let first_call_index = usize::from(self.response_message_open);
+        for (index, call) in record.tool_calls.iter().enumerate() {
+            let output_index = first_call_index + index;
+            let added = json!({
+                "type": "response.output_item.added",
+                "sequence_number": self.next_sequence(),
+                "output_index": output_index,
+                "item": response_function_item(call, false)
+            });
+            self.pending
+                .push_back(named_event("response.output_item.added", added));
+            let arguments_delta = json!({
+                "type": "response.function_call_arguments.delta",
+                "sequence_number": self.next_sequence(),
+                "item_id": call.item_id,
+                "output_index": output_index,
+                "delta": call.arguments
+            });
+            self.pending.push_back(named_event(
+                "response.function_call_arguments.delta",
+                arguments_delta,
+            ));
+            let arguments_done = json!({
+                "type": "response.function_call_arguments.done",
+                "sequence_number": self.next_sequence(),
+                "item_id": call.item_id,
+                "output_index": output_index,
+                "arguments": call.arguments
+            });
+            self.pending.push_back(named_event(
+                "response.function_call_arguments.done",
+                arguments_done,
+            ));
+            let item_done = json!({
+                "type": "response.output_item.done",
+                "sequence_number": self.next_sequence(),
+                "output_index": output_index,
+                "item": response_function_item(call, true)
+            });
+            self.pending
+                .push_back(named_event("response.output_item.done", item_done));
+        }
+        let completed = json!({
+            "type": "response.completed",
+            "sequence_number": self.next_sequence(),
+            "response": responses_json(record)
+        });
+        self.pending
+            .push_back(named_event("response.completed", completed));
     }
 
     fn enqueue_failure(&mut self, failure: WorkerFailure) {
@@ -367,7 +503,8 @@ impl SseState {
                         "error": error["error"].clone()
                     }
                 });
-                self.pending.push_back(named_event("response.failed", failed));
+                self.pending
+                    .push_back(named_event("response.failed", failed));
             }
         }
     }
@@ -388,7 +525,7 @@ fn buffered_json(record: &CompletionRecord) -> Value {
             "model": record.model,
             "choices": [{
                 "index": 0,
-                "message": {"role": "assistant", "content": record.text},
+                "message": chat_message(record),
                 "finish_reason": finish_reason_string(record.finish_reason)
             }],
             "usage": chat_usage(record)
@@ -397,9 +534,44 @@ fn buffered_json(record: &CompletionRecord) -> Value {
     }
 }
 
+fn chat_message(record: &CompletionRecord) -> Value {
+    let mut message = serde_json::Map::new();
+    message.insert("role".to_string(), json!("assistant"));
+    message.insert(
+        "content".to_string(),
+        if record.content.is_empty() && !record.tool_calls.is_empty() {
+            Value::Null
+        } else {
+            Value::String(record.content.clone())
+        },
+    );
+    if !record.tool_calls.is_empty() {
+        message.insert(
+            "tool_calls".to_string(),
+            Value::Array(
+                record
+                    .tool_calls
+                    .iter()
+                    .map(|call| {
+                        json!({
+                            "id": call.id,
+                            "type": "function",
+                            "function": {
+                                "name": call.name,
+                                "arguments": call.arguments
+                            }
+                        })
+                    })
+                    .collect(),
+            ),
+        );
+    }
+    Value::Object(message)
+}
+
 fn responses_json(record: &CompletionRecord) -> Value {
     let incomplete = match record.finish_reason {
-        FinishReason::Stop => Value::Null,
+        FinishReason::Stop | FinishReason::ToolCalls => Value::Null,
         FinishReason::Length => json!({"reason": "max_output_tokens"}),
     };
     json!({
@@ -407,9 +579,9 @@ fn responses_json(record: &CompletionRecord) -> Value {
         "object": "response",
         "created_at": record.admission.created,
         "model": record.model,
-        "status": if record.finish_reason == FinishReason::Stop { "completed" } else { "incomplete" },
+        "status": if record.finish_reason == FinishReason::Length { "incomplete" } else { "completed" },
         "incomplete_details": incomplete,
-        "output": [response_output_item(record)],
+        "output": response_output_items(record),
         "usage": {
             "input_tokens": record.prompt_tokens,
             "input_tokens_details": {"cached_tokens": record.cached_tokens},
@@ -419,13 +591,38 @@ fn responses_json(record: &CompletionRecord) -> Value {
     })
 }
 
-fn response_output_item(record: &CompletionRecord) -> Value {
+fn response_output_items(record: &CompletionRecord) -> Vec<Value> {
+    let mut output = Vec::with_capacity(record.tool_calls.len() + 1);
+    if !record.content.is_empty() || record.tool_calls.is_empty() {
+        output.push(response_message_item(record));
+    }
+    output.extend(
+        record
+            .tool_calls
+            .iter()
+            .map(|call| response_function_item(call, true)),
+    );
+    output
+}
+
+fn response_message_item(record: &CompletionRecord) -> Value {
     json!({
         "id": record.admission.message_id,
         "type": "message",
-        "status": if record.finish_reason == FinishReason::Stop { "completed" } else { "incomplete" },
+        "status": if record.finish_reason == FinishReason::Length { "incomplete" } else { "completed" },
         "role": "assistant",
-        "content": [{"type": "output_text", "text": record.text, "annotations": []}]
+        "content": [{"type": "output_text", "text": record.content, "annotations": []}]
+    })
+}
+
+fn response_function_item(call: &GeneratedToolCall, completed: bool) -> Value {
+    json!({
+        "id": call.item_id,
+        "type": "function_call",
+        "status": if completed { "completed" } else { "in_progress" },
+        "call_id": call.id,
+        "name": call.name,
+        "arguments": if completed { call.arguments.as_str() } else { "" }
     })
 }
 
@@ -442,6 +639,7 @@ fn finish_reason_string(reason: FinishReason) -> &'static str {
     match reason {
         FinishReason::Stop => "stop",
         FinishReason::Length => "length",
+        FinishReason::ToolCalls => "tool_calls",
     }
 }
 

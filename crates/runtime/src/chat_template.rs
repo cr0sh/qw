@@ -22,7 +22,43 @@ use serde_json::Value as JsonValue;
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ChatToolCall>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ChatTool {
+    #[serde(rename = "type")]
+    pub tool_type: String,
+    pub function: ChatToolFunction,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ChatToolFunction {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub parameters: JsonValue,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strict: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ChatToolCall {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub tool_type: String,
+    pub function: ChatToolCallFunction,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ChatToolCallFunction {
+    pub name: String,
+    pub arguments: JsonValue,
 }
 
 pub(crate) struct ChatTemplateProcessor {
@@ -76,23 +112,63 @@ impl ChatTemplateProcessor {
     }
 
     pub(crate) fn render_user(&self, prompt: &str) -> Result<String> {
-        self.render_messages(&[ChatMessage {
-            role: "user".to_string(),
-            content: prompt.to_string(),
-        }])
+        self.render_messages(
+            &[ChatMessage {
+                role: "user".to_string(),
+                content: Some(prompt.to_string()),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            }],
+            &[],
+        )
     }
 
-    pub(crate) fn render_messages(&self, messages: &[ChatMessage]) -> Result<String> {
+    pub(crate) fn render_messages(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ChatTool],
+    ) -> Result<String> {
         anyhow::ensure!(!messages.is_empty(), "messages must not be empty");
         for (index, message) in messages.iter().enumerate() {
-            anyhow::ensure!(
-                matches!(
-                    message.role.as_str(),
-                    "system" | "user" | "assistant" | "tool"
-                ),
-                "message {index} has unsupported role {:?}",
-                message.role
-            );
+            match message.role.as_str() {
+                "system" | "user" => {
+                    anyhow::ensure!(
+                        message.content.is_some()
+                            && message.tool_calls.is_empty()
+                            && message.tool_call_id.is_none(),
+                        "message {index} has fields incompatible with role {:?}",
+                        message.role
+                    );
+                }
+                "assistant" => {
+                    anyhow::ensure!(
+                        (message.content.is_some() || !message.tool_calls.is_empty())
+                            && message.tool_call_id.is_none(),
+                        "message {index} has fields incompatible with role \"assistant\""
+                    );
+                    for (call_index, call) in message.tool_calls.iter().enumerate() {
+                        anyhow::ensure!(
+                            call.tool_type == "function"
+                                && call.function.arguments.is_object(),
+                            "message {index} tool call {call_index} is invalid"
+                        );
+                    }
+                }
+                "tool" => {
+                    anyhow::ensure!(
+                        message.content.is_some()
+                            && message.tool_calls.is_empty()
+                            && message.tool_call_id.is_some(),
+                        "message {index} has fields incompatible with role \"tool\""
+                    );
+                }
+                _ => {
+                    anyhow::bail!(
+                        "message {index} has unsupported role {:?}",
+                        message.role
+                    );
+                }
+            }
         }
         let mut environment = Environment::new();
         configure_environment(&mut environment);
@@ -103,13 +179,155 @@ impl ChatTemplateProcessor {
         template
             .render(context! {
                 messages => Value::from_serialize(messages),
-                tools => Value::from_serialize(Vec::<JsonValue>::new()),
+                tools => Value::from_serialize(tools),
                 bos_token => self.bos_token.as_str(),
                 eos_token => self.eos_token.as_str(),
                 add_generation_prompt => true,
                 enable_thinking => true,
             })
             .context("failed to render chat messages")
+    }
+
+    pub(crate) fn supports_qwen35_tool_calls(&self) -> bool {
+        self.template.contains("<tool_call>")
+            && self.template.contains("<function=")
+            && self.template.contains("<parameter=")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    const TOOL_TEMPLATE: &str = r#"
+{%- if tools %}<tools>{{ tools|tojson }}</tools>{% endif -%}
+{%- for message in messages -%}
+{%- if message.role == "assistant" and message.tool_calls -%}
+{{- message.content or "" -}}
+{%- for call in message.tool_calls -%}
+<tool_call><function={{ call.function.name }}>
+{%- for key, value in call.function.arguments|items -%}
+<parameter={{ key }}>{{ value|tojson }}</parameter>
+{%- endfor -%}
+</function></tool_call>
+{%- endfor -%}
+{%- elif message.role == "tool" -%}
+<tool_response>{{ message.content }}</tool_response>
+{%- else -%}
+{{ message.role }}:{{ message.content }}
+{%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt %}assistant:{% endif -%}
+"#;
+
+    fn processor() -> ChatTemplateProcessor {
+        ChatTemplateProcessor {
+            template: TOOL_TEMPLATE.to_string(),
+            bos_token: String::new(),
+            eos_token: String::new(),
+        }
+    }
+
+    fn user(content: &str) -> ChatMessage {
+        ChatMessage {
+            role: "user".to_string(),
+            content: Some(content.to_string()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }
+    }
+
+    fn tool() -> ChatTool {
+        ChatTool {
+            tool_type: "function".to_string(),
+            function: ChatToolFunction {
+                name: "weather".to_string(),
+                description: Some("Look up weather".to_string()),
+                parameters: json!({"type":"object"}),
+                strict: Some(true),
+            },
+        }
+    }
+
+    #[test]
+    fn renders_tool_declarations_and_assistant_calls() {
+        let messages = [
+            user("weather?"),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: None,
+                tool_calls: vec![ChatToolCall {
+                    id: "call_1".to_string(),
+                    tool_type: "function".to_string(),
+                    function: ChatToolCallFunction {
+                        name: "weather".to_string(),
+                        arguments: json!({"city":"Paris","days":2}),
+                    },
+                }],
+                tool_call_id: None,
+            },
+        ];
+        let rendered = processor()
+            .render_messages(&messages, &[tool()])
+            .expect("render tools");
+        assert!(rendered.contains("<tools>"));
+        assert!(rendered.contains(r#""name":"weather""#));
+        assert!(rendered.contains("<tool_call><function=weather>"));
+        assert!(rendered.contains("<parameter=city>\"Paris\"</parameter>"));
+        assert!(rendered.contains("<parameter=days>2</parameter>"));
+    }
+
+    #[test]
+    fn renders_consecutive_tool_results() {
+        let messages = [
+            user("weather?"),
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: None,
+                tool_calls: vec![ChatToolCall {
+                    id: "call_1".to_string(),
+                    tool_type: "function".to_string(),
+                    function: ChatToolCallFunction {
+                        name: "weather".to_string(),
+                        arguments: json!({}),
+                    },
+                }],
+                tool_call_id: None,
+            },
+            ChatMessage {
+                role: "tool".to_string(),
+                content: Some("sunny".to_string()),
+                tool_calls: Vec::new(),
+                tool_call_id: Some("call_1".to_string()),
+            },
+            ChatMessage {
+                role: "tool".to_string(),
+                content: Some("warm".to_string()),
+                tool_calls: Vec::new(),
+                tool_call_id: Some("call_2".to_string()),
+            },
+        ];
+        let rendered = processor()
+            .render_messages(&messages, &[tool()])
+            .expect("render tool results");
+        assert!(rendered.contains(
+            "<tool_response>sunny</tool_response><tool_response>warm</tool_response>"
+        ));
+    }
+
+    #[test]
+    fn empty_tools_and_render_user_keep_ordinary_chat() {
+        let processor = processor();
+        let rendered = processor
+            .render_messages(&[user("hello")], &[])
+            .expect("render without tools");
+        assert_eq!(rendered, "user:helloassistant:");
+        assert!(!rendered.contains("<tools>"));
+        assert_eq!(
+            processor.render_user("hello").expect("render user"),
+            rendered
+        );
     }
 }
 
