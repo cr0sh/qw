@@ -3015,6 +3015,7 @@ fn test_unified_linear_regular_has_no_quantized_weight() {
 }
 
 #[test]
+#[ignore = "benchmark performs 2,000 compiled and uncompiled GPU iterations"]
 fn bench_compiled_vs_uncompiled_swiglu() {
     use std::time::Instant;
 

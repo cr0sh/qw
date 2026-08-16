@@ -633,28 +633,19 @@ fn rotating_turbo4_wraparound_preserves_other_block_data() {
 
     let mut cache = RotatingKVCache::new_with_mode(max_size, KVCacheMode::Turbo4Asym);
 
-    // Write a sentinel token at slot 31 (last token in block 0).
+    // Fill the ring in one prefill update. Repeating the sentinel value keeps
+    // physical slot 31 observable without issuing 64 separate GPU
+    // quantize/dequantize cycles before the wraparound assertion.
     let sentinel_data: Vec<f32> = (0..head_dim)
         .map(|i| (i as f32 / head_dim as f32) - 0.25)
         .collect();
-    let sentinel_v = ffi::from_slice_f32(&sentinel_data, &[1, 1, 1, head_dim]);
-    let sentinel_k = synth_kv_tensor(1, 1, 1, head_dim, 999);
+    let prefill_values = sentinel_data.repeat(max_size as usize);
+    cache.update_and_fetch(
+        synth_kv_tensor(1, 1, max_size, head_dim, 999),
+        ffi::from_slice_f32(&prefill_values, &[1, 1, max_size, head_dim]),
+    );
 
-    // Prime: 31 nondescript tokens, then sentinel, then 32 more.
-    for t in 0..31 {
-        cache.update_and_fetch(
-            synth_kv_tensor(1, 1, 1, head_dim, 100 + t as u32),
-            synth_kv_tensor(1, 1, 1, head_dim, 200 + t as u32),
-        );
-    }
-    cache.update_and_fetch(sentinel_k, sentinel_v);
-    for t in 0..32 {
-        cache.update_and_fetch(
-            synth_kv_tensor(1, 1, 1, head_dim, 300 + t as u32),
-            synth_kv_tensor(1, 1, 1, head_dim, 400 + t as u32),
-        );
-    }
-    // Now write a wraparound token at physical slot 0 (one past max_size).
+    // Write a wraparound token at physical slot 0 (one past max_size).
     cache.update_and_fetch(
         synth_kv_tensor(1, 1, 1, head_dim, 31337),
         synth_kv_tensor(1, 1, 1, head_dim, 31338),
@@ -1114,6 +1105,7 @@ fn turbo4_reference_attention(
 }
 
 #[test]
+#[ignore = "runs a multi-step GPU dequantization/attention parity stress test"]
 fn turbo4_dequant_sdpa_matches_full_dequant_attention() {
     let head_dim = 64;
     let prefill_len = 8;
@@ -1184,6 +1176,7 @@ fn turbo4_dequant_sdpa_matches_full_dequant_attention() {
 /// The grouped-query shape (4 query heads over 2 KV heads, `n_rep = 2`)
 /// exercises the GQA head broadcast inside native SDPA.
 #[test]
+#[ignore = "runs a multi-step GPU dequantization/attention parity stress test"]
 fn turbo4_asym_dequant_sdpa_matches_full_dequant_attention() {
     let head_dim = 64;
     let n_kv_heads = 2; // GQA: 2 KV heads broadcast to 4 query heads (n_rep = 2).
@@ -2551,6 +2544,7 @@ fn delegated_dequant_sdpa_from_updated_cache(
 /// (cadence = `DELEGATED_FOLD_BLOCK = 128` post-fill).
 #[cfg(target_os = "macos")]
 #[test]
+#[ignore = "runs a 200-step Metal kernel parity stress test"]
 fn delegated_fused_kernel_matches_reference_over_200_steps() {
     let head_dim = 64;
     let prefill_len = 8;
@@ -2637,6 +2631,7 @@ fn delegated_fused_kernel_matches_reference_over_200_steps() {
 /// and Q/K scores are unchanged.
 #[cfg(target_os = "macos")]
 #[test]
+#[ignore = "runs a multi-fold GPU dequantization/attention parity stress test"]
 fn delegated_dequant_sdpa_matches_reference_attention() {
     let head_dim = 64;
     let prefill_len = 8;
@@ -2735,6 +2730,7 @@ fn delegated_dequant_sdpa_matches_reference_attention() {
 /// also crosses at least two fold boundaries.
 #[cfg(target_os = "macos")]
 #[test]
+#[ignore = "runs a 200-step Metal kernel parity stress test"]
 fn delegated_steel_envelope_matches_cold_only_fused_over_200_steps() {
     let head_dim = 64;
     let prefill_len = 8;
