@@ -12,18 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::path::Path;
 use anyhow::{Context, Result};
 use minijinja::value::{Value, ValueKind, from_args};
 use minijinja::{Environment, Error, ErrorKind, context};
 use serde::Serialize;
 use serde_json::Value as JsonValue;
+use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ChatMessage {
     pub role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<ChatMessageContent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tool_calls: Vec<ChatToolCall>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -185,10 +187,12 @@ impl ChatTemplateProcessor {
             &[ChatMessage {
                 role: "user".to_string(),
                 content: Some(ChatMessageContent::Text(prompt.to_string())),
+                reasoning_content: None,
                 tool_calls: Vec::new(),
                 tool_call_id: None,
             }],
             &[],
+            None,
         )
     }
 
@@ -196,6 +200,7 @@ impl ChatTemplateProcessor {
         &self,
         messages: &[ChatMessage],
         tools: &[ChatTool],
+        reasoning_effort: Option<&str>,
     ) -> Result<String> {
         anyhow::ensure!(!messages.is_empty(), "messages must not be empty");
         for (index, message) in messages.iter().enumerate() {
@@ -203,6 +208,7 @@ impl ChatTemplateProcessor {
                 "system" => {
                     anyhow::ensure!(
                         matches!(&message.content, Some(ChatMessageContent::Text(text)) if !text.is_empty())
+                            && message.reasoning_content.is_none()
                             && message.tool_calls.is_empty()
                             && message.tool_call_id.is_none(),
                         "message {index} has fields incompatible with role \"system\""
@@ -224,6 +230,7 @@ impl ChatTemplateProcessor {
                     };
                     anyhow::ensure!(
                         valid_content
+                            && message.reasoning_content.is_none()
                             && message.tool_calls.is_empty()
                             && message.tool_call_id.is_none(),
                         "message {index} has fields incompatible with role \"user\""
@@ -239,8 +246,7 @@ impl ChatTemplateProcessor {
                     );
                     for (call_index, call) in message.tool_calls.iter().enumerate() {
                         anyhow::ensure!(
-                            call.tool_type == "function"
-                                && call.function.arguments.is_object(),
+                            call.tool_type == "function" && call.function.arguments.is_object(),
                             "message {index} tool call {call_index} is invalid"
                         );
                     }
@@ -248,16 +254,14 @@ impl ChatTemplateProcessor {
                 "tool" => {
                     anyhow::ensure!(
                         matches!(&message.content, Some(ChatMessageContent::Text(text)) if !text.is_empty())
+                            && message.reasoning_content.is_none()
                             && message.tool_calls.is_empty()
                             && message.tool_call_id.is_some(),
                         "message {index} has fields incompatible with role \"tool\""
                     );
                 }
                 _ => {
-                    anyhow::bail!(
-                        "message {index} has unsupported role {:?}",
-                        message.role
-                    );
+                    anyhow::bail!("message {index} has unsupported role {:?}", message.role);
                 }
             }
         }
@@ -274,6 +278,7 @@ impl ChatTemplateProcessor {
                 bos_token => self.bos_token.as_str(),
                 eos_token => self.eos_token.as_str(),
                 add_generation_prompt => true,
+                reasoning_effort => reasoning_effort.unwrap_or("xhigh"),
                 enable_thinking => true,
             })
             .context("failed to render chat messages")
@@ -288,10 +293,8 @@ impl ChatTemplateProcessor {
     pub(crate) fn supports_image_content(&self) -> bool {
         self.template.contains("image_url")
             || (self.template.contains("content")
-                && (self.template.contains("\"image\"")
-                    || self.template.contains("'image'"))
-                && (self.template.contains("vision_start")
-                    || self.template.contains("image_pad")))
+                && (self.template.contains("\"image\"") || self.template.contains("'image'"))
+                && (self.template.contains("vision_start") || self.template.contains("image_pad")))
     }
 }
 
@@ -366,6 +369,7 @@ assistant:{{ content }}
         ChatMessage {
             role: "user".to_string(),
             content: Some(ChatMessageContent::Text(content.to_string())),
+            reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: None,
         }
@@ -390,6 +394,7 @@ assistant:{{ content }}
             ChatMessage {
                 role: "assistant".to_string(),
                 content: None,
+                reasoning_content: None,
                 tool_calls: vec![ChatToolCall {
                     id: "call_1".to_string(),
                     tool_type: "function".to_string(),
@@ -402,7 +407,7 @@ assistant:{{ content }}
             },
         ];
         let rendered = processor()
-            .render_messages(&messages, &[tool()])
+            .render_messages(&messages, &[tool()], None)
             .expect("render tools");
         assert!(rendered.contains("<tools>"));
         assert!(rendered.contains(r#""name":"weather""#));
@@ -418,6 +423,7 @@ assistant:{{ content }}
             ChatMessage {
                 role: "assistant".to_string(),
                 content: None,
+                reasoning_content: None,
                 tool_calls: vec![ChatToolCall {
                     id: "call_1".to_string(),
                     tool_type: "function".to_string(),
@@ -431,29 +437,33 @@ assistant:{{ content }}
             ChatMessage {
                 role: "tool".to_string(),
                 content: Some(ChatMessageContent::Text("sunny".to_string())),
+                reasoning_content: None,
                 tool_calls: Vec::new(),
                 tool_call_id: Some("call_1".to_string()),
             },
             ChatMessage {
                 role: "tool".to_string(),
                 content: Some(ChatMessageContent::Text("warm".to_string())),
+                reasoning_content: None,
                 tool_calls: Vec::new(),
                 tool_call_id: Some("call_2".to_string()),
             },
         ];
         let rendered = processor()
-            .render_messages(&messages, &[tool()])
+            .render_messages(&messages, &[tool()], None)
             .expect("render tool results");
-        assert!(rendered.contains(
-            "<tool_response>sunny</tool_response><tool_response>warm</tool_response>"
-        ));
+        assert!(
+            rendered.contains(
+                "<tool_response>sunny</tool_response><tool_response>warm</tool_response>"
+            )
+        );
     }
 
     #[test]
     fn empty_tools_and_render_user_keep_ordinary_chat() {
         let processor = processor();
         let rendered = processor
-            .render_messages(&[user("hello")], &[])
+            .render_messages(&[user("hello")], &[], None)
             .expect("render without tools");
         assert_eq!(rendered, "user:helloassistant:");
         assert!(!rendered.contains("<tools>"));
@@ -485,11 +495,12 @@ assistant:{{ content }}
                     text: "after".to_string(),
                 },
             ])),
+            reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: None,
         };
         let rendered = processor
-            .render_messages(&[message], &[])
+            .render_messages(&[message], &[], None)
             .expect("render image parts");
         let before = rendered.find("\"before\"").expect("leading text");
         let image = rendered.find("\"image_url\"").expect("image part");
@@ -521,12 +532,13 @@ assistant:{{ content }}
                     text: "after".to_string(),
                 },
             ])),
+            reasoning_content: None,
             tool_calls: Vec::new(),
             tool_call_id: None,
         };
         let vision_placeholder = "<|vision_start|><|image_pad|><|vision_end|>";
         let initial = processor
-            .render_messages(std::slice::from_ref(&image_message), &[tool()])
+            .render_messages(std::slice::from_ref(&image_message), &[tool()], None)
             .expect("render initial image turn");
         assert_eq!(initial.matches(vision_placeholder).count(), 1);
 
@@ -537,6 +549,7 @@ assistant:{{ content }}
                     ChatMessage {
                         role: "assistant".to_string(),
                         content: None,
+                        reasoning_content: None,
                         tool_calls: vec![ChatToolCall {
                             id: "call_1".to_string(),
                             tool_type: "function".to_string(),
@@ -550,15 +563,19 @@ assistant:{{ content }}
                     ChatMessage {
                         role: "tool".to_string(),
                         content: Some(ChatMessageContent::Text("sunny".to_string())),
+                        reasoning_content: None,
                         tool_calls: Vec::new(),
                         tool_call_id: Some("call_1".to_string()),
                     },
                 ],
                 &[tool()],
+                None,
             )
             .expect("render image and tool replay");
         let before = replayed.find("before").expect("leading text");
-        let image = replayed.find(vision_placeholder).expect("image placeholder");
+        let image = replayed
+            .find(vision_placeholder)
+            .expect("image placeholder");
         let after = replayed.find("after").expect("trailing text");
         assert!(before < image && image < after);
         assert_eq!(replayed.matches(vision_placeholder).count(), 1);
@@ -566,6 +583,37 @@ assistant:{{ content }}
         assert!(replayed.contains("<tool_response>sunny</tool_response>"));
     }
 
+    #[test]
+    fn renders_reasoning_effort_and_replays_assistant_reasoning_separately() {
+        let processor = ChatTemplateProcessor {
+            template: "{{ reasoning_effort }}|{{ messages|tojson }}".to_string(),
+            bos_token: String::new(),
+            eos_token: String::new(),
+        };
+        let message = ChatMessage {
+            role: "assistant".to_string(),
+            content: Some(ChatMessageContent::Text("final answer".to_string())),
+            reasoning_content: Some("private trace".to_string()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        };
+
+        for (effort, expected) in [
+            (Some("low"), "low"),
+            (Some("medium"), "medium"),
+            (Some("xhigh"), "xhigh"),
+            (None, "xhigh"),
+        ] {
+            let rendered = processor
+                .render_messages(std::slice::from_ref(&message), &[], effort)
+                .expect("render reasoning replay");
+            let (rendered_effort, messages) = rendered.split_once('|').expect("effort delimiter");
+            assert_eq!(rendered_effort, expected);
+            let messages: JsonValue = serde_json::from_str(messages).expect("serialized messages");
+            assert_eq!(messages[0]["content"], "final answer");
+            assert_eq!(messages[0]["reasoning_content"], "private trace");
+        }
+    }
 }
 
 fn extract_token(config: &JsonValue, name: &str) -> String {

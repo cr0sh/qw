@@ -24,7 +24,11 @@ async fn post(app: Router, path: &str, body: Value) -> (StatusCode, axum::http::
     let bytes = to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("response body");
-    (status, headers, String::from_utf8(bytes.to_vec()).expect("UTF-8 response"))
+    (
+        status,
+        headers,
+        String::from_utf8(bytes.to_vec()).expect("UTF-8 response"),
+    )
 }
 
 fn chat_request(prompt: &str) -> Value {
@@ -103,10 +107,7 @@ fn parse_sse(body: &str) -> (Vec<SseFrame>, bool) {
             .lines()
             .find_map(|line| line.strip_prefix("event: "))
             .map(str::to_string);
-        let Some(data) = block
-            .lines()
-            .find_map(|line| line.strip_prefix("data: "))
-        else {
+        let Some(data) = block.lines().find_map(|line| line.strip_prefix("data: ")) else {
             continue;
         };
         if data == "[DONE]" {
@@ -151,10 +152,12 @@ async fn streamed_chat_emits_role_content_terminal_usage_and_done() {
     request["stream"] = Value::Bool(true);
     let (status, headers, body) = post(app, "/v1/chat/completions", request).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(headers[header::CONTENT_TYPE]
-        .to_str()
-        .expect("content type")
-        .starts_with("text/event-stream"));
+    assert!(
+        headers[header::CONTENT_TYPE]
+            .to_str()
+            .expect("content type")
+            .starts_with("text/event-stream")
+    );
     assert!(body.contains("\"role\":\"assistant\""), "{body}");
     assert!(body.contains("\"content\":"), "{body}");
     assert!(body.contains("\"finish_reason\":\"stop\""), "{body}");
@@ -162,6 +165,69 @@ async fn streamed_chat_emits_role_content_terminal_usage_and_done() {
     assert!(body.trim_end().ends_with("data: [DONE]"), "{body}");
 }
 
+#[tokio::test]
+async fn buffered_chat_separates_reasoning_from_visible_content() {
+    let app = router(Engine::start_fake(MODEL, 8));
+    let (status, _, body) = post(app, "/v1/chat/completions", chat_request("reasoning")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let value: Value = serde_json::from_str(&body).expect("chat JSON");
+    let message = &value["choices"][0]["message"];
+    assert_eq!(message["reasoning_content"], "fake reasoning");
+    assert_eq!(message["content"], "echo:reasoning");
+    assert!(!body.contains("<think"));
+    assert!(!body.contains("</think>"));
+}
+
+#[tokio::test]
+async fn streamed_chat_uses_reasoning_and_content_deltas_without_markers() {
+    let app = router(Engine::start_fake(MODEL, 8));
+    let mut request = chat_request("reasoning");
+    request["stream"] = json!(true);
+    let (status, _, body) = post(app, "/v1/chat/completions", request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (frames, done) = parse_sse(&body);
+    assert!(done);
+    let reasoning = frames
+        .iter()
+        .filter_map(|frame| frame.data["choices"][0]["delta"]["reasoning_content"].as_str())
+        .collect::<String>();
+    let content = frames
+        .iter()
+        .filter_map(|frame| frame.data["choices"][0]["delta"]["content"].as_str())
+        .collect::<String>();
+    assert_eq!(reasoning, "fake reasoning");
+    assert_eq!(content, "echo:reasoning");
+    assert!(!body.contains("<think"));
+    assert!(!body.contains("</think>"));
+}
+
+#[tokio::test]
+async fn responses_suppresses_reasoning_buffered_and_streamed() {
+    let app = router(Engine::start_fake(MODEL, 8));
+    let (status, _, body) =
+        post(app.clone(), "/v1/responses", responses_request("reasoning")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let value: Value = serde_json::from_str(&body).expect("responses JSON");
+    assert_eq!(value["output"][0]["content"][0]["text"], "echo:reasoning");
+    assert!(!body.contains("fake reasoning"));
+    assert!(!body.contains("reasoning_content"));
+    assert!(!body.contains("<think"));
+
+    let mut request = responses_request("reasoning");
+    request["stream"] = json!(true);
+    let (status, _, body) = post(app, "/v1/responses", request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (frames, _) = parse_sse(&body);
+    let content = frames
+        .iter()
+        .filter(|frame| frame.event.as_deref() == Some("response.output_text.delta"))
+        .filter_map(|frame| frame.data["delta"].as_str())
+        .collect::<String>();
+    assert_eq!(content, "echo:reasoning");
+    assert!(!body.contains("fake reasoning"));
+    assert!(!body.contains("reasoning_content"));
+    assert!(!body.contains("<think"));
+}
 #[tokio::test]
 async fn buffered_responses_completion_has_output_and_cached_usage() {
     let app = router(Engine::start_fake(MODEL, 8));
@@ -207,7 +273,10 @@ async fn streamed_responses_events_have_exact_order_and_monotonic_sequences() {
         .filter_map(|value| value["sequence_number"].as_u64())
         .collect();
     assert_eq!(sequences, (0..sequences.len() as u64).collect::<Vec<_>>());
-    for frame in body.split("\n\n").filter(|frame| frame.starts_with("event: ")) {
+    for frame in body
+        .split("\n\n")
+        .filter(|frame| frame.starts_with("event: "))
+    {
         let mut lines = frame.lines();
         let name = lines
             .next()
@@ -260,6 +329,92 @@ async fn malformed_and_unsupported_fields_are_rejected() {
     }
 }
 
+#[test]
+fn chat_protocol_accepts_supported_reasoning_efforts() {
+    for (value, expected) in [
+        ("low", protocol::ReasoningEffort::Low),
+        ("medium", protocol::ReasoningEffort::Medium),
+        ("xhigh", protocol::ReasoningEffort::XHigh),
+    ] {
+        let mut request = chat_request("hello");
+        request["reasoning_effort"] = json!(value);
+        let parsed = protocol::parse_chat(request).expect("supported reasoning effort");
+        assert_eq!(parsed.reasoning_effort, Some(expected));
+        assert_eq!(
+            parsed.reasoning_effort.map(|effort| effort.as_str()),
+            Some(value)
+        );
+    }
+    assert_eq!(
+        protocol::parse_chat(chat_request("hello"))
+            .expect("omitted effort")
+            .reasoning_effort,
+        None
+    );
+}
+
+#[test]
+fn chat_protocol_rejects_unsupported_reasoning_efforts() {
+    for value in ["high", "max", "unknown", ""] {
+        let mut request = chat_request("hello");
+        request["reasoning_effort"] = json!(value);
+        let error = protocol::parse_chat(request).expect_err("unsupported reasoning effort");
+        assert_eq!(error.param.as_deref(), Some("reasoning_effort"));
+    }
+    for value in [Value::Null, json!(1)] {
+        let mut request = chat_request("hello");
+        request["reasoning_effort"] = value;
+        let error = protocol::parse_chat(request).expect_err("effort must be a string");
+        assert_eq!(error.param.as_deref(), Some("reasoning_effort"));
+    }
+}
+
+#[tokio::test]
+async fn unsupported_reasoning_efforts_return_parameterized_400() {
+    let app = router(Engine::start_fake(MODEL, 8));
+    for effort in ["high", "max"] {
+        let mut request = chat_request("hello");
+        request["reasoning_effort"] = json!(effort);
+        let (status, _, body) = post(app.clone(), "/v1/chat/completions", request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let value: Value = serde_json::from_str(&body).expect("error JSON");
+        assert_eq!(value["error"]["param"], "reasoning_effort");
+    }
+}
+#[test]
+fn chat_protocol_replays_assistant_reasoning_content() {
+    let parsed = protocol::parse_chat(json!({
+        "model": MODEL,
+        "messages": [
+            {"role":"user","content":"question"},
+            {
+                "role":"assistant",
+                "reasoning_content":"private trace",
+                "content":"answer"
+            },
+            {"role":"user","content":"follow-up"}
+        ]
+    }))
+    .expect("assistant reasoning replay");
+    assert_eq!(
+        parsed.messages[1].reasoning_content.as_deref(),
+        Some("private trace")
+    );
+    assert_eq!(parsed.messages[1].text_content(), Some("answer"));
+
+    let error = protocol::parse_chat(json!({
+        "model": MODEL,
+        "messages": [
+            {"role":"user","content":"question"},
+            {"role":"assistant","reasoning_content":null,"content":"answer"}
+        ]
+    }))
+    .expect_err("reasoning content must be a string");
+    assert_eq!(
+        error.param.as_deref(),
+        Some("messages[1].reasoning_content")
+    );
+}
 #[tokio::test]
 async fn json_object_and_strict_schema_are_generated_under_constraints() {
     let app = router(Engine::start_fake(MODEL, 8));
@@ -307,7 +462,8 @@ async fn every_strict_schema_rejection_class_returns_400() {
     }
 
     let mut non_strict = responses_request("schema");
-    non_strict["text"] = json!({"format":{"type":"json_schema","name":"bad","strict":false,"schema":{}}});
+    non_strict["text"] =
+        json!({"format":{"type":"json_schema","name":"bad","strict":false,"schema":{}}});
     let (status, _, _) = post(app, "/v1/responses", non_strict).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
@@ -334,18 +490,22 @@ async fn max_token_fields_map_to_length_and_incomplete() {
 #[tokio::test]
 async fn repeated_prefix_reports_cached_tokens_and_matches_cold_output() {
     let warm_app = router(Engine::start_fake(MODEL, 8));
-    let _ = post(warm_app.clone(), "/v1/chat/completions", chat_request("abc")).await;
-    let (status, _, warm_body) = post(
-        warm_app,
+    let _ = post(
+        warm_app.clone(),
         "/v1/chat/completions",
-        chat_request("abcdef"),
+        chat_request("abc"),
     )
     .await;
+    let (status, _, warm_body) =
+        post(warm_app, "/v1/chat/completions", chat_request("abcdef")).await;
     assert_eq!(status, StatusCode::OK);
     let warm: Value = serde_json::from_str(&warm_body).expect("warm JSON");
-    assert!(warm["usage"]["prompt_tokens_details"]["cached_tokens"]
-        .as_u64()
-        .expect("cached tokens") > 0);
+    assert!(
+        warm["usage"]["prompt_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .expect("cached tokens")
+            > 0
+    );
 
     let cold_app = router(Engine::start_fake(MODEL, 8));
     let (_, _, cold_body) = post(cold_app, "/v1/chat/completions", chat_request("abcdef")).await;
@@ -361,12 +521,7 @@ async fn over_budget_prefix_is_not_cached() {
     let app = router(Engine::start_fake(MODEL, 8));
     let long = "x".repeat(20);
     let _ = post(app.clone(), "/v1/responses", responses_request(&long)).await;
-    let (status, _, body) = post(
-        app,
-        "/v1/responses",
-        responses_request(&(long + "suffix")),
-    )
-    .await;
+    let (status, _, body) = post(app, "/v1/responses", responses_request(&(long + "suffix"))).await;
     assert_eq!(status, StatusCode::OK);
     let value: Value = serde_json::from_str(&body).expect("response JSON");
     assert_eq!(value["usage"]["input_tokens_details"]["cached_tokens"], 0);
@@ -452,7 +607,10 @@ async fn buffered_chat_completes_a_two_turn_tool_loop() {
     for (index, call) in calls.iter().enumerate() {
         assert!(call["id"].as_str().unwrap().starts_with("call_"));
         assert_eq!(call["type"], "function");
-        assert_eq!(call["function"]["name"], if index == 0 { "weather" } else { "time" });
+        assert_eq!(
+            call["function"]["name"],
+            if index == 0 { "weather" } else { "time" }
+        );
         assert!(
             serde_json::from_str::<Value>(call["function"]["arguments"].as_str().unwrap())
                 .unwrap()
@@ -474,9 +632,34 @@ async fn buffered_chat_completes_a_two_turn_tool_loop() {
     let content = second["choices"][0]["message"]["content"]
         .as_str()
         .expect("final content");
-    assert!(content.contains("sunny") && content.contains("noon"), "{content}");
+    assert!(
+        content.contains("sunny") && content.contains("noon"),
+        "{content}"
+    );
 }
 
+#[tokio::test]
+async fn buffered_tool_call_preserves_reasoning_without_visible_tool_xml() {
+    let app = router(Engine::start_fake(MODEL, 8));
+    let (status, _, body) = post(
+        app,
+        "/v1/chat/completions",
+        chat_tool_request("call-tool-with-reasoning"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let value: Value = serde_json::from_str(&body).expect("tool response");
+    let message = &value["choices"][0]["message"];
+    assert_eq!(message["reasoning_content"], "fake reasoning");
+    assert_eq!(message["content"], Value::Null);
+    assert_eq!(
+        message["tool_calls"].as_array().expect("tool calls").len(),
+        2
+    );
+    assert_eq!(value["choices"][0]["finish_reason"], "tool_calls");
+    assert!(!body.contains("<think"));
+    assert!(!body.contains("<tool_call>"));
+}
 #[tokio::test]
 async fn streamed_chat_emits_stable_indexed_calls_separate_usage_and_replays() {
     let app = router(Engine::start_fake(MODEL, 8));
@@ -557,7 +740,10 @@ async fn streamed_chat_emits_stable_indexed_calls_separate_usage_and_replays() {
         .iter()
         .filter_map(|frame| frame.data["choices"][0]["delta"]["content"].as_str())
         .collect::<String>();
-    assert!(content.contains("sunny") && content.contains("noon"), "{content}");
+    assert!(
+        content.contains("sunny") && content.contains("noon"),
+        "{content}"
+    );
 }
 
 #[tokio::test]
@@ -595,7 +781,10 @@ async fn buffered_responses_completes_a_two_turn_tool_loop() {
     let content = second["output"][0]["content"][0]["text"]
         .as_str()
         .expect("final content");
-    assert!(content.contains("sunny") && content.contains("noon"), "{content}");
+    assert!(
+        content.contains("sunny") && content.contains("noon"),
+        "{content}"
+    );
 }
 
 #[tokio::test]
@@ -731,17 +920,12 @@ async fn tool_choice_parallel_policy_and_tool_free_shapes_are_preserved() {
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
 
     let ordinary = router(Engine::start_fake(MODEL, 8));
-    let (status, _, body) = post(
-        ordinary,
-        "/v1/chat/completions",
-        chat_request("shape"),
-    )
-    .await;
+    let (status, _, body) = post(ordinary, "/v1/chat/completions", chat_request("shape")).await;
     assert_eq!(status, StatusCode::OK);
     let value: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(
         value["choices"][0]["message"],
-        json!({"role":"assistant","content":"echo:shape"})
+        json!({"role":"assistant","reasoning_content":"","content":"echo:shape"})
     );
 }
 
@@ -941,7 +1125,10 @@ async fn chat_and_responses_preserve_mixed_image_order_buffered_and_streamed() {
     let (status, _, body) = post(app.clone(), "/v1/chat/completions", image_only).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let value: Value = serde_json::from_str(&body).expect("image-only response");
-    assert_eq!(value["choices"][0]["message"]["content"], "echo:[image:png]");
+    assert_eq!(
+        value["choices"][0]["message"]["content"],
+        "echo:[image:png]"
+    );
 
     let responses = json!({
         "model": MODEL,
@@ -991,7 +1178,9 @@ async fn chat_and_responses_preserve_mixed_image_order_buffered_and_streamed() {
     assert!(
         frames.windows(2).all(|pair| {
             pair[1].data["sequence_number"].as_u64()
-                == pair[0].data["sequence_number"].as_u64().map(|value| value + 1)
+                == pair[0].data["sequence_number"]
+                    .as_u64()
+                    .map(|value| value + 1)
         }),
         "{body}"
     );
@@ -1084,10 +1273,7 @@ async fn image_requests_never_use_or_populate_the_text_prefix_cache() {
             post(app.clone(), "/v1/chat/completions", image_request.clone()).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let value: Value = serde_json::from_str(&body).expect("image response");
-        assert_eq!(
-            value["usage"]["prompt_tokens_details"]["cached_tokens"],
-            0
-        );
+        assert_eq!(value["usage"]["prompt_tokens_details"]["cached_tokens"], 0);
     }
     let _ = post(app.clone(), "/v1/chat/completions", chat_request("same")).await;
     let (status, _, body) = post(app, "/v1/chat/completions", chat_request("same-more")).await;
@@ -1192,8 +1378,7 @@ async fn image_requests_keep_structured_output_and_tool_choice_none_contracts() 
         "tools": chat_tools(),
         "tool_choice": "none"
     });
-    let (status, _, body) =
-        post(app.clone(), "/v1/chat/completions", chat_with_tools).await;
+    let (status, _, body) = post(app.clone(), "/v1/chat/completions", chat_with_tools).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let value: Value = serde_json::from_str(&body).expect("tool-free chat response");
     assert_eq!(
@@ -1215,10 +1400,7 @@ async fn image_requests_keep_structured_output_and_tool_choice_none_contracts() 
     assert_eq!(status, StatusCode::OK, "{body}");
     let value: Value = serde_json::from_str(&body).expect("tool-free Responses response");
     let output = value["output"].as_array().expect("Responses output");
-    assert_eq!(
-        output[0]["content"][0]["text"],
-        "echo:call-tool[image:png]"
-    );
+    assert_eq!(output[0]["content"][0]["text"], "echo:call-tool[image:png]");
     assert!(output.iter().all(|item| item["type"] != "function_call"));
 }
 
@@ -1243,8 +1425,7 @@ async fn cancelling_an_image_request_leaves_the_next_text_request_clean() {
         .cancelled
         .store(true, std::sync::atomic::Ordering::Release);
 
-    let text_request =
-        protocol::parse_chat(chat_request("clean")).expect("parse text request");
+    let text_request = protocol::parse_chat(chat_request("clean")).expect("parse text request");
     let mut text_submission = engine.submit(text_request).expect("submit text request");
     let record = loop {
         match text_submission.events.recv().await {

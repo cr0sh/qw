@@ -32,6 +32,23 @@ pub enum ToolChoice {
     None,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    Low,
+    Medium,
+    XHigh,
+}
+
+impl ReasoningEffort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::XHigh => "xhigh",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CompletionRequest {
     pub endpoint: Endpoint,
@@ -40,6 +57,7 @@ pub struct CompletionRequest {
     pub tools: Vec<ChatTool>,
     pub tool_choice: ToolChoice,
     pub parallel_tool_calls: bool,
+    pub reasoning_effort: Option<ReasoningEffort>,
     pub stream: bool,
     pub stream_include_usage: bool,
     pub max_tokens: usize,
@@ -73,11 +91,16 @@ impl RequestError {
 #[derive(Deserialize)]
 #[serde(tag = "role", rename_all = "lowercase", deny_unknown_fields)]
 enum ChatWireMessage {
-    System { content: Value },
-    User { content: Value },
+    System {
+        content: Value,
+    },
+    User {
+        content: Value,
+    },
     Assistant {
         #[serde(default)]
         content: Value,
+        reasoning_content: Option<String>,
         tool_calls: Option<Vec<Value>>,
     },
     Tool {
@@ -96,6 +119,7 @@ struct ChatWire {
     stream_options: Option<ChatStreamOptions>,
     max_completion_tokens: Option<usize>,
     max_tokens: Option<usize>,
+    reasoning_effort: Option<String>,
     temperature: Option<f32>,
     top_p: Option<f32>,
     seed: Option<u64>,
@@ -201,6 +225,14 @@ struct ResponsesFunctionOutputWire {
 pub fn parse_chat(value: Value) -> Result<CompletionRequest, RequestError> {
     let object = require_object(&value)?;
     reject_present(object, "logprobs", "logprobs are not supported")?;
+    if let Some(reasoning_effort) = object.get("reasoning_effort")
+        && !reasoning_effort.is_string()
+    {
+        return Err(RequestError::at(
+            "reasoning_effort must be a string",
+            "reasoning_effort",
+        ));
+    }
     let wire: ChatWire = serde_json::from_value(value).map_err(|error| {
         RequestError::new(format!("invalid Chat Completions request: {error}"), None)
     })?;
@@ -222,16 +254,14 @@ pub fn parse_chat(value: Value) -> Result<CompletionRequest, RequestError> {
     if let Some(stop) = wire.stop.as_ref()
         && stop_is_nonempty(stop)
     {
-        return Err(RequestError::at(
-            "stop sequences are not supported",
-            "stop",
-        ));
+        return Err(RequestError::at("stop sequences are not supported", "stop"));
     }
     let max_tokens = wire
         .max_completion_tokens
         .or(wire.max_tokens)
         .unwrap_or(DEFAULT_MAX_TOKENS);
     validate_sampling(max_tokens, wire.temperature, wire.top_p)?;
+    let reasoning_effort = parse_reasoning_effort(wire.reasoning_effort.as_deref())?;
     let output_format = parse_chat_format(wire.response_format)?;
     let tools = parse_tools(wire.tools.as_deref().unwrap_or_default(), ToolDialect::Chat)?;
     if !tools.is_empty() && !matches!(output_format, OutputFormat::Text) {
@@ -249,6 +279,7 @@ pub fn parse_chat(value: Value) -> Result<CompletionRequest, RequestError> {
         messages,
         tools,
         tool_choice,
+        reasoning_effort,
         parallel_tool_calls: wire.parallel_tool_calls.unwrap_or(true),
         stream: wire.stream,
         stream_include_usage: wire
@@ -298,13 +329,12 @@ pub fn parse_responses(value: Value) -> Result<CompletionRequest, RequestError> 
             vec![ChatMessage {
                 role: "user".to_string(),
                 content: Some(ChatMessageContent::Text(content)),
+                reasoning_content: None,
                 tool_calls: Vec::new(),
                 tool_call_id: None,
             }]
         }
-        ResponsesInput::Items(items) => {
-            parse_responses_items(items, &tools, &mut image_params)?
-        }
+        ResponsesInput::Items(items) => parse_responses_items(items, &tools, &mut image_params)?,
     };
     Ok(CompletionRequest {
         endpoint: Endpoint::Responses,
@@ -312,6 +342,7 @@ pub fn parse_responses(value: Value) -> Result<CompletionRequest, RequestError> 
         messages,
         tools,
         tool_choice,
+        reasoning_effort: None,
         parallel_tool_calls: wire.parallel_tool_calls.unwrap_or(true),
         stream: wire.stream,
         stream_include_usage: false,
@@ -458,10 +489,7 @@ fn require_function_type(value: Option<&Value>, param: &str) -> Result<(), Reque
     if value.and_then(Value::as_str) == Some("function") {
         Ok(())
     } else {
-        Err(RequestError::at(
-            "only function tools are supported",
-            param,
-        ))
+        Err(RequestError::at("only function tools are supported", param))
     }
 }
 
@@ -473,6 +501,19 @@ fn parse_tool_choice(value: Option<&Value>) -> Result<ToolChoice, RequestError> 
         _ => Err(RequestError::at(
             "tool_choice must be \"auto\" or \"none\"",
             "tool_choice",
+        )),
+    }
+}
+
+fn parse_reasoning_effort(value: Option<&str>) -> Result<Option<ReasoningEffort>, RequestError> {
+    match value {
+        None => Ok(None),
+        Some("low") => Ok(Some(ReasoningEffort::Low)),
+        Some("medium") => Ok(Some(ReasoningEffort::Medium)),
+        Some("xhigh") => Ok(Some(ReasoningEffort::XHigh)),
+        Some(_) => Err(RequestError::at(
+            "reasoning_effort must be \"low\", \"medium\", or \"xhigh\"",
+            "reasoning_effort",
         )),
     }
 }
@@ -491,7 +532,9 @@ fn parse_chat_messages(
             .as_object()
             .and_then(|object| object.get("role"))
             .and_then(Value::as_str)
-            .ok_or_else(|| RequestError::at("message role must be a string", format!("{base}.role")))?;
+            .ok_or_else(|| {
+                RequestError::at("message role must be a string", format!("{base}.role"))
+            })?;
         if role == "system" && index != 0 {
             return Err(RequestError::at(
                 "system messages are only allowed at index zero",
@@ -503,7 +546,7 @@ fn parse_chat_messages(
             .expect("role lookup already required an object");
         let allowed_fields = match role {
             "system" | "user" => &["role", "content"][..],
-            "assistant" => &["role", "content", "tool_calls"][..],
+            "assistant" => &["role", "content", "reasoning_content", "tool_calls"][..],
             "tool" => &["role", "content", "tool_call_id"][..],
             _ => {
                 return Err(RequestError::at(
@@ -513,21 +556,25 @@ fn parse_chat_messages(
             }
         };
         reject_unknown_fields(message_object, allowed_fields, &base)?;
+        if let Some(reasoning_content) = message_object.get("reasoning_content")
+            && !reasoning_content.is_string()
+        {
+            return Err(RequestError::at(
+                "assistant reasoning_content must be a string",
+                format!("{base}.reasoning_content"),
+            ));
+        }
         if role != "user" {
-            reject_chat_role_images(
-                message_object.get("content"),
-                &format!("{base}.content"),
-            )?;
+            reject_chat_role_images(message_object.get("content"), &format!("{base}.content"))?;
         }
         let tool_calls_field_present = message_object.contains_key("tool_calls");
         let wire: ChatWireMessage = serde_json::from_value(value).map_err(|error| {
             RequestError::at(format!("invalid chat message: {error}"), base.clone())
         })?;
         let message = match wire {
-            ChatWireMessage::System { content } => {
-                ordinary_message("system", content, &base)?
-            }
+            ChatWireMessage::System { content } => ordinary_message("system", content, &base)?,
             ChatWireMessage::User { content } => ChatMessage {
+                reasoning_content: None,
                 role: "user".to_string(),
                 content: Some(parse_chat_user_content(
                     &content,
@@ -540,6 +587,7 @@ fn parse_chat_messages(
             ChatWireMessage::Assistant {
                 content,
                 tool_calls,
+                reasoning_content,
             } => {
                 let calls_present = tool_calls_field_present;
                 let calls = parse_chat_tool_calls(
@@ -580,6 +628,7 @@ fn parse_chat_messages(
                     ));
                 }
                 ChatMessage {
+                    reasoning_content,
                     role: "assistant".to_string(),
                     content,
                     tool_calls: calls,
@@ -590,16 +639,12 @@ fn parse_chat_messages(
                 content,
                 tool_call_id,
             } => {
-                let content = require_nonempty_string_value(
-                    &content,
-                    &format!("{base}.content"),
-                )?;
-                let call_id = require_nonempty_string_value(
-                    &tool_call_id,
-                    &format!("{base}.tool_call_id"),
-                )?;
+                let content = require_nonempty_string_value(&content, &format!("{base}.content"))?;
+                let call_id =
+                    require_nonempty_string_value(&tool_call_id, &format!("{base}.tool_call_id"))?;
                 history.resolve(&call_id, format!("{base}.tool_call_id"))?;
                 ChatMessage {
+                    reasoning_content: None,
                     role: "tool".to_string(),
                     content: Some(ChatMessageContent::Text(content)),
                     tool_calls: Vec::new(),
@@ -619,13 +664,8 @@ fn parse_chat_user_content(
     image_params: &mut Vec<String>,
 ) -> Result<ChatMessageContent, RequestError> {
     match content {
-        Value::String(text) if !text.is_empty() => {
-            Ok(ChatMessageContent::Text(text.clone()))
-        }
-        Value::String(_) => Err(RequestError::at(
-            "user content must not be empty",
-            base,
-        )),
+        Value::String(text) if !text.is_empty() => Ok(ChatMessageContent::Text(text.clone())),
+        Value::String(_) => Err(RequestError::at("user content must not be empty", base)),
         Value::Array(parts) => {
             if parts.is_empty() {
                 return Err(RequestError::at(
@@ -639,10 +679,8 @@ fn parse_chat_user_content(
                 let object = part.as_object().ok_or_else(|| {
                     RequestError::at("content part must be an object", &part_base)
                 })?;
-                let part_type = require_nonempty_string(
-                    object.get("type"),
-                    &format!("{part_base}.type"),
-                )?;
+                let part_type =
+                    require_nonempty_string(object.get("type"), &format!("{part_base}.type"))?;
                 match part_type {
                     "text" => {
                         reject_unknown_fields(object, &["type", "text"], &part_base)?;
@@ -661,10 +699,7 @@ fn parse_chat_user_content(
                             .get("image_url")
                             .and_then(Value::as_object)
                             .ok_or_else(|| {
-                                RequestError::at(
-                                    "image_url must be an object",
-                                    &image_base,
-                                )
+                                RequestError::at("image_url must be an object", &image_base)
                             })?;
                         reject_unknown_fields(image, &["url", "detail"], &image_base)?;
                         let url_path = format!("{image_base}.url");
@@ -725,7 +760,9 @@ fn parse_chat_tool_calls(
         let function = object
             .get("function")
             .and_then(Value::as_object)
-            .ok_or_else(|| RequestError::at("tool call function must be an object", &function_path))?;
+            .ok_or_else(|| {
+                RequestError::at("tool call function must be an object", &function_path)
+            })?;
         reject_unknown_fields(function, &["name", "arguments"], &function_path)?;
         let name_path = format!("{function_path}.name");
         let name = require_nonempty_string(function.get("name"), &name_path)?.to_string();
@@ -772,9 +809,7 @@ fn parse_responses_items(
             .ok_or_else(|| RequestError::at("input item must be an object", &base))?;
         let item_type = object.get("type").and_then(Value::as_str);
         let allowed_fields = match item_type {
-            Some("function_call") => {
-                &["type", "id", "call_id", "name", "arguments"][..]
-            }
+            Some("function_call") => &["type", "id", "call_id", "name", "arguments"][..],
             Some("function_call_output") => &["type", "call_id", "output"][..],
             Some(_) => &["type"][..],
             None => &["role", "content"][..],
@@ -787,19 +822,13 @@ fn parse_responses_items(
                         RequestError::at(format!("invalid function call item: {error}"), &base)
                     })?;
                 debug_assert_eq!(wire.item_type, "function_call");
-                let _item_id =
-                    require_nonempty_string_value(&wire.id, &format!("{base}.id"))?;
-                let call_id = require_nonempty_string_value(
-                    &wire.call_id,
-                    &format!("{base}.call_id"),
-                )?;
-                let name =
-                    require_nonempty_string_value(&wire.name, &format!("{base}.name"))?;
+                let _item_id = require_nonempty_string_value(&wire.id, &format!("{base}.id"))?;
+                let call_id =
+                    require_nonempty_string_value(&wire.call_id, &format!("{base}.call_id"))?;
+                let name = require_nonempty_string_value(&wire.name, &format!("{base}.name"))?;
                 require_declared(&name, &declared, &format!("{base}.name"))?;
-                let arguments_text = require_nonempty_string_value(
-                    &wire.arguments,
-                    &format!("{base}.arguments"),
-                )?;
+                let arguments_text =
+                    require_nonempty_string_value(&wire.arguments, &format!("{base}.arguments"))?;
                 let arguments: Value = serde_json::from_str(&arguments_text).map_err(|_| {
                     RequestError::at(
                         "function call arguments must be valid JSON",
@@ -814,6 +843,7 @@ fn parse_responses_items(
                 }
                 history.add(&call_id, format!("{base}.call_id"))?;
                 messages.push(ChatMessage {
+                    reasoning_content: None,
                     role: "assistant".to_string(),
                     content: None,
                     tool_calls: vec![ChatToolCall {
@@ -830,13 +860,12 @@ fn parse_responses_items(
                         RequestError::at(format!("invalid function output item: {error}"), &base)
                     })?;
                 debug_assert_eq!(wire.item_type, "function_call_output");
-                let call_id = require_nonempty_string_value(
-                    &wire.call_id,
-                    &format!("{base}.call_id"),
-                )?;
+                let call_id =
+                    require_nonempty_string_value(&wire.call_id, &format!("{base}.call_id"))?;
                 let output = require_string_value(&wire.output, &format!("{base}.output"))?;
                 history.resolve(&call_id, format!("{base}.call_id"))?;
                 messages.push(ChatMessage {
+                    reasoning_content: None,
                     role: "tool".to_string(),
                     content: Some(ChatMessageContent::Text(output)),
                     tool_calls: Vec::new(),
@@ -888,6 +917,7 @@ fn parse_responses_items(
                     ChatMessageContent::Text(text)
                 };
                 messages.push(ChatMessage {
+                    reasoning_content: None,
                     role: wire.role,
                     content: Some(content),
                     tool_calls: Vec::new(),
@@ -906,13 +936,8 @@ fn parse_responses_user_content(
     image_params: &mut Vec<String>,
 ) -> Result<ChatMessageContent, RequestError> {
     match content {
-        Value::String(text) if !text.is_empty() => {
-            Ok(ChatMessageContent::Text(text.clone()))
-        }
-        Value::String(_) => Err(RequestError::at(
-            "user content must not be empty",
-            base,
-        )),
+        Value::String(text) if !text.is_empty() => Ok(ChatMessageContent::Text(text.clone())),
+        Value::String(_) => Err(RequestError::at("user content must not be empty", base)),
         Value::Array(parts) => {
             if parts.is_empty() {
                 return Err(RequestError::at(
@@ -926,10 +951,8 @@ fn parse_responses_user_content(
                 let object = part.as_object().ok_or_else(|| {
                     RequestError::at("content part must be an object", &part_base)
                 })?;
-                let part_type = require_nonempty_string(
-                    object.get("type"),
-                    &format!("{part_base}.type"),
-                )?;
+                let part_type =
+                    require_nonempty_string(object.get("type"), &format!("{part_base}.type"))?;
                 match part_type {
                     "input_text" => {
                         reject_unknown_fields(object, &["type", "text"], &part_base)?;
@@ -1009,10 +1032,7 @@ fn validate_data_image_uri(url: &str, param: &str) -> Result<(), RequestError> {
     Ok(())
 }
 
-fn record_image_param(
-    image_params: &mut Vec<String>,
-    param: &str,
-) -> Result<(), RequestError> {
+fn record_image_param(image_params: &mut Vec<String>, param: &str) -> Result<(), RequestError> {
     if image_params.len() == MAX_IMAGES_PER_REQUEST {
         return Err(RequestError::at(
             format!("requests may contain at most {MAX_IMAGES_PER_REQUEST} images"),
@@ -1027,9 +1047,11 @@ fn reject_chat_role_images(content: Option<&Value>, base: &str) -> Result<(), Re
     let Some(Value::Array(parts)) = content else {
         return Ok(());
     };
-    if let Some((index, _)) = parts.iter().enumerate().find(|(_, part)| {
-        part.get("type").and_then(Value::as_str) == Some("image_url")
-    }) {
+    if let Some((index, _)) = parts
+        .iter()
+        .enumerate()
+        .find(|(_, part)| part.get("type").and_then(Value::as_str) == Some("image_url"))
+    {
         return Err(RequestError::at(
             "image inputs are only allowed on user messages",
             format!("{base}[{index}].image_url.url"),
@@ -1040,10 +1062,12 @@ fn reject_chat_role_images(content: Option<&Value>, base: &str) -> Result<(), Re
 
 fn ordinary_message(role: &str, content: Value, base: &str) -> Result<ChatMessage, RequestError> {
     Ok(ChatMessage {
+        reasoning_content: None,
         role: role.to_string(),
-        content: Some(ChatMessageContent::Text(
-            require_nonempty_string_value(&content, &format!("{base}.content"))?,
-        )),
+        content: Some(ChatMessageContent::Text(require_nonempty_string_value(
+            &content,
+            &format!("{base}.content"),
+        )?)),
         tool_calls: Vec::new(),
         tool_call_id: None,
     })
@@ -1091,11 +1115,7 @@ fn declared_names(tools: &[ChatTool]) -> HashSet<&str> {
         .collect()
 }
 
-fn require_declared(
-    name: &str,
-    declared: &HashSet<&str>,
-    param: &str,
-) -> Result<(), RequestError> {
+fn require_declared(name: &str, declared: &HashSet<&str>, param: &str) -> Result<(), RequestError> {
     if declared.contains(name) {
         Ok(())
     } else {
@@ -1132,11 +1152,11 @@ fn reject_unknown_fields(
     allowed: &[&str],
     base: &str,
 ) -> Result<(), RequestError> {
-    if let Some(field) = object.keys().find(|field| !allowed.contains(&field.as_str())) {
-        Err(RequestError::at(
-            "unknown field",
-            format!("{base}.{field}"),
-        ))
+    if let Some(field) = object
+        .keys()
+        .find(|field| !allowed.contains(&field.as_str()))
+    {
+        Err(RequestError::at("unknown field", format!("{base}.{field}")))
     } else {
         Ok(())
     }
