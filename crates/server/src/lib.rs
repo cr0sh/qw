@@ -218,10 +218,7 @@ impl SseState {
             }
             match self.receiver.recv().await {
                 Some(WorkerEvent::Started) => continue,
-                Some(WorkerEvent::Delta(WorkerDelta::Reasoning(_))) => {}
-                Some(WorkerEvent::Delta(WorkerDelta::Content(delta))) => {
-                    self.enqueue_delta(delta);
-                }
+                Some(WorkerEvent::Delta(delta)) => self.enqueue_delta(delta),
                 Some(WorkerEvent::Complete(record)) => {
                     self.enqueue_complete(record);
                     self.guard.armed = false;
@@ -269,32 +266,56 @@ impl SseState {
         }
     }
 
-    fn enqueue_delta(&mut self, delta: String) {
-        if delta.is_empty() {
-            return;
-        }
-        match self.endpoint {
-            Endpoint::Chat => {
+    fn enqueue_delta(&mut self, delta: WorkerDelta) {
+        match delta {
+            WorkerDelta::Reasoning(reasoning) => {
+                if reasoning.is_empty() || self.endpoint == Endpoint::Responses {
+                    return;
+                }
                 self.pending.push_back(data_event(json!({
                     "id": self.admission.response_id,
                     "object": "chat.completion.chunk",
                     "created": self.admission.created,
                     "model": self.model,
-                    "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": null}]
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"reasoning_content": reasoning},
+                        "finish_reason": null
+                    }]
                 })));
             }
-            Endpoint::Responses => {
-                self.ensure_response_message_open();
-                let event = json!({
-                    "type": "response.output_text.delta",
-                    "sequence_number": self.next_sequence(),
-                    "item_id": self.admission.message_id,
-                    "output_index": 0,
-                    "content_index": 0,
-                    "delta": delta
-                });
-                self.pending
-                    .push_back(named_event("response.output_text.delta", event));
+            WorkerDelta::Content(content) => {
+                if content.is_empty() {
+                    return;
+                }
+                match self.endpoint {
+                    Endpoint::Chat => {
+                        self.pending.push_back(data_event(json!({
+                            "id": self.admission.response_id,
+                            "object": "chat.completion.chunk",
+                            "created": self.admission.created,
+                            "model": self.model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"content": content},
+                                "finish_reason": null
+                            }]
+                        })));
+                    }
+                    Endpoint::Responses => {
+                        self.ensure_response_message_open();
+                        let event = json!({
+                            "type": "response.output_text.delta",
+                            "sequence_number": self.next_sequence(),
+                            "item_id": self.admission.message_id,
+                            "output_index": 0,
+                            "content_index": 0,
+                            "delta": content
+                        });
+                        self.pending
+                            .push_back(named_event("response.output_text.delta", event));
+                    }
+                }
             }
         }
     }
@@ -551,6 +572,10 @@ fn buffered_json(record: &CompletionRecord) -> Value {
 fn chat_message(record: &CompletionRecord) -> Value {
     let mut message = serde_json::Map::new();
     message.insert("role".to_string(), json!("assistant"));
+    message.insert(
+        "reasoning_content".to_string(),
+        Value::String(record.reasoning_content.clone()),
+    );
     message.insert(
         "content".to_string(),
         if record.content.is_empty() && !record.tool_calls.is_empty() {
