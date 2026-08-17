@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, ensure};
 use clap::Parser as _;
 use clap_derive::Parser;
-use qw_server::{Engine, init_tracing, router};
+use qw_server::{Engine, router};
 use tracing::info;
 
 #[derive(Debug, Parser)]
@@ -44,7 +44,7 @@ fn validate_cli(cli: &Cli) -> Result<()> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     validate_cli(&cli)?;
-    init_tracing().context("failed to initialize structured tracing")?;
+    tracing_subscriber::fmt::init();
     let bind: SocketAddr = cli
         .bind
         .parse()

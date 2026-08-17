@@ -4,7 +4,6 @@ mod media;
 mod prefix_cache;
 pub mod protocol;
 mod tool_calls;
-mod tracing_log;
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
@@ -33,9 +32,6 @@ use protocol::{Endpoint, RequestError};
 #[derive(Clone)]
 struct AppState {
     engine: Engine,
-}
-pub fn init_tracing() -> Result<(), tracing::subscriber::SetGlobalDefaultError> {
-    tracing_log::init()
 }
 
 pub fn router(engine: Engine) -> Router {

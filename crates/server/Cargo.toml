@@ -24,6 +24,7 @@ tokio.workspace = true
 tokenizers.workspace = true
 toktrie.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
 tower.workspace = true
