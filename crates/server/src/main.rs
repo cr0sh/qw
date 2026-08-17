@@ -3,16 +3,10 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, ensure};
 use clap::Parser as _;
-use clap_derive::{Parser, ValueEnum};
-use qw_runtime::KVCacheMode;
-use qw_server::{Engine, router};
+use clap_derive::Parser;
+use qw_server::{Engine, init_tracing, router};
+use mlxcel_core::cache::KVCacheMode;
 use tracing::info;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-enum OutputFormat {
-    Human,
-    Json,
-}
 
 #[derive(Debug, Parser)]
 #[command(name = "qw-server", about = "OpenAI-compatible dense Qwen3.5 server")]
@@ -36,24 +30,11 @@ struct Cli {
     /// MTP verify input block size (bonus token plus proposals).
     #[arg(long = "mtp-k", default_value_t = 3)]
     mtp_k: usize,
-    /// Disable the default 4-bit TurboQuant KV cache.
+
+    /// Disable the default symmetric 4-bit TurboQuant KV cache.
     #[arg(long)]
     no_kv_quantization: bool,
-
-    /// Tracing output format.
-    #[arg(long, value_enum, default_value = "human")]
-    output_format: OutputFormat,
 }
-impl Cli {
-    fn kv_cache_mode(&self) -> KVCacheMode {
-        if self.no_kv_quantization {
-            KVCacheMode::Fp16
-        } else {
-            KVCacheMode::Turbo4
-        }
-    }
-}
-
 
 fn validate_cli(cli: &Cli) -> Result<()> {
     ensure!(
@@ -68,17 +49,18 @@ fn validate_cli(cli: &Cli) -> Result<()> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     validate_cli(&cli)?;
-    match cli.output_format {
-        OutputFormat::Human => tracing_subscriber::fmt().init(),
-        OutputFormat::Json => tracing_subscriber::fmt().json().init(),
-    }
+    init_tracing().context("failed to initialize structured tracing")?;
     let bind: SocketAddr = cli
         .bind
         .parse()
         .with_context(|| format!("invalid --bind address {:?}", cli.bind))?;
     info!(phase = "server.starting", bind = %bind);
 
-    let kv_cache_mode = cli.kv_cache_mode();
+    let kv_cache_mode = if cli.no_kv_quantization {
+        KVCacheMode::Fp16
+    } else {
+        KVCacheMode::Turbo4
+    };
     let engine = Engine::start_qwen(
         cli.model,
         cli.model_id,
@@ -97,8 +79,7 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, OutputFormat, validate_cli};
-    use qw_runtime::KVCacheMode;
+    use super::{Cli, validate_cli};
     use clap::{CommandFactory as _, Parser as _};
 
     #[test]
@@ -120,53 +101,6 @@ mod tests {
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("--model-id <MODEL_ID>"), "{help}");
     }
-    #[test]
-    fn cli_parses_output_format_and_documents_values() {
-        let default =
-            Cli::try_parse_from(["qw-server", "--model", "/tmp/checkpoint"]).expect("CLI");
-        assert_eq!(default.output_format, OutputFormat::Human);
-
-        for (value, expected) in [
-            ("human", OutputFormat::Human),
-            ("json", OutputFormat::Json),
-        ] {
-            let cli = Cli::try_parse_from([
-                "qw-server",
-                "--model",
-                "/tmp/checkpoint",
-                "--output-format",
-                value,
-            ])
-            .expect("CLI");
-            assert_eq!(cli.output_format, expected);
-        }
-
-        let help = Cli::command().render_long_help().to_string();
-        assert!(help.contains("--output-format <OUTPUT_FORMAT>"), "{help}");
-        assert!(help.contains("human"), "{help}");
-        assert!(help.contains("json"), "{help}");
-    }
-
-    #[test]
-    fn turbo4_kv_quantization_is_default_with_explicit_opt_out() {
-        let default =
-            Cli::try_parse_from(["qw-server", "--model", "/tmp/checkpoint"]).expect("CLI");
-        assert_eq!(default.kv_cache_mode(), KVCacheMode::Turbo4);
-
-        let unquantized = Cli::try_parse_from([
-            "qw-server",
-            "--model",
-            "/tmp/checkpoint",
-            "--no-kv-quantization",
-        ])
-        .expect("CLI");
-        assert_eq!(unquantized.kv_cache_mode(), KVCacheMode::Fp16);
-
-        let help = Cli::command().render_long_help().to_string();
-        assert!(help.contains("--no-kv-quantization"), "{help}");
-        assert!(help.contains("default 4-bit TurboQuant KV cache"), "{help}");
-    }
-
 
     #[test]
     fn cli_parses_and_validates_mtp_k() {
