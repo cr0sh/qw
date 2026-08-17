@@ -826,6 +826,7 @@ impl QwenWorker {
         info!(
             phase = "model_generation.started",
             route = ?route,
+            mtp_k,
             prefix_cached_tokens = prefix_reuse
                 .as_ref()
                 .map_or(0, |reuse| reuse.cached_tokens),

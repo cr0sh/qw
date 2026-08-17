@@ -772,6 +772,12 @@ impl Qwen35Provider {
             completion_tokens,
             cached_tokens = 0,
             stop_reason = ?generated.stop_reason,
+            mtp_proposed_draft_tokens = generated.stats.proposed_draft_tokens,
+            mtp_accepted_draft_tokens = generated.stats.accepted_draft_tokens,
+            mtp_acceptance_percentage = generated.stats.acceptance_percentage(),
+            mtp_decode_seconds = generated.stats.decode_time.as_secs_f64(),
+            mtp_cache_clear_count = generated.stats.cache_clear_count,
+            mtp_cache_clear_seconds = generated.stats.cache_clear_time.as_secs_f64(),
         );
         Ok((
             BaselineGeneration {
