@@ -11,6 +11,7 @@ use qw_runtime::Qwen35Provider;
 use qw_runtime::{ChatContentRef, ChatMessage};
 use serde_json::Value;
 use tokio::sync::mpsc;
+use tracing::{Span, error, info, info_span, warn};
 
 use crate::grammar::GrammarFactory;
 #[cfg(test)]
@@ -270,10 +271,12 @@ fn gate_worker_delta(
 
 fn send_delta(job: &Job, delta: WorkerDelta) -> bool {
     if job.cancelled.load(Ordering::Acquire) {
+        info!(phase = "generation.cancelled");
         return false;
     }
     if job.events.blocking_send(WorkerEvent::Delta(delta)).is_err() {
         job.cancelled.store(true, Ordering::Release);
+        warn!(phase = "response.receiver_closed");
         false
     } else {
         true
@@ -285,12 +288,14 @@ struct Job {
     admission: Admission,
     events: mpsc::Sender<WorkerEvent>,
     cancelled: Arc<AtomicBool>,
+    span: Span,
 }
 
 pub struct Submission {
     pub admission: Admission,
     pub events: mpsc::Receiver<WorkerEvent>,
     pub cancelled: Arc<AtomicBool>,
+    pub span: Span,
 }
 
 #[derive(Clone)]
@@ -316,8 +321,8 @@ impl Engine {
         let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
         thread::Builder::new()
             .name("qw-generation".to_string())
-            .spawn(move || {
-                match QwenWorker::load(&model_path, prefix_cache_max_tokens, mtp_k) {
+            .spawn(
+                move || match QwenWorker::load(&model_path, prefix_cache_max_tokens, mtp_k) {
                     Ok(mut worker) => {
                         let supports_image_inputs = worker.provider.supports_image_inputs();
                         let _ = ready_tx.send(Ok(supports_image_inputs));
@@ -326,8 +331,8 @@ impl Engine {
                     Err(error) => {
                         let _ = ready_tx.send(Err(error));
                     }
-                }
-            })
+                },
+            )
             .context("failed to spawn generation thread")?;
         let supports_image_inputs = ready_rx
             .recv()
@@ -348,6 +353,17 @@ impl Engine {
     }
     pub fn submit(&self, request: CompletionRequest) -> Result<Submission, SubmitError> {
         let admission = new_admission(request.endpoint);
+        let span = info_span!(
+            "generation",
+            response_id = %admission.response_id,
+            endpoint = ?request.endpoint,
+            model = %request.model,
+            stream = request.stream,
+            message_count = request.messages.len(),
+            tool_count = request.tools.len(),
+            image_count = request.image_params.len(),
+            max_tokens = request.max_tokens,
+        );
         let cancelled = Arc::new(AtomicBool::new(false));
         let (events_tx, events_rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
         let job = Job {
@@ -355,15 +371,18 @@ impl Engine {
             admission: admission.clone(),
             events: events_tx,
             cancelled: cancelled.clone(),
+            span: span.clone(),
         };
         self.jobs.try_send(job).map_err(|error| match error {
             mpsc::error::TrySendError::Full(_) => SubmitError::Full,
             mpsc::error::TrySendError::Closed(_) => SubmitError::Closed,
         })?;
+        info!(parent: &span, phase = "dispatch.enqueued");
         Ok(Submission {
             admission,
             events: events_rx,
             cancelled,
+            span,
         })
     }
 
@@ -415,6 +434,9 @@ impl Engine {
             let grammar = GrammarFactory::single_byte().expect("single-byte grammar factory");
             let mut cached_prompt: Option<String> = None;
             while let Some(job) = jobs_rx.blocking_recv() {
+                let span = job.span.clone();
+                let _entered = span.enter();
+                info!(phase = "worker.accepted");
                 if let Err(error) = grammar.compile(&job.request.output_format) {
                     send_failure(
                         &job,
@@ -424,6 +446,7 @@ impl Engine {
                     );
                     continue;
                 }
+                info!(phase = "generation.started");
                 if job.events.blocking_send(WorkerEvent::Started).is_err() {
                     job.cancelled.store(true, Ordering::Release);
                     continue;
@@ -432,6 +455,7 @@ impl Engine {
                     while !job.cancelled.load(Ordering::Acquire) {
                         std::thread::sleep(std::time::Duration::from_millis(5));
                     }
+                    info!(phase = "generation.cancelled");
                     continue;
                 }
                 if message_text(&job.request.messages[0]) == "fail-after-start" {
@@ -566,6 +590,7 @@ impl Engine {
                     }
                 }
                 if job.cancelled.load(Ordering::Acquire) {
+                    info!(phase = "generation.cancelled");
                     continue;
                 }
                 cached_prompt = (!has_images && prompt.len() <= 16).then_some(prompt.clone());
@@ -593,6 +618,14 @@ impl Engine {
                     finish_reason,
                     stream_include_usage: job.request.stream_include_usage,
                 };
+                info!(
+                    phase = "generation.complete",
+                    prompt_tokens = record.prompt_tokens,
+                    completion_tokens = record.completion_tokens,
+                    cached_tokens = record.cached_tokens,
+                    finish_reason = ?record.finish_reason,
+                    generated_tool_count = record.tool_calls.len(),
+                );
                 let _ = job.events.blocking_send(WorkerEvent::Complete(record));
             }
         });
@@ -603,7 +636,6 @@ impl Engine {
         }
     }
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubmitError {
@@ -654,6 +686,9 @@ impl QwenWorker {
     }
 
     fn process(&mut self, mut job: Job) {
+        let span = job.span.clone();
+        let _entered = span.enter();
+        info!(phase = "worker.accepted");
         let mut constraint = match self.grammar.compile(&job.request.output_format) {
             Ok(constraint) => constraint,
             Err(error) => {
@@ -744,6 +779,12 @@ impl QwenWorker {
                 }
             }
         };
+        info!(
+            phase = "prompt.prepared",
+            prompt_tokens = prompt_ids.len(),
+            image_count = prepared_images.len(),
+            tool_count = effective_tools.len(),
+        );
         if job.events.blocking_send(WorkerEvent::Started).is_err() {
             job.cancelled.store(true, Ordering::Release);
             return;
@@ -770,6 +811,13 @@ impl QwenWorker {
             snapshot: hit.snapshot,
             cached_tokens: hit.token_count,
         });
+        info!(
+            phase = "model_generation.started",
+            route = ?route,
+            prefix_cached_tokens = prefix_reuse
+                .as_ref()
+                .map_or(0, |reuse| reuse.cached_tokens),
+        );
         let mut trace_parser = ReasoningTraceParser::new(job.request.enable_thinking);
         let mut gate = ToolCallGate::default();
         let mut emit_delta = |fragment: &str| {
@@ -784,15 +832,13 @@ impl QwenWorker {
             true
         };
         let generated = match route {
-            QwenGenerationRoute::MtpMultimodal => {
-                provider.generate_mtp_multimodal_streaming(
-                    multimodal_prefill.expect("multimodal route requires prepared embeddings"),
-                    job.request.max_tokens,
-                    &sampling,
-                    mtp_k,
-                    &mut emit_delta,
-                )
-            }
+            QwenGenerationRoute::MtpMultimodal => provider.generate_mtp_multimodal_streaming(
+                multimodal_prefill.expect("multimodal route requires prepared embeddings"),
+                job.request.max_tokens,
+                &sampling,
+                mtp_k,
+                &mut emit_delta,
+            ),
             QwenGenerationRoute::MtpText => provider.generate_mtp_streaming(
                 &prompt_ids,
                 job.request.max_tokens,
@@ -800,17 +846,15 @@ impl QwenWorker {
                 mtp_k,
                 &mut emit_delta,
             ),
-            QwenGenerationRoute::BaselineMultimodal => {
-                provider.generate_multimodal_streaming(
-                    multimodal_prefill.expect("multimodal route requires prepared embeddings"),
-                    job.request.max_tokens,
-                    &sampling,
-                    constraint
-                        .as_mut()
-                        .map(|value| value as &mut dyn mlxcel_core::generate::TokenConstraint),
-                    &mut emit_delta,
-                )
-            }
+            QwenGenerationRoute::BaselineMultimodal => provider.generate_multimodal_streaming(
+                multimodal_prefill.expect("multimodal route requires prepared embeddings"),
+                job.request.max_tokens,
+                &sampling,
+                constraint
+                    .as_mut()
+                    .map(|value| value as &mut dyn mlxcel_core::generate::TokenConstraint),
+                &mut emit_delta,
+            ),
             QwenGenerationRoute::BaselineText => provider.generate_baseline_streaming(
                 &prompt_ids,
                 job.request.max_tokens,
@@ -825,7 +869,11 @@ impl QwenWorker {
         };
         let generated = match generated {
             Ok(generated) => generated,
-            Err(_) => {
+            Err(generation_error) => {
+                error!(
+                    phase = "model_generation.error",
+                    error = %generation_error,
+                );
                 send_failure(
                     &job,
                     FailureKind::Server,
@@ -835,6 +883,13 @@ impl QwenWorker {
                 return;
             }
         };
+        info!(
+            phase = "model_generation.complete",
+            prompt_tokens = generated.prompt_tokens,
+            completion_tokens = generated.completion_tokens,
+            cached_tokens = generated.cached_tokens,
+            stop_reason = ?generated.finish_outcome,
+        );
         for delta in trace_parser.finish() {
             let Some(delta) = gate_worker_delta(delta, tool_enabled, &mut gate) else {
                 continue;
@@ -857,7 +912,10 @@ impl QwenWorker {
             GenerationStopReason::Eos
             | GenerationStopReason::ConstraintAccepted
             | GenerationStopReason::RepetitionLoop => FinishReason::Stop,
-            GenerationStopReason::CallbackCancelled => return,
+            GenerationStopReason::CallbackCancelled => {
+                info!(phase = "generation.cancelled");
+                return;
+            }
         };
         let (reasoning_content, visible_content) = if job.request.enable_thinking {
             split_reasoning_trace(&generated.text)
@@ -948,6 +1006,14 @@ impl QwenWorker {
             finish_reason,
             stream_include_usage: job.request.stream_include_usage,
         };
+        info!(
+            phase = "generation.complete",
+            prompt_tokens = record.prompt_tokens,
+            completion_tokens = record.completion_tokens,
+            cached_tokens = record.cached_tokens,
+            finish_reason = ?record.finish_reason,
+            generated_tool_count = record.tool_calls.len(),
+        );
         let _ = job.events.blocking_send(WorkerEvent::Complete(record));
     }
 }
@@ -972,13 +1038,18 @@ fn generated_tool_call(
 }
 
 fn send_failure(job: &Job, kind: FailureKind, message: String, param: Option<String>) {
+    error!(
+        phase = "generation.failed",
+        failure_kind = ?kind,
+        parameter = param.as_deref(),
+        error = %message,
+    );
     let _ = job.events.blocking_send(WorkerEvent::Failed(WorkerFailure {
         kind,
         message,
         param,
     }));
 }
-
 
 fn output_format_param(endpoint: Endpoint) -> &'static str {
     match endpoint {
@@ -1113,8 +1184,7 @@ mod tests {
             for has_images in [false, true] {
                 for constrained in [false, true] {
                     for temperature in [0.0f32, 0.7] {
-                        let route =
-                            qwen_generation_route(has_mtp, has_images, constrained);
+                        let route = qwen_generation_route(has_mtp, has_images, constrained);
                         let expected = match (has_mtp && !constrained, has_images) {
                             (true, false) => QwenGenerationRoute::MtpText,
                             (true, true) => QwenGenerationRoute::MtpMultimodal,

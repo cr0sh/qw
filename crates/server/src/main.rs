@@ -4,7 +4,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, ensure};
 use clap::Parser as _;
 use clap_derive::Parser;
-use qw_server::{Engine, router};
+use qw_server::{Engine, init_tracing, router};
+use tracing::info;
 
 #[derive(Debug, Parser)]
 #[command(name = "qw-server", about = "OpenAI-compatible dense Qwen3.5 server")]
@@ -43,10 +44,12 @@ fn validate_cli(cli: &Cli) -> Result<()> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     validate_cli(&cli)?;
+    init_tracing().context("failed to initialize structured tracing")?;
     let bind: SocketAddr = cli
         .bind
         .parse()
         .with_context(|| format!("invalid --bind address {:?}", cli.bind))?;
+    info!(phase = "server.starting", bind = %bind);
 
     let engine = Engine::start_qwen(
         cli.model,
@@ -57,6 +60,7 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("failed to bind {bind}"))?;
+    info!(phase = "server.listening", bind = %bind);
     axum::serve(listener, router(engine))
         .await
         .context("HTTP server failed")
@@ -95,19 +99,8 @@ mod tests {
         validate_cli(&default).expect("default MTP K");
 
         for args in [
-            vec![
-                "qw-server",
-                "--model",
-                "/tmp/checkpoint",
-                "--mtp-k=5",
-            ],
-            vec![
-                "qw-server",
-                "--model",
-                "/tmp/checkpoint",
-                "--mtp-k",
-                "5",
-            ],
+            vec!["qw-server", "--model", "/tmp/checkpoint", "--mtp-k=5"],
+            vec!["qw-server", "--model", "/tmp/checkpoint", "--mtp-k", "5"],
         ] {
             let cli = Cli::try_parse_from(args).expect("CLI");
             assert_eq!(cli.mtp_k, 5);

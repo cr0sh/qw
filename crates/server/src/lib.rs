@@ -4,6 +4,7 @@ mod media;
 mod prefix_cache;
 pub mod protocol;
 mod tool_calls;
+mod tracing_log;
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
@@ -20,6 +21,7 @@ use axum::routing::post;
 use futures_util::stream;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
+use tracing::{Instrument, Span, error, info, info_span, warn};
 
 use engine::{
     Admission, CompletionRecord, FailureKind, FinishReason, GeneratedToolCall, WorkerDelta,
@@ -31,6 +33,9 @@ use protocol::{Endpoint, RequestError};
 #[derive(Clone)]
 struct AppState {
     engine: Engine,
+}
+pub fn init_tracing() -> Result<(), tracing::subscriber::SetGlobalDefaultError> {
+    tracing_log::init()
 }
 
 pub fn router(engine: Engine) -> Router {
@@ -59,22 +64,68 @@ async fn handle(
     payload: Result<Json<Value>, JsonRejection>,
     endpoint: Endpoint,
 ) -> Response {
+    let span = info_span!(
+        "server.request",
+        endpoint = ?endpoint,
+        model = tracing::field::Empty,
+        stream = tracing::field::Empty,
+        message_count = tracing::field::Empty,
+        tool_count = tracing::field::Empty,
+        image_count = tracing::field::Empty,
+    );
+    handle_inner(state, payload, endpoint)
+        .instrument(span)
+        .await
+}
+
+async fn handle_inner(
+    state: AppState,
+    payload: Result<Json<Value>, JsonRejection>,
+    endpoint: Endpoint,
+) -> Response {
+    info!(phase = "request.received");
     let value = match payload {
         Ok(Json(value)) => value,
-        Err(error) => {
-            return ApiError::invalid(format!("invalid JSON request body: {error}"), None)
+        Err(json_error) => {
+            warn!(
+                phase = "request.json_rejected",
+                error = %json_error,
+            );
+            return ApiError::invalid(format!("invalid JSON request body: {json_error}"), None)
                 .into_response();
         }
     };
+    info!(phase = "request.validation_started");
     let request = match endpoint {
         Endpoint::Chat => protocol::parse_chat(value),
         Endpoint::Responses => protocol::parse_responses(value),
     };
     let mut request = match request {
         Ok(request) => request,
-        Err(error) => return ApiError::from_request(error).into_response(),
+        Err(request_error) => {
+            warn!(
+                phase = "request.validation_failed",
+                parameter = request_error.param.as_deref(),
+                error = %request_error.message,
+            );
+            return ApiError::from_request(request_error).into_response();
+        }
     };
+    let request_span = Span::current();
+    request_span.record("model", request.model.as_str());
+    request_span.record("stream", request.stream);
+    request_span.record("message_count", request.messages.len());
+    request_span.record("tool_count", request.tools.len());
+    request_span.record("image_count", request.image_params.len());
+    info!(
+        phase = "request.validation_complete",
+        max_tokens = request.max_tokens,
+    );
     if !request.image_params.is_empty() && !state.engine.supports_image_inputs() {
+        warn!(
+            phase = "request.capability_rejected",
+            capability = "image_inputs",
+        );
         return ApiError::invalid(
             "model does not support image inputs",
             request.image_params.first().cloned(),
@@ -86,20 +137,35 @@ async fn handle(
         .configured_model_id()
         .is_some_and(|model_id| request.model != model_id)
     {
+        warn!(phase = "request.model_rejected");
         return ApiError::model_not_found(&request.model).into_response();
     }
-    if let Err(error) = media::decode_request_images(&mut request) {
-        return ApiError::from_request(error).into_response();
+    if let Err(decode_error) = media::decode_request_images(&mut request) {
+        warn!(
+            phase = "request.media_failed",
+            parameter = decode_error.param.as_deref(),
+            error = %decode_error.message,
+        );
+        return ApiError::from_request(decode_error).into_response();
     }
     let stream_requested = request.stream;
     let response_model = request.model.clone();
+    info!(phase = "dispatch.started");
     let submission = match state.engine.submit(request) {
         Ok(submission) => submission,
-        Err(SubmitError::Full) => return ApiError::queue_full().into_response(),
+        Err(SubmitError::Full) => {
+            warn!(phase = "dispatch.rejected", reason = "queue_full");
+            return ApiError::queue_full().into_response();
+        }
         Err(SubmitError::Closed) => {
+            error!(phase = "dispatch.rejected", reason = "worker_closed");
             return ApiError::server("generation worker is unavailable").into_response();
         }
     };
+    info!(
+        phase = "dispatch.complete",
+        response_id = %submission.admission.response_id,
+    );
     if stream_requested {
         streaming_response(endpoint, response_model, submission).await
     } else {
@@ -107,9 +173,16 @@ async fn handle(
     }
 }
 
-async fn buffered_response(mut submission: engine::Submission) -> Response {
+async fn buffered_response(submission: engine::Submission) -> Response {
+    let span = submission.span.clone();
+    buffered_response_inner(submission).instrument(span).await
+}
+
+async fn buffered_response_inner(mut submission: engine::Submission) -> Response {
+    info!(phase = "response.buffered_wait_started");
     let mut guard = CancelGuard {
         cancelled: submission.cancelled.clone(),
+        span: submission.span.clone(),
         armed: true,
     };
     while let Some(event) = submission.events.recv().await {
@@ -117,42 +190,86 @@ async fn buffered_response(mut submission: engine::Submission) -> Response {
             WorkerEvent::Started | WorkerEvent::Delta(_) => {}
             WorkerEvent::Complete(record) => {
                 guard.armed = false;
+                info!(
+                    phase = "response.buffered_complete",
+                    response_id = %record.admission.response_id,
+                    prompt_tokens = record.prompt_tokens,
+                    completion_tokens = record.completion_tokens,
+                    cached_tokens = record.cached_tokens,
+                    finish_reason = ?record.finish_reason,
+                );
                 return Json(buffered_json(&record)).into_response();
             }
             WorkerEvent::Failed(failure) => {
                 guard.armed = false;
+                error!(
+                    phase = "response.buffered_failed",
+                    failure_kind = ?failure.kind,
+                    parameter = failure.param.as_deref(),
+                    error = %failure.message,
+                );
                 return ApiError::from_worker(failure).into_response();
             }
         }
     }
+    error!(phase = "response.worker_closed");
     ApiError::server("generation worker closed without a result").into_response()
 }
 
 async fn streaming_response(
     endpoint: Endpoint,
     model: String,
+    submission: engine::Submission,
+) -> Response {
+    let span = submission.span.clone();
+    streaming_response_inner(endpoint, model, submission)
+        .instrument(span)
+        .await
+}
+
+async fn streaming_response_inner(
+    endpoint: Endpoint,
+    model: String,
     mut submission: engine::Submission,
 ) -> Response {
+    info!(phase = "response.streaming_admission_started");
     let mut admission_guard = CancelGuard {
         cancelled: submission.cancelled.clone(),
+        span: submission.span.clone(),
         armed: true,
     };
     let first = submission.events.recv().await;
     match first {
-        Some(WorkerEvent::Started) => admission_guard.armed = false,
+        Some(WorkerEvent::Started) => {
+            admission_guard.armed = false;
+            info!(phase = "response.streaming_admitted");
+        }
         Some(WorkerEvent::Failed(failure)) => {
             admission_guard.armed = false;
+            error!(
+                phase = "response.streaming_admission_failed",
+                failure_kind = ?failure.kind,
+                parameter = failure.param.as_deref(),
+                error = %failure.message,
+            );
             return ApiError::from_worker(failure).into_response();
         }
         Some(WorkerEvent::Complete(record)) => {
             admission_guard.armed = false;
+            info!(
+                phase = "response.completed_before_stream",
+                prompt_tokens = record.prompt_tokens,
+                completion_tokens = record.completion_tokens,
+            );
             return Json(buffered_json(&record)).into_response();
         }
         Some(WorkerEvent::Delta(_)) => {
+            error!(phase = "response.streaming_protocol_error");
             return ApiError::server("generation worker emitted output before admission")
                 .into_response();
         }
         None => {
+            error!(phase = "response.worker_closed_during_admission");
             return ApiError::server("generation worker closed during admission").into_response();
         }
     }
@@ -163,16 +280,23 @@ async fn streaming_response(
         model,
         submission.events,
         submission.cancelled,
+        submission.span,
     );
     let events = stream::unfold(state, |mut state| async move {
-        let event = state.next_event().await?;
-        Some((Ok::<Event, Infallible>(event), state))
+        let span = state.span.clone();
+        async move {
+            let event = state.next_event().await?;
+            Some((Ok::<Event, Infallible>(event), state))
+        }
+        .instrument(span)
+        .await
     });
     Sse::new(events).into_response()
 }
 
 struct CancelGuard {
     cancelled: Arc<AtomicBool>,
+    span: Span,
     armed: bool,
 }
 
@@ -180,6 +304,7 @@ impl Drop for CancelGuard {
     fn drop(&mut self) {
         if self.armed {
             self.cancelled.store(true, Ordering::Release);
+            warn!(parent: &self.span, phase = "generation.cancelled");
         }
     }
 }
@@ -192,6 +317,7 @@ struct SseState {
     pending: VecDeque<Event>,
     sequence: u64,
     response_message_open: bool,
+    span: Span,
     guard: CancelGuard,
 }
 
@@ -202,6 +328,7 @@ impl SseState {
         model: String,
         receiver: mpsc::Receiver<WorkerEvent>,
         cancelled: Arc<AtomicBool>,
+        span: Span,
     ) -> Self {
         let mut state = Self {
             endpoint,
@@ -214,7 +341,9 @@ impl SseState {
             guard: CancelGuard {
                 cancelled,
                 armed: true,
+                span: span.clone(),
             },
+            span,
         };
         state.enqueue_initial();
         state
@@ -237,6 +366,7 @@ impl SseState {
                     self.guard.armed = false;
                 }
                 None => {
+                    error!(phase = "response.stream_worker_closed");
                     self.guard.cancelled.store(true, Ordering::Release);
                     return None;
                 }
@@ -361,6 +491,14 @@ impl SseState {
     }
 
     fn enqueue_complete(&mut self, record: CompletionRecord) {
+        info!(
+            phase = "response.streaming_complete",
+            response_id = %record.admission.response_id,
+            prompt_tokens = record.prompt_tokens,
+            completion_tokens = record.completion_tokens,
+            cached_tokens = record.cached_tokens,
+            finish_reason = ?record.finish_reason,
+        );
         match self.endpoint {
             Endpoint::Chat => self.enqueue_chat_complete(&record),
             Endpoint::Responses => self.enqueue_responses_complete(&record),
@@ -521,6 +659,12 @@ impl SseState {
     }
 
     fn enqueue_failure(&mut self, failure: WorkerFailure) {
+        error!(
+            phase = "response.streaming_failed",
+            failure_kind = ?failure.kind,
+            parameter = failure.param.as_deref(),
+            error = %failure.message,
+        );
         let error = error_json(
             &failure.message,
             match failure.kind {
