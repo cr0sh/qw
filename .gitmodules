@@ -1,3 +1,6 @@
 [submodule "mlxcel"]
 	path = mlxcel
 	url = https://github.com/lablup/mlxcel
+[submodule "mlx"]
+	path = mlx
+	url = https://github.com/ml-explore/mlx.git
