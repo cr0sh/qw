@@ -309,6 +309,8 @@ fn build_mlx(expected_commit: &str) -> PathBuf {
 
     let mut config = Config::new("../mlx-cpp");
     config.very_verbose(true);
+    // XXX: This exists to circumvent auth failures on my machine
+    config.env("GIT_CONFIG_GLOBAL", "/dev/null");
     config.define("CMAKE_INSTALL_PREFIX", ".");
 
     // Platform features
