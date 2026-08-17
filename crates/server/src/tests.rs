@@ -928,6 +928,51 @@ async fn repeated_prefix_reports_cached_tokens_and_matches_cold_output() {
 }
 
 #[tokio::test]
+async fn five_sequential_turns_keep_reusing_the_latest_complete_prefix() {
+    let app = router(Engine::start_fake(Some(MODEL), 8));
+    let mut messages = vec![json!({"role": "user", "content": "a"})];
+    let expected_cached = [0_u64, 1, 5, 9, 13];
+
+    for (turn, expected) in expected_cached.into_iter().enumerate() {
+        let request = json!({
+            "model": MODEL,
+            "messages": messages,
+        });
+        let (status, _, body) = post(app.clone(), "/v1/chat/completions", request).await;
+        assert_eq!(status, StatusCode::OK, "turn {}: {body}", turn + 1);
+        let value: Value = serde_json::from_str(&body).expect("chat JSON");
+        assert_eq!(
+            value["usage"]["prompt_tokens_details"]["cached_tokens"],
+            expected,
+            "turn {} must restore the full previous prompt state",
+            turn + 1,
+        );
+
+        let prompt = messages
+            .iter()
+            .map(|message| message["content"].as_str().expect("text content"))
+            .collect::<Vec<_>>()
+            .join("|");
+        assert_eq!(
+            value["choices"][0]["message"]["content"],
+            format!("echo:{prompt}"),
+            "cache reuse must preserve the cold-generation result on turn {}",
+            turn + 1,
+        );
+
+        let next = b'b' + u8::try_from(turn * 2).expect("small turn");
+        messages.push(json!({
+            "role": "assistant",
+            "content": char::from(next).to_string(),
+        }));
+        messages.push(json!({
+            "role": "user",
+            "content": char::from(next + 1).to_string(),
+        }));
+    }
+}
+
+#[tokio::test]
 async fn over_budget_prefix_is_not_cached() {
     let app = router(Engine::start_fake(Some(MODEL), 8));
     let long = "x".repeat(20);

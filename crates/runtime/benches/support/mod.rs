@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use qw_runtime::provider::Qwen35GenerationMode;
 use qw_runtime::{
-    ChatMessage, ChatMessageContent, GenerationRequest, Qwen35Provider,
+    ChatMessage, ChatMessageContent, GenerationRequest, KVCacheMode, Qwen35Provider,
 };
 
 pub const MODEL_ENV: &str = "QW_BENCH_MODEL";
@@ -51,7 +51,7 @@ pub fn load_provider() -> Qwen35Provider {
         std::env::var_os(MODEL_ENV)
             .unwrap_or_else(|| panic!("{MODEL_ENV} must point to a local Qwen checkpoint")),
     );
-    Qwen35Provider::load(&model_dir)
+    Qwen35Provider::load(&model_dir, KVCacheMode::Fp16)
         .unwrap_or_else(|error| panic!("failed to load {}: {error:#}", model_dir.display()))
 }
 

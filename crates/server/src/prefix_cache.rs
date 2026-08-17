@@ -115,6 +115,21 @@ mod tests {
     }
 
     #[test]
+    fn sequential_turns_preserve_full_cached_token_and_snapshot_lengths() {
+        let mut cache = PrefixCache::new(32);
+        for turn_len in [1_usize, 3, 5, 7, 9] {
+            let tokens = (0..turn_len as i32).collect::<Vec<_>>();
+            cache.insert(tokens.clone(), snapshot(turn_len));
+
+            let mut next_turn = tokens;
+            next_turn.extend([100, 101]);
+            let hit = cache.lookup(&next_turn).expect("latest turn prefix");
+            assert_eq!(hit.token_count, turn_len);
+            assert_eq!(hit.snapshot.token_len(), turn_len);
+        }
+    }
+
+    #[test]
     fn over_budget_prompts_are_not_inserted() {
         let mut cache = PrefixCache::new(2);
         cache.insert(vec![1, 2, 3], snapshot(3));

@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};
 use mlxcel_core::generate::{GenerationStopReason, PrefixReuse};
-use qw_runtime::Qwen35Provider;
+use qw_runtime::{KVCacheMode, Qwen35Provider};
 #[cfg(test)]
 use qw_runtime::{ChatContentRef, ChatMessage};
 use serde_json::Value;
@@ -311,6 +311,7 @@ impl Engine {
         model_id: Option<String>,
         prefix_cache_max_tokens: usize,
         mtp_k: usize,
+        kv_cache_mode: KVCacheMode,
     ) -> Result<Self> {
         ensure!(
             prefix_cache_max_tokens > 0,
@@ -321,8 +322,13 @@ impl Engine {
         let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
         thread::Builder::new()
             .name("qw-generation".to_string())
-            .spawn(
-                move || match QwenWorker::load(&model_path, prefix_cache_max_tokens, mtp_k) {
+            .spawn(move || {
+                match QwenWorker::load(
+                    &model_path,
+                    prefix_cache_max_tokens,
+                    mtp_k,
+                    kv_cache_mode,
+                ) {
                     Ok(mut worker) => {
                         let supports_image_inputs = worker.provider.supports_image_inputs();
                         let _ = ready_tx.send(Ok(supports_image_inputs));
@@ -331,8 +337,8 @@ impl Engine {
                     Err(error) => {
                         let _ = ready_tx.send(Err(error));
                     }
-                },
-            )
+                }
+            })
             .context("failed to spawn generation thread")?;
         let supports_image_inputs = ready_rx
             .recv()
@@ -651,9 +657,14 @@ struct QwenWorker {
 }
 
 impl QwenWorker {
-    fn load(model_path: &Path, prefix_cache_max_tokens: usize, mtp_k: usize) -> Result<Self> {
+    fn load(
+        model_path: &Path,
+        prefix_cache_max_tokens: usize,
+        mtp_k: usize,
+        kv_cache_mode: KVCacheMode,
+    ) -> Result<Self> {
         validate_mtp_k(mtp_k)?;
-        let provider = Qwen35Provider::load(model_path)?;
+        let provider = Qwen35Provider::load(model_path, kv_cache_mode)?;
         ensure!(
             provider.supports_qwen35_tool_calls(),
             "unsupported Qwen3.5 chat template: expected <tool_call>, <function=, and <parameter= literals"

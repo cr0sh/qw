@@ -15,6 +15,7 @@ mod qwen_vl_processor;
 
 pub mod provider;
 
+pub use mlxcel_core::cache::KVCacheMode;
 pub use provider::{
     BaselineGeneration, ChatContentPart, ChatContentRef, ChatCustomToolCall, ChatFile,
     ChatImageUrl, ChatInputAudio, ChatMessage, ChatMessageContent, ChatPromptCacheBreakpoint,

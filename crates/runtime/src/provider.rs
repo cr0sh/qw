@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use anyhow::{Context, Result, ensure};
+use mlxcel_core::cache::KVCacheMode;
 use mlxcel_core::generate::{
     ControlledGeneration, CxxGenerator, GenerationStopReason, LanguageModel, ModelStateSnapshot,
     PrefixReuse, SamplingConfig, TokenConstraint,
@@ -169,7 +170,7 @@ struct GenerationDefaults {
 
 impl Qwen35Provider {
     #[tracing::instrument(name = "runtime.model_load", skip(model_dir), err)]
-    pub fn load(model_dir: impl AsRef<Path>) -> Result<Self> {
+    pub fn load(model_dir: impl AsRef<Path>, kv_cache_mode: KVCacheMode) -> Result<Self> {
         initialize_runtime()?;
         let model_dir = model_dir.as_ref();
         ensure!(
@@ -189,7 +190,7 @@ impl Qwen35Provider {
             .with_context(|| format!("failed to load tokenizer {}", tokenizer_path.display()))?;
         let chat_template = ChatTemplateProcessor::from_model_path(model_dir)?;
         let defaults = load_generation_defaults(model_dir)?;
-        let model = Qwen35Model::load(model_dir)?;
+        let model = Qwen35Model::load(model_dir, kv_cache_mode)?;
         if model.has_vision() {
             ensure!(
                 chat_template.supports_image_content(),
@@ -200,7 +201,7 @@ impl Qwen35Provider {
             .vision_config()
             .map(|vision| load_vision_processor(model_dir, vision))
             .transpose()?;
-        let generator = CxxGenerator::new(model.num_layers());
+        let generator = CxxGenerator::new_with_kv_mode(model.num_layers(), kv_cache_mode);
         let mtp_generator = model.has_mtp().then(Qwen35MtpGenerator::new);
 
         Ok(Self {
@@ -1058,7 +1059,7 @@ mod tests {
         std::fs::write(fixture.0.join("tokenizer_config.json"), b"{}")
             .expect("write tokenizer config");
 
-        let error = match Qwen35Provider::load(&fixture.0) {
+        let error = match Qwen35Provider::load(&fixture.0, KVCacheMode::Fp16) {
             Ok(_) => panic!("provider load must reject an absent chat template"),
             Err(error) => error.to_string(),
         };
@@ -1103,7 +1104,8 @@ mod tests {
         let model_dir = std::env::var_os("QW_BENCH_MODEL")
             .map(PathBuf::from)
             .expect("QW_BENCH_MODEL must point at a real checkpoint");
-        let mut provider = Qwen35Provider::load(&model_dir).expect("load real Qwen checkpoint");
+        let mut provider = Qwen35Provider::load(&model_dir, KVCacheMode::Fp16)
+            .expect("load real Qwen checkpoint");
         let request = GenerationRequest {
             prompt: "Continue counting upward from one, writing each integer on its own line without stopping."
                 .to_string(),

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use clap::Parser as _;
 use clap_derive::{Args, Parser, Subcommand};
-use qw_runtime::{GenerationRequest, Qwen35Provider};
+use qw_runtime::{GenerationRequest, KVCacheMode, Qwen35Provider};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -70,7 +70,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::Generate(args) => {
             eprintln!("Loading model from {}", args.model.display());
-            let mut provider = Qwen35Provider::load(&args.model)?;
+            let mut provider = Qwen35Provider::load(&args.model, KVCacheMode::Fp16)?;
             let stdout = std::io::stdout();
             let mut stdout = stdout.lock();
             let mut io_error = None;

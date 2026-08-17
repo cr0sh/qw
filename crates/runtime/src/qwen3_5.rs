@@ -28,7 +28,7 @@ use crate::qwen3_next::{
     Mlp, Quantization, Qwen3NextAttention, Qwen3NextCache, Qwen3NextConfig,
 };
 use anyhow::{Context, Result, ensure};
-use mlxcel_core::cache::SequenceId;
+use mlxcel_core::cache::{KVCacheMode, SequenceId};
 use mlxcel_core::generate::{LanguageModel, ModelStateSnapshot};
 use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::utils::{create_causal_mask, silu};
@@ -757,6 +757,7 @@ pub struct Qwen35Model {
     pub(crate) lm_head: Option<UnifiedLinear>,
     pub(crate) config: Qwen35Config,
     mtp: Option<Qwen35MtpDraftModel>,
+    kv_cache_mode: KVCacheMode,
     vision: Option<Qwen3VLVisionEncoder>,
     /// Model-owned heterogeneous cache state used by one synchronous sequence.
     sequence_state: ModelOwnedSequenceState<Qwen3NextCache>,
@@ -814,7 +815,9 @@ impl Qwen35Model {
                 if layer.is_linear {
                     Qwen3NextCache::Linear(GatedDeltaCache::new())
                 } else {
-                    Qwen3NextCache::Attention(Box::new(KVCache::new()))
+                    Qwen3NextCache::Attention(Box::new(KVCache::new_with_mode(
+                        self.kv_cache_mode,
+                    )))
                 }
             })
             .collect()
@@ -1257,7 +1260,7 @@ impl Qwen35Model {
         Ok(())
     }
 
-    pub fn load(model_dir: &Path) -> Result<Self> {
+    pub fn load(model_dir: &Path, kv_cache_mode: KVCacheMode) -> Result<Self> {
         ensure!(
             model_dir.is_dir(),
             "model directory does not exist or is not a directory: {}",
@@ -1282,7 +1285,7 @@ impl Qwen35Model {
             model_dir.display()
         );
         let weights = sanitize_language_model_weights(weights, &config, model_dir)?;
-        let mut model = Self::from_weights(&weights.target, &config)
+        let mut model = Self::from_weights(&weights.target, &config, kv_cache_mode)
             .map_err(anyhow::Error::msg)
             .with_context(|| {
                 format!(
@@ -1329,6 +1332,7 @@ impl Qwen35Model {
     pub(crate) fn from_weights(
         weights: &WeightMap,
         config: &Qwen35Config,
+        kv_cache_mode: KVCacheMode,
     ) -> std::result::Result<Self, String> {
         let qn_config = config.to_qwen3next_config();
         let (embed_group_size, embed_bits) = config.quant_params("model.embed_tokens");
@@ -1367,7 +1371,7 @@ impl Qwen35Model {
                 if layer.is_linear {
                     Qwen3NextCache::Linear(GatedDeltaCache::new())
                 } else {
-                    Qwen3NextCache::Attention(Box::new(KVCache::new()))
+                    Qwen3NextCache::Attention(Box::new(KVCache::new_with_mode(kv_cache_mode)))
                 }
             })
             .collect();
@@ -1378,6 +1382,7 @@ impl Qwen35Model {
             norm: RMSNorm::new(norm_weight, config.rms_norm_eps),
             lm_head,
             config: config.clone(),
+            kv_cache_mode,
             mtp: None,
             vision: None,
             sequence_state: ModelOwnedSequenceState::new(internal_caches),
@@ -1683,6 +1688,7 @@ fn push_snapshot_i32(snapshot: &mut ModelStateSnapshot, name: &str, value: i32) 
 fn validate_snapshot_tensor_names(
     snapshot: &ModelStateSnapshot,
     layers: &[Qwen35DecoderLayer],
+    kv_cache_mode: KVCacheMode,
 ) -> std::result::Result<(), String> {
     let mut expected = BTreeSet::from([
         "meta.layer_count".to_string(),
@@ -1698,6 +1704,10 @@ fn validate_snapshot_tensor_names(
         if layer.is_linear {
             expected.insert(format!("layer.{index}.conv_state"));
             expected.insert(format!("layer.{index}.state_cache"));
+        } else if kv_cache_mode == KVCacheMode::Turbo4 {
+            for suffix in ["k_packed", "k_norms", "v_packed", "v_norms", "v_rescale"] {
+                expected.insert(format!("layer.{index}.{suffix}"));
+            }
         } else {
             expected.insert(format!("layer.{index}.keys"));
             expected.insert(format!("layer.{index}.values"));
@@ -1888,13 +1898,39 @@ impl LanguageModel for Qwen35Model {
                 );
                 match cache {
                     Qwen3NextCache::Attention(cache) => {
-                        let (Some(keys), Some(values)) =
-                            (cache.keys.as_deref(), cache.values.as_deref())
-                        else {
-                            return false;
-                        };
-                        snapshot.push_tensor(format!("layer.{index}.keys"), keys);
-                        snapshot.push_tensor(format!("layer.{index}.values"), values);
+                        if cache.mode == KVCacheMode::Turbo4 {
+                            let Some(tensors) = cache.turbo4_snapshot_tensors() else {
+                                return false;
+                            };
+                            snapshot.push_tensor(
+                                format!("layer.{index}.k_packed"),
+                                tensors.k_packed,
+                            );
+                            snapshot.push_tensor(
+                                format!("layer.{index}.k_norms"),
+                                tensors.k_norms,
+                            );
+                            snapshot.push_tensor(
+                                format!("layer.{index}.v_packed"),
+                                tensors.v_packed,
+                            );
+                            snapshot.push_tensor(
+                                format!("layer.{index}.v_norms"),
+                                tensors.v_norms,
+                            );
+                            snapshot.push_tensor(
+                                format!("layer.{index}.v_rescale"),
+                                tensors.v_rescale,
+                            );
+                        } else {
+                            let (Some(keys), Some(values)) =
+                                (cache.keys.as_deref(), cache.values.as_deref())
+                            else {
+                                return false;
+                            };
+                            snapshot.push_tensor(format!("layer.{index}.keys"), keys);
+                            snapshot.push_tensor(format!("layer.{index}.values"), values);
+                        }
                     }
                     Qwen3NextCache::Linear(cache) => {
                         let (Some(conv_state), Some(state_cache)) =
@@ -1930,7 +1966,7 @@ impl LanguageModel for Qwen35Model {
         {
             return Err("Qwen3.5 snapshot layer count does not match the loaded model".to_string());
         }
-        validate_snapshot_tensor_names(snapshot, &self.layers)?;
+        validate_snapshot_tensor_names(snapshot, &self.layers, self.kv_cache_mode)?;
 
         let mut restored = Vec::with_capacity(self.layers.len());
         for (index, layer) in self.layers.iter().enumerate() {
@@ -1958,6 +1994,25 @@ impl LanguageModel for Qwen35Model {
                     state_cache: Some(mlxcel_core::copy(state_cache)),
                     offset: token_len,
                 }));
+            } else if self.kv_cache_mode == KVCacheMode::Turbo4 {
+                let tensor = |suffix: &str| {
+                    snapshot
+                        .tensor(&format!("layer.{index}.{suffix}"))
+                        .map(mlxcel_core::copy)
+                        .ok_or_else(|| {
+                            format!("Qwen3.5 snapshot is missing layer {index} {suffix}")
+                        })
+                };
+                let mut cache = KVCache::new_with_mode(KVCacheMode::Turbo4);
+                cache.restore_turbo4_snapshot(
+                    token_len,
+                    tensor("k_packed")?,
+                    tensor("k_norms")?,
+                    tensor("v_packed")?,
+                    tensor("v_norms")?,
+                    tensor("v_rescale")?,
+                )?;
+                restored.push(Qwen3NextCache::Attention(Box::new(cache)));
             } else {
                 let keys = snapshot
                     .tensor(&format!("layer.{index}.keys"))
@@ -2410,7 +2465,8 @@ mod tests {
             .expect("QW_BENCH_MODEL must point at a real checkpoint");
         let tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
             .expect("load tokenizer");
-        let model = Qwen35Model::load(&model_dir).expect("load Qwen3.5 model");
+        let model = Qwen35Model::load(&model_dir, KVCacheMode::Fp16)
+            .expect("load Qwen3.5 model");
         let prompt = tokenizer
             .encode("Snapshot restore invariant", true)
             .expect("encode prompt");
