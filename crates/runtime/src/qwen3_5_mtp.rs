@@ -37,6 +37,7 @@ use mlxcel_core::speculative::stochastic_accept::{
 };
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
+use tracing::info;
 
 use crate::qwen_vl_position::decode_rope_positions;
 use crate::qwen3_5::{Qwen35Config, Qwen35DecoderLayer, Qwen35Model};
@@ -518,6 +519,35 @@ fn mtp_round_reaches_cache_clear(previous: usize, emitted: usize, interval: usiz
     interval != 0
         && (previous.saturating_add(1)..=emitted)
             .any(|n| mlxcel_core::memory::should_clear_cache_at(n, interval))
+}
+
+// MTP verify changes graph shapes as draft acceptance varies. On Metal, waiting
+// for the general 256-token cadence lets those cached command buffers exceed
+// the live model/KV footprint, so bound this loop independently.
+const MTP_MAX_CACHE_CLEAR_INTERVAL: usize = 16;
+
+fn bound_mtp_cache_clear_interval(configured: usize) -> usize {
+    if configured == 0 {
+        0
+    } else {
+        configured.min(MTP_MAX_CACHE_CLEAR_INTERVAL)
+    }
+}
+
+fn mtp_cache_clear_interval() -> usize {
+    bound_mtp_cache_clear_interval(mlxcel_core::memory::cache_clear_interval())
+}
+
+fn log_mtp_memory(phase: &'static str, tokens: usize) {
+    let memory = mlxcel_core::memory::snapshot();
+    info!(
+        phase,
+        tokens,
+        active_bytes = memory.active_bytes,
+        cache_bytes = memory.cache_bytes,
+        peak_bytes = memory.peak_bytes,
+        limit_bytes = memory.limit_bytes,
+    );
 }
 
 fn finish_mtp_request(model: &Qwen35Model) {
@@ -1208,6 +1238,7 @@ fn prefill_for_input(
             drafter.materialize_state();
             model.materialize_mtp_cache_state();
             mlxcel_core::clear_memory_cache();
+            log_mtp_memory("mtp.prefill.chunk_complete", end as usize);
         },
     )
 }
@@ -1248,6 +1279,7 @@ fn finish_drafter_prefill(
     ));
     drop(prefill);
     mlxcel_core::clear_memory_cache();
+    log_mtp_memory("mtp.prefill.final_complete", prompt_len as usize);
     last_hidden
 }
 fn rebuild_mtp_state(
@@ -1415,6 +1447,7 @@ impl Qwen35MtpGenerator {
         mlxcel_core::eval(&first_token);
         mlxcel_core::eval(&prefill.hidden);
         let first_token = mlxcel_core::item_i32(&first_token);
+        log_mtp_memory("mtp.first_token.handoff", prompt_tokens.len());
 
         let mut generated = Vec::with_capacity(max_tokens);
         let mut history = prompt_tokens.to_vec();
@@ -1546,9 +1579,15 @@ impl Qwen35MtpGenerator {
                 if mtp_round_reaches_cache_clear(
                     emitted_before,
                     generated.len(),
-                    mlxcel_core::memory::cache_clear_interval(),
+                    mtp_cache_clear_interval(),
                 ) {
+                    if generated.len() <= 64 {
+                        log_mtp_memory("mtp.decode.cache_clear.before", generated.len());
+                    }
                     mlxcel_core::clear_memory_cache();
+                    if generated.len() <= 64 {
+                        log_mtp_memory("mtp.decode.cache_clear.after", generated.len());
+                    }
                 }
                 if round_stop_reason.is_some() {
                     break;
@@ -1810,9 +1849,15 @@ impl Qwen35MtpGenerator {
             if mtp_round_reaches_cache_clear(
                 emitted_before,
                 generated.len(),
-                mlxcel_core::memory::cache_clear_interval(),
+                mtp_cache_clear_interval(),
             ) {
+                if generated.len() <= 64 {
+                    log_mtp_memory("mtp.decode.cache_clear.before", generated.len());
+                }
                 mlxcel_core::clear_memory_cache();
+                if generated.len() <= 64 {
+                    log_mtp_memory("mtp.decode.cache_clear.after", generated.len());
+                }
             }
 
             if callback_cancelled {
@@ -2367,6 +2412,14 @@ mod tests {
         assert!(mtp_round_reaches_cache_clear(7, 12, 4));
         assert!(!mtp_round_reaches_cache_clear(4, 7, 4));
         assert!(!mtp_round_reaches_cache_clear(0, usize::MAX, 0));
+    }
+
+    #[test]
+    fn mtp_cache_clear_interval_bounds_metal_allocator_growth() {
+        assert_eq!(bound_mtp_cache_clear_interval(0), 0);
+        assert_eq!(bound_mtp_cache_clear_interval(8), 8);
+        assert_eq!(bound_mtp_cache_clear_interval(16), 16);
+        assert_eq!(bound_mtp_cache_clear_interval(256), 16);
     }
 
     #[test]
