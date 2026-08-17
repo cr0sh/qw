@@ -6,11 +6,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};
 use mlxcel_core::generate::{GenerationStopReason, PrefixReuse};
-use qw_runtime::{ChatContentRef, ChatMessage, Qwen35Provider};
+use qw_runtime::Qwen35Provider;
+#[cfg(test)]
+use qw_runtime::{ChatContentRef, ChatMessage};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
 use crate::grammar::GrammarFactory;
+#[cfg(test)]
 use crate::media::DecodedImage;
 use crate::prefix_cache::PrefixCache;
 use crate::protocol::{CompletionRequest, Endpoint, OutputFormat, ReasoningEffort, ToolChoice};
@@ -334,6 +337,47 @@ impl Engine {
         let (jobs_tx, mut jobs_rx) = mpsc::channel::<Job>(queue_capacity);
         let model_id_owned = model_id.to_string();
         thread::spawn(move || {
+            fn message_text(message: &ChatMessage) -> String {
+                let mut text = String::new();
+                message.visit_content(|part| {
+                    if let ChatContentRef::Text(part) = part {
+                        text.push_str(part);
+                    }
+                });
+                text
+            }
+
+            fn fake_prompt_observation(
+                messages: &[ChatMessage],
+                images: &[DecodedImage],
+            ) -> String {
+                let mut prompt = String::new();
+                let mut image_index = 0;
+                for (message_index, message) in messages.iter().enumerate() {
+                    if message_index != 0 {
+                        prompt.push('|');
+                    }
+                    message.visit_content(|part| match part {
+                        ChatContentRef::Text(text) => prompt.push_str(text),
+                        ChatContentRef::Image(_) => {
+                            let image = images
+                                .get(image_index)
+                                .expect("decoded image order must match normalized content");
+                            prompt.push_str("[image:");
+                            prompt.push_str(image.format.as_str());
+                            prompt.push(']');
+                            image_index += 1;
+                        }
+                    });
+                }
+                assert_eq!(
+                    image_index,
+                    images.len(),
+                    "decoded image order must match normalized content"
+                );
+                prompt
+            }
+
             let grammar = GrammarFactory::single_byte().expect("single-byte grammar factory");
             let mut cached_prompt: Option<String> = None;
             while let Some(job) = jobs_rx.blocking_recv() {
@@ -434,9 +478,11 @@ impl Engine {
                         })
                         .collect();
                     (
-                        (latest_user.as_deref() == Some("call-tool-with-preamble"))
-                            .then(|| "I will use tools.".to_string())
-                            .unwrap_or_default(),
+                        if latest_user.as_deref() == Some("call-tool-with-preamble") {
+                            "I will use tools.".to_string()
+                        } else {
+                            String::new()
+                        },
                         tool_calls,
                         FinishReason::ToolCalls,
                     )
@@ -524,43 +570,6 @@ impl Engine {
     }
 }
 
-fn message_text(message: &ChatMessage) -> String {
-    let mut text = String::new();
-    message.visit_content(|part| {
-        if let ChatContentRef::Text(part) = part {
-            text.push_str(part);
-        }
-    });
-    text
-}
-
-fn fake_prompt_observation(messages: &[ChatMessage], images: &[DecodedImage]) -> String {
-    let mut prompt = String::new();
-    let mut image_index = 0;
-    for (message_index, message) in messages.iter().enumerate() {
-        if message_index != 0 {
-            prompt.push('|');
-        }
-        message.visit_content(|part| match part {
-            ChatContentRef::Text(text) => prompt.push_str(text),
-            ChatContentRef::Image(_) => {
-                let image = images
-                    .get(image_index)
-                    .expect("decoded image order must match normalized content");
-                prompt.push_str("[image:");
-                prompt.push_str(image.format.as_str());
-                prompt.push(']');
-                image_index += 1;
-            }
-        });
-    }
-    assert_eq!(
-        image_index,
-        images.len(),
-        "decoded image order must match normalized content"
-    );
-    prompt
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubmitError {
@@ -769,7 +778,6 @@ impl QwenWorker {
                 return;
             }
         };
-        drop(emit_delta);
         for delta in trace_parser.finish() {
             let Some(delta) = gate_worker_delta(delta, tool_enabled, &mut gate) else {
                 continue;

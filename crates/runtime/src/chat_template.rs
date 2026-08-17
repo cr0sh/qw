@@ -300,6 +300,75 @@ impl ChatTemplateProcessor {
     }
 }
 
+
+fn extract_token(config: &JsonValue, name: &str) -> String {
+    let Some(value) = config.get(name) else {
+        return String::new();
+    };
+    if let Some(value) = value.as_str() {
+        return value.to_owned();
+    }
+    value
+        .get("content")
+        .and_then(JsonValue::as_str)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+fn configure_environment(environment: &mut Environment<'_>) {
+    environment.set_keep_trailing_newline(true);
+    environment.set_trim_blocks(true);
+    environment.set_lstrip_blocks(true);
+    environment.set_fuel(Some(50_000_000));
+    environment.add_function(
+        "raise_exception",
+        |message: String| -> std::result::Result<Value, Error> {
+            Err(Error::new(ErrorKind::InvalidOperation, message))
+        },
+    );
+    environment.set_unknown_method_callback(|state, value, method, args| {
+        if value.kind() == ValueKind::Map && method == "items" {
+            let _: () = from_args(args)?;
+            return state.apply_filter("items", std::slice::from_ref(value));
+        }
+        if value.kind() != ValueKind::String {
+            return Err(Error::new(
+                ErrorKind::UnknownMethod,
+                format!("unknown method {method}"),
+            ));
+        }
+        let string = value.as_str().unwrap_or_default();
+        let argument = || args.first().and_then(Value::as_str).unwrap_or_default();
+        match method {
+            "startswith" => Ok(Value::from(string.starts_with(argument()))),
+            "endswith" => Ok(Value::from(string.ends_with(argument()))),
+            "strip" => Ok(Value::from(string.trim().to_owned())),
+            "lstrip" => Ok(Value::from(string.trim_start().to_owned())),
+            "rstrip" => Ok(Value::from(string.trim_end().to_owned())),
+            "split" => {
+                let separator = argument();
+                if separator.is_empty() {
+                    return Err(Error::new(
+                        ErrorKind::InvalidOperation,
+                        "chat template split requires a separator",
+                    ));
+                }
+                Ok(Value::from(
+                    string
+                        .split(separator)
+                        .map(str::to_owned)
+                        .map(Value::from)
+                        .collect::<Vec<_>>(),
+                ))
+            }
+            _ => Err(Error::new(
+                ErrorKind::UnknownMethod,
+                format!("unknown string method {method}"),
+            )),
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -632,72 +701,4 @@ assistant:{{ content }}
             "False"
         );
     }
-}
-
-fn extract_token(config: &JsonValue, name: &str) -> String {
-    let Some(value) = config.get(name) else {
-        return String::new();
-    };
-    if let Some(value) = value.as_str() {
-        return value.to_owned();
-    }
-    value
-        .get("content")
-        .and_then(JsonValue::as_str)
-        .unwrap_or_default()
-        .to_owned()
-}
-
-fn configure_environment(environment: &mut Environment<'_>) {
-    environment.set_keep_trailing_newline(true);
-    environment.set_trim_blocks(true);
-    environment.set_lstrip_blocks(true);
-    environment.set_fuel(Some(50_000_000));
-    environment.add_function(
-        "raise_exception",
-        |message: String| -> std::result::Result<Value, Error> {
-            Err(Error::new(ErrorKind::InvalidOperation, message))
-        },
-    );
-    environment.set_unknown_method_callback(|state, value, method, args| {
-        if value.kind() == ValueKind::Map && method == "items" {
-            let _: () = from_args(args)?;
-            return state.apply_filter("items", &[value.clone()]);
-        }
-        if value.kind() != ValueKind::String {
-            return Err(Error::new(
-                ErrorKind::UnknownMethod,
-                format!("unknown method {method}"),
-            ));
-        }
-        let string = value.as_str().unwrap_or_default();
-        let argument = || args.first().and_then(Value::as_str).unwrap_or_default();
-        match method {
-            "startswith" => Ok(Value::from(string.starts_with(argument()))),
-            "endswith" => Ok(Value::from(string.ends_with(argument()))),
-            "strip" => Ok(Value::from(string.trim().to_owned())),
-            "lstrip" => Ok(Value::from(string.trim_start().to_owned())),
-            "rstrip" => Ok(Value::from(string.trim_end().to_owned())),
-            "split" => {
-                let separator = argument();
-                if separator.is_empty() {
-                    return Err(Error::new(
-                        ErrorKind::InvalidOperation,
-                        "chat template split requires a separator",
-                    ));
-                }
-                Ok(Value::from(
-                    string
-                        .split(separator)
-                        .map(str::to_owned)
-                        .map(Value::from)
-                        .collect::<Vec<_>>(),
-                ))
-            }
-            _ => Err(Error::new(
-                ErrorKind::UnknownMethod,
-                format!("unknown string method {method}"),
-            )),
-        }
-    });
 }

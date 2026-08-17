@@ -622,13 +622,8 @@ fn supports_metal_gated_delta_kernel(hk: i32, hv: i32, dk: i32, dv: i32) -> bool
 ///
 /// Used by: Qwen3Next, Qwen3.5, KimiLinear
 pub fn gated_delta_update(
-    q: &MlxArray,
-    k: &MlxArray,
-    v: &MlxArray,
-    a: &MlxArray,
-    b: &MlxArray,
-    a_log: &MlxArray,
-    dt_bias: &MlxArray,
+    (q, k, v): (&MlxArray, &MlxArray, &MlxArray),
+    (a, b, a_log, dt_bias): (&MlxArray, &MlxArray, &MlxArray, &MlxArray),
     state: Option<&MlxArray>,
     mask: Option<&MlxArray>,
 ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
