@@ -364,6 +364,20 @@ fn chat_protocol_accepts_qwen_thinking_extensions() {
 }
 
 #[test]
+fn chat_protocol_accepts_opencode_thinking_options() {
+    let mut request = chat_request("hello");
+    request["thinking"] = json!({"type": "enabled", "budgetTokens": 15999});
+    request["mcp_timeout"] = json!(60);
+    let parsed = protocol::parse_chat(request).expect("opencode thinking options");
+    assert!(parsed.enable_thinking);
+
+    let mut request = chat_request("hello");
+    request["thinking"] = json!({"type": "disabled"});
+    let parsed = protocol::parse_chat(request).expect("disabled opencode thinking");
+    assert!(!parsed.enable_thinking);
+}
+
+#[test]
 fn chat_protocol_rejects_unsupported_reasoning_efforts() {
     for value in ["high", "max", "unknown", ""] {
         let mut request = chat_request("hello");

@@ -121,11 +121,14 @@ struct ChatWire {
     max_completion_tokens: Option<usize>,
     max_tokens: Option<usize>,
     reasoning_effort: Option<String>,
+    thinking: Option<ChatThinking>,
     #[serde(rename = "preserve_thinking")]
     _preserve_thinking: Option<bool>,
     enable_thinking: Option<bool>,
     #[serde(rename = "chat_template_kwargs")]
     _chat_template_kwargs: Option<Map<String, Value>>,
+    #[serde(rename = "mcp_timeout")]
+    _mcp_timeout: Option<Value>,
     temperature: Option<f32>,
     top_p: Option<f32>,
     seed: Option<u64>,
@@ -135,6 +138,16 @@ struct ChatWire {
     tools: Option<Vec<Value>>,
     tool_choice: Option<Value>,
     parallel_tool_calls: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase", deny_unknown_fields)]
+enum ChatThinking {
+    Enabled {
+        #[serde(rename = "budgetTokens")]
+        _budget_tokens: Option<usize>,
+    },
+    Disabled,
 }
 
 #[derive(Deserialize)]
@@ -281,7 +294,14 @@ pub fn parse_chat(value: Value) -> Result<CompletionRequest, RequestError> {
             })
         })
         .transpose()?;
-    let enable_thinking = wire.enable_thinking.or(template_enable_thinking).unwrap_or(true);
+    let opencode_enable_thinking = wire
+        .thinking
+        .map(|thinking| matches!(thinking, ChatThinking::Enabled { .. }));
+    let enable_thinking = wire
+        .enable_thinking
+        .or(template_enable_thinking)
+        .or(opencode_enable_thinking)
+        .unwrap_or(true);
     let output_format = parse_chat_format(wire.response_format)?;
     let tools = parse_tools(wire.tools.as_deref().unwrap_or_default(), ToolDialect::Chat)?;
     if !tools.is_empty() && !matches!(output_format, OutputFormat::Text) {
