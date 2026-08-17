@@ -266,17 +266,20 @@ pub struct Submission {
 #[derive(Clone)]
 pub struct Engine {
     jobs: mpsc::Sender<Job>,
-    model_id: Arc<str>,
+    configured_model_id: Option<Arc<str>>,
     supports_image_inputs: bool,
 }
 
 impl Engine {
-    pub fn start_qwen(model_path: PathBuf, prefix_cache_max_tokens: usize) -> Result<Self> {
+    pub fn start_qwen(
+        model_path: PathBuf,
+        model_id: Option<String>,
+        prefix_cache_max_tokens: usize,
+    ) -> Result<Self> {
         ensure!(
             prefix_cache_max_tokens > 0,
             "prefix cache capacity must be nonzero"
         );
-        let model_id = checkpoint_model_id(&model_path)?;
         let (jobs_tx, jobs_rx) = mpsc::channel(JOB_QUEUE_CAPACITY);
         let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
         thread::Builder::new()
@@ -299,13 +302,13 @@ impl Engine {
             .context("generation thread exited during startup")??;
         Ok(Self {
             jobs: jobs_tx,
-            model_id: model_id.into(),
+            configured_model_id: model_id.map(Arc::from),
             supports_image_inputs,
         })
     }
 
-    pub fn model_id(&self) -> &str {
-        &self.model_id
+    pub fn configured_model_id(&self) -> Option<&str> {
+        self.configured_model_id.as_deref()
     }
 
     pub fn supports_image_inputs(&self) -> bool {
@@ -333,9 +336,8 @@ impl Engine {
     }
 
     #[cfg(test)]
-    pub fn start_fake(model_id: &str, queue_capacity: usize) -> Self {
+    pub fn start_fake(model_id: Option<&str>, queue_capacity: usize) -> Self {
         let (jobs_tx, mut jobs_rx) = mpsc::channel::<Job>(queue_capacity);
-        let model_id_owned = model_id.to_string();
         thread::spawn(move || {
             fn message_text(message: &ChatMessage) -> String {
                 let mut text = String::new();
@@ -549,7 +551,7 @@ impl Engine {
                 let record = CompletionRecord {
                     admission: job.admission,
                     endpoint: job.request.endpoint,
-                    model: model_id_owned.clone(),
+                    model: job.request.model.clone(),
                     content,
                     reasoning_content,
                     tool_calls,
@@ -564,7 +566,7 @@ impl Engine {
         });
         Self {
             jobs: jobs_tx,
-            model_id: model_id.into(),
+            configured_model_id: model_id.map(Arc::from),
             supports_image_inputs: true,
         }
     }
@@ -920,13 +922,6 @@ fn send_failure(job: &Job, kind: FailureKind, message: String, param: Option<Str
     }));
 }
 
-fn checkpoint_model_id(path: &Path) -> Result<String> {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .map(str::to_owned)
-        .context("model checkpoint path must have a UTF-8 directory basename")
-}
 
 fn output_format_param(endpoint: Endpoint) -> &'static str {
     match endpoint {

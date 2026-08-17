@@ -81,14 +81,18 @@ async fn handle(
         )
         .into_response();
     }
-    if request.model != state.engine.model_id() {
+    if state
+        .engine
+        .configured_model_id()
+        .is_some_and(|model_id| request.model != model_id)
+    {
         return ApiError::model_not_found(&request.model).into_response();
     }
     if let Err(error) = media::decode_request_images(&mut request) {
         return ApiError::from_request(error).into_response();
     }
     let stream_requested = request.stream;
-    let model_id = state.engine.model_id().to_string();
+    let response_model = request.model.clone();
     let submission = match state.engine.submit(request) {
         Ok(submission) => submission,
         Err(SubmitError::Full) => return ApiError::queue_full().into_response(),
@@ -97,7 +101,7 @@ async fn handle(
         }
     };
     if stream_requested {
-        streaming_response(endpoint, model_id, submission).await
+        streaming_response(endpoint, response_model, submission).await
     } else {
         buffered_response(submission).await
     }
