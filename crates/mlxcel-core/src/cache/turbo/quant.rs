@@ -306,9 +306,9 @@ fn quantize_into_packed(
 
     const NON_METAL_TOKEN_CHUNK: i32 = 256;
     if !ffi::metal_is_available() && t > NON_METAL_TOKEN_CHUNK {
-        let mut packed_acc = None;
-        let mut norms_acc = None;
-        let mut rescale_acc = None;
+        let mut packed_acc: Option<UniquePtr<MlxArray>> = None;
+        let mut norms_acc: Option<UniquePtr<MlxArray>> = None;
+        let mut rescale_acc: Option<UniquePtr<MlxArray>> = None;
         let mut start = 0;
         while start < t {
             let end = (start + NON_METAL_TOKEN_CHUNK).min(t);

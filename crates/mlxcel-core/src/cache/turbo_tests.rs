@@ -129,7 +129,7 @@ fn turbo4_asym_update_returns_fp16_dequantized_v() {
 }
 
 #[test]
-fn turbo4_verify_attention_preserves_per_position_shape_and_offset() {
+fn turbo4_causal_attention_preserves_per_position_shape_and_offset() {
     let head_dim = 64;
     let query_len = 3;
     let mut cache = KVCache::new_with_mode(KVCacheMode::Turbo4);
@@ -139,7 +139,7 @@ fn turbo4_verify_attention_preserves_per_position_shape_and_offset() {
     );
 
     let queries = synth_kv_tensor(1, 2, query_len, head_dim, 103);
-    let output = cache.update_and_turbo4_dequant_sdpa_verify_attention(
+    let output = cache.update_and_turbo4_dequant_sdpa_causal_attention(
         &queries,
         synth_kv_tensor(1, 1, query_len, head_dim, 104),
         synth_kv_tensor(1, 1, query_len, head_dim, 105),
