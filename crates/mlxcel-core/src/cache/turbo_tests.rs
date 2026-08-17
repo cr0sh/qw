@@ -129,6 +129,32 @@ fn turbo4_asym_update_returns_fp16_dequantized_v() {
 }
 
 #[test]
+fn turbo4_verify_attention_preserves_per_position_shape_and_offset() {
+    let head_dim = 64;
+    let query_len = 3;
+    let mut cache = KVCache::new_with_mode(KVCacheMode::Turbo4);
+    cache.update(
+        synth_kv_tensor(1, 1, 2, head_dim, 101),
+        synth_kv_tensor(1, 1, 2, head_dim, 102),
+    );
+
+    let queries = synth_kv_tensor(1, 2, query_len, head_dim, 103);
+    let output = cache.update_and_turbo4_dequant_sdpa_verify_attention(
+        &queries,
+        synth_kv_tensor(1, 1, query_len, head_dim, 104),
+        synth_kv_tensor(1, 1, query_len, head_dim, 105),
+        (head_dim as f32).powf(-0.5),
+    );
+
+    assert_eq!(ffi::array_shape(&output), [1, 2, query_len, head_dim]);
+    assert_eq!(cache.offset, 5);
+    assert!(cache.keys.is_none());
+    assert!(cache.values.is_none());
+    assert!(cache.k_packed.is_some());
+    assert!(cache.v_packed.is_some());
+}
+
+#[test]
 fn turbo4_asym_multi_token_growth_keeps_visible_window_correct() {
     let head_dim = 64;
     let mut cache = KVCache::new_with_mode(KVCacheMode::Turbo4Asym);
