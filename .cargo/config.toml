@@ -1,0 +1,3 @@
+[env]
+# MLX's Metal and CUDA backends are unsafe under concurrent libtest execution.
+RUST_TEST_THREADS = { value = "1", force = false }
