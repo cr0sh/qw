@@ -84,6 +84,225 @@ fn chat_tool_request(prompt: &str) -> Value {
         "tools": chat_tools()
     })
 }
+fn representative_documented_chat_request() -> Value {
+    serde_json::from_str(
+        r#"{
+            "model": "test-model",
+            "messages": [
+                {
+                    "role": "developer",
+                    "name": "policy",
+                    "content": [{
+                        "type": "text",
+                        "text": "follow policy",
+                        "prompt_cache_breakpoint": {"mode": "explicit"}
+                    }]
+                },
+                {"role": "system", "name": "context", "content": "system context"},
+                {
+                    "role": "user",
+                    "name": "alice",
+                    "content": [
+                        {"type": "text", "text": "hello"},
+                        {
+                            "type": "input_audio",
+                            "input_audio": {"data": "UklGRg==", "format": "wav"},
+                            "prompt_cache_breakpoint": {"mode": "explicit"}
+                        },
+                        {
+                            "type": "file",
+                            "file": {"file_data": "ZmlsZQ==", "filename": "note.txt"}
+                        }
+                    ]
+                },
+                {
+                    "role": "assistant",
+                    "name": "agent",
+                    "content": null,
+                    "audio": {"id": "audio_1"},
+                    "refusal": null,
+                    "tool_calls": [{
+                        "id": "custom_1",
+                        "type": "custom",
+                        "custom": {"name": "shell", "input": "status"}
+                    }]
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "custom_1",
+                    "content": [{"type": "text", "text": "ready"}]
+                },
+                {"role": "function", "name": "legacy", "content": null},
+                {"role": "user", "name": "alice", "content": "finish"}
+            ],
+            "audio": {"format": "wav", "voice": {"id": "voice_1"}},
+            "frequency_penalty": 0.1,
+            "function_call": {"name": "legacy"},
+            "functions": [{"name": "legacy", "description": null}],
+            "logit_bias": {"42": -1},
+            "logprobs": true,
+            "max_completion_tokens": 32,
+            "max_tokens": 16,
+            "metadata": {"request_kind": "compatibility"},
+            "modalities": ["text", "audio"],
+            "moderation": {"model": "omni-moderation-latest"},
+            "n": 2,
+            "parallel_tool_calls": false,
+            "prediction": {
+                "type": "content",
+                "content": [{"type": "text", "text": "predicted"}]
+            },
+            "presence_penalty": 0.2,
+            "prompt_cache_key": "cache-key",
+            "prompt_cache_options": {"mode": "explicit", "ttl": "30m"},
+            "prompt_cache_retention": "in_memory",
+            "reasoning_effort": "high",
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "description": "an answer",
+                    "strict": false
+                }
+            },
+            "safety_identifier": "safe-user",
+            "seed": 7,
+            "service_tier": "flex",
+            "stop": ["done"],
+            "store": false,
+            "stream_options": {"include_obfuscation": false, "include_usage": true},
+            "temperature": 0.5,
+            "tool_choice": {"type": "function", "function": {"name": "legacy"}},
+            "tools": [{
+                "type": "custom",
+                "custom": {
+                    "name": "shell",
+                    "description": "run a command",
+                    "format": {
+                        "type": "grammar",
+                        "grammar": {"definition": "start: /.+/", "syntax": "lark"}
+                    }
+                }
+            }],
+            "top_logprobs": 5,
+            "top_p": 0.9,
+            "user": "legacy-user",
+            "verbosity": "high",
+            "web_search_options": {
+                "search_context_size": "low",
+                "user_location": {
+                    "type": "approximate",
+                    "approximate": {"country": "US", "timezone": "America/Los_Angeles"}
+                }
+            }
+        }"#,
+    )
+    .expect("representative request JSON")
+}
+mod trace_capture {
+    use std::cell::RefCell;
+    use std::fmt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, Once};
+
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Attributes, Id, Record};
+    use tracing::{Event, Level, Metadata, Subscriber, level_filters::LevelFilter};
+
+    static INSTALL: Once = Once::new();
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    static LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    thread_local! {
+        static STACK: RefCell<Vec<Id>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn install() {
+        INSTALL.call_once(|| {
+            tracing::subscriber::set_global_default(CaptureSubscriber)
+                .expect("server tests install only one tracing subscriber");
+        });
+    }
+
+    pub(super) fn clear() {
+        LINES.lock().expect("trace lines lock").clear();
+    }
+
+    pub(super) fn snapshot() -> Vec<String> {
+        LINES.lock().expect("trace lines lock").clone()
+    }
+
+    struct CaptureSubscriber;
+
+    impl Subscriber for CaptureSubscriber {
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            (metadata.target().starts_with("qw_server")
+                || metadata.target().starts_with("qw_runtime"))
+                && *metadata.level() <= Level::INFO
+        }
+
+        fn max_level_hint(&self) -> Option<LevelFilter> {
+            Some(LevelFilter::INFO)
+        }
+
+        fn new_span(&self, attributes: &Attributes<'_>) -> Id {
+            let id = Id::from_u64(NEXT_ID.fetch_add(1, Ordering::Relaxed));
+            let contextual_parent = STACK.with(|stack| stack.borrow().last().cloned());
+            let parent = attributes.parent().cloned().or(contextual_parent);
+            let mut line = format!(
+                "span {} id={} parent={:?}",
+                attributes.metadata().name(),
+                id.into_u64(),
+                parent.as_ref().map(Id::into_u64),
+            );
+            attributes.record(&mut LineVisitor(&mut line));
+            LINES.lock().expect("trace lines lock").push(line);
+            id
+        }
+
+        fn record(&self, span: &Id, values: &Record<'_>) {
+            let mut line = format!("record id={}", span.into_u64());
+            values.record(&mut LineVisitor(&mut line));
+            LINES.lock().expect("trace lines lock").push(line);
+        }
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            let mut line = format!("event {}", event.metadata().target());
+            event.record(&mut LineVisitor(&mut line));
+            LINES.lock().expect("trace lines lock").push(line);
+        }
+
+        fn enter(&self, span: &Id) {
+            STACK.with(|stack| stack.borrow_mut().push(span.clone()));
+        }
+
+        fn exit(&self, span: &Id) {
+            STACK.with(|stack| {
+                let popped = stack.borrow_mut().pop();
+                assert_eq!(
+                    popped.as_ref(),
+                    Some(span),
+                    "tracing span stack is balanced"
+                );
+            });
+        }
+
+        fn clone_span(&self, id: &Id) -> Id {
+            id.clone()
+        }
+    }
+
+    struct LineVisitor<'a>(&'a mut String);
+
+    impl Visit for LineVisitor<'_> {
+        fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+            use fmt::Write as _;
+            let _ = write!(self.0, " {}={value:?}", field.name());
+        }
+    }
+}
 
 fn responses_tool_request(prompt: &str) -> Value {
     json!({
@@ -296,8 +515,7 @@ async fn unconfigured_model_id_routes_arbitrary_models_and_preserves_response_id
 
     let mut buffered_request = chat_request("first");
     buffered_request["model"] = json!("arbitrary-one");
-    let (status, _, body) =
-        post(app.clone(), "/v1/chat/completions", buffered_request).await;
+    let (status, _, body) = post(app.clone(), "/v1/chat/completions", buffered_request).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let response: Value = serde_json::from_str(&body).expect("buffered response JSON");
     assert_eq!(response["model"], "arbitrary-one");
@@ -353,15 +571,13 @@ async fn configured_model_id_accepts_exact_match_and_rejects_mismatch() {
 }
 
 #[tokio::test]
-async fn malformed_and_unsupported_fields_are_rejected() {
+async fn malformed_fields_are_rejected() {
     let app = router(Engine::start_fake(Some(MODEL), 8));
     for request in [
         json!({"model": MODEL, "messages": []}),
         json!({"model": MODEL, "messages": [{"role":"user","content":[]}]}),
-        json!({"model": MODEL, "messages": [{"role":"user","content":"x"}], "n": 2}),
-        json!({"model": MODEL, "messages": [{"role":"user","content":"x"}], "logprobs": true}),
-        json!({"model": MODEL, "messages": [{"role":"user","content":"x"}], "stop": ["x"]}),
-        json!({"model": MODEL, "messages": [{"role":"user","content":"x"}], "max_tokens": 1, "max_completion_tokens": 1}),
+        json!({"model": MODEL, "messages": [{"role":"user","content":"x"}], "max_tokens": 0}),
+        json!({"model": MODEL, "messages": [{"role":"user","content":"x"}], "unknown_control": true}),
     ] {
         let (status, _, body) = post(app.clone(), "/v1/chat/completions", request).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
@@ -377,37 +593,168 @@ async fn malformed_and_unsupported_fields_are_rejected() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     }
 }
+#[test]
+fn chat_protocol_accepts_message_names_and_documented_nested_variants() {
+    let parsed = protocol::parse_chat(representative_documented_chat_request())
+        .expect("representative documented request");
+    assert_eq!(parsed.messages[0].name.as_deref(), Some("policy"));
+    assert_eq!(parsed.messages[1].name.as_deref(), Some("context"));
+    assert_eq!(parsed.messages[2].name.as_deref(), Some("alice"));
+    assert_eq!(parsed.messages[3].name.as_deref(), Some("agent"));
+    assert_eq!(parsed.messages[5].name.as_deref(), Some("legacy"));
+    assert_eq!(
+        parsed.reasoning_effort,
+        Some(protocol::ReasoningEffort::High)
+    );
+    assert_eq!(parsed.max_tokens, 32);
+    assert_eq!(parsed.tools.len(), 1);
+
+    let messages = serde_json::to_value(&parsed.messages).expect("serialize normalized messages");
+    assert_eq!(messages[0]["name"], "policy");
+    assert_eq!(messages[2]["content"][1]["type"], "input_audio");
+    assert_eq!(messages[2]["content"][2]["type"], "file");
+    assert_eq!(messages[3]["tool_calls"][0]["type"], "custom");
+    assert_eq!(messages[4]["content"][0]["type"], "text");
+}
+
+#[tokio::test]
+async fn documented_optional_chat_inputs_reach_the_handler() {
+    let app = router(Engine::start_fake(Some(MODEL), 8));
+    let (status, _, body) = post(
+        app,
+        "/v1/chat/completions",
+        representative_documented_chat_request(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let response: Value = serde_json::from_str(&body).expect("chat response JSON");
+    assert_eq!(response["object"], "chat.completion");
+}
+#[tokio::test]
+async fn structured_tracing_covers_request_stream_error_and_cancellation_without_bodies() {
+    trace_capture::install();
+    trace_capture::clear();
+
+    const SECRET_PROMPT: &str = "trace-secret-prompt-7b5c";
+    const SECRET_ARGUMENTS: &str = "trace-secret-tool-arguments-29af";
+    let app = router(Engine::start_fake(Some(MODEL), 8));
+    let request = json!({
+        "model": MODEL,
+        "tools": chat_tools(),
+        "messages": [
+            {"role": "user", "content": SECRET_PROMPT},
+            {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "trace_call",
+                    "type": "function",
+                    "function": {
+                        "name": "weather",
+                        "arguments": format!(r#"{{"value":"{SECRET_ARGUMENTS}"}}"#)
+                    }
+                }]
+            },
+            {"role": "tool", "tool_call_id": "trace_call", "content": "ready"},
+            {"role": "user", "content": "finish"}
+        ]
+    });
+    let (status, _, body) = post(app.clone(), "/v1/chat/completions", request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let mut streaming = chat_request("stream trace");
+    streaming["stream"] = json!(true);
+    let (status, _, body) = post(app.clone(), "/v1/chat/completions", streaming).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let mut failing = chat_request("fail-after-start");
+    failing["stream"] = json!(true);
+    let (status, _, body) = post(app.clone(), "/v1/chat/completions", failing).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("\"type\":\"server_error\""), "{body}");
+
+    let response = app
+        .oneshot(
+            Request::post("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": MODEL,
+                        "messages": [{"role": "user", "content": "hold"}],
+                        "stream": true
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("stream response");
+    assert_eq!(response.status(), StatusCode::OK);
+    drop(response);
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    let traces = trace_capture::snapshot().join("\n");
+    assert!(traces.contains("span server.request"), "{traces}");
+    assert!(
+        traces
+            .lines()
+            .any(|line| line.contains("span generation") && line.contains("parent=Some")),
+        "{traces}"
+    );
+    for phase in [
+        "request.validation_complete",
+        "dispatch.enqueued",
+        "generation.complete",
+        "response.buffered_complete",
+        "response.streaming_admitted",
+        "response.streaming_complete",
+        "response.streaming_failed",
+        "generation.cancelled",
+    ] {
+        assert!(traces.contains(phase), "missing {phase}: {traces}");
+    }
+    assert!(!traces.contains(SECRET_PROMPT), "{traces}");
+    assert!(!traces.contains(SECRET_ARGUMENTS), "{traces}");
+}
 
 #[test]
-fn chat_protocol_accepts_supported_reasoning_efforts() {
+fn chat_protocol_accepts_documented_reasoning_efforts() {
     for (value, expected) in [
+        ("none", protocol::ReasoningEffort::None),
+        ("minimal", protocol::ReasoningEffort::Minimal),
         ("low", protocol::ReasoningEffort::Low),
         ("medium", protocol::ReasoningEffort::Medium),
+        ("high", protocol::ReasoningEffort::High),
         ("xhigh", protocol::ReasoningEffort::XHigh),
+        ("max", protocol::ReasoningEffort::Max),
     ] {
         let mut request = chat_request("hello");
         request["reasoning_effort"] = json!(value);
-        let parsed = protocol::parse_chat(request).expect("supported reasoning effort");
+        let parsed = protocol::parse_chat(request).expect("documented reasoning effort");
         assert_eq!(parsed.reasoning_effort, Some(expected));
         assert_eq!(
             parsed.reasoning_effort.map(|effort| effort.as_str()),
             Some(value)
         );
     }
-    assert_eq!(
-        protocol::parse_chat(chat_request("hello"))
-            .expect("omitted effort")
-            .reasoning_effort,
-        None
-    );
+    for value in [None, Some(Value::Null)] {
+        let mut request = chat_request("hello");
+        if let Some(value) = value {
+            request["reasoning_effort"] = value;
+        }
+        assert_eq!(
+            protocol::parse_chat(request)
+                .expect("omitted or null effort")
+                .reasoning_effort,
+            None
+        );
+    }
 }
 
 #[test]
 fn chat_protocol_accepts_qwen_thinking_extensions() {
     let mut request = chat_request("hello");
     request["preserve_thinking"] = json!(true);
-    request["chat_template_kwargs"] =
-        json!({"preserve_thinking": true, "enable_thinking": false});
+    request["chat_template_kwargs"] = json!({"preserve_thinking": true, "enable_thinking": false});
     let parsed = protocol::parse_chat(request).expect("Qwen thinking extensions");
     assert!(!parsed.enable_thinking);
 }
@@ -427,31 +774,23 @@ fn chat_protocol_accepts_opencode_thinking_options() {
 }
 
 #[test]
-fn chat_protocol_rejects_unsupported_reasoning_efforts() {
-    for value in ["high", "max", "unknown", ""] {
-        let mut request = chat_request("hello");
-        request["reasoning_effort"] = json!(value);
-        let error = protocol::parse_chat(request).expect_err("unsupported reasoning effort");
-        assert_eq!(error.param.as_deref(), Some("reasoning_effort"));
-    }
-    for value in [Value::Null, json!(1)] {
+fn chat_protocol_rejects_invalid_reasoning_efforts() {
+    for value in [json!("unknown"), json!(""), json!(1)] {
         let mut request = chat_request("hello");
         request["reasoning_effort"] = value;
-        let error = protocol::parse_chat(request).expect_err("effort must be a string");
+        let error = protocol::parse_chat(request).expect_err("invalid reasoning effort");
         assert_eq!(error.param.as_deref(), Some("reasoning_effort"));
     }
 }
 
 #[tokio::test]
-async fn unsupported_reasoning_efforts_return_parameterized_400() {
+async fn documented_reasoning_efforts_reach_the_handler() {
     let app = router(Engine::start_fake(Some(MODEL), 8));
-    for effort in ["high", "max"] {
+    for effort in ["none", "minimal", "high", "max"] {
         let mut request = chat_request("hello");
         request["reasoning_effort"] = json!(effort);
         let (status, _, body) = post(app.clone(), "/v1/chat/completions", request).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        let value: Value = serde_json::from_str(&body).expect("error JSON");
-        assert_eq!(value["error"]["param"], "reasoning_effort");
+        assert_eq!(status, StatusCode::OK, "{body}");
     }
 }
 #[test]
@@ -475,18 +814,15 @@ fn chat_protocol_replays_assistant_reasoning_content() {
     );
     assert_eq!(parsed.messages[1].text_content(), Some("answer"));
 
-    let error = protocol::parse_chat(json!({
+    let parsed = protocol::parse_chat(json!({
         "model": MODEL,
         "messages": [
             {"role":"user","content":"question"},
             {"role":"assistant","reasoning_content":null,"content":"answer"}
         ]
     }))
-    .expect_err("reasoning content must be a string");
-    assert_eq!(
-        error.param.as_deref(),
-        Some("messages[1].reasoning_content")
-    );
+    .expect("nullable reasoning content");
+    assert_eq!(parsed.messages[1].reasoning_content, None);
 }
 #[tokio::test]
 async fn json_object_and_strict_schema_are_generated_under_constraints() {
@@ -1024,28 +1360,12 @@ async fn chat_tool_validation_reports_exact_paths() {
             "tools[0].function.parameters",
         ),
         (
-            json!({"model":MODEL,"messages":[{"role":"user","content":"x"}],"tools":[{"type":"function","function":{"name":"x","description":null,"parameters":{}}}]}),
-            "tools[0].function.description",
-        ),
-        (
             json!({"model":MODEL,"messages":[{"role":"user","content":"x"}],"tools":[{"type":"function","function":{"name":"x","parameters":{},"strict":"yes"}}]}),
             "tools[0].function.strict",
         ),
         (
             json!({"model":MODEL,"messages":[{"role":"user","content":"x"}],"tools":[{"type":"function","function":{"name":"x","parameters":{},"extra":1}}]}),
             "tools[0].function.extra",
-        ),
-        (
-            json!({"model":MODEL,"messages":[{"role":"user","content":"x"}],"tools":chat_tools(),"tool_choice":"required"}),
-            "tool_choice",
-        ),
-        (
-            json!({"model":MODEL,"messages":[{"role":"user","content":"x"}],"tools":chat_tools(),"tool_choice":{"type":"function","function":{"name":"weather"}}}),
-            "tool_choice",
-        ),
-        (
-            json!({"model":MODEL,"messages":[{"role":"user","content":"x"}],"tools":chat_tools(),"response_format":{"type":"json_object"}}),
-            "response_format",
         ),
         (
             json!({"model":MODEL,"messages":[{"role":"user","content":null}]}),
@@ -1058,10 +1378,6 @@ async fn chat_tool_validation_reports_exact_paths() {
         (
             json!({"model":MODEL,"messages":[{"role":"user","content":"x","extra":1}]}),
             "messages[0].extra",
-        ),
-        (
-            json!({"model":MODEL,"messages":[{"role":"user","content":"x"},{"role":"system","content":"late"}]}),
-            "messages[1].role",
         ),
         (
             json!({"model":MODEL,"tools":chat_tools(),"messages":[{"role":"user","content":"x"},{"role":"assistant","tool_calls":[{"id":"c","type":"function","function":{"name":"weather","arguments":"bad"}}]},{"role":"tool","tool_call_id":"c","content":"x"}]}),
@@ -1262,18 +1578,21 @@ async fn chat_and_responses_preserve_mixed_image_order_buffered_and_streamed() {
 #[tokio::test]
 async fn image_validation_reports_exact_openai_parameter_paths() {
     let app = router(Engine::start_fake(Some(MODEL), 8));
+    let (status, _, body) = post(
+        app.clone(),
+        "/v1/chat/completions",
+        json!({"model":MODEL,"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":tiny_png_data_uri(),"detail":"high"}}]}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
     let chat_cases = [
         (
             json!({"model":MODEL,"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/a.png"}}]}]}),
             "messages[0].content[0].image_url.url",
         ),
         (
-            json!({"model":MODEL,"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":tiny_png_data_uri(),"detail":"high"}}]}]}),
-            "messages[0].content[0].image_url.detail",
-        ),
-        (
             json!({"model":MODEL,"messages":[{"role":"system","content":[{"type":"image_url","image_url":{"url":tiny_png_data_uri()}}]},{"role":"user","content":"x"}]}),
-            "messages[0].content[0].image_url.url",
+            "messages[0].content[0].image_url",
         ),
         (
             json!({"model":MODEL,"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":tiny_png_data_uri(),"extra":1}}]}]}),

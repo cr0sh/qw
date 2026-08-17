@@ -4,8 +4,9 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use qw_runtime::{
-    ChatContentPart, ChatImageUrl, ChatMessage, ChatMessageContent, ChatTool, ChatToolCall,
-    ChatToolCallFunction, ChatToolFunction,
+    ChatContentPart, ChatCustomToolCall, ChatFile, ChatImageUrl, ChatInputAudio, ChatMessage,
+    ChatMessageContent, ChatPromptCacheBreakpoint, ChatTool, ChatToolCall, ChatToolCallFunction,
+    ChatToolFunction,
 };
 
 use crate::media::DecodedImage;
@@ -34,17 +35,25 @@ pub enum ToolChoice {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReasoningEffort {
+    None,
+    Minimal,
     Low,
     Medium,
+    High,
     XHigh,
+    Max,
 }
 
 impl ReasoningEffort {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
             Self::Low => "low",
             Self::Medium => "medium",
+            Self::High => "high",
             Self::XHigh => "xhigh",
+            Self::Max => "max",
         }
     }
 }
@@ -92,21 +101,38 @@ impl RequestError {
 #[derive(Deserialize)]
 #[serde(tag = "role", rename_all = "lowercase", deny_unknown_fields)]
 enum ChatWireMessage {
+    Developer {
+        content: Value,
+        name: Option<String>,
+    },
     System {
         content: Value,
+        name: Option<String>,
     },
     User {
         content: Value,
+        name: Option<String>,
     },
     Assistant {
         #[serde(default)]
         content: Value,
         reasoning_content: Option<String>,
         tool_calls: Option<Vec<Value>>,
+        #[serde(rename = "audio")]
+        _audio: Option<Value>,
+        function_call: Option<Value>,
+        name: Option<String>,
+        #[serde(rename = "refusal")]
+        _refusal: Option<String>,
     },
     Tool {
         content: Value,
         tool_call_id: Value,
+    },
+    Function {
+        #[serde(default)]
+        content: Value,
+        name: Value,
     },
 }
 
@@ -115,8 +141,7 @@ enum ChatWireMessage {
 struct ChatWire {
     model: String,
     messages: Vec<Value>,
-    #[serde(default)]
-    stream: bool,
+    stream: Option<bool>,
     stream_options: Option<ChatStreamOptions>,
     max_completion_tokens: Option<usize>,
     max_tokens: Option<usize>,
@@ -133,11 +158,53 @@ struct ChatWire {
     top_p: Option<f32>,
     seed: Option<u64>,
     response_format: Option<ChatFormat>,
-    n: Option<usize>,
-    stop: Option<Value>,
+    #[serde(rename = "n")]
+    _n: Option<usize>,
+    #[serde(rename = "stop")]
+    _stop: Option<Value>,
     tools: Option<Vec<Value>>,
     tool_choice: Option<Value>,
     parallel_tool_calls: Option<bool>,
+    functions: Option<Vec<Value>>,
+    function_call: Option<Value>,
+    #[serde(rename = "audio")]
+    _audio: Option<Value>,
+    #[serde(rename = "frequency_penalty")]
+    _frequency_penalty: Option<f32>,
+    #[serde(rename = "logit_bias")]
+    _logit_bias: Option<Map<String, Value>>,
+    #[serde(rename = "logprobs")]
+    _logprobs: Option<bool>,
+    #[serde(rename = "metadata")]
+    _metadata: Option<Map<String, Value>>,
+    #[serde(rename = "modalities")]
+    _modalities: Option<Vec<String>>,
+    #[serde(rename = "moderation")]
+    _moderation: Option<Value>,
+    #[serde(rename = "prediction")]
+    _prediction: Option<Value>,
+    #[serde(rename = "presence_penalty")]
+    _presence_penalty: Option<f32>,
+    #[serde(rename = "prompt_cache_key")]
+    _prompt_cache_key: Option<String>,
+    #[serde(rename = "prompt_cache_options")]
+    _prompt_cache_options: Option<Value>,
+    #[serde(rename = "prompt_cache_retention")]
+    _prompt_cache_retention: Option<String>,
+    #[serde(rename = "safety_identifier")]
+    _safety_identifier: Option<String>,
+    #[serde(rename = "service_tier")]
+    _service_tier: Option<String>,
+    #[serde(rename = "store")]
+    _store: Option<bool>,
+    #[serde(rename = "top_logprobs")]
+    _top_logprobs: Option<usize>,
+    #[serde(rename = "user")]
+    _user: Option<String>,
+    #[serde(rename = "verbosity")]
+    _verbosity: Option<String>,
+    #[serde(rename = "web_search_options")]
+    _web_search_options: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -155,6 +222,8 @@ enum ChatThinking {
 struct ChatStreamOptions {
     #[serde(default)]
     include_usage: bool,
+    #[serde(rename = "include_obfuscation")]
+    _include_obfuscation: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -169,8 +238,11 @@ enum ChatFormat {
 #[serde(deny_unknown_fields)]
 struct ChatJsonSchema {
     name: String,
-    strict: bool,
-    schema: Value,
+    #[serde(rename = "description")]
+    _description: Option<String>,
+    #[serde(rename = "strict")]
+    _strict: Option<bool>,
+    schema: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -243,12 +315,12 @@ struct ResponsesFunctionOutputWire {
 
 pub fn parse_chat(value: Value) -> Result<CompletionRequest, RequestError> {
     let object = require_object(&value)?;
-    reject_present(object, "logprobs", "logprobs are not supported")?;
     if let Some(reasoning_effort) = object.get("reasoning_effort")
+        && !reasoning_effort.is_null()
         && !reasoning_effort.is_string()
     {
         return Err(RequestError::at(
-            "reasoning_effort must be a string",
+            "reasoning_effort must be a string or null",
             "reasoning_effort",
         ));
     }
@@ -260,20 +332,6 @@ pub fn parse_chat(value: Value) -> Result<CompletionRequest, RequestError> {
             "messages must contain at least one message",
             "messages",
         ));
-    }
-    if wire.max_completion_tokens.is_some() && wire.max_tokens.is_some() {
-        return Err(RequestError::at(
-            "max_completion_tokens and max_tokens cannot both be provided",
-            "max_completion_tokens",
-        ));
-    }
-    if wire.n.is_some_and(|n| n != 1) {
-        return Err(RequestError::at("only n=1 is supported", "n"));
-    }
-    if let Some(stop) = wire.stop.as_ref()
-        && stop_is_nonempty(stop)
-    {
-        return Err(RequestError::at("stop sequences are not supported", "stop"));
     }
     let max_tokens = wire
         .max_completion_tokens
@@ -303,14 +361,15 @@ pub fn parse_chat(value: Value) -> Result<CompletionRequest, RequestError> {
         .or(opencode_enable_thinking)
         .unwrap_or(true);
     let output_format = parse_chat_format(wire.response_format)?;
-    let tools = parse_tools(wire.tools.as_deref().unwrap_or_default(), ToolDialect::Chat)?;
-    if !tools.is_empty() && !matches!(output_format, OutputFormat::Text) {
-        return Err(RequestError::at(
-            "tools cannot be combined with structured response formats",
-            "response_format",
-        ));
-    }
-    let tool_choice = parse_tool_choice(wire.tool_choice.as_ref())?;
+    let mut tool_values = wire.tools.unwrap_or_default();
+    tool_values.extend(
+        wire.functions
+            .unwrap_or_default()
+            .into_iter()
+            .map(|function| json_object_tool(function)),
+    );
+    let tools = parse_tools(&tool_values, ToolDialect::Chat)?;
+    let tool_choice = parse_tool_choice(wire.tool_choice.as_ref().or(wire.function_call.as_ref()))?;
     let mut image_params = Vec::new();
     let messages = parse_chat_messages(wire.messages, &tools, &mut image_params)?;
     Ok(CompletionRequest {
@@ -322,7 +381,7 @@ pub fn parse_chat(value: Value) -> Result<CompletionRequest, RequestError> {
         reasoning_effort,
         enable_thinking,
         parallel_tool_calls: wire.parallel_tool_calls.unwrap_or(true),
-        stream: wire.stream,
+        stream: wire.stream.unwrap_or(false),
         stream_include_usage: wire
             .stream_options
             .is_some_and(|options| options.include_usage),
@@ -369,6 +428,7 @@ pub fn parse_responses(value: Value) -> Result<CompletionRequest, RequestError> 
             }
             vec![ChatMessage {
                 role: "user".to_string(),
+                name: None,
                 content: Some(ChatMessageContent::Text(content)),
                 reasoning_content: None,
                 tool_calls: Vec::new(),
@@ -403,16 +463,13 @@ fn parse_chat_format(format: Option<ChatFormat>) -> Result<OutputFormat, Request
         ChatFormat::Text => Ok(OutputFormat::Text),
         ChatFormat::JsonObject => Ok(OutputFormat::JsonObject),
         ChatFormat::JsonSchema { json_schema } => {
-            if !json_schema.strict {
-                return Err(RequestError::at(
-                    "json_schema.strict must be true",
-                    "response_format.json_schema.strict",
-                ));
-            }
-            require_schema_object(&json_schema.schema, "response_format.json_schema.schema")?;
+            let schema = json_schema
+                .schema
+                .unwrap_or_else(|| Value::Object(Map::new()));
+            require_schema_object(&schema, "response_format.json_schema.schema")?;
             Ok(OutputFormat::JsonSchema {
                 name: json_schema.name,
-                schema: json_schema.schema,
+                schema,
             })
         }
     }
@@ -444,6 +501,67 @@ enum ToolDialect {
     Chat,
     Responses,
 }
+fn json_object_tool(function: Value) -> Value {
+    let mut tool = Map::new();
+    tool.insert("type".to_string(), Value::String("function".to_string()));
+    tool.insert("function".to_string(), function);
+    Value::Object(tool)
+}
+fn parse_custom_tool(object: &Map<String, Value>, base: &str) -> Result<(), RequestError> {
+    reject_unknown_fields(object, &["type", "custom"], base)?;
+    let custom_path = format!("{base}.custom");
+    let custom = object
+        .get("custom")
+        .and_then(Value::as_object)
+        .ok_or_else(|| RequestError::at("custom tool must be an object", &custom_path))?;
+    reject_unknown_fields(custom, &["name", "description", "format"], &custom_path)?;
+    require_nonempty_string(custom.get("name"), &format!("{custom_path}.name"))?;
+    if let Some(description) = custom.get("description")
+        && !description.is_null()
+        && !description.is_string()
+    {
+        return Err(RequestError::at(
+            "custom tool description must be a string",
+            format!("{custom_path}.description"),
+        ));
+    }
+    let Some(format) = custom.get("format") else {
+        return Ok(());
+    };
+    let format_path = format!("{custom_path}.format");
+    let format = format
+        .as_object()
+        .ok_or_else(|| RequestError::at("custom tool format must be an object", &format_path))?;
+    match format.get("type").and_then(Value::as_str) {
+        Some("text") => reject_unknown_fields(format, &["type"], &format_path),
+        Some("grammar") => {
+            reject_unknown_fields(format, &["type", "grammar"], &format_path)?;
+            let grammar_path = format!("{format_path}.grammar");
+            let grammar = format
+                .get("grammar")
+                .and_then(Value::as_object)
+                .ok_or_else(|| {
+                    RequestError::at("custom tool grammar must be an object", &grammar_path)
+                })?;
+            reject_unknown_fields(grammar, &["definition", "syntax"], &grammar_path)?;
+            require_nonempty_string(
+                grammar.get("definition"),
+                &format!("{grammar_path}.definition"),
+            )?;
+            match grammar.get("syntax").and_then(Value::as_str) {
+                Some("lark" | "regex") => Ok(()),
+                _ => Err(RequestError::at(
+                    "custom tool grammar syntax must be \"lark\" or \"regex\"",
+                    format!("{grammar_path}.syntax"),
+                )),
+            }
+        }
+        _ => Err(RequestError::at(
+            "custom tool format type must be \"text\" or \"grammar\"",
+            format!("{format_path}.type"),
+        )),
+    }
+}
 
 fn parse_tools(values: &[Value], dialect: ToolDialect) -> Result<Vec<ChatTool>, RequestError> {
     let mut tools = Vec::with_capacity(values.len());
@@ -455,6 +573,12 @@ fn parse_tools(values: &[Value], dialect: ToolDialect) -> Result<Vec<ChatTool>, 
             .ok_or_else(|| RequestError::at("tool definition must be an object", &base))?;
         let (function, function_path) = match dialect {
             ToolDialect::Chat => {
+                let tool_type =
+                    require_nonempty_string(object.get("type"), &format!("{base}.type"))?;
+                if tool_type == "custom" {
+                    parse_custom_tool(object, &base)?;
+                    continue;
+                }
                 reject_unknown_fields(object, &["type", "function"], &base)?;
                 require_function_type(object.get("type"), &format!("{base}.type"))?;
                 let path = format!("{base}.function");
@@ -487,7 +611,7 @@ fn parse_tools(values: &[Value], dialect: ToolDialect) -> Result<Vec<ChatTool>, 
             return Err(RequestError::at("tool names must be unique", name_path));
         }
         let description = match function.get("description") {
-            None => None,
+            None | Some(Value::Null) => None,
             Some(Value::String(value)) => Some(value.clone()),
             Some(_) => {
                 return Err(RequestError::at(
@@ -497,15 +621,18 @@ fn parse_tools(values: &[Value], dialect: ToolDialect) -> Result<Vec<ChatTool>, 
             }
         };
         let parameters_path = format!("{function_path}.parameters");
-        let parameters = function
-            .get("parameters")
-            .filter(|value| value.is_object())
-            .cloned()
-            .ok_or_else(|| {
-                RequestError::at("tool parameters must be an object", parameters_path)
-            })?;
+        let parameters = match function.get("parameters") {
+            None | Some(Value::Null) => Value::Object(Map::new()),
+            Some(value) if value.is_object() => value.clone(),
+            Some(_) => {
+                return Err(RequestError::at(
+                    "tool parameters must be an object",
+                    parameters_path,
+                ));
+            }
+        };
         let strict = match function.get("strict") {
-            None => None,
+            None | Some(Value::Null) => None,
             Some(Value::Bool(value)) => Some(*value),
             Some(_) => {
                 return Err(RequestError::at(
@@ -538,10 +665,28 @@ fn require_function_type(value: Option<&Value>, param: &str) -> Result<(), Reque
 fn parse_tool_choice(value: Option<&Value>) -> Result<ToolChoice, RequestError> {
     match value {
         None => Ok(ToolChoice::Auto),
-        Some(Value::String(value)) if value == "auto" => Ok(ToolChoice::Auto),
+        Some(Value::String(value)) if value == "auto" || value == "required" => {
+            Ok(ToolChoice::Auto)
+        }
         Some(Value::String(value)) if value == "none" => Ok(ToolChoice::None),
+        Some(Value::Object(object))
+            if object
+                .get("name")
+                .or_else(|| object.get("function").and_then(|value| value.get("name")))
+                .or_else(|| object.get("custom").and_then(|value| value.get("name")))
+                .and_then(Value::as_str)
+                .is_some_and(|name| !name.is_empty()) =>
+        {
+            Ok(ToolChoice::Auto)
+        }
+        Some(Value::Object(object))
+            if object.get("type").and_then(Value::as_str) == Some("allowed_tools")
+                && object.get("allowed_tools").is_some_and(Value::is_object) =>
+        {
+            Ok(ToolChoice::Auto)
+        }
         _ => Err(RequestError::at(
-            "tool_choice must be \"auto\" or \"none\"",
+            "tool_choice is not a documented tool selection",
             "tool_choice",
         )),
     }
@@ -550,11 +695,15 @@ fn parse_tool_choice(value: Option<&Value>) -> Result<ToolChoice, RequestError> 
 fn parse_reasoning_effort(value: Option<&str>) -> Result<Option<ReasoningEffort>, RequestError> {
     match value {
         None => Ok(None),
+        Some("none") => Ok(Some(ReasoningEffort::None)),
+        Some("minimal") => Ok(Some(ReasoningEffort::Minimal)),
         Some("low") => Ok(Some(ReasoningEffort::Low)),
         Some("medium") => Ok(Some(ReasoningEffort::Medium)),
+        Some("high") => Ok(Some(ReasoningEffort::High)),
         Some("xhigh") => Ok(Some(ReasoningEffort::XHigh)),
+        Some("max") => Ok(Some(ReasoningEffort::Max)),
         Some(_) => Err(RequestError::at(
-            "reasoning_effort must be \"low\", \"medium\", or \"xhigh\"",
+            "reasoning_effort is not a documented value",
             "reasoning_effort",
         )),
     }
@@ -570,26 +719,29 @@ fn parse_chat_messages(
     let mut messages = Vec::with_capacity(values.len());
     for (index, value) in values.into_iter().enumerate() {
         let base = format!("messages[{index}]");
-        let role = value
+        let message_object = value
             .as_object()
-            .and_then(|object| object.get("role"))
+            .ok_or_else(|| RequestError::at("message must be an object", &base))?;
+        let role = message_object
+            .get("role")
             .and_then(Value::as_str)
             .ok_or_else(|| {
                 RequestError::at("message role must be a string", format!("{base}.role"))
             })?;
-        if role == "system" && index != 0 {
-            return Err(RequestError::at(
-                "system messages are only allowed at index zero",
-                format!("{base}.role"),
-            ));
-        }
-        let message_object = value
-            .as_object()
-            .expect("role lookup already required an object");
         let allowed_fields = match role {
-            "system" | "user" => &["role", "content"][..],
-            "assistant" => &["role", "content", "reasoning_content", "tool_calls"][..],
+            "developer" | "system" | "user" => &["role", "content", "name"][..],
+            "assistant" => &[
+                "role",
+                "audio",
+                "content",
+                "function_call",
+                "name",
+                "reasoning_content",
+                "refusal",
+                "tool_calls",
+            ][..],
             "tool" => &["role", "content", "tool_call_id"][..],
+            "function" => &["role", "content", "name"][..],
             _ => {
                 return Err(RequestError::at(
                     "unsupported message role",
@@ -599,6 +751,7 @@ fn parse_chat_messages(
         };
         reject_unknown_fields(message_object, allowed_fields, &base)?;
         if let Some(reasoning_content) = message_object.get("reasoning_content")
+            && !reasoning_content.is_null()
             && !reasoning_content.is_string()
         {
             return Err(RequestError::at(
@@ -606,73 +759,75 @@ fn parse_chat_messages(
                 format!("{base}.reasoning_content"),
             ));
         }
-        if role != "user" {
-            reject_chat_role_images(message_object.get("content"), &format!("{base}.content"))?;
-        }
         let tool_calls_field_present = message_object.contains_key("tool_calls");
         let wire: ChatWireMessage = serde_json::from_value(value).map_err(|error| {
             RequestError::at(format!("invalid chat message: {error}"), base.clone())
         })?;
         let message = match wire {
-            ChatWireMessage::System { content } => ordinary_message("system", content, &base)?,
-            ChatWireMessage::User { content } => ChatMessage {
-                reasoning_content: None,
+            ChatWireMessage::Developer { content, name } => {
+                ordinary_message("developer", content, name, &base)?
+            }
+            ChatWireMessage::System { content, name } => {
+                ordinary_message("system", content, name, &base)?
+            }
+            ChatWireMessage::User { content, name } => ChatMessage {
                 role: "user".to_string(),
+                name,
                 content: Some(parse_chat_user_content(
                     &content,
                     &format!("{base}.content"),
                     image_params,
                 )?),
+                reasoning_content: None,
                 tool_calls: Vec::new(),
                 tool_call_id: None,
             },
             ChatWireMessage::Assistant {
                 content,
-                tool_calls,
                 reasoning_content,
+                tool_calls,
+                _audio: _,
+                function_call,
+                name,
+                _refusal: refusal,
             } => {
-                let calls_present = tool_calls_field_present;
-                let calls = parse_chat_tool_calls(
+                let mut calls = parse_chat_tool_calls(
                     tool_calls.unwrap_or_default(),
                     index,
                     &declared,
                     &mut history,
                 )?;
-                if calls_present && calls.is_empty() {
+                if tool_calls_field_present && calls.is_empty() {
                     return Err(RequestError::at(
                         "assistant tool_calls must not be empty",
                         format!("{base}.tool_calls"),
                     ));
                 }
-                let content = match content {
-                    Value::Null => None,
-                    Value::String(value) => Some(ChatMessageContent::Text(value)),
-                    _ => {
-                        return Err(RequestError::at(
-                            "assistant content must be a string or null",
-                            format!("{base}.content"),
-                        ));
-                    }
+                if let Some(function_call) = function_call.filter(|value| !value.is_null()) {
+                    calls.push(parse_legacy_function_call(
+                        &function_call,
+                        index,
+                        &declared,
+                    )?);
+                }
+                let content =
+                    parse_assistant_content(content, refusal, &format!("{base}.content"))?;
+                let content_empty = match content.as_ref() {
+                    None => true,
+                    Some(ChatMessageContent::Text(text)) => text.is_empty(),
+                    Some(ChatMessageContent::Parts(parts)) => parts.is_empty(),
                 };
-                if content
-                    .as_ref()
-                    .and_then(|content| match content {
-                        ChatMessageContent::Text(text) => Some(text.as_str()),
-                        ChatMessageContent::Parts(_) => None,
-                    })
-                    .unwrap_or_default()
-                    .is_empty()
-                    && calls.is_empty()
-                {
+                if content_empty && calls.is_empty() {
                     return Err(RequestError::at(
                         "assistant content may be empty only when tool_calls are present",
                         format!("{base}.content"),
                     ));
                 }
                 ChatMessage {
-                    reasoning_content,
                     role: "assistant".to_string(),
+                    name,
                     content,
+                    reasoning_content,
                     tool_calls: calls,
                     tool_call_id: None,
                 }
@@ -681,23 +836,197 @@ fn parse_chat_messages(
                 content,
                 tool_call_id,
             } => {
-                let content = require_nonempty_string_value(&content, &format!("{base}.content"))?;
                 let call_id =
                     require_nonempty_string_value(&tool_call_id, &format!("{base}.tool_call_id"))?;
                 history.resolve(&call_id, format!("{base}.tool_call_id"))?;
                 ChatMessage {
-                    reasoning_content: None,
                     role: "tool".to_string(),
-                    content: Some(ChatMessageContent::Text(content)),
+                    name: None,
+                    content: Some(parse_chat_text_content(
+                        &content,
+                        &format!("{base}.content"),
+                    )?),
+                    reasoning_content: None,
                     tool_calls: Vec::new(),
                     tool_call_id: Some(call_id),
                 }
             }
+            ChatWireMessage::Function { content, name } => ChatMessage {
+                role: "function".to_string(),
+                name: Some(require_nonempty_string_value(
+                    &name,
+                    &format!("{base}.name"),
+                )?),
+                content: match content {
+                    Value::Null => None,
+                    Value::String(content) => Some(ChatMessageContent::Text(content)),
+                    _ => {
+                        return Err(RequestError::at(
+                            "function content must be a string or null",
+                            format!("{base}.content"),
+                        ));
+                    }
+                },
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            },
         };
         messages.push(message);
     }
     history.finish()?;
     Ok(messages)
+}
+
+fn parse_prompt_cache_breakpoint(
+    object: &Map<String, Value>,
+    base: &str,
+) -> Result<Option<ChatPromptCacheBreakpoint>, RequestError> {
+    let Some(value) = object.get("prompt_cache_breakpoint") else {
+        return Ok(None);
+    };
+    let path = format!("{base}.prompt_cache_breakpoint");
+    let breakpoint = value
+        .as_object()
+        .ok_or_else(|| RequestError::at("prompt cache breakpoint must be an object", &path))?;
+    reject_unknown_fields(breakpoint, &["mode"], &path)?;
+    if breakpoint.get("mode").and_then(Value::as_str) != Some("explicit") {
+        return Err(RequestError::at(
+            "prompt cache breakpoint mode must be \"explicit\"",
+            format!("{path}.mode"),
+        ));
+    }
+    Ok(Some(ChatPromptCacheBreakpoint {
+        mode: "explicit".to_string(),
+    }))
+}
+
+fn parse_chat_text_content(
+    content: &Value,
+    base: &str,
+) -> Result<ChatMessageContent, RequestError> {
+    match content {
+        Value::String(text) if !text.is_empty() => Ok(ChatMessageContent::Text(text.clone())),
+        Value::String(_) => Err(RequestError::at("message content must not be empty", base)),
+        Value::Array(parts) if !parts.is_empty() => {
+            let mut normalized = Vec::with_capacity(parts.len());
+            for (index, part) in parts.iter().enumerate() {
+                let part_base = format!("{base}[{index}]");
+                let object = part.as_object().ok_or_else(|| {
+                    RequestError::at("content part must be an object", &part_base)
+                })?;
+                reject_unknown_fields(
+                    object,
+                    &["type", "text", "prompt_cache_breakpoint"],
+                    &part_base,
+                )?;
+                if object.get("type").and_then(Value::as_str) != Some("text") {
+                    return Err(RequestError::at(
+                        "only text content parts are allowed for this role",
+                        format!("{part_base}.type"),
+                    ));
+                }
+                let text =
+                    require_nonempty_string(object.get("text"), &format!("{part_base}.text"))?;
+                normalized.push(ChatContentPart::Text {
+                    text: text.to_string(),
+                    prompt_cache_breakpoint: parse_prompt_cache_breakpoint(object, &part_base)?,
+                });
+            }
+            Ok(ChatMessageContent::Parts(normalized))
+        }
+        Value::Array(_) => Err(RequestError::at("content parts must not be empty", base)),
+        _ => Err(RequestError::at(
+            "message content must be a string or an array of text parts",
+            base,
+        )),
+    }
+}
+
+fn parse_assistant_content(
+    content: Value,
+    refusal: Option<String>,
+    base: &str,
+) -> Result<Option<ChatMessageContent>, RequestError> {
+    let mut content = match content {
+        Value::Null => None,
+        Value::String(value) => Some(ChatMessageContent::Text(value)),
+        Value::Array(parts) if !parts.is_empty() => {
+            let mut normalized = Vec::with_capacity(parts.len());
+            for (index, part) in parts.iter().enumerate() {
+                let part_base = format!("{base}[{index}]");
+                let object = part.as_object().ok_or_else(|| {
+                    RequestError::at("assistant content part must be an object", &part_base)
+                })?;
+                match object.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        reject_unknown_fields(
+                            object,
+                            &["type", "text", "prompt_cache_breakpoint"],
+                            &part_base,
+                        )?;
+                        normalized.push(ChatContentPart::Text {
+                            text: require_nonempty_string(
+                                object.get("text"),
+                                &format!("{part_base}.text"),
+                            )?
+                            .to_string(),
+                            prompt_cache_breakpoint: parse_prompt_cache_breakpoint(
+                                object, &part_base,
+                            )?,
+                        });
+                    }
+                    Some("refusal") => {
+                        reject_unknown_fields(object, &["type", "refusal"], &part_base)?;
+                        normalized.push(ChatContentPart::Refusal {
+                            refusal: require_nonempty_string(
+                                object.get("refusal"),
+                                &format!("{part_base}.refusal"),
+                            )?
+                            .to_string(),
+                        });
+                    }
+                    _ => {
+                        return Err(RequestError::at(
+                            "unsupported assistant content part type",
+                            format!("{part_base}.type"),
+                        ));
+                    }
+                }
+            }
+            Some(ChatMessageContent::Parts(normalized))
+        }
+        Value::Array(_) => {
+            return Err(RequestError::at(
+                "assistant content parts must not be empty",
+                base,
+            ));
+        }
+        _ => {
+            return Err(RequestError::at(
+                "assistant content must be a string, array, or null",
+                base,
+            ));
+        }
+    };
+    if let Some(refusal) = refusal {
+        let refusal = ChatContentPart::Refusal { refusal };
+        content = Some(match content {
+            None => ChatMessageContent::Parts(vec![refusal]),
+            Some(ChatMessageContent::Text(text)) => ChatMessageContent::Parts(vec![
+                ChatContentPart::Text {
+                    text,
+                    prompt_cache_breakpoint: None,
+                },
+                refusal,
+            ]),
+            Some(ChatMessageContent::Parts(mut parts)) => {
+                parts.push(refusal);
+                ChatMessageContent::Parts(parts)
+            }
+        });
+    }
+    Ok(content)
 }
 
 fn parse_chat_user_content(
@@ -708,13 +1037,7 @@ fn parse_chat_user_content(
     match content {
         Value::String(text) if !text.is_empty() => Ok(ChatMessageContent::Text(text.clone())),
         Value::String(_) => Err(RequestError::at("user content must not be empty", base)),
-        Value::Array(parts) => {
-            if parts.is_empty() {
-                return Err(RequestError::at(
-                    "user content parts must not be empty",
-                    base,
-                ));
-            }
+        Value::Array(parts) if !parts.is_empty() => {
             let mut normalized = Vec::with_capacity(parts.len());
             for (index, part) in parts.iter().enumerate() {
                 let part_base = format!("{base}[{index}]");
@@ -723,19 +1046,29 @@ fn parse_chat_user_content(
                 })?;
                 let part_type =
                     require_nonempty_string(object.get("type"), &format!("{part_base}.type"))?;
+                let prompt_cache_breakpoint = parse_prompt_cache_breakpoint(object, &part_base)?;
                 match part_type {
                     "text" => {
-                        reject_unknown_fields(object, &["type", "text"], &part_base)?;
+                        reject_unknown_fields(
+                            object,
+                            &["type", "text", "prompt_cache_breakpoint"],
+                            &part_base,
+                        )?;
                         let text = require_nonempty_string(
                             object.get("text"),
                             &format!("{part_base}.text"),
                         )?;
                         normalized.push(ChatContentPart::Text {
                             text: text.to_string(),
+                            prompt_cache_breakpoint,
                         });
                     }
                     "image_url" => {
-                        reject_unknown_fields(object, &["type", "image_url"], &part_base)?;
+                        reject_unknown_fields(
+                            object,
+                            &["type", "image_url", "prompt_cache_breakpoint"],
+                            &part_base,
+                        )?;
                         let image_base = format!("{part_base}.image_url");
                         let image = object
                             .get("image_url")
@@ -747,14 +1080,17 @@ fn parse_chat_user_content(
                         let url_path = format!("{image_base}.url");
                         let url = require_nonempty_string(image.get("url"), &url_path)?;
                         validate_data_image_uri(url, &url_path)?;
-                        let detail_path = format!("{image_base}.detail");
                         let detail = match image.get("detail") {
                             None => "auto",
-                            Some(Value::String(detail)) if detail == "auto" => "auto",
+                            Some(Value::String(detail))
+                                if matches!(detail.as_str(), "auto" | "low" | "high") =>
+                            {
+                                detail
+                            }
                             _ => {
                                 return Err(RequestError::at(
-                                    "image detail must be \"auto\"",
-                                    detail_path,
+                                    "image detail must be \"auto\", \"low\", or \"high\"",
+                                    format!("{image_base}.detail"),
                                 ));
                             }
                         };
@@ -764,6 +1100,82 @@ fn parse_chat_user_content(
                                 url: url.to_string(),
                                 detail: detail.to_string(),
                             },
+                            prompt_cache_breakpoint,
+                        });
+                    }
+                    "input_audio" => {
+                        reject_unknown_fields(
+                            object,
+                            &["type", "input_audio", "prompt_cache_breakpoint"],
+                            &part_base,
+                        )?;
+                        let audio_path = format!("{part_base}.input_audio");
+                        let audio = object
+                            .get("input_audio")
+                            .and_then(Value::as_object)
+                            .ok_or_else(|| {
+                                RequestError::at("input_audio must be an object", &audio_path)
+                            })?;
+                        reject_unknown_fields(audio, &["data", "format"], &audio_path)?;
+                        let data = require_nonempty_string(
+                            audio.get("data"),
+                            &format!("{audio_path}.data"),
+                        )?;
+                        let format = match audio.get("format").and_then(Value::as_str) {
+                            Some(format @ ("wav" | "mp3")) => format,
+                            _ => {
+                                return Err(RequestError::at(
+                                    "input audio format must be \"wav\" or \"mp3\"",
+                                    format!("{audio_path}.format"),
+                                ));
+                            }
+                        };
+                        normalized.push(ChatContentPart::InputAudio {
+                            input_audio: ChatInputAudio {
+                                data: data.to_string(),
+                                format: format.to_string(),
+                            },
+                            prompt_cache_breakpoint,
+                        });
+                    }
+                    "file" => {
+                        reject_unknown_fields(
+                            object,
+                            &["type", "file", "prompt_cache_breakpoint"],
+                            &part_base,
+                        )?;
+                        let file_path = format!("{part_base}.file");
+                        let file =
+                            object
+                                .get("file")
+                                .and_then(Value::as_object)
+                                .ok_or_else(|| {
+                                    RequestError::at("file must be an object", &file_path)
+                                })?;
+                        reject_unknown_fields(
+                            file,
+                            &["file_data", "file_id", "filename"],
+                            &file_path,
+                        )?;
+                        let string_field = |field: &str| -> Result<Option<String>, RequestError> {
+                            match file.get(field) {
+                                None | Some(Value::Null) => Ok(None),
+                                Some(Value::String(value)) => Ok(Some(value.clone())),
+                                Some(_) => Err(RequestError::at(
+                                    format!("{field} must be a string"),
+                                    format!("{file_path}.{field}"),
+                                )),
+                            }
+                        };
+                        let file_data = string_field("file_data")?;
+                        let file_id = string_field("file_id")?;
+                        normalized.push(ChatContentPart::File {
+                            file: ChatFile {
+                                file_data,
+                                file_id,
+                                filename: string_field("filename")?,
+                            },
+                            prompt_cache_breakpoint,
                         });
                     }
                     _ => {
@@ -776,11 +1188,49 @@ fn parse_chat_user_content(
             }
             Ok(ChatMessageContent::Parts(normalized))
         }
+        Value::Array(_) => Err(RequestError::at(
+            "user content parts must not be empty",
+            base,
+        )),
         _ => Err(RequestError::at(
             "user content must be a string or an array of content parts",
             base,
         )),
     }
+}
+
+fn parse_legacy_function_call(
+    value: &Value,
+    message_index: usize,
+    declared: &HashSet<&str>,
+) -> Result<ChatToolCall, RequestError> {
+    let base = format!("messages[{message_index}].function_call");
+    let function = value
+        .as_object()
+        .ok_or_else(|| RequestError::at("function_call must be an object", &base))?;
+    reject_unknown_fields(function, &["name", "arguments"], &base)?;
+    let name = require_nonempty_string(function.get("name"), &format!("{base}.name"))?.to_string();
+    if !declared.is_empty() {
+        require_declared(&name, declared, &format!("{base}.name"))?;
+    }
+    let arguments_path = format!("{base}.arguments");
+    let arguments_text = require_nonempty_string(function.get("arguments"), &arguments_path)?;
+    let arguments: Value = serde_json::from_str(arguments_text).map_err(|_| {
+        RequestError::at(
+            "function call arguments must be valid JSON",
+            &arguments_path,
+        )
+    })?;
+    if !arguments.is_object() {
+        return Err(RequestError::at(
+            "function call arguments must decode to an object",
+            arguments_path,
+        ));
+    }
+    Ok(ChatToolCall::Function {
+        id: format!("legacy_call_{message_index}"),
+        function: ChatToolCallFunction { name, arguments },
+    })
 }
 
 fn parse_chat_tool_calls(
@@ -795,37 +1245,77 @@ fn parse_chat_tool_calls(
         let object = value
             .as_object()
             .ok_or_else(|| RequestError::at("tool call must be an object", &base))?;
-        reject_unknown_fields(object, &["id", "type", "function"], &base)?;
         let id = require_nonempty_string(object.get("id"), &format!("{base}.id"))?.to_string();
-        require_function_type(object.get("type"), &format!("{base}.type"))?;
-        let function_path = format!("{base}.function");
-        let function = object
-            .get("function")
-            .and_then(Value::as_object)
-            .ok_or_else(|| {
-                RequestError::at("tool call function must be an object", &function_path)
-            })?;
-        reject_unknown_fields(function, &["name", "arguments"], &function_path)?;
-        let name_path = format!("{function_path}.name");
-        let name = require_nonempty_string(function.get("name"), &name_path)?.to_string();
-        require_declared(&name, declared, &name_path)?;
-        let arguments_path = format!("{function_path}.arguments");
-        let arguments_text = require_nonempty_string(function.get("arguments"), &arguments_path)?;
-        let arguments: Value = serde_json::from_str(arguments_text).map_err(|_| {
-            RequestError::at("tool call arguments must be valid JSON", &arguments_path)
-        })?;
-        if !arguments.is_object() {
-            return Err(RequestError::at(
-                "tool call arguments must decode to an object",
-                arguments_path,
-            ));
-        }
+        let call = match object.get("type").and_then(Value::as_str) {
+            Some("function") => {
+                reject_unknown_fields(object, &["id", "type", "function"], &base)?;
+                let function_path = format!("{base}.function");
+                let function = object
+                    .get("function")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| {
+                        RequestError::at("tool call function must be an object", &function_path)
+                    })?;
+                reject_unknown_fields(function, &["name", "arguments"], &function_path)?;
+                let name_path = format!("{function_path}.name");
+                let name = require_nonempty_string(function.get("name"), &name_path)?.to_string();
+                require_declared(&name, declared, &name_path)?;
+                let arguments_path = format!("{function_path}.arguments");
+                let arguments_text =
+                    require_nonempty_string(function.get("arguments"), &arguments_path)?;
+                let arguments: Value = serde_json::from_str(arguments_text).map_err(|_| {
+                    RequestError::at("tool call arguments must be valid JSON", &arguments_path)
+                })?;
+                if !arguments.is_object() {
+                    return Err(RequestError::at(
+                        "tool call arguments must decode to an object",
+                        arguments_path,
+                    ));
+                }
+                ChatToolCall::Function {
+                    id: id.clone(),
+                    function: ChatToolCallFunction { name, arguments },
+                }
+            }
+            Some("custom") => {
+                reject_unknown_fields(object, &["id", "type", "custom"], &base)?;
+                let custom_path = format!("{base}.custom");
+                let custom = object
+                    .get("custom")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| {
+                        RequestError::at("custom tool call must be an object", &custom_path)
+                    })?;
+                reject_unknown_fields(custom, &["name", "input"], &custom_path)?;
+                ChatToolCall::Custom {
+                    id: id.clone(),
+                    custom: ChatCustomToolCall {
+                        name: require_nonempty_string(
+                            custom.get("name"),
+                            &format!("{custom_path}.name"),
+                        )?
+                        .to_string(),
+                        input: require_string_value(
+                            custom.get("input").ok_or_else(|| {
+                                RequestError::at(
+                                    "custom tool input is required",
+                                    format!("{custom_path}.input"),
+                                )
+                            })?,
+                            &format!("{custom_path}.input"),
+                        )?,
+                    },
+                }
+            }
+            _ => {
+                return Err(RequestError::at(
+                    "tool call type must be \"function\" or \"custom\"",
+                    format!("{base}.type"),
+                ));
+            }
+        };
         history.add(&id, format!("{base}.id"))?;
-        calls.push(ChatToolCall {
-            id,
-            tool_type: "function".to_string(),
-            function: ChatToolCallFunction { name, arguments },
-        });
+        calls.push(call);
     }
     Ok(calls)
 }
@@ -885,12 +1375,12 @@ fn parse_responses_items(
                 }
                 history.add(&call_id, format!("{base}.call_id"))?;
                 messages.push(ChatMessage {
-                    reasoning_content: None,
                     role: "assistant".to_string(),
+                    name: None,
                     content: None,
-                    tool_calls: vec![ChatToolCall {
+                    reasoning_content: None,
+                    tool_calls: vec![ChatToolCall::Function {
                         id: call_id.clone(),
-                        tool_type: "function".to_string(),
                         function: ChatToolCallFunction { name, arguments },
                     }],
                     tool_call_id: None,
@@ -907,9 +1397,10 @@ fn parse_responses_items(
                 let output = require_string_value(&wire.output, &format!("{base}.output"))?;
                 history.resolve(&call_id, format!("{base}.call_id"))?;
                 messages.push(ChatMessage {
-                    reasoning_content: None,
                     role: "tool".to_string(),
+                    name: None,
                     content: Some(ChatMessageContent::Text(output)),
+                    reasoning_content: None,
                     tool_calls: Vec::new(),
                     tool_call_id: Some(call_id),
                 });
@@ -959,9 +1450,10 @@ fn parse_responses_items(
                     ChatMessageContent::Text(text)
                 };
                 messages.push(ChatMessage {
-                    reasoning_content: None,
                     role: wire.role,
+                    name: None,
                     content: Some(content),
+                    reasoning_content: None,
                     tool_calls: Vec::new(),
                     tool_call_id: None,
                 });
@@ -1004,6 +1496,7 @@ fn parse_responses_user_content(
                         )?;
                         normalized.push(ChatContentPart::Text {
                             text: text.to_string(),
+                            prompt_cache_breakpoint: None,
                         });
                     }
                     "input_image" => {
@@ -1018,10 +1511,14 @@ fn parse_responses_user_content(
                         let detail_path = format!("{part_base}.detail");
                         let detail = match object.get("detail") {
                             None => "auto",
-                            Some(Value::String(detail)) if detail == "auto" => "auto",
+                            Some(Value::String(detail))
+                                if matches!(detail.as_str(), "auto" | "low" | "high") =>
+                            {
+                                detail
+                            }
                             _ => {
                                 return Err(RequestError::at(
-                                    "image detail must be \"auto\"",
+                                    "image detail must be \"auto\", \"low\", or \"high\"",
                                     detail_path,
                                 ));
                             }
@@ -1032,6 +1529,7 @@ fn parse_responses_user_content(
                                 url: url.to_string(),
                                 detail: detail.to_string(),
                             },
+                            prompt_cache_breakpoint: None,
                         });
                     }
                     _ => {
@@ -1085,31 +1583,20 @@ fn record_image_param(image_params: &mut Vec<String>, param: &str) -> Result<(),
     Ok(())
 }
 
-fn reject_chat_role_images(content: Option<&Value>, base: &str) -> Result<(), RequestError> {
-    let Some(Value::Array(parts)) = content else {
-        return Ok(());
-    };
-    if let Some((index, _)) = parts
-        .iter()
-        .enumerate()
-        .find(|(_, part)| part.get("type").and_then(Value::as_str) == Some("image_url"))
-    {
-        return Err(RequestError::at(
-            "image inputs are only allowed on user messages",
-            format!("{base}[{index}].image_url.url"),
-        ));
-    }
-    Ok(())
-}
-
-fn ordinary_message(role: &str, content: Value, base: &str) -> Result<ChatMessage, RequestError> {
+fn ordinary_message(
+    role: &str,
+    content: Value,
+    name: Option<String>,
+    base: &str,
+) -> Result<ChatMessage, RequestError> {
     Ok(ChatMessage {
-        reasoning_content: None,
         role: role.to_string(),
-        content: Some(ChatMessageContent::Text(require_nonempty_string_value(
+        name,
+        content: Some(parse_chat_text_content(
             &content,
             &format!("{base}.content"),
-        )?)),
+        )?),
+        reasoning_content: None,
         tool_calls: Vec::new(),
         tool_call_id: None,
     })
@@ -1219,15 +1706,6 @@ fn reject_present(
         Err(RequestError::at(message, field))
     } else {
         Ok(())
-    }
-}
-
-fn stop_is_nonempty(stop: &Value) -> bool {
-    match stop {
-        Value::Null => false,
-        Value::String(value) => !value.is_empty(),
-        Value::Array(values) => !values.is_empty(),
-        _ => true,
     }
 }
 

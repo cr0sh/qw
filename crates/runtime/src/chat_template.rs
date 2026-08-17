@@ -23,6 +23,8 @@ use std::path::Path;
 pub struct ChatMessage {
     pub role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<ChatMessageContent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_content: Option<String>,
@@ -42,14 +44,56 @@ pub enum ChatMessageContent {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ChatContentPart {
-    Text { text: String },
-    ImageUrl { image_url: ChatImageUrl },
+    Text {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prompt_cache_breakpoint: Option<ChatPromptCacheBreakpoint>,
+    },
+    ImageUrl {
+        image_url: ChatImageUrl,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prompt_cache_breakpoint: Option<ChatPromptCacheBreakpoint>,
+    },
+    InputAudio {
+        input_audio: ChatInputAudio,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prompt_cache_breakpoint: Option<ChatPromptCacheBreakpoint>,
+    },
+    File {
+        file: ChatFile,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prompt_cache_breakpoint: Option<ChatPromptCacheBreakpoint>,
+    },
+    Refusal {
+        refusal: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ChatPromptCacheBreakpoint {
+    pub mode: String,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ChatImageUrl {
     pub url: String,
     pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ChatInputAudio {
+    pub data: String,
+    pub format: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ChatFile {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_data: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,8 +120,11 @@ impl ChatMessage {
             .into_iter()
             .flatten()
             .filter_map(|part| match part {
-                ChatContentPart::Text { .. } => None,
-                ChatContentPart::ImageUrl { image_url } => Some(image_url),
+                ChatContentPart::ImageUrl { image_url, .. } => Some(image_url),
+                ChatContentPart::Text { .. }
+                | ChatContentPart::InputAudio { .. }
+                | ChatContentPart::File { .. }
+                | ChatContentPart::Refusal { .. } => None,
             })
     }
 
@@ -88,12 +135,14 @@ impl ChatMessage {
             Some(ChatMessageContent::Parts(parts)) => {
                 for part in parts {
                     match part {
-                        ChatContentPart::Text { text } => {
+                        ChatContentPart::Text { text, .. }
+                        | ChatContentPart::Refusal { refusal: text } => {
                             visitor(ChatContentRef::Text(text));
                         }
-                        ChatContentPart::ImageUrl { image_url } => {
+                        ChatContentPart::ImageUrl { image_url, .. } => {
                             visitor(ChatContentRef::Image(image_url));
                         }
+                        ChatContentPart::InputAudio { .. } | ChatContentPart::File { .. } => {}
                     }
                 }
             }
@@ -119,17 +168,28 @@ pub struct ChatToolFunction {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub struct ChatToolCall {
-    pub id: String,
-    #[serde(rename = "type")]
-    pub tool_type: String,
-    pub function: ChatToolCallFunction,
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ChatToolCall {
+    Function {
+        id: String,
+        function: ChatToolCallFunction,
+    },
+    Custom {
+        id: String,
+        custom: ChatCustomToolCall,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ChatToolCallFunction {
     pub name: String,
     pub arguments: JsonValue,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ChatCustomToolCall {
+    pub name: String,
+    pub input: String,
 }
 
 pub(crate) struct ChatTemplateProcessor {
@@ -186,6 +246,7 @@ impl ChatTemplateProcessor {
         self.render_messages(
             &[ChatMessage {
                 role: "user".to_string(),
+                name: None,
                 content: Some(ChatMessageContent::Text(prompt.to_string())),
                 reasoning_content: None,
                 tool_calls: Vec::new(),
@@ -205,15 +266,31 @@ impl ChatTemplateProcessor {
         enable_thinking: bool,
     ) -> Result<String> {
         anyhow::ensure!(!messages.is_empty(), "messages must not be empty");
+        let valid_text_content = |content: &Option<ChatMessageContent>| match content {
+            Some(ChatMessageContent::Text(text)) => !text.is_empty(),
+            Some(ChatMessageContent::Parts(parts)) => {
+                !parts.is_empty()
+                    && parts.iter().all(|part| {
+                        matches!(
+                            part,
+                            ChatContentPart::Text { text, .. }
+                                | ChatContentPart::Refusal { refusal: text }
+                                if !text.is_empty()
+                        )
+                    })
+            }
+            None => false,
+        };
         for (index, message) in messages.iter().enumerate() {
             match message.role.as_str() {
-                "system" => {
+                "system" | "developer" => {
                     anyhow::ensure!(
-                        matches!(&message.content, Some(ChatMessageContent::Text(text)) if !text.is_empty())
+                        valid_text_content(&message.content)
                             && message.reasoning_content.is_none()
                             && message.tool_calls.is_empty()
                             && message.tool_call_id.is_none(),
-                        "message {index} has fields incompatible with role \"system\""
+                        "message {index} has fields incompatible with role {:?}",
+                        message.role
                     );
                 }
                 "user" => {
@@ -222,10 +299,20 @@ impl ChatTemplateProcessor {
                         Some(ChatMessageContent::Parts(parts)) => {
                             !parts.is_empty()
                                 && parts.iter().all(|part| match part {
-                                    ChatContentPart::Text { text } => !text.is_empty(),
-                                    ChatContentPart::ImageUrl { image_url } => {
-                                        !image_url.url.is_empty() && image_url.detail == "auto"
+                                    ChatContentPart::Text { text, .. } => !text.is_empty(),
+                                    ChatContentPart::ImageUrl { image_url, .. } => {
+                                        !image_url.url.is_empty()
+                                            && matches!(
+                                                image_url.detail.as_str(),
+                                                "auto" | "low" | "high"
+                                            )
                                     }
+                                    ChatContentPart::InputAudio { input_audio, .. } => {
+                                        !input_audio.data.is_empty()
+                                            && matches!(input_audio.format.as_str(), "wav" | "mp3")
+                                    }
+                                    ChatContentPart::File { .. } => true,
+                                    ChatContentPart::Refusal { .. } => false,
                                 })
                         }
                         None => false,
@@ -240,26 +327,38 @@ impl ChatTemplateProcessor {
                 }
                 "assistant" => {
                     anyhow::ensure!(
-                        (matches!(&message.content, Some(ChatMessageContent::Text(text)) if !text.is_empty())
-                            || !message.tool_calls.is_empty())
-                            && !matches!(&message.content, Some(ChatMessageContent::Parts(_)))
+                        (valid_text_content(&message.content) || !message.tool_calls.is_empty())
                             && message.tool_call_id.is_none(),
                         "message {index} has fields incompatible with role \"assistant\""
                     );
                     for (call_index, call) in message.tool_calls.iter().enumerate() {
-                        anyhow::ensure!(
-                            call.tool_type == "function" && call.function.arguments.is_object(),
-                            "message {index} tool call {call_index} is invalid"
-                        );
+                        let valid = match call {
+                            ChatToolCall::Function { function, .. } => {
+                                function.arguments.is_object()
+                            }
+                            ChatToolCall::Custom { custom, .. } => !custom.name.is_empty(),
+                        };
+                        anyhow::ensure!(valid, "message {index} tool call {call_index} is invalid");
                     }
                 }
                 "tool" => {
                     anyhow::ensure!(
-                        matches!(&message.content, Some(ChatMessageContent::Text(text)) if !text.is_empty())
+                        valid_text_content(&message.content)
                             && message.reasoning_content.is_none()
                             && message.tool_calls.is_empty()
                             && message.tool_call_id.is_some(),
                         "message {index} has fields incompatible with role \"tool\""
+                    );
+                }
+                "function" => {
+                    anyhow::ensure!(
+                        (message.content.is_none()
+                            || matches!(&message.content, Some(ChatMessageContent::Text(_))))
+                            && message.name.as_ref().is_some_and(|name| !name.is_empty())
+                            && message.reasoning_content.is_none()
+                            && message.tool_calls.is_empty()
+                            && message.tool_call_id.is_none(),
+                        "message {index} has fields incompatible with role \"function\""
                     );
                 }
                 _ => {
@@ -299,7 +398,6 @@ impl ChatTemplateProcessor {
                 && (self.template.contains("vision_start") || self.template.contains("image_pad")))
     }
 }
-
 
 fn extract_token(config: &JsonValue, name: &str) -> String {
     let Some(value) = config.get(name) else {
@@ -439,6 +537,7 @@ assistant:{{ content }}
     fn user(content: &str) -> ChatMessage {
         ChatMessage {
             role: "user".to_string(),
+            name: None,
             content: Some(ChatMessageContent::Text(content.to_string())),
             reasoning_content: None,
             tool_calls: Vec::new(),
@@ -464,11 +563,11 @@ assistant:{{ content }}
             user("weather?"),
             ChatMessage {
                 role: "assistant".to_string(),
+                name: None,
                 content: None,
                 reasoning_content: None,
-                tool_calls: vec![ChatToolCall {
+                tool_calls: vec![ChatToolCall::Function {
                     id: "call_1".to_string(),
-                    tool_type: "function".to_string(),
                     function: ChatToolCallFunction {
                         name: "weather".to_string(),
                         arguments: json!({"city":"Paris","days":2}),
@@ -493,11 +592,11 @@ assistant:{{ content }}
             user("weather?"),
             ChatMessage {
                 role: "assistant".to_string(),
+                name: None,
                 content: None,
                 reasoning_content: None,
-                tool_calls: vec![ChatToolCall {
+                tool_calls: vec![ChatToolCall::Function {
                     id: "call_1".to_string(),
-                    tool_type: "function".to_string(),
                     function: ChatToolCallFunction {
                         name: "weather".to_string(),
                         arguments: json!({}),
@@ -507,6 +606,7 @@ assistant:{{ content }}
             },
             ChatMessage {
                 role: "tool".to_string(),
+                name: None,
                 content: Some(ChatMessageContent::Text("sunny".to_string())),
                 reasoning_content: None,
                 tool_calls: Vec::new(),
@@ -514,6 +614,7 @@ assistant:{{ content }}
             },
             ChatMessage {
                 role: "tool".to_string(),
+                name: None,
                 content: Some(ChatMessageContent::Text("warm".to_string())),
                 reasoning_content: None,
                 tool_calls: Vec::new(),
@@ -552,18 +653,22 @@ assistant:{{ content }}
         };
         let message = ChatMessage {
             role: "user".to_string(),
+            name: None,
             content: Some(ChatMessageContent::Parts(vec![
                 ChatContentPart::Text {
                     text: "before".to_string(),
+                    prompt_cache_breakpoint: None,
                 },
                 ChatContentPart::ImageUrl {
                     image_url: ChatImageUrl {
                         url: "data:image/png;base64,AA==".to_string(),
                         detail: "auto".to_string(),
                     },
+                    prompt_cache_breakpoint: None,
                 },
                 ChatContentPart::Text {
                     text: "after".to_string(),
+                    prompt_cache_breakpoint: None,
                 },
             ])),
             reasoning_content: None,
@@ -589,18 +694,22 @@ assistant:{{ content }}
         };
         let image_message = ChatMessage {
             role: "user".to_string(),
+            name: None,
             content: Some(ChatMessageContent::Parts(vec![
                 ChatContentPart::Text {
                     text: "before".to_string(),
+                    prompt_cache_breakpoint: None,
                 },
                 ChatContentPart::ImageUrl {
                     image_url: ChatImageUrl {
                         url: "data:image/png;base64,AA==".to_string(),
                         detail: "auto".to_string(),
                     },
+                    prompt_cache_breakpoint: None,
                 },
                 ChatContentPart::Text {
                     text: "after".to_string(),
+                    prompt_cache_breakpoint: None,
                 },
             ])),
             reasoning_content: None,
@@ -619,11 +728,11 @@ assistant:{{ content }}
                     image_message,
                     ChatMessage {
                         role: "assistant".to_string(),
+                        name: None,
                         content: None,
                         reasoning_content: None,
-                        tool_calls: vec![ChatToolCall {
+                        tool_calls: vec![ChatToolCall::Function {
                             id: "call_1".to_string(),
-                            tool_type: "function".to_string(),
                             function: ChatToolCallFunction {
                                 name: "weather".to_string(),
                                 arguments: json!({"city":"Paris"}),
@@ -633,6 +742,7 @@ assistant:{{ content }}
                     },
                     ChatMessage {
                         role: "tool".to_string(),
+                        name: None,
                         content: Some(ChatMessageContent::Text("sunny".to_string())),
                         reasoning_content: None,
                         tool_calls: Vec::new(),
@@ -664,6 +774,7 @@ assistant:{{ content }}
         };
         let message = ChatMessage {
             role: "assistant".to_string(),
+            name: None,
             content: Some(ChatMessageContent::Text("final answer".to_string())),
             reasoning_content: Some("private trace".to_string()),
             tool_calls: Vec::new(),

@@ -9,11 +9,13 @@ use mlxcel_core::generate::{
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use tokenizers::Tokenizer;
+use tracing::info;
 
 use crate::chat_template::ChatTemplateProcessor;
 pub use crate::chat_template::{
-    ChatContentPart, ChatContentRef, ChatImageUrl, ChatMessage, ChatMessageContent, ChatTool,
-    ChatToolCall, ChatToolCallFunction, ChatToolFunction,
+    ChatContentPart, ChatContentRef, ChatCustomToolCall, ChatFile, ChatImageUrl, ChatInputAudio,
+    ChatMessage, ChatMessageContent, ChatPromptCacheBreakpoint, ChatTool, ChatToolCall,
+    ChatToolCallFunction, ChatToolFunction,
 };
 use crate::qwen_vl::insert_qwen_vl_image_tokens;
 use crate::qwen_vl_merge::merge_llava;
@@ -166,6 +168,7 @@ struct GenerationDefaults {
 }
 
 impl Qwen35Provider {
+    #[tracing::instrument(name = "runtime.model_load", skip(model_dir), err)]
     pub fn load(model_dir: impl AsRef<Path>) -> Result<Self> {
         initialize_runtime()?;
         let model_dir = model_dir.as_ref();
@@ -231,6 +234,16 @@ impl Qwen35Provider {
         self.mtp_generator.is_some()
     }
 
+    #[tracing::instrument(
+        name = "runtime.render_messages",
+        skip_all,
+        fields(
+            message_count = messages.len(),
+            tool_count = tools.len(),
+            enable_thinking,
+        ),
+        err
+    )]
     pub fn render_messages(
         &self,
         messages: &[ChatMessage],
@@ -242,6 +255,16 @@ impl Qwen35Provider {
             .render_messages(messages, tools, reasoning_effort, enable_thinking)
     }
 
+    #[tracing::instrument(
+        name = "runtime.tokenize_messages",
+        skip_all,
+        fields(
+            message_count = messages.len(),
+            tool_count = tools.len(),
+            enable_thinking,
+        ),
+        err
+    )]
     pub fn tokenize_messages(
         &self,
         messages: &[ChatMessage],
@@ -264,9 +287,19 @@ impl Qwen35Provider {
             !prompt_ids.is_empty(),
             "rendered messages tokenized to an empty sequence"
         );
+        info!(
+            phase = "tokenization.complete",
+            prompt_tokens = prompt_ids.len(),
+        );
         Ok(prompt_ids)
     }
 
+    #[tracing::instrument(
+        name = "runtime.prepare_image",
+        skip(self, rgb),
+        fields(width, height, input_bytes = rgb.len()),
+        err
+    )]
     pub fn prepare_image(&self, width: u32, height: u32, rgb: Vec<u8>) -> Result<PreparedImage> {
         self.vision_processor
             .as_ref()
@@ -274,6 +307,17 @@ impl Qwen35Provider {
             .prepare_rgb_bytes(width, height, rgb)
     }
 
+    #[tracing::instrument(
+        name = "runtime.prepare_multimodal_prefill",
+        skip_all,
+        fields(
+            message_count = messages.len(),
+            tool_count = tools.len(),
+            image_count = images.len(),
+            enable_thinking,
+        ),
+        err
+    )]
     pub fn prepare_multimodal_prefill(
         &self,
         messages: &[ChatMessage],
@@ -346,6 +390,11 @@ impl Qwen35Provider {
             video_token_id,
         )?;
         let position_ids = positions.to_mlx();
+        info!(
+            phase = "multimodal_prefill.complete",
+            prompt_tokens = prompt_ids.len(),
+            image_tokens = expansion.total_image_tokens,
+        );
         Ok(PreparedMultimodalPrefill {
             prompt_ids,
             input_embeddings,
@@ -374,6 +423,17 @@ impl Qwen35Provider {
         }
     }
 
+    #[tracing::instrument(
+        name = "runtime.generate_baseline",
+        skip_all,
+        fields(
+            prompt_tokens = prompt_ids.len(),
+            max_tokens,
+            cached_tokens = prefix_reuse.as_ref().map_or(0, |reuse| reuse.cached_tokens),
+            constrained = constraint.is_some(),
+        ),
+        err
+    )]
     #[allow(clippy::too_many_arguments)]
     pub fn generate_baseline_streaming<F: FnMut(&str) -> bool>(
         &mut self,
@@ -442,6 +502,13 @@ impl Qwen35Provider {
         }
         let text = decoder.emitted;
         let completion_tokens = controlled.token_ids.len();
+        info!(
+            phase = "model.complete",
+            prompt_tokens = prompt_ids.len(),
+            completion_tokens,
+            cached_tokens = controlled.cached_tokens,
+            stop_reason = ?controlled.stop_reason,
+        );
         Ok(BaselineGeneration {
             text,
             token_ids: controlled.token_ids,
@@ -453,6 +520,16 @@ impl Qwen35Provider {
         })
     }
 
+    #[tracing::instrument(
+        name = "runtime.generate_multimodal",
+        skip_all,
+        fields(
+            prompt_tokens = prefill.prompt_ids.len(),
+            max_tokens,
+            constrained = constraint.is_some(),
+        ),
+        err
+    )]
     #[allow(clippy::too_many_arguments)]
     pub fn generate_multimodal_streaming<F: FnMut(&str) -> bool>(
         &mut self,
@@ -517,6 +594,13 @@ impl Qwen35Provider {
             }
         }
         let completion_tokens = controlled.token_ids.len();
+        info!(
+            phase = "model.complete",
+            prompt_tokens = prefill.prompt_ids.len(),
+            completion_tokens,
+            cached_tokens = 0,
+            stop_reason = ?controlled.stop_reason,
+        );
         Ok(BaselineGeneration {
             text: decoder.emitted,
             token_ids: controlled.token_ids,
@@ -567,6 +651,12 @@ impl Qwen35Provider {
         )
         .map(|(generation, _)| generation)
     }
+    #[tracing::instrument(
+        name = "runtime.generate_mtp",
+        skip_all,
+        fields(max_tokens, block_size),
+        err
+    )]
 
     fn generate_mtp_streaming_for_prompt<F: FnMut(&str) -> bool>(
         &mut self,
@@ -675,6 +765,13 @@ impl Qwen35Provider {
             }
         }
         let completion_tokens = generated.token_ids.len();
+        info!(
+            phase = "model.complete",
+            prompt_tokens,
+            completion_tokens,
+            cached_tokens = 0,
+            stop_reason = ?generated.stop_reason,
+        );
         Ok((
             BaselineGeneration {
                 text: decoder.emitted,
@@ -698,6 +795,12 @@ impl Qwen35Provider {
             .map(|(output, _)| output)
     }
 
+    #[tracing::instrument(
+        name = "runtime.generate_streaming",
+        skip_all,
+        fields(max_tokens = request.max_tokens, mode = ?mode),
+        err
+    )]
     #[doc(hidden)]
     pub fn generate_streaming_in_mode<F: FnMut(&str) -> bool>(
         &mut self,
@@ -758,6 +861,12 @@ impl Qwen35Provider {
             }
         }
     }
+    #[tracing::instrument(
+        name = "runtime.prepare_generation",
+        skip_all,
+        fields(max_tokens = request.max_tokens),
+        err
+    )]
 
     fn prepare_generation(
         &self,

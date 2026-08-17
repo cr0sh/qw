@@ -1860,6 +1860,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokenizers",
+ "tracing",
 ]
 
 [[package]]
@@ -1882,6 +1883,7 @@ dependencies = [
  "tokio",
  "toktrie",
  "tower",
+ "tracing",
 ]
 
 [[package]]
