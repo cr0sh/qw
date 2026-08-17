@@ -48,6 +48,8 @@ pub struct MtpGenerationStats {
     pub proposed_draft_tokens: usize,
     /// Wall-clock time spent in the post-prefill MTP decode loop.
     pub decode_time: Duration,
+    pub cache_clear_count: usize,
+    pub cache_clear_time: Duration,
 }
 
 impl MtpGenerationStats {
@@ -57,6 +59,16 @@ impl MtpGenerationStats {
         } else {
             self.accepted_draft_tokens as f64 / self.proposed_draft_tokens as f64 * 100.0
         }
+    }
+
+    fn record_round(&mut self, accepted: usize, proposed: usize) {
+        self.accepted_draft_tokens += accepted;
+        self.proposed_draft_tokens += proposed;
+    }
+
+    fn record_cache_clear(&mut self, elapsed: Duration) {
+        self.cache_clear_count += 1;
+        self.cache_clear_time += elapsed;
     }
 }
 
@@ -516,26 +528,53 @@ fn materialize_detached(array: UniquePtr<MlxArray>) -> UniquePtr<MlxArray> {
 }
 
 fn mtp_round_reaches_cache_clear(previous: usize, emitted: usize, interval: usize) -> bool {
-    interval != 0
-        && (previous.saturating_add(1)..=emitted)
-            .any(|n| mlxcel_core::memory::should_clear_cache_at(n, interval))
+    mlxcel_core::memory::should_clear_cache_crossing(previous, emitted, interval)
 }
 
-// MTP verify changes graph shapes as draft acceptance varies. On Metal, waiting
-// for the general 256-token cadence lets those cached command buffers exceed
-// the live model/KV footprint, so bound this loop independently.
-const MTP_MAX_CACHE_CLEAR_INTERVAL: usize = 16;
+// Variable MTP verify shapes accumulate reusable Metal buffers much faster than
+// ordinary one-token decode. Keep a bounded cache, but retain those buffers
+// until the bound is reached so the common shapes can be reused.
+const MTP_CACHE_WATERMARK_BYTES: u64 = 3 * 256 * 1024 * 1024;
 
-fn bound_mtp_cache_clear_interval(configured: usize) -> usize {
-    if configured == 0 {
-        0
-    } else {
-        configured.min(MTP_MAX_CACHE_CLEAR_INTERVAL)
+fn mtp_cache_should_clear(
+    previous: usize,
+    emitted: usize,
+    configured_interval: usize,
+    cache_bytes: u64,
+    cache_watermark_bytes: u64,
+) -> bool {
+    cache_bytes >= cache_watermark_bytes
+        || mtp_round_reaches_cache_clear(previous, emitted, configured_interval)
+}
+
+fn clear_mtp_cache_if_needed(previous: usize, emitted: usize) -> Option<Duration> {
+    let memory = mlxcel_core::memory::snapshot();
+    if !mtp_cache_should_clear(
+        previous,
+        emitted,
+        mlxcel_core::memory::cache_clear_interval(),
+        memory.cache_bytes,
+        MTP_CACHE_WATERMARK_BYTES,
+    ) {
+        return None;
     }
-}
-
-fn mtp_cache_clear_interval() -> usize {
-    bound_mtp_cache_clear_interval(mlxcel_core::memory::cache_clear_interval())
+    if emitted <= 64 {
+        info!(
+            phase = "mtp.decode.cache_clear.before",
+            tokens = emitted,
+            active_bytes = memory.active_bytes,
+            cache_bytes = memory.cache_bytes,
+            peak_bytes = memory.peak_bytes,
+            limit_bytes = memory.limit_bytes,
+        );
+    }
+    let started = Instant::now();
+    mlxcel_core::clear_memory_cache();
+    let elapsed = started.elapsed();
+    if emitted <= 64 {
+        log_mtp_memory("mtp.decode.cache_clear.after", emitted);
+    }
+    Some(elapsed)
 }
 
 fn log_mtp_memory(phase: &'static str, tokens: usize) {
@@ -1534,8 +1573,7 @@ impl Qwen35MtpGenerator {
                         remaining,
                     )
                 };
-                mtp_stats.accepted_draft_tokens += walk.accepted;
-                mtp_stats.proposed_draft_tokens += draft_tokens.len();
+                mtp_stats.record_round(walk.accepted, draft_tokens.len());
 
                 let round_stop_reason = emit_walk_tokens(
                     &walk.new_tokens,
@@ -1576,18 +1614,10 @@ impl Qwen35MtpGenerator {
                     .last()
                     .expect("speculative walk emits at least one token");
                 drafter.materialize_state();
-                if mtp_round_reaches_cache_clear(
-                    emitted_before,
-                    generated.len(),
-                    mtp_cache_clear_interval(),
-                ) {
-                    if generated.len() <= 64 {
-                        log_mtp_memory("mtp.decode.cache_clear.before", generated.len());
-                    }
-                    mlxcel_core::clear_memory_cache();
-                    if generated.len() <= 64 {
-                        log_mtp_memory("mtp.decode.cache_clear.after", generated.len());
-                    }
+                if let Some(elapsed) =
+                    clear_mtp_cache_if_needed(emitted_before, generated.len())
+                {
+                    mtp_stats.record_cache_clear(elapsed);
                 }
                 if round_stop_reason.is_some() {
                     break;
@@ -1788,8 +1818,7 @@ impl Qwen35MtpGenerator {
                     )
                 }
             })?;
-            stats.accepted_draft_tokens += walk.accepted;
-            stats.proposed_draft_tokens += draft_tokens.len();
+            stats.record_round(walk.accepted, draft_tokens.len());
             generated = walk.output;
 
             let mut callback_cancelled = false;
@@ -1846,18 +1875,8 @@ impl Qwen35MtpGenerator {
             }
             drafter.materialize_state();
             model.materialize_mtp_cache_state();
-            if mtp_round_reaches_cache_clear(
-                emitted_before,
-                generated.len(),
-                mtp_cache_clear_interval(),
-            ) {
-                if generated.len() <= 64 {
-                    log_mtp_memory("mtp.decode.cache_clear.before", generated.len());
-                }
-                mlxcel_core::clear_memory_cache();
-                if generated.len() <= 64 {
-                    log_mtp_memory("mtp.decode.cache_clear.after", generated.len());
-                }
+            if let Some(elapsed) = clear_mtp_cache_if_needed(emitted_before, generated.len()) {
+                stats.record_cache_clear(elapsed);
             }
 
             if callback_cancelled {
@@ -2043,6 +2062,7 @@ mod tests {
                 accepted_draft_tokens: 1,
                 proposed_draft_tokens: 4,
                 decode_time: Duration::ZERO,
+                ..MtpGenerationStats::default()
             }
             .acceptance_percentage(),
             25.0
@@ -2414,12 +2434,119 @@ mod tests {
         assert!(!mtp_round_reaches_cache_clear(0, usize::MAX, 0));
     }
 
+    const fn tensor_bytes(elements: u64, bits_per_element: u64) -> u64 {
+        elements.saturating_mul(bits_per_element).div_ceil(8)
+    }
+
+    const fn shaped_tensor_bytes(shape: &[u64], bits_per_element: u64) -> u64 {
+        let mut elements = 1u64;
+        let mut index = 0;
+        while index < shape.len() {
+            elements = elements.saturating_mul(shape[index]);
+            index += 1;
+        }
+        tensor_bytes(elements, bits_per_element)
+    }
+
     #[test]
-    fn mtp_cache_clear_interval_bounds_metal_allocator_growth() {
-        assert_eq!(bound_mtp_cache_clear_interval(0), 0);
-        assert_eq!(bound_mtp_cache_clear_interval(8), 8);
-        assert_eq!(bound_mtp_cache_clear_interval(16), 16);
-        assert_eq!(bound_mtp_cache_clear_interval(256), 16);
+    fn theoretical_tensor_bytes_cover_packed_model_cache_and_transient_geometry() {
+        let packed_model = shaped_tensor_bytes(&[4, 64, 32], 4);
+        let kv_cache = 2 * shaped_tensor_bytes(&[4, 2, 128, 16], 4);
+        let verify_transient = shaped_tensor_bytes(&[1, 3, 64], 16)
+            + shaped_tensor_bytes(&[1, 3, 96], 16);
+
+        assert_eq!(packed_model, 4_096);
+        assert_eq!(kv_cache, 16_384);
+        assert_eq!(verify_transient, 960);
+        assert_eq!(packed_model + kv_cache + verify_transient, 21_440);
+    }
+
+    #[test]
+    fn watermark_bounds_variable_shape_cache_before_256_token_cadence() {
+        let persistent = shaped_tensor_bytes(&[8, 64, 64], 4);
+        let bounded_transient = shaped_tensor_bytes(&[1, 3, 64], 16);
+        let cache_per_round = shaped_tensor_bytes(&[2, 3, 64], 16);
+        let cache_watermark = 4 * cache_per_round;
+        let total_budget = persistent + bounded_transient + cache_watermark;
+
+        let cache_at_256_cadence = 86 * cache_per_round;
+        assert!(
+            persistent + bounded_transient + cache_at_256_cadence > total_budget,
+            "a cadence-only 256-token policy must exceed this geometry's budget"
+        );
+
+        let mut cached = 0;
+        let mut maximum_used = persistent + bounded_transient;
+        let mut previous = 0;
+        for round in 1..=86 {
+            cached += cache_per_round;
+            let emitted = round * 3;
+            maximum_used = maximum_used.max(persistent + bounded_transient + cached);
+            if mtp_cache_should_clear(previous, emitted, 256, cached, cache_watermark) {
+                cached = 0;
+            }
+            previous = emitted;
+        }
+        assert_eq!(
+            maximum_used,
+            persistent + bounded_transient + cache_watermark
+        );
+        assert!(maximum_used <= total_budget);
+    }
+
+
+    #[test]
+    fn mtp_round_stats_record_proposals_and_accepted_tokens() {
+        let mut stats = MtpGenerationStats::default();
+        stats.record_round(2, 2);
+        stats.record_round(1, 2);
+        assert_eq!(stats.proposed_draft_tokens, 4);
+        assert_eq!(stats.accepted_draft_tokens, 3);
+        assert_eq!(stats.acceptance_percentage(), 75.0);
+        stats.record_cache_clear(Duration::from_millis(3));
+        assert_eq!(stats.cache_clear_count, 1);
+        assert_eq!(stats.cache_clear_time, Duration::from_millis(3));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_variable_shape_cycles_obey_a_computed_cache_watermark() {
+        mlxcel_core::clear_memory_cache();
+        let baseline = mlxcel_core::memory::snapshot().active_bytes;
+        let transient_bytes = shaped_tensor_bytes(&[1, 16, 64], 32);
+        let cache_watermark = 4 * transient_bytes;
+        let mut clears = 0;
+
+        for round in 1..=32 {
+            let width = 16 + (round % 4) * 16;
+            let temporary = mlxcel_core::zeros(
+                &[1, width as i32, 64],
+                mlxcel_core::dtype::FLOAT32,
+            );
+            mlxcel_core::eval(&temporary);
+            drop(temporary);
+            let memory = mlxcel_core::memory::snapshot();
+            if mtp_cache_should_clear(
+                (round - 1) * 3,
+                round * 3,
+                256,
+                memory.cache_bytes,
+                cache_watermark,
+            ) {
+                mlxcel_core::clear_memory_cache();
+                clears += 1;
+            }
+        }
+
+        let final_memory = mlxcel_core::memory::snapshot();
+        assert!(clears > 0, "variable Metal shapes must exercise the watermark");
+        assert!(
+            final_memory.used_bytes() <= baseline + transient_bytes + cache_watermark,
+            "final allocator bytes {} exceeded computed bound {}",
+            final_memory.used_bytes(),
+            baseline + transient_bytes + cache_watermark,
+        );
+        mlxcel_core::clear_memory_cache();
     }
 
     #[test]
