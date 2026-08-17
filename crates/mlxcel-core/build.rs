@@ -18,7 +18,7 @@
 use cmake::Config;
 use std::{env, path::PathBuf};
 
-// Resolve and verify the MLX submodule commit used by the CMake build.
+// Single-source-of-truth resolution and verification of the pinned MLX commit.
 // Shared by path (not by dependency) with `mlxcel-mlx-pin`, which unit-tests it
 // without dragging in an MLX build; see that crate's manifest for the reason.
 #[path = "build_support/mlx_pin.rs"]
@@ -28,21 +28,28 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
 
-    // The MLX pin is the checked-out submodule commit. Resolve it once before
-    // the _deps purge decision, the MLXCEL_MLX_COMMIT export, the post-build
-    // submodule verification, and the cache marker write.
+    // The pinned MLX commit has exactly one home: GIT_TAG in
+    // ../mlx-cpp/CMakeLists.txt, which is what CMake actually fetches. Resolve
+    // it once, here, before anything compares against it. Everything below
+    // (the _deps/ purge decision, the MLXCEL_MLX_COMMIT export, the post-build
+    // HEAD verification and the cache marker) consumes this one value, so they
+    // cannot disagree with each other or with the tag that was fetched (#1047).
     let mlx_commit = match mlx_pin::read_pinned_commit(&manifest_dir) {
         Ok(commit) => commit,
         Err(err) => panic!("mlxcel-core: {err}"),
     };
 
-    // Expose the MLX commit to the crate so the runtime can scope the
+    // Expose the pinned MLX commit to the crate so the runtime can scope the
     // persistent CUDA PTX cache directory by it (see ensure_persistent_ptx_cache).
     println!("cargo:rustc-env=MLXCEL_MLX_COMMIT={mlx_commit}");
 
     // Build MLX using cmake
     let mlx_dst = build_mlx(&mlx_commit);
-    verify_mlx_submodule_head(&manifest_dir, &mlx_commit);
+    // Verify what actually landed on disk before blessing it. CMake reuses an
+    // already-populated _deps/mlx-src rather than re-running FetchContent, so a
+    // checkout restored from a CI cache or seeded by hand can disagree with the
+    // pin without anything upstream of here noticing.
+    verify_fetched_mlx_head(&out_dir, &mlx_commit);
     mark_mlx_cache_valid(&out_dir, &mlx_commit);
     let mlx_include = mlx_dst.join("build/include");
     let mlx_lib = mlx_dst.join("build/lib");
@@ -228,18 +235,21 @@ fn main() {
     println!("cargo:rerun-if-env-changed=MLXCEL_BUILD_METAL");
     println!("cargo:rerun-if-env-changed=MLXCEL_BUILD_ACCELERATE");
     println!("cargo:rerun-if-env-changed=MLXCEL_CXX_MARCH");
-    println!("cargo:rerun-if-changed=../../mlx");
 }
 
 /// Purge stale cached MLX build artifacts before CMake runs.
 ///
-/// CI caches may restore `_deps/` from a previous build. Even when the MLX
-/// submodule is correct, stale CMake build artifacts can cause compilation to
-/// succeed using outdated object files because make skips recompilation when
-/// timestamps look current.
+/// CI caches may restore `_deps/` from a previous build. Even when the git
+/// source checkout is correct, stale CMake build artifacts (object files in
+/// `_deps/mlx-build/`) can cause compilation to succeed using outdated `.o`
+/// files because make skips recompilation when timestamps look current.
 ///
-/// After a successful build, `_deps/.mlx-build-commit` records the submodule
-/// commit. If the marker is missing or doesn't match, purge the entire `_deps/`.
+/// Instead of fragile git-based validation, we use a simple marker file:
+/// after a successful build, `_deps/.mlx-build-commit` records the commit.
+/// If the marker is missing or doesn't match, we purge the entire `_deps/`.
+///
+/// `expected_commit` is the value resolved from `../mlx-cpp/CMakeLists.txt` in
+/// `main`, so this decision is made against the tag CMake would actually fetch.
 fn purge_stale_mlx_cache(out_dir: &std::path::Path, expected_commit: &str) {
     let deps_dir = out_dir.join("build/_deps");
     if !deps_dir.exists() {
@@ -261,20 +271,27 @@ fn purge_stale_mlx_cache(out_dir: &std::path::Path, expected_commit: &str) {
     }
 }
 
-/// Fail the build if the MLX submodule changes while CMake is running.
-fn verify_mlx_submodule_head(manifest_dir: &std::path::Path, expected_commit: &str) {
-    let mlx_src = manifest_dir.join(mlx_pin::MLX_SUBMODULE_RELATIVE_PATH);
-    match mlx_pin::check_head(&mlx_src, expected_commit) {
+/// Fail the build when the MLX checkout CMake used is not the pinned commit.
+///
+/// Runs after the CMake build returns and before the cache marker is written,
+/// so a tree that fails verification is never blessed as valid. A source tree
+/// with no git metadata, or a host without `git`, warns and skips: vendored and
+/// offline checkouts are legitimate and prove nothing either way. Only a
+/// readable HEAD that disagrees is an error.
+fn verify_fetched_mlx_head(out_dir: &std::path::Path, expected_commit: &str) {
+    let mlx_src = out_dir.join("build/_deps/mlx-src");
+    match mlx_pin::check_fetched_head(&mlx_src, expected_commit) {
         mlx_pin::HeadCheck::Match => {}
         mlx_pin::HeadCheck::Unavailable { reason } => {
-            panic!(
-                "mlxcel-core: MLX submodule at {} is unavailable ({reason})",
-                mlx_src.display()
+            println!(
+                "cargo:warning=mlxcel-core: skipped the fetched-MLX-commit check against \
+                 {expected_commit} ({reason})"
             );
         }
         mlx_pin::HeadCheck::Mismatch { found } => {
             panic!(
-                "mlxcel-core: MLX submodule changed during the build: expected {expected_commit}, found {found}"
+                "mlxcel-core: {}",
+                mlx_pin::head_mismatch_message(&mlx_src, expected_commit, &found)
             );
         }
     }
