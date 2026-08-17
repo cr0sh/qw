@@ -15,7 +15,7 @@
 
 - All agents(including the principal root agent) should not work on main to
   prevent collision. Delegate to subagents unless it's trivial fix unlikely to collide.
-- Subagents MUST create a dedicated git worktree for each task under `worktrees/`, using a new branch based on `main`.
+- Subagents MUST create a dedicated git worktree for each task under `worktrees/`, using a new branch based on `main`. On the worktree, symlink `mlx` to the repo root's `mlx` submodule(so `../../mlx`)
 - Subagents MUST perform all task work in that worktree and MUST NOT modify the main worktree directly.
 - After completing and committing the task, subagents MUST return to the main worktree and merge the worktree branch into `main` as their final action.
 
