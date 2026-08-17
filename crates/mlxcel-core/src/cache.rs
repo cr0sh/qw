@@ -461,6 +461,16 @@ pub struct KVCache {
     /// be `Send`/`Sync`).
     pub(crate) paged_backing: Option<PagedBacking>,
 }
+/// Borrowed packed tensors required to preserve a symmetric Turbo4 cache
+/// across an exact-prefix snapshot.
+pub struct Turbo4SnapshotTensors<'a> {
+    pub k_packed: &'a MlxArray,
+    pub k_norms: &'a MlxArray,
+    pub v_packed: &'a MlxArray,
+    pub v_norms: &'a MlxArray,
+    pub v_rescale: &'a MlxArray,
+}
+
 
 /// Shared handle that makes one [`KVCache`] write/read through a pooled paged
 /// KV store instead of its own dense buffers.
@@ -570,6 +580,65 @@ impl KVCache {
             paged_backing: None,
         }
     }
+    /// Return the packed sidecars needed for an exact-prefix Turbo4 snapshot.
+    pub fn turbo4_snapshot_tensors(&self) -> Option<Turbo4SnapshotTensors<'_>> {
+        (self.mode == KVCacheMode::Turbo4).then_some(Turbo4SnapshotTensors {
+            k_packed: self.k_packed.as_deref()?,
+            k_norms: self.k_norms.as_deref()?,
+            v_packed: self.v_packed.as_deref()?,
+            v_norms: self.v_norms.as_deref()?,
+            v_rescale: self.v_rescale.as_deref()?,
+        })
+    }
+
+    /// Restore symmetric Turbo4 packed storage without dequantizing and
+    /// requantizing the cached prefix.
+    pub fn restore_turbo4_snapshot(
+        &mut self,
+        offset: i32,
+        k_packed: UniquePtr<MlxArray>,
+        k_norms: UniquePtr<MlxArray>,
+        v_packed: UniquePtr<MlxArray>,
+        v_norms: UniquePtr<MlxArray>,
+        v_rescale: UniquePtr<MlxArray>,
+    ) -> Result<(), String> {
+        if self.mode != KVCacheMode::Turbo4 {
+            return Err("Turbo4 snapshot requires a Turbo4 cache".to_string());
+        }
+        if offset <= 0 {
+            return Err(format!(
+                "Turbo4 snapshot offset must be positive, got {offset}"
+            ));
+        }
+        let tensors = [
+            ("k_packed", k_packed.as_ref()),
+            ("k_norms", k_norms.as_ref()),
+            ("v_packed", v_packed.as_ref()),
+            ("v_norms", v_norms.as_ref()),
+            ("v_rescale", v_rescale.as_ref()),
+        ];
+        for (name, tensor) in tensors {
+            let tensor = tensor.ok_or_else(|| format!("Turbo4 snapshot {name} is null"))?;
+            let shape = ffi::array_shape(tensor);
+            if shape.len() != 4 || shape[2] < offset {
+                return Err(format!(
+                    "Turbo4 snapshot {name} must be rank 4 with at least {offset} tokens, got {shape:?}"
+                ));
+            }
+        }
+        self.keys = None;
+        self.values = None;
+        self.k_packed = Some(k_packed);
+        self.k_norms = Some(k_norms);
+        self.v_packed = Some(v_packed);
+        self.v_norms = Some(v_norms);
+        self.v_rescale = Some(v_rescale);
+        self.offset = offset;
+        self.live_start = 0;
+        self.turbo_params = None;
+        Ok(())
+    }
+
 
     /// Create a transparently pool-backed empty KV cache for one layer.
     ///

@@ -3511,3 +3511,37 @@ fn turbo4_asym_continuous_batching_grow_shrink_matches_sequential() {
         );
     }
 }
+
+#[test]
+fn symmetric_turbo4_snapshot_restore_keeps_packed_storage_and_offset() {
+    let head_dim = 64;
+    let mut source = KVCache::new_with_mode(KVCacheMode::Turbo4);
+    source.update_and_fetch(
+        synth_kv_tensor(1, 1, 4, head_dim, 401),
+        synth_kv_tensor(1, 1, 4, head_dim, 402),
+    );
+    let tensors = source
+        .turbo4_snapshot_tensors()
+        .expect("populated Turbo4 sidecars");
+    let k_packed = ffi::copy(tensors.k_packed);
+    let k_norms = ffi::copy(tensors.k_norms);
+    let v_packed = ffi::copy(tensors.v_packed);
+    let v_norms = ffi::copy(tensors.v_norms);
+    let v_rescale = ffi::copy(tensors.v_rescale);
+
+    let mut restored = KVCache::new_with_mode(KVCacheMode::Turbo4);
+    restored
+        .restore_turbo4_snapshot(4, k_packed, k_norms, v_packed, v_norms, v_rescale)
+        .expect("restore packed Turbo4 prefix");
+
+    assert_eq!(restored.seq_len(), 4);
+    assert!(restored.keys.is_none());
+    assert!(restored.values.is_none());
+    let (keys, values) = restored.update_and_fetch(
+        synth_kv_tensor(1, 1, 1, head_dim, 403),
+        synth_kv_tensor(1, 1, 1, head_dim, 404),
+    );
+    assert_eq!(ffi::array_shape(&keys)[2], 5);
+    assert_eq!(ffi::array_shape(&values)[2], 5);
+    assert_eq!(restored.seq_len(), 5);
+}

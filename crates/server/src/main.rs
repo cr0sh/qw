@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, ensure};
 use clap::Parser as _;
 use clap_derive::Parser;
+use qw_runtime::KVCacheMode;
 use qw_server::{Engine, router};
 use tracing::info;
 
@@ -29,7 +30,20 @@ struct Cli {
     /// MTP verify input block size (bonus token plus proposals).
     #[arg(long = "mtp-k", default_value_t = 3)]
     mtp_k: usize,
+    /// Disable the default 4-bit TurboQuant KV cache.
+    #[arg(long)]
+    no_kv_quantization: bool,
 }
+impl Cli {
+    fn kv_cache_mode(&self) -> KVCacheMode {
+        if self.no_kv_quantization {
+            KVCacheMode::Fp16
+        } else {
+            KVCacheMode::Turbo4
+        }
+    }
+}
+
 
 fn validate_cli(cli: &Cli) -> Result<()> {
     ensure!(
@@ -56,6 +70,7 @@ async fn main() -> Result<()> {
         cli.model_id,
         cli.prefix_cache_max_tokens,
         cli.mtp_k,
+        cli.kv_cache_mode(),
     )?;
     let listener = tokio::net::TcpListener::bind(bind)
         .await
@@ -69,6 +84,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{Cli, validate_cli};
+    use qw_runtime::KVCacheMode;
     use clap::{CommandFactory as _, Parser as _};
 
     #[test]
@@ -90,6 +106,26 @@ mod tests {
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("--model-id <MODEL_ID>"), "{help}");
     }
+    #[test]
+    fn turbo4_kv_quantization_is_default_with_explicit_opt_out() {
+        let default =
+            Cli::try_parse_from(["qw-server", "--model", "/tmp/checkpoint"]).expect("CLI");
+        assert_eq!(default.kv_cache_mode(), KVCacheMode::Turbo4);
+
+        let unquantized = Cli::try_parse_from([
+            "qw-server",
+            "--model",
+            "/tmp/checkpoint",
+            "--no-kv-quantization",
+        ])
+        .expect("CLI");
+        assert_eq!(unquantized.kv_cache_mode(), KVCacheMode::Fp16);
+
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("--no-kv-quantization"), "{help}");
+        assert!(help.contains("default 4-bit TurboQuant KV cache"), "{help}");
+    }
+
 
     #[test]
     fn cli_parses_and_validates_mtp_k() {
