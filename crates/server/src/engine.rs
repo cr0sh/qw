@@ -34,9 +34,9 @@ enum QwenGenerationRoute {
 fn qwen_generation_route(
     has_mtp: bool,
     has_images: bool,
-    has_constraint: bool,
+    _has_constraint: bool,
 ) -> QwenGenerationRoute {
-    match (has_mtp && !has_constraint, has_images) {
+    match (has_mtp, has_images) {
         (true, false) => QwenGenerationRoute::MtpText,
         (true, true) => QwenGenerationRoute::MtpMultimodal,
         (false, false) => QwenGenerationRoute::BaselineText,
@@ -666,6 +666,7 @@ impl QwenWorker {
                 return;
             }
         };
+        let enable_thinking = job.request.enable_thinking && constraint.is_none();
         let has_images = !job.request.decoded_images.is_empty();
         if has_images && !self.provider.supports_image_inputs() {
             send_failure(
@@ -706,7 +707,7 @@ impl QwenWorker {
                 &job.request.messages,
                 effective_tools,
                 reasoning_effort,
-                job.request.enable_thinking,
+                enable_thinking,
                 &prepared_images,
             ) {
                 Ok(prefill) => Some(prefill),
@@ -730,7 +731,7 @@ impl QwenWorker {
                 &job.request.messages,
                 effective_tools,
                 reasoning_effort,
-                job.request.enable_thinking,
+                enable_thinking,
             ) {
                 Ok(tokens) => tokens,
                 Err(error) => {
@@ -770,9 +771,12 @@ impl QwenWorker {
             snapshot: hit.snapshot,
             cached_tokens: hit.token_count,
         });
-        let mut trace_parser = ReasoningTraceParser::new(job.request.enable_thinking);
+        let mut trace_parser = ReasoningTraceParser::new(enable_thinking);
         let mut gate = ToolCallGate::default();
         let mut emit_delta = |fragment: &str| {
+            if job.cancelled.load(Ordering::Acquire) {
+                return false;
+            }
             for delta in trace_parser.feed(fragment) {
                 let Some(delta) = gate_worker_delta(delta, tool_enabled, &mut gate) else {
                     continue;
@@ -790,6 +794,9 @@ impl QwenWorker {
                     job.request.max_tokens,
                     &sampling,
                     mtp_k,
+                    constraint
+                        .as_mut()
+                        .map(|value| value as &mut dyn mlxcel_core::generate::TokenConstraint),
                     &mut emit_delta,
                 )
             }
@@ -798,6 +805,9 @@ impl QwenWorker {
                 job.request.max_tokens,
                 &sampling,
                 mtp_k,
+                constraint
+                    .as_mut()
+                    .map(|value| value as &mut dyn mlxcel_core::generate::TokenConstraint),
                 &mut emit_delta,
             ),
             QwenGenerationRoute::BaselineMultimodal => {
@@ -859,7 +869,7 @@ impl QwenWorker {
             | GenerationStopReason::RepetitionLoop => FinishReason::Stop,
             GenerationStopReason::CallbackCancelled => return,
         };
-        let (reasoning_content, visible_content) = if job.request.enable_thinking {
+        let (reasoning_content, visible_content) = if enable_thinking {
             split_reasoning_trace(&generated.text)
         } else {
             (String::new(), generated.text.clone())
@@ -1108,14 +1118,14 @@ mod tests {
     }
 
     #[test]
-    fn mtp_routing_matrix_preserves_constraints_and_ignores_temperature() {
+    fn mtp_routing_matrix_includes_constrained_capable_requests() {
         for has_mtp in [false, true] {
             for has_images in [false, true] {
                 for constrained in [false, true] {
                     for temperature in [0.0f32, 0.7] {
                         let route =
                             qwen_generation_route(has_mtp, has_images, constrained);
-                        let expected = match (has_mtp && !constrained, has_images) {
+                        let expected = match (has_mtp, has_images) {
                             (true, false) => QwenGenerationRoute::MtpText,
                             (true, true) => QwenGenerationRoute::MtpMultimodal,
                             (false, false) => QwenGenerationRoute::BaselineText,
