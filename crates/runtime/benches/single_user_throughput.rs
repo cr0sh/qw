@@ -180,7 +180,9 @@ fn single_user_throughput(criterion: &mut Criterion) {
             });
         });
         group.throughput(Throughput::Elements(mtp_decode_tokens as u64));
-        group.bench_function("mtp_k3", |bencher| {
+        // Keep an end-to-end target for autoresearch of prompt preparation,
+        // prefill, and decode together.
+        group.bench_function("mtp_k3_e2e", |bencher| {
             bencher.iter(|| {
                 let output = provider
                     .generate_streaming_in_mode(
@@ -198,6 +200,36 @@ fn single_user_throughput(criterion: &mut Criterion) {
                     "baseline and bundled-MTP k={MTP_BLOCK_SIZE} greedy token IDs diverged"
                 );
                 black_box(output);
+            });
+        });
+        // Report tokens per second against the MTP decode phase only. The
+        // generation call still executes prompt preparation and prefill.
+        group.bench_function("mtp_k3", |bencher| {
+            bencher.iter_custom(|iters| {
+                let mut decode_time = Duration::ZERO;
+                for _ in 0..iters {
+                    let (output, stats) = provider
+                        .generate_streaming_in_mode(
+                            &decode_request,
+                            Qwen35GenerationMode::Mtp,
+                            |delta| {
+                                black_box(delta);
+                                true
+                            },
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("benchmark MTP k={MTP_BLOCK_SIZE}: {error:#}")
+                        });
+                    assert_eq!(
+                        &output.token_ids, &baseline_token_ids,
+                        "baseline and bundled-MTP k={MTP_BLOCK_SIZE} greedy token IDs diverged"
+                    );
+                    decode_time += stats
+                        .expect("explicit MTP mode must return MTP statistics")
+                        .decode_time;
+                    black_box(output);
+                }
+                decode_time
             });
         });
         group.finish();
