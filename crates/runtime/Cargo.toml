@@ -18,6 +18,10 @@ tracing.workspace = true
 [dev-dependencies]
 criterion.workspace = true
 
+[[test]]
+name = "throughput_tokens"
+path = "benches/throughput_tokens.rs"
+
 [[bench]]
 name = "single_user_throughput"
 harness = false

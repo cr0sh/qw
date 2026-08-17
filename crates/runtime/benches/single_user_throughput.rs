@@ -1,10 +1,16 @@
+mod throughput_tokens;
+
 use std::hint::black_box;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use qw_runtime::provider::Qwen35GenerationMode;
-use qw_runtime::{GenerationRequest, Qwen35Provider};
+use qw_runtime::{
+    ChatMessage, ChatMessageContent, GenerationRequest, Qwen35Provider,
+};
+
+use throughput_tokens::generation_elements;
 
 const MODEL_ENV: &str = "QW_BENCH_MODEL";
 const PROMPT: &str = concat!(
@@ -48,6 +54,22 @@ fn single_user_throughput(criterion: &mut Criterion) {
     let mut provider = Qwen35Provider::load(&model_dir)
         .unwrap_or_else(|error| panic!("failed to load {}: {error:#}", model_dir.display()));
 
+    let prompt_tokens = provider
+        .tokenize_messages(
+            &[ChatMessage {
+                role: "user".to_owned(),
+                name: None,
+                content: Some(ChatMessageContent::Text(PROMPT.to_owned())),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            }],
+            &[],
+            None,
+            true,
+        )
+        .expect("tokenize single-user benchmark prompt")
+        .len();
     let prefill_request = request(1);
     let (prefill_output, _) = provider
         .generate_streaming_in_mode(&prefill_request, Qwen35GenerationMode::Automatic, |delta| {
@@ -56,10 +78,12 @@ fn single_user_throughput(criterion: &mut Criterion) {
         })
         .expect("warm up single-user prefill");
     assert!(!prefill_output.token_ids.is_empty());
+    let prefill_elements =
+        generation_elements(1, prompt_tokens, prefill_output.token_ids.len()).prefill;
 
     {
         let mut group = criterion.benchmark_group("single_user_prefill");
-        group.throughput(Throughput::Elements(prefill_output.token_ids.len() as u64));
+        group.throughput(Throughput::Elements(prefill_elements));
         group.bench_function("qwen", |bencher| {
             bencher.iter(|| {
                 let output = provider
@@ -88,7 +112,8 @@ fn single_user_throughput(criterion: &mut Criterion) {
         })
         .expect("warm up baseline single-user decode");
     let baseline_token_ids = baseline_output.token_ids;
-    let baseline_tokens = baseline_token_ids.len().saturating_sub(1);
+    let baseline_tokens =
+        generation_elements(1, prompt_tokens, baseline_token_ids.len()).decode as usize;
     assert!(
         baseline_tokens > 0,
         "the deterministic prompt must produce at least one autoregressive decode token"
@@ -104,7 +129,8 @@ fn single_user_throughput(criterion: &mut Criterion) {
         &mtp_output.token_ids, &baseline_token_ids,
         "baseline and bundled-MTP k={MTP_BLOCK_SIZE} greedy token IDs diverged"
     );
-    let mtp_decode_tokens = mtp_output.token_ids.len().saturating_sub(1);
+    let mtp_decode_tokens =
+        generation_elements(1, prompt_tokens, mtp_output.token_ids.len()).decode as usize;
     assert!(
         mtp_decode_tokens > 0,
         "the deterministic MTP prompt must produce at least one autoregressive decode token"
