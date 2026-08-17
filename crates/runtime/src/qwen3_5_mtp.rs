@@ -20,7 +20,10 @@
 
 use std::cell::RefCell;
 
-use mlxcel_core::generate::{GenerationStopReason, LanguageModel, SamplingConfig};
+use mlxcel_core::generate::{
+    ConstraintCommit, ConstraintMask, GenerationStopReason, LanguageModel, SamplingConfig,
+    TokenConstraint, mask_logits_to_allowed,
+};
 use mlxcel_core::generation_policy::{merged_eos_token_ids, seed_rng_if_needed};
 use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedLinear};
 use mlxcel_core::sampling::{
@@ -387,6 +390,115 @@ impl Qwen35MtpDraftModel {
         proposals
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn draft_block_greedy_constrained(
+        &self,
+        target: &Qwen35Model,
+        last_bonus: i32,
+        target_hidden: &MlxArray,
+        proposal_count: usize,
+        sampling: &SamplingConfig,
+        prompt_tokens: &[i32],
+        committed_output: &[i32],
+        eos_tokens: &[i32],
+        constraint: &mut dyn TokenConstraint,
+    ) -> Result<Vec<i32>, String> {
+        let mut state = self.state.borrow_mut();
+        state.round_appended = 0;
+        let mut tokens = Vec::with_capacity(proposal_count);
+        let mut output = committed_output.to_vec();
+        let mut history = Vec::with_capacity(prompt_tokens.len() + output.len() + proposal_count);
+        rebuild_history(prompt_tokens, &output, &mut history);
+        let (mut logits, mut hidden) =
+            self.draft_seed(target, last_bonus, target_hidden, &mut state);
+
+        while tokens.len() < proposal_count {
+            let step = constraint_step(&logits, constraint, &history)?;
+            let Some(logits_for_sample) = step.logits() else {
+                if let ConstraintStepLogits::Splice(commit) = step {
+                    commit.apply_to(&mut output)?;
+                }
+                break;
+            };
+            let (token_array, _) =
+                sample_token_optimized(logits_for_sample, sampling, &history);
+            mlxcel_core::eval(&token_array);
+            let token = mlxcel_core::item_i32(&token_array);
+            tokens.push(token);
+            if eos_tokens.contains(&token) {
+                break;
+            }
+            let commit = constraint.commit_token(token)?;
+            let changed = !commit.is_token(token);
+            commit.apply_to(&mut output)?;
+            rebuild_history(prompt_tokens, &output, &mut history);
+            if changed || commit.accept || tokens.len() == proposal_count {
+                break;
+            }
+            let token_array = mlxcel_core::from_slice_i32(&[token], &[1, 1]);
+            hidden = self.forward_tokens(target, &token_array, &hidden, &mut state);
+            state.round_appended += 1;
+            logits = target.project_logits(&hidden);
+        }
+        Ok(tokens)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draft_block_stochastic_constrained(
+        &self,
+        target: &Qwen35Model,
+        last_bonus: i32,
+        target_hidden: &MlxArray,
+        proposal_count: usize,
+        sampling: &SamplingConfig,
+        prompt_tokens: &[i32],
+        committed_output: &[i32],
+        eos_tokens: &[i32],
+        constraint: &mut dyn TokenConstraint,
+    ) -> Result<Vec<MtpProposal>, String> {
+        let mut state = self.state.borrow_mut();
+        state.round_appended = 0;
+        let mut proposals = Vec::with_capacity(proposal_count);
+        let mut output = committed_output.to_vec();
+        let mut history = Vec::with_capacity(prompt_tokens.len() + output.len() + proposal_count);
+        rebuild_history(prompt_tokens, &output, &mut history);
+        let (mut logits, mut hidden) =
+            self.draft_seed(target, last_bonus, target_hidden, &mut state);
+
+        while proposals.len() < proposal_count {
+            let step = constraint_step(&logits, constraint, &history)?;
+            let Some(logits_for_sample) = step.logits() else {
+                if let ConstraintStepLogits::Splice(commit) = step {
+                    commit.apply_to(&mut output)?;
+                }
+                break;
+            };
+            let (token_array, proposal_probs) =
+                sample_token_with_distribution(logits_for_sample, sampling, &history);
+            mlxcel_core::eval(&token_array);
+            let token = mlxcel_core::item_i32(&token_array);
+            proposals.push(MtpProposal {
+                token,
+                proposal_probs,
+            });
+            if eos_tokens.contains(&token) {
+                break;
+            }
+            let commit = constraint.commit_token(token)?;
+            let changed = !commit.is_token(token);
+            commit.apply_to(&mut output)?;
+            rebuild_history(prompt_tokens, &output, &mut history);
+            if changed || commit.accept || proposals.len() == proposal_count {
+                break;
+            }
+            let token_array = mlxcel_core::from_slice_i32(&[token], &[1, 1]);
+            hidden = self.forward_tokens(target, &token_array, &hidden, &mut state);
+            state.round_appended += 1;
+            logits = target.project_logits(&hidden);
+        }
+        Ok(proposals)
+    }
+
     pub(crate) fn accept_verified_tokens(
         &self,
         target: &Qwen35Model,
@@ -448,6 +560,70 @@ fn logits_at(logits: &MlxArray, position: usize) -> UniquePtr<MlxArray> {
     )
 }
 
+enum ConstraintStepLogits {
+    Masked(UniquePtr<MlxArray>),
+    Splice(ConstraintCommit),
+    Accept,
+}
+
+impl ConstraintStepLogits {
+    fn logits(&self) -> Option<&MlxArray> {
+        match self {
+            Self::Masked(logits) => logits.as_ref(),
+            Self::Splice(_) | Self::Accept => None,
+        }
+    }
+}
+
+fn constraint_step(
+    logits: &MlxArray,
+    constraint: &mut dyn TokenConstraint,
+    history: &[i32],
+) -> Result<ConstraintStepLogits, String> {
+    match constraint.compute_mask(logits, history)? {
+        ConstraintMask::Allow(allowed) => {
+            Ok(ConstraintStepLogits::Masked(mask_logits_to_allowed(
+                logits, &allowed,
+            )?))
+        }
+        ConstraintMask::Splice(commit) => Ok(ConstraintStepLogits::Splice(commit)),
+        ConstraintMask::Accept => Ok(ConstraintStepLogits::Accept),
+    }
+}
+
+fn rebuild_history(prompt_tokens: &[i32], output: &[i32], history: &mut Vec<i32>) {
+    history.clear();
+    history.extend_from_slice(prompt_tokens);
+    history.extend_from_slice(output);
+}
+
+fn rollback_constraint_transaction<T>(
+    constraint: &mut dyn TokenConstraint,
+    operation: impl FnOnce(&mut dyn TokenConstraint) -> Result<T, String>,
+) -> Result<T, String> {
+    constraint.begin_transaction()?;
+    let result = operation(constraint);
+    constraint.rollback_transaction();
+    result
+}
+
+fn commit_constraint_transaction<T>(
+    constraint: &mut dyn TokenConstraint,
+    operation: impl FnOnce(&mut dyn TokenConstraint) -> Result<T, String>,
+) -> Result<T, String> {
+    constraint.begin_transaction()?;
+    match operation(constraint) {
+        Ok(value) => {
+            constraint.commit_transaction()?;
+            Ok(value)
+        }
+        Err(error) => {
+            constraint.rollback_transaction();
+            Err(error)
+        }
+    }
+}
+
 fn greedy_walk(
     draft_tokens: &[i32],
     verify_logits: &MlxArray,
@@ -494,6 +670,7 @@ fn stochastic_walk(
                 if eos_tokens.contains(&proposal.token) || new_tokens.len() == max_new_tokens {
                     return WalkResult {
                         accepted,
+
                         new_tokens,
                     };
                 }
@@ -519,6 +696,378 @@ fn stochastic_walk(
         accepted,
         new_tokens,
     }
+}
+
+struct ConstrainedWalk {
+    accepted: usize,
+    new_tokens: Vec<i32>,
+    output: Vec<i32>,
+    rebuild: bool,
+    stop_reason: Option<GenerationStopReason>,
+}
+#[allow(clippy::too_many_arguments)]
+fn constrained_initial_step(
+    logits: &MlxArray,
+    sampling: &SamplingConfig,
+    prompt_tokens: &[i32],
+    committed_output: &[i32],
+    eos_tokens: &[i32],
+    max_tokens: usize,
+    constraint: &mut dyn TokenConstraint,
+) -> Result<ConstrainedWalk, String> {
+    let mut output = committed_output.to_vec();
+    let mut history = Vec::with_capacity(prompt_tokens.len() + output.len() + 1);
+    rebuild_history(prompt_tokens, &output, &mut history);
+    let step = constraint_step(logits, constraint, &history)?;
+    let logits_for_sample = match &step {
+        ConstraintStepLogits::Masked(logits) => logits
+            .as_ref()
+            .expect("masked constraint logits must not be null"),
+        ConstraintStepLogits::Splice(commit) => {
+            let stop_reason = apply_walk_splice(
+                commit.clone(),
+                prompt_tokens,
+                &mut output,
+                &mut history,
+                max_tokens,
+            )?;
+            return Ok(ConstrainedWalk {
+                accepted: 0,
+                new_tokens: Vec::new(),
+                output,
+                rebuild: true,
+                stop_reason,
+            });
+        }
+        ConstraintStepLogits::Accept => {
+            return Ok(ConstrainedWalk {
+                accepted: 0,
+                new_tokens: Vec::new(),
+                output,
+                rebuild: false,
+                stop_reason: Some(GenerationStopReason::ConstraintAccepted),
+            });
+        }
+    };
+    let (token, _) = sample_token_optimized(logits_for_sample, sampling, &history);
+    mlxcel_core::eval(&token);
+    let token = mlxcel_core::item_i32(&token);
+    if eos_tokens.contains(&token) {
+        return Ok(ConstrainedWalk {
+            accepted: 0,
+            new_tokens: vec![token],
+            output,
+            rebuild: false,
+            stop_reason: Some(GenerationStopReason::Eos),
+        });
+    }
+    let commit = constraint.commit_token(token)?;
+    let (rebuild, stop_reason) = apply_walk_commit(
+        token,
+        commit,
+        prompt_tokens,
+        &mut output,
+        &mut history,
+        max_tokens,
+    )?;
+    Ok(ConstrainedWalk {
+        accepted: 0,
+        new_tokens: vec![token],
+        output,
+        rebuild,
+        stop_reason,
+    })
+}
+
+fn apply_walk_commit(
+    sampled: i32,
+    commit: ConstraintCommit,
+    prompt_tokens: &[i32],
+    output: &mut Vec<i32>,
+    history: &mut Vec<i32>,
+    max_tokens: usize,
+) -> Result<(bool, Option<GenerationStopReason>), String> {
+    let rebuild = !commit.is_token(sampled);
+    commit.apply_to(output)?;
+    if output.len() > max_tokens {
+        output.truncate(max_tokens);
+    }
+    rebuild_history(prompt_tokens, output, history);
+    let stop_reason = if commit.accept {
+        Some(GenerationStopReason::ConstraintAccepted)
+    } else if output.len() == max_tokens {
+        Some(GenerationStopReason::MaxTokens)
+    } else {
+        None
+    };
+    Ok((rebuild, stop_reason))
+}
+
+fn apply_walk_splice(
+    commit: ConstraintCommit,
+    prompt_tokens: &[i32],
+    output: &mut Vec<i32>,
+    history: &mut Vec<i32>,
+    max_tokens: usize,
+) -> Result<Option<GenerationStopReason>, String> {
+    commit.apply_to(output)?;
+    if output.len() > max_tokens {
+        output.truncate(max_tokens);
+    }
+    rebuild_history(prompt_tokens, output, history);
+    Ok(if commit.accept {
+        Some(GenerationStopReason::ConstraintAccepted)
+    } else if output.len() == max_tokens {
+        Some(GenerationStopReason::MaxTokens)
+    } else {
+        None
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn constrained_greedy_walk(
+    draft_tokens: &[i32],
+    verify_logits: &MlxArray,
+    sampling: &SamplingConfig,
+    prompt_tokens: &[i32],
+    committed_output: &[i32],
+    eos_tokens: &[i32],
+    max_tokens: usize,
+    constraint: &mut dyn TokenConstraint,
+) -> Result<ConstrainedWalk, String> {
+    let mut output = committed_output.to_vec();
+    let mut history = Vec::with_capacity(prompt_tokens.len() + output.len() + draft_tokens.len() + 1);
+    rebuild_history(prompt_tokens, &output, &mut history);
+    let mut accepted = 0;
+    let mut new_tokens = Vec::with_capacity(draft_tokens.len() + 1);
+
+    for position in 0..=draft_tokens.len() {
+        let logits = logits_at(verify_logits, position);
+        let step = constraint_step(&logits, constraint, &history)?;
+        let logits_for_sample = match &step {
+            ConstraintStepLogits::Masked(logits) => logits
+                .as_ref()
+                .expect("masked constraint logits must not be null"),
+            ConstraintStepLogits::Splice(commit) => {
+                let stop_reason = apply_walk_splice(
+                    commit.clone(),
+                    prompt_tokens,
+                    &mut output,
+                    &mut history,
+                    max_tokens,
+                )?;
+                return Ok(ConstrainedWalk {
+                    accepted,
+                    new_tokens,
+                    output,
+                    rebuild: true,
+                    stop_reason,
+                });
+            }
+            ConstraintStepLogits::Accept => {
+                return Ok(ConstrainedWalk {
+                    accepted,
+                    new_tokens,
+                    output,
+                    rebuild: false,
+                    stop_reason: Some(GenerationStopReason::ConstraintAccepted),
+                });
+            }
+        };
+        let (token_array, _) = sample_token_optimized(logits_for_sample, sampling, &history);
+        mlxcel_core::eval(&token_array);
+        let target_token = mlxcel_core::item_i32(&token_array);
+        new_tokens.push(target_token);
+        if eos_tokens.contains(&target_token) {
+            return Ok(ConstrainedWalk {
+                accepted,
+                new_tokens,
+                output,
+                rebuild: false,
+                stop_reason: Some(GenerationStopReason::Eos),
+            });
+        }
+
+        let matches_proposal =
+            position < draft_tokens.len() && target_token == draft_tokens[position];
+        if matches_proposal {
+            accepted += 1;
+        }
+        let commit = constraint.commit_token(target_token)?;
+        let (rebuild, stop_reason) = apply_walk_commit(
+            target_token,
+            commit,
+            prompt_tokens,
+            &mut output,
+            &mut history,
+            max_tokens,
+        )?;
+        if !matches_proposal || rebuild || stop_reason.is_some() || position == draft_tokens.len() {
+            return Ok(ConstrainedWalk {
+                accepted,
+                new_tokens,
+                output,
+                rebuild,
+                stop_reason,
+            });
+        }
+    }
+    unreachable!("greedy constrained walk includes one target bonus position")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn constrained_stochastic_walk(
+    proposals: &[MtpProposal],
+    verify_logits: &MlxArray,
+    sampling: &SamplingConfig,
+    prompt_tokens: &[i32],
+    committed_output: &[i32],
+    eos_tokens: &[i32],
+    max_tokens: usize,
+    constraint: &mut dyn TokenConstraint,
+) -> Result<ConstrainedWalk, String> {
+    let mut output = committed_output.to_vec();
+    let mut history = Vec::with_capacity(prompt_tokens.len() + output.len() + proposals.len() + 1);
+    rebuild_history(prompt_tokens, &output, &mut history);
+    let mut accepted = 0;
+    let mut new_tokens = Vec::with_capacity(proposals.len() + 1);
+
+    for (position, proposal) in proposals.iter().enumerate() {
+        let logits = logits_at(verify_logits, position);
+        let step = constraint_step(&logits, constraint, &history)?;
+        let logits_for_sample = match &step {
+            ConstraintStepLogits::Masked(logits) => logits
+                .as_ref()
+                .expect("masked constraint logits must not be null"),
+            ConstraintStepLogits::Splice(commit) => {
+                let stop_reason = apply_walk_splice(
+                    commit.clone(),
+                    prompt_tokens,
+                    &mut output,
+                    &mut history,
+                    max_tokens,
+                )?;
+                return Ok(ConstrainedWalk {
+                    accepted,
+                    new_tokens,
+                    output,
+                    rebuild: true,
+                    stop_reason,
+                });
+            }
+            ConstraintStepLogits::Accept => {
+                return Ok(ConstrainedWalk {
+                    accepted,
+                    new_tokens,
+                    output,
+                    rebuild: false,
+                    stop_reason: Some(GenerationStopReason::ConstraintAccepted),
+                });
+            }
+        };
+        let target_probs = effective_token_distribution(logits_for_sample, sampling, &history);
+        let target_token = match verify_draft_token(
+            &target_probs,
+            &proposal.proposal_probs,
+            proposal.token,
+        ) {
+            DraftVerdict::Accept => {
+                accepted += 1;
+                proposal.token
+            }
+            DraftVerdict::Reject { replacement } => replacement,
+        };
+        new_tokens.push(target_token);
+        if eos_tokens.contains(&target_token) {
+            return Ok(ConstrainedWalk {
+                accepted,
+                new_tokens,
+                output,
+                rebuild: false,
+                stop_reason: Some(GenerationStopReason::Eos),
+            });
+        }
+        let commit = constraint.commit_token(target_token)?;
+        let (rebuild, stop_reason) = apply_walk_commit(
+            target_token,
+            commit,
+            prompt_tokens,
+            &mut output,
+            &mut history,
+            max_tokens,
+        )?;
+        if target_token != proposal.token || rebuild || stop_reason.is_some() {
+            return Ok(ConstrainedWalk {
+                accepted,
+                new_tokens,
+                output,
+                rebuild,
+                stop_reason,
+            });
+        }
+    }
+
+    let bonus_logits = logits_at(verify_logits, proposals.len());
+    let step = constraint_step(&bonus_logits, constraint, &history)?;
+    let logits_for_sample = match &step {
+        ConstraintStepLogits::Masked(logits) => logits
+            .as_ref()
+            .expect("masked constraint logits must not be null"),
+        ConstraintStepLogits::Splice(commit) => {
+            let stop_reason = apply_walk_splice(
+                commit.clone(),
+                prompt_tokens,
+                &mut output,
+                &mut history,
+                max_tokens,
+            )?;
+            return Ok(ConstrainedWalk {
+                accepted,
+                new_tokens,
+                output,
+                rebuild: true,
+                stop_reason,
+            });
+        }
+        ConstraintStepLogits::Accept => {
+            return Ok(ConstrainedWalk {
+                accepted,
+                new_tokens,
+                output,
+                rebuild: false,
+                stop_reason: Some(GenerationStopReason::ConstraintAccepted),
+            });
+        }
+    };
+    let (bonus, _) = sample_token_optimized(logits_for_sample, sampling, &history);
+    mlxcel_core::eval(&bonus);
+    let bonus = mlxcel_core::item_i32(&bonus);
+    new_tokens.push(bonus);
+    if eos_tokens.contains(&bonus) {
+        return Ok(ConstrainedWalk {
+            accepted,
+            new_tokens,
+            output,
+            rebuild: false,
+            stop_reason: Some(GenerationStopReason::Eos),
+        });
+    }
+    let commit = constraint.commit_token(bonus)?;
+    let (rebuild, stop_reason) = apply_walk_commit(
+        bonus,
+        commit,
+        prompt_tokens,
+        &mut output,
+        &mut history,
+        max_tokens,
+    )?;
+    Ok(ConstrainedWalk {
+        accepted,
+        new_tokens,
+        output,
+        rebuild,
+        stop_reason,
+    })
 }
 
 fn emit_walk_tokens<F: FnMut(i32) -> bool>(
@@ -558,6 +1107,109 @@ enum MtpPrefill<'a> {
     },
 }
 
+struct ActiveMtpState {
+    next_hidden: UniquePtr<MlxArray>,
+    bonus: i32,
+}
+
+fn prefill_for_input(
+    model: &Qwen35Model,
+    prefill_input: MtpPrefill<'_>,
+) -> Result<crate::qwen3_5::Qwen35MtpPrefill, String> {
+    match prefill_input {
+        MtpPrefill::Text { prompt } => Ok(model.forward_mtp_prefill(prompt)),
+        MtpPrefill::Multimodal {
+            prompt,
+            input_embeddings,
+            position_ids,
+            rope_delta,
+        } => model.forward_mtp_prefill_with_embeddings(
+            prompt,
+            input_embeddings,
+            position_ids,
+            rope_delta,
+        ),
+    }
+}
+
+fn seed_drafter_from_prefill(
+    model: &Qwen35Model,
+    drafter: &Qwen35MtpDraftModel,
+    prefill_input: MtpPrefill<'_>,
+    hidden: &MlxArray,
+    first_token: i32,
+) {
+    match prefill_input {
+        MtpPrefill::Text { prompt } => {
+            drafter.prefill_from_target_hidden(model, prompt, hidden, first_token);
+        }
+        MtpPrefill::Multimodal {
+            prompt,
+            input_embeddings,
+            position_ids,
+            rope_delta,
+        } => drafter.prefill_from_target_hidden_with_embeddings(
+            model,
+            prompt,
+            input_embeddings,
+            hidden,
+            first_token,
+            position_ids,
+            rope_delta,
+        ),
+    }
+}
+
+fn rebuild_mtp_state(
+    model: &Qwen35Model,
+    drafter: &Qwen35MtpDraftModel,
+    prefill_input: MtpPrefill<'_>,
+    output: &[i32],
+) -> Result<ActiveMtpState, String> {
+    let first_token = *output
+        .first()
+        .ok_or_else(|| "cannot rebuild MTP state for an empty output".to_string())?;
+    let prefill = prefill_for_input(model, prefill_input)?;
+    mlxcel_core::eval(&prefill.hidden);
+    seed_drafter_from_prefill(model, drafter, prefill_input, &prefill.hidden, first_token);
+    let prefill_shape = mlxcel_core::array_shape(&prefill.hidden);
+    let last = prefill_shape[1] - 1;
+    let mut next_hidden = mlxcel_core::slice(
+        &prefill.hidden,
+        &[0, last, 0],
+        &[prefill_shape[0], last + 1, prefill_shape[2]],
+    );
+
+    if output.len() > 1 {
+        let cached_output = &output[..output.len() - 1];
+        let verify_input = mlxcel_core::from_slice_i32(
+            cached_output,
+            &[1, i32::try_from(cached_output.len()).unwrap_or(i32::MAX)],
+        );
+        let verify = model.forward_mtp_verify(&verify_input);
+        let draft_tokens = &output[1..output.len() - 1];
+        drafter.accept_verified_tokens(
+            model,
+            &verify.hidden,
+            draft_tokens,
+            draft_tokens.len(),
+            output,
+        );
+        let hidden_shape = mlxcel_core::array_shape(&verify.hidden);
+        let accepted = i32::try_from(draft_tokens.len()).unwrap_or(i32::MAX);
+        next_hidden = mlxcel_core::slice(
+            &verify.hidden,
+            &[0, accepted, 0],
+            &[hidden_shape[0], accepted + 1, hidden_shape[2]],
+        );
+    }
+
+    Ok(ActiveMtpState {
+        next_hidden,
+        bonus: *output.last().expect("non-empty output"),
+    })
+}
+
 pub(crate) struct Qwen35MtpGenerator;
 
 impl Qwen35MtpGenerator {
@@ -572,8 +1224,9 @@ impl Qwen35MtpGenerator {
         max_tokens: usize,
         sampling: &SamplingConfig,
         block_size: usize,
+        constraint: Option<&mut dyn TokenConstraint>,
         on_token: F,
-    ) -> MtpGeneration {
+    ) -> Result<MtpGeneration, String> {
         let prompt = mlxcel_core::from_slice_i32(
             prompt_tokens,
             &[1, i32::try_from(prompt_tokens.len()).unwrap_or(i32::MAX)],
@@ -585,6 +1238,7 @@ impl Qwen35MtpGenerator {
             max_tokens,
             sampling,
             block_size,
+            constraint,
             on_token,
         )
     }
@@ -600,8 +1254,9 @@ impl Qwen35MtpGenerator {
         max_tokens: usize,
         sampling: &SamplingConfig,
         block_size: usize,
+        constraint: Option<&mut dyn TokenConstraint>,
         on_token: F,
-    ) -> MtpGeneration {
+    ) -> Result<MtpGeneration, String> {
         let prompt = mlxcel_core::from_slice_i32(
             prompt_tokens,
             &[1, i32::try_from(prompt_tokens.len()).unwrap_or(i32::MAX)],
@@ -618,6 +1273,7 @@ impl Qwen35MtpGenerator {
             max_tokens,
             sampling,
             block_size,
+            constraint,
             on_token,
         )
     }
@@ -630,10 +1286,23 @@ impl Qwen35MtpGenerator {
         max_tokens: usize,
         sampling: &SamplingConfig,
         block_size: usize,
+        constraint: Option<&mut dyn TokenConstraint>,
         mut on_token: F,
-    ) -> MtpGeneration {
+    ) -> Result<MtpGeneration, String> {
         assert!(!prompt_tokens.is_empty(), "MTP prompt must not be empty");
         assert!(block_size >= 2, "MTP block size must be at least 2");
+        if let Some(constraint) = constraint {
+            return self.generate_streaming_constrained_for_prefill(
+                model,
+                prompt_tokens,
+                prefill_input,
+                max_tokens,
+                sampling,
+                block_size,
+                constraint,
+                on_token,
+            );
+        }
         let drafter = model
             .mtp()
             .expect("Qwen35MtpGenerator requires a bundled MTP head");
@@ -644,11 +1313,11 @@ impl Qwen35MtpGenerator {
         seed_rng_if_needed(&sampling);
         let eos_tokens = merged_eos_token_ids(model.eos_token_ids(), &sampling.stop_token_ids);
         if max_tokens == 0 {
-            return MtpGeneration {
+            return Ok(MtpGeneration {
                 token_ids: Vec::new(),
                 stats: MtpGenerationStats::default(),
                 stop_reason: GenerationStopReason::MaxTokens,
-            };
+            });
         }
 
         let prefill = match prefill_input {
@@ -726,6 +1395,7 @@ impl Qwen35MtpGenerator {
                 let greedy = sampler_is_greedy(&sampling);
                 let (draft_tokens, proposal_probs) = if greedy {
                     (
+
                         drafter.draft_block_greedy(
                             model,
                             bonus,
@@ -822,12 +1492,298 @@ impl Qwen35MtpGenerator {
                     .expect("speculative walk emits at least one token");
             }
         }
-
-        MtpGeneration {
+        Ok(MtpGeneration {
             token_ids: generated,
             stats: mtp_stats,
             stop_reason,
+        })
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn generate_streaming_constrained_for_prefill<F: FnMut(i32) -> bool>(
+        &mut self,
+        model: &Qwen35Model,
+        prompt_tokens: &[i32],
+        prefill_input: MtpPrefill<'_>,
+        max_tokens: usize,
+        sampling: &SamplingConfig,
+        block_size: usize,
+        constraint: &mut dyn TokenConstraint,
+        mut on_token: F,
+    ) -> Result<MtpGeneration, String> {
+        let drafter = model
+            .mtp()
+            .expect("Qwen35MtpGenerator requires a bundled MTP head");
+        let mut sampling = sampling.clone();
+        sampling
+            .token_bias
+            .suppress_tokens(&model.output_suppressed_token_ids());
+        seed_rng_if_needed(&sampling);
+        let eos_tokens = merged_eos_token_ids(model.eos_token_ids(), &sampling.stop_token_ids);
+        if max_tokens == 0 {
+            return Ok(MtpGeneration {
+                token_ids: Vec::new(),
+                stats: MtpGenerationStats::default(),
+                stop_reason: GenerationStopReason::MaxTokens,
+            });
         }
+
+        let mut generated = Vec::with_capacity(max_tokens);
+        let mut stats = MtpGenerationStats::default();
+        let mut stop_reason = GenerationStopReason::MaxTokens;
+        let mut state;
+
+        loop {
+            let prefill = prefill_for_input(model, prefill_input)?;
+            mlxcel_core::eval(&prefill.hidden);
+            let initial = commit_constraint_transaction(constraint, |active| {
+                constrained_initial_step(
+                    &prefill.first_logits,
+                    &sampling,
+                    prompt_tokens,
+                    &generated,
+                    &eos_tokens,
+                    max_tokens,
+                    active,
+                )
+            })?;
+            generated = initial.output;
+
+            let mut callback_cancelled = false;
+            for &token in &initial.new_tokens {
+                if eos_tokens.contains(&token) {
+                    break;
+                }
+                if !on_token(token) {
+                    callback_cancelled = true;
+                    break;
+                }
+            }
+            if initial.new_tokens.is_empty()
+                && initial.rebuild
+                && generated.last().is_some_and(|&token| !on_token(token))
+            {
+                callback_cancelled = true;
+            }
+            if callback_cancelled {
+                return Ok(MtpGeneration {
+                    token_ids: generated,
+                    stats,
+                    stop_reason: GenerationStopReason::CallbackCancelled,
+                });
+            }
+            if let Some(reason) = initial.stop_reason {
+                if initial.rebuild && !generated.is_empty() {
+                    let _ =
+                        rebuild_mtp_state(model, drafter, prefill_input, &generated)?;
+                }
+                return Ok(MtpGeneration {
+                    token_ids: generated,
+                    stats,
+                    stop_reason: reason,
+                });
+            }
+            if generated.is_empty() {
+                continue;
+            }
+
+            if !initial.rebuild
+                && initial.new_tokens.len() == 1
+                && generated.as_slice() == initial.new_tokens.as_slice()
+            {
+                let first_token = generated[0];
+                seed_drafter_from_prefill(
+                    model,
+                    drafter,
+                    prefill_input,
+                    &prefill.hidden,
+                    first_token,
+                );
+                let shape = mlxcel_core::array_shape(&prefill.hidden);
+                let last = shape[1] - 1;
+                state = ActiveMtpState {
+                    next_hidden: mlxcel_core::slice(
+                        &prefill.hidden,
+                        &[0, last, 0],
+                        &[shape[0], last + 1, shape[2]],
+                    ),
+                    bonus: first_token,
+                };
+            } else {
+                state = rebuild_mtp_state(model, drafter, prefill_input, &generated)?;
+            }
+            break;
+        }
+
+        while generated.len() < max_tokens && stop_reason == GenerationStopReason::MaxTokens {
+            let remaining = max_tokens - generated.len();
+            let proposal_count = round_proposal_count(block_size, remaining);
+            if proposal_count == 0 {
+                break;
+            }
+            let greedy = sampler_is_greedy(&sampling);
+            let (draft_tokens, proposal_probs) = rollback_constraint_transaction(
+                constraint,
+                |active| {
+                    if greedy {
+                        drafter
+                            .draft_block_greedy_constrained(
+                                model,
+                                state.bonus,
+                                &state.next_hidden,
+                                proposal_count,
+                                &sampling,
+                                prompt_tokens,
+                                &generated,
+                                &eos_tokens,
+                                active,
+                            )
+                            .map(|tokens| (tokens, None))
+                    } else {
+                        let proposals = drafter.draft_block_stochastic_constrained(
+                            model,
+                            state.bonus,
+                            &state.next_hidden,
+                            proposal_count,
+                            &sampling,
+                            prompt_tokens,
+                            &generated,
+                            &eos_tokens,
+                            active,
+                        )?;
+                        let tokens = proposals.iter().map(|proposal| proposal.token).collect();
+                        Ok((tokens, Some(proposals)))
+                    }
+                },
+            )?;
+
+            let mut verify_tokens = Vec::with_capacity(draft_tokens.len() + 1);
+            verify_tokens.push(state.bonus);
+            verify_tokens.extend_from_slice(&draft_tokens);
+            let verify_input = mlxcel_core::from_slice_i32(
+                &verify_tokens,
+                &[1, i32::try_from(verify_tokens.len()).unwrap_or(i32::MAX)],
+            );
+            let verify = model.forward_mtp_verify(&verify_input);
+            let walk = commit_constraint_transaction(constraint, |active| {
+                if let Some(proposals) = proposal_probs.as_deref() {
+                    constrained_stochastic_walk(
+                        proposals,
+                        &verify.logits,
+                        &sampling,
+                        prompt_tokens,
+                        &generated,
+                        &eos_tokens,
+                        max_tokens,
+                        active,
+                    )
+                } else {
+                    constrained_greedy_walk(
+                        &draft_tokens,
+                        &verify.logits,
+                        &sampling,
+                        prompt_tokens,
+                        &generated,
+                        &eos_tokens,
+                        max_tokens,
+                        active,
+                    )
+                }
+            })?;
+            stats.accepted_draft_tokens += walk.accepted;
+            stats.proposed_draft_tokens += draft_tokens.len();
+            generated = walk.output;
+
+            let mut callback_cancelled = false;
+            for &token in &walk.new_tokens {
+                if eos_tokens.contains(&token) {
+                    break;
+                }
+                if !on_token(token) {
+                    callback_cancelled = true;
+                    break;
+                }
+            }
+            if walk.new_tokens.is_empty()
+                && walk.rebuild
+                && generated.last().is_some_and(|&token| !on_token(token))
+            {
+                callback_cancelled = true;
+            }
+
+            if walk.rebuild {
+                if generated.is_empty() {
+                    let _ = prefill_for_input(model, prefill_input)?;
+                } else {
+                    state = rebuild_mtp_state(model, drafter, prefill_input, &generated)?;
+                }
+            } else if walk.stop_reason != Some(GenerationStopReason::Eos)
+                && !walk.new_tokens.is_empty()
+            {
+                if walk.accepted < draft_tokens.len() {
+                    model.rollback_mtp_verify(
+                        &verify.gdn_states,
+                        walk.accepted,
+                        verify_tokens.len(),
+                    );
+                }
+                drafter.accept_verified_tokens(
+                    model,
+                    &verify.hidden,
+                    &draft_tokens,
+                    walk.accepted,
+                    &walk.new_tokens,
+                );
+                let hidden_shape = mlxcel_core::array_shape(&verify.hidden);
+                let accepted = i32::try_from(walk.accepted).unwrap_or(i32::MAX);
+                state.next_hidden = mlxcel_core::slice(
+                    &verify.hidden,
+                    &[0, accepted, 0],
+                    &[hidden_shape[0], accepted + 1, hidden_shape[2]],
+                );
+                state.bonus = *walk
+                    .new_tokens
+                    .last()
+                    .expect("constrained walk emitted at least one token");
+            }
+
+            if callback_cancelled {
+                stop_reason = GenerationStopReason::CallbackCancelled;
+                break;
+            }
+            if let Some(reason) = walk.stop_reason {
+                stop_reason = reason;
+                break;
+            }
+            if generated.is_empty() {
+                let prefill = prefill_for_input(model, prefill_input)?;
+                let initial = commit_constraint_transaction(constraint, |active| {
+                    constrained_initial_step(
+                        &prefill.first_logits,
+                        &sampling,
+                        prompt_tokens,
+                        &generated,
+                        &eos_tokens,
+                        max_tokens,
+                        active,
+                    )
+                })?;
+                generated = initial.output;
+                if let Some(reason) = initial.stop_reason {
+                    stop_reason = reason;
+                    break;
+                }
+                if generated.is_empty() {
+                    continue;
+                }
+                state = rebuild_mtp_state(model, drafter, prefill_input, &generated)?;
+            }
+        }
+
+        Ok(MtpGeneration {
+            token_ids: generated,
+            stats,
+            stop_reason,
+        })
     }
 }
 
@@ -896,6 +1852,75 @@ mod tests {
         output
     }
 
+    struct RecordingConstraint {
+        committed: Vec<i32>,
+        transaction: Option<Vec<i32>>,
+        masks: Vec<Vec<i32>>,
+        splice_on: Option<(i32, ConstraintCommit)>,
+    }
+
+    impl RecordingConstraint {
+        fn active(&mut self) -> &mut Vec<i32> {
+            self.transaction.as_mut().unwrap_or(&mut self.committed)
+        }
+    }
+
+    impl TokenConstraint for RecordingConstraint {
+        fn begin_transaction(&mut self) -> Result<(), String> {
+            if self.transaction.is_some() {
+                return Err("recording transaction already active".to_string());
+            }
+            self.transaction = Some(self.committed.clone());
+            Ok(())
+        }
+
+        fn commit_transaction(&mut self) -> Result<(), String> {
+            self.committed = self
+                .transaction
+                .take()
+                .ok_or_else(|| "recording transaction not active".to_string())?;
+            Ok(())
+        }
+
+        fn rollback_transaction(&mut self) {
+            self.transaction = None;
+        }
+
+        fn compute_mask(
+            &mut self,
+            _logits: &MlxArray,
+            _token_history: &[i32],
+        ) -> Result<ConstraintMask, String> {
+            let phase = self.active().len();
+            Ok(self
+                .masks
+                .get(phase)
+                .cloned()
+                .map(ConstraintMask::Allow)
+                .unwrap_or(ConstraintMask::Accept))
+        }
+
+        fn commit_token(&mut self, token_id: i32) -> Result<ConstraintCommit, String> {
+            self.active().push(token_id);
+            Ok(self
+                .splice_on
+                .as_ref()
+                .filter(|(token, _)| *token == token_id)
+                .map(|(_, commit)| commit.clone())
+                .unwrap_or_else(|| ConstraintCommit::token(token_id)))
+        }
+    }
+
+    fn recording_constraint(phases: usize, vocab: i32) -> RecordingConstraint {
+        RecordingConstraint {
+            committed: Vec::new(),
+            transaction: None,
+            masks: vec![(0..vocab).collect(); phases],
+            splice_on: None,
+        }
+    }
+
+
     #[test]
     fn acceptance_percentage_handles_zero_and_partial() {
         assert_eq!(MtpGenerationStats::default().acceptance_percentage(), 0.0);
@@ -907,6 +1932,139 @@ mod tests {
             .acceptance_percentage(),
             25.0
         );
+    }
+
+    #[test]
+    fn constrained_greedy_walk_commits_full_partial_and_bonus_paths() {
+        let sampling = SamplingConfig::greedy();
+        let full_logits = logits_rows(&[
+            &[0.0, 10.0, 0.0, 0.0],
+            &[0.0, 0.0, 10.0, 0.0],
+            &[0.0, 0.0, 0.0, 10.0],
+        ]);
+        let mut full_constraint = recording_constraint(3, 4);
+        let full = commit_constraint_transaction(&mut full_constraint, |active| {
+            constrained_greedy_walk(
+                &[1, 2],
+                &full_logits,
+                &sampling,
+                &[9],
+                &[],
+                &[],
+                8,
+                active,
+            )
+        })
+        .expect("full constrained walk");
+        assert_eq!(full.accepted, 2);
+        assert_eq!(full.output, vec![1, 2, 3]);
+        assert_eq!(full_constraint.committed, vec![1, 2, 3]);
+
+        let partial_logits = logits_rows(&[
+            &[0.0, 10.0, 0.0, 0.0],
+            &[0.0, 0.0, 10.0, 0.0],
+            &[0.0, 0.0, 0.0, 10.0],
+        ]);
+        let mut partial_constraint = recording_constraint(3, 4);
+        let partial = commit_constraint_transaction(&mut partial_constraint, |active| {
+            constrained_greedy_walk(
+                &[1, 0],
+                &partial_logits,
+                &sampling,
+                &[9],
+                &[],
+                &[],
+                8,
+                active,
+            )
+        })
+        .expect("partial constrained walk");
+        assert_eq!(partial.accepted, 1);
+        assert_eq!(partial.output, vec![1, 2]);
+        assert_eq!(partial_constraint.committed, vec![1, 2]);
+    }
+
+    #[test]
+    fn constrained_stochastic_rejection_commits_residual_not_proposal() {
+        let sampling = stochastic_config(19);
+        seed_rng_if_needed(&sampling);
+        let proposal = MtpProposal {
+            token: 0,
+            proposal_probs: probs(&[1.0, 0.0]),
+        };
+        let target_logits = logits_rows(&[&[f32::NEG_INFINITY, 0.0], &[0.0, 0.0]]);
+        let mut constraint = recording_constraint(2, 2);
+        let walk = commit_constraint_transaction(&mut constraint, |active| {
+            constrained_stochastic_walk(
+                &[proposal],
+                &target_logits,
+                &sampling,
+                &[9],
+                &[],
+                &[],
+                4,
+                active,
+            )
+        })
+        .expect("residual constrained walk");
+        assert_eq!(walk.accepted, 0);
+        assert_eq!(walk.output, vec![1]);
+        assert_eq!(constraint.committed, vec![1]);
+    }
+
+    #[test]
+    fn constrained_backtrack_fast_forward_marks_cache_for_rebuild() {
+        let sampling = SamplingConfig::greedy();
+        let logits = logits_rows(&[&[0.0, 10.0, 0.0]]);
+        let mut constraint = recording_constraint(1, 3);
+        constraint.splice_on = Some((
+            1,
+            ConstraintCommit {
+                backtrack: 1,
+                tokens: vec![2, 0],
+                accept: true,
+            },
+        ));
+        let walk = commit_constraint_transaction(&mut constraint, |active| {
+            constrained_initial_step(
+                &logits,
+                &sampling,
+                &[9],
+                &[1],
+                &[],
+                8,
+                active,
+            )
+        })
+        .expect("spliced initial walk");
+        assert_eq!(walk.output, vec![2, 0]);
+        assert!(walk.rebuild);
+        assert_eq!(
+            walk.stop_reason,
+            Some(GenerationStopReason::ConstraintAccepted)
+        );
+    }
+
+    #[test]
+    fn constrained_eos_is_not_committed_to_parser_or_output() {
+        let sampling = SamplingConfig::greedy();
+        let logits = logits_rows(&[&[0.0, 0.0, 10.0]]);
+        let mut constraint = recording_constraint(1, 3);
+        let walk = commit_constraint_transaction(&mut constraint, |active| {
+            constrained_initial_step(
+                &logits,
+                &sampling,
+                &[9],
+                &[],
+                &[2],
+                8,
+                active,
+            )
+        })
+        .expect("EOS constrained walk");
+        assert!(walk.output.is_empty());
+        assert!(constraint.committed.is_empty());
+        assert_eq!(walk.stop_reason, Some(GenerationStopReason::Eos));
     }
 
     #[test]

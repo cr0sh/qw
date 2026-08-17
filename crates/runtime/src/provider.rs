@@ -386,6 +386,7 @@ impl Qwen35Provider {
         mut on_delta: F,
     ) -> Result<BaselineGeneration> {
         self.model.clear_prepared_mrope();
+        let buffer_output = constraint.is_some();
         let mut decoder = IncrementalTextDecoder::new(&self.tokenizer);
         let mut decode_error = None;
         let mut callback_active = true;
@@ -399,18 +400,24 @@ impl Qwen35Provider {
                 sampling,
                 constraint,
                 capture_prompt_snapshot,
-                |token_id| match decoder.push(token_id) {
-                    Ok(delta) => {
-                        if delta.is_empty() {
-                            true
-                        } else {
-                            callback_active = on_delta(&delta);
-                            callback_active
-                        }
+                |token_id| {
+                    if buffer_output {
+                        callback_active = on_delta("");
+                        return callback_active;
                     }
-                    Err(error) => {
-                        decode_error = Some(error);
-                        false
+                    match decoder.push(token_id) {
+                        Ok(delta) => {
+                            if delta.is_empty() {
+                                true
+                            } else {
+                                callback_active = on_delta(&delta);
+                                callback_active
+                            }
+                        }
+                        Err(error) => {
+                            decode_error = Some(error);
+                            false
+                        }
                     }
                 },
             )
@@ -419,9 +426,19 @@ impl Qwen35Provider {
         if let Some(error) = decode_error {
             return Err(error);
         }
-        let final_delta = decoder.finish()?;
-        if callback_active && !final_delta.is_empty() {
-            let _ = on_delta(&final_delta);
+        if buffer_output {
+            for &token_id in &controlled.token_ids {
+                let _ = decoder.push(token_id)?;
+            }
+            let _ = decoder.finish()?;
+            if callback_active && !decoder.emitted.is_empty() {
+                let _ = on_delta(&decoder.emitted);
+            }
+        } else {
+            let final_delta = decoder.finish()?;
+            if callback_active && !final_delta.is_empty() {
+                let _ = on_delta(&final_delta);
+            }
         }
         let text = decoder.emitted;
         let completion_tokens = controlled.token_ids.len();
@@ -447,6 +464,8 @@ impl Qwen35Provider {
     ) -> Result<BaselineGeneration> {
         self.model
             .prepare_mrope(&prefill.position_ids, prefill.rope_delta);
+        let buffer_output = constraint.is_some();
+        let mut callback_active = true;
         let mut decoder = IncrementalTextDecoder::new(&self.tokenizer);
         let mut decode_error = None;
         let controlled = self
@@ -461,11 +480,20 @@ impl Qwen35Provider {
                 sampling,
                 constraint,
                 false,
-                |token_id| match decoder.push(token_id) {
-                    Ok(delta) => on_delta(&delta),
-                    Err(error) => {
-                        decode_error = Some(error);
-                        false
+                |token_id| {
+                    if buffer_output {
+                        callback_active = on_delta("");
+                        return callback_active;
+                    }
+                    match decoder.push(token_id) {
+                        Ok(delta) => {
+                            callback_active = on_delta(&delta);
+                            callback_active
+                        }
+                        Err(error) => {
+                            decode_error = Some(error);
+                            false
+                        }
                     }
                 },
             )
@@ -474,9 +502,19 @@ impl Qwen35Provider {
         if let Some(error) = decode_error {
             return Err(error);
         }
-        let final_delta = decoder.finish()?;
-        if !final_delta.is_empty() {
-            let _ = on_delta(&final_delta);
+        if buffer_output {
+            for &token_id in &controlled.token_ids {
+                let _ = decoder.push(token_id)?;
+            }
+            let _ = decoder.finish()?;
+            if callback_active && !decoder.emitted.is_empty() {
+                let _ = on_delta(&decoder.emitted);
+            }
+        } else {
+            let final_delta = decoder.finish()?;
+            if callback_active && !final_delta.is_empty() {
+                let _ = on_delta(&final_delta);
+            }
         }
         let completion_tokens = controlled.token_ids.len();
         Ok(BaselineGeneration {
@@ -496,6 +534,7 @@ impl Qwen35Provider {
         max_tokens: usize,
         sampling: &SamplingConfig,
         block_size: usize,
+        constraint: Option<&mut dyn TokenConstraint>,
         on_delta: F,
     ) -> Result<BaselineGeneration> {
         self.generate_mtp_streaming_for_prompt(
@@ -503,6 +542,7 @@ impl Qwen35Provider {
             max_tokens,
             sampling,
             block_size,
+            constraint,
             on_delta,
         )
         .map(|(generation, _)| generation)
@@ -514,6 +554,7 @@ impl Qwen35Provider {
         max_tokens: usize,
         sampling: &SamplingConfig,
         block_size: usize,
+        constraint: Option<&mut dyn TokenConstraint>,
         on_delta: F,
     ) -> Result<BaselineGeneration> {
         self.generate_mtp_streaming_for_prompt(
@@ -521,6 +562,7 @@ impl Qwen35Provider {
             max_tokens,
             sampling,
             block_size,
+            constraint,
             on_delta,
         )
         .map(|(generation, _)| generation)
@@ -532,6 +574,7 @@ impl Qwen35Provider {
         max_tokens: usize,
         sampling: &SamplingConfig,
         block_size: usize,
+        constraint: Option<&mut dyn TokenConstraint>,
         mut on_delta: F,
     ) -> Result<(BaselineGeneration, MtpGenerationStats)> {
         ensure!(block_size >= 2, "MTP block size must be at least 2");
@@ -539,6 +582,7 @@ impl Qwen35Provider {
             self.mtp_generator.is_some(),
             "the loaded checkpoint does not contain a bundled Qwen 3.5 MTP head"
         );
+        let buffer_output = constraint.is_some();
         let prompt_tokens = match &prompt {
             MtpPrompt::Text { prompt_ids } => prompt_ids.len(),
             MtpPrompt::Multimodal(prefill) => prefill.prompt_ids.len(),
@@ -557,18 +601,25 @@ impl Qwen35Provider {
                 max_tokens,
                 sampling,
                 block_size,
-                |token_id| match decoder.push(token_id) {
-                    Ok(delta) => {
-                        if delta.is_empty() {
-                            true
-                        } else {
-                            callback_active = on_delta(&delta);
-                            callback_active
-                        }
+                constraint,
+                |token_id| {
+                    if buffer_output {
+                        callback_active = on_delta("");
+                        return callback_active;
                     }
-                    Err(error) => {
-                        decode_error = Some(error);
-                        false
+                    match decoder.push(token_id) {
+                        Ok(delta) => {
+                            if delta.is_empty() {
+                                true
+                            } else {
+                                callback_active = on_delta(&delta);
+                                callback_active
+                            }
+                        }
+                        Err(error) => {
+                            decode_error = Some(error);
+                            false
+                        }
                     }
                 },
             ),
@@ -581,28 +632,47 @@ impl Qwen35Provider {
                 max_tokens,
                 sampling,
                 block_size,
-                |token_id| match decoder.push(token_id) {
-                    Ok(delta) => {
-                        if delta.is_empty() {
-                            true
-                        } else {
-                            callback_active = on_delta(&delta);
-                            callback_active
-                        }
+                constraint,
+                |token_id| {
+                    if buffer_output {
+                        callback_active = on_delta("");
+                        return callback_active;
                     }
-                    Err(error) => {
-                        decode_error = Some(error);
-                        false
+                    match decoder.push(token_id) {
+                        Ok(delta) => {
+                            if delta.is_empty() {
+                                true
+                            } else {
+                                callback_active = on_delta(&delta);
+                                callback_active
+                            }
+                        }
+                        Err(error) => {
+                            decode_error = Some(error);
+                            false
+                        }
                     }
                 },
             ),
-        };
+        }
+        .map_err(anyhow::Error::msg)
+        .context("MTP generation failed")?;
         if let Some(error) = decode_error {
             return Err(error);
         }
-        let final_delta = decoder.finish()?;
-        if callback_active && !final_delta.is_empty() {
-            let _ = on_delta(&final_delta);
+        if buffer_output {
+            for &token_id in &generated.token_ids {
+                let _ = decoder.push(token_id)?;
+            }
+            let _ = decoder.finish()?;
+            if callback_active && !decoder.emitted.is_empty() {
+                let _ = on_delta(&decoder.emitted);
+            }
+        } else {
+            let final_delta = decoder.finish()?;
+            if callback_active && !final_delta.is_empty() {
+                let _ = on_delta(&final_delta);
+            }
         }
         let completion_tokens = generated.token_ids.len();
         Ok((
@@ -663,6 +733,7 @@ impl Qwen35Provider {
             request.max_tokens,
             &sampling,
             DEFAULT_MTP_BLOCK_SIZE,
+            None,
             on_delta,
         )?;
         Ok((
