@@ -492,6 +492,11 @@ impl Qwen35MtpDraftModel {
     }
 }
 
+fn materialize_borrowed(array: &MlxArray) {
+    mlxcel_core::eval(array);
+    unsafe { mlxcel_core::detach_all(&[array as *const MlxArray]) };
+}
+
 fn materialize_detached(array: UniquePtr<MlxArray>) -> UniquePtr<MlxArray> {
     mlxcel_core::eval(&array);
     let ptr = array
@@ -1202,6 +1207,10 @@ fn prefill_for_input(
                 rope_delta,
                 false,
             );
+            materialize_borrowed(hidden);
+            drafter.materialize_state();
+            model.materialize_mtp_cache_state();
+            mlxcel_core::clear_memory_cache();
         },
     )
 }
@@ -1231,6 +1240,10 @@ fn seed_drafter_from_prefill(
         rope_delta,
         true,
     );
+    materialize_borrowed(final_hidden);
+    drafter.materialize_state();
+    model.materialize_mtp_cache_state();
+    mlxcel_core::clear_memory_cache();
 }
 fn rebuild_mtp_state(
     model: &Qwen35Model,
