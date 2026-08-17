@@ -37,8 +37,6 @@ pub struct Qwen3VLVisionConfig {
     #[serde(default = "default_depth")]
     pub depth: usize,
     pub hidden_size: usize,
-    #[serde(default = "default_intermediate_size")]
-    pub intermediate_size: usize,
     #[serde(default = "default_out_hidden_size")]
     pub out_hidden_size: usize,
     #[serde(default = "default_num_heads")]
@@ -67,9 +65,6 @@ pub struct Qwen3VLVisionConfig {
 
 fn default_depth() -> usize {
     32
-}
-fn default_intermediate_size() -> usize {
-    3420
 }
 fn default_out_hidden_size() -> usize {
     1536

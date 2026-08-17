@@ -77,7 +77,7 @@ impl Qwen3NextConfig {
 // Cache Types.
 /// Mixed cache type for Qwen3Next layers
 pub enum Qwen3NextCache {
-    Attention(KVCache),
+    Attention(Box<KVCache>),
     Linear(GatedDeltaCache),
 }
 
@@ -370,13 +370,13 @@ impl Qwen3NextAttention {
 
 // Dense MLP.
 /// Dense MLP layer
-pub(crate) struct MLP {
+pub(crate) struct Mlp {
     gate_proj: UnifiedLinear,
     up_proj: UnifiedLinear,
     down_proj: UnifiedLinear,
 }
 
-impl MLP {
+impl Mlp {
     pub(crate) fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
         let gated = self.forward_hidden(x);
         self.down_proj.forward(&gated)

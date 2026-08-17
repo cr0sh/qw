@@ -25,7 +25,7 @@ use crate::qwen_mrope_state::MRopeState;
 use crate::qwen3_vl_vision::{Qwen3VLVisionConfig, Qwen3VLVisionEncoder};
 use crate::qwen_vl_position::decode_rope_positions;
 use crate::qwen3_next::{
-    MLP, Quantization, Qwen3NextAttention, Qwen3NextCache, Qwen3NextConfig,
+    Mlp, Quantization, Qwen3NextAttention, Qwen3NextCache, Qwen3NextConfig,
 };
 use anyhow::{Context, Result, ensure};
 use mlxcel_core::cache::SequenceId;
@@ -477,13 +477,8 @@ impl Qwen35GatedDeltaNet {
 
         // Run gated delta update (use guarded_mask which is None if batch dims mismatch)
         let (out, new_state) = gated_delta_update(
-            &q,
-            &k,
-            &v,
-            &a,
-            &b_proj,
-            &self.a_log,
-            &self.dt_bias,
+            (&q, &k, &v),
+            (&a, &b_proj, &self.a_log, &self.dt_bias),
             state.as_deref(),
             guarded_mask,
         );
@@ -597,7 +592,7 @@ pub(crate) enum Qwen35AttentionVariant {
 pub(crate) struct Qwen35DecoderLayer {
     pub(crate) is_linear: bool,
     pub(crate) attention: Qwen35AttentionVariant,
-    pub(crate) mlp: MLP,
+    pub(crate) mlp: Mlp,
     pub(crate) input_layernorm: RMSNorm,
     pub(crate) post_attention_layernorm: RMSNorm,
 }
@@ -730,7 +725,7 @@ impl Qwen35DecoderLayer {
             )?)
         };
 
-        let mlp = MLP::from_weights(weights, qn_config, &format!("{}.mlp", prefix))?;
+        let mlp = Mlp::from_weights(weights, qn_config, &format!("{}.mlp", prefix))?;
 
         let input_norm_weight = weights
             .get(&format!("{}.input_layernorm.weight", prefix))
@@ -809,50 +804,12 @@ impl Qwen35Model {
         hidden
     }
 
-    fn forward_hidden(
-        &self,
-        input_ids: &MlxArray,
-        caches: &mut [Qwen3NextCache],
-    ) -> UniquePtr<MlxArray> {
-        self.norm.forward(&self.forward_backbone(input_ids, caches))
-    }
-
     pub(crate) fn project_logits(&self, hidden: &MlxArray) -> UniquePtr<MlxArray> {
         if let Some(lm_head) = &self.lm_head {
             lm_head.forward(hidden)
         } else {
             self.embed_tokens.as_linear(hidden)
         }
-    }
-
-    fn forward_internal(
-        &self,
-        input_ids: &MlxArray,
-        caches: &mut [Qwen3NextCache],
-    ) -> UniquePtr<MlxArray> {
-        let hidden = self.forward_hidden(input_ids, caches);
-        self.project_logits(&hidden)
-    }
-
-    fn forward_last_internal(
-        &self,
-        input_ids: &MlxArray,
-        caches: &mut [Qwen3NextCache],
-        last_pos: usize,
-    ) -> UniquePtr<MlxArray> {
-        let hidden = self.forward_hidden(input_ids, caches);
-        let shape = mlxcel_core::array_shape(&hidden);
-        let batch = shape[0];
-        let seq_len = shape[1];
-        let hidden_size = shape[2];
-        let position = i32::try_from(last_pos).unwrap_or(i32::MAX);
-        assert!(position < seq_len, "last logits position is outside the input sequence");
-        let last_hidden = mlxcel_core::slice(
-            &hidden,
-            &[0, position, 0],
-            &[batch, position + 1, hidden_size],
-        );
-        self.project_logits(&last_hidden)
     }
 
     fn make_internal_caches(&self) -> Vec<Qwen3NextCache> {
@@ -862,7 +819,7 @@ impl Qwen35Model {
                 if layer.is_linear {
                     Qwen3NextCache::Linear(GatedDeltaCache::new())
                 } else {
-                    Qwen3NextCache::Attention(KVCache::new())
+                    Qwen3NextCache::Attention(Box::new(KVCache::new()))
                 }
             })
             .collect()
@@ -1004,10 +961,10 @@ impl Qwen35Model {
             let verify_offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
             let plan = rollback_plan(verify_offset, accepted, block_size);
             for cache in caches.iter_mut() {
-                if let Qwen3NextCache::Attention(cache) = cache {
-                    if plan.trim > 0 {
-                        cache.trim(plan.trim);
-                    }
+                if let Qwen3NextCache::Attention(cache) = cache
+                    && plan.trim > 0
+                {
+                    cache.trim(plan.trim);
                 }
             }
 
@@ -1052,13 +1009,8 @@ impl Qwen35Model {
                     &[b_shape[0], replay_len, b_shape[2]],
                 );
                 let (_, replayed_state) = gated_delta_update(
-                    &q,
-                    &k,
-                    &v,
-                    &a,
-                    &b,
-                    &layer.a_log,
-                    &layer.dt_bias,
+                    (&q, &k, &v),
+                    (&a, &b, &layer.a_log, &layer.dt_bias),
                     snapshot.init_state.as_deref(),
                     None,
                 );
@@ -1184,21 +1136,20 @@ impl Qwen35Model {
         );
         config.validate_mtp_metadata(&config_path)?;
         let root_quantization = config.quantization.clone();
-        if let Some(vision) = config.vision_config.as_mut() {
-            if let Some(quantization) = vision
+        if let Some(vision) = config.vision_config.as_mut()
+            && let Some(quantization) = vision
                 .quantization_config
                 .as_ref()
                 .or(root_quantization.as_ref())
-            {
-                ensure!(
-                    quantization.mode == "affine",
-                    "unsupported vision quantization mode {:?} in {}",
-                    quantization.mode,
-                    config_path.display()
-                );
-                vision.quant_group_size = quantization.group_size;
-                vision.quant_bits = quantization.bits;
-            }
+        {
+            ensure!(
+                quantization.mode == "affine",
+                "unsupported vision quantization mode {:?} in {}",
+                quantization.mode,
+                config_path.display()
+            );
+            vision.quant_group_size = quantization.group_size;
+            vision.quant_bits = quantization.bits;
         }
         if let Some(vision) = config.vision_config.as_ref() {
             ensure!(
@@ -1390,7 +1341,7 @@ impl Qwen35Model {
                 if layer.is_linear {
                     Qwen3NextCache::Linear(GatedDeltaCache::new())
                 } else {
-                    Qwen3NextCache::Attention(KVCache::new())
+                    Qwen3NextCache::Attention(Box::new(KVCache::new()))
                 }
             })
             .collect();
@@ -1408,12 +1359,7 @@ impl Qwen35Model {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn config(&self) -> &Qwen35Config {
-        &self.config
-    }
 }
-
 
 fn validate_quantization(value: &Value, config_path: &Path) -> Result<()> {
     let object = value.as_object().with_context(|| {
@@ -2039,7 +1985,7 @@ impl LanguageModel for Qwen35Model {
                 cache.keys = Some(mlxcel_core::copy(keys));
                 cache.values = Some(mlxcel_core::copy(values));
                 cache.offset = token_len;
-                restored.push(Qwen3NextCache::Attention(cache));
+                restored.push(Qwen3NextCache::Attention(Box::new(cache)));
             }
         }
 

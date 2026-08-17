@@ -470,7 +470,7 @@ mod tests {
         let mut linear = GatedDeltaCache::new();
         linear.offset = plan.final_offset;
         let caches = [
-            Qwen3NextCache::Attention(attention),
+            Qwen3NextCache::Attention(Box::new(attention)),
             Qwen3NextCache::Linear(linear),
         ];
         assert_eq!(caches[0].offset(), plan.final_offset);

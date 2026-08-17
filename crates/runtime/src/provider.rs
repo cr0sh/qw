@@ -803,18 +803,13 @@ mod tests {
     #[test]
     fn incremental_decoder_withholds_split_utf8_replacement_text() {
         let mut emitted = String::new();
-        let mut deltas = Vec::new();
-        deltas.push(
+        let deltas = [
             advance_decoded_text(&mut emitted, "\u{fffd}", false)
                 .expect("first byte-fallback token"),
-        );
-        deltas.push(
             advance_decoded_text(&mut emitted, "\u{fffd}", false)
                 .expect("second byte-fallback token"),
-        );
-        deltas.push(
             advance_decoded_text(&mut emitted, "你", false).expect("completed UTF-8 sequence"),
-        );
+        ];
         assert_eq!(deltas.concat(), "你");
         assert_eq!(emitted, "你");
         assert!(!emitted.contains('\u{fffd}'));
