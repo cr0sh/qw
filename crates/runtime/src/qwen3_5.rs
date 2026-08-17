@@ -230,12 +230,12 @@ pub(crate) struct GdnRollbackSnapshot {
 
 pub(crate) struct Qwen35MtpPrefill {
     pub(crate) hidden: UniquePtr<MlxArray>,
-    pub(crate) first_token: i32,
+    pub(crate) first_logits: UniquePtr<MlxArray>,
 }
 
 pub(crate) struct Qwen35MtpVerifyOutput {
     pub(crate) hidden: UniquePtr<MlxArray>,
-    pub(crate) target_tokens: Vec<i32>,
+    pub(crate) logits: UniquePtr<MlxArray>,
     pub(crate) gdn_states: Vec<GdnRollbackSnapshot>,
 }
 
@@ -641,6 +641,7 @@ impl Qwen35DecoderLayer {
         x: &MlxArray,
         mask: Option<&MlxArray>,
         cache: &mut Qwen3NextCache,
+        position_ids: Option<&MlxArray>,
         snapshots: &mut Vec<GdnRollbackSnapshot>,
     ) -> UniquePtr<MlxArray> {
         let normed = self.input_layernorm.forward(x);
@@ -652,11 +653,11 @@ impl Qwen35DecoderLayer {
                 attn.forward_with_capture(layer_idx, &normed, mask, None, snapshots)
             }
             (Qwen35AttentionVariant::FullAttention(attn), Qwen3NextCache::Attention(cache)) => {
-                attn.forward_verify(&normed, cache, mask)
+                attn.forward_verify(&normed, cache, mask, position_ids)
             }
             (Qwen35AttentionVariant::FullAttention(attn), _) => {
                 let mut temporary = KVCache::new();
-                attn.forward_verify(&normed, &mut temporary, mask)
+                attn.forward_verify(&normed, &mut temporary, mask, position_ids)
             }
         };
         let hidden = mlxcel_core::add(x, &residual);
@@ -671,11 +672,12 @@ impl Qwen35DecoderLayer {
         x: &MlxArray,
         mask: Option<&MlxArray>,
         cache: &mut KVCache,
+        position_ids: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
         let normed = self.input_layernorm.forward(x);
         let residual = match &self.attention {
             Qwen35AttentionVariant::FullAttention(attention) => {
-                attention.forward(&normed, cache, mask)
+                attention.forward_with_position_ids(&normed, cache, mask, position_ids)
             }
             Qwen35AttentionVariant::Linear(_) => {
                 unreachable!("the bundled MTP layer must use full attention")
@@ -763,13 +765,6 @@ pub struct Qwen35Model {
 }
 
 impl Qwen35Model {
-    fn forward_backbone(
-        &self,
-        input_ids: &MlxArray,
-        caches: &mut [Qwen3NextCache],
-    ) -> UniquePtr<MlxArray> {
-        self.forward_backbone_with_inputs(input_ids, None, caches, None)
-    }
 
     fn forward_backbone_with_inputs(
         &self,
@@ -879,8 +874,40 @@ impl Qwen35Model {
     }
 
     pub(crate) fn forward_mtp_prefill(&self, input_ids: &MlxArray) -> Qwen35MtpPrefill {
-        let (hidden, first_token, offset) = self.sequence_state.with_internal(|caches| {
-            let hidden = self.forward_backbone(input_ids, caches);
+        self.reset_runtime_state();
+        self.forward_mtp_prefill_with_inputs(input_ids, None, None)
+    }
+
+    pub(crate) fn forward_mtp_prefill_with_embeddings(
+        &self,
+        input_ids: &MlxArray,
+        input_embeddings: &MlxArray,
+        position_ids: &MlxArray,
+        rope_delta: i32,
+    ) -> std::result::Result<Qwen35MtpPrefill, String> {
+        self.reset_runtime_state();
+        self.mrope_state.prepare(position_ids, rope_delta);
+        self.mrope_state.activate_prepared()?;
+        let output = self.mrope_state.with_position_ids(|position_ids| {
+            self.forward_mtp_prefill_with_inputs(
+                input_ids,
+                Some(input_embeddings),
+                position_ids,
+            )
+        });
+        self.mrope_state.finish_prefill();
+        Ok(output)
+    }
+
+    fn forward_mtp_prefill_with_inputs(
+        &self,
+        input_ids: &MlxArray,
+        input_embeddings: Option<&MlxArray>,
+        position_ids: Option<&MlxArray>,
+    ) -> Qwen35MtpPrefill {
+        let (hidden, first_logits, offset) = self.sequence_state.with_internal(|caches| {
+            let hidden =
+                self.forward_backbone_with_inputs(input_ids, input_embeddings, caches, position_ids);
             let shape = mlxcel_core::array_shape(&hidden);
             let last_position = shape[1] - 1;
             let last_hidden = mlxcel_core::slice(
@@ -888,18 +915,14 @@ impl Qwen35Model {
                 &[0, last_position, 0],
                 &[shape[0], last_position + 1, shape[2]],
             );
-            let normalized = self.norm.forward(&last_hidden);
-            let logits = self.project_logits(&normalized);
-            let token = mlxcel_core::argmax_last_axis(&logits);
-            mlxcel_core::eval(&token);
-            let first_token = mlxcel_core::item_i32(&token);
+            let first_logits = self.project_logits(&self.norm.forward(&last_hidden));
             let offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
-            (hidden, first_token, offset)
+            (hidden, first_logits, offset)
         });
         self.mrope_state.set_position(offset);
         Qwen35MtpPrefill {
             hidden,
-            first_token,
+            first_logits,
         }
     }
 
@@ -907,20 +930,20 @@ impl Qwen35Model {
         &self,
         input_ids: &MlxArray,
     ) -> Qwen35MtpVerifyOutput {
+        let rope_delta = self.mrope_state.rope_delta();
         let (output, offset) = self.sequence_state.with_internal(|caches| {
             let mut hidden = self.embed_tokens.forward(input_ids);
             let shape = mlxcel_core::array_shape(&hidden);
             let seq_len = shape[1];
             let attention_layer = self.config.full_attention_interval.saturating_sub(1);
-            let attention_mask = if seq_len > 1 {
-                let offset = caches
-                    .get(attention_layer)
-                    .map(Qwen3NextCache::offset)
-                    .unwrap_or(0);
-                Some(create_causal_mask(seq_len, offset))
-            } else {
-                None
-            };
+            let cache_offset = caches
+                .get(attention_layer)
+                .map(Qwen3NextCache::offset)
+                .unwrap_or(0);
+            let attention_mask = (seq_len > 1)
+                .then(|| create_causal_mask(seq_len, cache_offset));
+            let position_ids =
+                rope_delta.map(|delta| decode_rope_positions(cache_offset, seq_len, delta));
             let mut gdn_states = Vec::new();
             for (layer_idx, (layer, cache)) in
                 self.layers.iter().zip(caches.iter_mut()).enumerate()
@@ -930,18 +953,21 @@ impl Qwen35Model {
                 } else {
                     attention_mask.as_deref()
                 };
-                hidden =
-                    layer.forward_with_capture(layer_idx, &hidden, mask, cache, &mut gdn_states);
+                hidden = layer.forward_with_capture(
+                    layer_idx,
+                    &hidden,
+                    mask,
+                    cache,
+                    position_ids.as_deref(),
+                    &mut gdn_states,
+                );
             }
-            let normalized = self.norm.forward(&hidden);
-            let logits = self.project_logits(&normalized);
-            let argmax = mlxcel_core::argmax_last_axis(&logits);
-            let target_tokens = materialize_i32(&argmax, seq_len as usize);
+            let logits = self.project_logits(&self.norm.forward(&hidden));
             let offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
             (
                 Qwen35MtpVerifyOutput {
                     hidden,
-                    target_tokens,
+                    logits,
                     gdn_states,
                 },
                 offset,
@@ -1636,39 +1662,6 @@ fn sanitize_mtp_weights(mut weights: WeightMap, raw_layout: bool) -> WeightMap {
     weights
 }
 
-fn materialize_i32(array: &MlxArray, expected_len: usize) -> Vec<i32> {
-    let bytes = mlxcel_core::array_evaluated_bytes(array);
-    match mlxcel_core::array_itemsize(array) {
-        4 => bytes
-            .chunks_exact(4)
-            .take(expected_len)
-            .map(|chunk| i32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .collect(),
-        8 => bytes
-            .chunks_exact(8)
-            .take(expected_len)
-            .map(|chunk| {
-                i64::from_ne_bytes([
-                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6],
-                    chunk[7],
-                ]) as i32
-            })
-            .collect(),
-        _ => {
-            let flat = mlxcel_core::reshape(array, &[expected_len as i32]);
-            (0..expected_len)
-                .map(|index| {
-                    let cell = mlxcel_core::slice(
-                        &flat,
-                        &[index as i32],
-                        &[(index + 1) as i32],
-                    );
-                    mlxcel_core::item_i32(&mlxcel_core::reshape(&cell, &[]))
-                })
-                .collect()
-        }
-    }
-}
 
 const QWEN35_SNAPSHOT_FAMILY: &str = "qwen3.5-target-v1";
 

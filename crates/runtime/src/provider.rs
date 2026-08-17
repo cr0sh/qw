@@ -23,7 +23,7 @@ use crate::qwen3_5::Qwen35Model;
 pub use crate::qwen3_5_mtp::MtpGenerationStats;
 use crate::qwen3_5_mtp::Qwen35MtpGenerator;
 
-const PRODUCTION_MTP_BLOCK_SIZE: usize = 4;
+const DEFAULT_MTP_BLOCK_SIZE: usize = 3;
 
 #[derive(Debug, Clone)]
 pub struct GenerationRequest {
@@ -56,6 +56,11 @@ pub struct PreparedMultimodalPrefill {
     input_embeddings: UniquePtr<MlxArray>,
     position_ids: UniquePtr<MlxArray>,
     rope_delta: i32,
+}
+
+enum MtpPrompt<'a> {
+    Text { prompt_ids: &'a [i32] },
+    Multimodal(PreparedMultimodalPrefill),
 }
 
 struct IncrementalTextDecoder<'a> {
@@ -220,6 +225,10 @@ impl Qwen35Provider {
 
     pub fn supports_image_inputs(&self) -> bool {
         self.vision_processor.is_some() && self.model.has_vision()
+    }
+
+    pub fn has_mtp(&self) -> bool {
+        self.mtp_generator.is_some()
     }
 
     pub fn render_messages(
@@ -481,6 +490,135 @@ impl Qwen35Provider {
         })
     }
 
+    pub fn generate_mtp_streaming<F: FnMut(&str) -> bool>(
+        &mut self,
+        prompt_ids: &[i32],
+        max_tokens: usize,
+        sampling: &SamplingConfig,
+        block_size: usize,
+        on_delta: F,
+    ) -> Result<BaselineGeneration> {
+        self.generate_mtp_streaming_for_prompt(
+            MtpPrompt::Text { prompt_ids },
+            max_tokens,
+            sampling,
+            block_size,
+            on_delta,
+        )
+        .map(|(generation, _)| generation)
+    }
+
+    pub fn generate_mtp_multimodal_streaming<F: FnMut(&str) -> bool>(
+        &mut self,
+        prefill: PreparedMultimodalPrefill,
+        max_tokens: usize,
+        sampling: &SamplingConfig,
+        block_size: usize,
+        on_delta: F,
+    ) -> Result<BaselineGeneration> {
+        self.generate_mtp_streaming_for_prompt(
+            MtpPrompt::Multimodal(prefill),
+            max_tokens,
+            sampling,
+            block_size,
+            on_delta,
+        )
+        .map(|(generation, _)| generation)
+    }
+
+    fn generate_mtp_streaming_for_prompt<F: FnMut(&str) -> bool>(
+        &mut self,
+        prompt: MtpPrompt<'_>,
+        max_tokens: usize,
+        sampling: &SamplingConfig,
+        block_size: usize,
+        mut on_delta: F,
+    ) -> Result<(BaselineGeneration, MtpGenerationStats)> {
+        ensure!(block_size >= 2, "MTP block size must be at least 2");
+        ensure!(
+            self.mtp_generator.is_some(),
+            "the loaded checkpoint does not contain a bundled Qwen 3.5 MTP head"
+        );
+        let prompt_tokens = match &prompt {
+            MtpPrompt::Text { prompt_ids } => prompt_ids.len(),
+            MtpPrompt::Multimodal(prefill) => prefill.prompt_ids.len(),
+        };
+        let mut decoder = IncrementalTextDecoder::new(&self.tokenizer);
+        let mut decode_error = None;
+        let mut callback_active = true;
+        let generator = self
+            .mtp_generator
+            .as_mut()
+            .expect("MTP capability was validated");
+        let generated = match prompt {
+            MtpPrompt::Text { prompt_ids } => generator.generate_streaming(
+                &self.model,
+                prompt_ids,
+                max_tokens,
+                sampling,
+                block_size,
+                |token_id| match decoder.push(token_id) {
+                    Ok(delta) => {
+                        if delta.is_empty() {
+                            true
+                        } else {
+                            callback_active = on_delta(&delta);
+                            callback_active
+                        }
+                    }
+                    Err(error) => {
+                        decode_error = Some(error);
+                        false
+                    }
+                },
+            ),
+            MtpPrompt::Multimodal(prefill) => generator.generate_streaming_with_embeddings(
+                &self.model,
+                &prefill.prompt_ids,
+                &prefill.input_embeddings,
+                &prefill.position_ids,
+                prefill.rope_delta,
+                max_tokens,
+                sampling,
+                block_size,
+                |token_id| match decoder.push(token_id) {
+                    Ok(delta) => {
+                        if delta.is_empty() {
+                            true
+                        } else {
+                            callback_active = on_delta(&delta);
+                            callback_active
+                        }
+                    }
+                    Err(error) => {
+                        decode_error = Some(error);
+                        false
+                    }
+                },
+            ),
+        };
+        if let Some(error) = decode_error {
+            return Err(error);
+        }
+        let final_delta = decoder.finish()?;
+        if callback_active && !final_delta.is_empty() {
+            let _ = on_delta(&final_delta);
+        }
+        let completion_tokens = generated.token_ids.len();
+        Ok((
+            BaselineGeneration {
+                text: decoder.emitted,
+                token_ids: generated.token_ids,
+                prompt_tokens,
+                completion_tokens,
+                cached_tokens: 0,
+                finish_outcome: generated.stop_reason,
+                prompt_snapshot: None,
+            },
+            generated.stats,
+        ))
+    }
+
     pub fn generate_streaming<F: FnMut(&str) -> bool>(
         &mut self,
         request: &GenerationRequest,
@@ -495,10 +633,10 @@ impl Qwen35Provider {
         &mut self,
         request: &GenerationRequest,
         mode: Qwen35GenerationMode,
-        mut on_delta: F,
+        on_delta: F,
     ) -> Result<(GenerationOutput, Option<MtpGenerationStats>)> {
         let (prompt_ids, sampling) = self.prepare_generation(request)?;
-        let use_mtp = self.resolve_generation_mode(mode, &sampling)?;
+        let use_mtp = self.resolve_generation_mode(mode)?;
         if !use_mtp {
             let generation = self.generate_baseline_streaming(
                 &prompt_ids,
@@ -518,68 +656,32 @@ impl Qwen35Provider {
             ));
         }
 
-        let mut decoder = IncrementalTextDecoder::new(&self.tokenizer);
-        let mut decode_error = None;
-        let mut callback_active = true;
-        let (token_ids, stats) = self
-            .mtp_generator
-            .as_mut()
-            .expect("MTP mode requires an initialized generator")
-            .generate_streaming(
-                &self.model,
-                &prompt_ids,
-                request.max_tokens,
-                &sampling,
-                PRODUCTION_MTP_BLOCK_SIZE,
-                |token_id| match decoder.push(token_id) {
-                    Ok(delta) => {
-                        if delta.is_empty() {
-                            true
-                        } else {
-                            callback_active = on_delta(&delta);
-                            callback_active
-                        }
-                    }
-                    Err(error) => {
-                        decode_error = Some(error);
-                        false
-                    }
-                },
-            );
-        if let Some(error) = decode_error {
-            return Err(error);
-        }
-        let final_delta = decoder.finish()?;
-        if callback_active && !final_delta.is_empty() {
-            let _ = on_delta(&final_delta);
-        }
+        let (generation, stats) = self.generate_mtp_streaming_for_prompt(
+            MtpPrompt::Text {
+                prompt_ids: &prompt_ids,
+            },
+            request.max_tokens,
+            &sampling,
+            DEFAULT_MTP_BLOCK_SIZE,
+            on_delta,
+        )?;
         Ok((
             GenerationOutput {
-                text: decoder.emitted,
-                token_ids,
+                text: generation.text,
+                token_ids: generation.token_ids,
             },
             Some(stats),
         ))
     }
 
-    fn resolve_generation_mode(
-        &self,
-        mode: Qwen35GenerationMode,
-        sampling: &SamplingConfig,
-    ) -> Result<bool> {
+    fn resolve_generation_mode(&self, mode: Qwen35GenerationMode) -> Result<bool> {
         match mode {
-            Qwen35GenerationMode::Automatic => {
-                Ok(self.mtp_generator.is_some() && sampling.temperature == 0.0)
-            }
+            Qwen35GenerationMode::Automatic => Ok(self.mtp_generator.is_some()),
             Qwen35GenerationMode::Baseline => Ok(false),
             Qwen35GenerationMode::Mtp => {
                 ensure!(
                     self.mtp_generator.is_some(),
                     "the loaded checkpoint does not contain a bundled Qwen 3.5 MTP head"
-                );
-                ensure!(
-                    sampling.temperature == 0.0,
-                    "Qwen 3.5 MTP decoding is available only for greedy requests"
                 );
                 Ok(true)
             }
