@@ -65,12 +65,13 @@ async fn main() -> Result<()> {
         .with_context(|| format!("invalid --bind address {:?}", cli.bind))?;
     info!(phase = "server.starting", bind = %bind);
 
+    let kv_cache_mode = cli.kv_cache_mode();
     let engine = Engine::start_qwen(
         cli.model,
         cli.model_id,
         cli.prefix_cache_max_tokens,
         cli.mtp_k,
-        cli.kv_cache_mode(),
+        kv_cache_mode,
     )?;
     let listener = tokio::net::TcpListener::bind(bind)
         .await
