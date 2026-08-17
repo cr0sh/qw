@@ -171,22 +171,64 @@ impl ModelStateSnapshot {
 pub enum ConstraintMask {
     /// Continue generation with exactly these token IDs enabled.
     Allow(Vec<i32>),
+    /// Apply a parser-requested output splice without sampling a model token.
+    Splice(ConstraintCommit),
     /// The grammar is accepting and no further token is required.
     Accept,
 }
 
-/// Result of committing a sampled token to a generation constraint.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConstraintCommit {
-    Continue,
-    Accept,
+/// Canonical output transition produced by a generation constraint.
+///
+/// The transition is applied to the output as it existed before the sampled
+/// token: remove `backtrack` tokens, append `tokens`, then stop when `accept`
+/// is set. A normal sampled-token commit is therefore
+/// `ConstraintCommit::token(token_id)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstraintCommit {
+    pub backtrack: usize,
+    pub tokens: Vec<i32>,
+    pub accept: bool,
+}
+
+impl ConstraintCommit {
+    pub fn token(token_id: i32) -> Self {
+        Self {
+            backtrack: 0,
+            tokens: vec![token_id],
+            accept: false,
+        }
+    }
+
+    pub fn apply_to(&self, output: &mut Vec<i32>) -> Result<(), String> {
+        if self.backtrack > output.len() {
+            return Err(format!(
+                "generation constraint attempted to backtrack {} tokens from an output of length {}",
+                self.backtrack,
+                output.len()
+            ));
+        }
+        output.truncate(output.len() - self.backtrack);
+        output.extend_from_slice(&self.tokens);
+        Ok(())
+    }
+
+    pub fn is_token(&self, token_id: i32) -> bool {
+        self.backtrack == 0 && self.tokens.as_slice() == [token_id]
+    }
 }
 
 /// Engine-neutral constraint interface for single-sequence generation.
 ///
-/// Implementations compute a vocabulary mask before sampling and advance only
-/// after the selected token has been committed to the output stream.
+/// Speculative callers fork the state before drafting, roll that state back
+/// after proposal construction, then fork again for target verification and
+/// commit only the accepted target path. Transactions are single-level.
 pub trait TokenConstraint {
+    fn begin_transaction(&mut self) -> Result<(), String>;
+
+    fn commit_transaction(&mut self) -> Result<(), String>;
+
+    fn rollback_transaction(&mut self);
+
     fn compute_mask(
         &mut self,
         logits: &MlxArray,
@@ -409,7 +451,7 @@ fn chunked_prefill_last_logits<M: LanguageModel + ?Sized>(
     logits.expect("chunked_prefill_last_logits requires a non-empty prompt")
 }
 
-fn mask_logits_to_allowed(
+pub fn mask_logits_to_allowed(
     logits: &MlxArray,
     allowed_token_ids: &[i32],
 ) -> Result<UniquePtr<MlxArray>, String> {
@@ -1300,6 +1342,30 @@ impl CxxGenerator {
         }
     }
 
+    fn replay_constraint_output<M: LanguageModel>(
+        &mut self,
+        model: &M,
+        prompt_snapshot: Option<&ModelStateSnapshot>,
+    ) -> Result<UniquePtr<MlxArray>, String> {
+        let snapshot = prompt_snapshot.ok_or_else(|| {
+            "model cannot restore prompt state required by a constraint backtrack".to_string()
+        })?;
+        self.caches = model.make_caches();
+        self.apply_kv_cache_mode_with_boundary_policy();
+        model.restore_sequence_state(SequenceId::from_raw(0), snapshot)?;
+        let mut logits = snapshot
+            .continuation_logits()
+            .map(ffi::copy)
+            .ok_or_else(|| {
+                "constraint rollback snapshot is missing continuation logits".to_string()
+            })?;
+        for &token_id in &self.generated_tokens {
+            let input = ffi::from_slice_i32(&[token_id], &[1, 1]);
+            logits = model.forward_last_logits(&input, &mut self.caches, None, 0);
+        }
+        Ok(logits)
+    }
+
     /// Baseline single-sequence generation with optional exact-prefix reuse and
     /// an engine-neutral token constraint.
     ///
@@ -1375,11 +1441,11 @@ impl CxxGenerator {
             }
         };
         ffi::eval(&logits);
-        let mut prompt_snapshot = if capture_prompt_snapshot && model.supports_snapshot_reuse() {
-            model.snapshot_sequence_state(sequence_id, prompt_tokens.len())
-        } else {
-            None
-        };
+        let retain_prompt_snapshot =
+            (capture_prompt_snapshot || constraint.is_some()) && model.supports_snapshot_reuse();
+        let mut prompt_snapshot = retain_prompt_snapshot
+            .then(|| model.snapshot_sequence_state(sequence_id, prompt_tokens.len()))
+            .flatten();
         if let Some(snapshot) = prompt_snapshot.as_mut() {
             snapshot.set_continuation_logits(
                 logits
@@ -1414,6 +1480,32 @@ impl CxxGenerator {
                             .as_ref()
                             .expect("masked generation logits must not be null")
                     }
+                    ConstraintMask::Splice(commit) => {
+                        commit.apply_to(&mut self.generated_tokens)?;
+                        if self.generated_tokens.len() > max_tokens {
+                            self.generated_tokens.truncate(max_tokens);
+                        }
+                        if needs_history {
+                            token_history.clear();
+                            token_history.extend_from_slice(prompt_tokens);
+                            token_history.extend_from_slice(&self.generated_tokens);
+                        }
+                        sampler_state = None;
+                        logits = self.replay_constraint_output(model, prompt_snapshot.as_ref())?;
+                        if commit.tokens.last().is_some_and(|&token| !on_token(token)) {
+                            stop_reason = GenerationStopReason::CallbackCancelled;
+                            break;
+                        }
+                        if commit.accept {
+                            stop_reason = GenerationStopReason::ConstraintAccepted;
+                            break;
+                        }
+                        if self.generated_tokens.len() == max_tokens {
+                            stop_reason = GenerationStopReason::MaxTokens;
+                            break;
+                        }
+                        continue;
+                    }
                     ConstraintMask::Accept => {
                         stop_reason = GenerationStopReason::ConstraintAccepted;
                         break;
@@ -1442,15 +1534,28 @@ impl CxxGenerator {
                 break;
             }
 
-            self.generated_tokens.push(token_id);
-            if needs_history {
-                token_history.push(token_id);
-            }
+            let mut replay = false;
             let constraint_accepted = if let Some(active) = constraint.as_deref_mut() {
-                active.commit_token(token_id)? == ConstraintCommit::Accept
+                let commit = active.commit_token(token_id)?;
+                replay = !commit.is_token(token_id);
+                commit.apply_to(&mut self.generated_tokens)?;
+                commit.accept
             } else {
+                self.generated_tokens.push(token_id);
                 false
             };
+            if self.generated_tokens.len() > max_tokens {
+                self.generated_tokens.truncate(max_tokens);
+            }
+            if needs_history {
+                token_history.clear();
+                token_history.extend_from_slice(prompt_tokens);
+                token_history.extend_from_slice(&self.generated_tokens);
+            }
+            if replay {
+                sampler_state = None;
+                logits = self.replay_constraint_output(model, prompt_snapshot.as_ref())?;
+            }
             if !on_token(token_id) {
                 stop_reason = GenerationStopReason::CallbackCancelled;
                 break;
@@ -1467,6 +1572,9 @@ impl CxxGenerator {
                 stop_reason = GenerationStopReason::MaxTokens;
                 break;
             }
+            if replay {
+                continue;
+            }
 
             let next_input = ffi::reshape_token_for_forward(&token);
             logits = model.forward_last_logits(&next_input, &mut self.caches, None, 0);
@@ -1475,7 +1583,7 @@ impl CxxGenerator {
         Ok(ControlledGeneration {
             token_ids: self.generated_tokens.clone(),
             stop_reason,
-            prompt_snapshot,
+            prompt_snapshot: capture_prompt_snapshot.then_some(prompt_snapshot).flatten(),
             cached_tokens,
         })
     }
@@ -1579,12 +1687,11 @@ impl CxxGenerator {
         if input_embeddings.is_some() {
             model.after_prefill();
         }
-        let mut prompt_snapshot =
-            if capture_prompt_snapshot && model.supports_snapshot_reuse() {
-                model.snapshot_sequence_state(sequence_id, prompt_tokens.len())
-            } else {
-                None
-            };
+        let retain_prompt_snapshot =
+            (capture_prompt_snapshot || constraint.is_some()) && model.supports_snapshot_reuse();
+        let mut prompt_snapshot = retain_prompt_snapshot
+            .then(|| model.snapshot_sequence_state(sequence_id, prompt_tokens.len()))
+            .flatten();
         if let Some(snapshot) = prompt_snapshot.as_mut() {
             snapshot.set_continuation_logits(
                 logits
@@ -1619,6 +1726,32 @@ impl CxxGenerator {
                             .as_ref()
                             .expect("masked generation logits must not be null")
                     }
+                    ConstraintMask::Splice(commit) => {
+                        commit.apply_to(&mut self.generated_tokens)?;
+                        if self.generated_tokens.len() > max_tokens {
+                            self.generated_tokens.truncate(max_tokens);
+                        }
+                        if needs_history {
+                            token_history.clear();
+                            token_history.extend_from_slice(prompt_tokens);
+                            token_history.extend_from_slice(&self.generated_tokens);
+                        }
+                        sampler_state = None;
+                        logits = self.replay_constraint_output(model, prompt_snapshot.as_ref())?;
+                        if commit.tokens.last().is_some_and(|&token| !on_token(token)) {
+                            stop_reason = GenerationStopReason::CallbackCancelled;
+                            break;
+                        }
+                        if commit.accept {
+                            stop_reason = GenerationStopReason::ConstraintAccepted;
+                            break;
+                        }
+                        if self.generated_tokens.len() == max_tokens {
+                            stop_reason = GenerationStopReason::MaxTokens;
+                            break;
+                        }
+                        continue;
+                    }
                     ConstraintMask::Accept => {
                         stop_reason = GenerationStopReason::ConstraintAccepted;
                         break;
@@ -1647,15 +1780,28 @@ impl CxxGenerator {
                 break;
             }
 
-            self.generated_tokens.push(token_id);
-            if needs_history {
-                token_history.push(token_id);
-            }
+            let mut replay = false;
             let constraint_accepted = if let Some(active) = constraint.as_deref_mut() {
-                active.commit_token(token_id)? == ConstraintCommit::Accept
+                let commit = active.commit_token(token_id)?;
+                replay = !commit.is_token(token_id);
+                commit.apply_to(&mut self.generated_tokens)?;
+                commit.accept
             } else {
+                self.generated_tokens.push(token_id);
                 false
             };
+            if self.generated_tokens.len() > max_tokens {
+                self.generated_tokens.truncate(max_tokens);
+            }
+            if needs_history {
+                token_history.clear();
+                token_history.extend_from_slice(prompt_tokens);
+                token_history.extend_from_slice(&self.generated_tokens);
+            }
+            if replay {
+                sampler_state = None;
+                logits = self.replay_constraint_output(model, prompt_snapshot.as_ref())?;
+            }
             if !on_token(token_id) {
                 stop_reason = GenerationStopReason::CallbackCancelled;
                 break;
@@ -1672,6 +1818,9 @@ impl CxxGenerator {
                 stop_reason = GenerationStopReason::MaxTokens;
                 break;
             }
+            if replay {
+                continue;
+            }
 
             let next_input = ffi::reshape_token_for_forward(&token);
             logits = model.forward_last_logits(&next_input, &mut self.caches, None, 0);
@@ -1680,7 +1829,7 @@ impl CxxGenerator {
         Ok(ControlledGeneration {
             token_ids: self.generated_tokens.clone(),
             stop_reason,
-            prompt_snapshot,
+            prompt_snapshot: capture_prompt_snapshot.then_some(prompt_snapshot).flatten(),
             cached_tokens,
         })
     }
@@ -2815,6 +2964,29 @@ mod tests {
         fn eos_token_ids(&self) -> Vec<i32> {
             vec![99]
         }
+
+        fn supports_snapshot_reuse(&self) -> bool {
+            true
+        }
+
+        fn snapshot_sequence_state(
+            &self,
+            _seq_id: SequenceId,
+            token_len: usize,
+        ) -> Option<ModelStateSnapshot> {
+            Some(ModelStateSnapshot::new("stub", token_len))
+        }
+
+        fn restore_sequence_state(
+            &self,
+            _seq_id: SequenceId,
+            snapshot: &ModelStateSnapshot,
+        ) -> Result<(), String> {
+            if snapshot.family() != "stub" {
+                return Err("unexpected stub snapshot family".to_string());
+            }
+            Ok(())
+        }
     }
 
     /// Multi-position stub: logits value encodes the sequence position, so a
@@ -3598,6 +3770,16 @@ mod tests {
     struct AllowOnly(i32);
 
     impl TokenConstraint for AllowOnly {
+        fn begin_transaction(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn commit_transaction(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn rollback_transaction(&mut self) {}
+
         fn compute_mask(
             &mut self,
             _logits: &MlxArray,
@@ -3606,10 +3788,58 @@ mod tests {
             Ok(ConstraintMask::Allow(vec![self.0]))
         }
 
-        fn commit_token(&mut self, _token_id: i32) -> Result<ConstraintCommit, String> {
-            Ok(ConstraintCommit::Continue)
+        fn commit_token(&mut self, token_id: i32) -> Result<ConstraintCommit, String> {
+            Ok(ConstraintCommit::token(token_id))
         }
     }
+
+    struct SplicingConstraint {
+        phase: u8,
+    }
+
+    impl TokenConstraint for SplicingConstraint {
+        fn begin_transaction(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn commit_transaction(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn rollback_transaction(&mut self) {}
+
+        fn compute_mask(
+            &mut self,
+            _logits: &MlxArray,
+            _token_history: &[i32],
+        ) -> Result<ConstraintMask, String> {
+            match self.phase {
+                0 => {
+                    self.phase = 1;
+                    Ok(ConstraintMask::Splice(ConstraintCommit {
+                        backtrack: 0,
+                        tokens: vec![2, 3],
+                        accept: false,
+                    }))
+                }
+                1 => Ok(ConstraintMask::Allow(vec![1])),
+                _ => Ok(ConstraintMask::Accept),
+            }
+        }
+
+        fn commit_token(&mut self, token_id: i32) -> Result<ConstraintCommit, String> {
+            if self.phase != 1 || token_id != 1 {
+                return Err("unexpected splicing-constraint token".to_string());
+            }
+            self.phase = 2;
+            Ok(ConstraintCommit {
+                backtrack: 1,
+                tokens: vec![0, 1],
+                accept: true,
+            })
+        }
+    }
+
 
     #[test]
     fn controlled_generation_mask_changes_the_winning_token() {
@@ -3635,6 +3865,28 @@ mod tests {
             .expect("constrained generation");
         assert_eq!(constrained.token_ids, vec![2]);
         assert_eq!(constrained.stop_reason, GenerationStopReason::MaxTokens);
+    }
+
+    #[test]
+    fn controlled_generation_replays_guidance_fast_forward_and_backtrack() {
+        let mut constraint = SplicingConstraint { phase: 0 };
+        let result = CxxGenerator::new(1)
+            .generate_streaming_controlled(
+                &StubModel,
+                &[1],
+                None,
+                8,
+                &SamplingConfig::greedy(),
+                Some(&mut constraint),
+                false,
+                |_| true,
+            )
+            .expect("spliced controlled generation");
+        assert_eq!(result.token_ids, vec![2, 0, 1]);
+        assert_eq!(
+            result.stop_reason,
+            GenerationStopReason::ConstraintAccepted
+        );
     }
 
     #[test]
