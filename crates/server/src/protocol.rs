@@ -141,6 +141,8 @@ enum ChatWireMessage {
 struct ChatWire {
     model: String,
     messages: Vec<Value>,
+    #[serde(rename = "body")]
+    _body: Option<Value>,
     stream: Option<bool>,
     stream_options: Option<ChatStreamOptions>,
     max_completion_tokens: Option<usize>,

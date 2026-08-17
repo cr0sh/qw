@@ -136,6 +136,7 @@ fn representative_documented_chat_request() -> Value {
                 {"role": "user", "name": "alice", "content": "finish"}
             ],
             "audio": {"format": "wav", "voice": {"id": "voice_1"}},
+            "body": {"provider": "opencode"},
             "frequency_penalty": 0.1,
             "function_call": {"name": "legacy"},
             "functions": [{"name": "legacy", "description": null}],
