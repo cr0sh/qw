@@ -19,6 +19,7 @@
 //! Apache-2.0 `mlxcel` Qwen 3.5 implementation.
 
 use std::cell::RefCell;
+use std::time::{Duration, Instant};
 
 use mlxcel_core::generate::{
     ConstraintCommit, ConstraintMask, GenerationStopReason, LanguageModel, SamplingConfig,
@@ -45,6 +46,8 @@ use crate::qwen3_5::{Qwen35Config, Qwen35DecoderLayer, Qwen35Model};
 pub struct MtpGenerationStats {
     pub accepted_draft_tokens: usize,
     pub proposed_draft_tokens: usize,
+    /// Wall-clock time spent in the post-prefill MTP decode loop.
+    pub decode_time: Duration,
 }
 
 impl MtpGenerationStats {
@@ -1355,6 +1358,7 @@ impl Qwen35MtpGenerator {
                 stop_reason = GenerationStopReason::CallbackCancelled;
             }
         }
+        let decode_start = Instant::now();
 
         if generated.len() < max_tokens && stop_reason == GenerationStopReason::MaxTokens {
             match prefill_input {
@@ -1492,6 +1496,7 @@ impl Qwen35MtpGenerator {
                     .expect("speculative walk emits at least one token");
             }
         }
+        mtp_stats.decode_time = decode_start.elapsed();
         Ok(MtpGeneration {
             token_ids: generated,
             stats: mtp_stats,
@@ -1928,6 +1933,7 @@ mod tests {
             MtpGenerationStats {
                 accepted_draft_tokens: 1,
                 proposed_draft_tokens: 4,
+                decode_time: Duration::ZERO,
             }
             .acceptance_percentage(),
             25.0
