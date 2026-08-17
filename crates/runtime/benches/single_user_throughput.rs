@@ -18,9 +18,10 @@ fn generation_elements(
 ) -> GenerationElements {
     GenerationElements {
         prefill: (batch_size * prompt_tokens) as u64,
-        // Prefill produces the logits for the first completion token. Only the
-        // remaining completion tokens require autoregressive decode steps.
-        decode: (batch_size * completion_tokens.saturating_sub(1)) as u64,
+        // The generation APIs return every sampled completion token,
+        // including the first token selected from the prefill logits. Decode
+        // throughput therefore uses the complete output-token count.
+        decode: (batch_size * completion_tokens) as u64,
     }
 }
 
