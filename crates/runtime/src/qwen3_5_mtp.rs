@@ -19,9 +19,8 @@
 //! Apache-2.0 `mlxcel` Qwen 3.5 implementation.
 
 use std::cell::RefCell;
-use std::time::Instant;
 
-use mlxcel_core::generate::{GenerationStats, LanguageModel, SamplingConfig};
+use mlxcel_core::generate::{LanguageModel, SamplingConfig};
 use mlxcel_core::generation_policy::merged_eos_token_ids;
 use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedLinear};
 use mlxcel_core::speculative::mtp::speculative_walk;
@@ -289,14 +288,15 @@ impl Qwen35MtpGenerator {
         Self
     }
 
-    pub(crate) fn generate(
+    pub(crate) fn generate_streaming<F: FnMut(i32) -> bool>(
         &mut self,
         model: &Qwen35Model,
         prompt_tokens: &[i32],
         max_tokens: usize,
         sampling: &SamplingConfig,
         block_size: usize,
-    ) -> (Vec<i32>, GenerationStats, MtpGenerationStats) {
+        mut on_token: F,
+    ) -> (Vec<i32>, MtpGenerationStats) {
         assert!(!prompt_tokens.is_empty(), "MTP prompt must not be empty");
         assert_eq!(sampling.temperature, 0.0, "Qwen MTP is greedy-only");
         assert!(block_size >= 2, "MTP block size must be at least 2");
@@ -306,7 +306,6 @@ impl Qwen35MtpGenerator {
             .expect("Qwen35MtpGenerator requires a bundled MTP head");
         let eos_tokens = merged_eos_token_ids(model.eos_token_ids(), &sampling.stop_token_ids);
 
-        let prefill_start = Instant::now();
         let prompt = mlxcel_core::from_slice_i32(
             prompt_tokens,
             &[1, i32::try_from(prompt_tokens.len()).unwrap_or(i32::MAX)],
@@ -318,16 +317,16 @@ impl Qwen35MtpGenerator {
         let mut generated = Vec::with_capacity(max_tokens);
         let mut mtp_stats = MtpGenerationStats::default();
         let first_is_eos = eos_tokens.contains(&first_token);
+        let mut cancelled = false;
         if max_tokens > 0 && !first_is_eos {
             generated.push(first_token);
+            cancelled = !on_token(first_token);
         }
-        if max_tokens > 1 && !first_is_eos {
+        if max_tokens > 1 && !first_is_eos && !cancelled {
             drafter.prefill_from_target_hidden(model, &prompt, &prefill.hidden, first_token);
         }
-        let prefill_time = prefill_start.elapsed();
 
-        let decode_start = Instant::now();
-        if generated.len() < max_tokens && !first_is_eos {
+        if generated.len() < max_tokens && !first_is_eos && !cancelled {
             let prefill_shape = mlxcel_core::array_shape(&prefill.hidden);
             let last = prefill_shape[1] - 1;
             let mut next_hidden = mlxcel_core::slice(
@@ -356,10 +355,16 @@ impl Qwen35MtpGenerator {
                 let walk = speculative_walk(&draft_tokens, &verify.target_tokens, remaining);
                 mtp_stats.accepted_draft_tokens += walk.accepted;
                 mtp_stats.proposed_draft_tokens += draft_tokens.len();
-                let (emitted, hit_eos) = visible_tokens(&walk.new_tokens, &eos_tokens);
-                generated.extend_from_slice(&emitted);
+                let (visible, hit_eos) = visible_tokens(&walk.new_tokens, &eos_tokens);
+                for token in visible {
+                    generated.push(token);
+                    if !on_token(token) {
+                        cancelled = true;
+                        break;
+                    }
+                }
 
-                if hit_eos || generated.len() >= max_tokens {
+                if cancelled || hit_eos || generated.len() >= max_tokens {
                     break;
                 }
 
@@ -386,28 +391,8 @@ impl Qwen35MtpGenerator {
                     .expect("speculative walk emits at least one token");
             }
         }
-        let decode_time = decode_start.elapsed();
 
-        let prefill_ms = prefill_time.as_secs_f64() * 1_000.0;
-        let decode_ms = decode_time.as_secs_f64() * 1_000.0;
-        let decode_tokens = generated.len().saturating_sub(1);
-        let stats = GenerationStats {
-            prompt_tokens: prompt_tokens.len(),
-            generated_tokens: generated.len(),
-            prefill_time_ms: prefill_ms,
-            decode_time_ms: decode_ms,
-            prefill_tok_per_sec: if prefill_ms > 0.0 {
-                prompt_tokens.len() as f64 / (prefill_ms / 1_000.0)
-            } else {
-                0.0
-            },
-            decode_tok_per_sec: if decode_ms > 0.0 {
-                decode_tokens as f64 / (decode_ms / 1_000.0)
-            } else {
-                0.0
-            },
-        };
-        (generated, stats, mtp_stats)
+        (generated, mtp_stats)
     }
 }
 
@@ -415,9 +400,9 @@ impl Qwen35MtpGenerator {
 mod tests {
     use super::*;
     use crate::gated_delta::GatedDeltaCache;
+    use crate::qwen_mrope_state::MRopeState;
     use crate::qwen3_5::rollback_plan;
     use crate::qwen3_next::Qwen3NextCache;
-    use crate::qwen_mrope_state::MRopeState;
 
     #[test]
     fn acceptance_percentage_handles_zero_proposals_and_partial_acceptance() {

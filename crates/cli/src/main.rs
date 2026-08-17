@@ -1,3 +1,4 @@
+use std::io::Write as _;
 use std::path::PathBuf;
 
 use clap::Parser as _;
@@ -70,8 +71,27 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Generate(args) => {
             eprintln!("Loading model from {}", args.model.display());
             let mut provider = Qwen35Provider::load(&args.model)?;
-            let output = provider.generate(&args.request())?;
-            print!("{}", output.text);
+            let stdout = std::io::stdout();
+            let mut stdout = stdout.lock();
+            let mut io_error = None;
+            let generation = provider.generate_streaming(&args.request(), |delta| {
+                if delta.is_empty() {
+                    return true;
+                }
+                if let Err(error) = stdout
+                    .write_all(delta.as_bytes())
+                    .and_then(|()| stdout.flush())
+                {
+                    io_error = Some(error);
+                    false
+                } else {
+                    true
+                }
+            });
+            if let Some(error) = io_error {
+                return Err(Box::new(error));
+            }
+            generation?;
         }
     }
     Ok(())
@@ -88,12 +108,8 @@ mod tests {
     #[test]
     fn generate_requires_model_and_prompt() {
         assert!(Cli::try_parse_from(["qw", "generate"]).is_err());
-        assert!(
-            Cli::try_parse_from(["qw", "generate", "--model", "/tmp/model"]).is_err()
-        );
-        assert!(
-            Cli::try_parse_from(["qw", "generate", "--prompt", "hello"]).is_err()
-        );
+        assert!(Cli::try_parse_from(["qw", "generate", "--model", "/tmp/model"]).is_err());
+        assert!(Cli::try_parse_from(["qw", "generate", "--prompt", "hello"]).is_err());
     }
 
     #[test]
