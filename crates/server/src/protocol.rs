@@ -177,6 +177,8 @@ struct ChatWire {
     _logprobs: Option<bool>,
     #[serde(rename = "metadata")]
     _metadata: Option<Map<String, Value>>,
+    #[serde(rename = "name")]
+    _name: Option<String>,
     #[serde(rename = "modalities")]
     _modalities: Option<Vec<String>>,
     #[serde(rename = "moderation")]

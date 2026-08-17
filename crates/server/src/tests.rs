@@ -144,6 +144,7 @@ fn representative_documented_chat_request() -> Value {
             "max_completion_tokens": 32,
             "max_tokens": 16,
             "metadata": {"request_kind": "compatibility"},
+            "name": "opencode",
             "modalities": ["text", "audio"],
             "moderation": {"model": "omni-moderation-latest"},
             "n": 2,
