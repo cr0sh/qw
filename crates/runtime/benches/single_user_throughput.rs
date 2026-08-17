@@ -1,16 +1,28 @@
-mod throughput_tokens;
-
 use std::hint::black_box;
 use std::path::PathBuf;
 use std::time::Duration;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use qw_runtime::provider::Qwen35GenerationMode;
-use qw_runtime::{
-    ChatMessage, ChatMessageContent, GenerationRequest, Qwen35Provider,
-};
+use qw_runtime::{ChatMessage, ChatMessageContent, GenerationRequest, Qwen35Provider};
 
-use throughput_tokens::generation_elements;
+struct GenerationElements {
+    prefill: u64,
+    decode: u64,
+}
+
+fn generation_elements(
+    batch_size: usize,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+) -> GenerationElements {
+    GenerationElements {
+        prefill: (batch_size * prompt_tokens) as u64,
+        // Prefill produces the logits for the first completion token. Only the
+        // remaining completion tokens require autoregressive decode steps.
+        decode: (batch_size * completion_tokens.saturating_sub(1)) as u64,
+    }
+}
 
 const MODEL_ENV: &str = "QW_BENCH_MODEL";
 const PROMPT: &str = concat!(
