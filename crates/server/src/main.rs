@@ -3,10 +3,16 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, ensure};
 use clap::Parser as _;
-use clap_derive::Parser;
+use clap_derive::{Parser, ValueEnum};
 use qw_runtime::KVCacheMode;
 use qw_server::{Engine, router};
 use tracing::info;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum OutputFormat {
+    Human,
+    Json,
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "qw-server", about = "OpenAI-compatible dense Qwen3.5 server")]
@@ -33,6 +39,10 @@ struct Cli {
     /// Disable the default 4-bit TurboQuant KV cache.
     #[arg(long)]
     no_kv_quantization: bool,
+
+    /// Tracing output format.
+    #[arg(long, value_enum, default_value = "human")]
+    output_format: OutputFormat,
 }
 impl Cli {
     fn kv_cache_mode(&self) -> KVCacheMode {
@@ -58,7 +68,10 @@ fn validate_cli(cli: &Cli) -> Result<()> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     validate_cli(&cli)?;
-    tracing_subscriber::fmt::init();
+    match cli.output_format {
+        OutputFormat::Human => tracing_subscriber::fmt().init(),
+        OutputFormat::Json => tracing_subscriber::fmt().json().init(),
+    }
     let bind: SocketAddr = cli
         .bind
         .parse()
@@ -84,7 +97,7 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, validate_cli};
+    use super::{Cli, OutputFormat, validate_cli};
     use qw_runtime::KVCacheMode;
     use clap::{CommandFactory as _, Parser as _};
 
@@ -107,6 +120,33 @@ mod tests {
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("--model-id <MODEL_ID>"), "{help}");
     }
+    #[test]
+    fn cli_parses_output_format_and_documents_values() {
+        let default =
+            Cli::try_parse_from(["qw-server", "--model", "/tmp/checkpoint"]).expect("CLI");
+        assert_eq!(default.output_format, OutputFormat::Human);
+
+        for (value, expected) in [
+            ("human", OutputFormat::Human),
+            ("json", OutputFormat::Json),
+        ] {
+            let cli = Cli::try_parse_from([
+                "qw-server",
+                "--model",
+                "/tmp/checkpoint",
+                "--output-format",
+                value,
+            ])
+            .expect("CLI");
+            assert_eq!(cli.output_format, expected);
+        }
+
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("--output-format <OUTPUT_FORMAT>"), "{help}");
+        assert!(help.contains("human"), "{help}");
+        assert!(help.contains("json"), "{help}");
+    }
+
     #[test]
     fn turbo4_kv_quantization_is_default_with_explicit_opt_out() {
         let default =
