@@ -21,3 +21,7 @@ criterion.workspace = true
 [[bench]]
 name = "single_user_throughput"
 harness = false
+
+[[bench]]
+name = "single_user_end_to_end"
+harness = false
