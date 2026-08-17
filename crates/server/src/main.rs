@@ -24,21 +24,36 @@ struct Cli {
     /// Total prompt-token capacity of the shared prefix cache.
     #[arg(long, default_value_t = 32_768)]
     prefix_cache_max_tokens: usize,
+
+    /// MTP verify input block size (bonus token plus proposals).
+    #[arg(long = "mtp-k", default_value_t = 3)]
+    mtp_k: usize,
+}
+
+fn validate_cli(cli: &Cli) -> Result<()> {
+    ensure!(
+        cli.prefix_cache_max_tokens > 0,
+        "--prefix-cache-max-tokens must be greater than zero"
+    );
+    ensure!(cli.mtp_k >= 2, "--mtp-k must be at least 2");
+    Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    ensure!(
-        cli.prefix_cache_max_tokens > 0,
-        "--prefix-cache-max-tokens must be greater than zero"
-    );
+    validate_cli(&cli)?;
     let bind: SocketAddr = cli
         .bind
         .parse()
         .with_context(|| format!("invalid --bind address {:?}", cli.bind))?;
 
-    let engine = Engine::start_qwen(cli.model, cli.model_id, cli.prefix_cache_max_tokens)?;
+    let engine = Engine::start_qwen(
+        cli.model,
+        cli.model_id,
+        cli.prefix_cache_max_tokens,
+        cli.mtp_k,
+    )?;
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("failed to bind {bind}"))?;
@@ -49,9 +64,8 @@ async fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::{Cli, validate_cli};
     use clap::{CommandFactory as _, Parser as _};
-
-    use super::Cli;
 
     #[test]
     fn cli_exposes_optional_model_id() {
@@ -71,5 +85,48 @@ mod tests {
 
         let help = Cli::command().render_long_help().to_string();
         assert!(help.contains("--model-id <MODEL_ID>"), "{help}");
+    }
+
+    #[test]
+    fn cli_parses_and_validates_mtp_k() {
+        let default =
+            Cli::try_parse_from(["qw-server", "--model", "/tmp/checkpoint"]).expect("CLI");
+        assert_eq!(default.mtp_k, 3);
+        validate_cli(&default).expect("default MTP K");
+
+        for args in [
+            vec![
+                "qw-server",
+                "--model",
+                "/tmp/checkpoint",
+                "--mtp-k=5",
+            ],
+            vec![
+                "qw-server",
+                "--model",
+                "/tmp/checkpoint",
+                "--mtp-k",
+                "5",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(args).expect("CLI");
+            assert_eq!(cli.mtp_k, 5);
+            validate_cli(&cli).expect("valid MTP K");
+        }
+
+        for invalid in [0, 1] {
+            let cli = Cli::try_parse_from([
+                "qw-server",
+                "--model",
+                "/tmp/checkpoint",
+                "--mtp-k",
+                &invalid.to_string(),
+            ])
+            .expect("CLI parsing reaches startup validation");
+            assert_eq!(
+                validate_cli(&cli).expect_err("invalid MTP K").to_string(),
+                "--mtp-k must be at least 2"
+            );
+        }
     }
 }

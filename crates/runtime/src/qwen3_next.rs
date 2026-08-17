@@ -107,14 +107,6 @@ pub(crate) struct Qwen3NextAttention {
 }
 
 impl Qwen3NextAttention {
-    pub(crate) fn forward(
-        &self,
-        x: &MlxArray,
-        cache: &mut KVCache,
-        mask: Option<&MlxArray>,
-    ) -> UniquePtr<MlxArray> {
-        self.forward_with_position_ids(x, cache, mask, None)
-    }
 
     pub(crate) fn forward_with_position_ids(
         &self,
@@ -134,8 +126,9 @@ impl Qwen3NextAttention {
         x: &MlxArray,
         cache: &mut KVCache,
         mask: Option<&MlxArray>,
+        position_ids: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        let output = self.forward_impl(x, cache, mask, None, true);
+        let output = self.forward_impl(x, cache, mask, position_ids, true);
         self.o_proj.forward(&output)
     }
 
@@ -498,11 +491,12 @@ mod tests {
         let input = mlxcel_core::from_slice_f32(&[0.0; 6], &[1, 2, 3]);
 
         let mut ordinary_cache = KVCache::new();
-        let ordinary = attention.forward(&input, &mut ordinary_cache, None);
+        let ordinary =
+            attention.forward_with_position_ids(&input, &mut ordinary_cache, None, None);
         assert_eq!(mlxcel_core::array_shape(&ordinary), vec![1, 2, 3]);
 
         let mut verify_cache = KVCache::new();
-        let verify = attention.forward_verify(&input, &mut verify_cache, None);
+        let verify = attention.forward_verify(&input, &mut verify_cache, None, None);
         assert_eq!(mlxcel_core::array_shape(&verify), vec![1, 2, 3]);
     }
 }

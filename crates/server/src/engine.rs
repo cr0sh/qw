@@ -23,6 +23,36 @@ const JOB_QUEUE_CAPACITY: usize = 8;
 const EVENT_QUEUE_CAPACITY: usize = 32;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QwenGenerationRoute {
+    BaselineText,
+    BaselineMultimodal,
+    MtpText,
+    MtpMultimodal,
+}
+
+fn qwen_generation_route(
+    has_mtp: bool,
+    has_images: bool,
+    has_constraint: bool,
+) -> QwenGenerationRoute {
+    match (has_mtp && !has_constraint, has_images) {
+        (true, false) => QwenGenerationRoute::MtpText,
+        (true, true) => QwenGenerationRoute::MtpMultimodal,
+        (false, false) => QwenGenerationRoute::BaselineText,
+        (false, true) => QwenGenerationRoute::BaselineMultimodal,
+    }
+}
+
+fn route_uses_prefix_cache(route: QwenGenerationRoute) -> bool {
+    route == QwenGenerationRoute::BaselineText
+}
+
+fn validate_mtp_k(mtp_k: usize) -> Result<()> {
+    ensure!(mtp_k >= 2, "--mtp-k must be at least 2");
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct Admission {
     pub response_id: String,
@@ -275,17 +305,19 @@ impl Engine {
         model_path: PathBuf,
         model_id: Option<String>,
         prefix_cache_max_tokens: usize,
+        mtp_k: usize,
     ) -> Result<Self> {
         ensure!(
             prefix_cache_max_tokens > 0,
             "prefix cache capacity must be nonzero"
         );
+        validate_mtp_k(mtp_k)?;
         let (jobs_tx, jobs_rx) = mpsc::channel(JOB_QUEUE_CAPACITY);
         let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
         thread::Builder::new()
             .name("qw-generation".to_string())
-            .spawn(
-                move || match QwenWorker::load(&model_path, prefix_cache_max_tokens) {
+            .spawn(move || {
+                match QwenWorker::load(&model_path, prefix_cache_max_tokens, mtp_k) {
                     Ok(mut worker) => {
                         let supports_image_inputs = worker.provider.supports_image_inputs();
                         let _ = ready_tx.send(Ok(supports_image_inputs));
@@ -294,8 +326,8 @@ impl Engine {
                     Err(error) => {
                         let _ = ready_tx.send(Err(error));
                     }
-                },
-            )
+                }
+            })
             .context("failed to spawn generation thread")?;
         let supports_image_inputs = ready_rx
             .recv()
@@ -583,10 +615,12 @@ struct QwenWorker {
     provider: Qwen35Provider,
     grammar: GrammarFactory,
     prefix_cache: PrefixCache,
+    mtp_k: usize,
 }
 
 impl QwenWorker {
-    fn load(model_path: &Path, prefix_cache_max_tokens: usize) -> Result<Self> {
+    fn load(model_path: &Path, prefix_cache_max_tokens: usize, mtp_k: usize) -> Result<Self> {
+        validate_mtp_k(mtp_k)?;
         let provider = Qwen35Provider::load(model_path)?;
         ensure!(
             provider.supports_qwen35_tool_calls(),
@@ -609,6 +643,7 @@ impl QwenWorker {
             provider,
             grammar,
             prefix_cache: PrefixCache::new(prefix_cache_max_tokens),
+            mtp_k,
         })
     }
 
@@ -619,6 +654,18 @@ impl QwenWorker {
     }
 
     fn process(&mut self, mut job: Job) {
+        let mut constraint = match self.grammar.compile(&job.request.output_format) {
+            Ok(constraint) => constraint,
+            Err(error) => {
+                send_failure(
+                    &job,
+                    FailureKind::InvalidRequest,
+                    format!("invalid structured output schema: {error}"),
+                    Some(output_format_param(job.request.endpoint).to_string()),
+                );
+                return;
+            }
+        };
         let has_images = !job.request.decoded_images.is_empty();
         if has_images && !self.provider.supports_image_inputs() {
             send_failure(
@@ -697,18 +744,6 @@ impl QwenWorker {
                 }
             }
         };
-        let mut constraint = match self.grammar.compile(&job.request.output_format) {
-            Ok(constraint) => constraint,
-            Err(error) => {
-                send_failure(
-                    &job,
-                    FailureKind::InvalidRequest,
-                    format!("invalid structured output schema: {error}"),
-                    Some(output_format_param(job.request.endpoint).to_string()),
-                );
-                return;
-            }
-        };
         if job.events.blocking_send(WorkerEvent::Started).is_err() {
             job.cancelled.store(true, Ordering::Release);
             return;
@@ -722,11 +757,14 @@ impl QwenWorker {
             job.request.top_p,
             job.request.seed,
         );
+        let route =
+            qwen_generation_route(self.provider.has_mtp(), has_images, constraint.is_some());
+        let mtp_k = self.mtp_k;
         let (provider, cache) = (&mut self.provider, &mut self.prefix_cache);
-        let hit = if has_images {
-            None
-        } else {
+        let hit = if route_uses_prefix_cache(route) {
             cache.lookup(&prompt_ids)
+        } else {
+            None
         };
         let prefix_reuse = hit.map(|hit| PrefixReuse {
             snapshot: hit.snapshot,
@@ -745,18 +783,35 @@ impl QwenWorker {
             }
             true
         };
-        let generated = if let Some(prefill) = multimodal_prefill {
-            provider.generate_multimodal_streaming(
-                prefill,
+        let generated = match route {
+            QwenGenerationRoute::MtpMultimodal => {
+                provider.generate_mtp_multimodal_streaming(
+                    multimodal_prefill.expect("multimodal route requires prepared embeddings"),
+                    job.request.max_tokens,
+                    &sampling,
+                    mtp_k,
+                    &mut emit_delta,
+                )
+            }
+            QwenGenerationRoute::MtpText => provider.generate_mtp_streaming(
+                &prompt_ids,
                 job.request.max_tokens,
                 &sampling,
-                constraint
-                    .as_mut()
-                    .map(|value| value as &mut dyn mlxcel_core::generate::TokenConstraint),
+                mtp_k,
                 &mut emit_delta,
-            )
-        } else {
-            provider.generate_baseline_streaming(
+            ),
+            QwenGenerationRoute::BaselineMultimodal => {
+                provider.generate_multimodal_streaming(
+                    multimodal_prefill.expect("multimodal route requires prepared embeddings"),
+                    job.request.max_tokens,
+                    &sampling,
+                    constraint
+                        .as_mut()
+                        .map(|value| value as &mut dyn mlxcel_core::generate::TokenConstraint),
+                    &mut emit_delta,
+                )
+            }
+            QwenGenerationRoute::BaselineText => provider.generate_baseline_streaming(
                 &prompt_ids,
                 job.request.max_tokens,
                 &sampling,
@@ -766,7 +821,7 @@ impl QwenWorker {
                     .map(|value| value as &mut dyn mlxcel_core::generate::TokenConstraint),
                 true,
                 &mut emit_delta,
-            )
+            ),
         };
         let generated = match generated {
             Ok(generated) => generated,
@@ -875,7 +930,9 @@ impl QwenWorker {
             );
             return;
         }
-        if !has_images && let Some(snapshot) = generated.prompt_snapshot {
+        if route_uses_prefix_cache(route)
+            && let Some(snapshot) = generated.prompt_snapshot
+        {
             cache.insert(prompt_ids, snapshot);
         }
         let record = CompletionRecord {
@@ -1048,5 +1105,62 @@ mod tests {
         assert!(parsed.content.is_empty());
         assert_eq!(parsed.tool_calls.len(), 1);
         assert_eq!(parsed.tool_calls[0].name, "weather");
+    }
+
+    #[test]
+    fn mtp_routing_matrix_preserves_constraints_and_ignores_temperature() {
+        for has_mtp in [false, true] {
+            for has_images in [false, true] {
+                for constrained in [false, true] {
+                    for temperature in [0.0f32, 0.7] {
+                        let route =
+                            qwen_generation_route(has_mtp, has_images, constrained);
+                        let expected = match (has_mtp && !constrained, has_images) {
+                            (true, false) => QwenGenerationRoute::MtpText,
+                            (true, true) => QwenGenerationRoute::MtpMultimodal,
+                            (false, false) => QwenGenerationRoute::BaselineText,
+                            (false, true) => QwenGenerationRoute::BaselineMultimodal,
+                        };
+                        assert_eq!(
+                            route, expected,
+                            "has_mtp={has_mtp} has_images={has_images} \
+                             constrained={constrained} temperature={temperature}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn only_baseline_text_routes_are_prefix_cache_eligible() {
+        for route in [
+            QwenGenerationRoute::BaselineText,
+            QwenGenerationRoute::BaselineMultimodal,
+            QwenGenerationRoute::MtpText,
+            QwenGenerationRoute::MtpMultimodal,
+        ] {
+            assert_eq!(
+                route_uses_prefix_cache(route),
+                route == QwenGenerationRoute::BaselineText
+            );
+        }
+        assert_ne!(
+            qwen_generation_route(true, true, false),
+            QwenGenerationRoute::BaselineText
+        );
+    }
+
+    #[test]
+    fn mtp_k_validation_rejects_library_callers_below_two() {
+        assert!(validate_mtp_k(2).is_ok());
+        assert_eq!(
+            validate_mtp_k(1).expect_err("invalid K").to_string(),
+            "--mtp-k must be at least 2"
+        );
+        assert_eq!(
+            validate_mtp_k(0).expect_err("invalid K").to_string(),
+            "--mtp-k must be at least 2"
+        );
     }
 }
