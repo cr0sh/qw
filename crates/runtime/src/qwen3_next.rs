@@ -16,6 +16,7 @@
 
 use crate::gated_delta::GatedDeltaCache;
 use crate::qwen_mrope::{InterleavedMRoPE, apply_multimodal_rotary_pos_emb};
+use mlxcel_core::cache::KVCacheMode;
 use mlxcel_core::layers::{FusedQKVLinear, KVCache, RMSNorm, UnifiedLinear};
 use mlxcel_core::utils::silu;
 use mlxcel_core::weights::WeightMap;
@@ -86,6 +87,27 @@ impl Qwen3NextCache {
         match self {
             Self::Attention(kv) => kv.offset,
             Self::Linear(gd) => gd.offset,
+        }
+    }
+
+    /// Materialize persistent model state at an MTP round boundary.
+    pub(crate) fn materialize_state(&mut self) {
+        match self {
+            Self::Attention(cache) => cache.materialize_state(),
+            Self::Linear(cache) => {
+                let arrays: Vec<*const MlxArray> =
+                    [cache.conv_state.as_deref(), cache.state_cache.as_deref()]
+                        .into_iter()
+                        .flatten()
+                        .map(|array| {
+                            mlxcel_core::eval(array);
+                            array as *const MlxArray
+                        })
+                        .collect();
+                if !arrays.is_empty() {
+                    unsafe { mlxcel_core::detach_all(&arrays) };
+                }
+            }
         }
     }
 }
@@ -232,19 +254,45 @@ impl Qwen3NextAttention {
             );
         }
 
-        // Update KV cache
-        let (cache_k, cache_v) = cache.update_and_fetch(keys, values);
-
-        let attn_out = if target_verify && l > 1 {
-            self.attend_per_position(&queries, &cache_k, &cache_v)
-        } else if l > 1 && mask.is_none() {
-            mlxcel_core::causal_attention(&queries, &cache_k, &cache_v, self.scale, 0.0, 0)
-        } else {
-            let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
-            unsafe {
-                mlxcel_core::layers::attention_from_ptr(
-                    &queries, &cache_k, &cache_v, self.scale, mask_ptr, 0.0, 0,
+        // Symmetric Turbo4 stays in the rotated codec basis. Target verify
+        // uses a prefix per position to preserve sequential causal semantics.
+        let attn_out = if cache.mode == KVCacheMode::Turbo4 {
+            if target_verify && l > 1 {
+                cache.update_and_turbo4_dequant_sdpa_verify_attention(
+                    &queries,
+                    keys,
+                    values,
+                    self.scale,
                 )
+            } else {
+                cache.update_and_turbo4_dequant_sdpa_attention(
+                    &queries,
+                    keys,
+                    values,
+                    self.scale,
+                    mask,
+                )
+            }
+        } else {
+            let (cache_k, cache_v) = cache.update_and_fetch(keys, values);
+            if target_verify && l > 1 {
+                self.attend_per_position(&queries, &cache_k, &cache_v)
+            } else if l > 1 && mask.is_none() {
+                mlxcel_core::causal_attention(
+                    &queries,
+                    &cache_k,
+                    &cache_v,
+                    self.scale,
+                    0.0,
+                    0,
+                )
+            } else {
+                let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
+                unsafe {
+                    mlxcel_core::layers::attention_from_ptr(
+                        &queries, &cache_k, &cache_v, self.scale, mask_ptr, 0.0, 0,
+                    )
+                }
             }
         };
 

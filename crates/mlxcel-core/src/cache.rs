@@ -3129,6 +3129,34 @@ impl KVCache {
         }
     }
 
+    /// Evaluate every persistent tensor and detach the cache-owned array roots
+    /// from the lazy graph that produced them.
+    ///
+    /// Callers must hold exclusive access to the cache so detaching cannot
+    /// mutate an aliased live array object. Views returned by attention own
+    /// separate `MlxArray` objects and are unaffected.
+    pub fn materialize_state(&mut self) {
+        self.eval_state();
+        let arrays: Vec<*const MlxArray> = [
+            self.keys.as_deref(),
+            self.values.as_deref(),
+            self.key_scales.as_deref(),
+            self.val_scales.as_deref(),
+            self.v_packed.as_deref(),
+            self.v_norms.as_deref(),
+            self.v_rescale.as_deref(),
+            self.k_packed.as_deref(),
+            self.k_norms.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|array| array as *const MlxArray)
+        .collect();
+        if !arrays.is_empty() {
+            unsafe { ffi::detach_all(&arrays) };
+        }
+    }
+
     /// Returns `true` iff this cache holds a packed V (the Turbo4 family)
     /// and the sparse-V threshold is enabled (see
     /// [`turbo::sparse_v::is_enabled`]).
@@ -3494,7 +3522,57 @@ impl KVCache {
             self.mode
         );
         self.update(new_keys, new_values);
+        self.turbo4_dequant_sdpa_prefix(q, self.offset, scale, mask)
+    }
 
+    /// Multi-token target-verification variant of the symmetric Turbo4 path.
+    ///
+    /// The cache is updated once, then each query position attends through the
+    /// prefix that sequential decoding would have exposed at that position.
+    /// Packed K/V stay in their rotated codec bases; no full inverse-rotated
+    /// cache tensor is reconstructed.
+    pub fn update_and_turbo4_dequant_sdpa_verify_attention(
+        &mut self,
+        q: &MlxArray,
+        new_keys: UniquePtr<MlxArray>,
+        new_values: UniquePtr<MlxArray>,
+        scale: f32,
+    ) -> UniquePtr<MlxArray> {
+        assert!(
+            self.turbo4_dequant_sdpa_available(),
+            "update_and_turbo4_dequant_sdpa_verify_attention called on a cache that is not in \
+             Turbo4 mode (mode={:?})",
+            self.mode
+        );
+        let q_shape = ffi::array_shape(q);
+        let query_len = q_shape[2];
+        assert!(query_len > 0, "verify attention requires at least one query position");
+        self.update(new_keys, new_values);
+        let prefix_len = self.offset - query_len;
+        let mut output: Option<UniquePtr<MlxArray>> = None;
+        for position in 0..query_len {
+            let query = ffi::slice(
+                q,
+                &[0, 0, position, 0],
+                &[q_shape[0], q_shape[1], position + 1, q_shape[3]],
+            );
+            let attended =
+                self.turbo4_dequant_sdpa_prefix(&query, prefix_len + position + 1, scale, None);
+            output = Some(match output {
+                None => attended,
+                Some(previous) => concatenate(&previous, &attended, 2),
+            });
+        }
+        output.expect("verify attention requires at least one query position")
+    }
+
+    fn turbo4_dequant_sdpa_prefix(
+        &self,
+        q: &MlxArray,
+        prefix_len: i32,
+        scale: f32,
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
         let kp = self.k_packed.as_ref().expect("k_packed must exist");
         let kn = self.k_norms.as_ref().expect("k_norms must exist");
         let vp = self.v_packed.as_ref().expect("v_packed must exist");
@@ -3511,22 +3589,22 @@ impl KVCache {
         let kp_slice = ffi::slice(
             kp,
             &[0, 0, 0, 0],
-            &[kp_shape[0], kp_shape[1], self.offset, kp_shape[3]],
+            &[kp_shape[0], kp_shape[1], prefix_len, kp_shape[3]],
         );
         let kn_slice = ffi::slice(
             kn,
             &[0, 0, 0, 0],
-            &[kn_shape[0], kn_shape[1], self.offset, 1],
+            &[kn_shape[0], kn_shape[1], prefix_len, 1],
         );
         let vp_slice = ffi::slice(
             vp,
             &[0, 0, 0, 0],
-            &[vp_shape[0], vp_shape[1], self.offset, vp_shape[3]],
+            &[vp_shape[0], vp_shape[1], prefix_len, vp_shape[3]],
         );
         let vr_slice = ffi::slice(
             vr,
             &[0, 0, 0, 0],
-            &[vr_shape[0], vr_shape[1], self.offset, 1],
+            &[vr_shape[0], vr_shape[1], prefix_len, 1],
         );
 
         turbo::sparse_v::attention_turbo4_dequant_sdpa(

@@ -206,8 +206,8 @@ impl Qwen35MtpDraftModel {
         hidden: &MlxArray,
         state: &mut Qwen35MtpDraftState,
     ) {
-        state.seed_logits = Some(target.project_logits(hidden));
-        state.seed_hidden = Some(mlxcel_core::copy(hidden));
+        state.seed_logits = Some(materialize_detached(target.project_logits(hidden)));
+        state.seed_hidden = Some(materialize_detached(mlxcel_core::copy(hidden)));
     }
 
     pub(crate) fn prefill_from_target_hidden(
@@ -298,6 +298,7 @@ impl Qwen35MtpDraftModel {
             &[output_shape[0], last + 1, output_shape[2]],
         );
         self.set_seed_from_hidden(target, &last_hidden, &mut state);
+        state.cache.materialize_state();
     }
 
     fn draft_seed(
@@ -522,11 +523,11 @@ impl Qwen35MtpDraftModel {
             let token_array = mlxcel_core::from_slice_i32(&tokens, &[1, tokens.len() as i32]);
             let hidden_shape = mlxcel_core::array_shape(verify_hidden);
             let end = accepted.saturating_add(1).min(hidden_shape[1] as usize) as i32;
-            let hidden = mlxcel_core::slice(
+            let hidden = materialize_detached(mlxcel_core::slice(
                 verify_hidden,
                 &[0, keep_appended as i32, 0],
                 &[hidden_shape[0], end, hidden_shape[2]],
-            );
+            ));
             let output = self.forward_tokens(target, &token_array, &hidden, &mut state);
             let output_shape = mlxcel_core::array_shape(&output);
             let last = output_shape[1] - 1;
@@ -537,8 +538,43 @@ impl Qwen35MtpDraftModel {
             );
             self.set_seed_from_hidden(target, &last_hidden, &mut state);
         }
+        state.cache.materialize_state();
         state.round_appended = 0;
     }
+
+    fn materialize_state(&self) {
+        let mut state = self.state.borrow_mut();
+        state.cache.materialize_state();
+        if let Some(hidden) = state.seed_hidden.take() {
+            state.seed_hidden = Some(materialize_detached(hidden));
+        }
+        if let Some(logits) = state.seed_logits.take() {
+            state.seed_logits = Some(materialize_detached(logits));
+        }
+    }
+}
+
+fn materialize_detached(array: UniquePtr<MlxArray>) -> UniquePtr<MlxArray> {
+    mlxcel_core::eval(&array);
+    let ptr = array
+        .as_ref()
+        .expect("materialized MLX array must be non-null") as *const MlxArray;
+    unsafe { mlxcel_core::detach_all(&[ptr]) };
+    array
+}
+
+fn mtp_round_reaches_cache_clear(previous: usize, emitted: usize, interval: usize) -> bool {
+    interval != 0
+        && (previous.saturating_add(1)..=emitted)
+            .any(|n| crate::memory::should_clear_cache_at(n, interval))
+}
+
+fn finish_mtp_request(model: &Qwen35Model) {
+    if let Some(drafter) = model.mtp() {
+        drafter.materialize_state();
+    }
+    model.materialize_mtp_cache_state();
+    mlxcel_core::clear_memory_cache();
 }
 
 fn trim_draft_cache(cache: &mut KVCache, round_appended: usize, accepted: usize) -> usize {
@@ -1177,11 +1213,11 @@ fn rebuild_mtp_state(
     seed_drafter_from_prefill(model, drafter, prefill_input, &prefill.hidden, first_token);
     let prefill_shape = mlxcel_core::array_shape(&prefill.hidden);
     let last = prefill_shape[1] - 1;
-    let mut next_hidden = mlxcel_core::slice(
+    let mut next_hidden = materialize_detached(mlxcel_core::slice(
         &prefill.hidden,
         &[0, last, 0],
         &[prefill_shape[0], last + 1, prefill_shape[2]],
-    );
+    ));
 
     if output.len() > 1 {
         let cached_output = &output[..output.len() - 1];
@@ -1200,11 +1236,12 @@ fn rebuild_mtp_state(
         );
         let hidden_shape = mlxcel_core::array_shape(&verify.hidden);
         let accepted = i32::try_from(draft_tokens.len()).unwrap_or(i32::MAX);
-        next_hidden = mlxcel_core::slice(
+        next_hidden = materialize_detached(mlxcel_core::slice(
             &verify.hidden,
             &[0, accepted, 0],
             &[hidden_shape[0], accepted + 1, hidden_shape[2]],
-        );
+        ));
+        model.materialize_mtp_cache_state();
     }
 
     Ok(ActiveMtpState {
@@ -1234,7 +1271,7 @@ impl Qwen35MtpGenerator {
             prompt_tokens,
             &[1, i32::try_from(prompt_tokens.len()).unwrap_or(i32::MAX)],
         );
-        self.generate_streaming_for_prefill(
+        let result = self.generate_streaming_for_prefill(
             model,
             prompt_tokens,
             MtpPrefill::Text { prompt: &prompt },
@@ -1243,7 +1280,9 @@ impl Qwen35MtpGenerator {
             block_size,
             constraint,
             on_token,
-        )
+        );
+        finish_mtp_request(model);
+        result
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1264,7 +1303,7 @@ impl Qwen35MtpGenerator {
             prompt_tokens,
             &[1, i32::try_from(prompt_tokens.len()).unwrap_or(i32::MAX)],
         );
-        self.generate_streaming_for_prefill(
+        let result = self.generate_streaming_for_prefill(
             model,
             prompt_tokens,
             MtpPrefill::Multimodal {
@@ -1278,7 +1317,9 @@ impl Qwen35MtpGenerator {
             block_size,
             constraint,
             on_token,
-        )
+        );
+        finish_mtp_request(model);
+        result
     }
 
     fn generate_streaming_for_prefill<F: FnMut(i32) -> bool>(
@@ -1383,14 +1424,17 @@ impl Qwen35MtpGenerator {
 
             let prefill_shape = mlxcel_core::array_shape(&prefill.hidden);
             let last = prefill_shape[1] - 1;
-            let mut next_hidden = mlxcel_core::slice(
+            let mut next_hidden = materialize_detached(mlxcel_core::slice(
                 &prefill.hidden,
                 &[0, last, 0],
                 &[prefill_shape[0], last + 1, prefill_shape[2]],
-            );
+            ));
             let mut bonus = first_token;
+            drafter.materialize_state();
+            model.materialize_mtp_cache_state();
 
             while generated.len() < max_tokens {
+                let emitted_before = generated.len();
                 let remaining = max_tokens - generated.len();
                 let proposal_count = round_proposal_count(block_size, remaining);
                 if proposal_count == 0 {
@@ -1457,16 +1501,16 @@ impl Qwen35MtpGenerator {
                 mtp_stats.accepted_draft_tokens += walk.accepted;
                 mtp_stats.proposed_draft_tokens += draft_tokens.len();
 
-                if let Some(reason) = emit_walk_tokens(
+                let round_stop_reason = emit_walk_tokens(
                     &walk.new_tokens,
                     &eos_tokens,
                     max_tokens,
                     &mut generated,
                     &mut history,
                     &mut on_token,
-                ) {
+                );
+                if let Some(reason) = round_stop_reason {
                     stop_reason = reason;
-                    break;
                 }
 
                 if walk.accepted < draft_tokens.len() {
@@ -1485,15 +1529,27 @@ impl Qwen35MtpGenerator {
                 );
                 let hidden_shape = mlxcel_core::array_shape(&verify.hidden);
                 let accepted = i32::try_from(walk.accepted).unwrap_or(i32::MAX);
-                next_hidden = mlxcel_core::slice(
+                next_hidden = materialize_detached(mlxcel_core::slice(
                     &verify.hidden,
                     &[0, accepted, 0],
                     &[hidden_shape[0], accepted + 1, hidden_shape[2]],
-                );
+                ));
+                model.materialize_mtp_cache_state();
                 bonus = *walk
                     .new_tokens
                     .last()
                     .expect("speculative walk emits at least one token");
+                drafter.materialize_state();
+                if mtp_round_reaches_cache_clear(
+                    emitted_before,
+                    generated.len(),
+                    crate::memory::cache_clear_interval(),
+                ) {
+                    mlxcel_core::clear_memory_cache();
+                }
+                if round_stop_reason.is_some() {
+                    break;
+                }
             }
         }
         mtp_stats.decode_time = decode_start.elapsed();
@@ -1606,11 +1662,11 @@ impl Qwen35MtpGenerator {
                 let shape = mlxcel_core::array_shape(&prefill.hidden);
                 let last = shape[1] - 1;
                 state = ActiveMtpState {
-                    next_hidden: mlxcel_core::slice(
+                    next_hidden: materialize_detached(mlxcel_core::slice(
                         &prefill.hidden,
                         &[0, last, 0],
                         &[shape[0], last + 1, shape[2]],
-                    ),
+                    )),
                     bonus: first_token,
                 };
             } else {
@@ -1619,7 +1675,10 @@ impl Qwen35MtpGenerator {
             break;
         }
 
+        drafter.materialize_state();
+        model.materialize_mtp_cache_state();
         while generated.len() < max_tokens && stop_reason == GenerationStopReason::MaxTokens {
+            let emitted_before = generated.len();
             let remaining = max_tokens - generated.len();
             let proposal_count = round_proposal_count(block_size, remaining);
             if proposal_count == 0 {
@@ -1740,15 +1799,24 @@ impl Qwen35MtpGenerator {
                 );
                 let hidden_shape = mlxcel_core::array_shape(&verify.hidden);
                 let accepted = i32::try_from(walk.accepted).unwrap_or(i32::MAX);
-                state.next_hidden = mlxcel_core::slice(
+                state.next_hidden = materialize_detached(mlxcel_core::slice(
                     &verify.hidden,
                     &[0, accepted, 0],
                     &[hidden_shape[0], accepted + 1, hidden_shape[2]],
-                );
+                ));
                 state.bonus = *walk
                     .new_tokens
                     .last()
                     .expect("constrained walk emitted at least one token");
+            }
+            drafter.materialize_state();
+            model.materialize_mtp_cache_state();
+            if mtp_round_reaches_cache_clear(
+                emitted_before,
+                generated.len(),
+                crate::memory::cache_clear_interval(),
+            ) {
+                mlxcel_core::clear_memory_cache();
             }
 
             if callback_cancelled {
@@ -2294,6 +2362,48 @@ mod tests {
             assert_eq!(mrope.position(), plan.final_offset);
             assert_eq!(mrope.rope_delta(), Some(-3));
         }
+    }
+
+    #[test]
+    fn round_cache_clear_reaches_boundaries_crossed_by_accepted_blocks() {
+        assert!(!mtp_round_reaches_cache_clear(0, 3, 4));
+        assert!(mtp_round_reaches_cache_clear(3, 6, 4));
+        assert!(mtp_round_reaches_cache_clear(7, 12, 4));
+        assert!(!mtp_round_reaches_cache_clear(4, 7, 4));
+        assert!(!mtp_round_reaches_cache_clear(0, usize::MAX, 0));
+    }
+
+    #[test]
+    fn materialized_hidden_and_trimmed_draft_cache_preserve_visible_state() {
+        let hidden_source =
+            mlxcel_core::from_slice_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 2, 2]);
+        let hidden = materialize_detached(mlxcel_core::slice(
+            &hidden_source,
+            &[0, 1, 0],
+            &[1, 2, 2],
+        ));
+        drop(hidden_source);
+        mlxcel_core::clear_memory_cache();
+        assert_eq!(array_f32(&hidden), [3.0, 4.0]);
+
+        let mut cache = KVCache::new();
+        cache.update(
+            mlxcel_core::from_slice_f32(&[1.0, 2.0, 3.0], &[1, 1, 3, 1]),
+            mlxcel_core::from_slice_f32(&[11.0, 12.0, 13.0], &[1, 1, 3, 1]),
+        );
+        cache.update(
+            mlxcel_core::from_slice_f32(&[4.0], &[1, 1, 1, 1]),
+            mlxcel_core::from_slice_f32(&[14.0], &[1, 1, 1, 1]),
+        );
+        assert_eq!(cache.trim(1), 1);
+        cache.materialize_state();
+        let (keys, values) = cache.update_and_fetch(
+            mlxcel_core::from_slice_f32(&[5.0], &[1, 1, 1, 1]),
+            mlxcel_core::from_slice_f32(&[15.0], &[1, 1, 1, 1]),
+        );
+        assert_eq!(cache.offset, 4);
+        assert_eq!(array_f32(&keys), [1.0, 2.0, 3.0, 5.0]);
+        assert_eq!(array_f32(&values), [11.0, 12.0, 13.0, 15.0]);
     }
 
     fn array_f32(array: &MlxArray) -> Vec<f32> {
