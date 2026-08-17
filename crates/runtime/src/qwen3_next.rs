@@ -254,11 +254,12 @@ impl Qwen3NextAttention {
             );
         }
 
-        // Symmetric Turbo4 stays in the rotated codec basis. Target verify
-        // uses a prefix per position to preserve sequential causal semantics.
+        // Symmetric Turbo4 stays in the rotated codec basis. Multi-token
+        // calls use native causal SDPA metadata rather than a materialized
+        // additive mask.
         let attn_out = if cache.mode == KVCacheMode::Turbo4 {
-            if target_verify && l > 1 {
-                cache.update_and_turbo4_dequant_sdpa_verify_attention(
+            if l > 1 && mask.is_none() {
+                cache.update_and_turbo4_dequant_sdpa_causal_attention(
                     &queries,
                     keys,
                     values,

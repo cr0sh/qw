@@ -35,7 +35,6 @@ use mlxcel_core::speculative::mtp::walk::WalkResult;
 use mlxcel_core::speculative::stochastic_accept::{
     DraftVerdict, sampler_is_greedy, verify_draft_token,
 };
-use mlxcel_core::utils::create_causal_mask;
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 
@@ -172,7 +171,6 @@ impl Qwen35MtpDraftModel {
         let mut output = self.fc.forward(&concatenated);
         let steps = mlxcel_core::array_shape(&output)[1];
         let cache_offset = state.cache.offset;
-        let mask = (steps > 1).then(|| create_causal_mask(steps, cache_offset));
         let decode_positions = if position_ids.is_none() {
             state
                 .rope_delta
@@ -182,7 +180,7 @@ impl Qwen35MtpDraftModel {
         };
         output = self.layer.forward_full_attention(
             &output,
-            mask.as_deref(),
+            None,
             &mut state.cache,
             position_ids.or(decode_positions.as_deref()),
         );

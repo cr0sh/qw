@@ -3522,16 +3522,16 @@ impl KVCache {
             self.mode
         );
         self.update(new_keys, new_values);
-        self.turbo4_dequant_sdpa_prefix(q, self.offset, scale, mask)
+        self.turbo4_dequant_sdpa_prefix(q, self.offset, scale, mask, false)
     }
 
-    /// Multi-token target-verification variant of the symmetric Turbo4 path.
+    /// Multi-token causal variant of the symmetric Turbo4 path.
     ///
-    /// The cache is updated once, then each query position attends through the
-    /// prefix that sequential decoding would have exposed at that position.
-    /// Packed K/V stay in their rotated codec bases; no full inverse-rotated
-    /// cache tensor is reconstructed.
-    pub fn update_and_turbo4_dequant_sdpa_verify_attention(
+    /// Packed K/V are dequantized in codec space and passed to MLX's native
+    /// causal SDPA metadata path. This preserves the query-to-key offset
+    /// implied by `q_len` and the updated cache length without allocating an
+    /// additive `T x T` mask.
+    pub fn update_and_turbo4_dequant_sdpa_causal_attention(
         &mut self,
         q: &MlxArray,
         new_keys: UniquePtr<MlxArray>,
@@ -3540,30 +3540,12 @@ impl KVCache {
     ) -> UniquePtr<MlxArray> {
         assert!(
             self.turbo4_dequant_sdpa_available(),
-            "update_and_turbo4_dequant_sdpa_verify_attention called on a cache that is not in \
+            "update_and_turbo4_dequant_sdpa_causal_attention called on a cache that is not in \
              Turbo4 mode (mode={:?})",
             self.mode
         );
-        let q_shape = ffi::array_shape(q);
-        let query_len = q_shape[2];
-        assert!(query_len > 0, "verify attention requires at least one query position");
         self.update(new_keys, new_values);
-        let prefix_len = self.offset - query_len;
-        let mut output: Option<UniquePtr<MlxArray>> = None;
-        for position in 0..query_len {
-            let query = ffi::slice(
-                q,
-                &[0, 0, position, 0],
-                &[q_shape[0], q_shape[1], position + 1, q_shape[3]],
-            );
-            let attended =
-                self.turbo4_dequant_sdpa_prefix(&query, prefix_len + position + 1, scale, None);
-            output = Some(match output {
-                None => attended,
-                Some(previous) => concatenate(&previous, &attended, 2),
-            });
-        }
-        output.expect("verify attention requires at least one query position")
+        self.turbo4_dequant_sdpa_prefix(q, self.offset, scale, None, true)
     }
 
     fn turbo4_dequant_sdpa_prefix(
@@ -3572,6 +3554,7 @@ impl KVCache {
         prefix_len: i32,
         scale: f32,
         mask: Option<&MlxArray>,
+        causal: bool,
     ) -> UniquePtr<MlxArray> {
         let kp = self.k_packed.as_ref().expect("k_packed must exist");
         let kn = self.k_norms.as_ref().expect("k_norms must exist");
@@ -3608,7 +3591,7 @@ impl KVCache {
         );
 
         turbo::sparse_v::attention_turbo4_dequant_sdpa(
-            q, &kp_slice, &kn_slice, &vp_slice, &vr_slice, params, scale, mask,
+            q, &kp_slice, &kn_slice, &vp_slice, &vr_slice, params, scale, mask, causal,
         )
     }
 

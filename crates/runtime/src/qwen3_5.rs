@@ -31,7 +31,7 @@ use anyhow::{Context, Result, ensure};
 use mlxcel_core::cache::{KVCacheMode, SequenceId};
 use mlxcel_core::generate::{LanguageModel, ModelStateSnapshot};
 use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
-use mlxcel_core::utils::{create_causal_mask, silu};
+use mlxcel_core::utils::silu;
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr, concatenate};
 use serde::Deserialize;
@@ -777,25 +777,9 @@ impl Qwen35Model {
         let mut hidden = input_embeddings
             .map(mlxcel_core::copy)
             .unwrap_or_else(|| self.embed_tokens.forward(input_ids));
-        let sequence_length = mlxcel_core::array_shape(&hidden)[1];
-        let attention_layer = self.config.full_attention_interval.saturating_sub(1);
-        let attention_mask = if sequence_length > 1 {
-            let offset = caches
-                .get(attention_layer)
-                .map(Qwen3NextCache::offset)
-                .unwrap_or(0);
-            Some(create_causal_mask(sequence_length, offset))
-        } else {
-            None
-        };
 
         for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
-            let mask = if layer.is_linear {
-                None
-            } else {
-                attention_mask.as_deref()
-            };
-            hidden = layer.forward(&hidden, mask, cache, position_ids);
+            hidden = layer.forward(&hidden, None, cache, position_ids);
         }
         hidden
     }
@@ -970,28 +954,20 @@ impl Qwen35Model {
             let mut hidden = self.embed_tokens.forward(input_ids);
             let shape = mlxcel_core::array_shape(&hidden);
             let seq_len = shape[1];
-            let attention_layer = self.config.full_attention_interval.saturating_sub(1);
             let cache_offset = caches
-                .get(attention_layer)
+                .first()
                 .map(Qwen3NextCache::offset)
                 .unwrap_or(0);
-            let attention_mask = (seq_len > 1)
-                .then(|| create_causal_mask(seq_len, cache_offset));
             let position_ids =
                 rope_delta.map(|delta| decode_rope_positions(cache_offset, seq_len, delta));
             let mut gdn_states = Vec::new();
             for (layer_idx, (layer, cache)) in
                 self.layers.iter().zip(caches.iter_mut()).enumerate()
             {
-                let mask = if layer.is_linear {
-                    None
-                } else {
-                    attention_mask.as_deref()
-                };
                 hidden = layer.forward_with_capture(
                     layer_idx,
                     &hidden,
-                    mask,
+                    None,
                     cache,
                     position_ids.as_deref(),
                     &mut gdn_states,

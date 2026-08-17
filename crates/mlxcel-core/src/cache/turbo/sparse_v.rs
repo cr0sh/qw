@@ -1057,12 +1057,17 @@ pub fn attention_turbo4_dequant_sdpa(
     params: &TurboQuantParams,
     scale: f32,
     mask: Option<&MlxArray>,
+    causal: bool,
 ) -> UniquePtr<MlxArray> {
     let q_rot_f32 = super::quant::turbo4_k_rotate(q, params);
     let q_rot = ffi::astype(&q_rot_f32, ffi::array_dtype(q));
     let k_rot = super::quant::dequantize_k_turbo4_rotated(k_packed, k_norms, params);
     let v_rot = dequantize_v_turbo4_rotated_for_sdpa(v_packed, v_rescale, params);
-    let rot_out = crate::layers::attention(&q_rot, &k_rot, &v_rot, scale, mask, 0.0, 0);
+    let rot_out = if causal {
+        crate::causal_attention(&q_rot, &k_rot, &v_rot, scale, 0.0, 0)
+    } else {
+        crate::layers::attention(&q_rot, &k_rot, &v_rot, scale, mask, 0.0, 0)
+    };
     super::quant::turbo4_v_inverse_rotate(&rot_out, params)
 }
 
