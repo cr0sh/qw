@@ -1695,6 +1695,18 @@ std::unique_ptr<MlxArray> bitlinear_matmul(
     bool invert_weight_scales
 );
 
+// Device-side Turbo4 nearest-centroid selection and nibble packing.
+void turbo4_pack_centroids(
+    const MlxArray& rotated,
+    const MlxArray& norms,
+    const MlxArray& boundaries,
+    const MlxArray& centroids,
+    int32_t head_dim,
+    std::unique_ptr<MlxArray>& packed_out,
+    std::unique_ptr<MlxArray>& norms_out,
+    std::unique_ptr<MlxArray>& rescale_out
+);
+
 // Fused MoE forward: gate + switch_mlp + score weighting + optional shared expert
 // Combines ~25 FFI calls into a single C++ function
 // Used by: NemotronH, NemotronNAS

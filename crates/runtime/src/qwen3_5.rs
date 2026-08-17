@@ -31,7 +31,7 @@ use anyhow::{Context, Result, ensure};
 use mlxcel_core::cache::{KVCacheMode, SequenceId};
 use mlxcel_core::generate::{LanguageModel, ModelStateSnapshot};
 use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
-use mlxcel_core::utils::{create_causal_mask, silu};
+use mlxcel_core::utils::silu;
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr, concatenate};
 use serde::Deserialize;
@@ -777,25 +777,9 @@ impl Qwen35Model {
         let mut hidden = input_embeddings
             .map(mlxcel_core::copy)
             .unwrap_or_else(|| self.embed_tokens.forward(input_ids));
-        let sequence_length = mlxcel_core::array_shape(&hidden)[1];
-        let attention_layer = self.config.full_attention_interval.saturating_sub(1);
-        let attention_mask = if sequence_length > 1 {
-            let offset = caches
-                .get(attention_layer)
-                .map(Qwen3NextCache::offset)
-                .unwrap_or(0);
-            Some(create_causal_mask(sequence_length, offset))
-        } else {
-            None
-        };
 
         for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
-            let mask = if layer.is_linear {
-                None
-            } else {
-                attention_mask.as_deref()
-            };
-            hidden = layer.forward(&hidden, mask, cache, position_ids);
+            hidden = layer.forward(&hidden, None, cache, position_ids);
         }
         hidden
     }
@@ -876,57 +860,89 @@ impl Qwen35Model {
         self.mtp.as_ref()
     }
 
-    pub(crate) fn forward_mtp_prefill(&self, input_ids: &MlxArray) -> Qwen35MtpPrefill {
-        self.reset_runtime_state();
-        self.forward_mtp_prefill_with_inputs(input_ids, None, None)
-    }
-
-    pub(crate) fn forward_mtp_prefill_with_embeddings(
-        &self,
-        input_ids: &MlxArray,
-        input_embeddings: &MlxArray,
-        position_ids: &MlxArray,
-        rope_delta: i32,
-    ) -> std::result::Result<Qwen35MtpPrefill, String> {
-        self.reset_runtime_state();
-        self.mrope_state.prepare(position_ids, rope_delta);
-        self.mrope_state.activate_prepared()?;
-        let output = self.mrope_state.with_position_ids(|position_ids| {
-            self.forward_mtp_prefill_with_inputs(
-                input_ids,
-                Some(input_embeddings),
-                position_ids,
-            )
-        });
-        self.mrope_state.finish_prefill();
-        Ok(output)
-    }
-
-    fn forward_mtp_prefill_with_inputs(
+    pub(crate) fn forward_mtp_prefill_chunks<F>(
         &self,
         input_ids: &MlxArray,
         input_embeddings: Option<&MlxArray>,
         position_ids: Option<&MlxArray>,
-    ) -> Qwen35MtpPrefill {
-        let (hidden, first_logits, offset) = self.sequence_state.with_internal(|caches| {
-            let hidden =
-                self.forward_backbone_with_inputs(input_ids, input_embeddings, caches, position_ids);
-            let shape = mlxcel_core::array_shape(&hidden);
-            let last_position = shape[1] - 1;
-            let last_hidden = mlxcel_core::slice(
-                &hidden,
-                &[0, last_position, 0],
-                &[shape[0], last_position + 1, shape[2]],
-            );
-            let first_logits = self.project_logits(&self.norm.forward(&last_hidden));
-            let offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
-            (hidden, first_logits, offset)
-        });
-        self.mrope_state.set_position(offset);
-        Qwen35MtpPrefill {
-            hidden,
-            first_logits,
+        rope_delta: Option<i32>,
+        mut consume_chunk: F,
+    ) -> std::result::Result<Qwen35MtpPrefill, String>
+    where
+        F: FnMut(i32, i32, &MlxArray),
+    {
+        self.reset_runtime_state();
+        if let (Some(position_ids), Some(rope_delta)) = (position_ids, rope_delta) {
+            self.mrope_state.prepare(position_ids, rope_delta);
+            self.mrope_state.activate_prepared()?;
         }
+
+        let shape = mlxcel_core::array_shape(input_ids);
+        let prompt_len = shape[1];
+        let configured = mlxcel_core::generate::prefill_chunk_len();
+        let chunk_len = mlxcel_core::generate::effective_prefill_chunk(
+            configured,
+            true,
+            prompt_len as usize,
+        )
+        .unwrap_or(prompt_len as usize) as i32;
+        let mut final_chunk = None;
+        let mut final_logits = None;
+        let mut start = 0;
+        while start < prompt_len {
+            let end = (start + chunk_len).min(prompt_len);
+            let ids = mlxcel_core::slice(input_ids, &[0, start], &[shape[0], end]);
+            let embeddings = input_embeddings.map(|embeddings| {
+                let embedding_shape = mlxcel_core::array_shape(embeddings);
+                mlxcel_core::slice(
+                    embeddings,
+                    &[0, start, 0],
+                    &[embedding_shape[0], end, embedding_shape[2]],
+                )
+            });
+            let positions = position_ids.map(|positions| {
+                let position_shape = mlxcel_core::array_shape(positions);
+                mlxcel_core::slice(
+                    positions,
+                    &[0, 0, start],
+                    &[position_shape[0], position_shape[1], end],
+                )
+            });
+            let hidden = self.sequence_state.with_internal(|caches| {
+                self.forward_backbone_with_inputs(
+                    &ids,
+                    embeddings.as_deref(),
+                    caches,
+                    positions.as_deref(),
+                )
+            });
+            if end < prompt_len {
+                consume_chunk(start, end, &hidden);
+            } else {
+                let hidden_shape = mlxcel_core::array_shape(&hidden);
+                let last = hidden_shape[1] - 1;
+                let last_hidden = mlxcel_core::slice(
+                    &hidden,
+                    &[0, last, 0],
+                    &[hidden_shape[0], last + 1, hidden_shape[2]],
+                );
+                final_logits = Some(self.project_logits(&self.norm.forward(&last_hidden)));
+                final_chunk = Some(hidden);
+            }
+            start = end;
+        }
+
+        let offset = self
+            .sequence_state
+            .with_internal(|caches| caches.first().map(Qwen3NextCache::offset).unwrap_or(0));
+        self.mrope_state.set_position(offset);
+        if position_ids.is_some() {
+            self.mrope_state.finish_prefill();
+        }
+        Ok(Qwen35MtpPrefill {
+            hidden: final_chunk.expect("MTP prefill requires a non-empty prompt"),
+            first_logits: final_logits.expect("MTP prefill requires a non-empty prompt"),
+        })
     }
 
     pub(crate) fn forward_mtp_verify(
@@ -938,28 +954,20 @@ impl Qwen35Model {
             let mut hidden = self.embed_tokens.forward(input_ids);
             let shape = mlxcel_core::array_shape(&hidden);
             let seq_len = shape[1];
-            let attention_layer = self.config.full_attention_interval.saturating_sub(1);
             let cache_offset = caches
-                .get(attention_layer)
+                .first()
                 .map(Qwen3NextCache::offset)
                 .unwrap_or(0);
-            let attention_mask = (seq_len > 1)
-                .then(|| create_causal_mask(seq_len, cache_offset));
             let position_ids =
                 rope_delta.map(|delta| decode_rope_positions(cache_offset, seq_len, delta));
             let mut gdn_states = Vec::new();
             for (layer_idx, (layer, cache)) in
                 self.layers.iter().zip(caches.iter_mut()).enumerate()
             {
-                let mask = if layer.is_linear {
-                    None
-                } else {
-                    attention_mask.as_deref()
-                };
                 hidden = layer.forward_with_capture(
                     layer_idx,
                     &hidden,
-                    mask,
+                    None,
                     cache,
                     position_ids.as_deref(),
                     &mut gdn_states,

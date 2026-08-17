@@ -35,7 +35,6 @@ use mlxcel_core::speculative::mtp::walk::WalkResult;
 use mlxcel_core::speculative::stochastic_accept::{
     DraftVerdict, sampler_is_greedy, verify_draft_token,
 };
-use mlxcel_core::utils::create_causal_mask;
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 
@@ -91,20 +90,30 @@ impl Qwen35MtpDraftState {
     }
 }
 
-fn shift_prompt_embeddings(
+fn shifted_embedding_range(
     input_embeddings: &MlxArray,
-    bonus_embedding: &MlxArray,
+    start: i32,
+    end: i32,
+    bonus_embedding: Option<&MlxArray>,
 ) -> UniquePtr<MlxArray> {
     let shape = mlxcel_core::array_shape(input_embeddings);
-    if shape[1] == 1 {
-        mlxcel_core::copy(bonus_embedding)
+    let stop = if bonus_embedding.is_some() {
+        shape[1]
     } else {
-        let tail = mlxcel_core::slice(
+        end + 1
+    };
+    let tail = (start + 1 < stop).then(|| {
+        mlxcel_core::slice(
             input_embeddings,
-            &[0, 1, 0],
-            &[shape[0], shape[1], shape[2]],
-        );
-        mlxcel_core::concatenate(&tail, bonus_embedding, 1)
+            &[0, start + 1, 0],
+            &[shape[0], stop, shape[2]],
+        )
+    });
+    match (tail, bonus_embedding) {
+        (Some(tail), Some(bonus)) => mlxcel_core::concatenate(&tail, bonus, 1),
+        (Some(tail), None) => tail,
+        (None, Some(bonus)) => mlxcel_core::copy(bonus),
+        (None, None) => panic!("shifted embedding range must not be empty"),
     }
 }
 
@@ -172,7 +181,6 @@ impl Qwen35MtpDraftModel {
         let mut output = self.fc.forward(&concatenated);
         let steps = mlxcel_core::array_shape(&output)[1];
         let cache_offset = state.cache.offset;
-        let mask = (steps > 1).then(|| create_causal_mask(steps, cache_offset));
         let decode_positions = if position_ids.is_none() {
             state
                 .rope_delta
@@ -182,7 +190,7 @@ impl Qwen35MtpDraftModel {
         };
         output = self.layer.forward_full_attention(
             &output,
-            mask.as_deref(),
+            None,
             &mut state.cache,
             position_ids.or(decode_positions.as_deref()),
         );
@@ -210,95 +218,33 @@ impl Qwen35MtpDraftModel {
         state.seed_hidden = Some(materialize_detached(mlxcel_core::copy(hidden)));
     }
 
-    pub(crate) fn prefill_from_target_hidden(
+    fn prefill_target_chunk(
         &self,
         target: &Qwen35Model,
-        input_ids: &MlxArray,
+        shifted_embeddings: &MlxArray,
         target_hidden: &MlxArray,
-        bonus_token: i32,
-    ) {
-        self.prefill_from_target_hidden_with_inputs(
-            target,
-            input_ids,
-            None,
-            target_hidden,
-            bonus_token,
-            None,
-            None,
-        );
-    }
-
-    pub(crate) fn prefill_from_target_hidden_with_embeddings(
-        &self,
-        target: &Qwen35Model,
-        input_ids: &MlxArray,
-        input_embeddings: &MlxArray,
-        target_hidden: &MlxArray,
-        bonus_token: i32,
-        position_ids: &MlxArray,
-        rope_delta: i32,
-    ) {
-        self.prefill_from_target_hidden_with_inputs(
-            target,
-            input_ids,
-            Some(input_embeddings),
-            target_hidden,
-            bonus_token,
-            Some(position_ids),
-            Some(rope_delta),
-        );
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn prefill_from_target_hidden_with_inputs(
-        &self,
-        target: &Qwen35Model,
-        input_ids: &MlxArray,
-        input_embeddings: Option<&MlxArray>,
-        target_hidden: &MlxArray,
-        bonus_token: i32,
         position_ids: Option<&MlxArray>,
         rope_delta: Option<i32>,
+        seed: bool,
     ) {
-        let shape = mlxcel_core::array_shape(input_ids);
-        let prompt_len = shape[1];
-        if prompt_len == 0 {
-            return;
-        }
-        let bonus = mlxcel_core::from_slice_i32(&[bonus_token], &[1, 1]);
-        let bonus_embedding = target.embed_tokens.forward(&bonus);
-        let shifted_embeddings = if let Some(input_embeddings) = input_embeddings {
-            shift_prompt_embeddings(input_embeddings, &bonus_embedding)
-        } else if prompt_len == 1 {
-            bonus_embedding
-        } else {
-            let tail = mlxcel_core::slice(input_ids, &[0, 1], &[shape[0], prompt_len]);
-            let shifted = mlxcel_core::concatenate(&tail, &bonus, 1);
-            target.embed_tokens.forward(&shifted)
-        };
-        let hidden_shape = mlxcel_core::array_shape(target_hidden);
-        let hidden = mlxcel_core::slice(
-            target_hidden,
-            &[0, 0, 0],
-            &[hidden_shape[0], prompt_len, hidden_shape[2]],
-        );
         let mut state = self.state.borrow_mut();
         state.rope_delta = rope_delta;
         let output = self.forward_embeddings(
-            &shifted_embeddings,
-            &hidden,
+            shifted_embeddings,
+            target_hidden,
             &mut state,
             position_ids,
         );
-        let output_shape = mlxcel_core::array_shape(&output);
-        let last = output_shape[1] - 1;
-        let last_hidden = mlxcel_core::slice(
-            &output,
-            &[0, last, 0],
-            &[output_shape[0], last + 1, output_shape[2]],
-        );
-        self.set_seed_from_hidden(target, &last_hidden, &mut state);
-        state.cache.materialize_state();
+        if seed {
+            let output_shape = mlxcel_core::array_shape(&output);
+            let last = output_shape[1] - 1;
+            let last_hidden = mlxcel_core::slice(
+                &output,
+                &[0, last, 0],
+                &[output_shape[0], last + 1, output_shape[2]],
+            );
+            self.set_seed_from_hidden(target, &last_hidden, &mut state);
+        }
     }
 
     fn draft_seed(
@@ -552,6 +498,11 @@ impl Qwen35MtpDraftModel {
             state.seed_logits = Some(materialize_detached(logits));
         }
     }
+}
+
+fn materialize_borrowed(array: &MlxArray) {
+    mlxcel_core::eval(array);
+    unsafe { mlxcel_core::detach_all(&[array as *const MlxArray]) };
 }
 
 fn materialize_detached(array: UniquePtr<MlxArray>) -> UniquePtr<MlxArray> {
@@ -1151,54 +1102,154 @@ struct ActiveMtpState {
     bonus: i32,
 }
 
-fn prefill_for_input(
-    model: &Qwen35Model,
-    prefill_input: MtpPrefill<'_>,
-) -> Result<crate::qwen3_5::Qwen35MtpPrefill, String> {
-    match prefill_input {
-        MtpPrefill::Text { prompt } => Ok(model.forward_mtp_prefill(prompt)),
-        MtpPrefill::Multimodal {
-            prompt,
-            input_embeddings,
-            position_ids,
-            rope_delta,
-        } => model.forward_mtp_prefill_with_embeddings(
-            prompt,
-            input_embeddings,
-            position_ids,
-            rope_delta,
-        ),
+fn prompt_for_prefill(prefill: MtpPrefill<'_>) -> &MlxArray {
+    match prefill {
+        MtpPrefill::Text { prompt } | MtpPrefill::Multimodal { prompt, .. } => prompt,
     }
 }
 
-fn seed_drafter_from_prefill(
+fn shifted_embeddings_for_range(
+    model: &Qwen35Model,
+    prefill: MtpPrefill<'_>,
+    start: i32,
+    end: i32,
+    bonus: Option<i32>,
+) -> UniquePtr<MlxArray> {
+    let prompt = prompt_for_prefill(prefill);
+    let prompt_shape = mlxcel_core::array_shape(prompt);
+    let prompt_len = prompt_shape[1];
+    match prefill {
+        MtpPrefill::Text { .. } => {
+            let shifted_ids = if let Some(bonus) = bonus {
+                let bonus = mlxcel_core::from_slice_i32(&[bonus], &[1, 1]);
+                if start + 1 < prompt_len {
+                    let tail =
+                        mlxcel_core::slice(prompt, &[0, start + 1], &[prompt_shape[0], prompt_len]);
+                    mlxcel_core::concatenate(&tail, &bonus, 1)
+                } else {
+                    bonus
+                }
+            } else {
+                mlxcel_core::slice(prompt, &[0, start + 1], &[prompt_shape[0], end + 1])
+            };
+            model.embed_tokens.forward(&shifted_ids)
+        }
+        MtpPrefill::Multimodal {
+            input_embeddings, ..
+        } => {
+            let bonus_embedding = bonus.map(|bonus| {
+                let bonus = mlxcel_core::from_slice_i32(&[bonus], &[1, 1]);
+                model.embed_tokens.forward(&bonus)
+            });
+            shifted_embedding_range(
+                input_embeddings,
+                start,
+                end,
+                bonus_embedding.as_deref(),
+            )
+        }
+    }
+}
+
+fn position_ids_for_range(
+    prefill: MtpPrefill<'_>,
+    start: i32,
+    end: i32,
+) -> Option<UniquePtr<MlxArray>> {
+    let MtpPrefill::Multimodal { position_ids, .. } = prefill else {
+        return None;
+    };
+    let shape = mlxcel_core::array_shape(position_ids);
+    Some(mlxcel_core::slice(
+        position_ids,
+        &[0, 0, start],
+        &[shape[0], shape[1], end],
+    ))
+}
+
+fn prefill_for_input(
     model: &Qwen35Model,
     drafter: &Qwen35MtpDraftModel,
     prefill_input: MtpPrefill<'_>,
-    hidden: &MlxArray,
-    first_token: i32,
-) {
-    match prefill_input {
-        MtpPrefill::Text { prompt } => {
-            drafter.prefill_from_target_hidden(model, prompt, hidden, first_token);
-        }
+) -> Result<crate::qwen3_5::Qwen35MtpPrefill, String> {
+    drafter.reset();
+    let prompt = prompt_for_prefill(prefill_input);
+    let (embeddings, positions, rope_delta) = match prefill_input {
+        MtpPrefill::Text { .. } => (None, None, None),
         MtpPrefill::Multimodal {
-            prompt,
             input_embeddings,
             position_ids,
             rope_delta,
-        } => drafter.prefill_from_target_hidden_with_embeddings(
-            model,
-            prompt,
-            input_embeddings,
-            hidden,
-            first_token,
-            position_ids,
-            rope_delta,
+            ..
+        } => (
+            Some(input_embeddings),
+            Some(position_ids),
+            Some(rope_delta),
         ),
-    }
+    };
+    model.forward_mtp_prefill_chunks(
+        prompt,
+        embeddings,
+        positions,
+        rope_delta,
+        |start, end, hidden| {
+            let shifted =
+                shifted_embeddings_for_range(model, prefill_input, start, end, None);
+            let chunk_positions = position_ids_for_range(prefill_input, start, end);
+            drafter.prefill_target_chunk(
+                model,
+                &shifted,
+                hidden,
+                chunk_positions.as_deref(),
+                rope_delta,
+                false,
+            );
+            materialize_borrowed(hidden);
+            drafter.materialize_state();
+            model.materialize_mtp_cache_state();
+            mlxcel_core::clear_memory_cache();
+        },
+    )
 }
 
+fn finish_drafter_prefill(
+    model: &Qwen35Model,
+    drafter: &Qwen35MtpDraftModel,
+    prefill_input: MtpPrefill<'_>,
+    prefill: crate::qwen3_5::Qwen35MtpPrefill,
+    first_token: i32,
+) -> UniquePtr<MlxArray> {
+    let prompt_len = mlxcel_core::array_shape(prompt_for_prefill(prefill_input))[1];
+    let final_shape = mlxcel_core::array_shape(&prefill.hidden);
+    let final_len = final_shape[1];
+    let start = prompt_len - final_len;
+    let shifted =
+        shifted_embeddings_for_range(model, prefill_input, start, prompt_len, Some(first_token));
+    let positions = position_ids_for_range(prefill_input, start, prompt_len);
+    let rope_delta = match prefill_input {
+        MtpPrefill::Text { .. } => None,
+        MtpPrefill::Multimodal { rope_delta, .. } => Some(rope_delta),
+    };
+    drafter.prefill_target_chunk(
+        model,
+        &shifted,
+        &prefill.hidden,
+        positions.as_deref(),
+        rope_delta,
+        true,
+    );
+    drafter.materialize_state();
+    model.materialize_mtp_cache_state();
+    let last = final_len - 1;
+    let last_hidden = materialize_detached(mlxcel_core::slice(
+        &prefill.hidden,
+        &[0, last, 0],
+        &[final_shape[0], last + 1, final_shape[2]],
+    ));
+    drop(prefill);
+    mlxcel_core::clear_memory_cache();
+    last_hidden
+}
 fn rebuild_mtp_state(
     model: &Qwen35Model,
     drafter: &Qwen35MtpDraftModel,
@@ -1208,16 +1259,9 @@ fn rebuild_mtp_state(
     let first_token = *output
         .first()
         .ok_or_else(|| "cannot rebuild MTP state for an empty output".to_string())?;
-    let prefill = prefill_for_input(model, prefill_input)?;
-    mlxcel_core::eval(&prefill.hidden);
-    seed_drafter_from_prefill(model, drafter, prefill_input, &prefill.hidden, first_token);
-    let prefill_shape = mlxcel_core::array_shape(&prefill.hidden);
-    let last = prefill_shape[1] - 1;
-    let mut next_hidden = materialize_detached(mlxcel_core::slice(
-        &prefill.hidden,
-        &[0, last, 0],
-        &[prefill_shape[0], last + 1, prefill_shape[2]],
-    ));
+    let prefill = prefill_for_input(model, drafter, prefill_input)?;
+    let mut next_hidden =
+        finish_drafter_prefill(model, drafter, prefill_input, prefill, first_token);
 
     if output.len() > 1 {
         let cached_output = &output[..output.len() - 1];
@@ -1364,22 +1408,8 @@ impl Qwen35MtpGenerator {
             });
         }
 
-        let prefill = match prefill_input {
-            MtpPrefill::Text { prompt } => model.forward_mtp_prefill(prompt),
-            MtpPrefill::Multimodal {
-                prompt,
-                input_embeddings,
-                position_ids,
-                rope_delta,
-            } => model
-                .forward_mtp_prefill_with_embeddings(
-                    prompt,
-                    input_embeddings,
-                    position_ids,
-                    rope_delta,
-                )
-                .expect("MTP multimodal prefill requires prepared MRoPE state"),
-        };
+        let prefill = prefill_for_input(model, drafter, prefill_input)
+            .expect("MTP prefill requires valid synchronized chunks");
         let (first_token, _) =
             sample_token_optimized(&prefill.first_logits, &sampling, prompt_tokens);
         mlxcel_core::eval(&first_token);
@@ -1402,36 +1432,9 @@ impl Qwen35MtpGenerator {
         let decode_start = Instant::now();
 
         if generated.len() < max_tokens && stop_reason == GenerationStopReason::MaxTokens {
-            match prefill_input {
-                MtpPrefill::Text { prompt } => {
-                    drafter.prefill_from_target_hidden(model, prompt, &prefill.hidden, first_token);
-                }
-                MtpPrefill::Multimodal {
-                    prompt,
-                    input_embeddings,
-                    position_ids,
-                    rope_delta,
-                } => drafter.prefill_from_target_hidden_with_embeddings(
-                    model,
-                    prompt,
-                    input_embeddings,
-                    &prefill.hidden,
-                    first_token,
-                    position_ids,
-                    rope_delta,
-                ),
-            }
-
-            let prefill_shape = mlxcel_core::array_shape(&prefill.hidden);
-            let last = prefill_shape[1] - 1;
-            let mut next_hidden = materialize_detached(mlxcel_core::slice(
-                &prefill.hidden,
-                &[0, last, 0],
-                &[prefill_shape[0], last + 1, prefill_shape[2]],
-            ));
+            let mut next_hidden =
+                finish_drafter_prefill(model, drafter, prefill_input, prefill, first_token);
             let mut bonus = first_token;
-            drafter.materialize_state();
-            model.materialize_mtp_cache_state();
 
             while generated.len() < max_tokens {
                 let emitted_before = generated.len();
@@ -1594,7 +1597,7 @@ impl Qwen35MtpGenerator {
         let mut state;
 
         loop {
-            let prefill = prefill_for_input(model, prefill_input)?;
+            let prefill = prefill_for_input(model, drafter, prefill_input)?;
             mlxcel_core::eval(&prefill.hidden);
             let initial = commit_constraint_transaction(constraint, |active| {
                 constrained_initial_step(
@@ -1652,21 +1655,14 @@ impl Qwen35MtpGenerator {
                 && generated.as_slice() == initial.new_tokens.as_slice()
             {
                 let first_token = generated[0];
-                seed_drafter_from_prefill(
-                    model,
-                    drafter,
-                    prefill_input,
-                    &prefill.hidden,
-                    first_token,
-                );
-                let shape = mlxcel_core::array_shape(&prefill.hidden);
-                let last = shape[1] - 1;
                 state = ActiveMtpState {
-                    next_hidden: materialize_detached(mlxcel_core::slice(
-                        &prefill.hidden,
-                        &[0, last, 0],
-                        &[shape[0], last + 1, shape[2]],
-                    )),
+                    next_hidden: finish_drafter_prefill(
+                        model,
+                        drafter,
+                        prefill_input,
+                        prefill,
+                        first_token,
+                    ),
                     bonus: first_token,
                 };
             } else {
@@ -1776,7 +1772,7 @@ impl Qwen35MtpGenerator {
 
             if walk.rebuild {
                 if generated.is_empty() {
-                    let _ = prefill_for_input(model, prefill_input)?;
+                    let _ = prefill_for_input(model, drafter, prefill_input)?;
                 } else {
                     state = rebuild_mtp_state(model, drafter, prefill_input, &generated)?;
                 }
@@ -1828,7 +1824,7 @@ impl Qwen35MtpGenerator {
                 break;
             }
             if generated.is_empty() {
-                let prefill = prefill_for_input(model, prefill_input)?;
+                let prefill = prefill_for_input(model, drafter, prefill_input)?;
                 let initial = commit_constraint_transaction(constraint, |active| {
                     constrained_initial_step(
                         &prefill.first_logits,
@@ -2405,7 +2401,6 @@ mod tests {
         assert_eq!(array_f32(&keys), [1.0, 2.0, 3.0, 5.0]);
         assert_eq!(array_f32(&values), [11.0, 12.0, 13.0, 15.0]);
     }
-
     fn array_f32(array: &MlxArray) -> Vec<f32> {
         mlxcel_core::eval(array);
         mlxcel_core::array_to_raw_bytes(array)
@@ -2415,25 +2410,28 @@ mod tests {
     }
 
     #[test]
-    fn multimodal_shift_preserves_one_and_multiple_image_embeddings() {
-        let one_image = mlxcel_core::from_slice_f32(
-            &[1.0, 2.0, 10.0, 11.0, 3.0, 4.0, 5.0, 6.0],
-            &[1, 4, 2],
-        );
-        let bonus = mlxcel_core::from_slice_f32(&[90.0, 91.0], &[1, 1, 2]);
-        assert_eq!(
-            array_f32(&shift_prompt_embeddings(&one_image, &bonus)),
-            [10.0, 11.0, 3.0, 4.0, 5.0, 6.0, 90.0, 91.0]
-        );
-
-        let images =
+    fn multimodal_shift_preserves_chunk_alignment_and_bonus_tail() {
+        let embeddings =
             mlxcel_core::from_slice_f32(&[1.0, 20.0, 2.0, 30.0, 3.0, 4.0], &[1, 6, 1]);
         let bonus = mlxcel_core::from_slice_f32(&[99.0], &[1, 1, 1]);
+        let first = shifted_embedding_range(&embeddings, 0, 2, None);
+        let second = shifted_embedding_range(&embeddings, 2, 4, None);
+        let final_chunk = shifted_embedding_range(&embeddings, 4, 6, Some(&bonus));
+        assert_eq!(array_f32(&first), [20.0, 2.0]);
+        assert_eq!(array_f32(&second), [30.0, 3.0]);
+        assert_eq!(array_f32(&final_chunk), [4.0, 99.0]);
+
+        let synchronized = mlxcel_core::concatenate(
+            &mlxcel_core::concatenate(&first, &second, 1),
+            &final_chunk,
+            1,
+        );
         assert_eq!(
-            array_f32(&shift_prompt_embeddings(&images, &bonus)),
+            array_f32(&synchronized),
             [20.0, 2.0, 30.0, 3.0, 4.0, 99.0]
         );
     }
+
 
     #[test]
     fn signed_rope_delta_is_retained_for_draft_decode_positions() {
