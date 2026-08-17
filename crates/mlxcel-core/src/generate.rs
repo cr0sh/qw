@@ -390,14 +390,14 @@ pub const DEFAULT_PREFILL_CHUNK: usize = 2048;
 /// multi-call prefill opt out via
 /// [`LanguageModel::supports_chunked_prefill`], mirroring mlx-vlm's
 /// `chunked_prefill_policy`.
-fn prefill_chunk_len() -> usize {
-    static CHUNK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CHUNK.get_or_init(|| {
+pub fn prefill_chunk_len() -> usize {
+    static CHUNK: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
         std::env::var("MLXCEL_PREFILL_CHUNK")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .unwrap_or(DEFAULT_PREFILL_CHUNK)
-    })
+    });
+    *CHUNK
 }
 
 /// Effective prefill chunk for one generation call: the configured chunk when
@@ -407,7 +407,7 @@ fn prefill_chunk_len() -> usize {
 /// environment: chunking applies when the configured chunk is non-zero, the
 /// model supports multi-call prefill, and the prompt is actually longer than
 /// one chunk.
-fn effective_prefill_chunk(
+pub fn effective_prefill_chunk(
     configured: usize,
     model_supports: bool,
     prompt_len: usize,
