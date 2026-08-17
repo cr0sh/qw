@@ -79,7 +79,7 @@ use std::sync::Arc;
 
 use cxx::UniquePtr;
 
-use super::codebook::{Codebook, nearest_centroid_indices_with_boundaries, optimal_codebook};
+use super::codebook::{Codebook, optimal_codebook};
 use crate::dtype;
 use crate::ffi;
 use crate::ffi::MlxArray;
@@ -304,6 +304,49 @@ fn quantize_into_packed(
         signs2.len()
     );
 
+    const NON_METAL_TOKEN_CHUNK: i32 = 256;
+    if !ffi::metal_is_available() && t > NON_METAL_TOKEN_CHUNK {
+        let mut packed_acc = None;
+        let mut norms_acc = None;
+        let mut rescale_acc = None;
+        let mut start = 0;
+        while start < t {
+            let end = (start + NON_METAL_TOKEN_CHUNK).min(t);
+            let piece = ffi::slice(x, &[0, 0, start, 0], &[shape[0], shape[1], end, d]);
+            let (packed, norms, rescale) =
+                quantize_into_packed(&piece, params, signs1, signs2);
+            packed_acc = Some(match packed_acc {
+                Some(acc) => crate::concatenate(&acc, &packed, 2),
+                None => packed,
+            });
+            norms_acc = Some(match norms_acc {
+                Some(acc) => crate::concatenate(&acc, &norms, 2),
+                None => norms,
+            });
+            rescale_acc = Some(match rescale_acc {
+                Some(acc) => crate::concatenate(&acc, &rescale, 2),
+                None => rescale,
+            });
+            let arrays = [
+                packed_acc.as_deref().expect("packed accumulator"),
+                norms_acc.as_deref().expect("norm accumulator"),
+                rescale_acc.as_deref().expect("rescale accumulator"),
+            ];
+            for array in arrays {
+                ffi::eval(array);
+            }
+            let ptrs: Vec<*const MlxArray> =
+                arrays.into_iter().map(|array| array as *const MlxArray).collect();
+            unsafe { crate::detach_all(&ptrs) };
+            start = end;
+        }
+        return (
+            packed_acc.expect("non-empty Turbo4 packed chunks"),
+            norms_acc.expect("non-empty Turbo4 norm chunks"),
+            rescale_acc.expect("non-empty Turbo4 rescale chunks"),
+        );
+    }
+
     // 1. Per-token L2 norm: ||x||_2 along last axis, keepdims=true → [B, H, T, 1]
     let v_sq = ffi::multiply(&v_f32, &v_f32);
     let sum_sq = ffi::sum_axis(&v_sq, -1, true);
@@ -328,119 +371,69 @@ fn quantize_into_packed(
     let v_h = wht(&v_d1);
     let v_rot = ffi::multiply(&v_h, &signs2_arr);
 
-    // 3. Per-coordinate nearest-centroid lookup. We materialize the rotated
-    //    coordinates back to host memory once per quantize call. This is the
-    //    same readback pattern the TurboQuant+ MLX port uses; for B2 the
-    //    correctness story dominates and a fully-fused on-GPU implementation
-    //    is the natural follow-up (likely B7's delegated KVCache or B11+).
-    //
-    //    TODO(follow-up): replace this readback with an on-device
-    //    nearest-centroid lookup (broadcast-compare against the 15 boundaries
-    //    and reduce). The dequantize path was migrated to on-device unpacking
-    // because it dominates decode latency (`O(visible_tokens)`
-    //    per layer per step). The quantize path is `O(new_tokens)` per layer
-    //    per step — typically 1 token at decode — so the readback cost here
-    //    is dwarfed by dequantize and was deferred to keep scoped.
-    ffi::eval(&v_rot);
-    let coord_count = (shape[0] * shape[1] * t * d) as usize;
-    let v_rot_bytes = ffi::array_to_raw_bytes(&v_rot);
-    debug_assert_eq!(
-        v_rot_bytes.len(),
-        coord_count * 4,
-        "fp32 byte count mismatch"
-    );
-    let mut coords = Vec::with_capacity(coord_count);
-    for chunk in v_rot_bytes.chunks_exact(4) {
-        coords.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
-    }
-
-    let n_centroids = params.codebook.centroids.len();
-    let indices =
-        nearest_centroid_indices_with_boundaries(&coords, &params.codebook.boundaries, n_centroids);
-
-    // 4. Pack two consecutive 4-bit indices into one byte.
-    //    Layout: byte[i] low nibble = indices[2*i], high nibble = indices[2*i+1].
-    debug_assert!(d % 2 == 0, "head_dim must be even for nibble-packing");
-    let coords_per_token = d as usize;
-    let bytes_per_token = coords_per_token / 2;
-    let total_tokens = (shape[0] * shape[1] * t) as usize;
-    let mut packed = vec![0u8; total_tokens * bytes_per_token];
-    for tok in 0..total_tokens {
-        let idx_off = tok * coords_per_token;
-        let pack_off = tok * bytes_per_token;
-        for j in 0..bytes_per_token {
-            let lo = (indices[idx_off + 2 * j] & 0x0F) as u8;
-            let hi = (indices[idx_off + 2 * j + 1] & 0x0F) as u8;
-            packed[pack_off + j] = lo | (hi << 4);
+    // 3. Select the nearest codebook centroid, nibble-pack the indices, and
+    //    produce the final fp16 sidecars without leaving device memory.
+    let boundaries =
+        ffi::from_slice_f32(&params.codebook.boundaries, &[params.codebook.boundaries.len() as i32]);
+    let centroids =
+        ffi::from_slice_f32(&params.codebook.centroids, &[params.codebook.centroids.len() as i32]);
+    if ffi::metal_is_available() {
+        let mut packed = UniquePtr::null();
+        let mut norms = UniquePtr::null();
+        let mut rescale = UniquePtr::null();
+        unsafe {
+            ffi::turbo4_pack_centroids(
+                &v_rot,
+                &norm_full,
+                &boundaries,
+                &centroids,
+                d,
+                &mut packed,
+                &mut norms,
+                &mut rescale,
+            );
         }
+        (packed, norms, rescale)
+    } else {
+        // The supported non-Metal backends use the same sidecar format. Keep
+        // centroid selection on-device with ordinary MLX ops rather than
+        // introducing a host serialization path or a backend-specific format.
+        let expanded = ffi::expand_dims(&v_rot, -1);
+        let boundary_shape = [1, 1, 1, 1, params.codebook.boundaries.len() as i32];
+        let boundaries = ffi::reshape(&boundaries, &boundary_shape);
+        let above = ffi::greater(&expanded, &boundaries);
+        let indices_sum = ffi::sum_axis(&ffi::astype(&above, dtype::UINT8), -1, false);
+        let indices = ffi::astype(&indices_sum, dtype::UINT8);
+
+        let paired = ffi::reshape(&indices, &[shape[0], shape[1], t, d / 2, 2]);
+        let low = ffi::slice(
+            &paired,
+            &[0, 0, 0, 0, 0],
+            &[shape[0], shape[1], t, d / 2, 1],
+        );
+        let high = ffi::slice(
+            &paired,
+            &[0, 0, 0, 0, 1],
+            &[shape[0], shape[1], t, d / 2, 2],
+        );
+        let low = ffi::reshape(&low, &[shape[0], shape[1], t, d / 2]);
+        let high = ffi::reshape(&high, &[shape[0], shape[1], t, d / 2]);
+        let sixteen = ffi::full_f32(&[1], 16.0, dtype::UINT8);
+        let packed = ffi::add(&low, &ffi::multiply(&high, &sixteen));
+
+        let reconstructed = ffi::take(&centroids, &indices, 0);
+        let reconstructed_sq = ffi::multiply(&reconstructed, &reconstructed);
+        let reconstructed_norm =
+            ffi::sqrt(&ffi::sum_axis(&reconstructed_sq, -1, true));
+        let eps = ffi::full_f32(&[1], 1e-10, dtype::FLOAT32);
+        let safe_reconstructed_norm = ffi::maximum(&reconstructed_norm, &eps);
+        let rescale = ffi::astype(
+            &ffi::divide(&norm_full, &safe_reconstructed_norm),
+            dtype::FLOAT16,
+        );
+        let norms = ffi::astype(&norm_full, dtype::FLOAT16);
+        (packed, norms, rescale)
     }
-
-    let v_packed = ffi::from_bytes(
-        &packed,
-        &[shape[0], shape[1], t, bytes_per_token as i32],
-        dtype::UINT8,
-    );
-
-    // 5. Norms stored in fp16 for the cache. The full-precision norm
-    //    (not safe_norm) is what the dequantize path consumes.
-    let v_norms = ffi::astype(&norm_full, dtype::FLOAT16);
-
-    // 6. Precompute the per-token rescale factor `norm[t] / max(|y_hat|, eps)`
-    //    consumed by the fused Sparse-V kernel. The previous
-    //    kernel implementation derived this on-GPU per token via a
-    //    `log2(Dim) + 2`-barrier threadgroup tree reduction, which dominated
-    //    decode latency on M5 Max at 4 K context for `turbo4-asym` (the kernel was 2.0× slower than the graph fallback's A/B). Because
-    //    `|y_hat|` is a pure function of the packed indices and the codebook
-    //    — both fixed at quantize time — we can compute it once here on the
-    //    host and store the resulting fp16 scalar alongside `v_norms`.
-    //
-    //    Algorithm (per token t):
-    //      sum_sq = Σ_d codebook[indices[t, d]]²
-    //      y_hat_norm = sqrt(sum_sq)
-    //      y_hat_safe = max(y_hat_norm, 1e-10)        (matches kernel guard)
-    //      rescale[t] = norm_full[t] / y_hat_safe
-    //
-    //    The 1e-10 guard mirrors the kernel-side `1e-10f` in
-    //    `sparse_v_sdpa.cpp` and the graph dequant's `eps` in
-    //    `dequantize_from_packed`, so kernel and graph paths see numerically
-    //    identical rescale values.
-    //
-    //    Since `norm_full` is still pending GPU evaluation at this point, we
-    //    materialize it back to host bytes alongside the rotated coordinates
-    //    we already read above. fp32 keeps the divide well-conditioned for
-    //    very small / very large magnitudes; the final cast to fp16 matches
-    //    the storage dtype.
-    ffi::eval(&norm_full);
-    let norm_bytes = ffi::array_to_raw_bytes(&norm_full);
-    debug_assert_eq!(
-        norm_bytes.len(),
-        total_tokens * 4,
-        "fp32 norm byte count mismatch"
-    );
-    let centroids = params.codebook.centroids.as_ref();
-    let mut rescale = vec![0.0_f32; total_tokens];
-    for (tok, slot) in rescale.iter_mut().enumerate() {
-        let idx_off = tok * coords_per_token;
-        let mut sum_sq = 0.0_f32;
-        for d_i in 0..coords_per_token {
-            let c = centroids[indices[idx_off + d_i]];
-            sum_sq += c * c;
-        }
-        let y_hat_norm = sum_sq.sqrt();
-        let y_hat_safe = y_hat_norm.max(1e-10);
-        let norm_off = tok * 4;
-        let n_t = f32::from_le_bytes([
-            norm_bytes[norm_off],
-            norm_bytes[norm_off + 1],
-            norm_bytes[norm_off + 2],
-            norm_bytes[norm_off + 3],
-        ]);
-        *slot = n_t / y_hat_safe;
-    }
-    let v_rescale_f32 = ffi::from_slice_f32(&rescale, &[shape[0], shape[1], t, 1]);
-    let v_rescale = ffi::astype(&v_rescale_f32, dtype::FLOAT16);
-
-    (v_packed, v_norms, v_rescale)
 }
 
 /// Quantize a V tensor of shape `[B, H, T, D]` (D == `params.head_dim`) into

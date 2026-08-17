@@ -1763,6 +1763,18 @@ mod ffi {
             invert_weight_scales: bool,
         ) -> UniquePtr<MlxArray>;
 
+        /// Device-side Turbo4 centroid selection and final sidecar packing.
+        unsafe fn turbo4_pack_centroids(
+            rotated: &MlxArray,
+            norms: &MlxArray,
+            boundaries: &MlxArray,
+            centroids: &MlxArray,
+            head_dim: i32,
+            packed_out: &mut UniquePtr<MlxArray>,
+            norms_out: &mut UniquePtr<MlxArray>,
+            rescale_out: &mut UniquePtr<MlxArray>,
+        );
+
         /// Fused gated-delta single-token decode step.
         /// Combines: decay → kv_mem → delta → state_update → output into one C++ call.
         /// Replaces ~26 FFI round-trips with 1.

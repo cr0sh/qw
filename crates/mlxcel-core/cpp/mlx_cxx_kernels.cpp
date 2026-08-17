@@ -186,6 +186,92 @@ std::unique_ptr<MlxArray> bitlinear_matmul(
     return std::make_unique<MlxArray>(reshape(results[0], out_shape));
 }
 
+namespace {
+    static const char* TURBO4_PACK_METAL_SOURCE = R"(
+        uint token = thread_position_in_grid.x;
+        if (token >= (uint)token_count) { return; }
+        uint coord_base = token * (uint)head_dim;
+        uint packed_base = token * (uint)(head_dim / 2);
+        float centroid_sum_sq = 0.0f;
+        for (uint byte_idx = 0; byte_idx < (uint)(head_dim / 2); ++byte_idx) {
+            uchar pair[2];
+            for (uint lane = 0; lane < 2; ++lane) {
+                float value = rotated[coord_base + byte_idx * 2 + lane];
+                uchar index = 0;
+                for (uint boundary = 0; boundary < 15; ++boundary) {
+                    index += (uchar)(value > boundaries[boundary]);
+                }
+                pair[lane] = index;
+                float centroid = centroids[index];
+                centroid_sum_sq += centroid * centroid;
+            }
+            packed[packed_base + byte_idx] =
+                (uchar)(pair[0] | (uchar)(pair[1] << 4));
+        }
+        float norm = norms[token];
+        packed_norms[token] = (half)norm;
+        float reconstructed_norm = metal::sqrt(centroid_sum_sq);
+        rescale[token] = (half)(norm / metal::max(reconstructed_norm, 1.0e-10f));
+    )";
+
+    struct Turbo4PackKernelHolder {
+        std::optional<mlx::core::fast::CustomKernelFunction> kernel;
+        mlx::core::fast::CustomKernelFunction& get() {
+            if (!kernel) {
+                kernel = mlx::core::fast::metal_kernel(
+                    "turbo4_pack_centroids",
+                    {"rotated", "norms", "boundaries", "centroids"},
+                    {"packed", "packed_norms", "rescale"},
+                    TURBO4_PACK_METAL_SOURCE);
+            }
+            return *kernel;
+        }
+    };
+
+    static Turbo4PackKernelHolder& get_turbo4_pack_kernel() {
+        static Turbo4PackKernelHolder holder;
+        return holder;
+    }
+}
+
+void turbo4_pack_centroids(
+    const MlxArray& rotated,
+    const MlxArray& norms,
+    const MlxArray& boundaries,
+    const MlxArray& centroids,
+    int32_t head_dim,
+    std::unique_ptr<MlxArray>& packed_out,
+    std::unique_ptr<MlxArray>& norms_out,
+    std::unique_ptr<MlxArray>& rescale_out
+) {
+    using namespace mlx::core;
+    const auto& shape = rotated.inner.shape();
+    int32_t token_count = 1;
+    for (size_t i = 0; i + 1 < shape.size(); ++i) {
+        token_count *= static_cast<int32_t>(shape[i]);
+    }
+    Shape packed_shape(shape.begin(), shape.end());
+    packed_shape.back() = head_dim / 2;
+    Shape sidecar_shape(shape.begin(), shape.end());
+    sidecar_shape.back() = 1;
+    auto results = get_turbo4_pack_kernel().get()(
+        {rotated.inner, norms.inner, boundaries.inner, centroids.inner},
+        {packed_shape, sidecar_shape, sidecar_shape},
+        {uint8, float16, float16},
+        std::make_tuple(token_count, 1, 1),
+        std::make_tuple(std::min(token_count, 256), 1, 1),
+        {
+            {"head_dim", head_dim},
+            {"token_count", token_count},
+        },
+        std::nullopt,
+        false,
+        {});
+    packed_out = std::make_unique<MlxArray>(std::move(results[0]));
+    norms_out = std::make_unique<MlxArray>(std::move(results[1]));
+    rescale_out = std::make_unique<MlxArray>(std::move(results[2]));
+}
+
 // ── xIELU activation (Apertus) fused elementwise Metal kernel ───────────────
 // Collapses the ~11 elementwise MLX ops in src/models/apertus.rs::apertus_xielu
 // (square, multiply_scalar, full, minimum, expm1, subtract, multiply_scalar,
