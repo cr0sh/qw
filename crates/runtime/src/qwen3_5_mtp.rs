@@ -566,7 +566,7 @@ fn materialize_detached(array: UniquePtr<MlxArray>) -> UniquePtr<MlxArray> {
 fn mtp_round_reaches_cache_clear(previous: usize, emitted: usize, interval: usize) -> bool {
     interval != 0
         && (previous.saturating_add(1)..=emitted)
-            .any(|n| crate::memory::should_clear_cache_at(n, interval))
+            .any(|n| mlxcel_core::memory::should_clear_cache_at(n, interval))
 }
 
 fn finish_mtp_request(model: &Qwen35Model) {
@@ -1543,7 +1543,7 @@ impl Qwen35MtpGenerator {
                 if mtp_round_reaches_cache_clear(
                     emitted_before,
                     generated.len(),
-                    crate::memory::cache_clear_interval(),
+                    mlxcel_core::memory::cache_clear_interval(),
                 ) {
                     mlxcel_core::clear_memory_cache();
                 }
@@ -1814,7 +1814,7 @@ impl Qwen35MtpGenerator {
             if mtp_round_reaches_cache_clear(
                 emitted_before,
                 generated.len(),
-                crate::memory::cache_clear_interval(),
+                mlxcel_core::memory::cache_clear_interval(),
             ) {
                 mlxcel_core::clear_memory_cache();
             }
