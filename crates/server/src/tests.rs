@@ -134,7 +134,7 @@ fn responses_replay_call(item: &Value) -> Value {
 
 #[tokio::test]
 async fn buffered_chat_completion_has_openai_shape_and_usage() {
-    let app = router(Engine::start_fake(MODEL, 8));
+    let app = router(Engine::start_fake(Some(MODEL), 8));
     let (status, _, body) = post(app, "/v1/chat/completions", chat_request("hello")).await;
     assert_eq!(status, StatusCode::OK);
     let value: Value = serde_json::from_str(&body).expect("JSON response");
@@ -147,7 +147,7 @@ async fn buffered_chat_completion_has_openai_shape_and_usage() {
 
 #[tokio::test]
 async fn streamed_chat_emits_role_content_terminal_usage_and_done() {
-    let app = router(Engine::start_fake(MODEL, 8));
+    let app = router(Engine::start_fake(Some(MODEL), 8));
     let mut request = chat_request("hello");
     request["stream"] = Value::Bool(true);
     let (status, headers, body) = post(app, "/v1/chat/completions", request).await;
@@ -167,7 +167,7 @@ async fn streamed_chat_emits_role_content_terminal_usage_and_done() {
 
 #[tokio::test]
 async fn buffered_chat_separates_reasoning_from_visible_content() {
-    let app = router(Engine::start_fake(MODEL, 8));
+    let app = router(Engine::start_fake(Some(MODEL), 8));
     let (status, _, body) = post(app, "/v1/chat/completions", chat_request("reasoning")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let value: Value = serde_json::from_str(&body).expect("chat JSON");
@@ -180,7 +180,7 @@ async fn buffered_chat_separates_reasoning_from_visible_content() {
 
 #[tokio::test]
 async fn streamed_chat_uses_reasoning_and_content_deltas_without_markers() {
-    let app = router(Engine::start_fake(MODEL, 8));
+    let app = router(Engine::start_fake(Some(MODEL), 8));
     let mut request = chat_request("reasoning");
     request["stream"] = json!(true);
     let (status, _, body) = post(app, "/v1/chat/completions", request).await;
@@ -203,7 +203,7 @@ async fn streamed_chat_uses_reasoning_and_content_deltas_without_markers() {
 
 #[tokio::test]
 async fn responses_suppresses_reasoning_buffered_and_streamed() {
-    let app = router(Engine::start_fake(MODEL, 8));
+    let app = router(Engine::start_fake(Some(MODEL), 8));
     let (status, _, body) =
         post(app.clone(), "/v1/responses", responses_request("reasoning")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -230,7 +230,7 @@ async fn responses_suppresses_reasoning_buffered_and_streamed() {
 }
 #[tokio::test]
 async fn buffered_responses_completion_has_output_and_cached_usage() {
-    let app = router(Engine::start_fake(MODEL, 8));
+    let app = router(Engine::start_fake(Some(MODEL), 8));
     let (status, _, body) = post(app, "/v1/responses", responses_request("hello")).await;
     assert_eq!(status, StatusCode::OK);
     let value: Value = serde_json::from_str(&body).expect("JSON response");
@@ -242,7 +242,7 @@ async fn buffered_responses_completion_has_output_and_cached_usage() {
 
 #[tokio::test]
 async fn streamed_responses_events_have_exact_order_and_monotonic_sequences() {
-    let app = router(Engine::start_fake(MODEL, 8));
+    let app = router(Engine::start_fake(Some(MODEL), 8));
     let mut request = responses_request("hello");
     request["stream"] = Value::Bool(true);
     let (status, _, body) = post(app, "/v1/responses", request).await;
@@ -291,21 +291,70 @@ async fn streamed_responses_events_have_exact_order_and_monotonic_sequences() {
 }
 
 #[tokio::test]
-async fn model_mismatch_returns_openai_404() {
-    let app = router(Engine::start_fake(MODEL, 8));
-    let mut request = chat_request("hello");
-    request["model"] = Value::String("other".to_string());
+async fn unconfigured_model_id_routes_arbitrary_models_and_preserves_response_identity() {
+    let app = router(Engine::start_fake(None, 8));
+
+    let mut buffered_request = chat_request("first");
+    buffered_request["model"] = json!("arbitrary-one");
+    let (status, _, body) =
+        post(app.clone(), "/v1/chat/completions", buffered_request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let response: Value = serde_json::from_str(&body).expect("buffered response JSON");
+    assert_eq!(response["model"], "arbitrary-one");
+
+    let mut streamed_request = chat_request("second");
+    streamed_request["model"] = json!("org/arbitrary-two");
+    streamed_request["stream"] = json!(true);
+    let (status, _, body) = post(app, "/v1/chat/completions", streamed_request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (frames, done) = parse_sse(&body);
+    assert!(done);
+    let response_models = frames
+        .iter()
+        .filter_map(|frame| frame.data["model"].as_str())
+        .collect::<Vec<_>>();
+    assert!(!response_models.is_empty());
+    assert!(
+        response_models
+            .iter()
+            .all(|model| *model == "org/arbitrary-two")
+    );
+}
+
+#[tokio::test]
+async fn configured_model_id_accepts_exact_match_and_rejects_mismatch() {
+    let app = router(Engine::start_fake(Some(MODEL), 8));
+    let (status, _, body) = post(
+        app.clone(),
+        "/v1/chat/completions",
+        chat_request("accepted"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let response: Value = serde_json::from_str(&body).expect("success JSON");
+    assert_eq!(response["model"], MODEL);
+
+    let mut request = chat_request("rejected");
+    request["model"] = json!("other");
     let (status, _, body) = post(app, "/v1/chat/completions", request).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     let value: Value = serde_json::from_str(&body).expect("error JSON");
-    assert_eq!(value["error"]["type"], "invalid_request_error");
-    assert_eq!(value["error"]["param"], "model");
-    assert_eq!(value["error"]["code"], "model_not_found");
+    assert_eq!(
+        value,
+        json!({
+            "error": {
+                "message": "model \"other\" was not found",
+                "type": "invalid_request_error",
+                "param": "model",
+                "code": "model_not_found"
+            }
+        })
+    );
 }
 
 #[tokio::test]
 async fn malformed_and_unsupported_fields_are_rejected() {
-    let app = router(Engine::start_fake(MODEL, 8));
+    let app = router(Engine::start_fake(Some(MODEL), 8));
     for request in [
         json!({"model": MODEL, "messages": []}),
         json!({"model": MODEL, "messages": [{"role":"user","content":[]}]}),
@@ -395,7 +444,7 @@ fn chat_protocol_rejects_unsupported_reasoning_efforts() {
 
 #[tokio::test]
 async fn unsupported_reasoning_efforts_return_parameterized_400() {
-    let app = router(Engine::start_fake(MODEL, 8));
+    let app = router(Engine::start_fake(Some(MODEL), 8));
     for effort in ["high", "max"] {
         let mut request = chat_request("hello");
         request["reasoning_effort"] = json!(effort);
@@ -441,7 +490,7 @@ fn chat_protocol_replays_assistant_reasoning_content() {
 }
 #[tokio::test]
 async fn json_object_and_strict_schema_are_generated_under_constraints() {
-    let app = router(Engine::start_fake(MODEL, 8));
+    let app = router(Engine::start_fake(Some(MODEL), 8));
     let mut object = chat_request("json");
     object["response_format"] = json!({"type":"json_object"});
     let (status, _, body) = post(app.clone(), "/v1/chat/completions", object).await;
@@ -465,7 +514,7 @@ async fn json_object_and_strict_schema_are_generated_under_constraints() {
 
 #[tokio::test]
 async fn every_strict_schema_rejection_class_returns_400() {
-    let app = router(Engine::start_fake(MODEL, 8));
+    let app = router(Engine::start_fake(Some(MODEL), 8));
     let schemas = [
         json!({"$ref":"https://example.com/schema.json"}),
         json!({"oneOf":[{"type":"string"},{"type":"string"}]}),
@@ -494,7 +543,7 @@ async fn every_strict_schema_rejection_class_returns_400() {
 
 #[tokio::test]
 async fn max_token_fields_map_to_length_and_incomplete() {
-    let app = router(Engine::start_fake(MODEL, 8));
+    let app = router(Engine::start_fake(Some(MODEL), 8));
     let mut chat = chat_request("short");
     chat["max_tokens"] = json!(1);
     let (status, _, body) = post(app.clone(), "/v1/chat/completions", chat).await;
@@ -513,7 +562,7 @@ async fn max_token_fields_map_to_length_and_incomplete() {
 
 #[tokio::test]
 async fn repeated_prefix_reports_cached_tokens_and_matches_cold_output() {
-    let warm_app = router(Engine::start_fake(MODEL, 8));
+    let warm_app = router(Engine::start_fake(Some(MODEL), 8));
     let _ = post(
         warm_app.clone(),
         "/v1/chat/completions",
@@ -531,7 +580,7 @@ async fn repeated_prefix_reports_cached_tokens_and_matches_cold_output() {
             > 0
     );
 
-    let cold_app = router(Engine::start_fake(MODEL, 8));
+    let cold_app = router(Engine::start_fake(Some(MODEL), 8));
     let (_, _, cold_body) = post(cold_app, "/v1/chat/completions", chat_request("abcdef")).await;
     let cold: Value = serde_json::from_str(&cold_body).expect("cold JSON");
     assert_eq!(
@@ -542,7 +591,7 @@ async fn repeated_prefix_reports_cached_tokens_and_matches_cold_output() {
 
 #[tokio::test]
 async fn over_budget_prefix_is_not_cached() {
-    let app = router(Engine::start_fake(MODEL, 8));
+    let app = router(Engine::start_fake(Some(MODEL), 8));
     let long = "x".repeat(20);
     let _ = post(app.clone(), "/v1/responses", responses_request(&long)).await;
     let (status, _, body) = post(app, "/v1/responses", responses_request(&(long + "suffix"))).await;
@@ -553,7 +602,7 @@ async fn over_budget_prefix_is_not_cached() {
 
 #[tokio::test]
 async fn full_generation_queue_returns_503() {
-    let engine = Engine::start_fake(MODEL, 1);
+    let engine = Engine::start_fake(Some(MODEL), 1);
     let mut held = engine
         .submit(protocol::parse_chat(chat_request("hold")).expect("held request"))
         .expect("submit held job");
@@ -573,7 +622,7 @@ async fn full_generation_queue_returns_503() {
 
 #[tokio::test]
 async fn dropping_stream_cancels_generation_and_releases_worker() {
-    let engine = Engine::start_fake(MODEL, 1);
+    let engine = Engine::start_fake(Some(MODEL), 1);
     let app = router(engine.clone());
     let response = app
         .clone()
@@ -596,7 +645,7 @@ async fn dropping_stream_cancels_generation_and_releases_worker() {
 
 #[tokio::test]
 async fn post_header_failures_use_endpoint_terminal_frames() {
-    let app = router(Engine::start_fake(MODEL, 8));
+    let app = router(Engine::start_fake(Some(MODEL), 8));
     let mut chat = chat_request("fail-after-start");
     chat["stream"] = Value::Bool(true);
     let (status, _, body) = post(app.clone(), "/v1/chat/completions", chat).await;
@@ -614,7 +663,7 @@ async fn post_header_failures_use_endpoint_terminal_frames() {
 
 #[tokio::test]
 async fn buffered_chat_completes_a_two_turn_tool_loop() {
-    let app = router(Engine::start_fake(MODEL, 8));
+    let app = router(Engine::start_fake(Some(MODEL), 8));
     let (status, _, body) = post(
         app.clone(),
         "/v1/chat/completions",
@@ -664,7 +713,7 @@ async fn buffered_chat_completes_a_two_turn_tool_loop() {
 
 #[tokio::test]
 async fn buffered_tool_call_preserves_reasoning_without_visible_tool_xml() {
-    let app = router(Engine::start_fake(MODEL, 8));
+    let app = router(Engine::start_fake(Some(MODEL), 8));
     let (status, _, body) = post(
         app,
         "/v1/chat/completions",
@@ -686,7 +735,7 @@ async fn buffered_tool_call_preserves_reasoning_without_visible_tool_xml() {
 }
 #[tokio::test]
 async fn streamed_chat_emits_stable_indexed_calls_separate_usage_and_replays() {
-    let app = router(Engine::start_fake(MODEL, 8));
+    let app = router(Engine::start_fake(Some(MODEL), 8));
     let mut request = chat_tool_request("call-tool");
     request["stream"] = json!(true);
     request["stream_options"] = json!({"include_usage":true});
@@ -772,7 +821,7 @@ async fn streamed_chat_emits_stable_indexed_calls_separate_usage_and_replays() {
 
 #[tokio::test]
 async fn buffered_responses_completes_a_two_turn_tool_loop() {
-    let app = router(Engine::start_fake(MODEL, 8));
+    let app = router(Engine::start_fake(Some(MODEL), 8));
     let (status, _, body) = post(
         app.clone(),
         "/v1/responses",
@@ -813,7 +862,7 @@ async fn buffered_responses_completes_a_two_turn_tool_loop() {
 
 #[tokio::test]
 async fn streamed_responses_has_lazy_exact_function_lifecycle_and_replays() {
-    let app = router(Engine::start_fake(MODEL, 8));
+    let app = router(Engine::start_fake(Some(MODEL), 8));
     let mut request = responses_tool_request("call-tool");
     request["stream"] = json!(true);
     let (status, _, body) = post(app.clone(), "/v1/responses", request).await;
@@ -885,7 +934,7 @@ async fn streamed_responses_has_lazy_exact_function_lifecycle_and_replays() {
 
 #[tokio::test]
 async fn streamed_responses_closes_preamble_before_function_items() {
-    let app = router(Engine::start_fake(MODEL, 8));
+    let app = router(Engine::start_fake(Some(MODEL), 8));
     let mut request = responses_tool_request("call-tool-with-preamble");
     request["stream"] = json!(true);
     let (status, _, body) = post(app, "/v1/responses", request).await;
@@ -915,7 +964,7 @@ async fn streamed_responses_closes_preamble_before_function_items() {
 
 #[tokio::test]
 async fn tool_choice_parallel_policy_and_tool_free_shapes_are_preserved() {
-    let app = router(Engine::start_fake(MODEL, 8));
+    let app = router(Engine::start_fake(Some(MODEL), 8));
     let mut none = chat_tool_request("call-tool");
     none["tool_choice"] = json!("none");
     let (status, _, body) = post(app.clone(), "/v1/chat/completions", none).await;
@@ -943,7 +992,7 @@ async fn tool_choice_parallel_policy_and_tool_free_shapes_are_preserved() {
     let (status, _, body) = post(app, "/v1/chat/completions", violation).await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
 
-    let ordinary = router(Engine::start_fake(MODEL, 8));
+    let ordinary = router(Engine::start_fake(Some(MODEL), 8));
     let (status, _, body) = post(ordinary, "/v1/chat/completions", chat_request("shape")).await;
     assert_eq!(status, StatusCode::OK);
     let value: Value = serde_json::from_str(&body).unwrap();
@@ -955,7 +1004,7 @@ async fn tool_choice_parallel_policy_and_tool_free_shapes_are_preserved() {
 
 #[tokio::test]
 async fn chat_tool_validation_reports_exact_paths() {
-    let app = router(Engine::start_fake(MODEL, 8));
+    let app = router(Engine::start_fake(Some(MODEL), 8));
     let valid_tool = chat_tools()[0].clone();
     let cases = [
         (
@@ -1053,7 +1102,7 @@ async fn chat_tool_validation_reports_exact_paths() {
 
 #[tokio::test]
 async fn responses_tool_validation_reports_exact_paths() {
-    let app = router(Engine::start_fake(MODEL, 8));
+    let app = router(Engine::start_fake(Some(MODEL), 8));
     let calls = json!([
         {"type":"function_call","id":"fc_1","call_id":"c","name":"weather","arguments":"{}"}
     ]);
@@ -1117,7 +1166,7 @@ fn tiny_png_data_uri() -> &'static str {
 
 #[tokio::test]
 async fn chat_and_responses_preserve_mixed_image_order_buffered_and_streamed() {
-    let app = router(Engine::start_fake(MODEL, 8));
+    let app = router(Engine::start_fake(Some(MODEL), 8));
     let chat = json!({
         "model": MODEL,
         "messages": [{
@@ -1212,7 +1261,7 @@ async fn chat_and_responses_preserve_mixed_image_order_buffered_and_streamed() {
 
 #[tokio::test]
 async fn image_validation_reports_exact_openai_parameter_paths() {
-    let app = router(Engine::start_fake(MODEL, 8));
+    let app = router(Engine::start_fake(Some(MODEL), 8));
     let chat_cases = [
         (
             json!({"model":MODEL,"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/a.png"}}]}]}),
@@ -1281,7 +1330,7 @@ async fn image_validation_reports_exact_openai_parameter_paths() {
 
 #[tokio::test]
 async fn image_requests_never_use_or_populate_the_text_prefix_cache() {
-    let app = router(Engine::start_fake(MODEL, 8));
+    let app = router(Engine::start_fake(Some(MODEL), 8));
     let image_request = json!({
         "model": MODEL,
         "messages": [{
@@ -1312,7 +1361,7 @@ async fn image_requests_never_use_or_populate_the_text_prefix_cache() {
 
 #[tokio::test]
 async fn image_messages_survive_chat_and_responses_tool_replay() {
-    let app = router(Engine::start_fake(MODEL, 8));
+    let app = router(Engine::start_fake(Some(MODEL), 8));
     let chat_user = json!({
         "role":"user",
         "content":[
@@ -1366,7 +1415,7 @@ async fn image_messages_survive_chat_and_responses_tool_replay() {
 
 #[tokio::test]
 async fn image_requests_keep_structured_output_and_tool_choice_none_contracts() {
-    let app = router(Engine::start_fake(MODEL, 8));
+    let app = router(Engine::start_fake(Some(MODEL), 8));
     let chat = json!({
         "model": MODEL,
         "messages": [{"role":"user","content":[
@@ -1430,7 +1479,7 @@ async fn image_requests_keep_structured_output_and_tool_choice_none_contracts() 
 
 #[tokio::test]
 async fn cancelling_an_image_request_leaves_the_next_text_request_clean() {
-    let engine = Engine::start_fake(MODEL, 8);
+    let engine = Engine::start_fake(Some(MODEL), 8);
     let mut image_request = protocol::parse_chat(json!({
         "model": MODEL,
         "messages": [{"role":"user","content":[

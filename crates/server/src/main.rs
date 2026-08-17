@@ -13,6 +13,10 @@ struct Cli {
     #[arg(long)]
     model: PathBuf,
 
+    /// Only accept requests for this exact model ID.
+    #[arg(long)]
+    model_id: Option<String>,
+
     /// HTTP listen address.
     #[arg(long, default_value = "127.0.0.1:8000")]
     bind: String,
@@ -34,11 +38,38 @@ async fn main() -> Result<()> {
         .parse()
         .with_context(|| format!("invalid --bind address {:?}", cli.bind))?;
 
-    let engine = Engine::start_qwen(cli.model, cli.prefix_cache_max_tokens)?;
+    let engine = Engine::start_qwen(cli.model, cli.model_id, cli.prefix_cache_max_tokens)?;
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("failed to bind {bind}"))?;
     axum::serve(listener, router(engine))
         .await
         .context("HTTP server failed")
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::{CommandFactory as _, Parser as _};
+
+    use super::Cli;
+
+    #[test]
+    fn cli_exposes_optional_model_id() {
+        let unrestricted =
+            Cli::try_parse_from(["qw-server", "--model", "/tmp/checkpoint"]).expect("CLI");
+        assert_eq!(unrestricted.model_id, None);
+
+        let configured = Cli::try_parse_from([
+            "qw-server",
+            "--model",
+            "/tmp/checkpoint",
+            "--model-id",
+            "served-model",
+        ])
+        .expect("CLI");
+        assert_eq!(configured.model_id.as_deref(), Some("served-model"));
+
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("--model-id <MODEL_ID>"), "{help}");
+    }
 }
