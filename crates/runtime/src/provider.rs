@@ -3,8 +3,8 @@ use std::sync::LazyLock;
 
 use anyhow::{Context, Result, ensure};
 use mlxcel_core::generate::{
-    ControlledGeneration, CxxGenerator, GenerationStats, GenerationStopReason, LanguageModel,
-    ModelStateSnapshot, PrefixReuse, SamplingConfig, TokenConstraint,
+    ControlledGeneration, CxxGenerator, GenerationStopReason, LanguageModel, ModelStateSnapshot,
+    PrefixReuse, SamplingConfig, TokenConstraint,
 };
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
@@ -240,8 +240,7 @@ impl Qwen35Provider {
         reasoning_effort: Option<&str>,
         enable_thinking: bool,
     ) -> Result<Vec<i32>> {
-        let rendered =
-            self.render_messages(messages, tools, reasoning_effort, enable_thinking)?;
+        let rendered = self.render_messages(messages, tools, reasoning_effort, enable_thinking)?;
         let encoded = self
             .tokenizer
             .encode(rendered, true)
@@ -380,6 +379,7 @@ impl Qwen35Provider {
         self.model.clear_prepared_mrope();
         let mut decoder = IncrementalTextDecoder::new(&self.tokenizer);
         let mut decode_error = None;
+        let mut callback_active = true;
         let controlled: ControlledGeneration = self
             .generator
             .generate_streaming_controlled(
@@ -391,7 +391,14 @@ impl Qwen35Provider {
                 constraint,
                 capture_prompt_snapshot,
                 |token_id| match decoder.push(token_id) {
-                    Ok(delta) => on_delta(&delta),
+                    Ok(delta) => {
+                        if delta.is_empty() {
+                            true
+                        } else {
+                            callback_active = on_delta(&delta);
+                            callback_active
+                        }
+                    }
                     Err(error) => {
                         decode_error = Some(error);
                         false
@@ -404,7 +411,7 @@ impl Qwen35Provider {
             return Err(error);
         }
         let final_delta = decoder.finish()?;
-        if !final_delta.is_empty() {
+        if callback_active && !final_delta.is_empty() {
             let _ = on_delta(&final_delta);
         }
         let text = decoder.emitted;
@@ -474,90 +481,85 @@ impl Qwen35Provider {
         })
     }
 
-    pub fn generate(&mut self, request: &GenerationRequest) -> Result<GenerationOutput> {
-        let (prompt_ids, sampling) = self.prepare_generation(request)?;
-        let use_mtp = self.resolve_generation_mode(Qwen35GenerationMode::Automatic, &sampling)?;
-        let token_ids = if use_mtp {
-            self.mtp_generator
-                .as_mut()
-                .expect("MTP mode requires an initialized generator")
-                .generate(
-                    &self.model,
-                    &prompt_ids,
-                    request.max_tokens,
-                    &sampling,
-                    PRODUCTION_MTP_BLOCK_SIZE,
-                )
-                .0
-        } else {
-            self.generator
-                .generate(&self.model, &prompt_ids, request.max_tokens, &sampling)
-        };
-        self.output_from_token_ids(token_ids)
-    }
-
-    /// Generate one response and return phase timings from the canonical
-    /// prefill/decode loop.
-    pub fn generate_with_stats(
+    pub fn generate_streaming<F: FnMut(&str) -> bool>(
         &mut self,
         request: &GenerationRequest,
-    ) -> Result<(GenerationOutput, GenerationStats)> {
-        self.generate_with_stats_in_mode(request, Qwen35GenerationMode::Automatic)
+        on_delta: F,
+    ) -> Result<GenerationOutput> {
+        self.generate_streaming_in_mode(request, Qwen35GenerationMode::Automatic, on_delta)
+            .map(|(output, _)| output)
     }
 
     #[doc(hidden)]
-    pub fn generate_with_stats_in_mode(
+    pub fn generate_streaming_in_mode<F: FnMut(&str) -> bool>(
         &mut self,
         request: &GenerationRequest,
         mode: Qwen35GenerationMode,
-    ) -> Result<(GenerationOutput, GenerationStats)> {
+        mut on_delta: F,
+    ) -> Result<(GenerationOutput, Option<MtpGenerationStats>)> {
         let (prompt_ids, sampling) = self.prepare_generation(request)?;
         let use_mtp = self.resolve_generation_mode(mode, &sampling)?;
-        let (token_ids, stats) = if use_mtp {
-            let (token_ids, stats, _) = self
-                .mtp_generator
-                .as_mut()
-                .expect("MTP mode requires an initialized generator")
-                .generate(
-                    &self.model,
-                    &prompt_ids,
-                    request.max_tokens,
-                    &sampling,
-                    PRODUCTION_MTP_BLOCK_SIZE,
-                );
-            (token_ids, stats)
-        } else {
-            self.generator.generate_with_stats(
-                &self.model,
+        if !use_mtp {
+            let generation = self.generate_baseline_streaming(
                 &prompt_ids,
                 request.max_tokens,
                 &sampling,
-            )
-        };
-        Ok((self.output_from_token_ids(token_ids)?, stats))
-    }
+                None,
+                None,
+                false,
+                on_delta,
+            )?;
+            return Ok((
+                GenerationOutput {
+                    text: generation.text,
+                    token_ids: generation.token_ids,
+                },
+                None,
+            ));
+        }
 
-    #[doc(hidden)]
-    pub fn generate_with_mtp_stats(
-        &mut self,
-        request: &GenerationRequest,
-        block_size: usize,
-    ) -> Result<(GenerationOutput, GenerationStats, MtpGenerationStats)> {
-        let (prompt_ids, sampling) = self.prepare_generation(request)?;
-        self.resolve_generation_mode(Qwen35GenerationMode::Mtp, &sampling)?;
-        ensure!(block_size >= 2, "MTP block size must be at least 2");
-        let (token_ids, stats, mtp_stats) = self
+        let mut decoder = IncrementalTextDecoder::new(&self.tokenizer);
+        let mut decode_error = None;
+        let mut callback_active = true;
+        let (token_ids, stats) = self
             .mtp_generator
             .as_mut()
             .expect("MTP mode requires an initialized generator")
-            .generate(
+            .generate_streaming(
                 &self.model,
                 &prompt_ids,
                 request.max_tokens,
                 &sampling,
-                block_size,
+                PRODUCTION_MTP_BLOCK_SIZE,
+                |token_id| match decoder.push(token_id) {
+                    Ok(delta) => {
+                        if delta.is_empty() {
+                            true
+                        } else {
+                            callback_active = on_delta(&delta);
+                            callback_active
+                        }
+                    }
+                    Err(error) => {
+                        decode_error = Some(error);
+                        false
+                    }
+                },
             );
-        Ok((self.output_from_token_ids(token_ids)?, stats, mtp_stats))
+        if let Some(error) = decode_error {
+            return Err(error);
+        }
+        let final_delta = decoder.finish()?;
+        if callback_active && !final_delta.is_empty() {
+            let _ = on_delta(&final_delta);
+        }
+        Ok((
+            GenerationOutput {
+                text: decoder.emitted,
+                token_ids,
+            },
+            Some(stats),
+        ))
     }
 
     fn resolve_generation_mode(
@@ -619,23 +621,6 @@ impl Qwen35Provider {
             ..SamplingConfig::default()
         };
         Ok((prompt_ids, sampling))
-    }
-
-    fn output_from_token_ids(&self, mut token_ids: Vec<i32>) -> Result<GenerationOutput> {
-        if token_ids
-            .last()
-            .is_some_and(|token| self.defaults.stop_token_ids.contains(token))
-        {
-            token_ids.pop();
-        }
-        let decoded_ids: Vec<u32> = token_ids.iter().map(|&token| token as u32).collect();
-        let text = self
-            .tokenizer
-            .decode(&decoded_ids, false)
-            .map_err(anyhow::Error::msg)
-            .context("failed to decode generated tokens")?;
-
-        Ok(GenerationOutput { text, token_ids })
     }
 }
 
@@ -846,13 +831,23 @@ mod tests {
             top_p: Some(1.0),
             seed: Some(0),
         };
+        let mut baseline_deltas = String::new();
         let (baseline, _) = provider
-            .generate_with_stats_in_mode(&request, Qwen35GenerationMode::Baseline)
+            .generate_streaming_in_mode(&request, Qwen35GenerationMode::Baseline, |delta| {
+                baseline_deltas.push_str(delta);
+                true
+            })
             .expect("baseline greedy generation");
+        let mut mtp_deltas = String::new();
         let (mtp, _) = provider
-            .generate_with_stats_in_mode(&request, Qwen35GenerationMode::Mtp)
+            .generate_streaming_in_mode(&request, Qwen35GenerationMode::Mtp, |delta| {
+                mtp_deltas.push_str(delta);
+                true
+            })
             .expect("MTP greedy generation");
         assert_eq!(baseline.token_ids, mtp.token_ids);
         assert_eq!(baseline.text, mtp.text);
+        assert_eq!(baseline_deltas, baseline.text);
+        assert_eq!(mtp_deltas, mtp.text);
     }
 }
