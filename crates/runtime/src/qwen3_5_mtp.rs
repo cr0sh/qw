@@ -319,8 +319,7 @@ impl Qwen35MtpDraftModel {
         state.round_appended = 0;
         let mut tokens = Vec::with_capacity(proposal_count);
         let mut history = committed_history.to_vec();
-        let mut hidden =
-            self.draft_seed_hidden(target, last_bonus, target_hidden, &mut state);
+        let mut hidden = self.draft_seed_hidden(target, last_bonus, target_hidden, &mut state);
         let mut logits = target.project_draft_logits(&hidden);
         let compact = target.has_compact_draft_head();
 
@@ -365,8 +364,7 @@ impl Qwen35MtpDraftModel {
         state.round_appended = 0;
         let mut proposals = Vec::with_capacity(proposal_count);
         let mut history = committed_history.to_vec();
-        let mut hidden =
-            self.draft_seed_hidden(target, last_bonus, target_hidden, &mut state);
+        let mut hidden = self.draft_seed_hidden(target, last_bonus, target_hidden, &mut state);
         let mut logits = target.project_logits(&hidden);
 
         while proposals.len() < proposal_count {
@@ -409,8 +407,7 @@ impl Qwen35MtpDraftModel {
         let mut output = committed_output.to_vec();
         let mut history = Vec::with_capacity(prompt_tokens.len() + output.len() + proposal_count);
         rebuild_history(prompt_tokens, &output, &mut history);
-        let mut hidden =
-            self.draft_seed_hidden(target, last_bonus, target_hidden, &mut state);
+        let mut hidden = self.draft_seed_hidden(target, last_bonus, target_hidden, &mut state);
         let mut logits = target.project_logits(&hidden);
 
         while tokens.len() < proposal_count {
@@ -462,8 +459,7 @@ impl Qwen35MtpDraftModel {
         let mut output = committed_output.to_vec();
         let mut history = Vec::with_capacity(prompt_tokens.len() + output.len() + proposal_count);
         rebuild_history(prompt_tokens, &output, &mut history);
-        let mut hidden =
-            self.draft_seed_hidden(target, last_bonus, target_hidden, &mut state);
+        let mut hidden = self.draft_seed_hidden(target, last_bonus, target_hidden, &mut state);
         let mut logits = target.project_logits(&hidden);
 
         while proposals.len() < proposal_count {
@@ -627,6 +623,8 @@ fn mtp_round_reaches_cache_clear(previous: usize, emitted: usize, interval: usiz
     mlxcel_core::memory::should_clear_cache_crossing(previous, emitted, interval)
 }
 
+const MTP_STATE_MATERIALIZE_INTERVAL: usize = 32;
+
 // Variable MTP verify shapes accumulate reusable Metal buffers much faster than
 // ordinary one-token decode. Keep a bounded cache, but retain those buffers
 // until the bound is reached so the common shapes can be reused.
@@ -784,15 +782,36 @@ fn greedy_walk(
     committed_history: &[i32],
     max_new_tokens: usize,
 ) -> WalkResult {
-    let mut history = committed_history.to_vec();
+    let history_independent = sampling.repetition_penalty == 1.0
+        && sampling.dry_multiplier == 0.0
+        && sampling.frequency_penalty == 0.0
+        && sampling.presence_penalty == 0.0
+        && sampling.xtc_probability == 0.0;
     let mut target_tokens = Vec::with_capacity(draft_tokens.len() + 1);
-    for position in 0..=draft_tokens.len() {
-        let logits = logits_at(verify_logits, position);
-        let (token, _) = sample_token_optimized(&logits, sampling, &history);
-        mlxcel_core::eval(&token);
-        target_tokens.push(mlxcel_core::item_i32(&token));
-        if position < draft_tokens.len() {
-            history.push(draft_tokens[position]);
+    if history_independent {
+        let biased_logits =
+            mlxcel_core::sampling::apply_token_bias(verify_logits, &sampling.token_bias);
+        let targets = mlxcel_core::argmax_last_axis(&biased_logits);
+        mlxcel_core::eval(&targets);
+        let shape = mlxcel_core::array_shape(&targets);
+        for position in 0..=draft_tokens.len() {
+            let token = mlxcel_core::slice(
+                &targets,
+                &[0, position as i32],
+                &[shape[0], position as i32 + 1],
+            );
+            target_tokens.push(mlxcel_core::item_i32(&token));
+        }
+    } else {
+        let mut history = committed_history.to_vec();
+        for position in 0..=draft_tokens.len() {
+            let logits = logits_at(verify_logits, position);
+            let (token, _) = sample_token_optimized(&logits, sampling, &history);
+            mlxcel_core::eval(&token);
+            target_tokens.push(mlxcel_core::item_i32(&token));
+            if position < draft_tokens.len() {
+                history.push(draft_tokens[position]);
+            }
         }
     }
     speculative_walk(draft_tokens, &target_tokens, max_new_tokens)
@@ -1803,9 +1822,14 @@ impl Qwen35MtpGenerator {
                         &verify.gdn_states,
                         walk.accepted,
                         verify_tokens.len(),
+                        false,
                     );
-                    mtp_stats.full_state_materializations += 1;
-                } else {
+                }
+                if mtp_round_reaches_cache_clear(
+                    emitted_before,
+                    generated.len(),
+                    MTP_STATE_MATERIALIZE_INTERVAL,
+                ) {
                     model.materialize_mtp_cache_state();
                     mtp_stats.full_state_materializations += 1;
                 }
@@ -2092,6 +2116,7 @@ impl Qwen35MtpGenerator {
                         &verify.gdn_states,
                         walk.accepted,
                         verify_tokens.len(),
+                        true,
                     );
                 }
                 drafter.accept_verified_tokens(
