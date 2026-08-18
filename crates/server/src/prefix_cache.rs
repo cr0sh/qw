@@ -1,13 +1,13 @@
-use mlxcel_core::generate::ModelStateSnapshot;
+use qw_runtime::PromptSnapshot;
 
 pub struct PrefixMatch<'a> {
     pub token_count: usize,
-    pub snapshot: &'a ModelStateSnapshot,
+    pub snapshot: &'a PromptSnapshot,
 }
 
 struct Entry {
     tokens: Vec<i32>,
-    snapshot: ModelStateSnapshot,
+    snapshot: PromptSnapshot,
     last_used: u64,
 }
 
@@ -35,8 +35,7 @@ impl PrefixCache {
             .iter()
             .enumerate()
             .filter(|(_, entry)| {
-                entry.tokens.len() <= prompt.len()
-                    && prompt[..entry.tokens.len()] == entry.tokens
+                entry.tokens.len() <= prompt.len() && prompt[..entry.tokens.len()] == entry.tokens
             })
             .max_by_key(|(_, entry)| entry.tokens.len())
             .map(|(index, _)| index)?;
@@ -48,7 +47,7 @@ impl PrefixCache {
         })
     }
 
-    pub fn insert(&mut self, tokens: Vec<i32>, snapshot: ModelStateSnapshot) {
+    pub fn insert(&mut self, tokens: Vec<i32>, snapshot: PromptSnapshot) {
         if tokens.len() > self.max_tokens {
             return;
         }
@@ -86,8 +85,10 @@ impl PrefixCache {
 mod tests {
     use super::*;
 
-    fn snapshot(tokens: usize) -> ModelStateSnapshot {
-        ModelStateSnapshot::new("test", tokens)
+    fn snapshot(tokens: usize) -> PromptSnapshot {
+        PromptSnapshot::Baseline(mlxcel_core::generate::ModelStateSnapshot::new(
+            "test", tokens,
+        ))
     }
 
     #[test]
@@ -125,8 +126,64 @@ mod tests {
             next_turn.extend([100, 101]);
             let hit = cache.lookup(&next_turn).expect("latest turn prefix");
             assert_eq!(hit.token_count, turn_len);
-            assert_eq!(hit.snapshot.token_len(), turn_len);
+            let PromptSnapshot::Baseline(snapshot) = hit.snapshot else {
+                panic!("test inserts baseline snapshots");
+            };
+            assert_eq!(snapshot.token_len(), turn_len);
         }
+    }
+    #[test]
+    fn unrelated_histories_and_branches_coexist_and_select_longest_prefix() {
+        let mut cache = PrefixCache::new(64);
+        cache.insert(vec![1, 2], snapshot(2));
+        cache.insert(vec![9, 8, 7], snapshot(3));
+        cache.insert(vec![1, 2, 3, 4], snapshot(4));
+        cache.insert(vec![1, 2, 5], snapshot(3));
+
+        assert_eq!(
+            cache
+                .lookup(&[9, 8, 7, 6])
+                .expect("unrelated history")
+                .token_count,
+            3
+        );
+        assert_eq!(
+            cache
+                .lookup(&[1, 2, 3, 4, 6])
+                .expect("first branch")
+                .token_count,
+            4
+        );
+        assert_eq!(
+            cache
+                .lookup(&[1, 2, 5, 6])
+                .expect("second branch")
+                .token_count,
+            3
+        );
+        assert_eq!(
+            cache
+                .lookup(&[1, 2, 6])
+                .expect("common ancestor")
+                .token_count,
+            2
+        );
+    }
+
+    #[test]
+    fn global_token_budget_evicts_lru_across_unrelated_histories() {
+        let mut cache = PrefixCache::new(9);
+        cache.insert(vec![1, 2, 3], snapshot(3));
+        cache.insert(vec![4, 5, 6], snapshot(3));
+        cache.insert(vec![7, 8, 9], snapshot(3));
+        cache.lookup(&[1, 2, 3, 0]).expect("refresh first history");
+        cache.insert(vec![10, 11, 12], snapshot(3));
+
+        assert!(cache.lookup(&[4, 5, 6, 0]).is_none());
+        assert!(cache.lookup(&[1, 2, 3, 0]).is_some());
+        assert!(cache.lookup(&[7, 8, 9, 0]).is_some());
+        assert!(cache.lookup(&[10, 11, 12, 0]).is_some());
+        assert_eq!(cache.total_tokens(), 9);
     }
 
     #[test]

@@ -6,9 +6,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};
 use mlxcel_core::generate::{GenerationStopReason, PrefixReuse};
-use qw_runtime::{KVCacheMode, Qwen35Provider};
 #[cfg(test)]
 use qw_runtime::{ChatContentRef, ChatMessage};
+use qw_runtime::{KVCacheMode, MtpPrefixReuse, PromptSnapshot, Qwen35Provider};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tracing::{Span, error, info, info_span, warn};
@@ -46,7 +46,10 @@ fn qwen_generation_route(
 }
 
 fn route_uses_prefix_cache(route: QwenGenerationRoute) -> bool {
-    route == QwenGenerationRoute::BaselineText
+    matches!(
+        route,
+        QwenGenerationRoute::BaselineText | QwenGenerationRoute::MtpText
+    )
 }
 
 fn validate_mtp_k(mtp_k: usize) -> Result<()> {
@@ -323,12 +326,7 @@ impl Engine {
         thread::Builder::new()
             .name("qw-generation".to_string())
             .spawn(move || {
-                match QwenWorker::load(
-                    &model_path,
-                    prefix_cache_max_tokens,
-                    mtp_k,
-                    kv_cache_mode,
-                ) {
+                match QwenWorker::load(&model_path, prefix_cache_max_tokens, mtp_k, kv_cache_mode) {
                     Ok(mut worker) => {
                         let supports_image_inputs = worker.provider.supports_image_inputs();
                         let _ = ready_tx.send(Ok(supports_image_inputs));
@@ -810,8 +808,8 @@ impl QwenWorker {
             job.request.top_p,
             job.request.seed,
         );
-        let mtp_available = self.provider.has_mtp()
-            && std::env::var_os("QW_BENCH_DISABLE_MTP").is_none();
+        let mtp_available =
+            self.provider.has_mtp() && std::env::var_os("QW_BENCH_DISABLE_MTP").is_none();
         let route = qwen_generation_route(mtp_available, has_images, constraint.is_some());
         let mtp_k = self.mtp_k;
         let (provider, cache) = (&mut self.provider, &mut self.prefix_cache);
@@ -820,17 +818,39 @@ impl QwenWorker {
         } else {
             None
         };
-        let prefix_reuse = hit.map(|hit| PrefixReuse {
-            snapshot: hit.snapshot,
-            cached_tokens: hit.token_count,
-        });
+        let (prefix_reuse, mtp_prefix_reuse) = match (route, hit) {
+            (QwenGenerationRoute::BaselineText, Some(hit)) => match hit.snapshot {
+                PromptSnapshot::Baseline(snapshot) => (
+                    Some(PrefixReuse {
+                        snapshot,
+                        cached_tokens: hit.token_count,
+                    }),
+                    None,
+                ),
+                PromptSnapshot::Mtp(_) => (None, None),
+            },
+            (QwenGenerationRoute::MtpText, Some(hit)) => match hit.snapshot {
+                PromptSnapshot::Mtp(snapshot) => (
+                    None,
+                    Some(MtpPrefixReuse {
+                        snapshot,
+                        cached_tokens: hit.token_count,
+                    }),
+                ),
+                PromptSnapshot::Baseline(_) => (None, None),
+            },
+            _ => (None, None),
+        };
         info!(
             phase = "model_generation.started",
             route = ?route,
             mtp_k,
             prefix_cached_tokens = prefix_reuse
                 .as_ref()
-                .map_or(0, |reuse| reuse.cached_tokens),
+                .map_or_else(
+                    || mtp_prefix_reuse.as_ref().map_or(0, |reuse| reuse.cached_tokens),
+                    |reuse| reuse.cached_tokens,
+                ),
         );
         let mut trace_parser = ReasoningTraceParser::new(enable_thinking);
         let mut gate = ToolCallGate::default();
@@ -864,6 +884,8 @@ impl QwenWorker {
                 job.request.max_tokens,
                 &sampling,
                 mtp_k,
+                mtp_prefix_reuse,
+                true,
                 constraint
                     .as_mut()
                     .map(|value| value as &mut dyn mlxcel_core::generate::TokenConstraint),
@@ -1226,7 +1248,7 @@ mod tests {
     }
 
     #[test]
-    fn only_baseline_text_routes_are_prefix_cache_eligible() {
+    fn text_routes_are_prefix_cache_eligible() {
         for route in [
             QwenGenerationRoute::BaselineText,
             QwenGenerationRoute::BaselineMultimodal,
@@ -1235,7 +1257,10 @@ mod tests {
         ] {
             assert_eq!(
                 route_uses_prefix_cache(route),
-                route == QwenGenerationRoute::BaselineText
+                matches!(
+                    route,
+                    QwenGenerationRoute::BaselineText | QwenGenerationRoute::MtpText
+                )
             );
         }
         assert_ne!(

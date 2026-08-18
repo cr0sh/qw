@@ -22,8 +22,8 @@ use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
 use mlxcel_core::generate::{
-    ConstraintCommit, ConstraintMask, GenerationStopReason, LanguageModel, SamplingConfig,
-    TokenConstraint, mask_logits_to_allowed,
+    ConstraintCommit, ConstraintMask, GenerationStopReason, LanguageModel, ModelStateSnapshot,
+    SamplingConfig, TokenConstraint, mask_logits_to_allowed,
 };
 use mlxcel_core::generation_policy::{merged_eos_token_ids, seed_rng_if_needed};
 use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedLinear};
@@ -84,6 +84,28 @@ pub(crate) struct MtpGeneration {
     pub(crate) token_ids: Vec<i32>,
     pub(crate) stats: MtpGenerationStats,
     pub(crate) stop_reason: GenerationStopReason,
+    pub(crate) prompt_snapshot: Option<MtpPromptSnapshot>,
+    pub(crate) cached_tokens: usize,
+}
+
+/// Detached target and drafter state at an exact text prompt boundary.
+///
+/// The target cache represents `token_len` tokens. The drafter cache represents
+/// the shifted prompt through `token_len - 1`; it deliberately contains no
+/// sampled completion seed or speculative-round state.
+pub struct MtpPromptSnapshot {
+    target: ModelStateSnapshot,
+    draft_keys: Option<UniquePtr<MlxArray>>,
+    draft_values: Option<UniquePtr<MlxArray>>,
+    draft_offset: i32,
+    last_hidden: UniquePtr<MlxArray>,
+    continuation_logits: UniquePtr<MlxArray>,
+}
+
+/// Exact-prefix MTP state supplied by the server cache.
+pub struct MtpPrefixReuse<'a> {
+    pub snapshot: &'a MtpPromptSnapshot,
+    pub cached_tokens: usize,
 }
 
 struct MtpProposal {
@@ -250,12 +272,8 @@ impl Qwen35MtpDraftModel {
     ) {
         let mut state = self.state.borrow_mut();
         state.rope_delta = rope_delta;
-        let output = self.forward_embeddings(
-            shifted_embeddings,
-            target_hidden,
-            &mut state,
-            position_ids,
-        );
+        let output =
+            self.forward_embeddings(shifted_embeddings, target_hidden, &mut state, position_ids);
         if seed {
             let output_shape = mlxcel_core::array_shape(&output);
             let last = output_shape[1] - 1;
@@ -391,8 +409,7 @@ impl Qwen35MtpDraftModel {
                 }
                 break;
             };
-            let (token_array, _) =
-                sample_token_optimized(logits_for_sample, sampling, &history);
+            let (token_array, _) = sample_token_optimized(logits_for_sample, sampling, &history);
             mlxcel_core::eval(&token_array);
             let token = mlxcel_core::item_i32(&token_array);
             tokens.push(token);
@@ -518,6 +535,69 @@ impl Qwen35MtpDraftModel {
         if let Some(logits) = state.seed_logits.take() {
             state.seed_logits = Some(materialize_detached(logits));
         }
+    }
+
+    fn capture_prompt_snapshot(
+        &self,
+        target: ModelStateSnapshot,
+        token_len: usize,
+        last_hidden: &MlxArray,
+        continuation_logits: &MlxArray,
+    ) -> Option<MtpPromptSnapshot> {
+        let expected_offset = i32::try_from(token_len.checked_sub(1)?).ok()?;
+        self.materialize_state();
+        let state = self.state.borrow();
+        if state.cache.offset != expected_offset
+            || state.round_appended != 0
+            || state.seed_hidden.is_some()
+            || state.seed_logits.is_some()
+        {
+            return None;
+        }
+        let detached = |array: &MlxArray| materialize_detached(mlxcel_core::copy(array));
+        Some(MtpPromptSnapshot {
+            target,
+            draft_keys: state.cache.keys.as_deref().map(detached),
+            draft_values: state.cache.values.as_deref().map(detached),
+            draft_offset: state.cache.offset,
+            last_hidden: detached(last_hidden),
+            continuation_logits: detached(continuation_logits),
+        })
+    }
+
+    fn restore_prompt_snapshot(
+        &self,
+        snapshot: &MtpPromptSnapshot,
+        token_len: usize,
+    ) -> Result<(), String> {
+        let expected_offset = i32::try_from(
+            token_len
+                .checked_sub(1)
+                .ok_or_else(|| "MTP snapshots require a non-empty prompt".to_string())?,
+        )
+        .map_err(|_| "MTP snapshot token length exceeds i32".to_string())?;
+        if snapshot.target.token_len() != token_len || snapshot.draft_offset != expected_offset {
+            return Err(
+                "MTP snapshot target/drafter offsets do not match the cached prefix".to_string(),
+            );
+        }
+        if snapshot.draft_keys.is_some() != snapshot.draft_values.is_some()
+            || (expected_offset > 0 && snapshot.draft_keys.is_none())
+        {
+            return Err("MTP snapshot drafter KV layout is incomplete".to_string());
+        }
+        let mut cache = KVCache::new();
+        cache.keys = snapshot.draft_keys.as_deref().map(mlxcel_core::copy);
+        cache.values = snapshot.draft_values.as_deref().map(mlxcel_core::copy);
+        cache.offset = expected_offset;
+        *self.state.borrow_mut() = Qwen35MtpDraftState {
+            cache,
+            seed_logits: None,
+            seed_hidden: None,
+            rope_delta: None,
+            round_appended: 0,
+        };
+        Ok(())
     }
 }
 
@@ -648,11 +728,9 @@ fn constraint_step(
     history: &[i32],
 ) -> Result<ConstraintStepLogits, String> {
     match constraint.compute_mask(logits, history)? {
-        ConstraintMask::Allow(allowed) => {
-            Ok(ConstraintStepLogits::Masked(mask_logits_to_allowed(
-                logits, &allowed,
-            )?))
-        }
+        ConstraintMask::Allow(allowed) => Ok(ConstraintStepLogits::Masked(mask_logits_to_allowed(
+            logits, &allowed,
+        )?)),
         ConstraintMask::Splice(commit) => Ok(ConstraintStepLogits::Splice(commit)),
         ConstraintMask::Accept => Ok(ConstraintStepLogits::Accept),
     }
@@ -725,11 +803,8 @@ fn stochastic_walk(
     let mut new_tokens = Vec::with_capacity((proposals.len() + 1).min(max_new_tokens));
 
     for (position, proposal) in proposals.iter().enumerate() {
-        let target_probs = effective_token_distribution(
-            &logits_at(verify_logits, position),
-            sampling,
-            &history,
-        );
+        let target_probs =
+            effective_token_distribution(&logits_at(verify_logits, position), sampling, &history);
         match verify_draft_token(&target_probs, &proposal.proposal_probs, proposal.token) {
             DraftVerdict::Accept => {
                 accepted += 1;
@@ -903,7 +978,8 @@ fn constrained_greedy_walk(
     constraint: &mut dyn TokenConstraint,
 ) -> Result<ConstrainedWalk, String> {
     let mut output = committed_output.to_vec();
-    let mut history = Vec::with_capacity(prompt_tokens.len() + output.len() + draft_tokens.len() + 1);
+    let mut history =
+        Vec::with_capacity(prompt_tokens.len() + output.len() + draft_tokens.len() + 1);
     rebuild_history(prompt_tokens, &output, &mut history);
     let mut accepted = 0;
     let mut new_tokens = Vec::with_capacity(draft_tokens.len() + 1);
@@ -1033,17 +1109,14 @@ fn constrained_stochastic_walk(
             }
         };
         let target_probs = effective_token_distribution(logits_for_sample, sampling, &history);
-        let target_token = match verify_draft_token(
-            &target_probs,
-            &proposal.proposal_probs,
-            proposal.token,
-        ) {
-            DraftVerdict::Accept => {
-                accepted += 1;
-                proposal.token
-            }
-            DraftVerdict::Reject { replacement } => replacement,
-        };
+        let target_token =
+            match verify_draft_token(&target_probs, &proposal.proposal_probs, proposal.token) {
+                DraftVerdict::Accept => {
+                    accepted += 1;
+                    proposal.token
+                }
+                DraftVerdict::Reject { replacement } => replacement,
+            };
         new_tokens.push(target_token);
         if eos_tokens.contains(&target_token) {
             return Ok(ConstrainedWalk {
@@ -1218,12 +1291,7 @@ fn shifted_embeddings_for_range(
                 let bonus = mlxcel_core::from_slice_i32(&[bonus], &[1, 1]);
                 model.embed_tokens.forward(&bonus)
             });
-            shifted_embedding_range(
-                input_embeddings,
-                start,
-                end,
-                bonus_embedding.as_deref(),
-            )
+            shifted_embedding_range(input_embeddings, start, end, bonus_embedding.as_deref())
         }
     }
 }
@@ -1258,20 +1326,15 @@ fn prefill_for_input(
             position_ids,
             rope_delta,
             ..
-        } => (
-            Some(input_embeddings),
-            Some(position_ids),
-            Some(rope_delta),
-        ),
+        } => (Some(input_embeddings), Some(position_ids), Some(rope_delta)),
     };
-    model.forward_mtp_prefill_chunks(
+    let prefill = model.forward_mtp_prefill_chunks(
         prompt,
         embeddings,
         positions,
         rope_delta,
         |start, end, hidden| {
-            let shifted =
-                shifted_embeddings_for_range(model, prefill_input, start, end, None);
+            let shifted = shifted_embeddings_for_range(model, prefill_input, start, end, None);
             let chunk_positions = position_ids_for_range(prefill_input, start, end);
             drafter.prefill_target_chunk(
                 model,
@@ -1287,7 +1350,110 @@ fn prefill_for_input(
             mlxcel_core::clear_memory_cache();
             log_mtp_memory("mtp.prefill.chunk_complete", end as usize);
         },
-    )
+    )?;
+    let prompt_len = mlxcel_core::array_shape(prompt)[1];
+    let final_shape = mlxcel_core::array_shape(&prefill.hidden);
+    let final_len = final_shape[1];
+    if final_len > 1 {
+        let start = prompt_len - final_len;
+        let shifted =
+            shifted_embeddings_for_range(model, prefill_input, start, prompt_len - 1, None);
+        let hidden = mlxcel_core::slice(
+            &prefill.hidden,
+            &[0, 0, 0],
+            &[final_shape[0], final_len - 1, final_shape[2]],
+        );
+        let positions = position_ids_for_range(prefill_input, start, prompt_len - 1);
+        drafter.prefill_target_chunk(
+            model,
+            &shifted,
+            &hidden,
+            positions.as_deref(),
+            rope_delta,
+            false,
+        );
+    }
+    drafter.materialize_state();
+    model.materialize_mtp_cache_state();
+    Ok(prefill)
+}
+
+fn prefill_text_with_reuse(
+    model: &Qwen35Model,
+    drafter: &Qwen35MtpDraftModel,
+    prompt_tokens: &[i32],
+    reuse: Option<MtpPrefixReuse<'_>>,
+) -> Result<(crate::qwen3_5::Qwen35MtpPrefill, usize), String> {
+    let Some(reuse) = reuse else {
+        let prompt = mlxcel_core::from_slice_i32(
+            prompt_tokens,
+            &[1, i32::try_from(prompt_tokens.len()).unwrap_or(i32::MAX)],
+        );
+        return prefill_for_input(model, drafter, MtpPrefill::Text { prompt: &prompt })
+            .map(|prefill| (prefill, 0));
+    };
+    if reuse.cached_tokens == 0 || reuse.cached_tokens > prompt_tokens.len() {
+        return Err("MTP cached token count is outside the prompt".to_string());
+    }
+    model.restore_sequence_state(
+        mlxcel_core::cache::SequenceId::from_raw(0),
+        &reuse.snapshot.target,
+    )?;
+    drafter.restore_prompt_snapshot(reuse.snapshot, reuse.cached_tokens)?;
+    if reuse.cached_tokens == prompt_tokens.len() {
+        return Ok((
+            crate::qwen3_5::Qwen35MtpPrefill {
+                hidden: mlxcel_core::copy(&reuse.snapshot.last_hidden),
+                first_logits: mlxcel_core::copy(&reuse.snapshot.continuation_logits),
+            },
+            reuse.cached_tokens,
+        ));
+    }
+
+    let suffix = &prompt_tokens[reuse.cached_tokens..];
+    let suffix_ids = mlxcel_core::from_slice_i32(
+        suffix,
+        &[1, i32::try_from(suffix.len()).unwrap_or(i32::MAX)],
+    );
+    let mut previous_hidden = mlxcel_core::copy(&reuse.snapshot.last_hidden);
+    let prefill = model.forward_mtp_text_suffix_chunks(&suffix_ids, |ids, hidden| {
+        let shape = mlxcel_core::array_shape(hidden);
+        let target_hidden = if shape[1] == 1 {
+            mlxcel_core::copy(&previous_hidden)
+        } else {
+            let prefix_hidden =
+                mlxcel_core::slice(hidden, &[0, 0, 0], &[shape[0], shape[1] - 1, shape[2]]);
+            mlxcel_core::concatenate(&previous_hidden, &prefix_hidden, 1)
+        };
+        let embeddings = model.embed_tokens.forward(ids);
+        drafter.prefill_target_chunk(model, &embeddings, &target_hidden, None, None, false);
+        previous_hidden = materialize_detached(mlxcel_core::slice(
+            hidden,
+            &[0, shape[1] - 1, 0],
+            &[shape[0], shape[1], shape[2]],
+        ));
+        drafter.materialize_state();
+        model.materialize_mtp_cache_state();
+    })?;
+    Ok((prefill, reuse.cached_tokens))
+}
+
+fn capture_mtp_prompt_snapshot(
+    model: &Qwen35Model,
+    drafter: &Qwen35MtpDraftModel,
+    token_len: usize,
+    prefill: &crate::qwen3_5::Qwen35MtpPrefill,
+) -> Option<MtpPromptSnapshot> {
+    let target =
+        model.snapshot_sequence_state(mlxcel_core::cache::SequenceId::from_raw(0), token_len)?;
+    let shape = mlxcel_core::array_shape(&prefill.hidden);
+    let last = shape[1] - 1;
+    let last_hidden = mlxcel_core::slice(
+        &prefill.hidden,
+        &[0, last, 0],
+        &[shape[0], last + 1, shape[2]],
+    );
+    drafter.capture_prompt_snapshot(target, token_len, &last_hidden, &prefill.first_logits)
 }
 
 fn finish_drafter_prefill(
@@ -1299,31 +1465,29 @@ fn finish_drafter_prefill(
 ) -> UniquePtr<MlxArray> {
     let prompt_len = mlxcel_core::array_shape(prompt_for_prefill(prefill_input))[1];
     let final_shape = mlxcel_core::array_shape(&prefill.hidden);
-    let final_len = final_shape[1];
-    let start = prompt_len - final_len;
-    let shifted =
-        shifted_embeddings_for_range(model, prefill_input, start, prompt_len, Some(first_token));
-    let positions = position_ids_for_range(prefill_input, start, prompt_len);
+    let last = final_shape[1] - 1;
+    let last_hidden = materialize_detached(mlxcel_core::slice(
+        &prefill.hidden,
+        &[0, last, 0],
+        &[final_shape[0], last + 1, final_shape[2]],
+    ));
+    let bonus = mlxcel_core::from_slice_i32(&[first_token], &[1, 1]);
+    let bonus_embedding = model.embed_tokens.forward(&bonus);
+    let positions = position_ids_for_range(prefill_input, prompt_len - 1, prompt_len);
     let rope_delta = match prefill_input {
         MtpPrefill::Text { .. } => None,
         MtpPrefill::Multimodal { rope_delta, .. } => Some(rope_delta),
     };
     drafter.prefill_target_chunk(
         model,
-        &shifted,
-        &prefill.hidden,
+        &bonus_embedding,
+        &last_hidden,
         positions.as_deref(),
         rope_delta,
         true,
     );
     drafter.materialize_state();
     model.materialize_mtp_cache_state();
-    let last = final_len - 1;
-    let last_hidden = materialize_detached(mlxcel_core::slice(
-        &prefill.hidden,
-        &[0, last, 0],
-        &[final_shape[0], last + 1, final_shape[2]],
-    ));
     drop(prefill);
     mlxcel_core::clear_memory_cache();
     log_mtp_memory("mtp.prefill.final_complete", prompt_len as usize);
@@ -1387,6 +1551,8 @@ impl Qwen35MtpGenerator {
         max_tokens: usize,
         sampling: &SamplingConfig,
         block_size: usize,
+        prefix_reuse: Option<MtpPrefixReuse<'_>>,
+        capture_prompt_snapshot: bool,
         constraint: Option<&mut dyn TokenConstraint>,
         on_token: F,
     ) -> Result<MtpGeneration, String> {
@@ -1401,6 +1567,8 @@ impl Qwen35MtpGenerator {
             max_tokens,
             sampling,
             block_size,
+            prefix_reuse,
+            capture_prompt_snapshot,
             constraint,
             on_token,
         );
@@ -1438,6 +1606,8 @@ impl Qwen35MtpGenerator {
             max_tokens,
             sampling,
             block_size,
+            None,
+            false,
             constraint,
             on_token,
         );
@@ -1453,6 +1623,8 @@ impl Qwen35MtpGenerator {
         max_tokens: usize,
         sampling: &SamplingConfig,
         block_size: usize,
+        prefix_reuse: Option<MtpPrefixReuse<'_>>,
+        capture_prompt_snapshot: bool,
         constraint: Option<&mut dyn TokenConstraint>,
         mut on_token: F,
     ) -> Result<MtpGeneration, String> {
@@ -1466,6 +1638,8 @@ impl Qwen35MtpGenerator {
                 max_tokens,
                 sampling,
                 block_size,
+                prefix_reuse,
+                capture_prompt_snapshot,
                 constraint,
                 on_token,
             );
@@ -1484,11 +1658,23 @@ impl Qwen35MtpGenerator {
                 token_ids: Vec::new(),
                 stats: MtpGenerationStats::default(),
                 stop_reason: GenerationStopReason::MaxTokens,
+                prompt_snapshot: None,
+                cached_tokens: 0,
             });
         }
 
-        let prefill = prefill_for_input(model, drafter, prefill_input)
-            .expect("MTP prefill requires valid synchronized chunks");
+        let (prefill, cached_tokens) = match prefill_input {
+            MtpPrefill::Text { .. } => {
+                prefill_text_with_reuse(model, drafter, prompt_tokens, prefix_reuse)
+            }
+            MtpPrefill::Multimodal { .. } => {
+                prefill_for_input(model, drafter, prefill_input).map(|prefill| (prefill, 0))
+            }
+        }
+        .expect("MTP prefill requires valid synchronized chunks");
+        let prompt_snapshot = capture_prompt_snapshot
+            .then(|| capture_mtp_prompt_snapshot(model, drafter, prompt_tokens.len(), &prefill))
+            .flatten();
         let (first_token, _) =
             sample_token_optimized(&prefill.first_logits, &sampling, prompt_tokens);
         mlxcel_core::eval(&first_token);
@@ -1527,7 +1713,6 @@ impl Qwen35MtpGenerator {
                 let phase_start = Instant::now();
                 let (draft_tokens, proposal_probs) = if greedy {
                     (
-
                         drafter.draft_block_greedy(
                             model,
                             bonus,
@@ -1636,9 +1821,7 @@ impl Qwen35MtpGenerator {
                     .expect("speculative walk emits at least one token");
                 mtp_stats.full_state_materializations += 1;
                 mtp_stats.cache_snapshot_count += 1;
-                if let Some(elapsed) =
-                    clear_mtp_cache_if_needed(emitted_before, generated.len())
-                {
+                if let Some(elapsed) = clear_mtp_cache_if_needed(emitted_before, generated.len()) {
                     mtp_stats.record_cache_clear(elapsed);
                 }
                 mtp_stats.reconcile_time += phase_start.elapsed();
@@ -1652,6 +1835,8 @@ impl Qwen35MtpGenerator {
             token_ids: generated,
             stats: mtp_stats,
             stop_reason,
+            prompt_snapshot,
+            cached_tokens,
         })
     }
     #[allow(clippy::too_many_arguments)]
@@ -1663,6 +1848,8 @@ impl Qwen35MtpGenerator {
         max_tokens: usize,
         sampling: &SamplingConfig,
         block_size: usize,
+        prefix_reuse: Option<MtpPrefixReuse<'_>>,
+        capture_prompt_snapshot: bool,
         constraint: &mut dyn TokenConstraint,
         mut on_token: F,
     ) -> Result<MtpGeneration, String> {
@@ -1680,16 +1867,37 @@ impl Qwen35MtpGenerator {
                 token_ids: Vec::new(),
                 stats: MtpGenerationStats::default(),
                 stop_reason: GenerationStopReason::MaxTokens,
+                prompt_snapshot: None,
+                cached_tokens: 0,
             });
         }
 
         let mut generated = Vec::with_capacity(max_tokens);
         let mut stats = MtpGenerationStats::default();
         let mut stop_reason = GenerationStopReason::MaxTokens;
+        let mut prefix_reuse = prefix_reuse;
+        let mut prompt_snapshot = None;
+        let mut cached_tokens = 0;
         let mut state;
 
         loop {
-            let prefill = prefill_for_input(model, drafter, prefill_input)?;
+            let (prefill, reused) = if generated.is_empty() {
+                match prefill_input {
+                    MtpPrefill::Text { .. } => {
+                        prefill_text_with_reuse(model, drafter, prompt_tokens, prefix_reuse.take())
+                    }
+                    MtpPrefill::Multimodal { .. } => {
+                        prefill_for_input(model, drafter, prefill_input).map(|prefill| (prefill, 0))
+                    }
+                }
+            } else {
+                prefill_for_input(model, drafter, prefill_input).map(|prefill| (prefill, 0))
+            }?;
+            cached_tokens = cached_tokens.max(reused);
+            if capture_prompt_snapshot && prompt_snapshot.is_none() {
+                prompt_snapshot =
+                    capture_mtp_prompt_snapshot(model, drafter, prompt_tokens.len(), &prefill);
+            }
             mlxcel_core::eval(&prefill.hidden);
             let initial = commit_constraint_transaction(constraint, |active| {
                 constrained_initial_step(
@@ -1724,17 +1932,20 @@ impl Qwen35MtpGenerator {
                 return Ok(MtpGeneration {
                     token_ids: generated,
                     stats,
+                    prompt_snapshot,
+                    cached_tokens,
                     stop_reason: GenerationStopReason::CallbackCancelled,
                 });
             }
             if let Some(reason) = initial.stop_reason {
                 if initial.rebuild && !generated.is_empty() {
-                    let _ =
-                        rebuild_mtp_state(model, drafter, prefill_input, &generated)?;
+                    let _ = rebuild_mtp_state(model, drafter, prefill_input, &generated)?;
                 }
                 return Ok(MtpGeneration {
                     token_ids: generated,
                     stats,
+                    prompt_snapshot,
+                    cached_tokens,
                     stop_reason: reason,
                 });
             }
@@ -1773,9 +1984,8 @@ impl Qwen35MtpGenerator {
                 break;
             }
             let greedy = sampler_is_greedy(&sampling);
-            let (draft_tokens, proposal_probs) = rollback_constraint_transaction(
-                constraint,
-                |active| {
+            let (draft_tokens, proposal_probs) =
+                rollback_constraint_transaction(constraint, |active| {
                     if greedy {
                         drafter
                             .draft_block_greedy_constrained(
@@ -1805,8 +2015,7 @@ impl Qwen35MtpGenerator {
                         let tokens = proposals.iter().map(|proposal| proposal.token).collect();
                         Ok((tokens, Some(proposals)))
                     }
-                },
-            )?;
+                })?;
 
             let mut verify_tokens = Vec::with_capacity(draft_tokens.len() + 1);
             verify_tokens.push(state.bonus);
@@ -1939,10 +2148,11 @@ impl Qwen35MtpGenerator {
             token_ids: generated,
             stats,
             stop_reason,
+            prompt_snapshot,
+            cached_tokens,
         })
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1952,10 +2162,45 @@ mod tests {
     use crate::qwen3_5::rollback_plan;
     use crate::qwen3_next::Qwen3NextCache;
 
+    #[test]
+    fn mtp_prompt_snapshot_arrays_remain_owned_after_sources_drop() {
+        let keys = mlxcel_core::from_slice_f32(&[1.0, 2.0], &[1, 1, 1, 2]);
+        let values = mlxcel_core::from_slice_f32(&[3.0, 4.0], &[1, 1, 1, 2]);
+        let hidden = mlxcel_core::from_slice_f32(&[5.0, 6.0], &[1, 1, 2]);
+        let logits = mlxcel_core::from_slice_f32(&[7.0, 8.0], &[1, 2]);
+        let snapshot = MtpPromptSnapshot {
+            target: ModelStateSnapshot::new("test", 2),
+            draft_keys: Some(materialize_detached(mlxcel_core::copy(&keys))),
+            draft_values: Some(materialize_detached(mlxcel_core::copy(&values))),
+            draft_offset: 1,
+            last_hidden: materialize_detached(mlxcel_core::copy(&hidden)),
+            continuation_logits: materialize_detached(mlxcel_core::copy(&logits)),
+        };
+        drop((keys, values, hidden, logits));
+        mlxcel_core::clear_memory_cache();
+
+        let expected_keys = mlxcel_core::from_slice_f32(&[1.0, 2.0], &[1, 1, 1, 2]);
+        let expected_hidden = mlxcel_core::from_slice_f32(&[5.0, 6.0], &[1, 1, 2]);
+        let keys_equal = mlxcel_core::allclose(
+            snapshot.draft_keys.as_deref().expect("draft keys"),
+            &expected_keys,
+            0.0,
+            0.0,
+        );
+        let hidden_equal = mlxcel_core::allclose(&snapshot.last_hidden, &expected_hidden, 0.0, 0.0);
+        mlxcel_core::eval(&keys_equal);
+        mlxcel_core::eval(&hidden_equal);
+        assert!(mlxcel_core::item_bool(&keys_equal));
+        assert!(mlxcel_core::item_bool(&hidden_equal));
+    }
+
     fn logits_rows(rows: &[&[f32]]) -> UniquePtr<MlxArray> {
         let vocab = rows.first().expect("logits row").len();
         assert!(rows.iter().all(|row| row.len() == vocab));
-        let values = rows.iter().flat_map(|row| row.iter().copied()).collect::<Vec<_>>();
+        let values = rows
+            .iter()
+            .flat_map(|row| row.iter().copied())
+            .collect::<Vec<_>>();
         mlxcel_core::from_slice_f32(&values, &[1, rows.len() as i32, vocab as i32])
     }
 
@@ -2076,7 +2321,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn acceptance_percentage_handles_zero_and_partial() {
         assert_eq!(MtpGenerationStats::default().acceptance_percentage(), 0.0);
@@ -2102,16 +2346,7 @@ mod tests {
         ]);
         let mut full_constraint = recording_constraint(3, 4);
         let full = commit_constraint_transaction(&mut full_constraint, |active| {
-            constrained_greedy_walk(
-                &[1, 2],
-                &full_logits,
-                &sampling,
-                &[9],
-                &[],
-                &[],
-                8,
-                active,
-            )
+            constrained_greedy_walk(&[1, 2], &full_logits, &sampling, &[9], &[], &[], 8, active)
         })
         .expect("full constrained walk");
         assert_eq!(full.accepted, 2);
@@ -2184,15 +2419,7 @@ mod tests {
             },
         ));
         let walk = commit_constraint_transaction(&mut constraint, |active| {
-            constrained_initial_step(
-                &logits,
-                &sampling,
-                &[9],
-                &[1],
-                &[],
-                8,
-                active,
-            )
+            constrained_initial_step(&logits, &sampling, &[9], &[1], &[], 8, active)
         })
         .expect("spliced initial walk");
         assert_eq!(walk.output, vec![2, 0]);
@@ -2209,15 +2436,7 @@ mod tests {
         let logits = logits_rows(&[&[0.0, 0.0, 10.0]]);
         let mut constraint = recording_constraint(1, 3);
         let walk = commit_constraint_transaction(&mut constraint, |active| {
-            constrained_initial_step(
-                &logits,
-                &sampling,
-                &[9],
-                &[],
-                &[2],
-                8,
-                active,
-            )
+            constrained_initial_step(&logits, &sampling, &[9], &[], &[2], 8, active)
         })
         .expect("EOS constrained walk");
         assert!(walk.output.is_empty());
@@ -2284,10 +2503,7 @@ mod tests {
                 token: 1,
                 proposal_probs: probs(&[0.0, 1.0]),
             }],
-            &logits_rows(&[
-                &[f32::NEG_INFINITY, 0.0],
-                &[0.0, f32::NEG_INFINITY],
-            ]),
+            &logits_rows(&[&[f32::NEG_INFINITY, 0.0], &[0.0, f32::NEG_INFINITY]]),
             &sampling,
             &[],
             &[],
@@ -2300,14 +2516,9 @@ mod tests {
     fn eos_cancellation_and_rejected_suffixes_only_commit_emitted_tokens() {
         let mut generated = Vec::new();
         let mut history = vec![10, 11];
-        let reason = emit_walk_tokens(
-            &[7, 99, 8],
-            &[99],
-            8,
-            &mut generated,
-            &mut history,
-            |_| true,
-        );
+        let reason = emit_walk_tokens(&[7, 99, 8], &[99], 8, &mut generated, &mut history, |_| {
+            true
+        });
         assert_eq!(reason, Some(GenerationStopReason::Eos));
         assert_eq!(generated, [7]);
         assert_eq!(history, [10, 11, 7]);
@@ -2315,8 +2526,7 @@ mod tests {
         let rejected_proposals = [20, 21, 22];
         let mut generated = Vec::new();
         let mut history = vec![10, 11];
-        let reason =
-            emit_walk_tokens(&[42], &[], 8, &mut generated, &mut history, |_| false);
+        let reason = emit_walk_tokens(&[42], &[], 8, &mut generated, &mut history, |_| false);
         assert_eq!(reason, Some(GenerationStopReason::CallbackCancelled));
         assert_eq!(history, [10, 11, 42]);
         assert!(
@@ -2343,8 +2553,7 @@ mod tests {
         seed_rng_if_needed(&sampling);
         let mut correct = [0usize; 3];
         for _ in 0..SAMPLES {
-            let (token, proposal_probs) =
-                sample_token_with_distribution(&q_logits, &sampling, &[]);
+            let (token, proposal_probs) = sample_token_with_distribution(&q_logits, &sampling, &[]);
             mlxcel_core::eval(&token);
             let walk = stochastic_walk(
                 &[MtpProposal {
@@ -2368,16 +2577,14 @@ mod tests {
         seed_rng_if_needed(&sampling);
         let mut mutant = [0usize; 3];
         for _ in 0..SAMPLES {
-            let (token, proposal_probs) =
-                sample_token_with_distribution(&q_logits, &sampling, &[]);
+            let (token, proposal_probs) = sample_token_with_distribution(&q_logits, &sampling, &[]);
             mlxcel_core::eval(&token);
             let token = mlxcel_core::item_i32(&token);
             let target_probs = effective_token_distribution(&p_logits, &sampling, &[]);
             let emitted = match verify_draft_token(&target_probs, &proposal_probs, token) {
                 DraftVerdict::Accept => token,
                 DraftVerdict::Reject { .. } => {
-                    let (unconditional, _) =
-                        sample_token_optimized(&p_logits, &sampling, &[]);
+                    let (unconditional, _) = sample_token_optimized(&p_logits, &sampling, &[]);
                     mlxcel_core::eval(&unconditional);
                     mlxcel_core::item_i32(&unconditional)
                 }
@@ -2397,8 +2604,7 @@ mod tests {
         let logits = logits_rows(&[&[0.0, 0.0, 100.0]]);
         seed_rng_if_needed(&sampling);
         for _ in 0..256 {
-            let (token, proposal_probs) =
-                sample_token_with_distribution(&logits, &sampling, &[]);
+            let (token, proposal_probs) = sample_token_with_distribution(&logits, &sampling, &[]);
             mlxcel_core::eval(&token);
             let walk = stochastic_walk(
                 &[MtpProposal {
@@ -2475,8 +2681,8 @@ mod tests {
     fn theoretical_tensor_bytes_cover_packed_model_cache_and_transient_geometry() {
         let packed_model = shaped_tensor_bytes(&[4, 64, 32], 4);
         let kv_cache = 2 * shaped_tensor_bytes(&[4, 2, 128, 16], 4);
-        let verify_transient = shaped_tensor_bytes(&[1, 3, 64], 16)
-            + shaped_tensor_bytes(&[1, 3, 96], 16);
+        let verify_transient =
+            shaped_tensor_bytes(&[1, 3, 64], 16) + shaped_tensor_bytes(&[1, 3, 96], 16);
 
         assert_eq!(packed_model, 4_096);
         assert_eq!(kv_cache, 16_384);
@@ -2517,7 +2723,6 @@ mod tests {
         assert!(maximum_used <= total_budget);
     }
 
-
     #[test]
     fn mtp_round_stats_record_proposals_and_accepted_tokens() {
         let mut stats = MtpGenerationStats::default();
@@ -2542,10 +2747,7 @@ mod tests {
 
         for round in 1..=32 {
             let width = 16 + (round % 4) * 16;
-            let temporary = mlxcel_core::zeros(
-                &[1, width as i32, 64],
-                mlxcel_core::dtype::FLOAT32,
-            );
+            let temporary = mlxcel_core::zeros(&[1, width as i32, 64], mlxcel_core::dtype::FLOAT32);
             mlxcel_core::eval(&temporary);
             drop(temporary);
             let memory = mlxcel_core::memory::snapshot();
@@ -2562,7 +2764,10 @@ mod tests {
         }
 
         let final_memory = mlxcel_core::memory::snapshot();
-        assert!(clears > 0, "variable Metal shapes must exercise the watermark");
+        assert!(
+            clears > 0,
+            "variable Metal shapes must exercise the watermark"
+        );
         assert!(
             final_memory.used_bytes() <= baseline + transient_bytes + cache_watermark,
             "final allocator bytes {} exceeded computed bound {}",
@@ -2574,13 +2779,9 @@ mod tests {
 
     #[test]
     fn materialized_hidden_and_trimmed_draft_cache_preserve_visible_state() {
-        let hidden_source =
-            mlxcel_core::from_slice_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 2, 2]);
-        let hidden = materialize_detached(mlxcel_core::slice(
-            &hidden_source,
-            &[0, 1, 0],
-            &[1, 2, 2],
-        ));
+        let hidden_source = mlxcel_core::from_slice_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 2, 2]);
+        let hidden =
+            materialize_detached(mlxcel_core::slice(&hidden_source, &[0, 1, 0], &[1, 2, 2]));
         drop(hidden_source);
         mlxcel_core::clear_memory_cache();
         assert_eq!(array_f32(&hidden), [3.0, 4.0]);
@@ -2614,8 +2815,7 @@ mod tests {
 
     #[test]
     fn multimodal_shift_preserves_chunk_alignment_and_bonus_tail() {
-        let embeddings =
-            mlxcel_core::from_slice_f32(&[1.0, 20.0, 2.0, 30.0, 3.0, 4.0], &[1, 6, 1]);
+        let embeddings = mlxcel_core::from_slice_f32(&[1.0, 20.0, 2.0, 30.0, 3.0, 4.0], &[1, 6, 1]);
         let bonus = mlxcel_core::from_slice_f32(&[99.0], &[1, 1, 1]);
         let first = shifted_embedding_range(&embeddings, 0, 2, None);
         let second = shifted_embedding_range(&embeddings, 2, 4, None);
@@ -2629,12 +2829,8 @@ mod tests {
             &final_chunk,
             1,
         );
-        assert_eq!(
-            array_f32(&synchronized),
-            [20.0, 2.0, 30.0, 3.0, 4.0, 99.0]
-        );
+        assert_eq!(array_f32(&synchronized), [20.0, 2.0, 30.0, 3.0, 4.0, 99.0]);
     }
-
 
     #[test]
     fn signed_rope_delta_is_retained_for_draft_decode_positions() {

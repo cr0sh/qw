@@ -24,8 +24,8 @@ use crate::qwen_vl_merge::merge_llava;
 use crate::qwen_vl_position::compute_rope_index;
 use crate::qwen_vl_processor::{PreparedImage, QwenVLProcessor};
 use crate::qwen3_5::Qwen35Model;
-pub use crate::qwen3_5_mtp::MtpGenerationStats;
 use crate::qwen3_5_mtp::Qwen35MtpGenerator;
+pub use crate::qwen3_5_mtp::{MtpGenerationStats, MtpPrefixReuse, MtpPromptSnapshot};
 
 const DEFAULT_MTP_BLOCK_SIZE: usize = 3;
 
@@ -45,6 +45,11 @@ pub struct GenerationOutput {
     pub token_ids: Vec<i32>,
 }
 
+pub enum PromptSnapshot {
+    Baseline(ModelStateSnapshot),
+    Mtp(MtpPromptSnapshot),
+}
+
 pub struct BaselineGeneration {
     pub text: String,
     pub token_ids: Vec<i32>,
@@ -52,7 +57,7 @@ pub struct BaselineGeneration {
     pub completion_tokens: usize,
     pub cached_tokens: usize,
     pub finish_outcome: GenerationStopReason,
-    pub prompt_snapshot: Option<ModelStateSnapshot>,
+    pub prompt_snapshot: Option<PromptSnapshot>,
     /// Wall time strictly after the first sampled token.
     #[doc(hidden)]
     pub decode_time: Duration,
@@ -525,7 +530,7 @@ impl Qwen35Provider {
             completion_tokens,
             cached_tokens: controlled.cached_tokens,
             finish_outcome: controlled.stop_reason,
-            prompt_snapshot: controlled.prompt_snapshot,
+            prompt_snapshot: controlled.prompt_snapshot.map(PromptSnapshot::Baseline),
             decode_time,
         })
     }
@@ -631,6 +636,8 @@ impl Qwen35Provider {
         max_tokens: usize,
         sampling: &SamplingConfig,
         block_size: usize,
+        prefix_reuse: Option<MtpPrefixReuse<'_>>,
+        capture_prompt_snapshot: bool,
         constraint: Option<&mut dyn TokenConstraint>,
         on_delta: F,
     ) -> Result<BaselineGeneration> {
@@ -639,6 +646,8 @@ impl Qwen35Provider {
             max_tokens,
             sampling,
             block_size,
+            prefix_reuse,
+            capture_prompt_snapshot,
             constraint,
             on_delta,
         )
@@ -659,6 +668,8 @@ impl Qwen35Provider {
             max_tokens,
             sampling,
             block_size,
+            None,
+            false,
             constraint,
             on_delta,
         )
@@ -677,6 +688,8 @@ impl Qwen35Provider {
         max_tokens: usize,
         sampling: &SamplingConfig,
         block_size: usize,
+        prefix_reuse: Option<MtpPrefixReuse<'_>>,
+        capture_prompt_snapshot: bool,
         constraint: Option<&mut dyn TokenConstraint>,
         mut on_delta: F,
     ) -> Result<(BaselineGeneration, MtpGenerationStats)> {
@@ -704,6 +717,8 @@ impl Qwen35Provider {
                 max_tokens,
                 sampling,
                 block_size,
+                prefix_reuse,
+                capture_prompt_snapshot,
                 constraint,
                 |token_id| {
                     if buffer_output {
@@ -782,7 +797,7 @@ impl Qwen35Provider {
             phase = "model.complete",
             prompt_tokens,
             completion_tokens,
-            cached_tokens = 0,
+            cached_tokens = generated.cached_tokens,
             stop_reason = ?generated.stop_reason,
             mtp_proposed_draft_tokens = generated.stats.proposed_draft_tokens,
             mtp_accepted_draft_tokens = generated.stats.accepted_draft_tokens,
@@ -805,9 +820,9 @@ impl Qwen35Provider {
                 token_ids: generated.token_ids,
                 prompt_tokens,
                 completion_tokens,
-                cached_tokens: 0,
+                cached_tokens: generated.cached_tokens,
                 finish_outcome: generated.stop_reason,
-                prompt_snapshot: None,
+                prompt_snapshot: generated.prompt_snapshot.map(PromptSnapshot::Mtp),
                 decode_time: generated.stats.decode_time,
             },
             generated.stats,
@@ -865,6 +880,8 @@ impl Qwen35Provider {
             &sampling,
             DEFAULT_MTP_BLOCK_SIZE,
             None,
+            false,
+            None,
             on_delta,
         )?;
         Ok((
@@ -912,6 +929,8 @@ impl Qwen35Provider {
             request.max_tokens,
             &sampling,
             DEFAULT_MTP_BLOCK_SIZE,
+            None,
+            false,
             None,
             on_delta,
         )?;
@@ -1180,8 +1199,8 @@ mod tests {
         let model_dir = std::env::var_os("QW_BENCH_MODEL")
             .map(PathBuf::from)
             .expect("QW_BENCH_MODEL must point at a real checkpoint");
-        let mut provider = Qwen35Provider::load(&model_dir, KVCacheMode::Fp16)
-            .expect("load real Qwen checkpoint");
+        let mut provider =
+            Qwen35Provider::load(&model_dir, KVCacheMode::Fp16).expect("load real Qwen checkpoint");
         let request = GenerationRequest {
             prompt: "Continue counting upward from one, writing each integer on its own line without stopping."
                 .to_string(),
@@ -1209,5 +1228,113 @@ mod tests {
         assert_eq!(baseline.text, mtp.text);
         assert_eq!(baseline_deltas, baseline.text);
         assert_eq!(mtp_deltas, mtp.text);
+    }
+
+    #[test]
+    #[ignore = "requires QW_BENCH_MODEL pointing at a real bundled-MTP checkpoint"]
+    fn real_model_mtp_prefix_reuse_matches_cold_and_reduces_ttft() {
+        let model_dir = std::env::var_os("QW_BENCH_MODEL")
+            .map(PathBuf::from)
+            .expect("QW_BENCH_MODEL must point at a real checkpoint");
+        let mut provider = Qwen35Provider::load(&model_dir, KVCacheMode::Turbo4)
+            .expect("load real bundled-MTP checkpoint");
+        let base = provider
+            .tokenizer
+            .encode(
+                "A deterministic cache benchmark paragraph. ".repeat(128),
+                true,
+            )
+            .expect("encode benchmark prefix");
+        let suffix = provider
+            .tokenizer
+            .encode(
+                "Continue this exact history with one additional user turn.",
+                false,
+            )
+            .expect("encode benchmark suffix");
+        let base_ids = base
+            .get_ids()
+            .iter()
+            .map(|&token| token as i32)
+            .collect::<Vec<_>>();
+        let mut full_ids = base_ids.clone();
+        full_ids.extend(suffix.get_ids().iter().map(|&token| token as i32));
+        let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
+
+        let mut cold_ttft = None;
+        let cold_started = Instant::now();
+        let cold = provider
+            .generate_mtp_streaming(
+                &full_ids,
+                32,
+                &sampling,
+                DEFAULT_MTP_BLOCK_SIZE,
+                None,
+                false,
+                None,
+                |_| {
+                    cold_ttft.get_or_insert_with(|| cold_started.elapsed());
+                    true
+                },
+            )
+            .expect("cold MTP generation");
+
+        let prefix = provider
+            .generate_mtp_streaming(
+                &base_ids,
+                1,
+                &sampling,
+                DEFAULT_MTP_BLOCK_SIZE,
+                None,
+                true,
+                None,
+                |_| true,
+            )
+            .expect("capture MTP prompt snapshot");
+        let PromptSnapshot::Mtp(snapshot) = prefix
+            .prompt_snapshot
+            .expect("complete MTP prompt snapshot")
+        else {
+            panic!("MTP generation must return an MTP snapshot");
+        };
+        let mut warm_ttft = None;
+        let warm_started = Instant::now();
+        let warm = provider
+            .generate_mtp_streaming(
+                &full_ids,
+                32,
+                &sampling,
+                DEFAULT_MTP_BLOCK_SIZE,
+                Some(MtpPrefixReuse {
+                    snapshot: &snapshot,
+                    cached_tokens: base_ids.len(),
+                }),
+                true,
+                None,
+                |_| {
+                    warm_ttft.get_or_insert_with(|| warm_started.elapsed());
+                    true
+                },
+            )
+            .expect("warm MTP generation");
+
+        assert_eq!(warm.cached_tokens, base_ids.len());
+        assert_eq!(warm.token_ids, cold.token_ids);
+        assert_eq!(warm.text, cold.text);
+        let cold_ttft = cold_ttft.expect("cold generation emitted a token");
+        let warm_ttft = warm_ttft.expect("warm generation emitted a token");
+        eprintln!(
+            "MTP prefix benchmark: cached_tokens={}, cold_ttft_ms={:.2}, warm_ttft_ms={:.2}, \
+             cold_decode_ms={:.2}, warm_decode_ms={:.2}",
+            warm.cached_tokens,
+            cold_ttft.as_secs_f64() * 1_000.0,
+            warm_ttft.as_secs_f64() * 1_000.0,
+            cold.decode_time.as_secs_f64() * 1_000.0,
+            warm.decode_time.as_secs_f64() * 1_000.0,
+        );
+        assert!(
+            warm_ttft < cold_ttft,
+            "warm suffix prefill must reduce TTFT: cold={cold_ttft:?}, warm={warm_ttft:?}"
+        );
     }
 }
