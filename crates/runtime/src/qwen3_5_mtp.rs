@@ -319,7 +319,11 @@ impl Qwen35MtpDraftModel {
         let compact = target.has_compact_draft_head();
 
         while tokens.len() < proposal_count {
-            let (token_array, _) = sample_token_optimized(&logits, sampling, &history);
+            let token_array = if compact && sampler_is_greedy(sampling) {
+                mlxcel_core::argmax_last_axis(&logits)
+            } else {
+                sample_token_optimized(&logits, sampling, &history).0
+            };
             mlxcel_core::eval(&token_array);
             let sampled = mlxcel_core::item_i32(&token_array);
             let token = if compact {
