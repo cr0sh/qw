@@ -20,13 +20,28 @@ output="$(mktemp)"
 trap 'rm -f "$output"' EXIT
 
 CARGO_TERM_COLOR=never cargo bench -p qw-runtime --bench single_user_throughput -- \
-  'single_user_prefill/qwen$' --noplot 2>&1 | tee "$output"
+  'single_user_(prefill/qwen|decode/mtp_k3)$' --noplot 2>&1 | tee "$output"
 
-metric="$(awk '/^[[:space:]]*thrpt:/ && /elem\/s/ { print $4; exit }' "$output")"
-[[ "$metric" =~ ^[0-9]+([.][0-9]+)?$ ]] || {
-  echo "Failed to parse single_user_prefill/qwen median elem/s" >&2
-  exit 1
-}
+metrics="$(
+  awk '
+    /^single_user_prefill\/qwen$/ { benchmark = "single_user_prefill_qwen_elem_per_s"; next }
+    /^single_user_decode\/mtp_k3$/ { benchmark = "single_user_decode_mtp_k3_tokens_per_s"; next }
+    benchmark != "" && /^[[:space:]]*thrpt:/ && /elem\/s/ {
+      print benchmark "=" $4
+      benchmark = ""
+    }
+  ' "$output"
+)"
 
-printf 'METRIC single_user_prefill_qwen_elem_per_s=%s\n' "$metric"
+for name in \
+  single_user_prefill_qwen_elem_per_s \
+  single_user_decode_mtp_k3_tokens_per_s
+do
+  value="$(printf '%s\n' "$metrics" | awk -F= -v name="$name" '$1 == name { print $2; exit }')"
+  [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ ]] || {
+    echo "Failed to parse $name" >&2
+    exit 1
+  }
+  printf 'METRIC %s=%s\n' "$name" "$value"
+done
 

@@ -1237,6 +1237,32 @@ std::unique_ptr<MlxArray> compiled_swiglu_activation(
     auto result = compiled_fn({gate.inner, x.inner});
     return std::make_unique<MlxArray>(std::move(result[0]));
 }
+namespace {
+    static std::function<std::vector<array>(const std::vector<array>&)>
+    get_compiled_gated_delta_gate() {
+        auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
+            const auto a_log = mlx::core::astype(inputs[0], mlx::core::float32);
+            const auto a_plus_dt = mlx::core::add(inputs[1], inputs[2]);
+            const auto softplus =
+                mlx::core::logaddexp(a_plus_dt, mlx::core::zeros_like(a_plus_dt));
+            const auto decay =
+                mlx::core::negative(mlx::core::multiply(mlx::core::exp(a_log), softplus));
+            return {mlx::core::exp(decay)};
+        };
+        return mlx::core::compile(fn, true);
+    }
+}
+
+std::unique_ptr<MlxArray> compiled_gated_delta_gate(
+    const MlxArray& a_log,
+    const MlxArray& a,
+    const MlxArray& dt_bias
+) {
+    static auto compiled_fn = get_compiled_gated_delta_gate();
+    auto result = compiled_fn({a_log.inner, a.inner, dt_bias.inner});
+    return std::make_unique<MlxArray>(std::move(result[0]));
+}
+
 
 // Compiled GptOss SwiGLU activation using the exact mlx-lm formulation:
 //   x_glu = clip(x_glu, max=7)

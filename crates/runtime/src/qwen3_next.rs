@@ -18,7 +18,6 @@ use crate::gated_delta::GatedDeltaCache;
 use crate::qwen_mrope::{InterleavedMRoPE, apply_multimodal_rotary_pos_emb};
 use mlxcel_core::cache::KVCacheMode;
 use mlxcel_core::layers::{FusedQKVLinear, KVCache, RMSNorm, UnifiedLinear};
-use mlxcel_core::utils::silu;
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
@@ -425,9 +424,9 @@ impl Mlp {
     }
 
     pub(crate) fn forward_hidden(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
-        let gate = silu(&self.gate_proj.forward(x));
+        let gate = self.gate_proj.forward(x);
         let up = self.up_proj.forward(x);
-        mlxcel_core::multiply(&gate, &up)
+        mlxcel_core::compiled_swiglu_activation(&gate, &up)
     }
 
     pub(crate) fn from_weights(
