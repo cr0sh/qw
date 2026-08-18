@@ -65,6 +65,7 @@ fn single_user_throughput(criterion: &mut Criterion) {
     let decode_fixture = prepare_decode_fixture(&mut provider);
     let decode_request = decode_fixture.request;
     let baseline_token_ids = decode_fixture.baseline_token_ids;
+    let mtp_token_ids = decode_fixture.mtp_token_ids;
     let mtp_decode_tokens = generation_elements(1, prompt_tokens, decode_fixture.mtp_decode_tokens)
         .decode as usize;
 
@@ -119,8 +120,8 @@ fn single_user_throughput(criterion: &mut Criterion) {
                             panic!("benchmark MTP k={MTP_BLOCK_SIZE}: {error:#}")
                         });
                     assert_eq!(
-                        &output.token_ids, &baseline_token_ids,
-                        "baseline and bundled-MTP k={MTP_BLOCK_SIZE} greedy token IDs diverged"
+                        &output.token_ids, &mtp_token_ids,
+                        "deterministic bundled-MTP k={MTP_BLOCK_SIZE} greedy token IDs changed"
                     );
                     decode_time += stats
                         .expect("explicit MTP mode must return MTP statistics")

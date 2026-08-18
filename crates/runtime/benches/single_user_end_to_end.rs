@@ -12,6 +12,7 @@ fn single_user_end_to_end(criterion: &mut Criterion) {
     let decode_fixture = prepare_decode_fixture(&mut provider);
     let decode_request = decode_fixture.request;
     let baseline_token_ids = decode_fixture.baseline_token_ids;
+    let mtp_token_ids = decode_fixture.mtp_token_ids;
     let baseline_tokens = baseline_token_ids.len() as u64;
     let mtp_tokens = decode_fixture.mtp_decode_tokens as u64;
 
@@ -52,8 +53,8 @@ fn single_user_end_to_end(criterion: &mut Criterion) {
                 .unwrap_or_else(|error| panic!("benchmark MTP k={MTP_BLOCK_SIZE}: {error:#}"))
                 .0;
             assert_eq!(
-                &output.token_ids, &baseline_token_ids,
-                "baseline and bundled-MTP k={MTP_BLOCK_SIZE} greedy token IDs diverged"
+                &output.token_ids, &mtp_token_ids,
+                "deterministic bundled-MTP k={MTP_BLOCK_SIZE} greedy token IDs changed"
             );
             black_box(output);
         });

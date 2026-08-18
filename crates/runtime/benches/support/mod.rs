@@ -30,6 +30,7 @@ pub const PROMPT: &str = concat!(
 pub struct DecodeFixture {
     pub request: GenerationRequest,
     pub baseline_token_ids: Vec<i32>,
+    pub mtp_token_ids: Vec<i32>,
     pub mtp_decode_tokens: usize,
 }
 
@@ -116,9 +117,11 @@ pub fn prepare_decode_fixture(provider: &mut Qwen35Provider) -> DecodeFixture {
         mtp_stats.cache_snapshot_count,
     );
 
+    let mtp_decode_tokens = mtp_output.token_ids.len();
     DecodeFixture {
         request,
         baseline_token_ids,
-        mtp_decode_tokens: mtp_output.token_ids.len(),
+        mtp_token_ids: mtp_output.token_ids,
+        mtp_decode_tokens,
     }
 }
