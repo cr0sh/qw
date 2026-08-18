@@ -623,7 +623,7 @@ fn mtp_round_reaches_cache_clear(previous: usize, emitted: usize, interval: usiz
     mlxcel_core::memory::should_clear_cache_crossing(previous, emitted, interval)
 }
 
-const MTP_STATE_MATERIALIZE_INTERVAL: usize = 32;
+const MTP_STATE_MATERIALIZE_INTERVAL: usize = 128;
 
 // Variable MTP verify shapes accumulate reusable Metal buffers much faster than
 // ordinary one-token decode. Keep a bounded cache, but retain those buffers
@@ -1840,19 +1840,21 @@ impl Qwen35MtpGenerator {
                     walk.accepted,
                     &walk.new_tokens,
                 );
-                let hidden_shape = mlxcel_core::array_shape(&verify.hidden);
-                let accepted = i32::try_from(walk.accepted).unwrap_or(i32::MAX);
-                next_hidden = materialize_detached(mlxcel_core::slice(
-                    &verify.hidden,
-                    &[0, accepted, 0],
-                    &[hidden_shape[0], accepted + 1, hidden_shape[2]],
-                ));
-                bonus = *walk
-                    .new_tokens
-                    .last()
-                    .expect("speculative walk emits at least one token");
-                mtp_stats.full_state_materializations += 1;
-                mtp_stats.cache_snapshot_count += 1;
+                if round_stop_reason.is_none() {
+                    let hidden_shape = mlxcel_core::array_shape(&verify.hidden);
+                    let accepted = i32::try_from(walk.accepted).unwrap_or(i32::MAX);
+                    next_hidden = materialize_detached(mlxcel_core::slice(
+                        &verify.hidden,
+                        &[0, accepted, 0],
+                        &[hidden_shape[0], accepted + 1, hidden_shape[2]],
+                    ));
+                    bonus = *walk
+                        .new_tokens
+                        .last()
+                        .expect("speculative walk emits at least one token");
+                    mtp_stats.full_state_materializations += 1;
+                    mtp_stats.cache_snapshot_count += 1;
+                }
                 if let Some(elapsed) = clear_mtp_cache_if_needed(emitted_before, generated.len()) {
                     mtp_stats.record_cache_clear(elapsed);
                 }

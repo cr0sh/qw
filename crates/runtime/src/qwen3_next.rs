@@ -17,9 +17,11 @@
 use crate::gated_delta::GatedDeltaCache;
 use crate::qwen_mrope::{InterleavedMRoPE, apply_multimodal_rotary_pos_emb};
 use mlxcel_core::cache::KVCacheMode;
-use mlxcel_core::layers::{FusedQKVLinear, KVCache, RMSNorm, UnifiedLinear};
+use mlxcel_core::layers::{
+    FusedQKVLinear, KVCache, QuantizedWeight, RMSNorm, UnifiedLinear,
+};
 use mlxcel_core::weights::WeightMap;
-use mlxcel_core::{MlxArray, UniquePtr};
+use mlxcel_core::{MlxArray, UniquePtr, concatenate};
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -410,10 +412,65 @@ impl Qwen3NextAttention {
 }
 
 // Dense MLP.
+enum MlpInputProjections {
+    Separate {
+        gate: UnifiedLinear,
+        up: UnifiedLinear,
+    },
+    Fused {
+        projection: UnifiedLinear,
+        intermediate_size: i32,
+    },
+}
+
+fn fuse_mlp_input_projections(
+    weights: &WeightMap,
+    gate_prefix: &str,
+    up_prefix: &str,
+    gate: UnifiedLinear,
+    up: UnifiedLinear,
+) -> MlpInputProjections {
+    let can_drop_linear_biases = !weights.contains_key(&format!("{gate_prefix}.bias"))
+        && !weights.contains_key(&format!("{up_prefix}.bias"));
+    let fused = (|| {
+        let (gate_weight, up_weight) = (gate.quantized_weight()?, up.quantized_weight()?);
+        if !can_drop_linear_biases
+            || gate_weight.group_size != up_weight.group_size
+            || gate_weight.bits != up_weight.bits
+            || gate_weight.mode != up_weight.mode
+            || gate_weight.global_scale.is_some()
+            || up_weight.global_scale.is_some()
+        {
+            return None;
+        }
+        let weight = concatenate(&gate_weight.weight, &up_weight.weight, 0);
+        let scales = concatenate(&gate_weight.scales, &up_weight.scales, 0);
+        let biases = concatenate(
+            gate_weight.biases.as_deref()?,
+            up_weight.biases.as_deref()?,
+            0,
+        );
+        Some(MlpInputProjections::Fused {
+            projection: UnifiedLinear::new(
+                QuantizedWeight::new(
+                    weight,
+                    scales,
+                    biases,
+                    gate_weight.group_size,
+                    gate_weight.bits,
+                ),
+                None,
+            ),
+            intermediate_size: mlxcel_core::array_shape(&gate_weight.weight)[0],
+        })
+    })();
+
+    fused.unwrap_or(MlpInputProjections::Separate { gate, up })
+}
+
 /// Dense MLP layer
 pub(crate) struct Mlp {
-    gate_proj: UnifiedLinear,
-    up_proj: UnifiedLinear,
+    input_projections: MlpInputProjections,
     down_proj: UnifiedLinear,
 }
 
@@ -424,8 +481,28 @@ impl Mlp {
     }
 
     pub(crate) fn forward_hidden(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
-        let gate = self.gate_proj.forward(x);
-        let up = self.up_proj.forward(x);
+        let (gate, up) = match &self.input_projections {
+            MlpInputProjections::Separate { gate, up } => (gate.forward(x), up.forward(x)),
+            MlpInputProjections::Fused {
+                projection,
+                intermediate_size,
+            } => {
+                let projected = projection.forward(x);
+                let shape = mlxcel_core::array_shape(&projected);
+                (
+                    mlxcel_core::slice(
+                        &projected,
+                        &[0, 0, 0],
+                        &[shape[0], shape[1], *intermediate_size],
+                    ),
+                    mlxcel_core::slice(
+                        &projected,
+                        &[0, 0, *intermediate_size],
+                        &[shape[0], shape[1], *intermediate_size * 2],
+                    ),
+                )
+            }
+        };
         mlxcel_core::compiled_swiglu_activation(&gate, &up)
     }
 
@@ -440,15 +517,18 @@ impl Mlp {
         let (gate_group_size, gate_bits) = config.quant_params(&gate_prefix);
         let (up_group_size, up_bits) = config.quant_params(&up_prefix);
         let (down_group_size, down_bits) = config.quant_params(&down_prefix);
+        let gate =
+            UnifiedLinear::from_weights(weights, &gate_prefix, gate_group_size, gate_bits)?;
+        let up = UnifiedLinear::from_weights(weights, &up_prefix, up_group_size, up_bits)?;
 
         Ok(Self {
-            gate_proj: UnifiedLinear::from_weights(
+            input_projections: fuse_mlp_input_projections(
                 weights,
                 &gate_prefix,
-                gate_group_size,
-                gate_bits,
-            )?,
-            up_proj: UnifiedLinear::from_weights(weights, &up_prefix, up_group_size, up_bits)?,
+                &up_prefix,
+                gate,
+                up,
+            ),
             down_proj: UnifiedLinear::from_weights(
                 weights,
                 &down_prefix,

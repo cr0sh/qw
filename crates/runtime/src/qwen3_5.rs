@@ -39,10 +39,10 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::Path;
 
-const DRAFT_PREFIX: i32 = 98_304;
+const DRAFT_PREFIX: i32 = 65_536;
 const DRAFT_CONTROL_START: i32 = 248_044;
 const DRAFT_CONTROL_END: i32 = 248_070;
-const DRAFT_PADDED: i32 = 98_336;
+const DRAFT_PADDED: i32 = 65_568;
 
 fn compact_rows(array: &MlxArray) -> UniquePtr<MlxArray> {
     let columns = mlxcel_core::array_shape(array)[1];
