@@ -1108,6 +1108,7 @@ impl Qwen35Model {
         gdn_states: &[GdnRollbackSnapshot],
         accepted: usize,
         block_size: usize,
+        materialize: bool,
     ) -> Qwen35RollbackPlan {
         let plan = self.sequence_state.with_internal(|caches| {
             let verify_offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
@@ -1178,6 +1179,11 @@ impl Qwen35Model {
                 );
                 cache.conv_state = Some(mlxcel_core::contiguous(&conv_state, false));
                 cache.offset = plan.final_offset;
+            }
+            if materialize {
+                for cache in caches.iter_mut() {
+                    cache.materialize_state();
+                }
             }
             plan
         });

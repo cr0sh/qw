@@ -319,8 +319,7 @@ impl Qwen35MtpDraftModel {
         state.round_appended = 0;
         let mut tokens = Vec::with_capacity(proposal_count);
         let mut history = committed_history.to_vec();
-        let mut hidden =
-            self.draft_seed_hidden(target, last_bonus, target_hidden, &mut state);
+        let mut hidden = self.draft_seed_hidden(target, last_bonus, target_hidden, &mut state);
         let mut logits = target.project_draft_logits(&hidden);
         let compact = target.has_compact_draft_head();
 
@@ -365,8 +364,7 @@ impl Qwen35MtpDraftModel {
         state.round_appended = 0;
         let mut proposals = Vec::with_capacity(proposal_count);
         let mut history = committed_history.to_vec();
-        let mut hidden =
-            self.draft_seed_hidden(target, last_bonus, target_hidden, &mut state);
+        let mut hidden = self.draft_seed_hidden(target, last_bonus, target_hidden, &mut state);
         let mut logits = target.project_logits(&hidden);
 
         while proposals.len() < proposal_count {
@@ -409,8 +407,7 @@ impl Qwen35MtpDraftModel {
         let mut output = committed_output.to_vec();
         let mut history = Vec::with_capacity(prompt_tokens.len() + output.len() + proposal_count);
         rebuild_history(prompt_tokens, &output, &mut history);
-        let mut hidden =
-            self.draft_seed_hidden(target, last_bonus, target_hidden, &mut state);
+        let mut hidden = self.draft_seed_hidden(target, last_bonus, target_hidden, &mut state);
         let mut logits = target.project_logits(&hidden);
 
         while tokens.len() < proposal_count {
@@ -462,8 +459,7 @@ impl Qwen35MtpDraftModel {
         let mut output = committed_output.to_vec();
         let mut history = Vec::with_capacity(prompt_tokens.len() + output.len() + proposal_count);
         rebuild_history(prompt_tokens, &output, &mut history);
-        let mut hidden =
-            self.draft_seed_hidden(target, last_bonus, target_hidden, &mut state);
+        let mut hidden = self.draft_seed_hidden(target, last_bonus, target_hidden, &mut state);
         let mut logits = target.project_logits(&hidden);
 
         while proposals.len() < proposal_count {
@@ -793,10 +789,8 @@ fn greedy_walk(
         && sampling.xtc_probability == 0.0;
     let mut target_tokens = Vec::with_capacity(draft_tokens.len() + 1);
     if history_independent {
-        let biased_logits = mlxcel_core::sampling::apply_token_bias(
-            verify_logits,
-            &sampling.token_bias,
-        );
+        let biased_logits =
+            mlxcel_core::sampling::apply_token_bias(verify_logits, &sampling.token_bias);
         let targets = mlxcel_core::argmax_last_axis(&biased_logits);
         mlxcel_core::eval(&targets);
         let shape = mlxcel_core::array_shape(&targets);
@@ -1828,6 +1822,7 @@ impl Qwen35MtpGenerator {
                         &verify.gdn_states,
                         walk.accepted,
                         verify_tokens.len(),
+                        false,
                     );
                 }
                 if mtp_round_reaches_cache_clear(
@@ -2121,6 +2116,7 @@ impl Qwen35MtpGenerator {
                         &verify.gdn_states,
                         walk.accepted,
                         verify_tokens.len(),
+                        true,
                     );
                 }
                 drafter.accept_verified_tokens(
