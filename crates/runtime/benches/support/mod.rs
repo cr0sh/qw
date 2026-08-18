@@ -7,7 +7,7 @@ use qw_runtime::{
 };
 
 pub const MODEL_ENV: &str = "QW_BENCH_MODEL";
-pub const DECODE_MAX_TOKENS: usize = 32;
+pub const DECODE_MAX_TOKENS: usize = 128;
 pub const MTP_BLOCK_SIZE: usize = 3;
 pub const PROMPT: &str = concat!(
     "You are the on-call support operations analyst for Acme Commerce. ",
@@ -51,7 +51,7 @@ pub fn load_provider() -> Qwen35Provider {
         std::env::var_os(MODEL_ENV)
             .unwrap_or_else(|| panic!("{MODEL_ENV} must point to a local Qwen checkpoint")),
     );
-    Qwen35Provider::load(&model_dir, KVCacheMode::Fp16)
+    Qwen35Provider::load(&model_dir, KVCacheMode::Turbo4)
         .unwrap_or_else(|error| panic!("failed to load {}: {error:#}", model_dir.display()))
 }
 
@@ -92,6 +92,7 @@ pub fn prepare_decode_fixture(provider: &mut Qwen35Provider) -> DecodeFixture {
             true
         })
         .unwrap_or_else(|error| panic!("warm up MTP k={MTP_BLOCK_SIZE}: {error:#}"));
+    let mtp_stats = mtp_stats.expect("explicit MTP mode must return MTP statistics");
     assert_eq!(
         &mtp_output.token_ids, &baseline_token_ids,
         "baseline and bundled-MTP k={MTP_BLOCK_SIZE} greedy token IDs diverged"
@@ -101,11 +102,22 @@ pub fn prepare_decode_fixture(provider: &mut Qwen35Provider) -> DecodeFixture {
         "the deterministic MTP prompt must produce at least one completion token"
     );
     assert!(
-        mtp_stats
-            .expect("explicit MTP mode must return MTP statistics")
-            .proposed_draft_tokens
-            > 0,
+        mtp_stats.proposed_draft_tokens > 0,
         "MTP k={MTP_BLOCK_SIZE} must propose draft tokens"
+    );
+    eprintln!(
+        "MTP_PROFILE tokens={} accepted={} proposed={} acceptance={:.2}% forwards={} draft_ms={:.3} verify_ms={:.3} walk_ms={:.3} reconcile_ms={:.3} materializations={} snapshots={}",
+        mtp_output.token_ids.len(),
+        mtp_stats.accepted_draft_tokens,
+        mtp_stats.proposed_draft_tokens,
+        mtp_stats.acceptance_percentage(),
+        mtp_stats.target_forward_calls,
+        mtp_stats.draft_time.as_secs_f64() * 1_000.0,
+        mtp_stats.target_verify_time.as_secs_f64() * 1_000.0,
+        mtp_stats.walk_time.as_secs_f64() * 1_000.0,
+        mtp_stats.reconcile_time.as_secs_f64() * 1_000.0,
+        mtp_stats.full_state_materializations,
+        mtp_stats.cache_snapshot_count,
     );
 
     DecodeFixture {
