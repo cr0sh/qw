@@ -928,6 +928,48 @@ async fn repeated_prefix_reports_cached_tokens_and_matches_cold_output() {
 }
 
 #[tokio::test]
+async fn divergent_multi_turn_chat_reuses_exact_common_prefix_and_matches_cold_output() {
+    let warm_app = router(Engine::start_fake(Some(MODEL), 8));
+    let warmed = json!({
+        "model": MODEL,
+        "messages": [
+            {"role": "user", "content": "a"},
+            {"role": "assistant", "content": "b"},
+            {"role": "user", "content": "c"},
+            {"role": "assistant", "content": "d"},
+            {"role": "user", "content": "e"}
+        ]
+    });
+    let divergent = json!({
+        "model": MODEL,
+        "messages": [
+            {"role": "user", "content": "a"},
+            {"role": "assistant", "content": "b"},
+            {"role": "user", "content": "c"},
+            {"role": "assistant", "content": "x"}
+        ]
+    });
+    let _ = post(warm_app.clone(), "/v1/chat/completions", warmed).await;
+    let (status, _, warm_body) =
+        post(warm_app, "/v1/chat/completions", divergent.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{warm_body}");
+    let warm: Value = serde_json::from_str(&warm_body).expect("warm JSON");
+    assert_eq!(
+        warm["usage"]["prompt_tokens_details"]["cached_tokens"],
+        6,
+        "a|b|c| is the exact common prompt prefix"
+    );
+
+    let cold_app = router(Engine::start_fake(Some(MODEL), 8));
+    let (_, _, cold_body) = post(cold_app, "/v1/chat/completions", divergent).await;
+    let cold: Value = serde_json::from_str(&cold_body).expect("cold JSON");
+    assert_eq!(
+        warm["choices"][0]["message"]["content"],
+        cold["choices"][0]["message"]["content"]
+    );
+}
+
+#[tokio::test]
 async fn five_sequential_turns_keep_reusing_the_latest_complete_prefix() {
     let app = router(Engine::start_fake(Some(MODEL), 8));
     let mut messages = vec![json!({"role": "user", "content": "a"})];

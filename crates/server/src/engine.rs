@@ -16,7 +16,7 @@ use tracing::{Span, error, info, info_span, warn};
 use crate::grammar::GrammarFactory;
 #[cfg(test)]
 use crate::media::DecodedImage;
-use crate::prefix_cache::PrefixCache;
+use crate::prefix_cache::{PrefixCache, SnapshotRoute};
 use crate::protocol::{CompletionRequest, Endpoint, OutputFormat, ReasoningEffort, ToolChoice};
 use crate::tool_calls::{ToolCallGate, parse_assistant_output};
 
@@ -477,10 +477,13 @@ impl Engine {
                 let cached_tokens = if has_images {
                     0
                 } else {
-                    cached_prompt
-                        .as_ref()
-                        .filter(|cached| prompt.starts_with(cached.as_str()))
-                        .map_or(0, |cached| cached.len())
+                    cached_prompt.as_ref().map_or(0, |cached| {
+                        cached
+                            .bytes()
+                            .zip(prompt.bytes())
+                            .take_while(|(cached, requested)| cached == requested)
+                            .count()
+                    })
                 };
                 let tool_results = job
                     .request
@@ -813,10 +816,12 @@ impl QwenWorker {
         let route = qwen_generation_route(mtp_available, has_images, constraint.is_some());
         let mtp_k = self.mtp_k;
         let (provider, cache) = (&mut self.provider, &mut self.prefix_cache);
-        let hit = if route_uses_prefix_cache(route) {
-            cache.lookup(&prompt_ids)
-        } else {
-            None
+        let hit = match route {
+            QwenGenerationRoute::BaselineText => {
+                cache.lookup(&prompt_ids, SnapshotRoute::Baseline)
+            }
+            QwenGenerationRoute::MtpText => cache.lookup(&prompt_ids, SnapshotRoute::Mtp),
+            _ => None,
         };
         let (prefix_reuse, mtp_prefix_reuse) = match (route, hit) {
             (QwenGenerationRoute::BaselineText, Some(hit)) => match hit.snapshot {
@@ -1033,10 +1038,8 @@ impl QwenWorker {
             );
             return;
         }
-        if route_uses_prefix_cache(route)
-            && let Some(snapshot) = generated.prompt_snapshot
-        {
-            cache.insert(prompt_ids, snapshot);
+        if route_uses_prefix_cache(route) && !generated.prompt_snapshots.is_empty() {
+            cache.insert(prompt_ids, generated.prompt_snapshots);
         }
         let record = CompletionRecord {
             admission: job.admission,

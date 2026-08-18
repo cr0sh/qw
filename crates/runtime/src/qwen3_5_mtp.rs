@@ -102,6 +102,12 @@ pub struct MtpPromptSnapshot {
     continuation_logits: UniquePtr<MlxArray>,
 }
 
+impl MtpPromptSnapshot {
+    pub fn token_len(&self) -> usize {
+        self.target.token_len()
+    }
+}
+
 /// Exact-prefix MTP state supplied by the server cache.
 pub struct MtpPrefixReuse<'a> {
     pub snapshot: &'a MtpPromptSnapshot,

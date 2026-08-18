@@ -50,6 +50,15 @@ pub enum PromptSnapshot {
     Mtp(MtpPromptSnapshot),
 }
 
+impl PromptSnapshot {
+    pub fn token_len(&self) -> usize {
+        match self {
+            Self::Baseline(snapshot) => snapshot.token_len(),
+            Self::Mtp(snapshot) => snapshot.token_len(),
+        }
+    }
+}
+
 pub struct BaselineGeneration {
     pub text: String,
     pub token_ids: Vec<i32>,
@@ -57,7 +66,7 @@ pub struct BaselineGeneration {
     pub completion_tokens: usize,
     pub cached_tokens: usize,
     pub finish_outcome: GenerationStopReason,
-    pub prompt_snapshot: Option<PromptSnapshot>,
+    pub prompt_snapshots: Vec<PromptSnapshot>,
     /// Wall time strictly after the first sampled token.
     #[doc(hidden)]
     pub decode_time: Duration,
@@ -530,7 +539,11 @@ impl Qwen35Provider {
             completion_tokens,
             cached_tokens: controlled.cached_tokens,
             finish_outcome: controlled.stop_reason,
-            prompt_snapshot: controlled.prompt_snapshot.map(PromptSnapshot::Baseline),
+            prompt_snapshots: controlled
+                .prompt_snapshots
+                .into_iter()
+                .map(PromptSnapshot::Baseline)
+                .collect(),
             decode_time,
         })
     }
@@ -625,7 +638,7 @@ impl Qwen35Provider {
             completion_tokens,
             cached_tokens: 0,
             finish_outcome: controlled.stop_reason,
-            prompt_snapshot: None,
+            prompt_snapshots: Vec::new(),
             decode_time: decode_start.map_or(Duration::ZERO, |start| start.elapsed()),
         })
     }
@@ -822,7 +835,11 @@ impl Qwen35Provider {
                 completion_tokens,
                 cached_tokens: generated.cached_tokens,
                 finish_outcome: generated.stop_reason,
-                prompt_snapshot: generated.prompt_snapshot.map(PromptSnapshot::Mtp),
+                prompt_snapshots: generated
+                    .prompt_snapshot
+                    .map(PromptSnapshot::Mtp)
+                    .into_iter()
+                    .collect(),
                 decode_time: generated.stats.decode_time,
             },
             generated.stats,
@@ -1292,7 +1309,9 @@ mod tests {
             )
             .expect("capture MTP prompt snapshot");
         let PromptSnapshot::Mtp(snapshot) = prefix
-            .prompt_snapshot
+            .prompt_snapshots
+            .into_iter()
+            .next()
             .expect("complete MTP prompt snapshot")
         else {
             panic!("MTP generation must return an MTP snapshot");
