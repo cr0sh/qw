@@ -1805,9 +1805,6 @@ impl Qwen35MtpGenerator {
                         verify_tokens.len(),
                     );
                     mtp_stats.full_state_materializations += 1;
-                } else {
-                    model.materialize_mtp_cache_state();
-                    mtp_stats.full_state_materializations += 1;
                 }
                 drafter.accept_verified_tokens(
                     model,
