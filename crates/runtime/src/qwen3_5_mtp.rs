@@ -789,19 +789,33 @@ fn greedy_walk(
         && sampling.frequency_penalty == 0.0
         && sampling.presence_penalty == 0.0
         && sampling.xtc_probability == 0.0;
-    let mut history = if history_independent {
-        Vec::new()
-    } else {
-        committed_history.to_vec()
-    };
     let mut target_tokens = Vec::with_capacity(draft_tokens.len() + 1);
-    for position in 0..=draft_tokens.len() {
-        let logits = logits_at(verify_logits, position);
-        let (token, _) = sample_token_optimized(&logits, sampling, &history);
-        mlxcel_core::eval(&token);
-        target_tokens.push(mlxcel_core::item_i32(&token));
-        if !history_independent && position < draft_tokens.len() {
-            history.push(draft_tokens[position]);
+    if history_independent {
+        let biased_logits = mlxcel_core::sampling::apply_token_bias(
+            verify_logits,
+            &sampling.token_bias,
+        );
+        let targets = mlxcel_core::argmax_last_axis(&biased_logits);
+        mlxcel_core::eval(&targets);
+        let shape = mlxcel_core::array_shape(&targets);
+        for position in 0..=draft_tokens.len() {
+            let token = mlxcel_core::slice(
+                &targets,
+                &[0, position as i32],
+                &[shape[0], position as i32 + 1],
+            );
+            target_tokens.push(mlxcel_core::item_i32(&token));
+        }
+    } else {
+        let mut history = committed_history.to_vec();
+        for position in 0..=draft_tokens.len() {
+            let logits = logits_at(verify_logits, position);
+            let (token, _) = sample_token_optimized(&logits, sampling, &history);
+            mlxcel_core::eval(&token);
+            target_tokens.push(mlxcel_core::item_i32(&token));
+            if position < draft_tokens.len() {
+                history.push(draft_tokens[position]);
+            }
         }
     }
     speculative_walk(draft_tokens, &target_tokens, max_new_tokens)
