@@ -869,7 +869,9 @@ impl Qwen35Provider {
         on_delta: F,
     ) -> Result<(GenerationOutput, Option<MtpGenerationStats>)> {
         let (prompt_ids, sampling) = self.prepare_generation(request)?;
-        let use_mtp = self.resolve_generation_mode(mode)?;
+        let use_mtp =
+            self.resolve_generation_mode(mode)? && !(mode == Qwen35GenerationMode::Automatic
+                && request.max_tokens == 1);
         if !use_mtp {
             let generation = self.generate_baseline_streaming(
                 &prompt_ids,
