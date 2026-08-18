@@ -293,6 +293,78 @@ pub(crate) fn rollback_plan(
     }
 }
 
+enum Qwen35GatedAuxProjections {
+    Separate {
+        z: UnifiedLinear,
+        b: UnifiedLinear,
+        a: UnifiedLinear,
+    },
+    Fused(UnifiedLinear),
+}
+
+fn fuse_gated_aux_projections(
+    weights: &WeightMap,
+    prefixes: [&str; 3],
+    z: UnifiedLinear,
+    b: UnifiedLinear,
+    a: UnifiedLinear,
+) -> Qwen35GatedAuxProjections {
+    let can_drop_linear_biases = prefixes
+        .iter()
+        .all(|prefix| !weights.contains_key(&format!("{prefix}.bias")));
+    let fused = (|| {
+        let (z_weight, b_weight, a_weight) = (
+            z.quantized_weight()?,
+            b.quantized_weight()?,
+            a.quantized_weight()?,
+        );
+        if !can_drop_linear_biases
+            || z_weight.group_size != b_weight.group_size
+            || z_weight.group_size != a_weight.group_size
+            || z_weight.bits != b_weight.bits
+            || z_weight.bits != a_weight.bits
+            || z_weight.mode != b_weight.mode
+            || z_weight.mode != a_weight.mode
+            || z_weight.global_scale.is_some()
+            || b_weight.global_scale.is_some()
+            || a_weight.global_scale.is_some()
+        {
+            return None;
+        }
+        let biases = [
+            z_weight.biases.as_deref()?,
+            b_weight.biases.as_deref()?,
+            a_weight.biases.as_deref()?,
+        ];
+        let weight = concatenate(
+            &concatenate(&z_weight.weight, &b_weight.weight, 0),
+            &a_weight.weight,
+            0,
+        );
+        let scales = concatenate(
+            &concatenate(&z_weight.scales, &b_weight.scales, 0),
+            &a_weight.scales,
+            0,
+        );
+        let biases = concatenate(&concatenate(biases[0], biases[1], 0), biases[2], 0);
+        Some(UnifiedLinear::new(
+            QuantizedWeight::new(
+                weight,
+                scales,
+                biases,
+                z_weight.group_size,
+                z_weight.bits,
+            ),
+            None,
+        ))
+    })();
+
+    fused.map_or(
+        Qwen35GatedAuxProjections::Separate { z, b, a },
+        Qwen35GatedAuxProjections::Fused,
+    )
+}
+
 // GatedDeltaNet - Qwen3.5 variant with separate projections.
 /// GatedDeltaNet for Qwen3.5 with separate in_proj_qkv, in_proj_z, in_proj_b, in_proj_a
 #[allow(dead_code)]
@@ -309,9 +381,7 @@ pub(crate) struct Qwen35GatedDeltaNet {
 
     conv1d_weight: UniquePtr<MlxArray>,
     in_proj_qkv: UnifiedLinear,
-    in_proj_z: UnifiedLinear,
-    in_proj_b: UnifiedLinear,
-    in_proj_a: UnifiedLinear,
+    aux_projections: Qwen35GatedAuxProjections,
     dt_bias: UniquePtr<MlxArray>,
     a_log: UniquePtr<MlxArray>,
     norm: RMSNormGated,
@@ -354,12 +424,24 @@ impl Qwen35GatedDeltaNet {
 
         let effective_mask = mask;
 
-        // Separate projections (different from Qwen3Next's combined projections)
         let qkv = self.in_proj_qkv.forward(inputs);
-        let z = self.in_proj_z.forward(inputs);
+        let (z, b_proj, a) = match &self.aux_projections {
+            Qwen35GatedAuxProjections::Separate { z, b, a } => {
+                (z.forward(inputs), b.forward(inputs), a.forward(inputs))
+            }
+            Qwen35GatedAuxProjections::Fused(projection) => {
+                let projected = projection.forward(inputs);
+                let z_end = self.value_dim as i32;
+                let b_end = z_end + self.num_v_heads as i32;
+                let a_end = b_end + self.num_v_heads as i32;
+                (
+                    mlxcel_core::slice(&projected, &[0, 0, 0], &[b, s, z_end]),
+                    mlxcel_core::slice(&projected, &[0, 0, z_end], &[b, s, b_end]),
+                    mlxcel_core::slice(&projected, &[0, 0, b_end], &[b, s, a_end]),
+                )
+            }
+        };
         let z = mlxcel_core::reshape(&z, &[b, s, self.num_v_heads as i32, self.head_v_dim as i32]);
-        let b_proj = self.in_proj_b.forward(inputs);
-        let a = self.in_proj_a.forward(inputs);
 
         // Get conv state from cache
         let input_dtype = mlxcel_core::array_dtype(&qkv);
@@ -563,6 +645,13 @@ impl Qwen35GatedDeltaNet {
         let in_proj_z = UnifiedLinear::from_weights(weights, &z_prefix, z_group_size, z_bits)?;
         let in_proj_b = UnifiedLinear::from_weights(weights, &b_prefix, b_group_size, b_bits)?;
         let in_proj_a = UnifiedLinear::from_weights(weights, &a_prefix, a_group_size, a_bits)?;
+        let aux_projections = fuse_gated_aux_projections(
+            weights,
+            [&z_prefix, &b_prefix, &a_prefix],
+            in_proj_z,
+            in_proj_b,
+            in_proj_a,
+        );
 
         let dt_bias = weights
             .get(&format!("{}.dt_bias", prefix))
@@ -593,9 +682,7 @@ impl Qwen35GatedDeltaNet {
             conv_dim,
             conv1d_weight,
             in_proj_qkv,
-            in_proj_z,
-            in_proj_b,
-            in_proj_a,
+            aux_projections,
             dt_bias,
             a_log,
             norm: RMSNormGated::new(norm_weight, config.rms_norm_eps),
