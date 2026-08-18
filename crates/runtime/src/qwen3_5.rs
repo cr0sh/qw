@@ -1179,9 +1179,6 @@ impl Qwen35Model {
                 cache.conv_state = Some(mlxcel_core::contiguous(&conv_state, false));
                 cache.offset = plan.final_offset;
             }
-            for cache in caches.iter_mut() {
-                cache.materialize_state();
-            }
             plan
         });
         self.mrope_state.set_position(plan.final_offset);

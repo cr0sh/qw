@@ -627,6 +627,8 @@ fn mtp_round_reaches_cache_clear(previous: usize, emitted: usize, interval: usiz
     mlxcel_core::memory::should_clear_cache_crossing(previous, emitted, interval)
 }
 
+const MTP_STATE_MATERIALIZE_INTERVAL: usize = 32;
+
 // Variable MTP verify shapes accumulate reusable Metal buffers much faster than
 // ordinary one-token decode. Keep a bounded cache, but retain those buffers
 // until the bound is reached so the common shapes can be reused.
@@ -1827,6 +1829,13 @@ impl Qwen35MtpGenerator {
                         walk.accepted,
                         verify_tokens.len(),
                     );
+                }
+                if mtp_round_reaches_cache_clear(
+                    emitted_before,
+                    generated.len(),
+                    MTP_STATE_MATERIALIZE_INTERVAL,
+                ) {
+                    model.materialize_mtp_cache_state();
                     mtp_stats.full_state_materializations += 1;
                 }
                 drafter.accept_verified_tokens(
