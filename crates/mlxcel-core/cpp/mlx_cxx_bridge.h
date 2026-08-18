@@ -488,6 +488,14 @@ std::unique_ptr<MlxArray> compiled_swiglu_activation(
     const MlxArray& gate,
     const MlxArray& x
 );
+// Gated-delta decay gate compiled into one elementwise kernel.
+// output = exp(-exp(float32(a_log)) * softplus(a + dt_bias))
+std::unique_ptr<MlxArray> compiled_gated_delta_gate(
+    const MlxArray& a_log,
+    const MlxArray& a,
+    const MlxArray& dt_bias
+);
+
 
 // GptOss SwiGLU activation only - compiled with kernel fusion (shapeless=true)
 // output = clipped_gate * sigmoid(1.702 * clipped_gate) * (clipped_up + 1)

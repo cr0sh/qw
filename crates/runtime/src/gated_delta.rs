@@ -21,7 +21,7 @@
 //!
 //! Reference: https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/gated_delta.py
 
-use mlxcel_core::utils::{silu, softplus, stack_arrays};
+use mlxcel_core::utils::{silu, stack_arrays};
 use mlxcel_core::{MlxArray, UniquePtr, dtype};
 
 /// Chunk length for the chunked parallel prefill scan (`gated_delta_chunked`).
@@ -74,14 +74,7 @@ impl Default for GatedDeltaCache {
 ///
 /// Used by: Qwen3Next, Qwen3.5, KimiLinear
 pub fn compute_g(a_log: &MlxArray, a: &MlxArray, dt_bias: &MlxArray) -> UniquePtr<MlxArray> {
-    let a_plus_dt = mlxcel_core::add(a, dt_bias);
-    let sp = softplus(&a_plus_dt);
-    // Cast a_log to float32 before exp() for numerical precision
-    let a_log_f32 = mlxcel_core::astype(a_log, dtype::FLOAT32);
-    let exp_a_log = mlxcel_core::exp(&a_log_f32);
-    let neg_product = mlxcel_core::negative(&mlxcel_core::multiply(&exp_a_log, &sp));
-    // Keep result in float32 (no cast back to input dtype)
-    mlxcel_core::exp(&neg_product)
+    mlxcel_core::compiled_gated_delta_gate(a_log, a, dt_bias)
 }
 
 /// Single recurrent step of the gated delta rule.
