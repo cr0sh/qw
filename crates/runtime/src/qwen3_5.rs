@@ -20,13 +20,11 @@ use crate::gated_delta::{
     GatedDeltaCache, RMSNormGated, gated_delta_update, scaled_fast_rms_norm_no_weight,
 };
 use crate::model_owned::ModelOwnedSequenceState;
-use crate::qwen3_5_mtp::Qwen35MtpDraftModel;
 use crate::qwen_mrope_state::MRopeState;
-use crate::qwen3_vl_vision::{Qwen3VLVisionConfig, Qwen3VLVisionEncoder};
 use crate::qwen_vl_position::decode_rope_positions;
-use crate::qwen3_next::{
-    Mlp, Quantization, Qwen3NextAttention, Qwen3NextCache, Qwen3NextConfig,
-};
+use crate::qwen3_5_mtp::Qwen35MtpDraftModel;
+use crate::qwen3_next::{Mlp, Quantization, Qwen3NextAttention, Qwen3NextCache, Qwen3NextConfig};
+use crate::qwen3_vl_vision::{Qwen3VLVisionConfig, Qwen3VLVisionEncoder};
 use anyhow::{Context, Result, ensure};
 use mlxcel_core::cache::{KVCacheMode, SequenceId};
 use mlxcel_core::generate::{LanguageModel, ModelStateSnapshot};
@@ -63,7 +61,6 @@ pub struct Qwen35Config {
     pub linear_value_head_dim: usize,
     #[serde(default = "default_linear_conv_kernel_dim")]
     pub linear_conv_kernel_dim: usize,
-
 
     // Rope parameters (dict format)
     #[serde(default)]
@@ -128,7 +125,6 @@ impl Qwen35Config {
             .unwrap_or((quantization.group_size, quantization.bits))
     }
 
-
     fn rope_theta(&self) -> f32 {
         self.rope_parameters
             .as_ref()
@@ -168,11 +164,9 @@ impl Qwen35Config {
             .unwrap_or(self.hidden_size / self.num_attention_heads)
     }
 
-
     pub fn is_linear_layer(&self, layer_idx: usize) -> bool {
         !(layer_idx + 1).is_multiple_of(self.full_attention_interval)
     }
-
 
     /// Convert to Qwen3NextConfig for reusing shared components
     pub fn to_qwen3next_config(&self) -> Qwen3NextConfig {
@@ -212,8 +206,7 @@ impl Qwen35Config {
     }
 
     pub(crate) fn has_mtp_metadata(&self) -> bool {
-        self.mtp_num_hidden_layers == Some(1)
-            && self.mtp_use_dedicated_embeddings == Some(false)
+        self.mtp_num_hidden_layers == Some(1) && self.mtp_use_dedicated_embeddings == Some(false)
     }
 }
 
@@ -286,7 +279,6 @@ pub(crate) struct Qwen35GatedDeltaNet {
     out_proj: UnifiedLinear,
 }
 
-
 impl Qwen35GatedDeltaNet {
     pub(crate) fn forward(
         &self,
@@ -306,12 +298,7 @@ impl Qwen35GatedDeltaNet {
         cache: Option<&mut GatedDeltaCache>,
         snapshots: &mut Vec<GdnRollbackSnapshot>,
     ) -> UniquePtr<MlxArray> {
-        let out = self.forward_hidden_internal(
-            inputs,
-            mask,
-            cache,
-            Some((layer_idx, snapshots)),
-        );
+        let out = self.forward_hidden_internal(inputs, mask, cache, Some((layer_idx, snapshots)));
         self.out_proj.forward(&out)
     }
 
@@ -534,12 +521,9 @@ impl Qwen35GatedDeltaNet {
         // Qwen3.5 uses separate projections instead of combined projections.
         let in_proj_qkv =
             UnifiedLinear::from_weights(weights, &qkv_prefix, qkv_group_size, qkv_bits)?;
-        let in_proj_z =
-            UnifiedLinear::from_weights(weights, &z_prefix, z_group_size, z_bits)?;
-        let in_proj_b =
-            UnifiedLinear::from_weights(weights, &b_prefix, b_group_size, b_bits)?;
-        let in_proj_a =
-            UnifiedLinear::from_weights(weights, &a_prefix, a_group_size, a_bits)?;
+        let in_proj_z = UnifiedLinear::from_weights(weights, &z_prefix, z_group_size, z_bits)?;
+        let in_proj_b = UnifiedLinear::from_weights(weights, &b_prefix, b_group_size, b_bits)?;
+        let in_proj_a = UnifiedLinear::from_weights(weights, &a_prefix, a_group_size, a_bits)?;
 
         let dt_bias = weights
             .get(&format!("{}.dt_bias", prefix))
@@ -556,8 +540,7 @@ impl Qwen35GatedDeltaNet {
             .map(|w| mlxcel_core::copy(w))
             .ok_or_else(|| format!("Missing norm weight: {}", prefix))?;
 
-        let out_proj =
-            UnifiedLinear::from_weights(weights, &out_prefix, out_group_size, out_bits)?;
+        let out_proj = UnifiedLinear::from_weights(weights, &out_prefix, out_group_size, out_bits)?;
 
         Ok(Self {
             hidden_size,
@@ -620,12 +603,7 @@ impl Qwen35DecoderLayer {
             ) => attention.forward_with_position_ids(&normed, cache, mask, position_ids),
             (Qwen35AttentionVariant::FullAttention(attention), _) => {
                 let mut temporary = KVCache::new();
-                attention.forward_with_position_ids(
-                    &normed,
-                    &mut temporary,
-                    mask,
-                    position_ids,
-                )
+                attention.forward_with_position_ids(&normed, &mut temporary, mask, position_ids)
             }
         };
         let hidden = mlxcel_core::add(x, &residual);
@@ -689,7 +667,6 @@ impl Qwen35DecoderLayer {
             .forward(&self.post_attention_layernorm.forward(&hidden));
         mlxcel_core::add(&hidden, &mlp)
     }
-
 
     fn from_weights(
         weights: &WeightMap,
@@ -777,7 +754,6 @@ pub struct Qwen35Model {
 }
 
 impl Qwen35Model {
-
     fn forward_backbone_with_inputs(
         &self,
         input_ids: &MlxArray,
@@ -810,9 +786,7 @@ impl Qwen35Model {
                 if layer.is_linear {
                     Qwen3NextCache::Linear(GatedDeltaCache::new())
                 } else {
-                    Qwen3NextCache::Attention(Box::new(KVCache::new_with_mode(
-                        self.kv_cache_mode,
-                    )))
+                    Qwen3NextCache::Attention(Box::new(KVCache::new_with_mode(self.kv_cache_mode)))
                 }
             })
             .collect()
@@ -887,7 +861,6 @@ impl Qwen35Model {
         });
     }
 
-
     pub(crate) fn forward_mtp_prefill_chunks<F>(
         &self,
         input_ids: &MlxArray,
@@ -908,12 +881,9 @@ impl Qwen35Model {
         let shape = mlxcel_core::array_shape(input_ids);
         let prompt_len = shape[1];
         let configured = mlxcel_core::generate::prefill_chunk_len();
-        let chunk_len = mlxcel_core::generate::effective_prefill_chunk(
-            configured,
-            true,
-            prompt_len as usize,
-        )
-        .unwrap_or(prompt_len as usize) as i32;
+        let chunk_len =
+            mlxcel_core::generate::effective_prefill_chunk(configured, true, prompt_len as usize)
+                .unwrap_or(prompt_len as usize) as i32;
         let mut final_chunk = None;
         let mut final_logits = None;
         self.enforce_mtp_cache_bound(prompt_len);
@@ -974,10 +944,59 @@ impl Qwen35Model {
         })
     }
 
-    pub(crate) fn forward_mtp_verify(
+    pub(crate) fn forward_mtp_text_suffix_chunks<F>(
         &self,
         input_ids: &MlxArray,
-    ) -> Qwen35MtpVerifyOutput {
+        mut consume_chunk: F,
+    ) -> std::result::Result<Qwen35MtpPrefill, String>
+    where
+        F: FnMut(&MlxArray, &MlxArray),
+    {
+        let shape = mlxcel_core::array_shape(input_ids);
+        let suffix_len = shape[1];
+        if suffix_len == 0 {
+            return Err("MTP suffix prefill requires at least one token".to_string());
+        }
+        let cached_len = self
+            .sequence_state
+            .with_internal(|caches| caches.first().map(Qwen3NextCache::offset).unwrap_or(0));
+        self.enforce_mtp_cache_bound(cached_len + suffix_len);
+        let configured = mlxcel_core::generate::prefill_chunk_len();
+        let chunk_len =
+            mlxcel_core::generate::effective_prefill_chunk(configured, true, suffix_len as usize)
+                .unwrap_or(suffix_len as usize) as i32;
+        let mut final_hidden = None;
+        let mut start = 0;
+        while start < suffix_len {
+            let end = (start + chunk_len).min(suffix_len);
+            let ids = mlxcel_core::slice(input_ids, &[0, start], &[shape[0], end]);
+            let hidden = self.sequence_state.with_internal(|caches| {
+                self.forward_backbone_with_inputs(&ids, None, caches, None)
+            });
+            consume_chunk(&ids, &hidden);
+            final_hidden = Some(hidden);
+            start = end;
+        }
+        let hidden = final_hidden.expect("non-empty suffix produces target hidden state");
+        let hidden_shape = mlxcel_core::array_shape(&hidden);
+        let last = hidden_shape[1] - 1;
+        let last_hidden = mlxcel_core::slice(
+            &hidden,
+            &[0, last, 0],
+            &[hidden_shape[0], last + 1, hidden_shape[2]],
+        );
+        let first_logits = self.project_logits(&self.norm.forward(&last_hidden));
+        let offset = self
+            .sequence_state
+            .with_internal(|caches| caches.first().map(Qwen3NextCache::offset).unwrap_or(0));
+        self.mrope_state.set_position(offset);
+        Ok(Qwen35MtpPrefill {
+            hidden,
+            first_logits,
+        })
+    }
+
+    pub(crate) fn forward_mtp_verify(&self, input_ids: &MlxArray) -> Qwen35MtpVerifyOutput {
         let input_len = mlxcel_core::array_shape(input_ids)[1];
         let projected = self.sequence_state.with_internal(|caches| {
             caches.first().map(Qwen3NextCache::offset).unwrap_or(0) + input_len
@@ -988,15 +1007,11 @@ impl Qwen35Model {
             let mut hidden = self.embed_tokens.forward(input_ids);
             let shape = mlxcel_core::array_shape(&hidden);
             let seq_len = shape[1];
-            let cache_offset = caches
-                .first()
-                .map(Qwen3NextCache::offset)
-                .unwrap_or(0);
+            let cache_offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
             let position_ids =
                 rope_delta.map(|delta| decode_rope_positions(cache_offset, seq_len, delta));
             let mut gdn_states = Vec::new();
-            for (layer_idx, (layer, cache)) in
-                self.layers.iter().zip(caches.iter_mut()).enumerate()
+            for (layer_idx, (layer, cache)) in self.layers.iter().zip(caches.iter_mut()).enumerate()
             {
                 hidden = layer.forward_with_capture(
                     layer_idx,
@@ -1116,7 +1131,6 @@ impl Qwen35Model {
         });
     }
 
-
     fn parse_config(model_dir: &Path) -> Result<Qwen35Config> {
         let config_path = model_dir.join("config.json");
         let config_text = std::fs::read_to_string(&config_path)
@@ -1141,14 +1155,20 @@ impl Qwen35Model {
             .cloned()
             .unwrap_or_else(|| root.clone());
         let text_object = text_config.as_object_mut().with_context(|| {
-            format!("text_config in {} must contain a JSON object", config_path.display())
+            format!(
+                "text_config in {} must contain a JSON object",
+                config_path.display()
+            )
         })?;
 
         for object in [Some(root_object), Some(&*text_object)] {
             let object = object.expect("config object");
             if let Some(value) = object.get("num_experts") {
                 let experts = value.as_i64().with_context(|| {
-                    format!("num_experts in {} must be an integer", config_path.display())
+                    format!(
+                        "num_experts in {} must be an integer",
+                        config_path.display()
+                    )
                 })?;
                 ensure!(
                     experts == 0,
@@ -1190,8 +1210,12 @@ impl Qwen35Model {
             }
         }
 
-        let mut config: Qwen35Config = serde_json::from_value(text_config)
-            .with_context(|| format!("failed to parse dense text config in {}", config_path.display()))?;
+        let mut config: Qwen35Config = serde_json::from_value(text_config).with_context(|| {
+            format!(
+                "failed to parse dense text config in {}",
+                config_path.display()
+            )
+        })?;
         ensure!(
             config.model_type == "qwen3_5" || config.model_type == "qwen3_5_text",
             "unsupported dense text architecture {:?} in {}",
@@ -1265,9 +1289,8 @@ impl Qwen35Model {
                 );
             }
             let sections = config.mrope_section();
-            let rotary_half = ((config.head_dim_resolved() as f32
-                * config.partial_rotary_factor()) as i32)
-                / 2;
+            let rotary_half =
+                ((config.head_dim_resolved() as f32 * config.partial_rotary_factor()) as i32) / 2;
             ensure!(
                 sections.iter().all(|&section| section > 0)
                     && sections.iter().sum::<i32>() == rotary_half,
@@ -1297,7 +1320,10 @@ impl Qwen35Model {
         let mut shards = BTreeSet::new();
         for (tensor, shard) in weight_map {
             let shard = shard.as_str().with_context(|| {
-                format!("shard for tensor {tensor:?} in {} must be a string", index_path.display())
+                format!(
+                    "shard for tensor {tensor:?} in {} must be a string",
+                    index_path.display()
+                )
             })?;
             let shard_path = Path::new(shard);
             ensure!(
@@ -1309,7 +1335,11 @@ impl Qwen35Model {
         }
         for shard in shards {
             let path = model_dir.join(shard);
-            ensure!(path.is_file(), "missing checkpoint shard {}", path.display());
+            ensure!(
+                path.is_file(),
+                "missing checkpoint shard {}",
+                path.display()
+            );
         }
         Ok(())
     }
@@ -1332,7 +1362,12 @@ impl Qwen35Model {
                 || name.starts_with("lm_head.")
         })
         .map_err(anyhow::Error::msg)
-        .with_context(|| format!("failed to load checkpoint shards from {}", model_dir.display()))?;
+        .with_context(|| {
+            format!(
+                "failed to load checkpoint shards from {}",
+                model_dir.display()
+            )
+        })?;
         ensure!(
             !weights.is_empty(),
             "checkpoint {} contains no Qwen3.5 model tensors",
@@ -1354,8 +1389,7 @@ impl Qwen35Model {
                     model_dir.display()
                 )
             })?;
-        model.bounded_mtp_fp16 =
-            weights.mtp.is_some() && kv_cache_mode == KVCacheMode::Turbo4;
+        model.bounded_mtp_fp16 = weights.mtp.is_some() && kv_cache_mode == KVCacheMode::Turbo4;
         if let Some(mtp_weights) = weights.mtp.as_ref() {
             model.mtp = Some(
                 Qwen35MtpDraftModel::from_weights(mtp_weights, &config)
@@ -1375,18 +1409,14 @@ impl Qwen35Model {
                 vision_config.quant_bits = bits;
             }
             model.vision = Some(
-                Qwen3VLVisionEncoder::from_weights(
-                    &weights.vision,
-                    &vision_config,
-                    "vision_tower",
-                )
-                .map_err(anyhow::Error::msg)
-                .with_context(|| {
-                    format!(
-                        "failed to construct Qwen3.5 vision encoder from checkpoint {}",
-                        model_dir.display()
-                    )
-                })?,
+                Qwen3VLVisionEncoder::from_weights(&weights.vision, &vision_config, "vision_tower")
+                    .map_err(anyhow::Error::msg)
+                    .with_context(|| {
+                        format!(
+                            "failed to construct Qwen3.5 vision encoder from checkpoint {}",
+                            model_dir.display()
+                        )
+                    })?,
             );
         }
         Ok(model)
@@ -1409,10 +1439,7 @@ impl Qwen35Model {
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for layer_idx in 0..config.num_hidden_layers {
             layers.push(Qwen35DecoderLayer::from_weights(
-                weights,
-                config,
-                &qn_config,
-                layer_idx,
+                weights, config, &qn_config, layer_idx,
             )?);
         }
 
@@ -1453,7 +1480,6 @@ impl Qwen35Model {
             mrope_state: MRopeState::new(),
         })
     }
-
 }
 
 fn validate_quantization(value: &Value, config_path: &Path) -> Result<()> {
@@ -1498,14 +1524,15 @@ fn validate_quantization_entry(
         .get("bits")
         .and_then(Value::as_i64)
         .with_context(|| {
-            format!("{name}.bits in {} must be an integer", config_path.display())
+            format!(
+                "{name}.bits in {} must be an integer",
+                config_path.display()
+            )
         })?;
     let mode = object
         .get("mode")
         .and_then(Value::as_str)
-        .with_context(|| {
-            format!("{name}.mode in {} must be a string", config_path.display())
-        })?;
+        .with_context(|| format!("{name}.mode in {} must be a string", config_path.display()))?;
     ensure!(
         group_size > 0 && group_size <= i32::MAX as i64,
         "{name}.group_size in {} must be positive",
@@ -1539,8 +1566,7 @@ fn is_raw_conv1d_layout(shape: &[i32]) -> bool {
 
 pub(crate) fn sanitize_weights(mut weights: WeightMap, config: &Qwen35Config) -> WeightMap {
     let raw_conv1d = weights.iter().any(|(name, value)| {
-        name.contains("conv1d.weight")
-            && is_raw_conv1d_layout(&mlxcel_core::array_shape(value))
+        name.contains("conv1d.weight") && is_raw_conv1d_layout(&mlxcel_core::array_shape(value))
     });
 
     weights.retain(|name, _| !name.starts_with("mtp.") && !name.contains(".mtp."));
@@ -1639,8 +1665,7 @@ fn sanitize_language_model_weights(
     );
 
     let raw_layout = target.iter().any(|(name, value)| {
-        name.contains("conv1d.weight")
-            && is_raw_conv1d_layout(&mlxcel_core::array_shape(value))
+        name.contains("conv1d.weight") && is_raw_conv1d_layout(&mlxcel_core::array_shape(value))
     });
     let mtp = if declared {
         validate_mtp_weights(&mtp, checkpoint_path)?;
@@ -1731,7 +1756,6 @@ fn sanitize_mtp_weights(mut weights: WeightMap, raw_layout: bool) -> WeightMap {
     weights
 }
 
-
 const QWEN35_SNAPSHOT_FAMILY: &str = "qwen3.5-target-v1";
 
 fn snapshot_i32(snapshot: &ModelStateSnapshot, name: &str) -> std::result::Result<i32, String> {
@@ -1749,16 +1773,28 @@ fn push_snapshot_i32(snapshot: &mut ModelStateSnapshot, name: &str, value: i32) 
     snapshot.push_tensor(name, &array);
 }
 
+fn snapshot_cache_mode(value: i32) -> std::result::Result<KVCacheMode, String> {
+    match value {
+        0 => Ok(KVCacheMode::Fp16),
+        1 => Ok(KVCacheMode::Turbo4),
+        _ => Err("Qwen3.5 snapshot contains an unsupported adaptive cache mode".to_string()),
+    }
+}
+
 fn validate_snapshot_tensor_names(
     snapshot: &ModelStateSnapshot,
     layers: &[Qwen35DecoderLayer],
     kv_cache_mode: KVCacheMode,
+    bounded_mtp_fp16: bool,
 ) -> std::result::Result<(), String> {
     let mut expected = BTreeSet::from([
         "meta.layer_count".to_string(),
         "mrope.position".to_string(),
         "mrope.rope_delta".to_string(),
     ]);
+    if bounded_mtp_fp16 {
+        expected.insert("meta.adaptive_mtp_cache".to_string());
+    }
     if snapshot.tensor("mrope.position_ids").is_some() {
         expected.insert("mrope.position_ids".to_string());
     }
@@ -1768,7 +1804,16 @@ fn validate_snapshot_tensor_names(
         if layer.is_linear {
             expected.insert(format!("layer.{index}.conv_state"));
             expected.insert(format!("layer.{index}.state_cache"));
-        } else if kv_cache_mode == KVCacheMode::Turbo4 {
+            continue;
+        }
+        let mode = if bounded_mtp_fp16 {
+            let name = format!("layer.{index}.mode");
+            expected.insert(name.clone());
+            snapshot_cache_mode(snapshot_i32(snapshot, &name)?)?
+        } else {
+            kv_cache_mode
+        };
+        if mode == KVCacheMode::Turbo4 {
             for suffix in ["k_packed", "k_norms", "v_packed", "v_norms", "v_rescale"] {
                 expected.insert(format!("layer.{index}.{suffix}"));
             }
@@ -1796,14 +1841,10 @@ impl LanguageModel for Qwen35Model {
         let rope_delta = self.mrope_state.rope_delta();
         let (logits, offset) = self.sequence_state.with_internal(|caches| {
             let cache_offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
-            let position_ids = rope_delta
-                .map(|delta| decode_rope_positions(cache_offset, sequence_length, delta));
-            let hidden = self.forward_backbone_with_inputs(
-                input,
-                None,
-                caches,
-                position_ids.as_deref(),
-            );
+            let position_ids =
+                rope_delta.map(|delta| decode_rope_positions(cache_offset, sequence_length, delta));
+            let hidden =
+                self.forward_backbone_with_inputs(input, None, caches, position_ids.as_deref());
             let logits = self.project_logits(&self.norm.forward(&hidden));
             let offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
             (logits, offset)
@@ -1823,14 +1864,10 @@ impl LanguageModel for Qwen35Model {
         let rope_delta = self.mrope_state.rope_delta();
         let (logits, offset) = self.sequence_state.with_internal(|caches| {
             let cache_offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
-            let position_ids = rope_delta
-                .map(|delta| decode_rope_positions(cache_offset, sequence_length, delta));
-            let hidden = self.forward_backbone_with_inputs(
-                input_ids,
-                None,
-                caches,
-                position_ids.as_deref(),
-            );
+            let position_ids =
+                rope_delta.map(|delta| decode_rope_positions(cache_offset, sequence_length, delta));
+            let hidden =
+                self.forward_backbone_with_inputs(input_ids, None, caches, position_ids.as_deref());
             let shape = mlxcel_core::array_shape(&hidden);
             let position = i32::try_from(last_pos).unwrap_or(i32::MAX);
             assert!(
@@ -1859,12 +1896,7 @@ impl LanguageModel for Qwen35Model {
     ) -> UniquePtr<MlxArray> {
         let (logits, offset) = self.sequence_state.with_internal(|caches| {
             let hidden = self.mrope_state.with_position_ids(|position_ids| {
-                self.forward_backbone_with_inputs(
-                    input_ids,
-                    input_embeddings,
-                    caches,
-                    position_ids,
-                )
+                self.forward_backbone_with_inputs(input_ids, input_embeddings, caches, position_ids)
             });
             let logits = self.project_logits(&self.norm.forward(&hidden));
             let offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
@@ -1930,6 +1962,9 @@ impl LanguageModel for Qwen35Model {
             "meta.layer_count",
             i32::try_from(self.layers.len()).ok()?,
         );
+        if self.bounded_mtp_fp16 {
+            push_snapshot_i32(&mut snapshot, "meta.adaptive_mtp_cache", 1);
+        }
         push_snapshot_i32(&mut snapshot, "mrope.position", self.mrope_state.position());
         push_snapshot_i32(
             &mut snapshot,
@@ -1962,30 +1997,26 @@ impl LanguageModel for Qwen35Model {
                 );
                 match cache {
                     Qwen3NextCache::Attention(cache) => {
+                        if self.bounded_mtp_fp16 {
+                            let mode = match cache.mode {
+                                KVCacheMode::Fp16 => 0,
+                                KVCacheMode::Turbo4 => 1,
+                                _ => return false,
+                            };
+                            push_snapshot_i32(&mut snapshot, &format!("layer.{index}.mode"), mode);
+                        }
                         if cache.mode == KVCacheMode::Turbo4 {
                             let Some(tensors) = cache.turbo4_snapshot_tensors() else {
                                 return false;
                             };
-                            snapshot.push_tensor(
-                                format!("layer.{index}.k_packed"),
-                                tensors.k_packed,
-                            );
-                            snapshot.push_tensor(
-                                format!("layer.{index}.k_norms"),
-                                tensors.k_norms,
-                            );
-                            snapshot.push_tensor(
-                                format!("layer.{index}.v_packed"),
-                                tensors.v_packed,
-                            );
-                            snapshot.push_tensor(
-                                format!("layer.{index}.v_norms"),
-                                tensors.v_norms,
-                            );
-                            snapshot.push_tensor(
-                                format!("layer.{index}.v_rescale"),
-                                tensors.v_rescale,
-                            );
+                            snapshot
+                                .push_tensor(format!("layer.{index}.k_packed"), tensors.k_packed);
+                            snapshot.push_tensor(format!("layer.{index}.k_norms"), tensors.k_norms);
+                            snapshot
+                                .push_tensor(format!("layer.{index}.v_packed"), tensors.v_packed);
+                            snapshot.push_tensor(format!("layer.{index}.v_norms"), tensors.v_norms);
+                            snapshot
+                                .push_tensor(format!("layer.{index}.v_rescale"), tensors.v_rescale);
                         } else {
                             let (Some(keys), Some(values)) =
                                 (cache.keys.as_deref(), cache.values.as_deref())
@@ -2030,13 +2061,23 @@ impl LanguageModel for Qwen35Model {
         {
             return Err("Qwen3.5 snapshot layer count does not match the loaded model".to_string());
         }
-        validate_snapshot_tensor_names(snapshot, &self.layers, self.kv_cache_mode)?;
+        if self.bounded_mtp_fp16 && snapshot_i32(snapshot, "meta.adaptive_mtp_cache")? != 1 {
+            return Err("Qwen3.5 snapshot adaptive cache policy mismatch".to_string());
+        }
+        validate_snapshot_tensor_names(
+            snapshot,
+            &self.layers,
+            self.kv_cache_mode,
+            self.bounded_mtp_fp16,
+        )?;
 
         let mut restored = Vec::with_capacity(self.layers.len());
         for (index, layer) in self.layers.iter().enumerate() {
             let expected_kind = if layer.is_linear { 1 } else { 0 };
             if snapshot_i32(snapshot, &format!("layer.{index}.kind"))? != expected_kind {
-                return Err(format!("Qwen3.5 snapshot layer {index} cache variant mismatch"));
+                return Err(format!(
+                    "Qwen3.5 snapshot layer {index} cache variant mismatch"
+                ));
             }
             if snapshot_i32(snapshot, &format!("layer.{index}.offset"))? != token_len {
                 return Err(format!("Qwen3.5 snapshot layer {index} offset mismatch"));
@@ -2044,21 +2085,32 @@ impl LanguageModel for Qwen35Model {
             if layer.is_linear {
                 let conv_state = snapshot
                     .tensor(&format!("layer.{index}.conv_state"))
-                    .ok_or_else(|| format!("Qwen3.5 snapshot is missing layer {index} conv state"))?;
+                    .ok_or_else(|| {
+                        format!("Qwen3.5 snapshot is missing layer {index} conv state")
+                    })?;
                 let state_cache = snapshot
                     .tensor(&format!("layer.{index}.state_cache"))
-                    .ok_or_else(|| format!("Qwen3.5 snapshot is missing layer {index} recurrent state"))?;
+                    .ok_or_else(|| {
+                        format!("Qwen3.5 snapshot is missing layer {index} recurrent state")
+                    })?;
                 if mlxcel_core::array_shape(conv_state).len() != 3
                     || mlxcel_core::array_shape(state_cache).len() != 4
                 {
-                    return Err(format!("Qwen3.5 snapshot layer {index} linear cache layout mismatch"));
+                    return Err(format!(
+                        "Qwen3.5 snapshot layer {index} linear cache layout mismatch"
+                    ));
                 }
                 restored.push(Qwen3NextCache::Linear(GatedDeltaCache {
                     conv_state: Some(mlxcel_core::copy(conv_state)),
                     state_cache: Some(mlxcel_core::copy(state_cache)),
                     offset: token_len,
                 }));
-            } else if self.kv_cache_mode == KVCacheMode::Turbo4 {
+            } else if (if self.bounded_mtp_fp16 {
+                snapshot_cache_mode(snapshot_i32(snapshot, &format!("layer.{index}.mode"))?)?
+            } else {
+                self.kv_cache_mode
+            }) == KVCacheMode::Turbo4
+            {
                 let tensor = |suffix: &str| {
                     snapshot
                         .tensor(&format!("layer.{index}.{suffix}"))
@@ -2091,9 +2143,16 @@ impl LanguageModel for Qwen35Model {
                     || key_shape[0] != 1
                     || key_shape[2] < token_len
                 {
-                    return Err(format!("Qwen3.5 snapshot layer {index} attention cache layout mismatch"));
+                    return Err(format!(
+                        "Qwen3.5 snapshot layer {index} attention cache layout mismatch"
+                    ));
                 }
-                let mut cache = KVCache::new();
+                let mode = if self.bounded_mtp_fp16 {
+                    snapshot_cache_mode(snapshot_i32(snapshot, &format!("layer.{index}.mode"))?)?
+                } else {
+                    self.kv_cache_mode
+                };
+                let mut cache = KVCache::new_with_mode(mode);
                 cache.keys = Some(mlxcel_core::copy(keys));
                 cache.values = Some(mlxcel_core::copy(values));
                 cache.offset = token_len;
@@ -2110,19 +2169,12 @@ impl LanguageModel for Qwen35Model {
             value => Some(value),
         };
         self.sequence_state.replace_internal(restored);
-        self.mrope_state.restore(
-            position,
-            snapshot.tensor("mrope.position_ids"),
-            rope_delta,
-        );
+        self.mrope_state
+            .restore(position, snapshot.tensor("mrope.position_ids"), rope_delta);
         Ok(())
     }
 
-    fn snapshot_truncatable_to(
-        &self,
-        snapshot: &ModelStateSnapshot,
-        target_len: usize,
-    ) -> bool {
+    fn snapshot_truncatable_to(&self, snapshot: &ModelStateSnapshot, target_len: usize) -> bool {
         snapshot.family() == QWEN35_SNAPSHOT_FAMILY && target_len == snapshot.token_len()
     }
 
@@ -2143,7 +2195,6 @@ impl LanguageModel for Qwen35Model {
         vec![248046, 248044]
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -2196,13 +2247,21 @@ mod tests {
 
     #[test]
     fn qwen35_mtp_fp16_cap_is_two_gibibytes() {
-        let bytes = 16_u64
-            * 4
-            * MTP_FP16_TARGET_MAX_TOKENS as u64
-            * 256
-            * 2
-            * 2;
+        let bytes = 16_u64 * 4 * MTP_FP16_TARGET_MAX_TOKENS as u64 * 256 * 2 * 2;
         assert_eq!(bytes, 2_u64 << 30);
+    }
+
+    #[test]
+    fn adaptive_snapshot_mode_round_trips_fp16_and_turbo4() {
+        for (encoded, expected) in [(0, KVCacheMode::Fp16), (1, KVCacheMode::Turbo4)] {
+            let mut snapshot = ModelStateSnapshot::new("test", 32_768);
+            push_snapshot_i32(&mut snapshot, "layer.0.mode", encoded);
+            let restored =
+                snapshot_cache_mode(snapshot_i32(&snapshot, "layer.0.mode").expect("mode field"))
+                    .expect("supported adaptive cache mode");
+            assert_eq!(restored, expected);
+        }
+        assert!(snapshot_cache_mode(2).is_err());
     }
 
     fn insert_required_mtp_weights(weights: &mut WeightMap) {
@@ -2289,7 +2348,10 @@ mod tests {
             config.quant_params("model.layers.0.linear_attn.in_proj_qkv"),
             (64, 5)
         );
-        assert_eq!(config.quant_params("model.layers.1.self_attn.q_proj"), (64, 4));
+        assert_eq!(
+            config.quant_params("model.layers.1.self_attn.q_proj"),
+            (64, 4)
+        );
     }
 
     #[test]
@@ -2377,31 +2439,30 @@ mod tests {
     #[test]
     fn declared_mtp_requires_the_complete_exact_tensor_set() {
         let config = mtp_config();
-        let error = sanitize_language_model_weights(
-            WeightMap::new(),
-            &config,
-            Path::new("/checkpoint"),
-        )
-        .err()
-        .expect("declared MTP without tensors must fail")
-        .to_string();
+        let error =
+            sanitize_language_model_weights(WeightMap::new(), &config, Path::new("/checkpoint"))
+                .err()
+                .expect("declared MTP without tensors must fail")
+                .to_string();
         assert!(error.contains("/checkpoint"), "{error}");
-        assert!(error.contains("contains no language_model.mtp.* tensors"), "{error}");
+        assert!(
+            error.contains("contains no language_model.mtp.* tensors"),
+            "{error}"
+        );
 
         let mut incomplete = WeightMap::new();
         incomplete.insert(
             "language_model.mtp.fc.weight".to_string(),
             mlxcel_core::from_slice_f32(&[0.0; 4], &[4]),
         );
-        let error = sanitize_language_model_weights(
-            incomplete,
-            &config,
-            Path::new("/checkpoint"),
-        )
-        .err()
-        .expect("incomplete MTP tensors must fail")
-        .to_string();
-        assert!(error.contains("language_model.mtp.pre_fc_norm_embedding.weight"), "{error}");
+        let error = sanitize_language_model_weights(incomplete, &config, Path::new("/checkpoint"))
+            .err()
+            .expect("incomplete MTP tensors must fail")
+            .to_string();
+        assert!(
+            error.contains("language_model.mtp.pre_fc_norm_embedding.weight"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -2434,12 +2495,8 @@ mod tests {
         );
         insert_required_mtp_weights(&mut weights);
 
-        let sanitized = sanitize_language_model_weights(
-            weights,
-            &config,
-            Path::new("/checkpoint"),
-        )
-        .expect("valid bundled MTP weights");
+        let sanitized = sanitize_language_model_weights(weights, &config, Path::new("/checkpoint"))
+            .expect("valid bundled MTP weights");
         let mtp = sanitized.mtp.expect("retained MTP partition");
         assert!(mtp.contains_key("mtp.fc.weight"));
         let expected = mlxcel_core::from_slice_f32(&[1.0; 4], &[4]);
@@ -2537,9 +2594,8 @@ mod tests {
             "model.language_model.embed_tokens.weight".to_string(),
             mlxcel_core::from_slice_f32(&[2.0], &[1]),
         );
-        let sanitized =
-            sanitize_language_model_weights(weights, &config, Path::new("/checkpoint"))
-                .expect("partition weights");
+        let sanitized = sanitize_language_model_weights(weights, &config, Path::new("/checkpoint"))
+            .expect("partition weights");
         assert!(
             sanitized
                 .vision
@@ -2556,8 +2612,7 @@ mod tests {
             .expect("QW_BENCH_MODEL must point at a real checkpoint");
         let tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
             .expect("load tokenizer");
-        let model = Qwen35Model::load(&model_dir, KVCacheMode::Fp16)
-            .expect("load Qwen3.5 model");
+        let model = Qwen35Model::load(&model_dir, KVCacheMode::Fp16).expect("load Qwen3.5 model");
         let prompt = tokenizer
             .encode("Snapshot restore invariant", true)
             .expect("encode prompt");
@@ -2565,14 +2620,9 @@ mod tests {
         assert!(!prompt_ids.is_empty());
 
         model.reset_runtime_state();
-        let prompt_array =
-            mlxcel_core::from_slice_i32(&prompt_ids, &[1, prompt_ids.len() as i32]);
-        let prompt_logits = model.forward_last_logits(
-            &prompt_array,
-            &mut [],
-            None,
-            prompt_ids.len() - 1,
-        );
+        let prompt_array = mlxcel_core::from_slice_i32(&prompt_ids, &[1, prompt_ids.len() as i32]);
+        let prompt_logits =
+            model.forward_last_logits(&prompt_array, &mut [], None, prompt_ids.len() - 1);
         let first = mlxcel_core::argmax_last_axis(&prompt_logits);
         mlxcel_core::eval(&first);
         let first_id = mlxcel_core::item_i32(&first);
@@ -2581,8 +2631,7 @@ mod tests {
             .expect("capture complete mixed-state snapshot");
 
         let first_array = mlxcel_core::from_slice_i32(&[first_id], &[1, 1]);
-        let uninterrupted_logits =
-            model.forward_last_logits(&first_array, &mut [], None, 0);
+        let uninterrupted_logits = model.forward_last_logits(&first_array, &mut [], None, 0);
         let uninterrupted = mlxcel_core::argmax_last_axis(&uninterrupted_logits);
         mlxcel_core::eval(&uninterrupted);
         let uninterrupted_id = mlxcel_core::item_i32(&uninterrupted);

@@ -20,7 +20,8 @@ pub use provider::{
     BaselineGeneration, ChatContentPart, ChatContentRef, ChatCustomToolCall, ChatFile,
     ChatImageUrl, ChatInputAudio, ChatMessage, ChatMessageContent, ChatPromptCacheBreakpoint,
     ChatTool, ChatToolCall, ChatToolCallFunction, ChatToolFunction, GenerationOutput,
-    GenerationRequest, PreparedMultimodalPrefill, Qwen35Provider,
+    GenerationRequest, MtpPrefixReuse, MtpPromptSnapshot, PreparedMultimodalPrefill,
+    PromptSnapshot, Qwen35Provider,
 };
 pub use qwen_vl::{ExpandedImageTokens, insert_qwen_vl_image_tokens};
 pub use qwen_vl_processor::{PreparedImage, QwenVLProcessor};
