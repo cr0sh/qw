@@ -115,7 +115,6 @@ struct MtpProposal {
 
 struct Qwen35MtpDraftState {
     cache: KVCache,
-    seed_logits: Option<UniquePtr<MlxArray>>,
     seed_hidden: Option<UniquePtr<MlxArray>>,
     rope_delta: Option<i32>,
     round_appended: usize,
@@ -125,7 +124,6 @@ impl Qwen35MtpDraftState {
     fn new() -> Self {
         Self {
             cache: KVCache::new(),
-            seed_logits: None,
             seed_hidden: None,
             rope_delta: None,
             round_appended: 0,
@@ -253,11 +251,10 @@ impl Qwen35MtpDraftModel {
 
     fn set_seed_from_hidden(
         &self,
-        target: &Qwen35Model,
+        _target: &Qwen35Model,
         hidden: &MlxArray,
         state: &mut Qwen35MtpDraftState,
     ) {
-        state.seed_logits = Some(materialize_detached(target.project_logits(hidden)));
         state.seed_hidden = Some(materialize_detached(mlxcel_core::copy(hidden)));
     }
 
@@ -286,23 +283,19 @@ impl Qwen35MtpDraftModel {
         }
     }
 
-    fn draft_seed(
+    fn draft_seed_hidden(
         &self,
         target: &Qwen35Model,
         last_bonus: i32,
         target_hidden: &MlxArray,
         state: &mut Qwen35MtpDraftState,
-    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
-        match (state.seed_logits.take(), state.seed_hidden.take()) {
-            (Some(logits), Some(hidden)) => (logits, hidden),
-            _ => {
-                let bonus = mlxcel_core::from_slice_i32(&[last_bonus], &[1, 1]);
-                let hidden = self.forward_tokens(target, &bonus, target_hidden, state);
-                state.round_appended += 1;
-                let logits = target.project_logits(&hidden);
-                (logits, hidden)
-            }
-        }
+    ) -> UniquePtr<MlxArray> {
+        state.seed_hidden.take().unwrap_or_else(|| {
+            let bonus = mlxcel_core::from_slice_i32(&[last_bonus], &[1, 1]);
+            let hidden = self.forward_tokens(target, &bonus, target_hidden, state);
+            state.round_appended += 1;
+            hidden
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -320,13 +313,24 @@ impl Qwen35MtpDraftModel {
         state.round_appended = 0;
         let mut tokens = Vec::with_capacity(proposal_count);
         let mut history = committed_history.to_vec();
-        let (mut logits, mut hidden) =
-            self.draft_seed(target, last_bonus, target_hidden, &mut state);
+        let mut hidden =
+            self.draft_seed_hidden(target, last_bonus, target_hidden, &mut state);
+        let mut logits = target.project_draft_logits(&hidden);
+        let compact = target.has_compact_draft_head();
 
         while tokens.len() < proposal_count {
-            let (token_array, _) = sample_token_optimized(&logits, sampling, &history);
+            let token_array = if compact && sampler_is_greedy(sampling) {
+                mlxcel_core::argmax_last_axis(&logits)
+            } else {
+                sample_token_optimized(&logits, sampling, &history).0
+            };
             mlxcel_core::eval(&token_array);
-            let token = mlxcel_core::item_i32(&token_array);
+            let sampled = mlxcel_core::item_i32(&token_array);
+            let token = if compact {
+                Qwen35Model::map_draft_token(sampled)
+            } else {
+                sampled
+            };
             tokens.push(token);
             if eos_tokens.contains(&token) || tokens.len() == proposal_count {
                 break;
@@ -335,7 +339,7 @@ impl Qwen35MtpDraftModel {
             let token_array = mlxcel_core::from_slice_i32(&[token], &[1, 1]);
             hidden = self.forward_tokens(target, &token_array, &hidden, &mut state);
             state.round_appended += 1;
-            logits = target.project_logits(&hidden);
+            logits = target.project_draft_logits(&hidden);
         }
         tokens
     }
@@ -355,8 +359,9 @@ impl Qwen35MtpDraftModel {
         state.round_appended = 0;
         let mut proposals = Vec::with_capacity(proposal_count);
         let mut history = committed_history.to_vec();
-        let (mut logits, mut hidden) =
-            self.draft_seed(target, last_bonus, target_hidden, &mut state);
+        let mut hidden =
+            self.draft_seed_hidden(target, last_bonus, target_hidden, &mut state);
+        let mut logits = target.project_logits(&hidden);
 
         while proposals.len() < proposal_count {
             let (token_array, proposal_probs) =
@@ -398,8 +403,9 @@ impl Qwen35MtpDraftModel {
         let mut output = committed_output.to_vec();
         let mut history = Vec::with_capacity(prompt_tokens.len() + output.len() + proposal_count);
         rebuild_history(prompt_tokens, &output, &mut history);
-        let (mut logits, mut hidden) =
-            self.draft_seed(target, last_bonus, target_hidden, &mut state);
+        let mut hidden =
+            self.draft_seed_hidden(target, last_bonus, target_hidden, &mut state);
+        let mut logits = target.project_logits(&hidden);
 
         while tokens.len() < proposal_count {
             let step = constraint_step(&logits, constraint, &history)?;
@@ -450,8 +456,9 @@ impl Qwen35MtpDraftModel {
         let mut output = committed_output.to_vec();
         let mut history = Vec::with_capacity(prompt_tokens.len() + output.len() + proposal_count);
         rebuild_history(prompt_tokens, &output, &mut history);
-        let (mut logits, mut hidden) =
-            self.draft_seed(target, last_bonus, target_hidden, &mut state);
+        let mut hidden =
+            self.draft_seed_hidden(target, last_bonus, target_hidden, &mut state);
+        let mut logits = target.project_logits(&hidden);
 
         while proposals.len() < proposal_count {
             let step = constraint_step(&logits, constraint, &history)?;
@@ -532,9 +539,6 @@ impl Qwen35MtpDraftModel {
         if let Some(hidden) = state.seed_hidden.take() {
             state.seed_hidden = Some(materialize_detached(hidden));
         }
-        if let Some(logits) = state.seed_logits.take() {
-            state.seed_logits = Some(materialize_detached(logits));
-        }
     }
 
     fn capture_prompt_snapshot(
@@ -550,7 +554,6 @@ impl Qwen35MtpDraftModel {
         if state.cache.offset != expected_offset
             || state.round_appended != 0
             || state.seed_hidden.is_some()
-            || state.seed_logits.is_some()
         {
             return None;
         }
@@ -592,7 +595,6 @@ impl Qwen35MtpDraftModel {
         cache.offset = expected_offset;
         *self.state.borrow_mut() = Qwen35MtpDraftState {
             cache,
-            seed_logits: None,
             seed_hidden: None,
             rope_delta: None,
             round_appended: 0,
