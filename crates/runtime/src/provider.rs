@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 use mlxcel_core::cache::KVCacheMode;
@@ -52,6 +53,9 @@ pub struct BaselineGeneration {
     pub cached_tokens: usize,
     pub finish_outcome: GenerationStopReason,
     pub prompt_snapshot: Option<ModelStateSnapshot>,
+    /// Wall time strictly after the first sampled token.
+    #[doc(hidden)]
+    pub decode_time: Duration,
 }
 
 pub struct PreparedMultimodalPrefill {
@@ -451,6 +455,7 @@ impl Qwen35Provider {
         let mut decoder = IncrementalTextDecoder::new(&self.tokenizer);
         let mut decode_error = None;
         let mut callback_active = true;
+        let mut decode_start = None;
         let controlled: ControlledGeneration = self
             .generator
             .generate_streaming_controlled(
@@ -462,6 +467,7 @@ impl Qwen35Provider {
                 constraint,
                 capture_prompt_snapshot,
                 |token_id| {
+                    decode_start.get_or_insert_with(Instant::now);
                     if buffer_output {
                         callback_active = on_delta("");
                         return callback_active;
@@ -503,12 +509,14 @@ impl Qwen35Provider {
         }
         let text = decoder.emitted;
         let completion_tokens = controlled.token_ids.len();
+        let decode_time = decode_start.map_or(Duration::ZERO, |start| start.elapsed());
         info!(
             phase = "model.complete",
             prompt_tokens = prompt_ids.len(),
             completion_tokens,
             cached_tokens = controlled.cached_tokens,
             stop_reason = ?controlled.stop_reason,
+            decode_seconds = decode_time.as_secs_f64(),
         );
         Ok(BaselineGeneration {
             text,
@@ -518,6 +526,7 @@ impl Qwen35Provider {
             cached_tokens: controlled.cached_tokens,
             finish_outcome: controlled.stop_reason,
             prompt_snapshot: controlled.prompt_snapshot,
+            decode_time,
         })
     }
 
@@ -546,6 +555,7 @@ impl Qwen35Provider {
         let mut callback_active = true;
         let mut decoder = IncrementalTextDecoder::new(&self.tokenizer);
         let mut decode_error = None;
+        let mut decode_start = None;
         let controlled = self
             .generator
             .generate_streaming_controlled_with_embeddings(
@@ -559,6 +569,7 @@ impl Qwen35Provider {
                 constraint,
                 false,
                 |token_id| {
+                    decode_start.get_or_insert_with(Instant::now);
                     if buffer_output {
                         callback_active = on_delta("");
                         return callback_active;
@@ -610,6 +621,7 @@ impl Qwen35Provider {
             cached_tokens: 0,
             finish_outcome: controlled.stop_reason,
             prompt_snapshot: None,
+            decode_time: decode_start.map_or(Duration::ZERO, |start| start.elapsed()),
         })
     }
 
@@ -777,6 +789,14 @@ impl Qwen35Provider {
             mtp_acceptance_percentage = generated.stats.acceptance_percentage(),
             mtp_decode_seconds = generated.stats.decode_time.as_secs_f64(),
             mtp_cache_clear_count = generated.stats.cache_clear_count,
+            mtp_draft_seconds = generated.stats.draft_time.as_secs_f64(),
+            mtp_target_verify_seconds = generated.stats.target_verify_time.as_secs_f64(),
+            mtp_walk_seconds = generated.stats.walk_time.as_secs_f64(),
+            mtp_reconcile_seconds = generated.stats.reconcile_time.as_secs_f64(),
+            mtp_target_forward_calls = generated.stats.target_forward_calls,
+            mtp_speculative_rounds = generated.stats.speculative_rounds,
+            mtp_full_state_materializations = generated.stats.full_state_materializations,
+            mtp_cache_snapshot_count = generated.stats.cache_snapshot_count,
             mtp_cache_clear_seconds = generated.stats.cache_clear_time.as_secs_f64(),
         );
         Ok((
@@ -788,6 +808,7 @@ impl Qwen35Provider {
                 cached_tokens: 0,
                 finish_outcome: generated.stop_reason,
                 prompt_snapshot: None,
+                decode_time: generated.stats.decode_time,
             },
             generated.stats,
         ))
@@ -851,6 +872,55 @@ impl Qwen35Provider {
                 text: generation.text,
                 token_ids: generation.token_ids,
             },
+            Some(stats),
+        ))
+    }
+
+    /// Controlled decode benchmark route. Production callers continue through
+    /// [`Self::generate_streaming`], which selects bundled MTP when present.
+    #[doc(hidden)]
+    pub fn benchmark_streaming_in_mode<F: FnMut(&str) -> bool>(
+        &mut self,
+        request: &GenerationRequest,
+        mode: Qwen35GenerationMode,
+        on_delta: F,
+    ) -> Result<(GenerationOutput, Duration, Option<MtpGenerationStats>)> {
+        let (prompt_ids, sampling) = self.prepare_generation(request)?;
+        if !self.resolve_generation_mode(mode)? {
+            let generation = self.generate_baseline_streaming(
+                &prompt_ids,
+                request.max_tokens,
+                &sampling,
+                None,
+                None,
+                false,
+                on_delta,
+            )?;
+            return Ok((
+                GenerationOutput {
+                    text: generation.text,
+                    token_ids: generation.token_ids,
+                },
+                generation.decode_time,
+                None,
+            ));
+        }
+        let (generation, stats) = self.generate_mtp_streaming_for_prompt(
+            MtpPrompt::Text {
+                prompt_ids: &prompt_ids,
+            },
+            request.max_tokens,
+            &sampling,
+            DEFAULT_MTP_BLOCK_SIZE,
+            None,
+            on_delta,
+        )?;
+        Ok((
+            GenerationOutput {
+                text: generation.text,
+                token_ids: generation.token_ids,
+            },
+            generation.decode_time,
             Some(stats),
         ))
     }

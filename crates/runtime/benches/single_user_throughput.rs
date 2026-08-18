@@ -19,10 +19,8 @@ fn generation_elements(
 ) -> GenerationElements {
     GenerationElements {
         prefill: (batch_size * prompt_tokens) as u64,
-        // The generation APIs return every sampled completion token,
-        // including the first token selected from the prefill logits. Decode
-        // throughput therefore uses the complete output-token count.
-        decode: (batch_size * completion_tokens) as u64,
+        // True decode begins after the first token sampled from prefill logits.
+        decode: (batch_size * completion_tokens.saturating_sub(1)) as u64,
     }
 }
 
@@ -69,6 +67,35 @@ fn single_user_throughput(criterion: &mut Criterion) {
     let baseline_token_ids = decode_fixture.baseline_token_ids;
     let mtp_decode_tokens = generation_elements(1, prompt_tokens, decode_fixture.mtp_decode_tokens)
         .decode as usize;
+
+    {
+        let baseline_decode_tokens = baseline_token_ids.len().saturating_sub(1);
+        let mut group = criterion.benchmark_group("single_user_decode");
+        group.throughput(Throughput::Elements(baseline_decode_tokens as u64));
+        group.bench_function("baseline", |bencher| {
+            bencher.iter_custom(|iters| {
+                let mut decode_time = Duration::ZERO;
+                for _ in 0..iters {
+                    let (output, measured_decode, stats) = provider
+                        .benchmark_streaming_in_mode(
+                            &decode_request,
+                            Qwen35GenerationMode::Baseline,
+                            |delta| {
+                                black_box(delta);
+                                true
+                            },
+                        )
+                        .expect("benchmark controlled non-MTP baseline");
+                    assert_eq!(&output.token_ids, &baseline_token_ids);
+                    assert!(stats.is_none(), "baseline mode returned MTP statistics");
+                    decode_time += measured_decode;
+                    black_box(output);
+                }
+                decode_time
+            });
+        });
+        group.finish();
+    }
 
     {
         let mut group = criterion.benchmark_group("single_user_decode");

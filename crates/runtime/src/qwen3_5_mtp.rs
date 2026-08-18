@@ -50,6 +50,14 @@ pub struct MtpGenerationStats {
     pub decode_time: Duration,
     pub cache_clear_count: usize,
     pub cache_clear_time: Duration,
+    pub draft_time: Duration,
+    pub target_verify_time: Duration,
+    pub walk_time: Duration,
+    pub reconcile_time: Duration,
+    pub target_forward_calls: usize,
+    pub speculative_rounds: usize,
+    pub full_state_materializations: usize,
+    pub cache_snapshot_count: usize,
 }
 
 impl MtpGenerationStats {
@@ -1516,6 +1524,7 @@ impl Qwen35MtpGenerator {
                     break;
                 }
                 let greedy = sampler_is_greedy(&sampling);
+                let phase_start = Instant::now();
                 let (draft_tokens, proposal_probs) = if greedy {
                     (
 
@@ -1543,6 +1552,7 @@ impl Qwen35MtpGenerator {
                     let tokens = proposals.iter().map(|proposal| proposal.token).collect();
                     (tokens, Some(proposals))
                 };
+                mtp_stats.draft_time += phase_start.elapsed();
                 if draft_tokens.is_empty() {
                     break;
                 }
@@ -1554,7 +1564,13 @@ impl Qwen35MtpGenerator {
                     &verify_tokens,
                     &[1, i32::try_from(verify_tokens.len()).unwrap_or(i32::MAX)],
                 );
+                let phase_start = Instant::now();
                 let verify = model.forward_mtp_verify(&verify_input);
+                mlxcel_core::eval(&verify.logits);
+                mtp_stats.target_verify_time += phase_start.elapsed();
+                mtp_stats.target_forward_calls += 1;
+                mtp_stats.speculative_rounds += 1;
+                let phase_start = Instant::now();
                 let walk = if let Some(proposals) = proposal_probs.as_deref() {
                     stochastic_walk(
                         proposals,
@@ -1573,6 +1589,8 @@ impl Qwen35MtpGenerator {
                         remaining,
                     )
                 };
+                mtp_stats.walk_time += phase_start.elapsed();
+                let phase_start = Instant::now();
                 mtp_stats.record_round(walk.accepted, draft_tokens.len());
 
                 let round_stop_reason = emit_walk_tokens(
@@ -1593,6 +1611,10 @@ impl Qwen35MtpGenerator {
                         walk.accepted,
                         verify_tokens.len(),
                     );
+                    mtp_stats.full_state_materializations += 1;
+                } else {
+                    model.materialize_mtp_cache_state();
+                    mtp_stats.full_state_materializations += 1;
                 }
                 drafter.accept_verified_tokens(
                     model,
@@ -1608,17 +1630,18 @@ impl Qwen35MtpGenerator {
                     &[0, accepted, 0],
                     &[hidden_shape[0], accepted + 1, hidden_shape[2]],
                 ));
-                model.materialize_mtp_cache_state();
                 bonus = *walk
                     .new_tokens
                     .last()
                     .expect("speculative walk emits at least one token");
-                drafter.materialize_state();
+                mtp_stats.full_state_materializations += 1;
+                mtp_stats.cache_snapshot_count += 1;
                 if let Some(elapsed) =
                     clear_mtp_cache_if_needed(emitted_before, generated.len())
                 {
                     mtp_stats.record_cache_clear(elapsed);
                 }
+                mtp_stats.reconcile_time += phase_start.elapsed();
                 if round_stop_reason.is_some() {
                     break;
                 }

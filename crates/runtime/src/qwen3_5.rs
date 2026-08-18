@@ -750,6 +750,16 @@ impl Qwen35DecoderLayer {
 }
 
 // Qwen3.5 Model.
+const MTP_FP16_TARGET_MAX_TOKENS: i32 = 32_768;
+
+fn mtp_target_cache_mode(has_mtp: bool, requested: KVCacheMode) -> KVCacheMode {
+    if has_mtp && requested == KVCacheMode::Turbo4 {
+        KVCacheMode::Fp16
+    } else {
+        requested
+    }
+}
+
 pub struct Qwen35Model {
     pub(crate) embed_tokens: UnifiedEmbedding,
     pub(crate) layers: Vec<Qwen35DecoderLayer>,
@@ -758,6 +768,7 @@ pub struct Qwen35Model {
     pub(crate) config: Qwen35Config,
     mtp: Option<Qwen35MtpDraftModel>,
     kv_cache_mode: KVCacheMode,
+    bounded_mtp_fp16: bool,
     vision: Option<Qwen3VLVisionEncoder>,
     /// Model-owned heterogeneous cache state used by one synchronous sequence.
     sequence_state: ModelOwnedSequenceState<Qwen3NextCache>,
@@ -859,6 +870,23 @@ impl Qwen35Model {
     pub(crate) fn mtp(&self) -> Option<&Qwen35MtpDraftModel> {
         self.mtp.as_ref()
     }
+    fn enforce_mtp_cache_bound(&self, projected_tokens: i32) {
+        if !self.bounded_mtp_fp16 || projected_tokens <= MTP_FP16_TARGET_MAX_TOKENS {
+            return;
+        }
+        self.sequence_state.with_internal(|caches| {
+            for cache in caches {
+                if let Qwen3NextCache::Attention(cache) = cache {
+                    if cache.offset == 0 {
+                        cache.mode = KVCacheMode::Turbo4;
+                    } else {
+                        cache.demote_fp16_to_turbo4();
+                    }
+                }
+            }
+        });
+    }
+
 
     pub(crate) fn forward_mtp_prefill_chunks<F>(
         &self,
@@ -888,6 +916,7 @@ impl Qwen35Model {
         .unwrap_or(prompt_len as usize) as i32;
         let mut final_chunk = None;
         let mut final_logits = None;
+        self.enforce_mtp_cache_bound(prompt_len);
         let mut start = 0;
         while start < prompt_len {
             let end = (start + chunk_len).min(prompt_len);
@@ -949,6 +978,11 @@ impl Qwen35Model {
         &self,
         input_ids: &MlxArray,
     ) -> Qwen35MtpVerifyOutput {
+        let input_len = mlxcel_core::array_shape(input_ids)[1];
+        let projected = self.sequence_state.with_internal(|caches| {
+            caches.first().map(Qwen3NextCache::offset).unwrap_or(0) + input_len
+        });
+        self.enforce_mtp_cache_bound(projected);
         let rope_delta = self.mrope_state.rope_delta();
         let (output, offset) = self.sequence_state.with_internal(|caches| {
             let mut hidden = self.embed_tokens.forward(input_ids);
@@ -1305,7 +1339,14 @@ impl Qwen35Model {
             model_dir.display()
         );
         let weights = sanitize_language_model_weights(weights, &config, model_dir)?;
-        let mut model = Self::from_weights(&weights.target, &config, kv_cache_mode)
+        let target_cache_mode = mtp_target_cache_mode(weights.mtp.is_some(), kv_cache_mode);
+        tracing::info!(
+            requested_cache_mode = ?kv_cache_mode,
+            effective_target_cache_mode = ?target_cache_mode,
+            mtp_fp16_target_cap_tokens = MTP_FP16_TARGET_MAX_TOKENS,
+            "selected Qwen3.5 target cache policy"
+        );
+        let mut model = Self::from_weights(&weights.target, &config, target_cache_mode)
             .map_err(anyhow::Error::msg)
             .with_context(|| {
                 format!(
@@ -1313,6 +1354,8 @@ impl Qwen35Model {
                     model_dir.display()
                 )
             })?;
+        model.bounded_mtp_fp16 =
+            weights.mtp.is_some() && kv_cache_mode == KVCacheMode::Turbo4;
         if let Some(mtp_weights) = weights.mtp.as_ref() {
             model.mtp = Some(
                 Qwen35MtpDraftModel::from_weights(mtp_weights, &config)
@@ -1404,6 +1447,7 @@ impl Qwen35Model {
             config: config.clone(),
             kv_cache_mode,
             mtp: None,
+            bounded_mtp_fp16: false,
             vision: None,
             sequence_state: ModelOwnedSequenceState::new(internal_caches),
             mrope_state: MRopeState::new(),
@@ -2132,6 +2176,33 @@ mod tests {
         config.mtp_num_hidden_layers = Some(1);
         config.mtp_use_dedicated_embeddings = Some(false);
         config
+    }
+
+    #[test]
+    fn bundled_mtp_uses_bounded_native_target_cache() {
+        assert_eq!(
+            mtp_target_cache_mode(true, KVCacheMode::Turbo4),
+            KVCacheMode::Fp16
+        );
+        assert_eq!(
+            mtp_target_cache_mode(false, KVCacheMode::Turbo4),
+            KVCacheMode::Turbo4
+        );
+        assert_eq!(
+            mtp_target_cache_mode(true, KVCacheMode::Int8),
+            KVCacheMode::Int8
+        );
+    }
+
+    #[test]
+    fn qwen35_mtp_fp16_cap_is_two_gibibytes() {
+        let bytes = 16_u64
+            * 4
+            * MTP_FP16_TARGET_MAX_TOKENS as u64
+            * 256
+            * 2
+            * 2;
+        assert_eq!(bytes, 2_u64 << 30);
     }
 
     fn insert_required_mtp_weights(weights: &mut WeightMap) {
