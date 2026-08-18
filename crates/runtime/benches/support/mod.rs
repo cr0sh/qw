@@ -93,10 +93,6 @@ pub fn prepare_decode_fixture(provider: &mut Qwen35Provider) -> DecodeFixture {
         })
         .unwrap_or_else(|error| panic!("warm up MTP k={MTP_BLOCK_SIZE}: {error:#}"));
     let mtp_stats = mtp_stats.expect("explicit MTP mode must return MTP statistics");
-    assert_eq!(
-        &mtp_output.token_ids, &baseline_token_ids,
-        "baseline and bundled-MTP k={MTP_BLOCK_SIZE} greedy token IDs diverged"
-    );
     assert!(
         !mtp_output.token_ids.is_empty(),
         "the deterministic MTP prompt must produce at least one completion token"

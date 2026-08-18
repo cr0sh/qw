@@ -3548,6 +3548,22 @@ impl KVCache {
         self.turbo4_dequant_sdpa_prefix(q, self.offset, scale, None, true)
     }
 
+    pub fn demote_fp16_to_turbo4(&mut self) -> bool {
+        if self.mode != KVCacheMode::Fp16 || self.offset <= 0 {
+            return false;
+        }
+        let keys = self.keys.take().expect("FP16 cache K");
+        let values = self.values.take().expect("FP16 cache V");
+        let ks = ffi::array_shape(&keys);
+        let vs = ffi::array_shape(&values);
+        let keys = ffi::slice(&keys, &[0, 0, 0, 0], &[ks[0], ks[1], self.offset, ks[3]]);
+        let values = ffi::slice(&values, &[0, 0, 0, 0], &[vs[0], vs[1], self.offset, vs[3]]);
+        self.mode = KVCacheMode::Turbo4;
+        self.offset = 0;
+        self.update_turbo4_sym(keys, values);
+        true
+    }
+
     fn turbo4_dequant_sdpa_prefix(
         &self,
         q: &MlxArray,
