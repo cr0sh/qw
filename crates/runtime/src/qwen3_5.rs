@@ -750,7 +750,7 @@ impl Qwen35DecoderLayer {
 }
 
 // Qwen3.5 Model.
-const MTP_FP16_TARGET_MAX_TOKENS: i32 = 16_384;
+const MTP_FP16_TARGET_MAX_TOKENS: i32 = 32_768;
 
 fn mtp_target_cache_mode(has_mtp: bool, requested: KVCacheMode) -> KVCacheMode {
     if has_mtp && requested == KVCacheMode::Turbo4 {
@@ -2195,14 +2195,14 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_mtp_fp16_cap_is_one_gibibyte() {
+    fn qwen35_mtp_fp16_cap_is_two_gibibytes() {
         let bytes = 16_u64
             * 4
             * MTP_FP16_TARGET_MAX_TOKENS as u64
             * 256
             * 2
             * 2;
-        assert_eq!(bytes, 1_u64 << 30);
+        assert_eq!(bytes, 2_u64 << 30);
     }
 
     fn insert_required_mtp_weights(weights: &mut WeightMap) {
