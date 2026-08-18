@@ -217,15 +217,31 @@ pub fn apply_token_bias(logits: &MlxArray, bias: &TokenBiasMap) -> UniquePtr<Mlx
     }
     let shape = ffi::array_shape(logits);
     let vocab_size = *shape.last().unwrap() as usize;
-    let mut bias_vec = vec![0.0f32; vocab_size];
-    for (&tok, &b) in bias.iter() {
-        if tok >= 0 && (tok as usize) < vocab_size {
-            bias_vec[tok as usize] = b;
-        }
+    let (tokens, biases): (Vec<i32>, Vec<f32>) = bias
+        .iter()
+        .filter_map(|(&token, &value)| {
+            (token >= 0 && (token as usize) < vocab_size).then_some((token, value))
+        })
+        .unzip();
+    if tokens.is_empty() {
+        return ffi::copy(logits);
     }
-    let bias_arr = ffi::from_slice_f32(&bias_vec, &[1, vocab_size as i32]);
-    let bias_broadcast = ffi::broadcast_to(&bias_arr, &shape);
-    ffi::add(logits, &bias_broadcast)
+
+    let mut sparse_shape = vec![1; shape.len()];
+    *sparse_shape.last_mut().unwrap() = tokens.len() as i32;
+    let mut update_shape = shape;
+    *update_shape.last_mut().unwrap() = tokens.len() as i32;
+    let indices = ffi::broadcast_to(
+        &ffi::from_slice_i32(&tokens, &sparse_shape),
+        &update_shape,
+    );
+    let values = ffi::broadcast_to(
+        &ffi::from_slice_f32(&biases, &sparse_shape),
+        &update_shape,
+    );
+    let selected = ffi::take_along_axis(logits, &indices, -1);
+    let updated = ffi::add(&selected, &values);
+    ffi::put_along_axis(logits, &indices, &updated, -1)
 }
 
 /// Optimized sampling that returns arrays for pipelining.
