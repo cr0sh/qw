@@ -784,14 +784,23 @@ fn greedy_walk(
     committed_history: &[i32],
     max_new_tokens: usize,
 ) -> WalkResult {
-    let mut history = committed_history.to_vec();
+    let history_independent = sampling.repetition_penalty == 1.0
+        && sampling.dry_multiplier == 0.0
+        && sampling.frequency_penalty == 0.0
+        && sampling.presence_penalty == 0.0
+        && sampling.xtc_probability == 0.0;
+    let mut history = if history_independent {
+        Vec::new()
+    } else {
+        committed_history.to_vec()
+    };
     let mut target_tokens = Vec::with_capacity(draft_tokens.len() + 1);
     for position in 0..=draft_tokens.len() {
         let logits = logits_at(verify_logits, position);
         let (token, _) = sample_token_optimized(&logits, sampling, &history);
         mlxcel_core::eval(&token);
         target_tokens.push(mlxcel_core::item_i32(&token));
-        if position < draft_tokens.len() {
+        if !history_independent && position < draft_tokens.len() {
             history.push(draft_tokens[position]);
         }
     }
