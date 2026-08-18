@@ -365,8 +365,8 @@ fn fuse_gated_aux_projections(
     )
 }
 
-// GatedDeltaNet - Qwen3.5 variant with separate projections.
-/// GatedDeltaNet for Qwen3.5 with separate in_proj_qkv, in_proj_z, in_proj_b, in_proj_a
+// GatedDeltaNet - Qwen3.5 variant with separately stored projections.
+/// Fuses compatible z, beta, and decay projections at load time.
 #[allow(dead_code)]
 pub(crate) struct Qwen35GatedDeltaNet {
     hidden_size: usize,
