@@ -810,8 +810,9 @@ impl QwenWorker {
             job.request.top_p,
             job.request.seed,
         );
-        let route =
-            qwen_generation_route(self.provider.has_mtp(), has_images, constraint.is_some());
+        let mtp_available = self.provider.has_mtp()
+            && std::env::var_os("QW_BENCH_DISABLE_MTP").is_none();
+        let route = qwen_generation_route(mtp_available, has_images, constraint.is_some());
         let mtp_k = self.mtp_k;
         let (provider, cache) = (&mut self.provider, &mut self.prefix_cache);
         let hit = if route_uses_prefix_cache(route) {

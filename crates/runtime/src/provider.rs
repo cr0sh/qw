@@ -509,12 +509,14 @@ impl Qwen35Provider {
         }
         let text = decoder.emitted;
         let completion_tokens = controlled.token_ids.len();
+        let decode_time = decode_start.map_or(Duration::ZERO, |start| start.elapsed());
         info!(
             phase = "model.complete",
             prompt_tokens = prompt_ids.len(),
             completion_tokens,
             cached_tokens = controlled.cached_tokens,
             stop_reason = ?controlled.stop_reason,
+            decode_seconds = decode_time.as_secs_f64(),
         );
         Ok(BaselineGeneration {
             text,
@@ -524,7 +526,7 @@ impl Qwen35Provider {
             cached_tokens: controlled.cached_tokens,
             finish_outcome: controlled.stop_reason,
             prompt_snapshot: controlled.prompt_snapshot,
-            decode_time: decode_start.map_or(Duration::ZERO, |start| start.elapsed()),
+            decode_time,
         })
     }
 
