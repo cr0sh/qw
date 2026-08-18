@@ -623,7 +623,7 @@ fn mtp_round_reaches_cache_clear(previous: usize, emitted: usize, interval: usiz
     mlxcel_core::memory::should_clear_cache_crossing(previous, emitted, interval)
 }
 
-const MTP_STATE_MATERIALIZE_INTERVAL: usize = 64;
+const MTP_STATE_MATERIALIZE_INTERVAL: usize = 128;
 
 // Variable MTP verify shapes accumulate reusable Metal buffers much faster than
 // ordinary one-token decode. Keep a bounded cache, but retain those buffers
