@@ -1464,6 +1464,9 @@ impl CxxGenerator {
         let eos_tokens = merged_eos_token_ids(model.eos_token_ids(), &sampling.stop_token_ids);
         let sequence_id = SequenceId::from_raw(0);
 
+        let requested_cached_tokens = prefix_reuse
+            .as_ref()
+            .map_or(0, |reuse| reuse.cached_tokens);
         let mut cached_tokens = 0;
         let mut cached_logits = None;
         if let Some(reuse) = prefix_reuse
@@ -1479,6 +1482,15 @@ impl CxxGenerator {
                 cached_logits = reuse.snapshot.continuation_logits().map(ffi::copy);
             }
         }
+        let prefill_tokens = &prompt_tokens[cached_tokens..];
+        tracing::info!(
+            phase = "prefill.started",
+            prompt_tokens = prompt_tokens.len(),
+            requested_cached_tokens,
+            prefix_cached_tokens = cached_tokens,
+            prefill_start = cached_tokens,
+            prefill_tokens = prefill_tokens.len(),
+        );
         let retain_prompt_snapshot = (!checkpoint_token_lengths.is_empty() || constraint.is_some())
             && model.supports_snapshot_reuse();
         let mut effective_checkpoint_lengths = checkpoint_token_lengths.to_vec();
@@ -1487,7 +1499,6 @@ impl CxxGenerator {
         {
             effective_checkpoint_lengths.push(prompt_tokens.len());
         }
-        let prefill_tokens = &prompt_tokens[cached_tokens..];
         let (mut logits, mut prompt_snapshots) = if let Some(logits) = cached_logits {
             (logits, Vec::new())
         } else if retain_prompt_snapshot {

@@ -1524,6 +1524,14 @@ fn prefill_text_with_reuse(
     reuse: Option<MtpPrefixReuse<'_>>,
 ) -> Result<(crate::qwen3_5::Qwen35MtpPrefill, usize), String> {
     let Some(reuse) = reuse else {
+        tracing::info!(
+            phase = "prefill.started",
+            prompt_tokens = prompt_tokens.len(),
+            requested_cached_tokens = 0,
+            prefix_cached_tokens = 0,
+            prefill_start = 0,
+            prefill_tokens = prompt_tokens.len(),
+        );
         let prompt = mlxcel_core::from_slice_i32(
             prompt_tokens,
             &[1, i32::try_from(prompt_tokens.len()).unwrap_or(i32::MAX)],
@@ -1545,6 +1553,14 @@ fn prefill_text_with_reuse(
         {
             return Err("MTP response continuation token does not match the prompt".to_string());
         }
+        tracing::info!(
+            phase = "prefill.started",
+            prompt_tokens = prompt_tokens.len(),
+            requested_cached_tokens = reuse.cached_tokens,
+            prefix_cached_tokens = reuse.cached_tokens,
+            prefill_start = reuse.cached_tokens,
+            prefill_tokens = 0,
+        );
         return Ok((
             crate::qwen3_5::Qwen35MtpPrefill {
                 hidden: mlxcel_core::copy(&reuse.snapshot.last_hidden),
@@ -1554,6 +1570,14 @@ fn prefill_text_with_reuse(
         ));
     }
     if reuse.cached_tokens == prompt_tokens.len() {
+        tracing::info!(
+            phase = "prefill.started",
+            prompt_tokens = prompt_tokens.len(),
+            requested_cached_tokens = reuse.cached_tokens,
+            prefix_cached_tokens = reuse.cached_tokens,
+            prefill_start = reuse.cached_tokens,
+            prefill_tokens = 0,
+        );
         return Ok((
             crate::qwen3_5::Qwen35MtpPrefill {
                 hidden: mlxcel_core::copy(&reuse.snapshot.last_hidden),
@@ -1564,6 +1588,14 @@ fn prefill_text_with_reuse(
     }
 
     let suffix = &prompt_tokens[reuse.cached_tokens..];
+    tracing::info!(
+        phase = "prefill.started",
+        prompt_tokens = prompt_tokens.len(),
+        requested_cached_tokens = reuse.cached_tokens,
+        prefix_cached_tokens = reuse.cached_tokens,
+        prefill_start = reuse.cached_tokens,
+        prefill_tokens = suffix.len(),
+    );
     let suffix_ids = mlxcel_core::from_slice_i32(
         suffix,
         &[1, i32::try_from(suffix.len()).unwrap_or(i32::MAX)],
@@ -1759,16 +1791,38 @@ fn capture_mtp_final_snapshot(
     drafter: &Qwen35MtpDraftModel,
     prompt_tokens: &[i32],
     prefill_input: MtpPrefill<'_>,
+    prefix_reuse: Option<MtpPrefixReuse<'_>>,
     generated: &[i32],
 ) -> Result<Option<MtpPromptSnapshot>, String> {
     let Some(&first_token) = generated.first() else {
         return Ok(None);
     };
-    let prefill = prefill_for_input(model, drafter, prefill_input)?;
+    let snapshot_start = Instant::now();
+    tracing::info!(
+        phase = "mtp.final_snapshot.started",
+        prompt_tokens = prompt_tokens.len(),
+        generated_tokens = generated.len(),
+        prefix_cached_tokens = prefix_reuse.map_or(0, |reuse| reuse.cached_tokens),
+    );
+    // Preserve prefix reuse for final-state capture; rebuilding the whole prompt
+    // here delays the terminal response after streamed output has finished.
+    let prefill = match prefix_reuse {
+        Some(reuse) => prefill_text_with_reuse(model, drafter, prompt_tokens, Some(reuse))?.0,
+        None => prefill_for_input(model, drafter, prefill_input)?,
+    };
     if generated.len() == 1 {
-        return capture_mtp_prompt_snapshot(model, drafter, prompt_tokens.len(), &prefill)
+        let snapshot = capture_mtp_prompt_snapshot(model, drafter, prompt_tokens.len(), &prefill)
             .map(Some)
-            .ok_or_else(|| "failed to capture aligned MTP final snapshot".to_string());
+            .ok_or_else(|| "failed to capture aligned MTP final snapshot".to_string())?;
+        tracing::info!(
+            phase = "mtp.final_snapshot.complete",
+            token_len = snapshot
+                .as_ref()
+                .expect("MTP final snapshot must be present")
+                .token_len(),
+            elapsed_seconds = snapshot_start.elapsed().as_secs_f64(),
+        );
+        return Ok(snapshot);
     }
 
     let _ = finish_drafter_prefill(model, drafter, prefill_input, prefill, first_token);
@@ -1808,10 +1862,19 @@ fn capture_mtp_final_snapshot(
     let target = model
         .snapshot_sequence_state(mlxcel_core::cache::SequenceId::from_raw(0), token_len)
         .ok_or_else(|| "failed to capture aligned MTP target state".to_string())?;
-    drafter
+    let snapshot = drafter
         .capture_prompt_snapshot(target, token_len, &last_hidden, &continuation_logits)
         .map(Some)
-        .ok_or_else(|| "failed to capture aligned MTP final snapshot".to_string())
+        .ok_or_else(|| "failed to capture aligned MTP final snapshot".to_string())?;
+    tracing::info!(
+        phase = "mtp.final_snapshot.complete",
+        token_len = snapshot
+            .as_ref()
+            .expect("MTP final snapshot must be present")
+            .token_len(),
+        elapsed_seconds = snapshot_start.elapsed().as_secs_f64(),
+    );
+    Ok(snapshot)
 }
 
 pub(crate) struct Qwen35MtpGenerator;
@@ -1936,7 +1999,8 @@ impl Qwen35MtpGenerator {
         let drafter = model
             .mtp()
             .expect("Qwen35MtpGenerator requires a bundled MTP head");
-        let continuation_token = prefix_reuse.and_then(|reuse| reuse.continuation_token);
+        let final_prefix_reuse = prefix_reuse;
+        let continuation_token = final_prefix_reuse.and_then(|reuse| reuse.continuation_token);
         let mut sampling = sampling.clone();
         sampling
             .token_bias
@@ -2183,7 +2247,14 @@ impl Qwen35MtpGenerator {
         }
         mtp_stats.decode_time = decode_start.elapsed();
         let final_snapshot = if matches!(prefill_input, MtpPrefill::Text { .. }) {
-            capture_mtp_final_snapshot(model, drafter, prompt_tokens, prefill_input, &generated)?
+            capture_mtp_final_snapshot(
+                model,
+                drafter,
+                prompt_tokens,
+                prefill_input,
+                final_prefix_reuse,
+                &generated,
+            )?
         } else {
             None
         };
@@ -2233,6 +2304,7 @@ impl Qwen35MtpGenerator {
         let mut generated = Vec::with_capacity(max_tokens);
         let mut stats = MtpGenerationStats::default();
         let mut stop_reason = GenerationStopReason::MaxTokens;
+        let final_prefix_reuse = prefix_reuse;
         let mut prefix_reuse = prefix_reuse;
         let mut prompt_snapshots = Vec::new();
         let mut cached_tokens = 0;
@@ -2298,6 +2370,7 @@ impl Qwen35MtpGenerator {
                         drafter,
                         prompt_tokens,
                         prefill_input,
+                        final_prefix_reuse,
                         &generated,
                     )?
                 } else {
@@ -2322,6 +2395,7 @@ impl Qwen35MtpGenerator {
                         drafter,
                         prompt_tokens,
                         prefill_input,
+                        final_prefix_reuse,
                         &generated,
                     )?
                 } else {
@@ -2533,7 +2607,14 @@ impl Qwen35MtpGenerator {
         }
 
         let final_snapshot = if matches!(prefill_input, MtpPrefill::Text { .. }) {
-            capture_mtp_final_snapshot(model, drafter, prompt_tokens, prefill_input, &generated)?
+            capture_mtp_final_snapshot(
+                model,
+                drafter,
+                prompt_tokens,
+                prefill_input,
+                final_prefix_reuse,
+                &generated,
+            )?
         } else {
             None
         };

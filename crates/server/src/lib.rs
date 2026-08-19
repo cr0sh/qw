@@ -366,8 +366,10 @@ impl SseState {
                     self.guard.armed = false;
                 }
                 None => {
-                    error!(phase = "response.stream_worker_closed");
-                    self.guard.cancelled.store(true, Ordering::Release);
+                    if self.guard.armed {
+                        error!(phase = "response.stream_worker_closed");
+                        self.guard.cancelled.store(true, Ordering::Release);
+                    }
                     return None;
                 }
             }

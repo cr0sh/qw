@@ -841,6 +841,7 @@ async fn structured_tracing_covers_request_stream_error_and_cancellation_without
     }
     assert!(!traces.contains(SECRET_PROMPT), "{traces}");
     assert!(!traces.contains(SECRET_ARGUMENTS), "{traces}");
+    assert!(!traces.contains("response.stream_worker_closed"), "{traces}");
 }
 
 #[test]
