@@ -1395,6 +1395,17 @@ mod tests {
             warm_ttft < cold_ttft,
             "warm suffix prefill must reduce TTFT: cold={cold_ttft:?}, warm={warm_ttft:?}"
         );
+        assert_eq!(
+            warm.final_snapshot
+                .as_ref()
+                .expect("warm generation must capture a final snapshot")
+                .token_len(),
+            cold.final_snapshot
+                .as_ref()
+                .expect("cold generation must capture a final snapshot")
+                .token_len(),
+            "prefix reuse must preserve the final snapshot boundary",
+        );
     }
 
     #[test]
