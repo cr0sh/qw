@@ -1410,6 +1410,128 @@ mod tests {
 
     #[test]
     #[ignore = "requires QW_BENCH_MODEL pointing at a real bundled-MTP checkpoint"]
+    fn real_model_mtp_prefix_reuse_covers_reasoning_and_plain_history() {
+        let model_dir = std::env::var_os("QW_BENCH_MODEL")
+            .map(PathBuf::from)
+            .expect("QW_BENCH_MODEL must point at a real checkpoint");
+        let mut provider = Qwen35Provider::load(&model_dir, KVCacheMode::Turbo4)
+            .expect("load real bundled-MTP checkpoint");
+        let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
+        let user = |content: &str| ChatMessage {
+            role: "user".to_string(),
+            name: None,
+            content: Some(ChatMessageContent::Text(content.to_string())),
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        };
+        let history_for = |reasoning: Option<&str>| {
+            vec![
+                user("Explain why prefix caching is token based."),
+                ChatMessage {
+                    role: "assistant".to_string(),
+                    name: None,
+                    content: Some(ChatMessageContent::Text(
+                        "The cache compares the rendered token prefix.".to_string(),
+                    )),
+                    reasoning_content: reasoning.map(str::to_string),
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                },
+            ]
+        };
+
+        for reasoning in [None, Some("I should answer precisely and briefly.")] {
+            let history = history_for(reasoning);
+            let history_ids = provider
+                .tokenize_history(&history, &[], None, true)
+                .expect("tokenize history");
+            let mut next_turn = history.clone();
+            next_turn.push(user("Now compare this with a plain history."));
+            let next_ids = provider
+                .tokenize_messages(&next_turn, &[], None, true)
+                .expect("tokenize next turn");
+            assert!(
+                history_ids.len() < next_ids.len(),
+                "next turn must extend the history checkpoint"
+            );
+
+            let checkpoint = provider
+                .generate_mtp_streaming(
+                    &history_ids,
+                    1,
+                    &sampling,
+                    DEFAULT_MTP_BLOCK_SIZE,
+                    None,
+                    &[history_ids.len()],
+                    None,
+                    |_| true,
+                )
+                .expect("capture reasoning-aware history snapshot");
+            let PromptSnapshot::Mtp(snapshot) = checkpoint
+                .prompt_snapshots
+                .into_iter()
+                .next()
+                .expect("history checkpoint snapshot")
+            else {
+                panic!("expected an MTP history checkpoint");
+            };
+
+            let reused = provider
+                .generate_mtp_streaming(
+                    &next_ids,
+                    1,
+                    &sampling,
+                    DEFAULT_MTP_BLOCK_SIZE,
+                    Some(MtpPrefixReuse {
+                        snapshot: &snapshot,
+                        cached_tokens: history_ids.len(),
+                        continuation_token: None,
+                    }),
+                    &[next_ids.len()],
+                    None,
+                    |_| true,
+                )
+                .expect("reuse reasoning-aware history snapshot");
+            assert_eq!(
+                reused.cached_tokens,
+                history_ids.len(),
+                "exactly replayed reasoning/plain history must be reusable"
+            );
+            eprintln!(
+                "MTP reasoning-prefix benchmark: reasoning={}, history_tokens={}, cached_tokens={}",
+                reasoning.is_some(),
+                history_ids.len(),
+                reused.cached_tokens,
+            );
+        }
+
+        let with_reasoning = provider
+            .tokenize_history(&history_for(Some("private trace")), &[], None, true)
+            .expect("tokenize history with reasoning");
+        let without_reasoning = provider
+            .tokenize_history(&history_for(None), &[], None, true)
+            .expect("tokenize history without reasoning");
+        let common_prefix = with_reasoning
+            .iter()
+            .zip(&without_reasoning)
+            .take_while(|(left, right)| left == right)
+            .count();
+        eprintln!(
+            "MTP reasoning-prefix boundary: common_tokens={}, with_reasoning={}, without_reasoning={}",
+            common_prefix,
+            with_reasoning.len(),
+            without_reasoning.len(),
+        );
+        assert!(common_prefix > 0);
+        assert!(
+            common_prefix < with_reasoning.len().min(without_reasoning.len()),
+            "omitting reasoning must create a cache boundary at the rendered divergence"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires QW_BENCH_MODEL pointing at a real bundled-MTP checkpoint"]
     fn real_model_mtp_max_output_has_bounded_terminal_tail() {
         let model_dir = std::env::var_os("QW_BENCH_MODEL")
             .map(PathBuf::from)
