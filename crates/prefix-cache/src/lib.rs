@@ -25,6 +25,7 @@ use trie::{RadixTrie, Terminal};
 const INITIAL_TTL_MS: u64 = 2 * 60 * 60 * 1000;
 const MAX_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 const IO_QUEUE_CAPACITY: usize = 64;
+const MAX_CHECKPOINT_INTERVAL: usize = 256;
 pub trait Clock: Send {
     fn now_unix_ms(&self) -> u64;
 }
@@ -323,9 +324,10 @@ impl AdaptivePrefixCache {
             .copied()
             .filter(|length| *length > 0 && *length <= tokens.len())
             .collect::<Vec<_>>();
-        if !lengths.contains(&tokens.len()) {
-            lengths.push(tokens.len());
-        }
+        lengths.extend(
+            (MAX_CHECKPOINT_INTERVAL..=tokens.len()).step_by(MAX_CHECKPOINT_INTERVAL),
+        );
+        lengths.push(tokens.len());
         let structural =
             self.trie
                 .path(tokens, route)
@@ -345,7 +347,7 @@ impl AdaptivePrefixCache {
                 .copied()
                 .filter(|length| *length <= common)
                 .max()
-                .unwrap_or((common / 256) * 256);
+                .unwrap_or((common / MAX_CHECKPOINT_INTERVAL) * MAX_CHECKPOINT_INTERVAL);
             if boundary > 0 {
                 lengths.push(boundary);
             }
