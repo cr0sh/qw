@@ -253,6 +253,10 @@ pub struct ControlledGeneration {
     pub token_ids: Vec<i32>,
     pub stop_reason: GenerationStopReason,
     pub prompt_snapshots: Vec<ModelStateSnapshot>,
+    /// Longest reusable state aligned with the accepted sequence. The final
+    /// accepted token is normally left unforwarded and is predicted by the
+    /// attached continuation logits.
+    pub final_snapshot: Option<ModelStateSnapshot>,
     pub cached_tokens: usize,
 }
 
@@ -451,21 +455,34 @@ fn chunked_prefill_last_logits<M: LanguageModel + ?Sized>(
     logits.expect("chunked_prefill_last_logits requires a non-empty prompt")
 }
 
-fn prefill_with_prefix_snapshots<M: LanguageModel + ?Sized>(
+fn prefill_with_checkpoints<M: LanguageModel + ?Sized>(
     model: &M,
     caches: &mut [KVCache],
     prompt_tokens: &[i32],
     cached_tokens: usize,
+    checkpoint_token_lengths: &[usize],
     sequence_id: SequenceId,
 ) -> (UniquePtr<MlxArray>, Vec<ModelStateSnapshot>) {
-    let mut snapshots = Vec::with_capacity(prompt_tokens.len().saturating_sub(cached_tokens));
+    let requested = checkpoint_token_lengths
+        .iter()
+        .copied()
+        .filter(|&length| length > cached_tokens);
+    let mut snapshots = Vec::with_capacity(requested.clone().count());
     let mut logits = None;
-    for (offset, &token) in prompt_tokens[cached_tokens..].iter().enumerate() {
-        let input = ffi::from_slice_i32(&[token], &[1, 1]);
-        let piece_logits = model.forward_last_logits(&input, caches, None, 0);
+    let mut range_start = cached_tokens;
+
+    for range_end in requested.chain(std::iter::once(prompt_tokens.len())) {
+        if range_end <= range_start {
+            continue;
+        }
+        let piece = &prompt_tokens[range_start..range_end];
+        let input = ffi::from_slice_i32(piece, &[1, piece.len() as i32]);
+        let piece_logits =
+            model.forward_last_logits(&input, caches, None, piece.len().saturating_sub(1));
         ffi::eval(&piece_logits);
-        let token_len = cached_tokens + offset + 1;
-        if let Some(mut snapshot) = model.snapshot_sequence_state(sequence_id, token_len) {
+        if checkpoint_token_lengths.binary_search(&range_end).is_ok()
+            && let Some(mut snapshot) = model.snapshot_sequence_state(sequence_id, range_end)
+        {
             snapshot.set_continuation_logits(
                 piece_logits
                     .as_ref()
@@ -474,9 +491,11 @@ fn prefill_with_prefix_snapshots<M: LanguageModel + ?Sized>(
             snapshots.push(snapshot);
         }
         logits = Some(piece_logits);
+        range_start = range_end;
     }
+
     (
-        logits.expect("prefix snapshot prefill requires uncached prompt tokens"),
+        logits.expect("checkpoint prefill requires uncached prompt tokens"),
         snapshots,
     )
 }
@@ -1412,7 +1431,7 @@ impl CxxGenerator {
         max_tokens: usize,
         sampling: &SamplingConfig,
         mut constraint: Option<&mut dyn TokenConstraint>,
-        capture_prompt_snapshot: bool,
+        checkpoint_token_lengths: &[usize],
         mut on_token: F,
     ) -> Result<ControlledGeneration, String> {
         if prompt_tokens.is_empty() {
@@ -1420,6 +1439,18 @@ impl CxxGenerator {
         }
         if max_tokens == 0 {
             return Err("max_tokens must be greater than zero".to_string());
+        }
+        if checkpoint_token_lengths
+            .iter()
+            .any(|&length| length == 0 || length > prompt_tokens.len())
+            || checkpoint_token_lengths
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(
+                "checkpoint token lengths must be sorted, unique, and within the prompt"
+                    .to_string(),
+            );
         }
 
         self.reset_with_model(model);
@@ -1449,16 +1480,24 @@ impl CxxGenerator {
             }
         }
         let retain_prompt_snapshot =
-            (capture_prompt_snapshot || constraint.is_some()) && model.supports_snapshot_reuse();
+            (!checkpoint_token_lengths.is_empty() || constraint.is_some())
+                && model.supports_snapshot_reuse();
+        let mut effective_checkpoint_lengths = checkpoint_token_lengths.to_vec();
+        if constraint.is_some()
+            && effective_checkpoint_lengths.last().copied() != Some(prompt_tokens.len())
+        {
+            effective_checkpoint_lengths.push(prompt_tokens.len());
+        }
         let prefill_tokens = &prompt_tokens[cached_tokens..];
         let (mut logits, mut prompt_snapshots) = if let Some(logits) = cached_logits {
             (logits, Vec::new())
         } else if retain_prompt_snapshot {
-            prefill_with_prefix_snapshots(
+            prefill_with_checkpoints(
                 model,
                 &mut self.caches,
                 prompt_tokens,
                 cached_tokens,
+                &effective_checkpoint_lengths,
                 sequence_id,
             )
         } else {
@@ -1482,7 +1521,11 @@ impl CxxGenerator {
             (logits, Vec::new())
         };
         ffi::eval(&logits);
-        if retain_prompt_snapshot && prompt_snapshots.is_empty() {
+        if retain_prompt_snapshot
+            && prompt_snapshots
+                .iter()
+                .all(|snapshot| snapshot.token_len() != prompt_tokens.len())
+        {
             if let Some(mut snapshot) =
                 model.snapshot_sequence_state(sequence_id, prompt_tokens.len())
             {
@@ -1500,6 +1543,7 @@ impl CxxGenerator {
         let mut token_history = initial_token_history(prompt_tokens, needs_history);
         let mut sampler_state: Option<SamplerState> = None;
         let mut stop_reason = GenerationStopReason::MaxTokens;
+        let mut aligned_token_len = prompt_tokens.len();
 
         while self.generated_tokens.len() < max_tokens {
             let constrained_logits;
@@ -1533,6 +1577,7 @@ impl CxxGenerator {
                         }
                         sampler_state = None;
                         logits = self.replay_constraint_output(model, prompt_snapshots.last())?;
+                        aligned_token_len = prompt_tokens.len() + self.generated_tokens.len();
                         if commit.tokens.last().is_some_and(|&token| !on_token(token)) {
                             stop_reason = GenerationStopReason::CallbackCancelled;
                             break;
@@ -1596,6 +1641,7 @@ impl CxxGenerator {
             if replay {
                 sampler_state = None;
                 logits = self.replay_constraint_output(model, prompt_snapshots.last())?;
+                aligned_token_len = prompt_tokens.len() + self.generated_tokens.len();
             }
             if !on_token(token_id) {
                 stop_reason = GenerationStopReason::CallbackCancelled;
@@ -1619,16 +1665,54 @@ impl CxxGenerator {
 
             let next_input = ffi::reshape_token_for_forward(&token);
             logits = model.forward_last_logits(&next_input, &mut self.caches, None, 0);
+            aligned_token_len += 1;
         }
+
+        if !self.generated_tokens.is_empty() {
+            let final_token_len = prompt_tokens.len() + self.generated_tokens.len() - 1;
+            if aligned_token_len != final_token_len {
+                let accepted_tokens = self.generated_tokens.clone();
+                let mut aligned_tokens = Vec::with_capacity(final_token_len);
+                aligned_tokens.extend_from_slice(prompt_tokens);
+                aligned_tokens.extend_from_slice(&accepted_tokens[..accepted_tokens.len() - 1]);
+                self.reset_with_model(model);
+                self.generated_tokens = accepted_tokens;
+                let input =
+                    ffi::from_slice_i32(&aligned_tokens, &[1, aligned_tokens.len() as i32]);
+                logits = model.forward_last_logits(
+                    &input,
+                    &mut self.caches,
+                    None,
+                    aligned_tokens.len().saturating_sub(1),
+                );
+                ffi::eval(&logits);
+                aligned_token_len = final_token_len;
+            }
+        }
+
+        let final_snapshot = (!self.generated_tokens.is_empty()
+            && model.supports_snapshot_reuse())
+        .then(|| model.snapshot_sequence_state(sequence_id, aligned_token_len))
+        .flatten()
+        .map(|mut snapshot| {
+            snapshot.set_continuation_logits(
+                logits
+                    .as_ref()
+                    .expect("generation logits must not be null"),
+            );
+            snapshot
+        });
+        prompt_snapshots.retain(|snapshot| {
+            checkpoint_token_lengths
+                .binary_search(&snapshot.token_len())
+                .is_ok()
+        });
 
         Ok(ControlledGeneration {
             token_ids: self.generated_tokens.clone(),
             stop_reason,
-            prompt_snapshots: if capture_prompt_snapshot {
-                prompt_snapshots
-            } else {
-                Vec::new()
-            },
+            prompt_snapshots,
+            final_snapshot,
             cached_tokens,
         })
     }
@@ -1651,7 +1735,6 @@ impl CxxGenerator {
         max_tokens: usize,
         sampling: &SamplingConfig,
         mut constraint: Option<&mut dyn TokenConstraint>,
-        capture_prompt_snapshot: bool,
         mut on_token: F,
     ) -> Result<ControlledGeneration, String> {
         if prompt_tokens.is_empty() {
@@ -1733,7 +1816,7 @@ impl CxxGenerator {
             model.after_prefill();
         }
         let retain_prompt_snapshot =
-            (capture_prompt_snapshot || constraint.is_some()) && model.supports_snapshot_reuse();
+            constraint.is_some() && model.supports_snapshot_reuse();
         let mut prompt_snapshot = retain_prompt_snapshot
             .then(|| model.snapshot_sequence_state(sequence_id, prompt_tokens.len()))
             .flatten();
@@ -1874,11 +1957,8 @@ impl CxxGenerator {
         Ok(ControlledGeneration {
             token_ids: self.generated_tokens.clone(),
             stop_reason,
-            prompt_snapshots: capture_prompt_snapshot
-                .then_some(prompt_snapshot)
-                .flatten()
-                .into_iter()
-                .collect(),
+            prompt_snapshots: Vec::new(),
+            final_snapshot: None,
             cached_tokens,
         })
     }
@@ -2991,15 +3071,22 @@ mod tests {
             _caches: &mut [KVCache],
             _mask: Option<&MlxArray>,
         ) -> UniquePtr<MlxArray> {
-            // Return logits where the token ID position has the highest value.
-            // Input shape: [1, 1], output shape: [1, 1, 4] (vocab=4)
+            // Return one logits row per input token, with that token ID's
+            // vocabulary position winning.
             ffi::eval(input_ids);
-            let tok = ffi::item_i32(input_ids);
-            let mut logits = vec![0.0f32; 4];
-            if tok >= 0 && (tok as usize) < 4 {
-                logits[tok as usize] = 10.0;
+            let tokens = ffi::array_to_raw_bytes(input_ids)
+                .chunks_exact(4)
+                .map(|bytes| i32::from_ne_bytes(bytes.try_into().expect("i32 token bytes")))
+                .collect::<Vec<_>>();
+            let mut logits = Vec::with_capacity(tokens.len() * 4);
+            for token in tokens {
+                let mut row = [0.0f32; 4];
+                if token >= 0 && (token as usize) < row.len() {
+                    row[token as usize] = 10.0;
+                }
+                logits.extend_from_slice(&row);
             }
-            ffi::from_slice_f32(&logits, &[1, 1, 4])
+            ffi::from_slice_f32(&logits, &[1, (logits.len() / 4) as i32, 4])
         }
 
         fn make_caches(&self) -> Vec<KVCache> {
@@ -3908,7 +3995,7 @@ mod tests {
                 1,
                 &sampling,
                 Some(&mut constraint),
-                false,
+                &[],
                 |_| true,
             )
             .expect("constrained generation");
@@ -3928,7 +4015,7 @@ mod tests {
                 1,
                 &sampling,
                 None,
-                true,
+                &[2, 3, 5],
                 |_| true,
             )
             .expect("warm generation");
@@ -3938,11 +4025,11 @@ mod tests {
                 .iter()
                 .map(ModelStateSnapshot::token_len)
                 .collect::<Vec<_>>(),
-            vec![1, 2, 3, 4, 5]
+            vec![2, 3, 5]
         );
 
         let reuse = PrefixReuse {
-            snapshot: &warmed.prompt_snapshots[2],
+            snapshot: &warmed.prompt_snapshots[1],
             cached_tokens: 3,
         };
         let divergent = generator
@@ -3953,13 +4040,26 @@ mod tests {
                 1,
                 &sampling,
                 None,
-                true,
+                &[4],
                 |_| true,
             )
             .expect("divergent generation");
         assert_eq!(divergent.cached_tokens, 3);
         assert_eq!(divergent.prompt_snapshots.len(), 1);
         assert_eq!(divergent.prompt_snapshots[0].token_len(), 4);
+        let cold = CxxGenerator::new(1)
+            .generate_streaming_controlled(
+                &StubModel,
+                &[1, 2, 3, 0],
+                None,
+                1,
+                &sampling,
+                None,
+                &[],
+                |_| true,
+            )
+            .expect("cold divergent generation");
+        assert_eq!(divergent.token_ids, cold.token_ids);
     }
 
     #[test]
@@ -3973,7 +4073,7 @@ mod tests {
                 8,
                 &SamplingConfig::greedy(),
                 Some(&mut constraint),
-                false,
+                &[],
                 |_| true,
             )
             .expect("spliced controlled generation");
@@ -3998,7 +4098,7 @@ mod tests {
                 4,
                 &sampling,
                 None,
-                false,
+                &[],
                 |_| {
                     emissions += 1;
                     false
@@ -4011,6 +4111,9 @@ mod tests {
             result.stop_reason,
             GenerationStopReason::CallbackCancelled
         );
+        let final_snapshot = result.final_snapshot.expect("cancelled final snapshot");
+        assert_eq!(final_snapshot.token_len(), 1);
+        assert!(final_snapshot.continuation_logits().is_some());
     }
 
     #[test]
@@ -4028,7 +4131,6 @@ mod tests {
                 3,
                 &SamplingConfig::greedy(),
                 None,
-                false,
                 |_| true,
             )
             .expect("embedding generation");
@@ -4052,7 +4154,6 @@ mod tests {
                 1,
                 &SamplingConfig::greedy(),
                 Some(&mut constraint),
-                false,
                 |_| true,
             )
             .expect("constrained embedding generation");
@@ -4074,7 +4175,6 @@ mod tests {
                 4,
                 &SamplingConfig::greedy(),
                 None,
-                false,
                 |_| {
                     emissions += 1;
                     false
@@ -4100,7 +4200,7 @@ mod tests {
                 2,
                 &SamplingConfig::greedy(),
                 None,
-                false,
+                &[],
                 |_| true,
             )
             .expect("token controlled generation");

@@ -67,6 +67,7 @@ pub struct BaselineGeneration {
     pub cached_tokens: usize,
     pub finish_outcome: GenerationStopReason,
     pub prompt_snapshots: Vec<PromptSnapshot>,
+    pub final_snapshot: Option<PromptSnapshot>,
     /// Wall time strictly after the first sampled token.
     #[doc(hidden)]
     pub decode_time: Duration,
@@ -271,7 +272,7 @@ impl Qwen35Provider {
         enable_thinking: bool,
     ) -> Result<String> {
         self.chat_template
-            .render_messages(messages, tools, reasoning_effort, enable_thinking)
+            .render_messages(messages, tools, reasoning_effort, enable_thinking, true)
     }
 
     #[tracing::instrument(
@@ -311,6 +312,41 @@ impl Qwen35Provider {
             prompt_tokens = prompt_ids.len(),
         );
         Ok(prompt_ids)
+    }
+
+    /// Tokenize the same message list without the assistant generation marker.
+    ///
+    /// The result is a stable history checkpoint only when it is an exact
+    /// prefix of [`Self::tokenize_messages`]' ordinary prompt.
+    pub fn tokenize_history(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ChatTool],
+        reasoning_effort: Option<&str>,
+        enable_thinking: bool,
+    ) -> Result<Vec<i32>> {
+        let rendered = self.chat_template.render_messages(
+            messages,
+            tools,
+            reasoning_effort,
+            enable_thinking,
+            false,
+        )?;
+        let encoded = self
+            .tokenizer
+            .encode(rendered, true)
+            .map_err(anyhow::Error::msg)
+            .context("failed to tokenize rendered message history")?;
+        let token_ids = encoded
+            .get_ids()
+            .iter()
+            .map(|&token| token as i32)
+            .collect::<Vec<_>>();
+        ensure!(
+            !token_ids.is_empty(),
+            "rendered message history tokenized to an empty sequence"
+        );
+        Ok(token_ids)
     }
 
     #[tracing::instrument(
@@ -461,7 +497,7 @@ impl Qwen35Provider {
         sampling: &SamplingConfig,
         prefix_reuse: Option<PrefixReuse<'_>>,
         constraint: Option<&mut dyn TokenConstraint>,
-        capture_prompt_snapshot: bool,
+        checkpoint_token_lengths: &[usize],
         mut on_delta: F,
     ) -> Result<BaselineGeneration> {
         self.model.clear_prepared_mrope();
@@ -479,7 +515,7 @@ impl Qwen35Provider {
                 max_tokens,
                 sampling,
                 constraint,
-                capture_prompt_snapshot,
+                checkpoint_token_lengths,
                 |token_id| {
                     decode_start.get_or_insert_with(Instant::now);
                     if buffer_output {
@@ -544,6 +580,7 @@ impl Qwen35Provider {
                 .into_iter()
                 .map(PromptSnapshot::Baseline)
                 .collect(),
+            final_snapshot: controlled.final_snapshot.map(PromptSnapshot::Baseline),
             decode_time,
         })
     }
@@ -585,7 +622,6 @@ impl Qwen35Provider {
                 max_tokens,
                 sampling,
                 constraint,
-                false,
                 |token_id| {
                     decode_start.get_or_insert_with(Instant::now);
                     if buffer_output {
@@ -639,6 +675,7 @@ impl Qwen35Provider {
             cached_tokens: 0,
             finish_outcome: controlled.stop_reason,
             prompt_snapshots: Vec::new(),
+            final_snapshot: None,
             decode_time: decode_start.map_or(Duration::ZERO, |start| start.elapsed()),
         })
     }
@@ -650,7 +687,7 @@ impl Qwen35Provider {
         sampling: &SamplingConfig,
         block_size: usize,
         prefix_reuse: Option<MtpPrefixReuse<'_>>,
-        capture_prompt_snapshot: bool,
+        checkpoint_token_lengths: &[usize],
         constraint: Option<&mut dyn TokenConstraint>,
         on_delta: F,
     ) -> Result<BaselineGeneration> {
@@ -660,7 +697,7 @@ impl Qwen35Provider {
             sampling,
             block_size,
             prefix_reuse,
-            capture_prompt_snapshot,
+            checkpoint_token_lengths,
             constraint,
             on_delta,
         )
@@ -682,7 +719,7 @@ impl Qwen35Provider {
             sampling,
             block_size,
             None,
-            false,
+            &[],
             constraint,
             on_delta,
         )
@@ -702,7 +739,7 @@ impl Qwen35Provider {
         sampling: &SamplingConfig,
         block_size: usize,
         prefix_reuse: Option<MtpPrefixReuse<'_>>,
-        capture_prompt_snapshot: bool,
+        checkpoint_token_lengths: &[usize],
         constraint: Option<&mut dyn TokenConstraint>,
         mut on_delta: F,
     ) -> Result<(BaselineGeneration, MtpGenerationStats)> {
@@ -731,7 +768,7 @@ impl Qwen35Provider {
                 sampling,
                 block_size,
                 prefix_reuse,
-                capture_prompt_snapshot,
+                checkpoint_token_lengths,
                 constraint,
                 |token_id| {
                     if buffer_output {
@@ -836,10 +873,11 @@ impl Qwen35Provider {
                 cached_tokens: generated.cached_tokens,
                 finish_outcome: generated.stop_reason,
                 prompt_snapshots: generated
-                    .prompt_snapshot
-                    .map(PromptSnapshot::Mtp)
+                    .prompt_snapshots
                     .into_iter()
+                    .map(PromptSnapshot::Mtp)
                     .collect(),
+                final_snapshot: generated.final_snapshot.map(PromptSnapshot::Mtp),
                 decode_time: generated.stats.decode_time,
             },
             generated.stats,
@@ -879,7 +917,7 @@ impl Qwen35Provider {
                 &sampling,
                 None,
                 None,
-                false,
+                &[],
                 on_delta,
             )?;
             return Ok((
@@ -899,7 +937,7 @@ impl Qwen35Provider {
             &sampling,
             DEFAULT_MTP_BLOCK_SIZE,
             None,
-            false,
+            &[],
             None,
             on_delta,
         )?;
@@ -929,7 +967,7 @@ impl Qwen35Provider {
                 &sampling,
                 None,
                 None,
-                false,
+                &[],
                 on_delta,
             )?;
             return Ok((
@@ -949,7 +987,7 @@ impl Qwen35Provider {
             &sampling,
             DEFAULT_MTP_BLOCK_SIZE,
             None,
-            false,
+            &[],
             None,
             on_delta,
         )?;
@@ -1289,7 +1327,7 @@ mod tests {
                 &sampling,
                 DEFAULT_MTP_BLOCK_SIZE,
                 None,
-                false,
+                &[],
                 None,
                 |_| {
                     cold_ttft.get_or_insert_with(|| cold_started.elapsed());
@@ -1305,7 +1343,7 @@ mod tests {
                 &sampling,
                 DEFAULT_MTP_BLOCK_SIZE,
                 None,
-                true,
+                &[base_ids.len()],
                 None,
                 |_| true,
             )
@@ -1330,7 +1368,7 @@ mod tests {
                     snapshot: &snapshot,
                     cached_tokens: base_ids.len(),
                 }),
-                true,
+                &[full_ids.len()],
                 None,
                 |_| {
                     warm_ttft.get_or_insert_with(|| warm_started.elapsed());
