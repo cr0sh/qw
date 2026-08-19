@@ -220,6 +220,37 @@ fn radix_divergence_promotes_second_observation_and_selects_longest_snapshot() {
 }
 
 #[test]
+fn divergent_long_prefix_reuses_latest_regular_checkpoint() {
+    let clock = ManualClock::new(1_000);
+    let mut cache = AdaptivePrefixCache::with_store_and_clock(
+        namespaces(),
+        memory_config(1_000_000),
+        Box::new(EmptyStore),
+        Box::new(clock),
+    )
+    .expect("cache");
+    let prompt = (0..1_024).collect::<Vec<i32>>();
+    let checkpoint_lengths =
+        cache.checkpoint_lengths(&prompt, &[prompt.len()], SnapshotRoute::Baseline);
+    assert_eq!(checkpoint_lengths, vec![256, 512, 768, 1_024]);
+    cache.insert(
+        &prompt,
+        checkpoint_lengths
+            .into_iter()
+            .map(|token_len| snapshot(token_len, &[1.0, 2.0]))
+            .collect(),
+        SnapshotRoute::Baseline,
+    );
+
+    let mut divergent_prompt = prompt.clone();
+    divergent_prompt[900] = 10_000;
+    let hit = cache
+        .lookup(&divergent_prompt, SnapshotRoute::Baseline)
+        .expect("reusable checkpoint before divergence");
+    assert_eq!(hit.token_count, 768);
+}
+
+#[test]
 fn ttl_progression_expiry_and_byte_eviction_are_adaptive() {
     assert_eq!(
         (0..8).map(reuse_ttl_ms).collect::<Vec<_>>(),
