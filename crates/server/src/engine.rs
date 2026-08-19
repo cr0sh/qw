@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, ensure};
 use mlxcel_core::generate::{GenerationStopReason, PrefixReuse};
 use qw_prefix_cache::{
-    AdaptivePrefixCache, CacheConfig, CacheNamespaces,
+    AdaptivePrefixCache, CacheConfig, CacheNamespaces, ResponseResumeMetadata, ResumeLookupError,
     SnapshotRoute as CacheSnapshotRoute, namespace_hash,
 };
 #[cfg(test)]
@@ -21,7 +21,9 @@ use crate::grammar::GrammarFactory;
 #[cfg(test)]
 use crate::media::DecodedImage;
 
-use crate::protocol::{CompletionRequest, Endpoint, OutputFormat, ReasoningEffort, ToolChoice};
+use crate::protocol::{
+    CompletionRequest, Endpoint, OutputFormat, ReasoningEffort, ToolChoice, request_fingerprint,
+};
 use crate::tool_calls::{ToolCallGate, parse_assistant_output};
 
 const JOB_QUEUE_CAPACITY: usize = 8;
@@ -49,12 +51,6 @@ fn qwen_generation_route(
     }
 }
 
-fn route_uses_prefix_cache(route: QwenGenerationRoute) -> bool {
-    matches!(
-        route,
-        QwenGenerationRoute::BaselineText | QwenGenerationRoute::MtpText
-    )
-}
 fn cache_snapshot_route(route: QwenGenerationRoute) -> Option<CacheSnapshotRoute> {
     match route {
         QwenGenerationRoute::BaselineText => Some(CacheSnapshotRoute::Baseline),
@@ -109,6 +105,9 @@ pub struct CompletionRecord {
 pub enum FailureKind {
     InvalidRequest,
     Server,
+    ResumeMismatch,
+    ResumeNotFound,
+    ResumeUnsupported,
 }
 
 #[derive(Debug, Clone)]
@@ -126,7 +125,7 @@ pub enum WorkerDelta {
 
 #[derive(Debug)]
 pub enum WorkerEvent {
-    Started,
+    Started(Admission),
     Delta(WorkerDelta),
     Complete(CompletionRecord),
     Failed(WorkerFailure),
@@ -444,8 +443,17 @@ impl Engine {
             }
 
             let grammar = GrammarFactory::single_byte().expect("single-byte grammar factory");
+            #[derive(Clone)]
+            struct FakeResume {
+                admission: Admission,
+                fingerprint: String,
+                raw_text: String,
+                completion_tokens: usize,
+            }
+
+            let mut response_resumes = std::collections::HashMap::<String, FakeResume>::new();
             let mut cached_prompt: Option<String> = None;
-            while let Some(job) = jobs_rx.blocking_recv() {
+            while let Some(mut job) = jobs_rx.blocking_recv() {
                 let span = job.span.clone();
                 let _entered = span.enter();
                 info!(phase = "worker.accepted");
@@ -458,8 +466,49 @@ impl Engine {
                     );
                     continue;
                 }
+                let fingerprint = request_fingerprint(&job.request);
+                let mut resumed = None;
+                if let Some(response_id) = &job.request.resume_response_id {
+                    if !job.request.image_params.is_empty()
+                        || !matches!(job.request.output_format, OutputFormat::Text)
+                    {
+                        send_failure(
+                            &job,
+                            FailureKind::ResumeUnsupported,
+                            "response continuation supports only unconstrained text generation"
+                                .to_string(),
+                            Some("resume_response_id".to_string()),
+                        );
+                        continue;
+                    }
+                    let Some(checkpoint) = response_resumes.get(response_id).cloned() else {
+                        send_failure(
+                            &job,
+                            FailureKind::ResumeNotFound,
+                            "response continuation checkpoint was not found".to_string(),
+                            Some("resume_response_id".to_string()),
+                        );
+                        continue;
+                    };
+                    if checkpoint.fingerprint != fingerprint {
+                        send_failure(
+                            &job,
+                            FailureKind::ResumeMismatch,
+                            "resume request does not match the original request".to_string(),
+                            Some("resume_response_id".to_string()),
+                        );
+                        continue;
+                    }
+                    response_resumes.remove(response_id);
+                    job.admission = checkpoint.admission.clone();
+                    resumed = Some(checkpoint);
+                }
                 info!(phase = "generation.started");
-                if job.events.blocking_send(WorkerEvent::Started).is_err() {
+                if job
+                    .events
+                    .blocking_send(WorkerEvent::Started(job.admission.clone()))
+                    .is_err()
+                {
                     job.cancelled.store(true, Ordering::Release);
                     continue;
                 }
@@ -583,8 +632,23 @@ impl Engine {
                 .then_some("fake reasoning")
                 .unwrap_or_default();
                 let generated_text = format!("{reasoning}{THINK_CLOSE}\n\n{content}");
+                let interrupt = resumed.is_none()
+                    && latest_user.as_deref() == Some("resume-interrupt");
+                let emitted_text = if interrupt {
+                    format!("{THINK_CLOSE}\n\necho:resume-")
+                } else if let Some(checkpoint) = &resumed {
+                    generated_text
+                        .strip_prefix(&checkpoint.raw_text)
+                        .unwrap_or(&generated_text)
+                        .to_string()
+                } else {
+                    generated_text.clone()
+                };
                 let mut trace_parser = ReasoningTraceParser::default();
-                for fragment in generated_text.as_bytes().chunks(4) {
+                if let Some(checkpoint) = &resumed {
+                    let _ = trace_parser.feed(&checkpoint.raw_text);
+                }
+                for fragment in emitted_text.as_bytes().chunks(4) {
                     let fragment = String::from_utf8(fragment.to_vec()).expect("ASCII fake output");
                     for delta in trace_parser.feed(&fragment) {
                         if job.cancelled.load(Ordering::Acquire)
@@ -608,8 +672,24 @@ impl Engine {
                     info!(phase = "generation.cancelled");
                     continue;
                 }
+                if interrupt {
+                    response_resumes.insert(
+                        job.admission.response_id.clone(),
+                        FakeResume {
+                            admission: job.admission,
+                            fingerprint,
+                            raw_text: emitted_text,
+                            completion_tokens: "echo:resume-".len(),
+                        },
+                    );
+                    info!(phase = "generation.cancelled");
+                    continue;
+                }
                 cached_prompt = (!has_images && prompt.len() <= 16).then_some(prompt.clone());
-                let completion_tokens = if job.request.max_tokens == 1 {
+                let completion_tokens = if let Some(checkpoint) = &resumed {
+                    checkpoint.completion_tokens
+                        + content.len().saturating_sub(checkpoint.completion_tokens)
+                } else if job.request.max_tokens == 1 {
                     1
                 } else {
                     reasoning.len()
@@ -629,7 +709,11 @@ impl Engine {
                     tool_calls,
                     prompt_tokens: prompt.len(),
                     completion_tokens,
-                    cached_tokens,
+                    cached_tokens: if resumed.is_some() {
+                        cached_tokens.max(prompt.len())
+                    } else {
+                        cached_tokens
+                    },
                     finish_reason,
                     stream_include_usage: job.request.stream_include_usage,
                 };
@@ -759,6 +843,15 @@ impl QwenWorker {
         };
         let enable_thinking = job.request.enable_thinking && constraint.is_none();
         let has_images = !job.request.decoded_images.is_empty();
+        if job.request.resume_response_id.is_some() && (has_images || constraint.is_some()) {
+            send_failure(
+                &job,
+                FailureKind::ResumeUnsupported,
+                "response continuation supports only unconstrained text generation".to_string(),
+                Some("resume_response_id".to_string()),
+            );
+            return;
+        }
         if has_images && !self.provider.supports_image_inputs() {
             send_failure(
                 &job,
@@ -869,13 +962,6 @@ impl QwenWorker {
             image_count = prepared_images.len(),
             tool_count = effective_tools.len(),
         );
-        if job.events.blocking_send(WorkerEvent::Started).is_err() {
-            job.cancelled.store(true, Ordering::Release);
-            return;
-        }
-        if job.cancelled.load(Ordering::Acquire) {
-            return;
-        }
 
         let sampling = self.provider.baseline_sampling(
             job.request.temperature,
@@ -886,15 +972,140 @@ impl QwenWorker {
             self.provider.has_mtp() && std::env::var_os("QW_BENCH_DISABLE_MTP").is_none();
         let route = qwen_generation_route(mtp_available, has_images, constraint.is_some());
         let cache_route = cache_snapshot_route(route);
+        if job.request.resume_response_id.is_some() && cache_route.is_none() {
+            send_failure(
+                &job,
+                FailureKind::ResumeUnsupported,
+                "response continuation supports only unconstrained text generation".to_string(),
+                Some("resume_response_id".to_string()),
+            );
+            return;
+        }
+        let fingerprint = request_fingerprint(&job.request);
+        let resume_entry = if let Some(response_id) = &job.request.resume_response_id {
+            match self.prefix_cache.take_resume(
+                response_id,
+                &fingerprint,
+                cache_route.expect("text resume route has a cache namespace"),
+            ) {
+                Ok(entry) => Some(entry),
+                Err(ResumeLookupError::Mismatch) => {
+                    send_failure(
+                        &job,
+                        FailureKind::ResumeMismatch,
+                        "resume request does not match the original request".to_string(),
+                        Some("resume_response_id".to_string()),
+                    );
+                    return;
+                }
+                Err(ResumeLookupError::NotFound) => {
+                    send_failure(
+                        &job,
+                        FailureKind::ResumeNotFound,
+                        "response continuation checkpoint was not found".to_string(),
+                        Some("resume_response_id".to_string()),
+                    );
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(resume) = &resume_entry {
+            if !resume.token_ids.starts_with(&prompt_ids)
+                || resume.metadata.prompt_token_count != prompt_ids.len()
+                || resume.metadata.generated_token_ids.len()
+                    >= resume.metadata.original_max_tokens
+            {
+                send_failure(
+                    &job,
+                    FailureKind::ResumeNotFound,
+                    "response continuation checkpoint was not found".to_string(),
+                    Some("resume_response_id".to_string()),
+                );
+                return;
+            }
+            job.admission = Admission {
+                response_id: resume.metadata.response_id.clone(),
+                message_id: resume.metadata.message_id.clone(),
+                created: resume.metadata.created_unix_seconds,
+            };
+        }
+        let mut generation_prompt_ids = prompt_ids.clone();
+        let mut max_tokens = job.request.max_tokens;
+        if let Some(resume) = &resume_entry {
+            generation_prompt_ids.extend_from_slice(&resume.metadata.generated_token_ids);
+            max_tokens = resume
+                .metadata
+                .original_max_tokens
+                .saturating_sub(resume.metadata.generated_token_ids.len());
+            checkpoint_token_lengths.clear();
+            checkpoint_token_lengths.push(generation_prompt_ids.len());
+        }
+        if job
+            .events
+            .blocking_send(WorkerEvent::Started(job.admission.clone()))
+            .is_err()
+        {
+            job.cancelled.store(true, Ordering::Release);
+            return;
+        }
+        if job.cancelled.load(Ordering::Acquire) {
+            return;
+        }
+
         let mtp_k = self.mtp_k;
         let (provider, cache) = (&mut self.provider, &mut self.prefix_cache);
         if let Some(cache_route) = cache_route {
-            checkpoint_token_lengths =
-                cache.checkpoint_lengths(&prompt_ids, &checkpoint_token_lengths, cache_route);
+            checkpoint_token_lengths = cache.checkpoint_lengths(
+                &generation_prompt_ids,
+                &checkpoint_token_lengths,
+                cache_route,
+            );
         }
-        let hit = cache_route.and_then(|cache_route| cache.lookup(&prompt_ids, cache_route));
-        let (prefix_reuse, mtp_prefix_reuse) = match (route, hit) {
-            (QwenGenerationRoute::BaselineText, Some(hit)) => match hit.snapshot {
+        let hit = if resume_entry.is_none() {
+            cache_route.and_then(|cache_route| cache.lookup(&generation_prompt_ids, cache_route))
+        } else {
+            None
+        };
+        let (prefix_reuse, mtp_prefix_reuse) = match (route, resume_entry.as_ref(), hit) {
+            (QwenGenerationRoute::BaselineText, Some(resume), _) => match &resume.snapshot {
+                PromptSnapshot::Baseline(snapshot) => (
+                    Some(PrefixReuse {
+                        snapshot,
+                        cached_tokens: snapshot.token_len(),
+                    }),
+                    None,
+                ),
+                PromptSnapshot::Mtp(_) => {
+                    send_failure(
+                        &job,
+                        FailureKind::ResumeNotFound,
+                        "response continuation checkpoint was not found".to_string(),
+                        Some("resume_response_id".to_string()),
+                    );
+                    return;
+                }
+            },
+            (QwenGenerationRoute::MtpText, Some(resume), _) => match &resume.snapshot {
+                PromptSnapshot::Mtp(snapshot) => (
+                    None,
+                    Some(MtpPrefixReuse {
+                        snapshot,
+                        cached_tokens: snapshot.token_len(),
+                    }),
+                ),
+                PromptSnapshot::Baseline(_) => {
+                    send_failure(
+                        &job,
+                        FailureKind::ResumeNotFound,
+                        "response continuation checkpoint was not found".to_string(),
+                        Some("resume_response_id".to_string()),
+                    );
+                    return;
+                }
+            },
+            (QwenGenerationRoute::BaselineText, None, Some(hit)) => match hit.snapshot {
                 PromptSnapshot::Baseline(snapshot) => (
                     Some(PrefixReuse {
                         snapshot,
@@ -904,7 +1115,7 @@ impl QwenWorker {
                 ),
                 PromptSnapshot::Mtp(_) => (None, None),
             },
-            (QwenGenerationRoute::MtpText, Some(hit)) => match hit.snapshot {
+            (QwenGenerationRoute::MtpText, None, Some(hit)) => match hit.snapshot {
                 PromptSnapshot::Mtp(snapshot) => (
                     None,
                     Some(MtpPrefixReuse {
@@ -920,15 +1131,18 @@ impl QwenWorker {
             phase = "model_generation.started",
             route = ?route,
             mtp_k,
-            prefix_cached_tokens = prefix_reuse
-                .as_ref()
-                .map_or_else(
-                    || mtp_prefix_reuse.as_ref().map_or(0, |reuse| reuse.cached_tokens),
-                    |reuse| reuse.cached_tokens,
-                ),
+            prefix_cached_tokens = prefix_reuse.as_ref().map_or_else(
+                || mtp_prefix_reuse.as_ref().map_or(0, |reuse| reuse.cached_tokens),
+                |reuse| reuse.cached_tokens,
+            ),
         );
         let mut trace_parser = ReasoningTraceParser::new(enable_thinking);
         let mut gate = ToolCallGate::default();
+        if let Some(resume) = &resume_entry {
+            for delta in trace_parser.feed(&resume.metadata.raw_text) {
+                let _ = gate_worker_delta(delta, tool_enabled, &mut gate);
+            }
+        }
         let mut emit_delta = |fragment: &str| {
             if job.cancelled.load(Ordering::Acquire) {
                 return false;
@@ -946,7 +1160,7 @@ impl QwenWorker {
         let generated = match route {
             QwenGenerationRoute::MtpMultimodal => provider.generate_mtp_multimodal_streaming(
                 multimodal_prefill.expect("multimodal route requires prepared embeddings"),
-                job.request.max_tokens,
+                max_tokens,
                 &sampling,
                 mtp_k,
                 constraint
@@ -955,8 +1169,8 @@ impl QwenWorker {
                 &mut emit_delta,
             ),
             QwenGenerationRoute::MtpText => provider.generate_mtp_streaming(
-                &prompt_ids,
-                job.request.max_tokens,
+                &generation_prompt_ids,
+                max_tokens,
                 &sampling,
                 mtp_k,
                 mtp_prefix_reuse,
@@ -968,7 +1182,7 @@ impl QwenWorker {
             ),
             QwenGenerationRoute::BaselineMultimodal => provider.generate_multimodal_streaming(
                 multimodal_prefill.expect("multimodal route requires prepared embeddings"),
-                job.request.max_tokens,
+                max_tokens,
                 &sampling,
                 constraint
                     .as_mut()
@@ -976,8 +1190,8 @@ impl QwenWorker {
                 &mut emit_delta,
             ),
             QwenGenerationRoute::BaselineText => provider.generate_baseline_streaming(
-                &prompt_ids,
-                job.request.max_tokens,
+                &generation_prompt_ids,
+                max_tokens,
                 &sampling,
                 prefix_reuse,
                 constraint
@@ -1010,21 +1224,69 @@ impl QwenWorker {
             cached_tokens = generated.cached_tokens,
             stop_reason = ?generated.finish_outcome,
         );
+        let prior_metadata = resume_entry.as_ref().map(|resume| resume.metadata.clone());
+        let mut combined_token_ids = prior_metadata
+            .as_ref()
+            .map(|metadata| metadata.generated_token_ids.clone())
+            .unwrap_or_default();
+        combined_token_ids.extend_from_slice(&generated.token_ids);
+        let mut combined_raw_text = prior_metadata
+            .as_ref()
+            .map(|metadata| metadata.raw_text.clone())
+            .unwrap_or_default();
+        combined_raw_text.push_str(&generated.text);
+        let cancelled = job.cancelled.load(Ordering::Acquire)
+            || generated.finish_outcome == GenerationStopReason::CallbackCancelled;
         if let Some(cache_route) = cache_route {
             let prompt_snapshots = std::mem::take(&mut generated.prompt_snapshots);
             if !prompt_snapshots.is_empty() {
-                cache.insert(&prompt_ids, prompt_snapshots, cache_route);
+                cache.insert(&generation_prompt_ids, prompt_snapshots, cache_route);
             }
             if let Some(final_snapshot) = generated.final_snapshot.take() {
                 let mut completed_tokens =
-                    Vec::with_capacity(prompt_ids.len() + generated.token_ids.len());
-                completed_tokens.extend_from_slice(&prompt_ids);
+                    Vec::with_capacity(generation_prompt_ids.len() + generated.token_ids.len());
+                completed_tokens.extend_from_slice(&generation_prompt_ids);
                 completed_tokens.extend_from_slice(&generated.token_ids);
                 completed_tokens.truncate(final_snapshot.token_len());
                 if completed_tokens.len() == final_snapshot.token_len() {
-                    cache.insert(&completed_tokens, vec![final_snapshot], cache_route);
+                    if cancelled {
+                        let metadata = ResponseResumeMetadata {
+                            response_id: job.admission.response_id.clone(),
+                            message_id: job.admission.message_id.clone(),
+                            created_unix_seconds: job.admission.created,
+                            prompt_token_count: prior_metadata
+                                .as_ref()
+                                .map_or(prompt_ids.len(), |metadata| {
+                                    metadata.prompt_token_count
+                                }),
+                            request_fingerprint: fingerprint,
+                            generated_token_ids: combined_token_ids.clone(),
+                            raw_text: combined_raw_text.clone(),
+                            original_max_tokens: prior_metadata
+                                .as_ref()
+                                .map_or(job.request.max_tokens, |metadata| {
+                                    metadata.original_max_tokens
+                                }),
+                        };
+                        cache.insert_resume(
+                            &completed_tokens,
+                            final_snapshot,
+                            cache_route,
+                            metadata,
+                        );
+                    } else {
+                        cache.insert(
+                            &completed_tokens,
+                            vec![final_snapshot],
+                            cache_route,
+                        );
+                    }
                 }
             }
+        }
+        if cancelled {
+            info!(phase = "generation.cancelled");
+            return;
         }
         for delta in trace_parser.finish() {
             let Some(delta) = gate_worker_delta(delta, tool_enabled, &mut gate) else {
@@ -1040,18 +1302,18 @@ impl QwenWorker {
         {
             return;
         }
-        if job.cancelled.load(Ordering::Acquire) {
-            return;
+        generated.text = combined_raw_text;
+        generated.token_ids = combined_token_ids;
+        generated.completion_tokens = generated.token_ids.len();
+        if let Some(metadata) = &prior_metadata {
+            generated.prompt_tokens = metadata.prompt_token_count;
         }
         let core_finish_reason = match generated.finish_outcome {
             GenerationStopReason::MaxTokens => FinishReason::Length,
             GenerationStopReason::Eos
             | GenerationStopReason::ConstraintAccepted
             | GenerationStopReason::RepetitionLoop => FinishReason::Stop,
-            GenerationStopReason::CallbackCancelled => {
-                info!(phase = "generation.cancelled");
-                return;
-            }
+            GenerationStopReason::CallbackCancelled => unreachable!("handled above"),
         };
         let (reasoning_content, visible_content) = if enable_thinking {
             split_reasoning_trace(&generated.text)
@@ -1343,7 +1605,7 @@ mod tests {
             QwenGenerationRoute::MtpMultimodal,
         ] {
             assert_eq!(
-                route_uses_prefix_cache(route),
+                cache_snapshot_route(route).is_some(),
                 matches!(
                     route,
                     QwenGenerationRoute::BaselineText | QwenGenerationRoute::MtpText
