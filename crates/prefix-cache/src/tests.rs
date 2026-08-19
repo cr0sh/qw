@@ -202,7 +202,7 @@ fn radix_divergence_promotes_second_observation_and_selects_longest_snapshot() {
     third.extend(2_000..2_100);
     assert_eq!(
         cache.checkpoint_lengths(&first, &[400], SnapshotRoute::Baseline),
-        vec![400]
+        vec![256, 400]
     );
     assert_eq!(
         cache.checkpoint_lengths(&second, &[400], SnapshotRoute::Baseline),
