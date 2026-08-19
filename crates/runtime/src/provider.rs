@@ -1410,6 +1410,64 @@ mod tests {
 
     #[test]
     #[ignore = "requires QW_BENCH_MODEL pointing at a real bundled-MTP checkpoint"]
+    fn real_model_mtp_max_output_has_bounded_terminal_tail() {
+        let model_dir = std::env::var_os("QW_BENCH_MODEL")
+            .map(PathBuf::from)
+            .expect("QW_BENCH_MODEL must point at a real checkpoint");
+        let mut provider = Qwen35Provider::load(&model_dir, KVCacheMode::Turbo4)
+            .expect("load real bundled-MTP checkpoint");
+        let prompt = provider
+            .tokenizer
+            .encode(
+                "Produce a very long technical essay about distributed systems. \
+                 Continue until the output limit and do not stop early.",
+                true,
+            )
+            .expect("encode long-output prompt");
+        let prompt_ids = prompt
+            .get_ids()
+            .iter()
+            .map(|&token| token as i32)
+            .collect::<Vec<_>>();
+        let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
+        let mut callback_count = 0;
+        let mut last_callback = None;
+        let generated = provider
+            .generate_mtp_streaming(
+                &prompt_ids,
+                1024,
+                &sampling,
+                DEFAULT_MTP_BLOCK_SIZE,
+                None,
+                &[],
+                None,
+                |_| {
+                    callback_count += 1;
+                    last_callback = Some(Instant::now());
+                    true
+                },
+            )
+            .expect("long MTP generation");
+        let tail = last_callback.expect("long generation emitted a token").elapsed();
+        assert_eq!(callback_count, 1024);
+        assert_eq!(
+            generated.finish_outcome,
+            GenerationStopReason::MaxTokens
+        );
+        eprintln!(
+            "MTP terminal-tail benchmark: completion_tokens={}, callbacks={}, tail_ms={:.2}",
+            generated.completion_tokens,
+            callback_count,
+            tail.as_secs_f64() * 1_000.0,
+        );
+        assert!(
+            tail < Duration::from_secs(10),
+            "terminal snapshot must not replay the output: tail={tail:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires QW_BENCH_MODEL pointing at a real bundled-MTP checkpoint"]
     fn real_model_cancelled_mtp_snapshot_portable_resume_matches_uninterrupted_greedy() {
         let model_dir = std::env::var_os("QW_BENCH_MODEL")
             .map(PathBuf::from)
