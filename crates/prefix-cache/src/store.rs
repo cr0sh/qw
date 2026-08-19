@@ -33,7 +33,12 @@ pub struct FilesystemSnapshotStore {
 impl FilesystemSnapshotStore {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, String> {
         let root = root.into();
-        fs::create_dir_all(&root).map_err(|error| format!("failed to create cache directory {}: {error}", root.display()))?;
+        fs::create_dir_all(&root).map_err(|error| {
+            format!(
+                "failed to create cache directory {}: {error}",
+                root.display()
+            )
+        })?;
         Ok(Self { root })
     }
 
@@ -51,7 +56,10 @@ impl FilesystemSnapshotStore {
         match fs::remove_dir_all(path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(format!("failed to remove cache entry {}: {error}", path.display())),
+            Err(error) => Err(format!(
+                "failed to remove cache entry {}: {error}",
+                path.display()
+            )),
         }
     }
 }
@@ -65,7 +73,12 @@ impl PersistentSnapshotStore for FilesystemSnapshotStore {
         let entries = match fs::read_dir(&directory) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(format!("failed to scan cache directory {}: {error}", directory.display())),
+            Err(error) => {
+                return Err(format!(
+                    "failed to scan cache directory {}: {error}",
+                    directory.display()
+                ));
+            }
         };
         let mut scanned = Vec::new();
         for item in entries {
@@ -81,7 +94,10 @@ impl PersistentSnapshotStore for FilesystemSnapshotStore {
                 let _ = Self::delete_path(&path);
                 continue;
             };
-            if !item.file_type().is_ok_and(|kind| kind.is_dir()) || !safe_component(&digest) || digest.starts_with(".tmp-") {
+            if !item.file_type().is_ok_and(|kind| kind.is_dir())
+                || !safe_component(&digest)
+                || digest.starts_with(".tmp-")
+            {
                 let _ = Self::delete_path(&path);
                 continue;
             }
@@ -112,30 +128,49 @@ impl PersistentSnapshotStore for FilesystemSnapshotStore {
             match fs::read(&blob_path) {
                 Ok(blob) => blobs.push(blob),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
-                Err(error) => return Err(format!("failed to read cache blob {}: {error}", blob_path.display())),
+                Err(error) => {
+                    return Err(format!(
+                        "failed to read cache blob {}: {error}",
+                        blob_path.display()
+                    ));
+                }
             }
         }
-        Ok(Some(StoredEntry { key: key.clone(), manifest, blobs }))
+        Ok(Some(StoredEntry {
+            key: key.clone(),
+            manifest,
+            blobs,
+        }))
     }
 
     fn put(&mut self, entry: StoredEntry, _expires_at_unix_ms: u64) -> Result<(), String> {
         let destination = self.entry_path(&entry.key)?;
         let parent = destination.parent().ok_or("cache entry has no parent")?;
-        fs::create_dir_all(parent).map_err(|error| format!("failed to create cache namespace: {error}"))?;
-        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("failed to create cache namespace: {error}"))?;
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
         let temporary = parent.join(format!(".tmp-{}-{unique}", std::process::id()));
-        fs::create_dir(&temporary).map_err(|error| format!("failed to create temporary cache entry: {error}"))?;
+        fs::create_dir(&temporary)
+            .map_err(|error| format!("failed to create temporary cache entry: {error}"))?;
         let write_result = (|| {
             for (index, blob) in entry.blobs.iter().enumerate() {
                 write_synced(&temporary.join(format!("{index:05}.blob")), blob)?;
             }
             write_synced(&temporary.join("manifest.json"), &entry.manifest)?;
-            File::open(&temporary).and_then(|file| file.sync_all()).map_err(|error| format!("failed to sync temporary cache entry: {error}"))?;
+            File::open(&temporary)
+                .and_then(|file| file.sync_all())
+                .map_err(|error| format!("failed to sync temporary cache entry: {error}"))?;
             if destination.exists() {
                 Self::delete_path(&destination)?;
             }
-            fs::rename(&temporary, &destination).map_err(|error| format!("failed to publish cache entry: {error}"))?;
-            File::open(parent).and_then(|file| file.sync_all()).map_err(|error| format!("failed to sync cache namespace: {error}"))?;
+            fs::rename(&temporary, &destination)
+                .map_err(|error| format!("failed to publish cache entry: {error}"))?;
+            File::open(parent)
+                .and_then(|file| file.sync_all())
+                .map_err(|error| format!("failed to sync cache namespace: {error}"))?;
             Ok(())
         })();
         if write_result.is_err() {
@@ -147,16 +182,25 @@ impl PersistentSnapshotStore for FilesystemSnapshotStore {
     fn refresh(&mut self, key: &EntryKey, expires_at_unix_ms: u64) -> Result<(), String> {
         let path = self.entry_path(key)?;
         let manifest_path = path.join("manifest.json");
-        let bytes = fs::read(&manifest_path).map_err(|error| format!("failed to read cache manifest for refresh: {error}"))?;
-        let mut value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| format!("failed to parse cache manifest for refresh: {error}"))?;
-        let object = value.as_object_mut().ok_or("cache manifest is not an object")?;
-        let expiry = object.get_mut("expires_at_unix_ms").ok_or("cache manifest is missing expiry")?;
+        let bytes = fs::read(&manifest_path)
+            .map_err(|error| format!("failed to read cache manifest for refresh: {error}"))?;
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("failed to parse cache manifest for refresh: {error}"))?;
+        let object = value
+            .as_object_mut()
+            .ok_or("cache manifest is not an object")?;
+        let expiry = object
+            .get_mut("expires_at_unix_ms")
+            .ok_or("cache manifest is missing expiry")?;
         *expiry = serde_json::Value::from(expires_at_unix_ms);
         let refreshed = serde_json::to_vec(&value).map_err(|error| error.to_string())?;
         let temporary = path.join("manifest.json.tmp");
         write_synced(&temporary, &refreshed)?;
-        fs::rename(&temporary, &manifest_path).map_err(|error| format!("failed to publish refreshed cache manifest: {error}"))?;
-        File::open(&path).and_then(|file| file.sync_all()).map_err(|error| format!("failed to sync refreshed cache entry: {error}"))
+        fs::rename(&temporary, &manifest_path)
+            .map_err(|error| format!("failed to publish refreshed cache manifest: {error}"))?;
+        File::open(&path)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| format!("failed to sync refreshed cache entry: {error}"))
     }
 
     fn remove(&mut self, key: &EntryKey) -> Result<(), String> {
@@ -165,12 +209,20 @@ impl PersistentSnapshotStore for FilesystemSnapshotStore {
 }
 
 fn write_synced(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let mut file = OpenOptions::new().create_new(true).write(true).open(path)
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
         .map_err(|error| format!("failed to create {}: {error}", path.display()))?;
-    file.write_all(bytes).map_err(|error| format!("failed to write {}: {error}", path.display()))?;
-    file.sync_all().map_err(|error| format!("failed to sync {}: {error}", path.display()))
+    file.write_all(bytes)
+        .map_err(|error| format!("failed to write {}: {error}", path.display()))?;
+    file.sync_all()
+        .map_err(|error| format!("failed to sync {}: {error}", path.display()))
 }
 
 fn safe_component(value: &str) -> bool {
-    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }

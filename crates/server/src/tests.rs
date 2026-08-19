@@ -391,8 +391,7 @@ async fn interrupted_response_resumes_once_without_replaying_deltas() {
     let app = router(Engine::start_fake(Some(MODEL), 8));
     let mut interrupted = chat_request("resume-interrupt");
     interrupted["stream"] = json!(true);
-    let (status, _, body) =
-        post(app.clone(), "/v1/chat/completions", interrupted.clone()).await;
+    let (status, _, body) = post(app.clone(), "/v1/chat/completions", interrupted.clone()).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (frames, done) = parse_sse(&body);
     assert!(!done);
@@ -1076,13 +1075,11 @@ async fn divergent_multi_turn_chat_reuses_exact_common_prefix_and_matches_cold_o
         ]
     });
     let _ = post(warm_app.clone(), "/v1/chat/completions", warmed).await;
-    let (status, _, warm_body) =
-        post(warm_app, "/v1/chat/completions", divergent.clone()).await;
+    let (status, _, warm_body) = post(warm_app, "/v1/chat/completions", divergent.clone()).await;
     assert_eq!(status, StatusCode::OK, "{warm_body}");
     let warm: Value = serde_json::from_str(&warm_body).expect("warm JSON");
     assert_eq!(
-        warm["usage"]["prompt_tokens_details"]["cached_tokens"],
-        6,
+        warm["usage"]["prompt_tokens_details"]["cached_tokens"], 6,
         "a|b|c| is the exact common prompt prefix"
     );
 

@@ -54,7 +54,6 @@ pub struct ModelStateTensor {
     array: UniquePtr<MlxArray>,
 }
 
-
 impl ModelStateTensor {
     /// Capture a materialized copy of `array` under `name`.
     pub fn new(name: impl Into<String>, array: &MlxArray) -> Self {
@@ -94,7 +93,6 @@ pub struct ModelStateSnapshot {
     tensors: Vec<ModelStateTensor>,
     continuation_logits: Option<UniquePtr<MlxArray>>,
 }
-
 
 impl ModelStateSnapshot {
     /// Build an empty snapshot for `family` at `token_len` tokens.
@@ -160,7 +158,10 @@ impl ModelStateSnapshot {
 
     /// Sum of all captured tensor byte footprints.
     pub fn nbytes(&self) -> usize {
-        self.tensors.iter().map(ModelStateTensor::nbytes).sum::<usize>()
+        self.tensors
+            .iter()
+            .map(ModelStateTensor::nbytes)
+            .sum::<usize>()
             + self
                 .continuation_logits
                 .as_deref()
@@ -521,10 +522,7 @@ pub fn mask_logits_to_allowed(
             "generation constraint returned a token outside vocabulary 0..{vocab_size}"
         ));
     }
-    let indices = ffi::from_slice_i32(
-        allowed_token_ids,
-        &[1, 1, allowed_token_ids.len() as i32],
-    );
+    let indices = ffi::from_slice_i32(allowed_token_ids, &[1, 1, allowed_token_ids.len() as i32]);
     let values = ffi::take_along_axis(logits, &indices, -1);
     let masked = ffi::full_f32(&shape, f32::NEG_INFINITY, ffi::array_dtype(logits));
     Ok(ffi::put_along_axis(&masked, &indices, &values, -1))
@@ -1481,9 +1479,8 @@ impl CxxGenerator {
                 cached_logits = reuse.snapshot.continuation_logits().map(ffi::copy);
             }
         }
-        let retain_prompt_snapshot =
-            (!checkpoint_token_lengths.is_empty() || constraint.is_some())
-                && model.supports_snapshot_reuse();
+        let retain_prompt_snapshot = (!checkpoint_token_lengths.is_empty() || constraint.is_some())
+            && model.supports_snapshot_reuse();
         let mut effective_checkpoint_lengths = checkpoint_token_lengths.to_vec();
         if constraint.is_some()
             && effective_checkpoint_lengths.last().copied() != Some(prompt_tokens.len())
@@ -1511,8 +1508,7 @@ impl CxxGenerator {
             let logits = if let Some(chunk) = prefill_chunk {
                 chunked_prefill_last_logits(model, &mut self.caches, prefill_tokens, chunk)
             } else {
-                let input =
-                    ffi::from_slice_i32(prefill_tokens, &[1, prefill_tokens.len() as i32]);
+                let input = ffi::from_slice_i32(prefill_tokens, &[1, prefill_tokens.len() as i32]);
                 model.forward_last_logits(
                     &input,
                     &mut self.caches,
@@ -1532,9 +1528,7 @@ impl CxxGenerator {
                 model.snapshot_sequence_state(sequence_id, prompt_tokens.len())
             {
                 snapshot.set_continuation_logits(
-                    logits
-                        .as_ref()
-                        .expect("generation logits must not be null"),
+                    logits.as_ref().expect("generation logits must not be null"),
                 );
                 prompt_snapshots.push(snapshot);
             }
@@ -1551,16 +1545,12 @@ impl CxxGenerator {
             let constrained_logits;
             let logits_for_sample = if let Some(active) = constraint.as_deref_mut() {
                 match active.compute_mask(
-                    logits
-                        .as_ref()
-                        .expect("generation logits must not be null"),
+                    logits.as_ref().expect("generation logits must not be null"),
                     &token_history,
                 )? {
                     ConstraintMask::Allow(allowed) => {
                         constrained_logits = mask_logits_to_allowed(
-                            logits
-                                .as_ref()
-                                .expect("generation logits must not be null"),
+                            logits.as_ref().expect("generation logits must not be null"),
                             &allowed,
                         )?;
                         constrained_logits
@@ -1600,9 +1590,7 @@ impl CxxGenerator {
                     }
                 }
             } else {
-                logits
-                    .as_ref()
-                    .expect("generation logits must not be null")
+                logits.as_ref().expect("generation logits must not be null")
             };
 
             let (token, _) = if needs_history {
@@ -1679,8 +1667,7 @@ impl CxxGenerator {
                 aligned_tokens.extend_from_slice(&accepted_tokens[..accepted_tokens.len() - 1]);
                 self.reset_with_model(model);
                 self.generated_tokens = accepted_tokens;
-                let input =
-                    ffi::from_slice_i32(&aligned_tokens, &[1, aligned_tokens.len() as i32]);
+                let input = ffi::from_slice_i32(&aligned_tokens, &[1, aligned_tokens.len() as i32]);
                 logits = model.forward_last_logits(
                     &input,
                     &mut self.caches,
@@ -1692,18 +1679,15 @@ impl CxxGenerator {
             }
         }
 
-        let final_snapshot = (!self.generated_tokens.is_empty()
-            && model.supports_snapshot_reuse())
-        .then(|| model.snapshot_sequence_state(sequence_id, aligned_token_len))
-        .flatten()
-        .map(|mut snapshot| {
-            snapshot.set_continuation_logits(
-                logits
-                    .as_ref()
-                    .expect("generation logits must not be null"),
-            );
-            snapshot
-        });
+        let final_snapshot = (!self.generated_tokens.is_empty() && model.supports_snapshot_reuse())
+            .then(|| model.snapshot_sequence_state(sequence_id, aligned_token_len))
+            .flatten()
+            .map(|mut snapshot| {
+                snapshot.set_continuation_logits(
+                    logits.as_ref().expect("generation logits must not be null"),
+                );
+                snapshot
+            });
         prompt_snapshots.retain(|snapshot| {
             checkpoint_token_lengths
                 .binary_search(&snapshot.token_len())
@@ -1746,9 +1730,7 @@ impl CxxGenerator {
             return Err("max_tokens must be greater than zero".to_string());
         }
         if input_embeddings.is_some() && prefix_reuse.is_some() {
-            return Err(
-                "embedding prefill cannot reuse a token-only prefix snapshot".to_string(),
-            );
+            return Err("embedding prefill cannot reuse a token-only prefix snapshot".to_string());
         }
 
         self.reset_with_model(model);
@@ -1785,14 +1767,9 @@ impl CxxGenerator {
         let mut logits = if let Some(logits) = cached_logits {
             logits
         } else if input_embeddings.is_some() || mask.is_some() {
-            let input =
-                ffi::from_slice_i32(prefill_tokens, &[1, prefill_tokens.len() as i32]);
-            let logits = model.forward_with_embeddings(
-                &input,
-                input_embeddings,
-                &mut self.caches,
-                mask,
-            );
+            let input = ffi::from_slice_i32(prefill_tokens, &[1, prefill_tokens.len() as i32]);
+            let logits =
+                model.forward_with_embeddings(&input, input_embeddings, &mut self.caches, mask);
             logits_at_position(&logits, prefill_tokens.len().saturating_sub(1))
         } else {
             let prefill_chunk = effective_prefill_chunk(
@@ -1803,8 +1780,7 @@ impl CxxGenerator {
             if let Some(chunk) = prefill_chunk {
                 chunked_prefill_last_logits(model, &mut self.caches, prefill_tokens, chunk)
             } else {
-                let input =
-                    ffi::from_slice_i32(prefill_tokens, &[1, prefill_tokens.len() as i32]);
+                let input = ffi::from_slice_i32(prefill_tokens, &[1, prefill_tokens.len() as i32]);
                 model.forward_last_logits(
                     &input,
                     &mut self.caches,
@@ -1817,16 +1793,13 @@ impl CxxGenerator {
         if input_embeddings.is_some() {
             model.after_prefill();
         }
-        let retain_prompt_snapshot =
-            constraint.is_some() && model.supports_snapshot_reuse();
+        let retain_prompt_snapshot = constraint.is_some() && model.supports_snapshot_reuse();
         let mut prompt_snapshot = retain_prompt_snapshot
             .then(|| model.snapshot_sequence_state(sequence_id, prompt_tokens.len()))
             .flatten();
         if let Some(snapshot) = prompt_snapshot.as_mut() {
             snapshot.set_continuation_logits(
-                logits
-                    .as_ref()
-                    .expect("generation logits must not be null"),
+                logits.as_ref().expect("generation logits must not be null"),
             );
         }
         ffi::clear_memory_cache();
@@ -1840,16 +1813,12 @@ impl CxxGenerator {
             let constrained_logits;
             let logits_for_sample = if let Some(active) = constraint.as_deref_mut() {
                 match active.compute_mask(
-                    logits
-                        .as_ref()
-                        .expect("generation logits must not be null"),
+                    logits.as_ref().expect("generation logits must not be null"),
                     &token_history,
                 )? {
                     ConstraintMask::Allow(allowed) => {
                         constrained_logits = mask_logits_to_allowed(
-                            logits
-                                .as_ref()
-                                .expect("generation logits must not be null"),
+                            logits.as_ref().expect("generation logits must not be null"),
                             &allowed,
                         )?;
                         constrained_logits
@@ -1888,9 +1857,7 @@ impl CxxGenerator {
                     }
                 }
             } else {
-                logits
-                    .as_ref()
-                    .expect("generation logits must not be null")
+                logits.as_ref().expect("generation logits must not be null")
             };
 
             let (token, _) = if needs_history {
@@ -3978,7 +3945,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn controlled_generation_mask_changes_the_winning_token() {
         let model = StubModel;
@@ -4080,10 +4046,7 @@ mod tests {
             )
             .expect("spliced controlled generation");
         assert_eq!(result.token_ids, vec![2, 0, 1]);
-        assert_eq!(
-            result.stop_reason,
-            GenerationStopReason::ConstraintAccepted
-        );
+        assert_eq!(result.stop_reason, GenerationStopReason::ConstraintAccepted);
     }
 
     #[test]
@@ -4093,26 +4056,14 @@ mod tests {
         let mut generator = CxxGenerator::new(1);
         let mut emissions = 0;
         let result = generator
-            .generate_streaming_controlled(
-                &model,
-                &[1],
-                None,
-                4,
-                &sampling,
-                None,
-                &[],
-                |_| {
-                    emissions += 1;
-                    false
-                },
-            )
+            .generate_streaming_controlled(&model, &[1], None, 4, &sampling, None, &[], |_| {
+                emissions += 1;
+                false
+            })
             .expect("cancelled generation");
         assert_eq!(emissions, 1);
         assert_eq!(result.token_ids.len(), 1);
-        assert_eq!(
-            result.stop_reason,
-            GenerationStopReason::CallbackCancelled
-        );
+        assert_eq!(result.stop_reason, GenerationStopReason::CallbackCancelled);
         let final_snapshot = result.final_snapshot.expect("cancelled final snapshot");
         assert_eq!(final_snapshot.token_len(), 1);
         assert!(final_snapshot.continuation_logits().is_some());
@@ -4185,10 +4136,7 @@ mod tests {
             .expect("cancelled embedding generation");
         assert_eq!(emissions, 1);
         assert_eq!(result.token_ids.len(), 1);
-        assert_eq!(
-            result.stop_reason,
-            GenerationStopReason::CallbackCancelled
-        );
+        assert_eq!(result.stop_reason, GenerationStopReason::CallbackCancelled);
     }
 
     #[test]

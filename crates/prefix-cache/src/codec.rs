@@ -102,7 +102,6 @@ pub fn namespace_hash(parts: &[&[u8]]) -> String {
     hex(&hash.finalize())
 }
 
-
 pub fn encode_portable(
     namespace: &str,
     route: SnapshotRoute,
@@ -118,7 +117,9 @@ pub fn encode_portable(
     };
     validate_resume_metadata(token_ids, response_resume.as_ref())?;
     if token_ids.is_empty() || portable_token_len != token_ids.len() || portable_route != route {
-        return Err("portable snapshot route and token length must match the cache entry".to_string());
+        return Err(
+            "portable snapshot route and token length must match the cache entry".to_string(),
+        );
     }
     let (family, draft_offset, arrays) = flatten(portable)?;
     let mut descriptors = Vec::with_capacity(arrays.len());
@@ -136,8 +137,14 @@ pub fn encode_portable(
             byte_len,
         });
     }
-    let blobs = payload.chunks(MAX_BLOB_BYTES).map(<[u8]>::to_vec).collect::<Vec<_>>();
-    let blob_sha256 = blobs.iter().map(|blob| hex(&Sha256::digest(blob))).collect();
+    let blobs = payload
+        .chunks(MAX_BLOB_BYTES)
+        .map(<[u8]>::to_vec)
+        .collect::<Vec<_>>();
+    let blob_sha256 = blobs
+        .iter()
+        .map(|blob| hex(&Sha256::digest(blob)))
+        .collect();
     let total_bytes = payload.len() as u64;
     let manifest = Manifest {
         namespace: namespace.to_string(),
@@ -161,7 +168,11 @@ pub fn encode_portable(
     })
 }
 
-pub fn decode(expected_namespace: &str, manifest: &[u8], blobs: Vec<Vec<u8>>) -> Result<DecodedEntry, String> {
+pub fn decode(
+    expected_namespace: &str,
+    manifest: &[u8],
+    blobs: Vec<Vec<u8>>,
+) -> Result<DecodedEntry, String> {
     let manifest: Manifest = serde_json::from_slice(manifest).map_err(|error| error.to_string())?;
     validate_manifest(expected_namespace, &manifest)?;
     if blobs.len() != manifest.blob_sha256.len() {
@@ -180,18 +191,26 @@ pub fn decode(expected_namespace: &str, manifest: &[u8], blobs: Vec<Vec<u8>>) ->
     if payload.len() as u64 != manifest.total_bytes {
         return Err("cache payload byte count does not match manifest".to_string());
     }
-    let arrays = manifest.arrays.iter().map(|descriptor| {
-        let start = usize::try_from(descriptor.offset).map_err(|_| "array offset overflow")?;
-        let len = usize::try_from(descriptor.byte_len).map_err(|_| "array length overflow")?;
-        let end = start.checked_add(len).ok_or("array range overflow")?;
-        let bytes = payload.get(start..end).ok_or("array range is outside payload")?.to_vec();
-        Ok(PortableArray {
-            name: descriptor.name.clone(),
-            shape: descriptor.shape.clone(),
-            dtype: descriptor.dtype,
-            bytes,
+    let arrays = manifest
+        .arrays
+        .iter()
+        .map(|descriptor| {
+            let start = usize::try_from(descriptor.offset).map_err(|_| "array offset overflow")?;
+            let len = usize::try_from(descriptor.byte_len).map_err(|_| "array length overflow")?;
+            let end = start.checked_add(len).ok_or("array range overflow")?;
+            let bytes = payload
+                .get(start..end)
+                .ok_or("array range is outside payload")?
+                .to_vec();
+            Ok(PortableArray {
+                name: descriptor.name.clone(),
+                shape: descriptor.shape.clone(),
+                dtype: descriptor.dtype,
+                bytes,
+            })
         })
-    }).collect::<Result<Vec<_>, &str>>().map_err(str::to_string)?;
+        .collect::<Result<Vec<_>, &str>>()
+        .map_err(str::to_string)?;
     let portable = inflate(&manifest, arrays)?;
     let snapshot = PromptSnapshot::from_portable(portable)?;
     if snapshot.token_len() != manifest.token_len || !manifest.route.matches(&snapshot) {
@@ -217,7 +236,11 @@ fn validate_manifest(expected_namespace: &str, manifest: &Manifest) -> Result<()
     if manifest.family.is_empty() || manifest.arrays.is_empty() {
         return Err("cache manifest is missing model state".to_string());
     }
-    if manifest.blob_sha256.iter().any(|digest| digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit())) {
+    if manifest
+        .blob_sha256
+        .iter()
+        .any(|digest| digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
         return Err("cache manifest contains an invalid blob digest".to_string());
     }
     let mut end = 0u64;
@@ -228,7 +251,9 @@ fn validate_manifest(expected_namespace: &str, manifest: &Manifest) -> Result<()
         if descriptor.offset != end || descriptor.byte_len == 0 {
             return Err("cache array descriptors are not contiguous".to_string());
         }
-        end = end.checked_add(descriptor.byte_len).ok_or("cache array range overflow")?;
+        end = end
+            .checked_add(descriptor.byte_len)
+            .ok_or("cache array range overflow")?;
     }
     if end != manifest.total_bytes {
         return Err("cache array bytes do not match total bytes".to_string());
@@ -255,31 +280,58 @@ pub(crate) fn validate_resume_metadata(
     }
     let aligned_output = &token_ids[metadata.prompt_token_count..];
     if aligned_output.len() > metadata.generated_token_ids.len()
-        || aligned_output
-            != &metadata.generated_token_ids[..aligned_output.len()]
+        || aligned_output != &metadata.generated_token_ids[..aligned_output.len()]
     {
         return Err("cache response resume tokens do not match the snapshot".to_string());
     }
     Ok(())
 }
 
-fn flatten(portable: PortablePromptSnapshot) -> Result<(String, Option<i32>, Vec<(ArrayRole, PortableArray)>), String> {
+fn flatten(
+    portable: PortablePromptSnapshot,
+) -> Result<(String, Option<i32>, Vec<(ArrayRole, PortableArray)>), String> {
     match portable {
         PortablePromptSnapshot::Baseline(model) => {
             let family = model.family.clone();
-            let mut arrays = model.tensors.into_iter().map(|array| (ArrayRole::ModelTensor, array)).collect::<Vec<_>>();
-            arrays.push((ArrayRole::ModelContinuation, model.continuation_logits.ok_or("baseline snapshot is missing continuation logits")?));
+            let mut arrays = model
+                .tensors
+                .into_iter()
+                .map(|array| (ArrayRole::ModelTensor, array))
+                .collect::<Vec<_>>();
+            arrays.push((
+                ArrayRole::ModelContinuation,
+                model
+                    .continuation_logits
+                    .ok_or("baseline snapshot is missing continuation logits")?,
+            ));
             Ok((family, None, arrays))
         }
-        PortablePromptSnapshot::Mtp { target, draft_keys, draft_values, draft_offset, last_hidden, continuation_logits } => {
+        PortablePromptSnapshot::Mtp {
+            target,
+            draft_keys,
+            draft_values,
+            draft_offset,
+            last_hidden,
+            continuation_logits,
+        } => {
             if draft_keys.is_some() != draft_values.is_some() {
                 return Err("MTP draft key/value pairing is invalid".to_string());
             }
             let family = target.family.clone();
-            let mut arrays = target.tensors.into_iter().map(|array| (ArrayRole::ModelTensor, array)).collect::<Vec<_>>();
-            if let Some(array) = target.continuation_logits { arrays.push((ArrayRole::ModelContinuation, array)); }
-            if let Some(array) = draft_keys { arrays.push((ArrayRole::DraftKeys, array)); }
-            if let Some(array) = draft_values { arrays.push((ArrayRole::DraftValues, array)); }
+            let mut arrays = target
+                .tensors
+                .into_iter()
+                .map(|array| (ArrayRole::ModelTensor, array))
+                .collect::<Vec<_>>();
+            if let Some(array) = target.continuation_logits {
+                arrays.push((ArrayRole::ModelContinuation, array));
+            }
+            if let Some(array) = draft_keys {
+                arrays.push((ArrayRole::DraftKeys, array));
+            }
+            if let Some(array) = draft_values {
+                arrays.push((ArrayRole::DraftValues, array));
+            }
             arrays.push((ArrayRole::LastHidden, last_hidden));
             arrays.push((ArrayRole::MtpContinuation, continuation_logits));
             Ok((family, Some(draft_offset), arrays))
@@ -287,8 +339,15 @@ fn flatten(portable: PortablePromptSnapshot) -> Result<(String, Option<i32>, Vec
     }
 }
 
-fn inflate(manifest: &Manifest, arrays: Vec<PortableArray>) -> Result<PortablePromptSnapshot, String> {
-    let mut roles = manifest.arrays.iter().map(|descriptor| descriptor.role).zip(arrays);
+fn inflate(
+    manifest: &Manifest,
+    arrays: Vec<PortableArray>,
+) -> Result<PortablePromptSnapshot, String> {
+    let mut roles = manifest
+        .arrays
+        .iter()
+        .map(|descriptor| descriptor.role)
+        .zip(arrays);
     let mut tensors = Vec::new();
     let mut model_continuation = None;
     let mut draft_keys = None;
@@ -326,7 +385,12 @@ fn inflate(manifest: &Manifest, arrays: Vec<PortableArray>) -> Result<PortablePr
         }
     }
     let mut names = HashSet::new();
-    if tensors.iter().any(|array| array.name.as_ref().is_none_or(|name| name.is_empty() || !names.insert(name.clone()))) {
+    if tensors.iter().any(|array| {
+        array
+            .name
+            .as_ref()
+            .is_none_or(|name| name.is_empty() || !names.insert(name.clone()))
+    }) {
         return Err("cache model tensor names must be present and unique".to_string());
     }
     let draft_offset = match manifest.route {
@@ -341,10 +405,19 @@ fn inflate(manifest: &Manifest, arrays: Vec<PortableArray>) -> Result<PortablePr
         }
     };
     let family = manifest.family.clone();
-    let target = PortableModelState { family, token_len: manifest.token_len, tensors, continuation_logits: model_continuation };
+    let target = PortableModelState {
+        family,
+        token_len: manifest.token_len,
+        tensors,
+        continuation_logits: model_continuation,
+    };
     match manifest.route {
         SnapshotRoute::Baseline => {
-            if draft_keys.is_some() || draft_values.is_some() || last_hidden.is_some() || mtp_continuation.is_some() {
+            if draft_keys.is_some()
+                || draft_values.is_some()
+                || last_hidden.is_some()
+                || mtp_continuation.is_some()
+            {
                 return Err("baseline manifest contains MTP arrays".to_string());
             }
             Ok(PortablePromptSnapshot::Baseline(target))
@@ -359,7 +432,8 @@ fn inflate(manifest: &Manifest, arrays: Vec<PortableArray>) -> Result<PortablePr
                 draft_values,
                 draft_offset: draft_offset.expect("MTP route has parsed offset"),
                 last_hidden: last_hidden.ok_or("MTP manifest is missing last_hidden")?,
-                continuation_logits: mtp_continuation.ok_or("MTP manifest is missing continuation logits")?,
+                continuation_logits: mtp_continuation
+                    .ok_or("MTP manifest is missing continuation logits")?,
             })
         }
     }
