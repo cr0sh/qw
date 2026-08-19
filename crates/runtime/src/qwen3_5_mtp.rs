@@ -21,6 +21,10 @@
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
+use crate::portable_snapshot::{
+    PortableArray, PortablePromptSnapshot, array_from_portable, array_to_portable,
+    portable_model_state,
+};
 use mlxcel_core::generate::{
     ConstraintCommit, ConstraintMask, GenerationStopReason, LanguageModel, ModelStateSnapshot,
     SamplingConfig, TokenConstraint, mask_logits_to_allowed,
@@ -36,10 +40,6 @@ use mlxcel_core::speculative::stochastic_accept::{
     DraftVerdict, sampler_is_greedy, verify_draft_token,
 };
 use mlxcel_core::weights::WeightMap;
-use crate::portable_snapshot::{
-    PortableArray, PortablePromptSnapshot, array_from_portable, array_to_portable,
-    portable_model_state,
-};
 use mlxcel_core::{MlxArray, UniquePtr};
 use tracing::info;
 
@@ -107,7 +107,6 @@ pub struct MtpPromptSnapshot {
     continuation_logits: UniquePtr<MlxArray>,
 }
 
-
 impl MtpPromptSnapshot {
     pub fn token_len(&self) -> usize {
         self.target.token_len()
@@ -174,17 +173,16 @@ impl MtpPromptSnapshot {
         {
             return Err("MTP portable drafter key/value shapes do not match".to_string());
         }
-        if last_hidden.shape.len() != 3
-            || last_hidden.shape[0] != 1
-            || last_hidden.shape[1] != 1
-        {
+        if last_hidden.shape.len() != 3 || last_hidden.shape[0] != 1 || last_hidden.shape[1] != 1 {
             return Err("MTP portable last-hidden layout must be [1, 1, hidden]".to_string());
         }
         if continuation_logits.shape.len() != 3
             || continuation_logits.shape[0] != 1
             || continuation_logits.shape[1] != 1
         {
-            return Err("MTP portable continuation-logits layout must be [1, 1, vocab]".to_string());
+            return Err(
+                "MTP portable continuation-logits layout must be [1, 1, vocab]".to_string(),
+            );
         }
         Ok(Self {
             target,
@@ -1740,14 +1738,9 @@ fn capture_mtp_final_snapshot(
     };
     let prefill = prefill_for_input(model, drafter, prefill_input)?;
     if generated.len() == 1 {
-        return capture_mtp_prompt_snapshot(
-            model,
-            drafter,
-            prompt_tokens.len(),
-            &prefill,
-        )
-        .map(Some)
-        .ok_or_else(|| "failed to capture aligned MTP final snapshot".to_string());
+        return capture_mtp_prompt_snapshot(model, drafter, prompt_tokens.len(), &prefill)
+            .map(Some)
+            .ok_or_else(|| "failed to capture aligned MTP final snapshot".to_string());
     }
 
     let _ = finish_drafter_prefill(model, drafter, prefill_input, prefill, first_token);
@@ -2108,13 +2101,7 @@ impl Qwen35MtpGenerator {
         }
         mtp_stats.decode_time = decode_start.elapsed();
         let final_snapshot = if matches!(prefill_input, MtpPrefill::Text { .. }) {
-            capture_mtp_final_snapshot(
-                model,
-                drafter,
-                prompt_tokens,
-                prefill_input,
-                &generated,
-            )?
+            capture_mtp_final_snapshot(model, drafter, prompt_tokens, prefill_input, &generated)?
         } else {
             None
         };
@@ -2179,12 +2166,10 @@ impl Qwen35MtpGenerator {
                         prefix_reuse.take(),
                         checkpoint_token_lengths,
                     ),
-                    MtpPrefill::Multimodal { .. } => prefill_for_input(
-                        model,
-                        drafter,
-                        prefill_input,
-                    )
-                    .map(|prefill| (prefill, 0, Vec::new())),
+                    MtpPrefill::Multimodal { .. } => {
+                        prefill_for_input(model, drafter, prefill_input)
+                            .map(|prefill| (prefill, 0, Vec::new()))
+                    }
                 }
             } else {
                 prefill_for_input(model, drafter, prefill_input)
@@ -2466,13 +2451,7 @@ impl Qwen35MtpGenerator {
         }
 
         let final_snapshot = if matches!(prefill_input, MtpPrefill::Text { .. }) {
-            capture_mtp_final_snapshot(
-                model,
-                drafter,
-                prompt_tokens,
-                prefill_input,
-                &generated,
-            )?
+            capture_mtp_final_snapshot(model, drafter, prompt_tokens, prefill_input, &generated)?
         } else {
             None
         };

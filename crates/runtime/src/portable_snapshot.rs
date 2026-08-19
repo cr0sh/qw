@@ -141,7 +141,9 @@ fn model_from_portable(
             .clone()
             .ok_or_else(|| "portable model tensor is missing its name".to_string())?;
         if name.is_empty() || !names.insert(name.clone()) {
-            return Err(format!("duplicate or empty portable model tensor name {name:?}"));
+            return Err(format!(
+                "duplicate or empty portable model tensor name {name:?}"
+            ));
         }
         let array = array_from_portable(tensor, Some(&name))?;
         restored_tensors.push((name, array));

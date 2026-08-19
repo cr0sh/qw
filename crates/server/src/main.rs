@@ -116,8 +116,8 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{Cli, OutputFormat, validate_cli};
-    use qw_runtime::KVCacheMode;
     use clap::{CommandFactory as _, Parser as _};
+    use qw_runtime::KVCacheMode;
 
     #[test]
     fn cli_exposes_optional_model_id() {
@@ -144,10 +144,7 @@ mod tests {
             Cli::try_parse_from(["qw-server", "--model", "/tmp/checkpoint"]).expect("CLI");
         assert_eq!(default.output_format, OutputFormat::Human);
 
-        for (value, expected) in [
-            ("human", OutputFormat::Human),
-            ("json", OutputFormat::Json),
-        ] {
+        for (value, expected) in [("human", OutputFormat::Human), ("json", OutputFormat::Json)] {
             let cli = Cli::try_parse_from([
                 "qw-server",
                 "--model",
@@ -235,8 +232,6 @@ mod tests {
         assert!(help.contains("--prefix-cache-filesystem-bytes"), "{help}");
         assert!(!help.contains("--prefix-cache-max-tokens"), "{help}");
     }
-
-
 
     #[test]
     fn cli_parses_and_validates_mtp_k() {

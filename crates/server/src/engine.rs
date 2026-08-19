@@ -632,8 +632,8 @@ impl Engine {
                 .then_some("fake reasoning")
                 .unwrap_or_default();
                 let generated_text = format!("{reasoning}{THINK_CLOSE}\n\n{content}");
-                let interrupt = resumed.is_none()
-                    && latest_user.as_deref() == Some("resume-interrupt");
+                let interrupt =
+                    resumed.is_none() && latest_user.as_deref() == Some("resume-interrupt");
                 let emitted_text = if interrupt {
                     format!("{THINK_CLOSE}\n\necho:resume-")
                 } else if let Some(checkpoint) = &resumed {
@@ -1014,8 +1014,7 @@ impl QwenWorker {
         if let Some(resume) = &resume_entry {
             if !resume.token_ids.starts_with(&prompt_ids)
                 || resume.metadata.prompt_token_count != prompt_ids.len()
-                || resume.metadata.generated_token_ids.len()
-                    >= resume.metadata.original_max_tokens
+                || resume.metadata.generated_token_ids.len() >= resume.metadata.original_max_tokens
             {
                 send_failure(
                     &job,
@@ -1256,9 +1255,7 @@ impl QwenWorker {
                             created_unix_seconds: job.admission.created,
                             prompt_token_count: prior_metadata
                                 .as_ref()
-                                .map_or(prompt_ids.len(), |metadata| {
-                                    metadata.prompt_token_count
-                                }),
+                                .map_or(prompt_ids.len(), |metadata| metadata.prompt_token_count),
                             request_fingerprint: fingerprint,
                             generated_token_ids: combined_token_ids.clone(),
                             raw_text: combined_raw_text.clone(),
@@ -1275,11 +1272,7 @@ impl QwenWorker {
                             metadata,
                         );
                     } else {
-                        cache.insert(
-                            &completed_tokens,
-                            vec![final_snapshot],
-                            cache_route,
-                        );
+                        cache.insert(&completed_tokens, vec![final_snapshot], cache_route);
                     }
                 }
             }

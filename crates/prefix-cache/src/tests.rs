@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Condvar, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mlxcel_core::generate::ModelStateSnapshot;
@@ -17,7 +17,6 @@ fn namespaces() -> CacheNamespaces {
         mtp: MTP_NAMESPACE.to_string(),
     }
 }
-
 
 fn snapshot(token_len: usize, values: &[f32]) -> PromptSnapshot {
     let array = mlxcel_core::from_slice_f32(values, &[values.len() as i32]);
@@ -41,26 +40,46 @@ fn resume_metadata(response_id: &str, fingerprint: &str) -> ResponseResumeMetada
 }
 
 fn memory_config(memory_bytes: u64) -> CacheConfig {
-    CacheConfig { memory_bytes, directory: None, filesystem_bytes: 1024 * 1024 }
+    CacheConfig {
+        memory_bytes,
+        directory: None,
+        filesystem_bytes: 1024 * 1024,
+    }
 }
 
 #[derive(Clone)]
 struct ManualClock(Arc<AtomicU64>);
 impl Clock for ManualClock {
-    fn now_unix_ms(&self) -> u64 { self.0.load(Ordering::SeqCst) }
+    fn now_unix_ms(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
+    }
 }
 impl ManualClock {
-    fn new(now: u64) -> Self { Self(Arc::new(AtomicU64::new(now))) }
-    fn set(&self, now: u64) { self.0.store(now, Ordering::SeqCst); }
+    fn new(now: u64) -> Self {
+        Self(Arc::new(AtomicU64::new(now)))
+    }
+    fn set(&self, now: u64) {
+        self.0.store(now, Ordering::SeqCst);
+    }
 }
 
 struct EmptyStore;
 impl PersistentSnapshotStore for EmptyStore {
-    fn scan(&mut self, _namespace: &str, _now_unix_ms: u64) -> Result<Vec<ScannedEntry>, String> { Ok(Vec::new()) }
-    fn load(&mut self, _key: &EntryKey) -> Result<Option<StoredEntry>, String> { Ok(None) }
-    fn put(&mut self, _entry: StoredEntry, _expires_at_unix_ms: u64) -> Result<(), String> { Ok(()) }
-    fn refresh(&mut self, _key: &EntryKey, _expires_at_unix_ms: u64) -> Result<(), String> { Ok(()) }
-    fn remove(&mut self, _key: &EntryKey) -> Result<(), String> { Ok(()) }
+    fn scan(&mut self, _namespace: &str, _now_unix_ms: u64) -> Result<Vec<ScannedEntry>, String> {
+        Ok(Vec::new())
+    }
+    fn load(&mut self, _key: &EntryKey) -> Result<Option<StoredEntry>, String> {
+        Ok(None)
+    }
+    fn put(&mut self, _entry: StoredEntry, _expires_at_unix_ms: u64) -> Result<(), String> {
+        Ok(())
+    }
+    fn refresh(&mut self, _key: &EntryKey, _expires_at_unix_ms: u64) -> Result<(), String> {
+        Ok(())
+    }
+    fn remove(&mut self, _key: &EntryKey) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 #[test]
@@ -101,15 +120,15 @@ impl PersistentSnapshotStore for RecordingStore {
     }
 
     fn put(&mut self, entry: StoredEntry, _expires_at_unix_ms: u64) -> Result<(), String> {
-        self.0.lock().expect("recording store lock").entries.insert(
-            entry.key,
-            (entry.manifest, entry.blobs),
-        );
+        self.0
+            .lock()
+            .expect("recording store lock")
+            .entries
+            .insert(entry.key, (entry.manifest, entry.blobs));
         Ok(())
     }
 
     fn refresh(&mut self, key: &EntryKey, expires_at_unix_ms: u64) -> Result<(), String> {
-
         self.0
             .lock()
             .expect("recording store lock")
@@ -119,7 +138,11 @@ impl PersistentSnapshotStore for RecordingStore {
     }
 
     fn remove(&mut self, key: &EntryKey) -> Result<(), String> {
-        self.0.lock().expect("recording store lock").entries.remove(key);
+        self.0
+            .lock()
+            .expect("recording store lock")
+            .entries
+            .remove(key);
         Ok(())
     }
 }
@@ -132,11 +155,7 @@ struct BlockingState {
 struct BlockingStore(Arc<(Mutex<BlockingState>, Condvar)>);
 
 impl PersistentSnapshotStore for BlockingStore {
-    fn scan(
-        &mut self,
-        _namespace: &str,
-        _now_unix_ms: u64,
-    ) -> Result<Vec<ScannedEntry>, String> {
+    fn scan(&mut self, _namespace: &str, _now_unix_ms: u64) -> Result<Vec<ScannedEntry>, String> {
         Ok(Vec::new())
     }
 
@@ -144,11 +163,7 @@ impl PersistentSnapshotStore for BlockingStore {
         Ok(None)
     }
 
-    fn put(
-        &mut self,
-        _entry: StoredEntry,
-        _expires_at_unix_ms: u64,
-    ) -> Result<(), String> {
+    fn put(&mut self, _entry: StoredEntry, _expires_at_unix_ms: u64) -> Result<(), String> {
         let (state, wake) = &*self.0;
         let mut state = state.lock().expect("blocking store lock");
         state.entered = true;
@@ -172,45 +187,77 @@ impl PersistentSnapshotStore for BlockingStore {
 fn radix_divergence_promotes_second_observation_and_selects_longest_snapshot() {
     let clock = ManualClock::new(1_000);
     let mut cache = AdaptivePrefixCache::with_store_and_clock(
-        namespaces(), memory_config(1_000_000), Box::new(EmptyStore), Box::new(clock),
-    ).expect("cache");
+        namespaces(),
+        memory_config(1_000_000),
+        Box::new(EmptyStore),
+        Box::new(clock),
+    )
+    .expect("cache");
     let first = (0..400).collect::<Vec<i32>>();
     let mut second = first[..300].to_vec();
     second.extend(1_000..1_100);
     let mut third = first[..300].to_vec();
     third.extend(2_000..2_100);
-    assert_eq!(cache.checkpoint_lengths(&first, &[400], SnapshotRoute::Baseline), vec![400]);
+    assert_eq!(
+        cache.checkpoint_lengths(&first, &[400], SnapshotRoute::Baseline),
+        vec![400]
+    );
     assert_eq!(
         cache.checkpoint_lengths(&second, &[400], SnapshotRoute::Baseline),
         vec![256, 400],
     );
-    cache.insert(&second, vec![snapshot(256, &[1.0, 2.0])], SnapshotRoute::Baseline);
-    let hit = cache.lookup(&third, SnapshotRoute::Baseline).expect("promoted shared prefix");
+    cache.insert(
+        &second,
+        vec![snapshot(256, &[1.0, 2.0])],
+        SnapshotRoute::Baseline,
+    );
+    let hit = cache
+        .lookup(&third, SnapshotRoute::Baseline)
+        .expect("promoted shared prefix");
     assert_eq!(hit.token_count, 256);
 }
 
 #[test]
 fn ttl_progression_expiry_and_byte_eviction_are_adaptive() {
-    assert_eq!((0..8).map(reuse_ttl_ms).collect::<Vec<_>>(), vec![
-        2 * 60 * 60 * 1000,
-        4 * 60 * 60 * 1000,
-        4 * 60 * 60 * 1000,
-        8 * 60 * 60 * 1000,
-        8 * 60 * 60 * 1000,
-        8 * 60 * 60 * 1000,
-        8 * 60 * 60 * 1000,
-        16 * 60 * 60 * 1000,
-    ]);
+    assert_eq!(
+        (0..8).map(reuse_ttl_ms).collect::<Vec<_>>(),
+        vec![
+            2 * 60 * 60 * 1000,
+            4 * 60 * 60 * 1000,
+            4 * 60 * 60 * 1000,
+            8 * 60 * 60 * 1000,
+            8 * 60 * 60 * 1000,
+            8 * 60 * 60 * 1000,
+            8 * 60 * 60 * 1000,
+            16 * 60 * 60 * 1000,
+        ]
+    );
     let clock = ManualClock::new(10_000);
     let mut cache = AdaptivePrefixCache::with_store_and_clock(
-        namespaces(), memory_config(1), Box::new(EmptyStore), Box::new(clock.clone()),
-    ).expect("cache");
-    cache.insert(&[1, 2], vec![snapshot(2, &[1.0, 2.0])], SnapshotRoute::Baseline);
-    assert_eq!(cache.memory_bytes(), 0, "snapshot-byte budget evicts oversized state");
+        namespaces(),
+        memory_config(1),
+        Box::new(EmptyStore),
+        Box::new(clock.clone()),
+    )
+    .expect("cache");
+    cache.insert(
+        &[1, 2],
+        vec![snapshot(2, &[1.0, 2.0])],
+        SnapshotRoute::Baseline,
+    );
+    assert_eq!(
+        cache.memory_bytes(),
+        0,
+        "snapshot-byte budget evicts oversized state"
+    );
 
     let mut cache = AdaptivePrefixCache::with_store_and_clock(
-        namespaces(), memory_config(1_000_000), Box::new(EmptyStore), Box::new(clock.clone()),
-    ).expect("cache");
+        namespaces(),
+        memory_config(1_000_000),
+        Box::new(EmptyStore),
+        Box::new(clock.clone()),
+    )
+    .expect("cache");
     cache.insert(&[1, 2], vec![snapshot(2, &[1.0])], SnapshotRoute::Baseline);
     clock.set(10_000 + INITIAL_TTL_MS + 1);
     assert!(cache.lookup(&[1, 2, 3], SnapshotRoute::Baseline).is_none());
@@ -239,10 +286,7 @@ fn half_life_refreshes_are_coalesced_per_entry() {
     {
         let mut state = state.lock().expect("recording store lock");
         assert_eq!(state.refreshes.len(), 1);
-        assert_eq!(
-            state.refreshes[0].1,
-            start + 1 + 4 * 60 * 60 * 1000,
-        );
+        assert_eq!(state.refreshes[0].1, start + 1 + 4 * 60 * 60 * 1000,);
         state.refreshes.clear();
     }
 
@@ -274,12 +318,20 @@ fn filesystem_byte_cap_evicts_persistent_entries_by_snapshot_bytes() {
         Box::new(RecordingStore(Arc::clone(&state))),
     )
     .expect("cache");
-    cache.insert(&[1], vec![snapshot(1, &[1.0, 2.0])], SnapshotRoute::Baseline);
+    cache.insert(
+        &[1],
+        vec![snapshot(1, &[1.0, 2.0])],
+        SnapshotRoute::Baseline,
+    );
     cache.flush_persistence();
 
     assert_eq!(cache.filesystem_bytes, 0);
     assert!(
-        state.lock().expect("recording store lock").entries.is_empty(),
+        state
+            .lock()
+            .expect("recording store lock")
+            .entries
+            .is_empty(),
         "write-through is followed by persistent eviction under the byte cap",
     );
 }
@@ -287,27 +339,43 @@ fn filesystem_byte_cap_evicts_persistent_entries_by_snapshot_bytes() {
 #[test]
 fn filesystem_restart_promotes_valid_entry_and_deletes_corrupt_payload() {
     let directory = TempDirectory::new();
-    let config = CacheConfig { memory_bytes: 1_000_000, directory: Some(directory.path.clone()), filesystem_bytes: 1_000_000 };
+    let config = CacheConfig {
+        memory_bytes: 1_000_000,
+        directory: Some(directory.path.clone()),
+        filesystem_bytes: 1_000_000,
+    };
     let tokens = vec![4, 5, 6];
     let key = entry_key(NAMESPACE, SnapshotRoute::Baseline, &tokens);
     {
         let mut cache = AdaptivePrefixCache::new(namespaces(), config.clone()).expect("cache");
         cache.checkpoint_lengths(&tokens, &[tokens.len()], SnapshotRoute::Baseline);
-        cache.insert(&tokens, vec![snapshot(tokens.len(), &[1.0, 2.0])], SnapshotRoute::Baseline);
+        cache.insert(
+            &tokens,
+            vec![snapshot(tokens.len(), &[1.0, 2.0])],
+            SnapshotRoute::Baseline,
+        );
         cache.flush_persistence();
     }
     {
-        let mut restarted = AdaptivePrefixCache::new(namespaces(), config.clone()).expect("restart");
-        let hit = restarted.lookup(&[4, 5, 6, 7], SnapshotRoute::Baseline).expect("filesystem hit");
+        let mut restarted =
+            AdaptivePrefixCache::new(namespaces(), config.clone()).expect("restart");
+        let hit = restarted
+            .lookup(&[4, 5, 6, 7], SnapshotRoute::Baseline)
+            .expect("filesystem hit");
         assert_eq!(hit.token_count, 3);
     }
-    std::fs::write(directory.path.join(&key.0).join("00000.blob"), b"corrupt").expect("corrupt blob");
+    std::fs::write(directory.path.join(&key.0).join("00000.blob"), b"corrupt")
+        .expect("corrupt blob");
     {
-        let mut restarted = AdaptivePrefixCache::new(namespaces(), config).expect("restart corrupt");
+        let mut restarted =
+            AdaptivePrefixCache::new(namespaces(), config).expect("restart corrupt");
         assert!(restarted.lookup(&tokens, SnapshotRoute::Baseline).is_none());
         restarted.flush_persistence();
     }
-    assert!(!directory.path.join(&key.0).exists(), "corrupt entry is deletion-as-miss");
+    assert!(
+        !directory.path.join(&key.0).exists(),
+        "corrupt entry is deletion-as-miss"
+    );
 }
 
 #[test]
@@ -316,16 +384,34 @@ fn strict_manifest_rejects_unknown_fields_and_namespace_mismatch() {
         NAMESPACE,
         SnapshotRoute::Baseline,
         &[1],
-        snapshot(1, &[1.0]).to_portable().expect("portable snapshot"),
-        RetentionMetadata { observations: 1, reuse_count: 0, last_access_unix_ms: 0 },
+        snapshot(1, &[1.0])
+            .to_portable()
+            .expect("portable snapshot"),
+        RetentionMetadata {
+            observations: 1,
+            reuse_count: 0,
+            last_access_unix_ms: 0,
+        },
         INITIAL_TTL_MS,
         None,
-    ).expect("encode");
-    let mut value: serde_json::Value = serde_json::from_slice(&encoded.manifest).expect("manifest JSON");
-    value.as_object_mut().unwrap().insert("format_version".to_string(), 1.into());
+    )
+    .expect("encode");
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&encoded.manifest).expect("manifest JSON");
+    value
+        .as_object_mut()
+        .unwrap()
+        .insert("format_version".to_string(), 1.into());
     let changed = serde_json::to_vec(&value).unwrap();
     assert!(codec::decode(NAMESPACE, &changed, encoded.blobs.clone()).is_err());
-    assert!(codec::decode("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", &encoded.manifest, encoded.blobs.clone()).is_err());
+    assert!(
+        codec::decode(
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            &encoded.manifest,
+            encoded.blobs.clone()
+        )
+        .is_err()
+    );
     let mut missing: serde_json::Value =
         serde_json::from_slice(&encoded.manifest).expect("manifest JSON");
     missing.as_object_mut().unwrap().remove("response_resume");
@@ -365,12 +451,17 @@ fn mtp_manifest_round_trip_preserves_route_and_offset_validation() {
         SnapshotRoute::Mtp,
         &[7],
         portable,
-        RetentionMetadata { observations: 1, reuse_count: 0, last_access_unix_ms: 0 },
+        RetentionMetadata {
+            observations: 1,
+            reuse_count: 0,
+            last_access_unix_ms: 0,
+        },
         INITIAL_TTL_MS,
         None,
     )
     .expect("encode MTP");
-    let decoded = codec::decode(MTP_NAMESPACE, &encoded.manifest, encoded.blobs).expect("decode MTP");
+    let decoded =
+        codec::decode(MTP_NAMESPACE, &encoded.manifest, encoded.blobs).expect("decode MTP");
     assert!(matches!(decoded.snapshot, PromptSnapshot::Mtp(_)));
 }
 
@@ -383,8 +474,7 @@ fn filesystem_namespace_isolation_and_partial_recovery_are_misses() {
         filesystem_bytes: 1_000_000,
     };
     {
-        let mut cache =
-            AdaptivePrefixCache::new(namespaces(), config.clone()).expect("cache");
+        let mut cache = AdaptivePrefixCache::new(namespaces(), config.clone()).expect("cache");
         cache.insert(&[9], vec![snapshot(1, &[9.0])], SnapshotRoute::Baseline);
         cache.flush_persistence();
     }
@@ -392,13 +482,11 @@ fn filesystem_namespace_isolation_and_partial_recovery_are_misses() {
     std::fs::create_dir(&partial).expect("partial directory");
     std::fs::write(partial.join("00000.blob"), b"partial").expect("partial blob");
 
-    let other_namespace =
-        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let other_namespace = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     let mut isolated = AdaptivePrefixCache::new(
         CacheNamespaces {
             baseline: other_namespace.to_string(),
-            mtp: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
-                .to_string(),
+            mtp: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string(),
         },
         config,
     )
@@ -415,20 +503,33 @@ fn filesystem_namespace_isolation_and_partial_recovery_are_misses() {
         },
     )
     .expect("recovered cache");
-    assert!(!partial.exists(), "startup removes interrupted temporary entries");
+    assert!(
+        !partial.exists(),
+        "startup removes interrupted temporary entries"
+    );
 }
 
-struct TempDirectory { path: PathBuf }
+struct TempDirectory {
+    path: PathBuf,
+}
 impl TempDirectory {
     fn new() -> Self {
-        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
-        let path = std::env::temp_dir().join(format!("qw-prefix-cache-test-{}-{unique}", std::process::id()));
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "qw-prefix-cache-test-{}-{unique}",
+            std::process::id()
+        ));
         std::fs::create_dir(&path).expect("create temp directory");
         Self { path }
     }
 }
 impl Drop for TempDirectory {
-    fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.path); }
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
 }
 
 #[test]
@@ -448,28 +549,16 @@ fn resume_records_are_mismatch_safe_one_shot_and_expire() {
         resume_metadata("chatcmpl-original", "fingerprint"),
     );
     assert!(matches!(
-        cache.take_resume(
-            "chatcmpl-original",
-            "different",
-            SnapshotRoute::Baseline,
-        ),
+        cache.take_resume("chatcmpl-original", "different", SnapshotRoute::Baseline,),
         Err(ResumeLookupError::Mismatch)
     ));
     let resumed = cache
-        .take_resume(
-            "chatcmpl-original",
-            "fingerprint",
-            SnapshotRoute::Baseline,
-        )
+        .take_resume("chatcmpl-original", "fingerprint", SnapshotRoute::Baseline)
         .expect("resume checkpoint");
     assert_eq!(resumed.token_ids, vec![1, 2, 3]);
     assert_eq!(resumed.metadata.message_id, "msg_original");
     assert!(matches!(
-        cache.take_resume(
-            "chatcmpl-original",
-            "fingerprint",
-            SnapshotRoute::Baseline,
-        ),
+        cache.take_resume("chatcmpl-original", "fingerprint", SnapshotRoute::Baseline,),
         Err(ResumeLookupError::NotFound)
     ));
 
@@ -481,12 +570,7 @@ fn resume_records_are_mismatch_safe_one_shot_and_expire() {
     );
     clock.set(50_000 + INITIAL_TTL_MS + 1);
     assert!(matches!(
-        cache.take_resume(
-            "chatcmpl-expired",
-            "fingerprint",
-            SnapshotRoute::Baseline,
-        ),
-
+        cache.take_resume("chatcmpl-expired", "fingerprint", SnapshotRoute::Baseline,),
         Err(ResumeLookupError::NotFound)
     ));
 }
@@ -515,18 +599,17 @@ fn resume_is_hot_before_persistent_write_completes() {
         .expect("blocking store wait");
     let entered = state.entered;
     drop(state);
-    let resumed = cache.take_resume(
-        "chatcmpl-hot",
-        "fingerprint",
-        SnapshotRoute::Baseline,
-    );
+    let resumed = cache.take_resume("chatcmpl-hot", "fingerprint", SnapshotRoute::Baseline);
     let mut state = state_lock.lock().expect("blocking store lock");
     state.released = true;
     wake.notify_all();
     drop(state);
     cache.flush_persistence();
 
-    assert!(!timeout.timed_out() && entered, "persistence write did not start");
+    assert!(
+        !timeout.timed_out() && entered,
+        "persistence write did not start"
+    );
     assert!(resumed.is_ok(), "hot resume must not wait for persistence");
 }
 
