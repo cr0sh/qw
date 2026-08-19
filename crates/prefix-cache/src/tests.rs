@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -25,6 +25,19 @@ fn snapshot(token_len: usize, values: &[f32]) -> PromptSnapshot {
     snapshot.push_tensor("state", &array);
     snapshot.set_continuation_logits(&array);
     PromptSnapshot::Baseline(snapshot)
+}
+
+fn resume_metadata(response_id: &str, fingerprint: &str) -> ResponseResumeMetadata {
+    ResponseResumeMetadata {
+        response_id: response_id.to_string(),
+        message_id: "msg_original".to_string(),
+        created_unix_seconds: 123,
+        prompt_token_count: 2,
+        request_fingerprint: fingerprint.to_string(),
+        generated_token_ids: vec![3, 4],
+        raw_text: "partial".to_string(),
+        original_max_tokens: 8,
+    }
 }
 
 fn memory_config(memory_bytes: u64) -> CacheConfig {
@@ -96,6 +109,7 @@ impl PersistentSnapshotStore for RecordingStore {
     }
 
     fn refresh(&mut self, key: &EntryKey, expires_at_unix_ms: u64) -> Result<(), String> {
+
         self.0
             .lock()
             .expect("recording store lock")
@@ -106,6 +120,50 @@ impl PersistentSnapshotStore for RecordingStore {
 
     fn remove(&mut self, key: &EntryKey) -> Result<(), String> {
         self.0.lock().expect("recording store lock").entries.remove(key);
+        Ok(())
+    }
+}
+#[derive(Default)]
+struct BlockingState {
+    entered: bool,
+    released: bool,
+}
+
+struct BlockingStore(Arc<(Mutex<BlockingState>, Condvar)>);
+
+impl PersistentSnapshotStore for BlockingStore {
+    fn scan(
+        &mut self,
+        _namespace: &str,
+        _now_unix_ms: u64,
+    ) -> Result<Vec<ScannedEntry>, String> {
+        Ok(Vec::new())
+    }
+
+    fn load(&mut self, _key: &EntryKey) -> Result<Option<StoredEntry>, String> {
+        Ok(None)
+    }
+
+    fn put(
+        &mut self,
+        _entry: StoredEntry,
+        _expires_at_unix_ms: u64,
+    ) -> Result<(), String> {
+        let (state, wake) = &*self.0;
+        let mut state = state.lock().expect("blocking store lock");
+        state.entered = true;
+        wake.notify_all();
+        while !state.released {
+            state = wake.wait(state).expect("blocking store wait");
+        }
+        Ok(())
+    }
+
+    fn refresh(&mut self, _key: &EntryKey, _expires_at_unix_ms: u64) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn remove(&mut self, _key: &EntryKey) -> Result<(), String> {
         Ok(())
     }
 }
@@ -371,4 +429,144 @@ impl TempDirectory {
 }
 impl Drop for TempDirectory {
     fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.path); }
+}
+
+#[test]
+fn resume_records_are_mismatch_safe_one_shot_and_expire() {
+    let clock = ManualClock::new(50_000);
+    let mut cache = AdaptivePrefixCache::with_store_and_clock(
+        namespaces(),
+        memory_config(1_000_000),
+        Box::new(EmptyStore),
+        Box::new(clock.clone()),
+    )
+    .expect("cache");
+    cache.insert_resume(
+        &[1, 2, 3],
+        snapshot(3, &[1.0]),
+        SnapshotRoute::Baseline,
+        resume_metadata("chatcmpl-original", "fingerprint"),
+    );
+    assert!(matches!(
+        cache.take_resume(
+            "chatcmpl-original",
+            "different",
+            SnapshotRoute::Baseline,
+        ),
+        Err(ResumeLookupError::Mismatch)
+    ));
+    let resumed = cache
+        .take_resume(
+            "chatcmpl-original",
+            "fingerprint",
+            SnapshotRoute::Baseline,
+        )
+        .expect("resume checkpoint");
+    assert_eq!(resumed.token_ids, vec![1, 2, 3]);
+    assert_eq!(resumed.metadata.message_id, "msg_original");
+    assert!(matches!(
+        cache.take_resume(
+            "chatcmpl-original",
+            "fingerprint",
+            SnapshotRoute::Baseline,
+        ),
+        Err(ResumeLookupError::NotFound)
+    ));
+
+    cache.insert_resume(
+        &[5],
+        snapshot(1, &[2.0]),
+        SnapshotRoute::Baseline,
+        resume_metadata("chatcmpl-expired", "fingerprint"),
+    );
+    clock.set(50_000 + INITIAL_TTL_MS + 1);
+    assert!(matches!(
+        cache.take_resume(
+            "chatcmpl-expired",
+            "fingerprint",
+            SnapshotRoute::Baseline,
+        ),
+
+        Err(ResumeLookupError::NotFound)
+    ));
+}
+#[test]
+fn resume_is_hot_before_persistent_write_completes() {
+    let blocking = Arc::new((Mutex::new(BlockingState::default()), Condvar::new()));
+    let mut cache = AdaptivePrefixCache::with_store(
+        namespaces(),
+        memory_config(1_000_000),
+        Box::new(BlockingStore(Arc::clone(&blocking))),
+    )
+    .expect("cache");
+    cache.insert_resume(
+        &[1, 2, 3],
+        snapshot(3, &[1.0]),
+        SnapshotRoute::Baseline,
+        resume_metadata("chatcmpl-hot", "fingerprint"),
+    );
+
+    let (state_lock, wake) = &*blocking;
+    let state = state_lock.lock().expect("blocking store lock");
+    let (state, timeout) = wake
+        .wait_timeout_while(state, std::time::Duration::from_secs(5), |state| {
+            !state.entered
+        })
+        .expect("blocking store wait");
+    let entered = state.entered;
+    drop(state);
+    let resumed = cache.take_resume(
+        "chatcmpl-hot",
+        "fingerprint",
+        SnapshotRoute::Baseline,
+    );
+    let mut state = state_lock.lock().expect("blocking store lock");
+    state.released = true;
+    wake.notify_all();
+    drop(state);
+    cache.flush_persistence();
+
+    assert!(!timeout.timed_out() && entered, "persistence write did not start");
+    assert!(resumed.is_ok(), "hot resume must not wait for persistence");
+}
+
+#[test]
+fn resume_record_survives_persistent_restart_and_is_removed_on_take() {
+    let state = Arc::new(Mutex::new(RecordingState::default()));
+    {
+        let mut cache = AdaptivePrefixCache::with_store(
+            namespaces(),
+            memory_config(1_000_000),
+            Box::new(RecordingStore(Arc::clone(&state))),
+        )
+        .expect("cache");
+        cache.insert_resume(
+            &[7, 8],
+            snapshot(2, &[3.0]),
+            SnapshotRoute::Baseline,
+            resume_metadata("resp_original", "fingerprint"),
+        );
+        cache.flush_persistence();
+    }
+    {
+        let mut restarted = AdaptivePrefixCache::with_store(
+            namespaces(),
+            memory_config(1_000_000),
+            Box::new(RecordingStore(Arc::clone(&state))),
+        )
+        .expect("restarted cache");
+        let resumed = restarted
+            .take_resume("resp_original", "fingerprint", SnapshotRoute::Baseline)
+            .expect("persistent resume");
+        assert_eq!(resumed.metadata.raw_text, "partial");
+        restarted.flush_persistence();
+    }
+    assert!(
+        state
+            .lock()
+            .expect("recording store lock")
+            .entries
+            .is_empty(),
+        "taking a resume checkpoint removes persistent one-shot state"
+    );
 }

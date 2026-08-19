@@ -1,6 +1,6 @@
 use qw_runtime::PromptSnapshot;
 
-use crate::{EntryKey, SnapshotRoute};
+use crate::{EntryKey, ResponseResumeMetadata, SnapshotRoute};
 
 pub(crate) struct Terminal {
     pub route: SnapshotRoute,
@@ -11,6 +11,7 @@ pub(crate) struct Terminal {
     pub serialized_bytes: u64,
     pub snapshot: Option<PromptSnapshot>,
     pub persistent_key: Option<EntryKey>,
+    pub response_resume: Option<ResponseResumeMetadata>,
 }
 
 impl Terminal {
@@ -24,6 +25,7 @@ impl Terminal {
             serialized_bytes: 0,
             snapshot: None,
             persistent_key: None,
+            response_resume: None,
         }
     }
 }

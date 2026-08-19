@@ -17,7 +17,10 @@ use serde::{Deserialize, Serialize};
 
 pub use codec::{Manifest, ResponseResumeMetadata, namespace_hash};
 pub use store::{FilesystemSnapshotStore, PersistentSnapshotStore, ScannedEntry, StoredEntry};
-use codec::{RetentionMetadata, decode, encode_portable, entry_key, parse_manifest};
+use codec::{
+    RetentionMetadata, decode, encode_portable, entry_key, parse_manifest,
+    validate_resume_metadata,
+};
 use trie::{RadixTrie, Terminal};
 
 const INITIAL_TTL_MS: u64 = 2 * 60 * 60 * 1000;
@@ -110,6 +113,18 @@ pub struct PrefixMatch<'a> {
     pub snapshot: &'a PromptSnapshot,
 }
 
+pub struct ResumeEntry {
+    pub token_ids: Vec<i32>,
+    pub snapshot: PromptSnapshot,
+    pub metadata: ResponseResumeMetadata,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeLookupError {
+    NotFound,
+    Mismatch,
+}
+
 pub struct AdaptivePrefixCache {
     namespaces: CacheNamespaces,
     trie: RadixTrie,
@@ -119,6 +134,7 @@ pub struct AdaptivePrefixCache {
     filesystem_bytes: u64,
     io: Option<CacheIo>,
     clock: Box<dyn Clock>,
+    resumes: HashMap<String, (SnapshotRoute, Vec<i32>)>,
 }
 
 struct CacheIo {
@@ -136,6 +152,7 @@ enum IoCommand {
         portable: PortablePromptSnapshot,
         retention: RetentionMetadata,
         expires_at_unix_ms: u64,
+        response_resume: Option<ResponseResumeMetadata>,
     },
     Remove(EntryKey),
     FlushRefresh,
@@ -177,6 +194,7 @@ impl AdaptivePrefixCache {
         }
         let now = clock.now_unix_ms();
         let mut trie = RadixTrie::new();
+        let mut resumes = HashMap::new();
         let mut filesystem_bytes = 0u64;
         if let Some(store) = store.as_mut() {
             for (expected_route, namespace) in namespaces.iter() {
@@ -205,7 +223,14 @@ impl AdaptivePrefixCache {
                                 serialized_bytes: manifest.total_bytes,
                                 snapshot: None,
                                 persistent_key: Some(scanned_entry.key),
+                                response_resume: manifest.response_resume.clone(),
                             });
+                            if let Some(resume) = manifest.response_resume {
+                                resumes.insert(
+                                    resume.response_id,
+                                    (manifest.route, manifest.token_ids),
+                                );
+                            }
                         }
                         Ok(_) => { let _ = store.remove(&scanned_entry.key); }
                         Err(error) => {
@@ -226,6 +251,7 @@ impl AdaptivePrefixCache {
             filesystem_bytes,
             io,
             clock,
+            resumes,
         };
         cache.evict_persistent(now);
         tracing::info!(phase = "cache.insert", tier = "memory", capacity_bytes = cache.memory_cap);
@@ -293,65 +319,221 @@ impl AdaptivePrefixCache {
         Some(PrefixMatch { token_count, snapshot })
     }
 
-    pub fn insert(&mut self, tokens: &[i32], snapshots: Vec<PromptSnapshot>, route: SnapshotRoute) {
+    pub fn take_resume(
+        &mut self,
+        response_id: &str,
+        request_fingerprint: &str,
+        expected_route: SnapshotRoute,
+    ) -> Result<ResumeEntry, ResumeLookupError> {
+        let now = self.clock.now_unix_ms();
+        self.expire(now);
+        let (route, token_ids) = self
+            .resumes
+            .get(response_id)
+            .cloned()
+            .ok_or(ResumeLookupError::NotFound)?;
+        if route != expected_route {
+            return Err(ResumeLookupError::NotFound);
+        }
+        let Some((node, length)) = self.trie.path(&token_ids, route).into_iter().last() else {
+            self.resumes.remove(response_id);
+            return Err(ResumeLookupError::NotFound);
+        };
+        if length != token_ids.len() {
+            self.resumes.remove(response_id);
+            return Err(ResumeLookupError::NotFound);
+        }
+        let metadata = self
+            .trie
+            .terminal(node, route)
+            .and_then(|terminal| terminal.response_resume.clone())
+            .ok_or(ResumeLookupError::NotFound)?;
+        if metadata.request_fingerprint != request_fingerprint {
+            return Err(ResumeLookupError::Mismatch);
+        }
+        if self
+            .trie
+            .terminal(node, route)
+            .is_some_and(|terminal| terminal.snapshot.is_none())
+        {
+            let key = self
+                .trie
+                .terminal(node, route)
+                .and_then(|terminal| terminal.persistent_key.clone())
+                .ok_or(ResumeLookupError::NotFound)?;
+            if !self.load_persistent(node, route, &key, now) {
+                self.resumes.remove(response_id);
+                return Err(ResumeLookupError::NotFound);
+            }
+        }
+        let terminal = self
+            .trie
+            .remove_terminal(node, route)
+            .ok_or(ResumeLookupError::NotFound)?;
+        self.resumes.remove(response_id);
+        self.memory_bytes = self.memory_bytes.saturating_sub(
+            terminal
+                .snapshot
+                .as_ref()
+                .map_or(0, |snapshot| snapshot.nbytes() as u64),
+        );
+        self.filesystem_bytes = self.filesystem_bytes.saturating_sub(terminal.serialized_bytes);
+        if let Some(key) = terminal.persistent_key {
+            self.try_io(IoCommand::Remove(key));
+        }
+        let snapshot = terminal.snapshot.ok_or(ResumeLookupError::NotFound)?;
+        tracing::info!(phase = "cache.resume", response_id, route = route.as_str());
+        Ok(ResumeEntry {
+            token_ids,
+            snapshot,
+            metadata,
+        })
+    }
+
+    pub fn insert(
+        &mut self,
+        tokens: &[i32],
+        snapshots: Vec<PromptSnapshot>,
+        route: SnapshotRoute,
+    ) {
+        self.insert_snapshots(tokens, snapshots, route, None);
+    }
+
+    pub fn insert_resume(
+        &mut self,
+        tokens: &[i32],
+        snapshot: PromptSnapshot,
+        route: SnapshotRoute,
+        metadata: ResponseResumeMetadata,
+    ) {
+        if let Err(error) = validate_resume_metadata(tokens, Some(&metadata)) {
+            tracing::warn!(phase = "cache.persistence_error", error = %error);
+            return;
+        }
+        self.insert_snapshots(tokens, vec![snapshot], route, Some(metadata));
+    }
+
+    fn insert_snapshots(
+        &mut self,
+        tokens: &[i32],
+        snapshots: Vec<PromptSnapshot>,
+        route: SnapshotRoute,
+        response_resume: Option<ResponseResumeMetadata>,
+    ) {
         let now = self.clock.now_unix_ms();
         self.expire(now);
         for snapshot in snapshots {
             let token_len = snapshot.token_len();
-            if token_len == 0 || token_len > tokens.len() || !route.matches(&snapshot) { continue; }
+            if token_len == 0 || token_len > tokens.len() || !route.matches(&snapshot) {
+                continue;
+            }
             let prefix = &tokens[..token_len];
+            let resume = (token_len == tokens.len())
+                .then(|| response_resume.clone())
+                .flatten();
             let node = self.trie.ensure_node(prefix);
-            let (previous, previous_persistent_bytes) = self
+            let (previous, previous_persistent_bytes, previous_resume) = self
                 .trie
                 .terminal_mut(node, route)
                 .map(|terminal| {
                     (
                         terminal.snapshot.take(),
-                        terminal.persistent_key.is_some().then_some(terminal.serialized_bytes),
+                        terminal
+                            .persistent_key
+                            .is_some()
+                            .then_some(terminal.serialized_bytes),
+                        terminal.response_resume.take(),
                     )
                 })
-                .unwrap_or((None, None));
+                .unwrap_or((None, None, None));
             if let Some(previous) = previous {
                 self.memory_bytes = self.memory_bytes.saturating_sub(previous.nbytes() as u64);
             }
             if let Some(previous_bytes) = previous_persistent_bytes {
-                self.filesystem_bytes =
-                    self.filesystem_bytes.saturating_sub(previous_bytes);
+                self.filesystem_bytes = self.filesystem_bytes.saturating_sub(previous_bytes);
+            }
+            if let Some(previous_resume) = previous_resume {
+                self.resumes.remove(&previous_resume.response_id);
             }
             let bytes = snapshot.nbytes() as u64;
-            let portable = self.io.as_ref().and_then(|_| snapshot.to_portable().map_err(|error| tracing::warn!(phase = "cache.persistence_error", error = %error)).ok());
             let expiry = now.saturating_add(INITIAL_TTL_MS);
             let namespace = self.namespaces.get(route);
             let key = entry_key(namespace, route, prefix);
-            let (observations, reuse_count, last_access) = if let Some(terminal) = self.trie.terminal_mut(node, route) {
-                terminal.snapshot = Some(snapshot);
-                terminal.expires_at_unix_ms = expiry;
-                terminal.serialized_bytes = bytes;
-                terminal.persistent_key = self.io.as_ref().map(|_| key.clone());
-                (terminal.observations.max(1), terminal.reuse_count, terminal.last_access_unix_ms)
-            } else {
-                self.trie.ensure(prefix, route, Terminal {
-                    route,
-                    observations: 1,
-                    reuse_count: 0,
-                    last_access_unix_ms: now,
-                    expires_at_unix_ms: expiry,
-                    serialized_bytes: bytes,
-                    snapshot: Some(snapshot),
-                    persistent_key: self.io.as_ref().map(|_| key.clone()),
-                });
-                (1, 0, now)
-            };
+            let (observations, reuse_count, last_access) =
+                if let Some(terminal) = self.trie.terminal_mut(node, route) {
+                    terminal.snapshot = Some(snapshot);
+                    terminal.expires_at_unix_ms = expiry;
+                    terminal.serialized_bytes = bytes;
+                    terminal.persistent_key = self.io.as_ref().map(|_| key.clone());
+                    terminal.response_resume = resume.clone();
+                    (
+                        terminal.observations.max(1),
+                        terminal.reuse_count,
+                        terminal.last_access_unix_ms,
+                    )
+                } else {
+                    self.trie.ensure(
+                        prefix,
+                        route,
+                        Terminal {
+                            route,
+                            observations: 1,
+                            reuse_count: 0,
+                            last_access_unix_ms: now,
+                            expires_at_unix_ms: expiry,
+                            serialized_bytes: bytes,
+                            snapshot: Some(snapshot),
+                            persistent_key: self.io.as_ref().map(|_| key.clone()),
+                            response_resume: resume.clone(),
+                        },
+                    );
+                    (1, 0, now)
+                };
             self.memory_bytes = self.memory_bytes.saturating_add(bytes);
+            if let Some(resume) = resume.clone() {
+                self.resumes
+                    .insert(resume.response_id.clone(), (route, prefix.to_vec()));
+            }
+            // MLX array handles are thread-bound and !Send, so materialize only after the
+            // hot snapshot is installed, then hand portable bytes to the I/O thread.
+            let portable = self.io.as_ref().and_then(|_| {
+                self.trie
+                    .terminal(node, route)
+                    .and_then(|terminal| terminal.snapshot.as_ref())
+                    .and_then(|snapshot| {
+                        snapshot
+                            .to_portable()
+                            .map_err(|error| {
+                                tracing::warn!(
+                                    phase = "cache.persistence_error",
+                                    error = %error
+                                )
+                            })
+                            .ok()
+                    })
+            });
             if let Some(portable) = portable {
                 self.filesystem_bytes = self.filesystem_bytes.saturating_add(bytes);
                 self.try_io(IoCommand::Put {
-                    namespace: self.namespaces.get(route).to_string(), route, token_ids: prefix.to_vec(), portable,
-                    retention: RetentionMetadata { observations, reuse_count, last_access_unix_ms: last_access },
+                    namespace: self.namespaces.get(route).to_string(),
+                    route,
+                    token_ids: prefix.to_vec(),
+                    portable,
+                    retention: RetentionMetadata {
+                        observations,
+                        reuse_count,
+                        last_access_unix_ms: last_access,
+                    },
                     expires_at_unix_ms: expiry,
+                    response_resume: resume,
                 });
             }
-            tracing::info!(phase = "cache.insert", route = route.as_str(), token_count = token_len, snapshot_bytes = bytes);
+            tracing::info!(
+                phase = "cache.insert",
+                route = route.as_str(),
+                token_count = token_len,
+                snapshot_bytes = bytes
+            );
         }
         self.evict_memory();
         self.evict_persistent(now);
@@ -392,6 +574,7 @@ impl AdaptivePrefixCache {
                 let bytes = decoded.snapshot.nbytes() as u64;
                 let terminal = self.trie.terminal_mut(node, route).expect("persistent terminal exists");
                 terminal.snapshot = Some(decoded.snapshot);
+                terminal.response_resume = decoded.manifest.response_resume;
                 self.memory_bytes = self.memory_bytes.saturating_add(bytes);
                 self.evict_memory();
                 tracing::info!(phase = "cache.promote", from = "filesystem", to = "memory", route = route.as_str());
@@ -410,6 +593,9 @@ impl AdaptivePrefixCache {
         for (node, route) in self.trie.terminal_ids() {
             if self.trie.terminal(node, route).is_some_and(|terminal| terminal.expires_at_unix_ms <= now) {
                 if let Some(terminal) = self.trie.remove_terminal(node, route) {
+                    if let Some(resume) = &terminal.response_resume {
+                        self.resumes.remove(&resume.response_id);
+                    }
                     if let Some(snapshot) = terminal.snapshot { self.memory_bytes = self.memory_bytes.saturating_sub(snapshot.nbytes() as u64); }
                     self.filesystem_bytes = self.filesystem_bytes.saturating_sub(terminal.serialized_bytes);
                     if let Some(key) = terminal.persistent_key { self.try_io(IoCommand::Remove(key)); }
@@ -491,10 +677,33 @@ fn io_loop(
                 let _ = reply.send(store.load(&key));
                 continue;
             }
-            IoCommand::Put { namespace, route, token_ids, portable, retention, expires_at_unix_ms } => {
-                encode_portable(&namespace, route, &token_ids, portable, retention, expires_at_unix_ms, None)
-                    .and_then(|encoded| store.put(StoredEntry { key: encoded.key, manifest: encoded.manifest, blobs: encoded.blobs }, expires_at_unix_ms))
-            }
+            IoCommand::Put {
+                namespace,
+                route,
+                token_ids,
+                portable,
+                retention,
+                expires_at_unix_ms,
+                response_resume,
+            } => encode_portable(
+                &namespace,
+                route,
+                &token_ids,
+                portable,
+                retention,
+                expires_at_unix_ms,
+                response_resume,
+            )
+            .and_then(|encoded| {
+                store.put(
+                    StoredEntry {
+                        key: encoded.key,
+                        manifest: encoded.manifest,
+                        blobs: encoded.blobs,
+                    },
+                    expires_at_unix_ms,
+                )
+            }),
             IoCommand::Remove(key) => store.remove(&key),
             IoCommand::FlushRefresh => {
                 loop {

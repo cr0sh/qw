@@ -20,6 +20,9 @@ pub struct RetentionMetadata {
 #[serde(deny_unknown_fields)]
 pub struct ResponseResumeMetadata {
     pub response_id: String,
+    pub message_id: String,
+    pub created_unix_seconds: u64,
+    pub prompt_token_count: usize,
     pub request_fingerprint: String,
     pub generated_token_ids: Vec<i32>,
     pub raw_text: String,
@@ -113,6 +116,7 @@ pub fn encode_portable(
         PortablePromptSnapshot::Baseline(model) => (SnapshotRoute::Baseline, model.token_len),
         PortablePromptSnapshot::Mtp { target, .. } => (SnapshotRoute::Mtp, target.token_len),
     };
+    validate_resume_metadata(token_ids, response_resume.as_ref())?;
     if token_ids.is_empty() || portable_token_len != token_ids.len() || portable_route != route {
         return Err("portable snapshot route and token length must match the cache entry".to_string());
     }
@@ -209,6 +213,7 @@ fn validate_manifest(expected_namespace: &str, manifest: &Manifest) -> Result<()
     if manifest.token_ids.is_empty() || manifest.token_ids.len() != manifest.token_len {
         return Err("cache token length does not match token IDs".to_string());
     }
+    validate_resume_metadata(&manifest.token_ids, manifest.response_resume.as_ref())?;
     if manifest.family.is_empty() || manifest.arrays.is_empty() {
         return Err("cache manifest is missing model state".to_string());
     }
@@ -227,6 +232,33 @@ fn validate_manifest(expected_namespace: &str, manifest: &Manifest) -> Result<()
     }
     if end != manifest.total_bytes {
         return Err("cache array bytes do not match total bytes".to_string());
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_resume_metadata(
+    token_ids: &[i32],
+    metadata: Option<&ResponseResumeMetadata>,
+) -> Result<(), String> {
+    let Some(metadata) = metadata else {
+        return Ok(());
+    };
+    if metadata.response_id.is_empty()
+        || metadata.message_id.is_empty()
+        || metadata.request_fingerprint.is_empty()
+        || metadata.prompt_token_count == 0
+        || metadata.prompt_token_count > token_ids.len()
+        || metadata.generated_token_ids.is_empty()
+        || metadata.generated_token_ids.len() >= metadata.original_max_tokens
+    {
+        return Err("cache response resume metadata is invalid".to_string());
+    }
+    let aligned_output = &token_ids[metadata.prompt_token_count..];
+    if aligned_output.len() > metadata.generated_token_ids.len()
+        || aligned_output
+            != &metadata.generated_token_ids[..aligned_output.len()]
+    {
+        return Err("cache response resume tokens do not match the snapshot".to_string());
     }
     Ok(())
 }

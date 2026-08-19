@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use serde::Deserialize;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
 use qw_runtime::{
     ChatContentPart, ChatCustomToolCall, ChatFile, ChatImageUrl, ChatInputAudio, ChatMessage,
@@ -61,6 +61,7 @@ impl ReasoningEffort {
 #[derive(Debug, Clone)]
 pub struct CompletionRequest {
     pub endpoint: Endpoint,
+    pub resume_response_id: Option<String>,
     pub model: String,
     pub messages: Vec<ChatMessage>,
     pub tools: Vec<ChatTool>,
@@ -95,6 +96,53 @@ impl RequestError {
 
     pub(crate) fn at(message: impl Into<String>, param: impl Into<String>) -> Self {
         Self::new(message, Some(param.into()))
+    }
+}
+
+pub(crate) fn request_fingerprint(request: &CompletionRequest) -> String {
+    let output_format = match &request.output_format {
+        OutputFormat::Text => json!({"type": "text"}),
+        OutputFormat::JsonObject => json!({"type": "json_object"}),
+        OutputFormat::JsonSchema { name, schema } => {
+            json!({"type": "json_schema", "name": name, "schema": schema})
+        }
+    };
+    let mut canonical = json!({
+        "endpoint": match request.endpoint { Endpoint::Chat => "chat", Endpoint::Responses => "responses" },
+        "model": request.model,
+        "messages": request.messages,
+        "tools": request.tools,
+        "tool_choice": match request.tool_choice { ToolChoice::Auto => "auto", ToolChoice::None => "none" },
+        "parallel_tool_calls": request.parallel_tool_calls,
+        "reasoning_effort": request.reasoning_effort.map(ReasoningEffort::as_str),
+        "enable_thinking": request.enable_thinking,
+        "max_tokens": request.max_tokens,
+        "temperature": request.temperature,
+        "top_p": request.top_p,
+        "seed": request.seed,
+        "output_format": output_format,
+    });
+    canonicalize_json(&mut canonical);
+    let bytes = serde_json::to_vec(&canonical).expect("canonical request is serializable");
+    qw_prefix_cache::namespace_hash(&[&bytes])
+}
+
+fn canonicalize_json(value: &mut Value) {
+    match value {
+        Value::Array(values) => values.iter_mut().for_each(canonicalize_json),
+        Value::Object(object) => {
+            let mut sorted = object
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect::<Vec<_>>();
+            sorted.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+            object.clear();
+            for (key, mut value) in sorted {
+                canonicalize_json(&mut value);
+                object.insert(key, value);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
     }
 }
 
@@ -139,6 +187,7 @@ enum ChatWireMessage {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ChatWire {
+    resume_response_id: Option<String>,
     model: String,
     messages: Vec<Value>,
     #[serde(rename = "body")]
@@ -259,6 +308,7 @@ enum ResponsesInput {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ResponsesWire {
+    resume_response_id: Option<String>,
     model: String,
     input: ResponsesInput,
     #[serde(default)]
@@ -378,6 +428,7 @@ pub fn parse_chat(value: Value) -> Result<CompletionRequest, RequestError> {
     let messages = parse_chat_messages(wire.messages, &tools, &mut image_params)?;
     Ok(CompletionRequest {
         endpoint: Endpoint::Chat,
+        resume_response_id: wire.resume_response_id,
         model: wire.model,
         messages,
         tools,
@@ -443,6 +494,7 @@ pub fn parse_responses(value: Value) -> Result<CompletionRequest, RequestError> 
     };
     Ok(CompletionRequest {
         endpoint: Endpoint::Responses,
+        resume_response_id: wire.resume_response_id,
         model: wire.model,
         messages,
         tools,

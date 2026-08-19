@@ -54,6 +54,7 @@ pub struct ModelStateTensor {
     array: UniquePtr<MlxArray>,
 }
 
+
 impl ModelStateTensor {
     /// Capture a materialized copy of `array` under `name`.
     pub fn new(name: impl Into<String>, array: &MlxArray) -> Self {
@@ -93,6 +94,7 @@ pub struct ModelStateSnapshot {
     tensors: Vec<ModelStateTensor>,
     continuation_logits: Option<UniquePtr<MlxArray>>,
 }
+
 
 impl ModelStateSnapshot {
     /// Build an empty snapshot for `family` at `token_len` tokens.

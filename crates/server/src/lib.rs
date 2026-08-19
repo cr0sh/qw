@@ -182,7 +182,7 @@ async fn buffered_response_inner(mut submission: engine::Submission) -> Response
     };
     while let Some(event) = submission.events.recv().await {
         match event {
-            WorkerEvent::Started | WorkerEvent::Delta(_) => {}
+            WorkerEvent::Started(_) | WorkerEvent::Delta(_) => {}
             WorkerEvent::Complete(record) => {
                 guard.armed = false;
                 info!(
@@ -235,7 +235,8 @@ async fn streaming_response_inner(
     };
     let first = submission.events.recv().await;
     match first {
-        Some(WorkerEvent::Started) => {
+        Some(WorkerEvent::Started(admission)) => {
+            submission.admission = admission;
             admission_guard.armed = false;
             info!(phase = "response.streaming_admitted");
         }
@@ -350,7 +351,7 @@ impl SseState {
                 return Some(event);
             }
             match self.receiver.recv().await {
-                Some(WorkerEvent::Started) => continue,
+                Some(WorkerEvent::Started(_)) => continue,
                 Some(WorkerEvent::Delta(delta)) => self.enqueue_delta(delta),
                 Some(WorkerEvent::Complete(record)) => {
                     self.enqueue_complete(record);
@@ -663,11 +664,19 @@ impl SseState {
         let error = error_json(
             &failure.message,
             match failure.kind {
-                FailureKind::InvalidRequest => "invalid_request_error",
+                FailureKind::InvalidRequest
+                | FailureKind::ResumeMismatch
+                | FailureKind::ResumeNotFound
+                | FailureKind::ResumeUnsupported => "invalid_request_error",
                 FailureKind::Server => "server_error",
             },
             failure.param.as_deref(),
-            None,
+            match failure.kind {
+                FailureKind::ResumeMismatch => Some("resume_mismatch"),
+                FailureKind::ResumeNotFound => Some("resume_not_found"),
+                FailureKind::ResumeUnsupported => Some("resume_unsupported"),
+                FailureKind::InvalidRequest | FailureKind::Server => None,
+            },
         );
         match self.endpoint {
             Endpoint::Chat => {
@@ -865,6 +874,27 @@ impl ApiError {
         match error.kind {
             FailureKind::InvalidRequest => Self::invalid(error.message, error.param),
             FailureKind::Server => Self::server(error.message),
+            FailureKind::ResumeMismatch => Self {
+                status: StatusCode::CONFLICT,
+                message: error.message,
+                error_type: "invalid_request_error",
+                param: error.param,
+                code: Some("resume_mismatch"),
+            },
+            FailureKind::ResumeNotFound => Self {
+                status: StatusCode::NOT_FOUND,
+                message: error.message,
+                error_type: "invalid_request_error",
+                param: error.param,
+                code: Some("resume_not_found"),
+            },
+            FailureKind::ResumeUnsupported => Self {
+                status: StatusCode::BAD_REQUEST,
+                message: error.message,
+                error_type: "invalid_request_error",
+                param: error.param,
+                code: Some("resume_unsupported"),
+            },
         }
     }
 

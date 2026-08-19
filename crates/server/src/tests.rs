@@ -387,6 +387,109 @@ async fn streamed_chat_emits_role_content_terminal_usage_and_done() {
 }
 
 #[tokio::test]
+async fn interrupted_response_resumes_once_without_replaying_deltas() {
+    let app = router(Engine::start_fake(Some(MODEL), 8));
+    let mut interrupted = chat_request("resume-interrupt");
+    interrupted["stream"] = json!(true);
+    let (status, _, body) =
+        post(app.clone(), "/v1/chat/completions", interrupted.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (frames, done) = parse_sse(&body);
+    assert!(!done);
+    let response_id = frames
+        .iter()
+        .find_map(|frame| frame.data["id"].as_str())
+        .expect("partial stream response ID")
+        .to_string();
+    let partial = frames
+        .iter()
+        .filter_map(|frame| frame.data["choices"][0]["delta"]["content"].as_str())
+        .collect::<String>();
+    assert_eq!(partial, "echo:resume-");
+
+    let mut mismatch = interrupted.clone();
+    mismatch["stream"] = json!(false);
+    mismatch["temperature"] = json!(0.5);
+    mismatch["resume_response_id"] = json!(response_id);
+    let (status, _, body) = post(app.clone(), "/v1/chat/completions", mismatch).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).expect("mismatch JSON")["error"]["code"],
+        "resume_mismatch"
+    );
+
+    let mut unsupported = interrupted.clone();
+    unsupported["stream"] = json!(false);
+    unsupported["response_format"] = json!({"type": "json_object"});
+    unsupported["resume_response_id"] = json!(response_id);
+    let (status, _, body) = post(app.clone(), "/v1/chat/completions", unsupported).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).expect("unsupported JSON")["error"]["code"],
+        "resume_unsupported"
+    );
+
+    let mut resumed = interrupted;
+    resumed["stream"] = json!(false);
+    resumed["resume_response_id"] = json!(response_id);
+    let (status, _, body) = post(app.clone(), "/v1/chat/completions", resumed.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let response: Value = serde_json::from_str(&body).expect("resumed response JSON");
+    assert_eq!(response["id"], response_id);
+    assert_eq!(
+        response["choices"][0]["message"]["content"],
+        "echo:resume-interrupt"
+    );
+    assert!(
+        response["usage"]["prompt_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .expect("cached token count")
+            > 0
+    );
+
+    let (status, _, body) = post(app, "/v1/chat/completions", resumed).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(
+        serde_json::from_str::<Value>(&body).expect("not found JSON")["error"]["code"],
+        "resume_not_found"
+    );
+}
+
+#[tokio::test]
+async fn responses_resume_preserves_response_and_message_ids() {
+    let app = router(Engine::start_fake(Some(MODEL), 8));
+    let mut interrupted = responses_request("resume-interrupt");
+    interrupted["stream"] = json!(true);
+    let (status, _, body) = post(app.clone(), "/v1/responses", interrupted.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (frames, done) = parse_sse(&body);
+    assert!(!done);
+    let response_id = frames
+        .iter()
+        .find_map(|frame| frame.data["response"]["id"].as_str())
+        .expect("partial Responses response ID")
+        .to_string();
+    let message_id = frames
+        .iter()
+        .find_map(|frame| frame.data["item"]["id"].as_str())
+        .expect("partial Responses message ID")
+        .to_string();
+
+    let mut resumed = interrupted;
+    resumed["stream"] = json!(false);
+    resumed["resume_response_id"] = json!(response_id);
+    let (status, _, body) = post(app, "/v1/responses", resumed).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let response: Value = serde_json::from_str(&body).expect("resumed Responses JSON");
+    assert_eq!(response["id"], response_id);
+    assert_eq!(response["output"][0]["id"], message_id);
+    assert_eq!(
+        response["output"][0]["content"][0]["text"],
+        "echo:resume-interrupt"
+    );
+}
+
+#[tokio::test]
 async fn buffered_chat_separates_reasoning_from_visible_content() {
     let app = router(Engine::start_fake(Some(MODEL), 8));
     let (status, _, body) = post(app, "/v1/chat/completions", chat_request("reasoning")).await;
@@ -527,6 +630,7 @@ async fn unconfigured_model_id_routes_arbitrary_models_and_preserves_response_id
     streamed_request["stream"] = json!(true);
     let (status, _, body) = post(app, "/v1/chat/completions", streamed_request).await;
     assert_eq!(status, StatusCode::OK, "{body}");
+
     let (frames, done) = parse_sse(&body);
     assert!(done);
     let response_models = frames
@@ -538,6 +642,28 @@ async fn unconfigured_model_id_routes_arbitrary_models_and_preserves_response_id
         response_models
             .iter()
             .all(|model| *model == "org/arbitrary-two")
+    );
+}
+#[test]
+fn strict_protocols_accept_top_level_resume_response_id() {
+    let mut chat = chat_request("hello");
+    chat["resume_response_id"] = json!("chatcmpl-original");
+    assert_eq!(
+        protocol::parse_chat(chat)
+            .expect("chat resume field")
+            .resume_response_id
+            .as_deref(),
+        Some("chatcmpl-original")
+    );
+
+    let mut responses = responses_request("hello");
+    responses["resume_response_id"] = json!("resp_original");
+    assert_eq!(
+        protocol::parse_responses(responses)
+            .expect("responses resume field")
+            .resume_response_id
+            .as_deref(),
+        Some("resp_original")
     );
 }
 
@@ -1033,7 +1159,7 @@ async fn full_generation_queue_returns_503() {
         .expect("submit held job");
     assert!(matches!(
         tokio::time::timeout(Duration::from_secs(1), held.events.recv()).await,
-        Ok(Some(WorkerEvent::Started))
+        Ok(Some(WorkerEvent::Started(_)))
     ));
     let queued = engine
         .submit(protocol::parse_chat(chat_request("queued")).expect("queued request"))
@@ -1900,7 +2026,7 @@ async fn cancelling_an_image_request_leaves_the_next_text_request_clean() {
     let mut image_submission = engine.submit(image_request).expect("submit image request");
     assert!(matches!(
         image_submission.events.recv().await,
-        Some(WorkerEvent::Started)
+        Some(WorkerEvent::Started(_))
     ));
     image_submission
         .cancelled
@@ -1911,7 +2037,7 @@ async fn cancelling_an_image_request_leaves_the_next_text_request_clean() {
     let record = loop {
         match text_submission.events.recv().await {
             Some(WorkerEvent::Complete(record)) => break record,
-            Some(WorkerEvent::Started | WorkerEvent::Delta(_)) => {}
+            Some(WorkerEvent::Started(_) | WorkerEvent::Delta(_)) => {}
             Some(WorkerEvent::Failed(failure)) => panic!("text request failed: {failure:?}"),
             None => panic!("text request event channel closed"),
         }
