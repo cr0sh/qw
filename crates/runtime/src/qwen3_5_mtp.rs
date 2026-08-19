@@ -204,6 +204,10 @@ impl MtpPromptSnapshot {
 pub struct MtpPrefixReuse<'a> {
     pub snapshot: &'a MtpPromptSnapshot,
     pub cached_tokens: usize,
+    /// Accepted response suffix already present in the resume prompt but not in
+    /// the target snapshot. It becomes the next speculative-round bonus
+    /// without being emitted or singly prefetched.
+    pub continuation_token: Option<i32>,
 }
 
 struct MtpProposal {
@@ -1344,20 +1348,29 @@ fn emit_walk_tokens<F: FnMut(i32) -> bool>(
     committed_history: &mut Vec<i32>,
     mut on_token: F,
 ) -> Option<GenerationStopReason> {
+    let mut callback_cancelled = false;
     for &token in tokens {
         if eos_tokens.contains(&token) {
-            return Some(GenerationStopReason::Eos);
+            return Some(if callback_cancelled {
+                GenerationStopReason::CallbackCancelled
+            } else {
+                GenerationStopReason::Eos
+            });
         }
         generated.push(token);
         committed_history.push(token);
         if !on_token(token) {
-            return Some(GenerationStopReason::CallbackCancelled);
+            callback_cancelled = true;
         }
         if generated.len() == max_tokens {
-            return Some(GenerationStopReason::MaxTokens);
+            return Some(if callback_cancelled {
+                GenerationStopReason::CallbackCancelled
+            } else {
+                GenerationStopReason::MaxTokens
+            });
         }
     }
-    None
+    callback_cancelled.then_some(GenerationStopReason::CallbackCancelled)
 }
 
 #[derive(Clone, Copy)]
@@ -1526,6 +1539,20 @@ fn prefill_text_with_reuse(
         &reuse.snapshot.target,
     )?;
     drafter.restore_prompt_snapshot(reuse.snapshot, reuse.cached_tokens)?;
+    if let Some(continuation_token) = reuse.continuation_token {
+        if reuse.cached_tokens + 1 != prompt_tokens.len()
+            || prompt_tokens[reuse.cached_tokens] != continuation_token
+        {
+            return Err("MTP response continuation token does not match the prompt".to_string());
+        }
+        return Ok((
+            crate::qwen3_5::Qwen35MtpPrefill {
+                hidden: mlxcel_core::copy(&reuse.snapshot.last_hidden),
+                first_logits: mlxcel_core::copy(&reuse.snapshot.continuation_logits),
+            },
+            reuse.cached_tokens,
+        ));
+    }
     if reuse.cached_tokens == prompt_tokens.len() {
         return Ok((
             crate::qwen3_5::Qwen35MtpPrefill {
@@ -1616,6 +1643,7 @@ fn prefill_text_with_checkpoints(
             .map(|snapshot| MtpPrefixReuse {
                 snapshot,
                 cached_tokens: snapshot.token_len(),
+                continuation_token: None,
             })
             .or_else(|| source_reuse.take());
         let (prefill, _) =
@@ -1908,6 +1936,7 @@ impl Qwen35MtpGenerator {
         let drafter = model
             .mtp()
             .expect("Qwen35MtpGenerator requires a bundled MTP head");
+        let continuation_token = prefix_reuse.and_then(|reuse| reuse.continuation_token);
         let mut sampling = sampling.clone();
         sampling
             .token_bias
@@ -1937,24 +1966,30 @@ impl Qwen35MtpGenerator {
                 .map(|prefill| (prefill, 0, Vec::new())),
         }
         .expect("MTP prefill requires valid synchronized chunks");
-        let (first_token, _) =
-            sample_token_optimized(&prefill.first_logits, &sampling, prompt_tokens);
-        mlxcel_core::eval(&first_token);
+        let first_token = if let Some(token) = continuation_token {
+            token
+        } else {
+            let (token, _) =
+                sample_token_optimized(&prefill.first_logits, &sampling, prompt_tokens);
+            mlxcel_core::eval(&token);
+            mlxcel_core::item_i32(&token)
+        };
         mlxcel_core::eval(&prefill.hidden);
-        let first_token = mlxcel_core::item_i32(&first_token);
         log_mtp_memory("mtp.first_token.handoff", prompt_tokens.len());
 
         let mut generated = Vec::with_capacity(max_tokens);
         let mut history = prompt_tokens.to_vec();
         let mut mtp_stats = MtpGenerationStats::default();
         let mut stop_reason = GenerationStopReason::MaxTokens;
-        if eos_tokens.contains(&first_token) {
-            stop_reason = GenerationStopReason::Eos;
-        } else {
-            generated.push(first_token);
-            history.push(first_token);
-            if !on_token(first_token) {
-                stop_reason = GenerationStopReason::CallbackCancelled;
+        if continuation_token.is_none() {
+            if eos_tokens.contains(&first_token) {
+                stop_reason = GenerationStopReason::Eos;
+            } else {
+                generated.push(first_token);
+                history.push(first_token);
+                if !on_token(first_token) {
+                    stop_reason = GenerationStopReason::CallbackCancelled;
+                }
             }
         }
         let decode_start = Instant::now();
@@ -2075,6 +2110,53 @@ impl Qwen35MtpGenerator {
                     walk.accepted,
                     &walk.new_tokens,
                 );
+                if round_stop_reason == Some(GenerationStopReason::CallbackCancelled)
+                    && generated.len() - emitted_before == walk.new_tokens.len()
+                {
+                    model.materialize_mtp_cache_state();
+                    let aligned = i32::try_from(walk.accepted).unwrap_or(i32::MAX);
+                    let hidden_shape = mlxcel_core::array_shape(&verify.hidden);
+                    let last_hidden = mlxcel_core::slice(
+                        &verify.hidden,
+                        &[0, aligned, 0],
+                        &[hidden_shape[0], aligned + 1, hidden_shape[2]],
+                    );
+                    let logits_shape = mlxcel_core::array_shape(&verify.logits);
+                    let continuation_logits = mlxcel_core::slice(
+                        &verify.logits,
+                        &[0, aligned, 0],
+                        &[logits_shape[0], aligned + 1, logits_shape[2]],
+                    );
+                    let token_len = prompt_tokens.len() + generated.len() - 1;
+                    let target = model
+                        .snapshot_sequence_state(
+                            mlxcel_core::cache::SequenceId::from_raw(0),
+                            token_len,
+                        )
+                        .ok_or_else(|| {
+                            "failed to capture aligned cancelled MTP target state".to_string()
+                        })?;
+                    let final_snapshot = drafter
+                        .capture_prompt_snapshot(
+                            target,
+                            token_len,
+                            &last_hidden,
+                            &continuation_logits,
+                        )
+                        .ok_or_else(|| {
+                            "failed to capture aligned cancelled MTP snapshot".to_string()
+                        })?;
+                    mtp_stats.reconcile_time += phase_start.elapsed();
+                    mtp_stats.decode_time = decode_start.elapsed();
+                    return Ok(MtpGeneration {
+                        token_ids: generated,
+                        stats: mtp_stats,
+                        stop_reason,
+                        prompt_snapshots,
+                        final_snapshot: Some(final_snapshot),
+                        cached_tokens,
+                    });
+                }
                 if round_stop_reason.is_none() {
                     let hidden_shape = mlxcel_core::array_shape(&verify.hidden);
                     let accepted = i32::try_from(walk.accepted).unwrap_or(i32::MAX);

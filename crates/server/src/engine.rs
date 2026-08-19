@@ -282,6 +282,106 @@ fn gate_worker_delta(
     }
 }
 
+struct StreamOutputTracker {
+    trace_parser: ReasoningTraceParser,
+    gate: ToolCallGate,
+    tool_enabled: bool,
+    emitted_reasoning_text: String,
+    emitted_content_text: String,
+}
+
+impl StreamOutputTracker {
+    fn new(enable_thinking: bool, tool_enabled: bool) -> Self {
+        Self {
+            trace_parser: ReasoningTraceParser::new(enable_thinking),
+            gate: ToolCallGate::default(),
+            tool_enabled,
+            emitted_reasoning_text: String::new(),
+            emitted_content_text: String::new(),
+        }
+    }
+
+    fn feed(&mut self, fragment: &str) -> Vec<WorkerDelta> {
+        self.trace_parser
+            .feed(fragment)
+            .into_iter()
+            .filter_map(|delta| gate_worker_delta(delta, self.tool_enabled, &mut self.gate))
+            .collect()
+    }
+
+    fn finish(&mut self) -> Vec<WorkerDelta> {
+        let mut deltas = self
+            .trace_parser
+            .finish()
+            .into_iter()
+            .filter_map(|delta| gate_worker_delta(delta, self.tool_enabled, &mut self.gate))
+            .collect::<Vec<_>>();
+        if self.tool_enabled
+            && let Some(content) = self.gate.flush()
+        {
+            deltas.push(WorkerDelta::Content(content));
+        }
+        deltas
+    }
+
+    fn record_sent(&mut self, delta: &WorkerDelta) {
+        match delta {
+            WorkerDelta::Reasoning(fragment) => self.emitted_reasoning_text.push_str(fragment),
+            WorkerDelta::Content(fragment) => self.emitted_content_text.push_str(fragment),
+        }
+    }
+
+    fn prime_and_replay(
+        &mut self,
+        raw_text: &str,
+        emitted_reasoning_text: &str,
+        emitted_content_text: &str,
+    ) -> Result<Vec<WorkerDelta>, String> {
+        let deltas = self.feed(raw_text);
+        let mut reasoning_offset = 0;
+        let mut content_offset = 0;
+        let mut replay = Vec::new();
+        for delta in deltas {
+            let (reasoning, fragment, emitted, offset) = match delta {
+                WorkerDelta::Reasoning(fragment) => (
+                    true,
+                    fragment,
+                    emitted_reasoning_text,
+                    &mut reasoning_offset,
+                ),
+                WorkerDelta::Content(fragment) => {
+                    (false, fragment, emitted_content_text, &mut content_offset)
+                }
+            };
+            let remaining = &emitted[*offset..];
+            let skipped = remaining.len().min(fragment.len());
+            if !remaining.is_char_boundary(skipped)
+                || !fragment.is_char_boundary(skipped)
+                || fragment[..skipped] != remaining[..skipped]
+            {
+                return Err("stored emitted output is not a prefix of accepted output".to_string());
+            }
+            *offset += skipped;
+            if skipped < fragment.len() {
+                let fragment = fragment[skipped..].to_string();
+                replay.push(if reasoning {
+                    WorkerDelta::Reasoning(fragment)
+                } else {
+                    WorkerDelta::Content(fragment)
+                });
+            }
+        }
+        if reasoning_offset != emitted_reasoning_text.len()
+            || content_offset != emitted_content_text.len()
+        {
+            return Err("stored emitted output exceeds accepted output".to_string());
+        }
+        self.emitted_reasoning_text.push_str(emitted_reasoning_text);
+        self.emitted_content_text.push_str(emitted_content_text);
+        Ok(replay)
+    }
+}
+
 fn send_delta(job: &Job, delta: WorkerDelta) -> bool {
     if job.cancelled.load(Ordering::Acquire) {
         info!(phase = "generation.cancelled");
@@ -1039,7 +1139,6 @@ impl QwenWorker {
                 .original_max_tokens
                 .saturating_sub(resume.metadata.generated_token_ids.len());
             checkpoint_token_lengths.clear();
-            checkpoint_token_lengths.push(generation_prompt_ids.len());
         }
         if job
             .events
@@ -1055,7 +1154,9 @@ impl QwenWorker {
 
         let mtp_k = self.mtp_k;
         let (provider, cache) = (&mut self.provider, &mut self.prefix_cache);
-        if let Some(cache_route) = cache_route {
+        if resume_entry.is_none()
+            && let Some(cache_route) = cache_route
+        {
             checkpoint_token_lengths = cache.checkpoint_lengths(
                 &generation_prompt_ids,
                 &checkpoint_token_lengths,
@@ -1092,6 +1193,7 @@ impl QwenWorker {
                     Some(MtpPrefixReuse {
                         snapshot,
                         cached_tokens: snapshot.token_len(),
+                        continuation_token: resume.metadata.generated_token_ids.last().copied(),
                     }),
                 ),
                 PromptSnapshot::Baseline(_) => {
@@ -1120,6 +1222,7 @@ impl QwenWorker {
                     Some(MtpPrefixReuse {
                         snapshot,
                         cached_tokens: hit.token_count,
+                        continuation_token: None,
                     }),
                 ),
                 PromptSnapshot::Baseline(_) => (None, None),
@@ -1135,24 +1238,41 @@ impl QwenWorker {
                 |reuse| reuse.cached_tokens,
             ),
         );
-        let mut trace_parser = ReasoningTraceParser::new(enable_thinking);
-        let mut gate = ToolCallGate::default();
+        let mut output = StreamOutputTracker::new(enable_thinking, tool_enabled);
         if let Some(resume) = &resume_entry {
-            for delta in trace_parser.feed(&resume.metadata.raw_text) {
-                let _ = gate_worker_delta(delta, tool_enabled, &mut gate);
+            let replay = match output.prime_and_replay(
+                &resume.metadata.raw_text,
+                &resume.metadata.emitted_reasoning_text,
+                &resume.metadata.emitted_content_text,
+            ) {
+                Ok(replay) => replay,
+                Err(error) => {
+                    warn!(phase = "cache.resume", error = %error);
+                    send_failure(
+                        &job,
+                        FailureKind::ResumeNotFound,
+                        "response continuation checkpoint was not found".to_string(),
+                        Some("resume_response_id".to_string()),
+                    );
+                    return;
+                }
+            };
+            for delta in replay {
+                if !send_delta(&job, delta.clone()) {
+                    return;
+                }
+                output.record_sent(&delta);
             }
         }
         let mut emit_delta = |fragment: &str| {
             if job.cancelled.load(Ordering::Acquire) {
                 return false;
             }
-            for delta in trace_parser.feed(fragment) {
-                let Some(delta) = gate_worker_delta(delta, tool_enabled, &mut gate) else {
-                    continue;
-                };
-                if !send_delta(&job, delta) {
+            for delta in output.feed(fragment) {
+                if !send_delta(&job, delta.clone()) {
                     return false;
                 }
+                output.record_sent(&delta);
             }
             true
         };
@@ -1234,6 +1354,14 @@ impl QwenWorker {
             .map(|metadata| metadata.raw_text.clone())
             .unwrap_or_default();
         combined_raw_text.push_str(&generated.text);
+        if generated.finish_outcome != GenerationStopReason::CallbackCancelled {
+            for delta in output.finish() {
+                if !send_delta(&job, delta.clone()) {
+                    break;
+                }
+                output.record_sent(&delta);
+            }
+        }
         let cancelled = job.cancelled.load(Ordering::Acquire)
             || generated.finish_outcome == GenerationStopReason::CallbackCancelled;
         if let Some(cache_route) = cache_route {
@@ -1259,6 +1387,8 @@ impl QwenWorker {
                             request_fingerprint: fingerprint,
                             generated_token_ids: combined_token_ids.clone(),
                             raw_text: combined_raw_text.clone(),
+                            emitted_reasoning_text: output.emitted_reasoning_text.clone(),
+                            emitted_content_text: output.emitted_content_text.clone(),
                             original_max_tokens: prior_metadata
                                 .as_ref()
                                 .map_or(job.request.max_tokens, |metadata| {
@@ -1279,20 +1409,6 @@ impl QwenWorker {
         }
         if cancelled {
             info!(phase = "generation.cancelled");
-            return;
-        }
-        for delta in trace_parser.finish() {
-            let Some(delta) = gate_worker_delta(delta, tool_enabled, &mut gate) else {
-                continue;
-            };
-            if !send_delta(&job, delta) {
-                return;
-            }
-        }
-        if tool_enabled
-            && let Some(content) = gate.flush()
-            && !send_delta(&job, WorkerDelta::Content(content))
-        {
             return;
         }
         generated.text = combined_raw_text;
@@ -1540,6 +1656,62 @@ mod tests {
             )]
         );
         assert!(parser.finish().is_empty());
+    }
+
+    #[test]
+    fn resume_replays_callback_failed_fragment_without_duplicating_delivered_text() {
+        let mut interrupted = StreamOutputTracker::new(false, false);
+        let delivered = interrupted.feed("it is the");
+        assert_eq!(
+            delivered,
+            vec![WorkerDelta::Content("it is the".to_string())]
+        );
+        interrupted.record_sent(&delivered[0]);
+
+        let failed = interrupted.feed(" perfect");
+        assert_eq!(failed, vec![WorkerDelta::Content(" perfect".to_string())]);
+
+        let mut resumed = StreamOutputTracker::new(false, false);
+        let replay = resumed
+            .prime_and_replay(
+                "it is the perfect",
+                &interrupted.emitted_reasoning_text,
+                &interrupted.emitted_content_text,
+            )
+            .expect("stored delivered text is a prefix");
+        assert_eq!(replay, vec![WorkerDelta::Content(" perfect".to_string())]);
+        resumed.record_sent(&replay[0]);
+        let suffix = resumed.feed(" time");
+        resumed.record_sent(&suffix[0]);
+
+        assert_eq!(resumed.emitted_content_text, "it is the perfect time");
+    }
+
+    #[test]
+    fn resume_replays_only_unsent_delta_when_one_fragment_crosses_trace_boundary() {
+        let raw_text = "private trace</think>\nfinal answer";
+        let mut interrupted = StreamOutputTracker::new(true, false);
+        let deltas = interrupted.feed(raw_text);
+        assert_eq!(
+            deltas,
+            vec![
+                WorkerDelta::Reasoning("private trace".to_string()),
+                WorkerDelta::Content("final answer".to_string()),
+            ]
+        );
+        interrupted.record_sent(&deltas[0]);
+
+        let mut resumed = StreamOutputTracker::new(true, false);
+        assert_eq!(
+            resumed
+                .prime_and_replay(
+                    raw_text,
+                    &interrupted.emitted_reasoning_text,
+                    &interrupted.emitted_content_text,
+                )
+                .expect("partially delivered fragment replays"),
+            vec![WorkerDelta::Content("final answer".to_string())]
+        );
     }
 
     #[test]

@@ -26,6 +26,8 @@ pub struct ResponseResumeMetadata {
     pub request_fingerprint: String,
     pub generated_token_ids: Vec<i32>,
     pub raw_text: String,
+    pub emitted_reasoning_text: String,
+    pub emitted_content_text: String,
     pub original_max_tokens: usize,
 }
 
