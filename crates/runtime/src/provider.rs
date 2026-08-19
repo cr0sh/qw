@@ -1366,6 +1366,7 @@ mod tests {
                 Some(MtpPrefixReuse {
                     snapshot: &snapshot,
                     cached_tokens: base_ids.len(),
+                    continuation_token: None,
                 }),
                 &[full_ids.len()],
                 None,
@@ -1394,5 +1395,271 @@ mod tests {
             warm_ttft < cold_ttft,
             "warm suffix prefill must reduce TTFT: cold={cold_ttft:?}, warm={warm_ttft:?}"
         );
+    }
+
+    #[test]
+    #[ignore = "requires QW_BENCH_MODEL pointing at a real bundled-MTP checkpoint"]
+    fn real_model_cancelled_mtp_snapshot_portable_resume_matches_uninterrupted_greedy() {
+        let model_dir = std::env::var_os("QW_BENCH_MODEL")
+            .map(PathBuf::from)
+            .expect("QW_BENCH_MODEL must point at a real checkpoint");
+        let mut provider = Qwen35Provider::load(&model_dir, KVCacheMode::Turbo4)
+            .expect("load real bundled-MTP checkpoint");
+        let messages = vec![
+            ChatMessage {
+                role: "user".to_string(),
+                name: None,
+                content: Some(ChatMessageContent::Text(
+                    "What is the weather in Paris? Use the weather tool.".to_string(),
+                )),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                name: None,
+                content: None,
+                reasoning_content: None,
+                tool_calls: vec![ChatToolCall::Function {
+                    id: "call_prior".to_string(),
+                    function: ChatToolCallFunction {
+                        name: "weather".to_string(),
+                        arguments: serde_json::json!({"city": "Paris"}),
+                    },
+                }],
+                tool_call_id: None,
+            },
+            ChatMessage {
+                role: "tool".to_string(),
+                name: None,
+                content: Some(ChatMessageContent::Text("18 C and clear".to_string())),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                tool_call_id: Some("call_prior".to_string()),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                name: None,
+                content: Some(ChatMessageContent::Text(
+                    "Using the weather result, provide a detailed two-paragraph travel \
+                     recommendation for Paris. Do not call another tool."
+                        .to_string(),
+                )),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            },
+        ];
+        let prompt_ids = provider
+            .tokenize_messages(&messages, &[], None, false)
+            .expect("tokenize deterministic resume conversation");
+        assert_eq!(prompt_ids.len(), 95);
+        let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(7));
+        let mut control = provider
+            .generate_mtp_streaming(
+                &prompt_ids,
+                128,
+                &sampling,
+                DEFAULT_MTP_BLOCK_SIZE,
+                None,
+                &[prompt_ids.len()],
+                None,
+                |_| true,
+            )
+            .expect("uninterrupted MTP generation");
+        let prompt_snapshot = control
+            .prompt_snapshots
+            .pop()
+            .expect("control donates full-prompt checkpoint");
+        let prompt_portable = prompt_snapshot
+            .to_portable()
+            .expect("encode prompt checkpoint");
+        let PromptSnapshot::Mtp(prompt_snapshot) =
+            PromptSnapshot::from_portable(prompt_portable).expect("restore prompt checkpoint")
+        else {
+            panic!("portable prompt snapshot changed family");
+        };
+
+        let mut cold_callbacks = 0;
+        let mut cold_interrupted = provider
+            .generate_mtp_streaming(
+                &prompt_ids,
+                128,
+                &sampling,
+                DEFAULT_MTP_BLOCK_SIZE,
+                None,
+                &[],
+                None,
+                |_| {
+                    cold_callbacks += 1;
+                    cold_callbacks < 20
+                },
+            )
+            .expect("cold cancelled MTP generation");
+        let cold_accepted = cold_interrupted.token_ids.len();
+        let cold_snapshot = cold_interrupted
+            .final_snapshot
+            .take()
+            .expect("cold cancellation donates snapshot")
+            .to_portable()
+            .expect("encode cold cancellation snapshot");
+
+        let warm = provider
+            .generate_mtp_streaming(
+                &prompt_ids,
+                128,
+                &sampling,
+                DEFAULT_MTP_BLOCK_SIZE,
+                Some(MtpPrefixReuse {
+                    snapshot: &prompt_snapshot,
+                    cached_tokens: prompt_ids.len(),
+                    continuation_token: None,
+                }),
+                &[],
+                None,
+                |_| true,
+            )
+            .expect("uninterrupted full-prompt restore");
+        assert_eq!(
+            warm.token_ids, control.token_ids,
+            "full-prompt restore diverged before cancellation"
+        );
+
+        let mut callbacks = 0;
+        let mut interrupted = provider
+            .generate_mtp_streaming(
+                &prompt_ids,
+                128,
+                &sampling,
+                DEFAULT_MTP_BLOCK_SIZE,
+                Some(MtpPrefixReuse {
+                    snapshot: &prompt_snapshot,
+                    cached_tokens: prompt_ids.len(),
+                    continuation_token: None,
+                }),
+                &[],
+                None,
+                |_| {
+                    callbacks += 1;
+                    callbacks < 20
+                },
+            )
+            .expect("cancelled MTP generation");
+        assert_eq!(
+            interrupted.finish_outcome,
+            GenerationStopReason::CallbackCancelled
+        );
+        let accepted = interrupted.token_ids.len();
+        assert!(accepted >= 20 && accepted < control.token_ids.len());
+        assert_eq!(
+            interrupted.token_ids,
+            control.token_ids[..accepted],
+            "interrupted generation diverged before snapshot donation"
+        );
+        let snapshot = interrupted
+            .final_snapshot
+            .take()
+            .expect("cancelled generation donates an MTP snapshot");
+        assert_eq!(snapshot.token_len(), prompt_ids.len() + accepted - 1);
+        let portable = snapshot.to_portable().expect("encode cancelled snapshot");
+        assert_eq!(accepted, cold_accepted, "cancellation boundary changed");
+        assert_eq!(
+            interrupted.token_ids, cold_interrupted.token_ids,
+            "cold and restored-prefix cancellations emitted different tokens"
+        );
+        let (
+            crate::PortablePromptSnapshot::Mtp {
+                target: cold_target,
+                draft_keys: cold_draft_keys,
+                draft_values: cold_draft_values,
+                draft_offset: cold_draft_offset,
+                last_hidden: cold_last_hidden,
+                continuation_logits: cold_continuation_logits,
+            },
+            crate::PortablePromptSnapshot::Mtp {
+                target,
+                draft_keys,
+                draft_values,
+                draft_offset,
+                last_hidden,
+                continuation_logits,
+            },
+        ) = (&cold_snapshot, &portable)
+        else {
+            panic!("cancellation snapshots must both be MTP");
+        };
+        assert_eq!(
+            target.token_len,
+            prompt_ids.len() + accepted - 1,
+            "target snapshot must exclude the unforwarded response bonus"
+        );
+        assert_eq!(
+            *draft_offset,
+            i32::try_from(target.token_len - 1).expect("snapshot length fits i32"),
+            "drafter snapshot must match the shifted target boundary"
+        );
+        assert!(cold_target == target, "cancelled target states differ");
+        assert_eq!(cold_draft_offset, draft_offset, "drafter offsets differ");
+        assert!(cold_draft_keys == draft_keys, "drafter keys differ");
+        assert!(cold_draft_values == draft_values, "drafter values differ");
+        assert!(cold_last_hidden == last_hidden, "last hidden states differ");
+        assert!(
+            cold_continuation_logits == continuation_logits,
+            "continuation logits differ"
+        );
+        let PromptSnapshot::Mtp(live_snapshot) = snapshot else {
+            panic!("cancelled snapshot changed family");
+        };
+
+        let mut resume_prompt = prompt_ids.clone();
+        resume_prompt.extend_from_slice(&interrupted.token_ids);
+        let direct_resumed = provider
+            .generate_mtp_streaming(
+                &resume_prompt,
+                128 - accepted,
+                &sampling,
+                DEFAULT_MTP_BLOCK_SIZE,
+                Some(MtpPrefixReuse {
+                    snapshot: &live_snapshot,
+                    cached_tokens: live_snapshot.token_len(),
+                    continuation_token: interrupted.token_ids.last().copied(),
+                }),
+                &[],
+                None,
+                |_| true,
+            )
+            .expect("resume live MTP snapshot");
+        let mut direct_combined = interrupted.token_ids.clone();
+        direct_combined.extend_from_slice(&direct_resumed.token_ids);
+        assert_eq!(
+            direct_combined, control.token_ids,
+            "live cancelled snapshot diverged before portable conversion"
+        );
+        let PromptSnapshot::Mtp(restored) =
+            PromptSnapshot::from_portable(portable).expect("restore cancelled snapshot")
+        else {
+            panic!("portable MTP snapshot changed family");
+        };
+
+        let resumed = provider
+            .generate_mtp_streaming(
+                &resume_prompt,
+                128 - accepted,
+                &sampling,
+                DEFAULT_MTP_BLOCK_SIZE,
+                Some(MtpPrefixReuse {
+                    snapshot: &restored,
+                    cached_tokens: restored.token_len(),
+                    continuation_token: interrupted.token_ids.last().copied(),
+                }),
+                &[],
+                None,
+                |_| true,
+            )
+            .expect("resume portable MTP snapshot");
+        let mut combined = interrupted.token_ids;
+        combined.extend_from_slice(&resumed.token_ids);
+        assert_eq!(combined, control.token_ids);
     }
 }

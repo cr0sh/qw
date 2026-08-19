@@ -35,6 +35,8 @@ fn resume_metadata(response_id: &str, fingerprint: &str) -> ResponseResumeMetada
         request_fingerprint: fingerprint.to_string(),
         generated_token_ids: vec![3, 4],
         raw_text: "partial".to_string(),
+        emitted_reasoning_text: String::new(),
+        emitted_content_text: "partial".to_string(),
         original_max_tokens: 8,
     }
 }
@@ -642,6 +644,8 @@ fn resume_record_survives_persistent_restart_and_is_removed_on_take() {
             .take_resume("resp_original", "fingerprint", SnapshotRoute::Baseline)
             .expect("persistent resume");
         assert_eq!(resumed.metadata.raw_text, "partial");
+        assert_eq!(resumed.metadata.emitted_reasoning_text, "");
+        assert_eq!(resumed.metadata.emitted_content_text, "partial");
         restarted.flush_persistence();
     }
     assert!(
