@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, ensure};
 use clap::Parser as _;
 use clap_derive::{Parser, ValueEnum};
+use qw_prefix_cache::CacheConfig;
 use qw_runtime::KVCacheMode;
 use qw_server::{Engine, router};
 use tracing::info;
@@ -29,9 +30,17 @@ struct Cli {
     #[arg(long, default_value = "127.0.0.1:8000")]
     bind: String,
 
-    /// Total prompt-token capacity of the shared prefix cache.
-    #[arg(long, default_value_t = 32_768)]
-    prefix_cache_max_tokens: usize,
+    /// Byte capacity of the in-memory prefix snapshot tier.
+    #[arg(long, default_value_t = 2 * 1024 * 1024 * 1024_u64)]
+    prefix_cache_memory_bytes: u64,
+
+    /// Optional directory for persistent prefix snapshots.
+    #[arg(long)]
+    prefix_cache_directory: Option<PathBuf>,
+
+    /// Byte capacity of the filesystem prefix snapshot tier.
+    #[arg(long, default_value_t = 20 * 1024 * 1024 * 1024_u64)]
+    prefix_cache_filesystem_bytes: u64,
 
     /// MTP verify input block size (bonus token plus proposals).
     #[arg(long = "mtp-k", default_value_t = 3)]
@@ -54,12 +63,17 @@ impl Cli {
     }
 }
 
-
 fn validate_cli(cli: &Cli) -> Result<()> {
     ensure!(
-        cli.prefix_cache_max_tokens > 0,
-        "--prefix-cache-max-tokens must be greater than zero"
+        cli.prefix_cache_memory_bytes > 0,
+        "--prefix-cache-memory-bytes must be greater than zero"
     );
+    if cli.prefix_cache_directory.is_some() {
+        ensure!(
+            cli.prefix_cache_filesystem_bytes > 0,
+            "--prefix-cache-filesystem-bytes must be greater than zero"
+        );
+    }
     ensure!(cli.mtp_k >= 2, "--mtp-k must be at least 2");
     Ok(())
 }
@@ -82,7 +96,11 @@ async fn main() -> Result<()> {
     let engine = Engine::start_qwen(
         cli.model,
         cli.model_id,
-        cli.prefix_cache_max_tokens,
+        CacheConfig {
+            memory_bytes: cli.prefix_cache_memory_bytes,
+            directory: cli.prefix_cache_directory,
+            filesystem_bytes: cli.prefix_cache_filesystem_bytes,
+        },
         cli.mtp_k,
         kv_cache_mode,
     )?;
@@ -166,6 +184,58 @@ mod tests {
         assert!(help.contains("--no-kv-quantization"), "{help}");
         assert!(help.contains("default 4-bit TurboQuant KV cache"), "{help}");
     }
+    #[test]
+    fn cli_configures_memory_and_optional_filesystem_cache_tiers() {
+        let defaults =
+            Cli::try_parse_from(["qw-server", "--model", "/tmp/checkpoint"]).expect("CLI");
+        assert_eq!(defaults.prefix_cache_memory_bytes, 2 * 1024 * 1024 * 1024);
+        assert_eq!(defaults.prefix_cache_directory, None);
+        assert_eq!(
+            defaults.prefix_cache_filesystem_bytes,
+            20 * 1024 * 1024 * 1024
+        );
+        validate_cli(&defaults).expect("default cache configuration");
+
+        let configured = Cli::try_parse_from([
+            "qw-server",
+            "--model",
+            "/tmp/checkpoint",
+            "--prefix-cache-memory-bytes",
+            "4096",
+            "--prefix-cache-directory",
+            "/tmp/prefixes",
+            "--prefix-cache-filesystem-bytes",
+            "8192",
+        ])
+        .expect("CLI");
+        assert_eq!(configured.prefix_cache_memory_bytes, 4096);
+        assert_eq!(
+            configured.prefix_cache_directory.as_deref(),
+            Some(std::path::Path::new("/tmp/prefixes"))
+        );
+        assert_eq!(configured.prefix_cache_filesystem_bytes, 8192);
+        validate_cli(&configured).expect("configured cache tiers");
+
+        let invalid_memory = Cli::try_parse_from([
+            "qw-server",
+            "--model",
+            "/tmp/checkpoint",
+            "--prefix-cache-memory-bytes",
+            "0",
+        ])
+        .expect("CLI");
+        assert_eq!(
+            validate_cli(&invalid_memory).unwrap_err().to_string(),
+            "--prefix-cache-memory-bytes must be greater than zero"
+        );
+
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("--prefix-cache-memory-bytes"), "{help}");
+        assert!(help.contains("--prefix-cache-directory"), "{help}");
+        assert!(help.contains("--prefix-cache-filesystem-bytes"), "{help}");
+        assert!(!help.contains("--prefix-cache-max-tokens"), "{help}");
+    }
+
 
 
     #[test]

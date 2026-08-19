@@ -1856,6 +1856,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "qw-prefix-cache"
+version = "0.1.0"
+dependencies = [
+ "mlxcel-core",
+ "qw-runtime",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tracing",
+]
+
+[[package]]
 name = "qw-runtime"
 version = "0.1.0"
 dependencies = [
@@ -1885,6 +1897,7 @@ dependencies = [
  "image",
  "llguidance",
  "mlxcel-core",
+ "qw-prefix-cache",
  "qw-runtime",
  "serde",
  "serde_json",

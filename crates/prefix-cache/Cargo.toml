@@ -1,0 +1,14 @@
+[package]
+name = "qw-prefix-cache"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+qw-runtime = { path = "../runtime" }
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.11"
+tracing.workspace = true
+
+[dev-dependencies]
+mlxcel-core.workspace = true

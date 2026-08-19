@@ -6,6 +6,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};
 use mlxcel_core::generate::{GenerationStopReason, PrefixReuse};
+use qw_prefix_cache::{
+    AdaptivePrefixCache, CacheConfig, CacheNamespaces,
+    SnapshotRoute as CacheSnapshotRoute, namespace_hash,
+};
 #[cfg(test)]
 use qw_runtime::{ChatContentRef, ChatMessage};
 use qw_runtime::{KVCacheMode, MtpPrefixReuse, PromptSnapshot, Qwen35Provider};
@@ -16,7 +20,7 @@ use tracing::{Span, error, info, info_span, warn};
 use crate::grammar::GrammarFactory;
 #[cfg(test)]
 use crate::media::DecodedImage;
-use crate::prefix_cache::{PrefixCache, SnapshotRoute};
+
 use crate::protocol::{CompletionRequest, Endpoint, OutputFormat, ReasoningEffort, ToolChoice};
 use crate::tool_calls::{ToolCallGate, parse_assistant_output};
 
@@ -50,6 +54,13 @@ fn route_uses_prefix_cache(route: QwenGenerationRoute) -> bool {
         route,
         QwenGenerationRoute::BaselineText | QwenGenerationRoute::MtpText
     )
+}
+fn cache_snapshot_route(route: QwenGenerationRoute) -> Option<CacheSnapshotRoute> {
+    match route {
+        QwenGenerationRoute::BaselineText => Some(CacheSnapshotRoute::Baseline),
+        QwenGenerationRoute::MtpText => Some(CacheSnapshotRoute::Mtp),
+        QwenGenerationRoute::BaselineMultimodal | QwenGenerationRoute::MtpMultimodal => None,
+    }
 }
 
 fn validate_mtp_k(mtp_k: usize) -> Result<()> {
@@ -312,21 +323,18 @@ impl Engine {
     pub fn start_qwen(
         model_path: PathBuf,
         model_id: Option<String>,
-        prefix_cache_max_tokens: usize,
+        cache_config: CacheConfig,
         mtp_k: usize,
         kv_cache_mode: KVCacheMode,
     ) -> Result<Self> {
-        ensure!(
-            prefix_cache_max_tokens > 0,
-            "prefix cache capacity must be nonzero"
-        );
+        cache_config.validate().map_err(anyhow::Error::msg)?;
         validate_mtp_k(mtp_k)?;
         let (jobs_tx, jobs_rx) = mpsc::channel(JOB_QUEUE_CAPACITY);
         let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
         thread::Builder::new()
             .name("qw-generation".to_string())
             .spawn(move || {
-                match QwenWorker::load(&model_path, prefix_cache_max_tokens, mtp_k, kv_cache_mode) {
+                match QwenWorker::load(&model_path, cache_config, mtp_k, kv_cache_mode) {
                     Ok(mut worker) => {
                         let supports_image_inputs = worker.provider.supports_image_inputs();
                         let _ = ready_tx.send(Ok(supports_image_inputs));
@@ -653,14 +661,14 @@ pub enum SubmitError {
 struct QwenWorker {
     provider: Qwen35Provider,
     grammar: GrammarFactory,
-    prefix_cache: PrefixCache,
+    prefix_cache: AdaptivePrefixCache,
     mtp_k: usize,
 }
 
 impl QwenWorker {
     fn load(
         model_path: &Path,
-        prefix_cache_max_tokens: usize,
+        cache_config: CacheConfig,
         mtp_k: usize,
         kv_cache_mode: KVCacheMode,
     ) -> Result<Self> {
@@ -683,10 +691,46 @@ impl QwenWorker {
             provider.logits_vocab_size(),
             provider.eos_token_id(),
         )?;
+        let config_bytes = std::fs::read(model_path.join("config.json"))
+            .context("failed to read model config for prefix cache namespace")?;
+        let tokenizer_bytes = std::fs::read(model_path.join("tokenizer.json"))
+            .context("failed to read tokenizer for prefix cache namespace")?;
+        let tokenizer_config_bytes = std::fs::read(model_path.join("tokenizer_config.json"))
+            .context("failed to read tokenizer config for prefix cache namespace")?;
+        let tokenizer_config: Value = serde_json::from_slice(&tokenizer_config_bytes)
+            .context("failed to parse tokenizer config for prefix cache namespace")?;
+        let standalone_template = std::fs::read_to_string(model_path.join("chat_template.jinja"))
+            .ok()
+            .filter(|template| !template.trim().is_empty())
+            .map(String::into_bytes);
+        let selected_template = standalone_template.or_else(|| {
+            tokenizer_config
+                .get("chat_template")
+                .and_then(Value::as_str)
+                .map(|template| template.as_bytes().to_vec())
+        });
+        let selected_template =
+            selected_template.context("loaded provider has no selected chat template")?;
+        let cache_mode = format!("{kv_cache_mode:?}");
+        let namespace_parts = |route: &'static [u8]| {
+            namespace_hash(&[
+                &config_bytes,
+                &tokenizer_bytes,
+                &selected_template,
+                cache_mode.as_bytes(),
+                route,
+            ])
+        };
+        let namespaces = CacheNamespaces {
+            baseline: namespace_parts(b"baseline"),
+            mtp: namespace_parts(b"mtp"),
+        };
+        let prefix_cache =
+            AdaptivePrefixCache::new(namespaces, cache_config).map_err(anyhow::Error::msg)?;
         Ok(Self {
             provider,
             grammar,
-            prefix_cache: PrefixCache::new(prefix_cache_max_tokens),
+            prefix_cache,
             mtp_k,
         })
     }
@@ -841,15 +885,14 @@ impl QwenWorker {
         let mtp_available =
             self.provider.has_mtp() && std::env::var_os("QW_BENCH_DISABLE_MTP").is_none();
         let route = qwen_generation_route(mtp_available, has_images, constraint.is_some());
+        let cache_route = cache_snapshot_route(route);
         let mtp_k = self.mtp_k;
         let (provider, cache) = (&mut self.provider, &mut self.prefix_cache);
-        let hit = match route {
-            QwenGenerationRoute::BaselineText => {
-                cache.lookup(&prompt_ids, SnapshotRoute::Baseline)
-            }
-            QwenGenerationRoute::MtpText => cache.lookup(&prompt_ids, SnapshotRoute::Mtp),
-            _ => None,
-        };
+        if let Some(cache_route) = cache_route {
+            checkpoint_token_lengths =
+                cache.checkpoint_lengths(&prompt_ids, &checkpoint_token_lengths, cache_route);
+        }
+        let hit = cache_route.and_then(|cache_route| cache.lookup(&prompt_ids, cache_route));
         let (prefix_reuse, mtp_prefix_reuse) = match (route, hit) {
             (QwenGenerationRoute::BaselineText, Some(hit)) => match hit.snapshot {
                 PromptSnapshot::Baseline(snapshot) => (
@@ -944,7 +987,7 @@ impl QwenWorker {
                 &mut emit_delta,
             ),
         };
-        let generated = match generated {
+        let mut generated = match generated {
             Ok(generated) => generated,
             Err(generation_error) => {
                 error!(
@@ -967,6 +1010,22 @@ impl QwenWorker {
             cached_tokens = generated.cached_tokens,
             stop_reason = ?generated.finish_outcome,
         );
+        if let Some(cache_route) = cache_route {
+            let prompt_snapshots = std::mem::take(&mut generated.prompt_snapshots);
+            if !prompt_snapshots.is_empty() {
+                cache.insert(&prompt_ids, prompt_snapshots, cache_route);
+            }
+            if let Some(final_snapshot) = generated.final_snapshot.take() {
+                let mut completed_tokens =
+                    Vec::with_capacity(prompt_ids.len() + generated.token_ids.len());
+                completed_tokens.extend_from_slice(&prompt_ids);
+                completed_tokens.extend_from_slice(&generated.token_ids);
+                completed_tokens.truncate(final_snapshot.token_len());
+                if completed_tokens.len() == final_snapshot.token_len() {
+                    cache.insert(&completed_tokens, vec![final_snapshot], cache_route);
+                }
+            }
+        }
         for delta in trace_parser.finish() {
             let Some(delta) = gate_worker_delta(delta, tool_enabled, &mut gate) else {
                 continue;
@@ -1065,9 +1124,7 @@ impl QwenWorker {
             );
             return;
         }
-        if route_uses_prefix_cache(route) && !generated.prompt_snapshots.is_empty() {
-            cache.insert(prompt_ids, generated.prompt_snapshots);
-        }
+
         let record = CompletionRecord {
             admission: job.admission,
             endpoint: job.request.endpoint,

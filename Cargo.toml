@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/cli", "crates/mlxcel-core", "crates/runtime", "crates/server"]
+members = ["crates/cli", "crates/mlxcel-core", "crates/prefix-cache", "crates/runtime", "crates/server"]
 
 [workspace.dependencies]
 anyhow = "1.0.100"
