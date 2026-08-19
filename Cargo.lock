@@ -1853,6 +1853,8 @@ dependencies = [
  "clap",
  "clap_derive",
  "qw-runtime",
+ "qw-server",
+ "tokio",
 ]
 
 [[package]]

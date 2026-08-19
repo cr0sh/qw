@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use clap::Parser as _;
 use clap_derive::{Args, Parser, Subcommand};
 use qw_runtime::{GenerationRequest, KVCacheMode, Qwen35Provider};
+use qw_server::serve;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -20,6 +21,8 @@ struct Cli {
 enum Command {
     /// Generate one response from a local checkpoint.
     Generate(GenerateArgs),
+    /// Run the OpenAI-compatible HTTP server.
+    Serve(qw_server::ServerArgs),
 }
 
 #[derive(Debug, Args)]
@@ -66,7 +69,7 @@ impl GenerateArgs {
     }
 }
 
-fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::Generate(args) => {
             eprintln!("Loading model from {}", args.model.display());
@@ -93,17 +96,22 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
             generation?;
         }
+        Command::Serve(args) => {
+            serve(args).await?;
+        }
     }
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    run(Cli::parse())
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    run(Cli::parse()).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory as _;
 
     #[test]
     fn generate_requires_model_and_prompt() {
@@ -123,7 +131,9 @@ mod tests {
             "hello",
         ])
         .expect("parse generate command");
-        let Command::Generate(args) = cli.command;
+        let Command::Generate(args) = cli.command else {
+            panic!("expected generate command");
+        };
         let request = args.request();
         assert_eq!(request.max_tokens, 128);
         assert_eq!(request.temperature, None);
@@ -153,12 +163,65 @@ mod tests {
             "42",
         ])
         .expect("parse generate command");
-        let Command::Generate(args) = cli.command;
+        let Command::Generate(args) = cli.command else {
+            panic!("expected generate command");
+        };
         let request = args.request();
         assert_eq!(request.max_tokens, 9);
         assert_eq!(request.temperature, Some(0.7));
         assert_eq!(request.top_k, Some(11));
         assert_eq!(request.top_p, Some(0.8));
         assert_eq!(request.seed, Some(42));
+    }
+
+    #[test]
+    fn serve_accepts_server_options() {
+        let cli = Cli::try_parse_from([
+            "qw",
+            "serve",
+            "--model",
+            "/tmp/model",
+            "--model-id",
+            "served-model",
+            "--bind",
+            "127.0.0.1:9000",
+            "--prefix-cache-memory-bytes",
+            "4096",
+            "--prefix-cache-directory",
+            "/tmp/prefixes",
+            "--prefix-cache-filesystem-bytes",
+            "8192",
+            "--mtp-k",
+            "5",
+            "--no-kv-quantization",
+            "--output-format",
+            "json",
+        ])
+        .expect("parse serve command");
+        assert!(matches!(cli.command, Command::Serve(_)));
+    }
+
+    #[test]
+    fn help_documents_serve_command_and_server_options() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("serve"), "{help}");
+
+        let serve_help = Cli::try_parse_from(["qw", "serve", "--help"])
+            .expect_err("serve help exits through clap");
+        let serve_help = serve_help.to_string();
+        assert!(serve_help.contains("--model"), "{serve_help}");
+        assert!(serve_help.contains("--bind"), "{serve_help}");
+        assert!(serve_help.contains("--model-id"), "{serve_help}");
+        assert!(
+            serve_help.contains("--prefix-cache-memory-bytes"),
+            "{serve_help}"
+        );
+        assert!(
+            serve_help.contains("--prefix-cache-filesystem-bytes"),
+            "{serve_help}"
+        );
+        assert!(serve_help.contains("--mtp-k"), "{serve_help}");
+        assert!(serve_help.contains("--no-kv-quantization"), "{serve_help}");
+        assert!(serve_help.contains("--output-format"), "{serve_help}");
     }
 }

@@ -1,3 +1,7 @@
+mod cli;
+
+pub use cli::{ServerArgs, serve};
+
 mod engine;
 mod grammar;
 mod media;
