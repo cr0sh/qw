@@ -1,7 +1,6 @@
 mod engine;
 mod grammar;
 mod media;
-mod prefix_cache;
 pub mod protocol;
 mod tool_calls;
 
