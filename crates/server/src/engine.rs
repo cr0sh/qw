@@ -792,6 +792,33 @@ impl QwenWorker {
                 }
             }
         };
+        let mut checkpoint_token_lengths = Vec::new();
+        if !has_images {
+            match self.provider.tokenize_history(
+                &job.request.messages,
+                effective_tools,
+                reasoning_effort,
+                enable_thinking,
+            ) {
+                Ok(history_ids)
+                    if history_ids.len() < prompt_ids.len()
+                        && prompt_ids.starts_with(&history_ids) =>
+                {
+                    checkpoint_token_lengths.push(history_ids.len());
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    send_failure(
+                        &job,
+                        FailureKind::InvalidRequest,
+                        format!("failed to render message history: {error}"),
+                        Some("messages".to_string()),
+                    );
+                    return;
+                }
+            }
+            checkpoint_token_lengths.push(prompt_ids.len());
+        }
         info!(
             phase = "prompt.prepared",
             prompt_tokens = prompt_ids.len(),
@@ -890,7 +917,7 @@ impl QwenWorker {
                 &sampling,
                 mtp_k,
                 mtp_prefix_reuse,
-                true,
+                &checkpoint_token_lengths,
                 constraint
                     .as_mut()
                     .map(|value| value as &mut dyn mlxcel_core::generate::TokenConstraint),
@@ -913,7 +940,7 @@ impl QwenWorker {
                 constraint
                     .as_mut()
                     .map(|value| value as &mut dyn mlxcel_core::generate::TokenConstraint),
-                true,
+                &checkpoint_token_lengths,
                 &mut emit_delta,
             ),
         };

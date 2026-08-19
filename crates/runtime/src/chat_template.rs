@@ -255,6 +255,7 @@ impl ChatTemplateProcessor {
             &[],
             None,
             true,
+            true,
         )
     }
 
@@ -264,6 +265,7 @@ impl ChatTemplateProcessor {
         tools: &[ChatTool],
         reasoning_effort: Option<&str>,
         enable_thinking: bool,
+        add_generation_prompt: bool,
     ) -> Result<String> {
         anyhow::ensure!(!messages.is_empty(), "messages must not be empty");
         let valid_text_content = |content: &Option<ChatMessageContent>| match content {
@@ -378,7 +380,7 @@ impl ChatTemplateProcessor {
                 tools => Value::from_serialize(tools),
                 bos_token => self.bos_token.as_str(),
                 eos_token => self.eos_token.as_str(),
-                add_generation_prompt => true,
+                add_generation_prompt,
                 reasoning_effort => reasoning_effort.unwrap_or("xhigh"),
                 enable_thinking,
             })
@@ -577,7 +579,7 @@ assistant:{{ content }}
             },
         ];
         let rendered = processor()
-            .render_messages(&messages, &[tool()], None, true)
+            .render_messages(&messages, &[tool()], None, true, true)
             .expect("render tools");
         assert!(rendered.contains("<tools>"));
         assert!(rendered.contains(r#""name":"weather""#));
@@ -622,7 +624,7 @@ assistant:{{ content }}
             },
         ];
         let rendered = processor()
-            .render_messages(&messages, &[tool()], None, true)
+            .render_messages(&messages, &[tool()], None, true, true)
             .expect("render tool results");
         assert!(
             rendered.contains(
@@ -635,13 +637,19 @@ assistant:{{ content }}
     fn empty_tools_and_render_user_keep_ordinary_chat() {
         let processor = processor();
         let rendered = processor
-            .render_messages(&[user("hello")], &[], None, true)
+            .render_messages(&[user("hello")], &[], None, true, true)
             .expect("render without tools");
         assert_eq!(rendered, "user:helloassistant:");
         assert!(!rendered.contains("<tools>"));
         assert_eq!(
             processor.render_user("hello").expect("render user"),
             rendered
+        );
+        assert_eq!(
+            processor
+                .render_messages(&[user("hello")], &[], None, true, false)
+                .expect("render history"),
+            "user:hello"
         );
     }
     #[test]
@@ -676,7 +684,7 @@ assistant:{{ content }}
             tool_call_id: None,
         };
         let rendered = processor
-            .render_messages(&[message], &[], None, true)
+            .render_messages(&[message], &[], None, true, true)
             .expect("render image parts");
         let before = rendered.find("\"before\"").expect("leading text");
         let image = rendered.find("\"image_url\"").expect("image part");
@@ -718,7 +726,13 @@ assistant:{{ content }}
         };
         let vision_placeholder = "<|vision_start|><|image_pad|><|vision_end|>";
         let initial = processor
-            .render_messages(std::slice::from_ref(&image_message), &[tool()], None, true)
+            .render_messages(
+                std::slice::from_ref(&image_message),
+                &[tool()],
+                None,
+                true,
+                true,
+            )
             .expect("render initial image turn");
         assert_eq!(initial.matches(vision_placeholder).count(), 1);
 
@@ -751,6 +765,7 @@ assistant:{{ content }}
                 ],
                 &[tool()],
                 None,
+                true,
                 true,
             )
             .expect("render image and tool replay");
@@ -788,7 +803,7 @@ assistant:{{ content }}
             (None, "xhigh"),
         ] {
             let rendered = processor
-                .render_messages(std::slice::from_ref(&message), &[], effort, true)
+                .render_messages(std::slice::from_ref(&message), &[], effort, true, true)
                 .expect("render reasoning replay");
             let (rendered_effort, messages) = rendered.split_once('|').expect("effort delimiter");
             assert_eq!(rendered_effort, expected);
@@ -807,7 +822,7 @@ assistant:{{ content }}
         };
         assert_eq!(
             processor
-                .render_messages(&[user("hello")], &[], None, false)
+                .render_messages(&[user("hello")], &[], None, false, true)
                 .expect("render disabled thinking"),
             "False"
         );

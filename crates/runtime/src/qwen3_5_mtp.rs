@@ -36,6 +36,10 @@ use mlxcel_core::speculative::stochastic_accept::{
     DraftVerdict, sampler_is_greedy, verify_draft_token,
 };
 use mlxcel_core::weights::WeightMap;
+use crate::portable_snapshot::{
+    PortableArray, PortablePromptSnapshot, array_from_portable, array_to_portable,
+    portable_model_state,
+};
 use mlxcel_core::{MlxArray, UniquePtr};
 use tracing::info;
 
@@ -84,7 +88,8 @@ pub(crate) struct MtpGeneration {
     pub(crate) token_ids: Vec<i32>,
     pub(crate) stats: MtpGenerationStats,
     pub(crate) stop_reason: GenerationStopReason,
-    pub(crate) prompt_snapshot: Option<MtpPromptSnapshot>,
+    pub(crate) prompt_snapshots: Vec<MtpPromptSnapshot>,
+    pub(crate) final_snapshot: Option<MtpPromptSnapshot>,
     pub(crate) cached_tokens: usize,
 }
 
@@ -106,9 +111,97 @@ impl MtpPromptSnapshot {
     pub fn token_len(&self) -> usize {
         self.target.token_len()
     }
+
+    pub fn nbytes(&self) -> usize {
+        self.target.nbytes()
+            + self
+                .draft_keys
+                .as_deref()
+                .map(mlxcel_core::array_nbytes)
+                .unwrap_or(0)
+            + self
+                .draft_values
+                .as_deref()
+                .map(mlxcel_core::array_nbytes)
+                .unwrap_or(0)
+            + mlxcel_core::array_nbytes(&self.last_hidden)
+            + mlxcel_core::array_nbytes(&self.continuation_logits)
+    }
+
+    pub(crate) fn to_portable(&self) -> PortablePromptSnapshot {
+        PortablePromptSnapshot::Mtp {
+            target: portable_model_state(&self.target),
+            draft_keys: self
+                .draft_keys
+                .as_deref()
+                .map(|array| array_to_portable(None, array)),
+            draft_values: self
+                .draft_values
+                .as_deref()
+                .map(|array| array_to_portable(None, array)),
+            draft_offset: self.draft_offset,
+            last_hidden: array_to_portable(None, &self.last_hidden),
+            continuation_logits: array_to_portable(None, &self.continuation_logits),
+        }
+    }
+
+    pub(crate) fn from_portable_parts(
+        target: ModelStateSnapshot,
+        draft_keys: Option<PortableArray>,
+        draft_values: Option<PortableArray>,
+        draft_offset: i32,
+        last_hidden: PortableArray,
+        continuation_logits: PortableArray,
+    ) -> Result<Self, String> {
+        let expected_offset = i32::try_from(
+            target
+                .token_len()
+                .checked_sub(1)
+                .ok_or_else(|| "MTP portable target token length must be nonzero".to_string())?,
+        )
+        .map_err(|_| "MTP portable target token length exceeds i32".to_string())?;
+        if draft_offset != expected_offset {
+            return Err("MTP portable target and drafter offsets do not match".to_string());
+        }
+        if draft_keys.is_some() != draft_values.is_some()
+            || (expected_offset > 0 && draft_keys.is_none())
+        {
+            return Err("MTP portable drafter key/value layout is incomplete".to_string());
+        }
+        if let (Some(keys), Some(values)) = (&draft_keys, &draft_values)
+            && (keys.shape.len() != 4 || keys.shape != values.shape)
+        {
+            return Err("MTP portable drafter key/value shapes do not match".to_string());
+        }
+        if last_hidden.shape.len() != 3
+            || last_hidden.shape[0] != 1
+            || last_hidden.shape[1] != 1
+        {
+            return Err("MTP portable last-hidden layout must be [1, 1, hidden]".to_string());
+        }
+        if continuation_logits.shape.len() != 3
+            || continuation_logits.shape[0] != 1
+            || continuation_logits.shape[1] != 1
+        {
+            return Err("MTP portable continuation-logits layout must be [1, 1, vocab]".to_string());
+        }
+        Ok(Self {
+            target,
+            draft_keys: draft_keys
+                .map(|array| array_from_portable(array, None))
+                .transpose()?,
+            draft_values: draft_values
+                .map(|array| array_from_portable(array, None))
+                .transpose()?,
+            draft_offset,
+            last_hidden: array_from_portable(last_hidden, None)?,
+            continuation_logits: array_from_portable(continuation_logits, None)?,
+        })
+    }
 }
 
 /// Exact-prefix MTP state supplied by the server cache.
+#[derive(Clone, Copy)]
 pub struct MtpPrefixReuse<'a> {
     pub snapshot: &'a MtpPromptSnapshot,
     pub cached_tokens: usize,
@@ -552,11 +645,18 @@ impl Qwen35MtpDraftModel {
     ) -> Option<MtpPromptSnapshot> {
         let expected_offset = i32::try_from(token_len.checked_sub(1)?).ok()?;
         self.materialize_state();
-        let state = self.state.borrow();
-        if state.cache.offset != expected_offset
-            || state.round_appended != 0
-            || state.seed_hidden.is_some()
-        {
+        let mut state = self.state.borrow_mut();
+        if state.cache.offset < expected_offset {
+            return None;
+        }
+        if state.cache.offset > expected_offset {
+            let excess = state.cache.offset - expected_offset;
+            state.cache.trim(excess);
+        }
+        state.round_appended = 0;
+        state.seed_hidden = None;
+        state.rope_delta = None;
+        if state.cache.offset != expected_offset {
             return None;
         }
         let detached = |array: &MlxArray| materialize_detached(mlxcel_core::copy(array));
@@ -1475,12 +1575,75 @@ fn capture_mtp_prompt_snapshot(
         model.snapshot_sequence_state(mlxcel_core::cache::SequenceId::from_raw(0), token_len)?;
     let shape = mlxcel_core::array_shape(&prefill.hidden);
     let last = shape[1] - 1;
+
     let last_hidden = mlxcel_core::slice(
         &prefill.hidden,
         &[0, last, 0],
         &[shape[0], last + 1, shape[2]],
     );
     drafter.capture_prompt_snapshot(target, token_len, &last_hidden, &prefill.first_logits)
+}
+fn prefill_text_with_checkpoints(
+    model: &Qwen35Model,
+    drafter: &Qwen35MtpDraftModel,
+    prompt_tokens: &[i32],
+    reuse: Option<MtpPrefixReuse<'_>>,
+    checkpoint_token_lengths: &[usize],
+) -> Result<
+    (
+        crate::qwen3_5::Qwen35MtpPrefill,
+        usize,
+        Vec<MtpPromptSnapshot>,
+    ),
+    String,
+> {
+    let cached_tokens = reuse.map_or(0, |value| value.cached_tokens);
+    let mut source_reuse = reuse;
+    let mut latest_checkpoint = None;
+    let mut snapshots = Vec::with_capacity(checkpoint_token_lengths.len());
+    let mut final_prefill = None;
+    let boundaries = checkpoint_token_lengths
+        .iter()
+        .copied()
+        .filter(|&length| length > cached_tokens)
+        .chain(std::iter::once(prompt_tokens.len()));
+
+    for token_len in boundaries {
+        if final_prefill.is_some() {
+            break;
+        }
+        let active_reuse = latest_checkpoint
+            .as_ref()
+            .map(|snapshot| MtpPrefixReuse {
+                snapshot,
+                cached_tokens: snapshot.token_len(),
+            })
+            .or_else(|| source_reuse.take());
+        let (prefill, _) =
+            prefill_text_with_reuse(model, drafter, &prompt_tokens[..token_len], active_reuse)?;
+        if let Some(previous) = latest_checkpoint.take() {
+            snapshots.push(previous);
+        }
+        let requested = checkpoint_token_lengths.binary_search(&token_len).is_ok();
+        if requested {
+            let snapshot = capture_mtp_prompt_snapshot(model, drafter, token_len, &prefill)
+                .ok_or_else(|| format!("failed to capture MTP checkpoint at {token_len} tokens"))?;
+            if token_len == prompt_tokens.len() {
+                snapshots.push(snapshot);
+            } else {
+                latest_checkpoint = Some(snapshot);
+            }
+        }
+        if token_len == prompt_tokens.len() {
+            final_prefill = Some(prefill);
+        }
+    }
+
+    Ok((
+        final_prefill.expect("full prompt boundary is always included"),
+        cached_tokens,
+        snapshots,
+    ))
 }
 
 fn finish_drafter_prefill(
@@ -1564,6 +1727,71 @@ fn rebuild_mtp_state(
     })
 }
 
+fn capture_mtp_final_snapshot(
+    model: &Qwen35Model,
+    drafter: &Qwen35MtpDraftModel,
+    prompt_tokens: &[i32],
+    prefill_input: MtpPrefill<'_>,
+    generated: &[i32],
+) -> Result<Option<MtpPromptSnapshot>, String> {
+    let Some(&first_token) = generated.first() else {
+        return Ok(None);
+    };
+    let prefill = prefill_for_input(model, drafter, prefill_input)?;
+    if generated.len() == 1 {
+        return capture_mtp_prompt_snapshot(
+            model,
+            drafter,
+            prompt_tokens.len(),
+            &prefill,
+        )
+        .map(Some)
+        .ok_or_else(|| "failed to capture aligned MTP final snapshot".to_string());
+    }
+
+    let _ = finish_drafter_prefill(model, drafter, prefill_input, prefill, first_token);
+    let cached_output = &generated[..generated.len() - 1];
+    let verify_input = mlxcel_core::from_slice_i32(
+        cached_output,
+        &[1, i32::try_from(cached_output.len()).unwrap_or(i32::MAX)],
+    );
+    let verify = model.forward_mtp_verify(&verify_input);
+    mlxcel_core::eval(&verify.hidden);
+    mlxcel_core::eval(&verify.logits);
+    let draft_tokens = &generated[1..generated.len() - 1];
+    drafter.accept_verified_tokens(
+        model,
+        &verify.hidden,
+        draft_tokens,
+        draft_tokens.len(),
+        generated,
+    );
+    model.materialize_mtp_cache_state();
+
+    let hidden_shape = mlxcel_core::array_shape(&verify.hidden);
+    let aligned = i32::try_from(draft_tokens.len()).unwrap_or(i32::MAX);
+    let last_hidden = mlxcel_core::slice(
+        &verify.hidden,
+        &[0, aligned, 0],
+        &[hidden_shape[0], aligned + 1, hidden_shape[2]],
+    );
+    let logits_shape = mlxcel_core::array_shape(&verify.logits);
+    let last = logits_shape[1] - 1;
+    let continuation_logits = mlxcel_core::slice(
+        &verify.logits,
+        &[0, last, 0],
+        &[logits_shape[0], last + 1, logits_shape[2]],
+    );
+    let token_len = prompt_tokens.len() + generated.len() - 1;
+    let target = model
+        .snapshot_sequence_state(mlxcel_core::cache::SequenceId::from_raw(0), token_len)
+        .ok_or_else(|| "failed to capture aligned MTP target state".to_string())?;
+    drafter
+        .capture_prompt_snapshot(target, token_len, &last_hidden, &continuation_logits)
+        .map(Some)
+        .ok_or_else(|| "failed to capture aligned MTP final snapshot".to_string())
+}
+
 pub(crate) struct Qwen35MtpGenerator;
 
 impl Qwen35MtpGenerator {
@@ -1579,7 +1807,7 @@ impl Qwen35MtpGenerator {
         sampling: &SamplingConfig,
         block_size: usize,
         prefix_reuse: Option<MtpPrefixReuse<'_>>,
-        capture_prompt_snapshot: bool,
+        checkpoint_token_lengths: &[usize],
         constraint: Option<&mut dyn TokenConstraint>,
         on_token: F,
     ) -> Result<MtpGeneration, String> {
@@ -1595,7 +1823,7 @@ impl Qwen35MtpGenerator {
             sampling,
             block_size,
             prefix_reuse,
-            capture_prompt_snapshot,
+            checkpoint_token_lengths,
             constraint,
             on_token,
         );
@@ -1634,7 +1862,7 @@ impl Qwen35MtpGenerator {
             sampling,
             block_size,
             None,
-            false,
+            &[],
             constraint,
             on_token,
         );
@@ -1651,12 +1879,24 @@ impl Qwen35MtpGenerator {
         sampling: &SamplingConfig,
         block_size: usize,
         prefix_reuse: Option<MtpPrefixReuse<'_>>,
-        capture_prompt_snapshot: bool,
+        checkpoint_token_lengths: &[usize],
         constraint: Option<&mut dyn TokenConstraint>,
         mut on_token: F,
     ) -> Result<MtpGeneration, String> {
         assert!(!prompt_tokens.is_empty(), "MTP prompt must not be empty");
         assert!(block_size >= 2, "MTP block size must be at least 2");
+        if checkpoint_token_lengths
+            .iter()
+            .any(|&length| length == 0 || length > prompt_tokens.len())
+            || checkpoint_token_lengths
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(
+                "MTP checkpoint token lengths must be sorted, unique, and within the prompt"
+                    .to_string(),
+            );
+        }
         if let Some(constraint) = constraint {
             return self.generate_streaming_constrained_for_prefill(
                 model,
@@ -1666,7 +1906,7 @@ impl Qwen35MtpGenerator {
                 sampling,
                 block_size,
                 prefix_reuse,
-                capture_prompt_snapshot,
+                checkpoint_token_lengths,
                 constraint,
                 on_token,
             );
@@ -1685,23 +1925,24 @@ impl Qwen35MtpGenerator {
                 token_ids: Vec::new(),
                 stats: MtpGenerationStats::default(),
                 stop_reason: GenerationStopReason::MaxTokens,
-                prompt_snapshot: None,
+                prompt_snapshots: Vec::new(),
+                final_snapshot: None,
                 cached_tokens: 0,
             });
         }
 
-        let (prefill, cached_tokens) = match prefill_input {
-            MtpPrefill::Text { .. } => {
-                prefill_text_with_reuse(model, drafter, prompt_tokens, prefix_reuse)
-            }
-            MtpPrefill::Multimodal { .. } => {
-                prefill_for_input(model, drafter, prefill_input).map(|prefill| (prefill, 0))
-            }
+        let (prefill, cached_tokens, prompt_snapshots) = match prefill_input {
+            MtpPrefill::Text { .. } => prefill_text_with_checkpoints(
+                model,
+                drafter,
+                prompt_tokens,
+                prefix_reuse,
+                checkpoint_token_lengths,
+            ),
+            MtpPrefill::Multimodal { .. } => prefill_for_input(model, drafter, prefill_input)
+                .map(|prefill| (prefill, 0, Vec::new())),
         }
         .expect("MTP prefill requires valid synchronized chunks");
-        let prompt_snapshot = capture_prompt_snapshot
-            .then(|| capture_mtp_prompt_snapshot(model, drafter, prompt_tokens.len(), &prefill))
-            .flatten();
         let (first_token, _) =
             sample_token_optimized(&prefill.first_logits, &sampling, prompt_tokens);
         mlxcel_core::eval(&first_token);
@@ -1865,11 +2106,23 @@ impl Qwen35MtpGenerator {
             }
         }
         mtp_stats.decode_time = decode_start.elapsed();
+        let final_snapshot = if matches!(prefill_input, MtpPrefill::Text { .. }) {
+            capture_mtp_final_snapshot(
+                model,
+                drafter,
+                prompt_tokens,
+                prefill_input,
+                &generated,
+            )?
+        } else {
+            None
+        };
         Ok(MtpGeneration {
             token_ids: generated,
             stats: mtp_stats,
             stop_reason,
-            prompt_snapshot,
+            prompt_snapshots,
+            final_snapshot,
             cached_tokens,
         })
     }
@@ -1883,7 +2136,7 @@ impl Qwen35MtpGenerator {
         sampling: &SamplingConfig,
         block_size: usize,
         prefix_reuse: Option<MtpPrefixReuse<'_>>,
-        capture_prompt_snapshot: bool,
+        checkpoint_token_lengths: &[usize],
         constraint: &mut dyn TokenConstraint,
         mut on_token: F,
     ) -> Result<MtpGeneration, String> {
@@ -1901,7 +2154,8 @@ impl Qwen35MtpGenerator {
                 token_ids: Vec::new(),
                 stats: MtpGenerationStats::default(),
                 stop_reason: GenerationStopReason::MaxTokens,
-                prompt_snapshot: None,
+                prompt_snapshots: Vec::new(),
+                final_snapshot: None,
                 cached_tokens: 0,
             });
         }
@@ -1910,27 +2164,34 @@ impl Qwen35MtpGenerator {
         let mut stats = MtpGenerationStats::default();
         let mut stop_reason = GenerationStopReason::MaxTokens;
         let mut prefix_reuse = prefix_reuse;
-        let mut prompt_snapshot = None;
+        let mut prompt_snapshots = Vec::new();
         let mut cached_tokens = 0;
         let mut state;
 
         loop {
-            let (prefill, reused) = if generated.is_empty() {
+            let (prefill, reused, checkpoints) = if generated.is_empty() {
                 match prefill_input {
-                    MtpPrefill::Text { .. } => {
-                        prefill_text_with_reuse(model, drafter, prompt_tokens, prefix_reuse.take())
-                    }
-                    MtpPrefill::Multimodal { .. } => {
-                        prefill_for_input(model, drafter, prefill_input).map(|prefill| (prefill, 0))
-                    }
+                    MtpPrefill::Text { .. } => prefill_text_with_checkpoints(
+                        model,
+                        drafter,
+                        prompt_tokens,
+                        prefix_reuse.take(),
+                        checkpoint_token_lengths,
+                    ),
+                    MtpPrefill::Multimodal { .. } => prefill_for_input(
+                        model,
+                        drafter,
+                        prefill_input,
+                    )
+                    .map(|prefill| (prefill, 0, Vec::new())),
                 }
             } else {
-                prefill_for_input(model, drafter, prefill_input).map(|prefill| (prefill, 0))
+                prefill_for_input(model, drafter, prefill_input)
+                    .map(|prefill| (prefill, 0, Vec::new()))
             }?;
             cached_tokens = cached_tokens.max(reused);
-            if capture_prompt_snapshot && prompt_snapshot.is_none() {
-                prompt_snapshot =
-                    capture_mtp_prompt_snapshot(model, drafter, prompt_tokens.len(), &prefill);
+            if prompt_snapshots.is_empty() {
+                prompt_snapshots = checkpoints;
             }
             mlxcel_core::eval(&prefill.hidden);
             let initial = commit_constraint_transaction(constraint, |active| {
@@ -1963,10 +2224,22 @@ impl Qwen35MtpGenerator {
                 callback_cancelled = true;
             }
             if callback_cancelled {
+                let final_snapshot = if matches!(prefill_input, MtpPrefill::Text { .. }) {
+                    capture_mtp_final_snapshot(
+                        model,
+                        drafter,
+                        prompt_tokens,
+                        prefill_input,
+                        &generated,
+                    )?
+                } else {
+                    None
+                };
                 return Ok(MtpGeneration {
                     token_ids: generated,
                     stats,
-                    prompt_snapshot,
+                    prompt_snapshots,
+                    final_snapshot,
                     cached_tokens,
                     stop_reason: GenerationStopReason::CallbackCancelled,
                 });
@@ -1975,10 +2248,22 @@ impl Qwen35MtpGenerator {
                 if initial.rebuild && !generated.is_empty() {
                     let _ = rebuild_mtp_state(model, drafter, prefill_input, &generated)?;
                 }
+                let final_snapshot = if matches!(prefill_input, MtpPrefill::Text { .. }) {
+                    capture_mtp_final_snapshot(
+                        model,
+                        drafter,
+                        prompt_tokens,
+                        prefill_input,
+                        &generated,
+                    )?
+                } else {
+                    None
+                };
                 return Ok(MtpGeneration {
                     token_ids: generated,
                     stats,
-                    prompt_snapshot,
+                    prompt_snapshots,
+                    final_snapshot,
                     cached_tokens,
                     stop_reason: reason,
                 });
@@ -2179,11 +2464,23 @@ impl Qwen35MtpGenerator {
             }
         }
 
+        let final_snapshot = if matches!(prefill_input, MtpPrefill::Text { .. }) {
+            capture_mtp_final_snapshot(
+                model,
+                drafter,
+                prompt_tokens,
+                prefill_input,
+                &generated,
+            )?
+        } else {
+            None
+        };
         Ok(MtpGeneration {
             token_ids: generated,
             stats,
             stop_reason,
-            prompt_snapshot,
+            prompt_snapshots,
+            final_snapshot,
             cached_tokens,
         })
     }
@@ -2202,7 +2499,7 @@ mod tests {
         let keys = mlxcel_core::from_slice_f32(&[1.0, 2.0], &[1, 1, 1, 2]);
         let values = mlxcel_core::from_slice_f32(&[3.0, 4.0], &[1, 1, 1, 2]);
         let hidden = mlxcel_core::from_slice_f32(&[5.0, 6.0], &[1, 1, 2]);
-        let logits = mlxcel_core::from_slice_f32(&[7.0, 8.0], &[1, 2]);
+        let logits = mlxcel_core::from_slice_f32(&[7.0, 8.0], &[1, 1, 2]);
         let snapshot = MtpPromptSnapshot {
             target: ModelStateSnapshot::new("test", 2),
             draft_keys: Some(materialize_detached(mlxcel_core::copy(&keys))),
@@ -2227,6 +2524,51 @@ mod tests {
         mlxcel_core::eval(&hidden_equal);
         assert!(mlxcel_core::item_bool(&keys_equal));
         assert!(mlxcel_core::item_bool(&hidden_equal));
+    }
+
+    #[test]
+    fn mtp_portable_snapshot_round_trips_and_rejects_incomplete_pairs() {
+        let keys = mlxcel_core::from_slice_f32(&[1.0, 2.0], &[1, 1, 1, 2]);
+        let values = mlxcel_core::astype(&keys, mlxcel_core::dtype::FLOAT16);
+        let hidden = mlxcel_core::from_slice_f32(&[3.0, 4.0], &[1, 1, 2]);
+        let logits = mlxcel_core::from_slice_f32(&[5.0, 6.0], &[1, 1, 2]);
+        let mut target = ModelStateSnapshot::new("mtp-portable-test", 2);
+        target.push_tensor("target.state", &hidden);
+        let snapshot = crate::PromptSnapshot::Mtp(MtpPromptSnapshot {
+            target,
+            draft_keys: Some(materialize_detached(mlxcel_core::copy(&values))),
+            draft_values: Some(materialize_detached(mlxcel_core::copy(&values))),
+            draft_offset: 1,
+            last_hidden: materialize_detached(mlxcel_core::copy(&hidden)),
+            continuation_logits: materialize_detached(mlxcel_core::copy(&logits)),
+        });
+        let expected = snapshot.to_portable().expect("encode MTP snapshot");
+        let restored = crate::PromptSnapshot::from_portable(expected.clone())
+            .expect("restore MTP snapshot")
+            .to_portable()
+            .expect("re-encode MTP snapshot");
+        assert_eq!(restored, expected);
+
+        let crate::PortablePromptSnapshot::Mtp {
+            target,
+            draft_keys,
+            draft_offset,
+            last_hidden,
+            continuation_logits,
+            ..
+        } = expected
+        else {
+            unreachable!();
+        };
+        let incomplete = crate::PortablePromptSnapshot::Mtp {
+            target,
+            draft_keys,
+            draft_values: None,
+            draft_offset,
+            last_hidden,
+            continuation_logits,
+        };
+        assert!(crate::PromptSnapshot::from_portable(incomplete).is_err());
     }
 
     fn logits_rows(rows: &[&[f32]]) -> UniquePtr<MlxArray> {
