@@ -271,6 +271,30 @@ pub(crate) struct Qwen35MtpVerifyOutput {
     pub(crate) gdn_states: Vec<GdnRollbackSnapshot>,
 }
 
+/// DFlash2 verify output: the post-layer hidden state at each
+/// `target_layer_ids[i]` (copied before the final norm), the final logits,
+/// and the GDN rollback snapshots. Mirrors the SGLang DFLASH verify forward,
+/// which captures the target's hidden states at the draft's configured layer
+/// ids for the next draft round's context.
+pub(crate) struct Qwen35DflashVerifyOutput {
+    pub(crate) hidden_by_layer: Vec<UniquePtr<MlxArray>>,
+    pub(crate) logits: UniquePtr<MlxArray>,
+    pub(crate) gdn_states: Vec<GdnRollbackSnapshot>,
+}
+
+/// DFlash2 prefill output: `hidden_concat` is the per-layer captured hidden
+/// states concatenated along the hidden axis `[1, P', K * hidden]`; the
+/// drafter consumes it as its context buffer. `first_logits` is the last
+/// position's logits (the first sampled token). `hidden_offset` is the number
+/// of leading rows dropped once the captured rows exceeded the drafter's
+/// sliding-window limit (0 when nothing was dropped); the drafter cache
+/// offsets are aligned to it.
+pub(crate) struct Qwen35DflashPrefill {
+    pub(crate) hidden_concat: UniquePtr<MlxArray>,
+    pub(crate) first_logits: UniquePtr<MlxArray>,
+    pub(crate) hidden_offset: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Qwen35RollbackPlan {
     pub(crate) accepted_block_len: i32,
@@ -1188,6 +1212,170 @@ impl Qwen35Model {
         });
         self.mrope_state.set_position(offset);
         output
+    }
+
+    /// DFlash2 target verify: run the backbone over `input_ids` exactly like
+    /// `forward_mtp_verify` but additionally capture a post-layer hidden copy
+    /// at each `target_layer_ids[i]`. `target_layer_ids` is a small sorted
+    /// slice (5 ids for the Qwen3.8-27B-DFlash2 checkpoint); a linear scan per
+    /// layer is fine. The captured hiddens feed the next draft round's context
+    /// buffer (SGLang `DFLASH` verify captures the same per-layer features).
+    pub(crate) fn forward_dflash_verify(
+        &self,
+        input_ids: &MlxArray,
+        target_layer_ids: &[usize],
+    ) -> Qwen35DflashVerifyOutput {
+        let input_len = mlxcel_core::array_shape(input_ids)[1];
+        let projected = self.sequence_state.with_internal(|caches| {
+            caches.first().map(Qwen3NextCache::offset).unwrap_or(0) + input_len
+        });
+        self.enforce_mtp_cache_bound(projected);
+        let rope_delta = self.mrope_state.rope_delta();
+        let (output, offset) = self.sequence_state.with_internal(|caches| {
+            let mut hidden = self.embed_tokens.forward(input_ids);
+            let shape = mlxcel_core::array_shape(&hidden);
+            let seq_len = shape[1];
+            let cache_offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
+            let position_ids =
+                rope_delta.map(|delta| decode_rope_positions(cache_offset, seq_len, delta));
+            let mut hidden_by_layer = Vec::with_capacity(target_layer_ids.len());
+            let mut gdn_states = Vec::new();
+            for (layer_idx, (layer, cache)) in self.layers.iter().zip(caches.iter_mut()).enumerate()
+            {
+                hidden = layer.forward_with_capture(
+                    layer_idx,
+                    &hidden,
+                    None,
+                    cache,
+                    position_ids.as_deref(),
+                    &mut gdn_states,
+                );
+                if target_layer_ids.contains(&layer_idx) {
+                    hidden_by_layer.push(mlxcel_core::copy(&hidden));
+                }
+            }
+            let logits = self.project_logits(&self.norm.forward(&hidden));
+            let offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
+            (
+                Qwen35DflashVerifyOutput {
+                    hidden_by_layer,
+                    logits,
+                    gdn_states,
+                },
+                offset,
+            )
+        });
+        self.mrope_state.set_position(offset);
+        output
+    }
+
+    /// DFlash2 prefill: chunked backbone forward that also captures the
+    /// post-layer hidden state at each `target_layer_ids[i]`, keeping only the
+    /// last `hidden_limit` rows per layer (dropping leading rows once over the
+    /// limit, as the drafter's sliding window bounds the context the draft
+    /// layers can attend to). After all chunks, `hidden_concat` is the
+    /// per-layer hiddens concatenated along `-1`; `hidden_offset` is the number
+    /// of dropped leading rows.
+    pub(crate) fn forward_dflash_prefill(
+        &self,
+        input_ids: &MlxArray,
+        target_layer_ids: &[usize],
+        hidden_limit: usize,
+    ) -> std::result::Result<Qwen35DflashPrefill, String> {
+        self.reset_runtime_state();
+        let shape = mlxcel_core::array_shape(input_ids);
+        let prompt_len = shape[1];
+        if prompt_len == 0 {
+            return Err("DFlash2 prefill requires at least one token".to_owned());
+        }
+        let configured = mlxcel_core::generate::prefill_chunk_len();
+        let chunk_len =
+            mlxcel_core::generate::effective_prefill_chunk(configured, true, prompt_len as usize)
+                .unwrap_or(prompt_len as usize) as i32;
+        self.enforce_mtp_cache_bound(prompt_len);
+        // One captured hidden buffer per target layer, kept under `hidden_limit`
+        // rows.
+        let mut layer_hiddens: Vec<Option<UniquePtr<MlxArray>>> =
+            (0..target_layer_ids.len()).map(|_| None).collect();
+        let mut hidden_offset = 0usize;
+        let rope_delta = self.mrope_state.rope_delta();
+        let mut first_logits = None;
+        let mut start = 0;
+        while start < prompt_len {
+            let end = (start + chunk_len).min(prompt_len);
+            let ids = mlxcel_core::slice(input_ids, &[0, start], &[shape[0], end]);
+            let final_hidden = self.sequence_state.with_internal(|caches| {
+                let cache_offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
+                let seq_len = end - start;
+                let position_ids =
+                    rope_delta.map(|delta| decode_rope_positions(cache_offset, seq_len, delta));
+                let mut h = self.embed_tokens.forward(&ids);
+                for (layer_idx, (layer, cache)) in
+                    self.layers.iter().zip(caches.iter_mut()).enumerate()
+                {
+                    h = layer.forward(&h, None, cache, position_ids.as_deref());
+                    if let Some(capture_idx) = target_layer_ids.iter().position(|&t| t == layer_idx)
+                    {
+                        // Accumulate this layer's hidden rows (all positions of
+                        // this chunk row-wise).
+                        let h_rows = mlxcel_core::copy(&h);
+                        let current = layer_hiddens[capture_idx].take();
+                        let mut combined = match current {
+                            Some(prior) => mlxcel_core::concatenate(&prior, &h_rows, 1),
+                            None => h_rows,
+                        };
+                        // Keep at most `hidden_limit` rows; drop leading ones.
+                        let combined_shape = mlxcel_core::array_shape(&combined);
+                        let rows = combined_shape[1];
+                        if rows as usize > hidden_limit {
+                            let drop = rows as usize - hidden_limit;
+                            hidden_offset += drop;
+                            combined = mlxcel_core::slice(
+                                &combined,
+                                &[0, drop as i32, 0],
+                                &[combined_shape[0], rows, combined_shape[2]],
+                            );
+                        }
+                        layer_hiddens[capture_idx] = Some(combined);
+                    }
+                }
+                h
+            });
+            if end == prompt_len {
+                // Last chunk: final-row logits (the first sampled token).
+                let hidden_shape = mlxcel_core::array_shape(&final_hidden);
+                let last = hidden_shape[1] - 1;
+                let last_hidden = mlxcel_core::slice(
+                    &final_hidden,
+                    &[0, last, 0],
+                    &[hidden_shape[0], last + 1, hidden_shape[2]],
+                );
+                first_logits = Some(self.project_logits(&self.norm.forward(&last_hidden)));
+            }
+            start = end;
+        }
+
+        // Concatenate the per-layer captures along the hidden axis.
+        let mut hidden_concat: Option<UniquePtr<MlxArray>> = None;
+        for slot in layer_hiddens {
+            let h = slot.expect("DFlash2 prefill captured every target layer");
+            hidden_concat = Some(match hidden_concat {
+                Some(acc) => mlxcel_core::concatenate(&acc, &h, -1),
+                None => h,
+            });
+        }
+        let hidden_concat =
+            hidden_concat.expect("DFlash2 prefill captures at least one target layer");
+
+        let offset = self
+            .sequence_state
+            .with_internal(|caches| caches.first().map(Qwen3NextCache::offset).unwrap_or(0));
+        self.mrope_state.set_position(offset);
+        Ok(Qwen35DflashPrefill {
+            hidden_concat,
+            first_logits: first_logits.expect("non-empty prefill produces first_logits"),
+            hidden_offset,
+        })
     }
 
     pub(crate) fn rollback_mtp_verify(
