@@ -1436,22 +1436,17 @@ impl Qwen35Dflash2Generator {
             let verify_input = mlxcel_core::concatenate(&bonus_input, &out.path, 1);
             let phase_start = Instant::now();
             let verify = target.forward_dflash_verify(&verify_input, &self.target_layer_ids);
-            mlxcel_core::eval(&verify.logits);
-            stats.target_verify_time += phase_start.elapsed();
             stats.target_forward_calls += 1;
-            let draft_tokens = materialize_i32(&out.path);
             stats.speculative_rounds += 1;
 
-            // Greedy walk over the verified block.
-            let phase_start = Instant::now();
-            let walk = crate::qwen3_5_mtp::greedy_walk(
-                &draft_tokens,
+            let (walk, draft_tokens) = crate::qwen3_5_mtp::greedy_walk_device_proposals(
+                &out.path,
                 &verify.logits,
                 sampling,
                 &history,
                 remaining,
             );
-            stats.walk_time += phase_start.elapsed();
+            stats.target_verify_time += phase_start.elapsed();
             stats.record_round(walk.accepted, draft_tokens.len());
 
             // Emit the accepted prefix (and possibly a corrected token).
@@ -1504,22 +1499,6 @@ impl Qwen35Dflash2Generator {
     }
 }
 
-/// Materialize a `[1, L]` int32 array into a host `Vec<i32>`.
-fn materialize_i32(array: &MlxArray) -> Vec<i32> {
-    mlxcel_core::eval(array);
-    let shape = mlxcel_core::array_shape(array);
-    let total = shape[0] * shape[1];
-    let mut out = Vec::with_capacity(total as usize);
-    for i in 0..total {
-        let pos = mlxcel_core::slice(
-            array,
-            &[(i / shape[1]) as i32, (i % shape[1]) as i32],
-            &[(i / shape[1]) as i32 + 1, (i % shape[1]) as i32 + 1],
-        );
-        out.push(mlxcel_core::item_i32(&pos));
-    }
-    out
-}
 
 /// Concatenate a `[1, L, H]` per-target-layer hidden list along `-1`.
 fn concatenate_hiddens(hiddens: &[UniquePtr<MlxArray>]) -> UniquePtr<MlxArray> {
