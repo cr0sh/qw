@@ -15,17 +15,7 @@
 
 - All agents(including the principal root agent) should not work on main to
   prevent collision. Delegate to subagents unless it's trivial fix unlikely to collide.
-- Subagents MUST create a dedicated git worktree for each task under `worktrees/`,
-  using a new branch based on `main`.
-- Subagents MUST perform all task work in that worktree and MUST NOT modify the
-  main worktree directly.
-- Each sub-worktree MUST symlink its ignored `target` directory to the main
-  repository's shared `<REPO_ROOT>/target` directory immediately after creation.
-  Set `REPO_ROOT` and `SUB_WORKTREE` to the absolute paths of the main
-  repository and new worktree, then run:
-  `mkdir -p "$REPO_ROOT/target" && ln -s "$REPO_ROOT/target" "$SUB_WORKTREE/target"`.
-  The main worktree owns the actual `target` directory; do not replace it with
-  a symlink.
-- After completing and committing the task, subagents MUST return to the main
-  worktree and merge the worktree branch into `main` as their final action.
+- Subagents MUST create a dedicated git worktree for each task under `worktrees/`, using a new branch based on `main`.
+- Subagents MUST perform all task work in that worktree and MUST NOT modify the main worktree directly.
+- After completing and committing the task, subagents MUST return to the main worktree and merge the worktree branch into `main` as their final action.
 
