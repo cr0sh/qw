@@ -213,7 +213,7 @@ impl TokenBiasMap {
 /// verify (Gemma4 target adapter)
 pub fn apply_token_bias(logits: &MlxArray, bias: &TokenBiasMap) -> UniquePtr<MlxArray> {
     if bias.is_empty() {
-        return ffi::copy(logits);
+        return ffi::share(logits);
     }
     let shape = ffi::array_shape(logits);
     let vocab_size = *shape.last().unwrap() as usize;
