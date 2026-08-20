@@ -1854,6 +1854,7 @@ dependencies = [
  "clap_derive",
  "qw-runtime",
  "qw-server",
+ "serde_json",
  "tokio",
 ]
 
