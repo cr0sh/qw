@@ -1425,22 +1425,21 @@ impl Qwen35Dflash2Generator {
             let out = self
                 .model
                 .propose(&inputs, &hidden_concat, &mut self.caches, target)?;
-            let draft_tokens = materialize_i32(&out.path);
             stats.draft_time += phase_start.elapsed();
 
             // Verify the block against the target in a single batched forward.
-            let mut verify_tokens = Vec::with_capacity(bs);
-            verify_tokens.push(bonus);
-            verify_tokens.extend_from_slice(&draft_tokens);
-            let verify_input = mlxcel_core::from_slice_i32(
-                &verify_tokens,
-                &[1, i32::try_from(verify_tokens.len()).unwrap_or(i32::MAX)],
-            );
+            // Keep the proposal on-device. This mirrors dflash-mlx's fast
+            // path: target verification consumes the draft array directly,
+            // so draft and verify can be submitted without an intervening
+            // device-to-host synchronization.
+            let bonus_input = mlxcel_core::slice(&inputs, &[0, 0], &[1, 1]);
+            let verify_input = mlxcel_core::concatenate(&bonus_input, &out.path, 1);
             let phase_start = Instant::now();
             let verify = target.forward_dflash_verify(&verify_input, &self.target_layer_ids);
             mlxcel_core::eval(&verify.logits);
             stats.target_verify_time += phase_start.elapsed();
             stats.target_forward_calls += 1;
+            let draft_tokens = materialize_i32(&out.path);
             stats.speculative_rounds += 1;
 
             // Greedy walk over the verified block.
