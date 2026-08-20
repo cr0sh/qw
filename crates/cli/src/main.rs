@@ -1,5 +1,7 @@
-use std::io::Write as _;
-use std::path::PathBuf;
+use std::ffi::OsString;
+use std::io::{Error, ErrorKind, Write as _};
+use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 
 use clap::Parser as _;
 use clap_derive::{Args, Parser, Subcommand};
@@ -19,10 +21,18 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Download a Hugging Face model snapshot.
+    Download(DownloadArgs),
     /// Generate one response from a local checkpoint.
     Generate(GenerateArgs),
     /// Run the OpenAI-compatible HTTP server.
     Serve(qw_server::ServerArgs),
+}
+
+#[derive(Debug, Args)]
+struct DownloadArgs {
+    /// Hugging Face model identifier, such as Qwen/Qwen3.5-0.8B.
+    identifier: String,
 }
 
 #[derive(Debug, Args)]
@@ -69,8 +79,178 @@ impl GenerateArgs {
     }
 }
 
+fn invalid_input(message: impl Into<String>) -> Error {
+    Error::new(ErrorKind::InvalidInput, message.into())
+}
+
+fn validate_identifier(identifier: &str) -> Result<Vec<&str>, Error> {
+    let components: Vec<_> = identifier.split('/').collect();
+    if components.is_empty()
+        || components.len() > 2
+        || components
+            .iter()
+            .any(|component| component.is_empty() || *component == "." || *component == "..")
+        || identifier.starts_with('/')
+        || identifier.contains('\\')
+    {
+        return Err(invalid_input(format!(
+            "invalid Hugging Face model identifier `{identifier}`"
+        )));
+    }
+    Ok(components)
+}
+
+fn model_cache_path(home: &Path, identifier: &str) -> Result<PathBuf, Error> {
+    let mut destination = home.join(".cache/qw/models");
+    for component in validate_identifier(identifier)? {
+        destination.push(component);
+    }
+    Ok(destination)
+}
+
+fn sibling_path(destination: &Path, filename: &str) -> Result<PathBuf, Error> {
+    if filename.is_empty()
+        || filename.starts_with('/')
+        || filename.contains('\\')
+        || filename
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..")
+    {
+        return Err(invalid_input(format!(
+            "model API returned unsafe filename `{filename}`"
+        )));
+    }
+    Ok(destination.join(filename))
+}
+
+fn encode_url_path(path: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(path.len());
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'/') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    encoded
+}
+
+fn add_hf_token(command: &mut ProcessCommand) {
+    if let Some(token) = std::env::var_os("HF_TOKEN") {
+        let mut header = OsString::from("Authorization: Bearer ");
+        header.push(token);
+        command.arg("--header").arg(header);
+    }
+}
+
+fn download_model(identifier: &str) -> Result<(), Box<dyn std::error::Error>> {
+    validate_identifier(identifier)?;
+    let home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .ok_or_else(|| Error::new(ErrorKind::NotFound, "HOME is not set"))?;
+    let destination = model_cache_path(Path::new(&home), identifier)?;
+    std::fs::create_dir_all(&destination)?;
+
+    eprintln!("Fetching file list for {identifier}");
+    let api_url = format!(
+        "https://huggingface.co/api/models/{}",
+        encode_url_path(identifier)
+    );
+    let mut api_command = ProcessCommand::new("curl");
+    api_command.args(["--fail", "--silent", "--show-error", "--location"]);
+    add_hf_token(&mut api_command);
+    let output = api_command.arg(&api_url).output().map_err(|error| {
+        Error::new(
+            error.kind(),
+            format!("failed to run curl for Hugging Face model API: {error}"),
+        )
+    })?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        return Err(Error::other(format!(
+            "Hugging Face model API request failed ({}): {}",
+            output.status,
+            detail.trim()
+        ))
+        .into());
+    }
+
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let siblings = response
+        .get("siblings")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| Error::other("Hugging Face model API response did not contain `siblings`"))?;
+
+    for sibling in siblings {
+        let filename = sibling
+            .get("rfilename")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                Error::other("Hugging Face model API returned a sibling without `rfilename`")
+            })?;
+        let file_path = sibling_path(&destination, filename)?;
+        if file_path.is_file() {
+            eprintln!("Already downloaded {filename}");
+            continue;
+        }
+        if let Some(parent) = file_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let mut partial_name = file_path
+            .file_name()
+            .expect("validated sibling path has a filename")
+            .to_os_string();
+        partial_name.push(".qw-part");
+        let partial_path = file_path.with_file_name(partial_name);
+        let file_url = format!(
+            "https://huggingface.co/{}/resolve/main/{}",
+            encode_url_path(identifier),
+            encode_url_path(filename)
+        );
+        eprintln!("Downloading {filename}");
+        let mut command = ProcessCommand::new("curl");
+        command.args(["--fail", "--location", "--show-error"]);
+        if partial_path
+            .metadata()
+            .map(|metadata| metadata.len() > 0)
+            .unwrap_or(false)
+        {
+            command.args(["--continue-at", "-"]);
+        }
+        add_hf_token(&mut command);
+        let status = command
+            .arg("--output")
+            .arg(&partial_path)
+            .arg(&file_url)
+            .status()
+            .map_err(|error| {
+                Error::new(
+                    error.kind(),
+                    format!("failed to run curl while downloading `{filename}`: {error}"),
+                )
+            })?;
+        if !status.success() {
+            return Err(Error::other(format!(
+                "curl failed while downloading `{filename}` ({status})"
+            ))
+            .into());
+        }
+        std::fs::rename(&partial_path, &file_path)?;
+    }
+
+    eprintln!("Downloaded {identifier} to {}", destination.display());
+    Ok(())
+}
+
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
+        Command::Download(args) => {
+            download_model(&args.identifier)?;
+        }
         Command::Generate(args) => {
             eprintln!("Loading model from {}", args.model.display());
             let mut provider = Qwen35Provider::load(&args.model, KVCacheMode::Fp16)?;
@@ -112,6 +292,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use clap::CommandFactory as _;
+    #[test]
+    fn download_accepts_positional_identifier() {
+        let cli = Cli::try_parse_from(["qw", "download", "Qwen/Qwen3.5-0.8B"])
+            .expect("parse download command");
+        let Command::Download(args) = cli.command else {
+            panic!("expected download command");
+        };
+        assert_eq!(args.identifier, "Qwen/Qwen3.5-0.8B");
+    }
+
+    #[test]
+    fn model_cache_path_preserves_namespace() {
+        assert_eq!(
+            model_cache_path(Path::new("/home/user"), "Qwen/Qwen3.5-0.8B")
+                .expect("valid identifier"),
+            Path::new("/home/user/.cache/qw/models/Qwen/Qwen3.5-0.8B")
+        );
+    }
+
+    #[test]
+    fn model_cache_path_rejects_unsafe_identifiers() {
+        for identifier in [
+            "",
+            "/Qwen/model",
+            ".",
+            "..",
+            "Qwen/.",
+            "Qwen/..",
+            "Qwen//model",
+            "Qwen/model/extra",
+            r"Qwen\model",
+        ] {
+            assert!(
+                model_cache_path(Path::new("/home/user"), identifier).is_err(),
+                "{identifier:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn sibling_paths_cannot_escape_destination() {
+        let destination = Path::new("/home/user/.cache/qw/models/Qwen/model");
+        assert_eq!(
+            sibling_path(destination, "weights/model.safetensors").expect("safe sibling"),
+            destination.join("weights/model.safetensors")
+        );
+        for filename in ["", "/etc/passwd", "../token", "weights/../../token", r"..\token"] {
+            assert!(
+                sibling_path(destination, filename).is_err(),
+                "{filename:?} should be rejected"
+            );
+        }
+    }
 
     #[test]
     fn generate_requires_model_and_prompt() {
