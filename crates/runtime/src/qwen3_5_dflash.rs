@@ -1438,10 +1438,12 @@ impl Qwen35Dflash2Generator {
             let verify = target.forward_dflash_verify(&verify_input, &self.target_layer_ids);
             stats.target_forward_calls += 1;
             stats.speculative_rounds += 1;
+            let verify_retained = concatenate_hiddens(&verify.hidden_by_layer);
 
             let (walk, draft_tokens) = crate::qwen3_5_mtp::greedy_walk_device_proposals(
                 &out.path,
                 &verify.logits,
+                &verify_retained,
                 sampling,
                 &history,
                 remaining,
@@ -1465,7 +1467,6 @@ impl Qwen35Dflash2Generator {
 
             // Next context: the target-layer hidden states of the accepted
             // prefix (the verify captured hiddens for the whole block).
-            let verify_retained = concatenate_hiddens(&verify.hidden_by_layer);
             let retained_shape = mlxcel_core::array_shape(&verify_retained);
             let accepted_plus_one = i32::try_from(walk.accepted + 1).unwrap_or(i32::MAX);
             hidden_concat = mlxcel_core::slice(
