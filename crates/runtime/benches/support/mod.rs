@@ -8,6 +8,11 @@ use qw_runtime::{
 
 pub const DECODE_MAX_TOKENS: usize = 128;
 pub const MTP_BLOCK_SIZE: usize = 3;
+/// Environment variable pointing at the DFlash2 drafter checkpoint
+/// directory (optional; defaults to the model cache path below).
+pub const DRAFT_MODEL_ENV: &str = "QW_BENCH_DRAFT_MODEL";
+/// Default DFlash2 drafter identifier resolved through the model cache.
+pub const DEFAULT_DRAFT_MODEL_IDENTIFIER: &str = "incoai/Qwen3.8-27B-DFlash2";
 pub const PROMPT: &str = concat!(
     "You are the on-call support operations analyst for Acme Commerce. ",
     "Review this incident and return only one compact JSON object with keys ",
@@ -71,6 +76,21 @@ pub fn prompt_tokens(provider: &Qwen35Provider) -> usize {
         )
         .expect("tokenize single-user benchmark prompt")
         .len()
+}
+
+/// Resolve the DFlash2 drafter directory: `QW_BENCH_DRAFT_MODEL` when set,
+/// else the model cache path for the default identifier (mirrors the model
+/// resolution `qw generate` / `qw serve` use).
+#[allow(dead_code)]
+pub fn draft_model_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os(DRAFT_MODEL_ENV).filter(|value| !value.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .expect("HOME must be set to resolve the default drafter cache path");
+    qw_runtime::model_cache_path(&home, DEFAULT_DRAFT_MODEL_IDENTIFIER)
+        .expect("default DFlash2 drafter identifier is valid")
 }
 
 pub fn prepare_decode_fixture(provider: &mut Qwen35Provider) -> DecodeFixture {

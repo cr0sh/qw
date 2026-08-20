@@ -133,6 +133,67 @@ fn single_user_throughput(criterion: &mut Criterion) {
         });
         group.finish();
     }
+
+    // DFlash2 block-diffusion drafter, same decode fixture. Greedy parity is
+    // the load-bearing gate: token IDs must match the baseline byte-for-byte
+    // (lossless speculative decoding).
+    {
+        let draft_dir = support::draft_model_dir();
+        let (dflash2_output, dflash2_stats) = provider
+            .generate_dflash2_streaming(&decode_request, &draft_dir, |delta| {
+                black_box(delta);
+                true
+            })
+            .unwrap_or_else(|error| panic!("warm up DFlash2 single-user decode: {error:#}"));
+        assert_eq!(
+            &dflash2_output.token_ids, &baseline_token_ids,
+            "greedy DFlash2 token IDs must match baseline (lossless)"
+        );
+        assert!(
+            dflash2_stats.proposed_draft_tokens > 0,
+            "DFlash2 must propose draft tokens"
+        );
+        eprintln!(
+            "DFLASH2_PROFILE tokens={} accepted={} proposed={} acceptance={:.2}% forwards={} draft_ms={:.3} verify_ms={:.3} walk_ms={:.3} reconcile_ms={:.3}",
+            dflash2_output.token_ids.len(),
+            dflash2_stats.accepted_draft_tokens,
+            dflash2_stats.proposed_draft_tokens,
+            dflash2_stats.acceptance_percentage(),
+            dflash2_stats.target_forward_calls,
+            dflash2_stats.draft_time.as_secs_f64() * 1_000.0,
+            dflash2_stats.target_verify_time.as_secs_f64() * 1_000.0,
+            dflash2_stats.walk_time.as_secs_f64() * 1_000.0,
+            dflash2_stats.reconcile_time.as_secs_f64() * 1_000.0,
+        );
+        let dflash2_decode_tokens =
+            generation_elements(1, prompt_tokens, dflash2_output.token_ids.len()).decode as usize;
+
+        let mut group = criterion.benchmark_group("single_user_decode");
+        group.throughput(Throughput::Elements(dflash2_decode_tokens as u64));
+        group.bench_function("dflash2", |bencher| {
+            bencher.iter_custom(|iters| {
+                let mut decode_time = Duration::ZERO;
+                for _ in 0..iters {
+                    let (output, stats) = provider
+                        .generate_dflash2_streaming(&decode_request, &draft_dir, |delta| {
+                            black_box(delta);
+                            true
+                        })
+                        .unwrap_or_else(|error| {
+                            panic!("benchmark DFlash2 single-user decode: {error:#}")
+                        });
+                    assert_eq!(
+                        &output.token_ids, &baseline_token_ids,
+                        "greedy DFlash2 token IDs must match baseline (lossless)"
+                    );
+                    decode_time += stats.decode_time;
+                    black_box(output);
+                }
+                decode_time
+            });
+        });
+        group.finish();
+    }
 }
 
 criterion_group! {

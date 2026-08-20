@@ -516,10 +516,10 @@ impl DFlash2GroupedConv {
                 );
                 values = mlxcel_core::multiply(&values, &mask);
             }
-            // delta [B, L, taps, groups] -> [B, L, 1, groups]; broadcasting
-            // against base_tap [1, 1, groups, gs] yields [B, L, groups, gs]
-            // (SGLang `delta.unsqueeze(-1)` keeps the group axis, not a new
-            // trailing singleton).
+            // delta [B, L, taps, groups] -> [B, L, groups, 1]; the trailing
+            // singleton broadcasts the per-group kernel over the group_size
+            // channels (SGLang `delta.unsqueeze(-1)` against
+            // `base.view(1, taps, groups, group_size)`).
             let delta_tap = mlxcel_core::slice(
                 dynamic,
                 &[0, 0, tap, 0],
@@ -527,7 +527,7 @@ impl DFlash2GroupedConv {
             );
             let delta_tap = mlxcel_core::reshape(
                 &delta_tap,
-                &[batch, length, 1, groups],
+                &[batch, length, groups, 1],
             );
             let delta_tap = mlxcel_core::astype(&delta_tap, hidden_dtype);
             // base_tap [1, 1, groups, gs]
@@ -1024,36 +1024,38 @@ impl CandidateSelector {
         let mut path_rows = Vec::with_capacity(npos as usize);
         for position in 0..npos {
             let pred_emb = mlxcel_core::embedding(&self.predecessor_codebook, &predecessor); // [B, rank]
-            let succ_emb = mlxcel_core::embedding(
-                &self.successor_codebook,
-                &mlxcel_core::slice(&candidates, &[0, position, 0], &[batch, position + 1, k]),
-            ); // [B, K, rank]
+            let candidate_slice = mlxcel_core::slice(
+                candidates,
+                &[0, position, 0],
+                &[batch, position + 1, k],
+            );
+            let succ_emb =
+                mlxcel_core::embedding(&self.successor_codebook, &candidate_slice); // [B, K, rank]
             let hidden_row = mlxcel_core::slice(
                 &hidden_proj,
                 &[0, position, 0],
                 &[batch, position + 1, rank],
             ); // [B, 1, rank]
             let hidden_row = mlxcel_core::reshape(&hidden_row, &[batch, rank]); // [B, rank]
+            let pred_emb = mlxcel_core::expand_dims(&pred_emb, 1); // [B, 1, rank]
+            let hidden_row = mlxcel_core::expand_dims(&hidden_row, 1); // [B, 1, rank]
             let edges = mlxcel_core::sum_axis(
                 &mlxcel_core::multiply(
-                    &mlxcel_core::multiply(
-                        &mlxcel_core::expand_dims(&pred_emb, 1),   // [B, 1, rank]
-                        &mlxcel_core::expand_dims(&hidden_row, 1), // [B, 1, rank]
-                    ),
+                    &mlxcel_core::multiply(&pred_emb, &hidden_row),
                     &succ_emb, // [B, K, rank]
                 ),
                 -1,
                 false,
             ); // [B, K]
             let unary_row = mlxcel_core::slice(
-                &unary,
+                unary,
                 &[0, position, 0],
                 &[batch, position + 1, k],
             );
             let scores = mlxcel_core::add(&unary_row, &edges); // [B, K]
             let selected = mlxcel_core::argmax(&scores, -1, false); // [B]
             let candidate_row = mlxcel_core::slice(
-                &candidates,
+                candidates,
                 &[0, position, 0],
                 &[batch, position + 1, k],
             );
@@ -1634,9 +1636,7 @@ mod tests {
         // base_kernel [2, taps, hidden]; side 0 (prepare) tap 0 and tap 1
         // both identity over all channels, side 1 (finish) all zeros.
         let mut base = vec![0.0_f32; 2 * taps * hidden];
-        for i in 0..(taps * hidden) {
-            base[i] = 1.0;
-        }
+        base[..taps * hidden].fill(1.0);
         weights.insert(
             "conv.base_kernel".to_owned(),
             mlxcel_core::from_slice_f32(&base, &[2, taps as i32, hidden as i32]),
