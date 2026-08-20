@@ -2,9 +2,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 
-/// Fixed default identifier for checkpoints that `qw generate` and `qw serve`
-/// use when neither `--model` nor `QW_MODEL_PATH` is given. Users override the
-/// *path* to a checkpoint, never this identifier.
+/// Fixed default identifier for checkpoints that `qw generate`, `qw serve`,
+/// and the runtime benchmarks use when neither `--model` nor `QW_MODEL_PATH`
+/// is given. Users override the *path* to a checkpoint, never this identifier.
 pub const DEFAULT_MODEL_IDENTIFIER: &str = "Jundot/Qwen3.8-27B-oQ4e-fp16-mtp";
 
 /// Split a Hugging Face model identifier into the namespace and model

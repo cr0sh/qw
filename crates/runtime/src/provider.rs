@@ -1250,11 +1250,9 @@ mod tests {
         assert_eq!(emitted, "Hello, world!");
     }
     #[test]
-    #[ignore = "requires QW_BENCH_MODEL pointing at a real bundled-MTP checkpoint"]
+    #[ignore = "requires the real bundled-MTP checkpoint at QW_MODEL_PATH or the default model cache path"]
     fn real_model_baseline_and_mtp_greedy_outputs_match() {
-        let model_dir = std::env::var_os("QW_BENCH_MODEL")
-            .map(PathBuf::from)
-            .expect("QW_BENCH_MODEL must point at a real checkpoint");
+        let model_dir = crate::resolve_model_path(None).expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
         let mut provider =
             Qwen35Provider::load(&model_dir, KVCacheMode::Fp16).expect("load real Qwen checkpoint");
         let request = GenerationRequest {
@@ -1287,11 +1285,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires QW_BENCH_MODEL pointing at a real bundled-MTP checkpoint"]
+    #[ignore = "requires the real bundled-MTP checkpoint at QW_MODEL_PATH or the default model cache path"]
     fn real_model_mtp_prefix_reuse_matches_cold_and_reduces_ttft() {
-        let model_dir = std::env::var_os("QW_BENCH_MODEL")
-            .map(PathBuf::from)
-            .expect("QW_BENCH_MODEL must point at a real checkpoint");
+        let model_dir = crate::resolve_model_path(None).expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
         let mut provider = Qwen35Provider::load(&model_dir, KVCacheMode::Turbo4)
             .expect("load real bundled-MTP checkpoint");
         let base = provider
@@ -1409,11 +1405,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires QW_BENCH_MODEL pointing at a real bundled-MTP checkpoint"]
+    #[ignore = "requires the real bundled-MTP checkpoint at QW_MODEL_PATH or the default model cache path"]
     fn real_model_mtp_prefix_reuse_covers_reasoning_and_plain_history() {
-        let model_dir = std::env::var_os("QW_BENCH_MODEL")
-            .map(PathBuf::from)
-            .expect("QW_BENCH_MODEL must point at a real checkpoint");
+        let model_dir = crate::resolve_model_path(None).expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
         let mut provider = Qwen35Provider::load(&model_dir, KVCacheMode::Turbo4)
             .expect("load real bundled-MTP checkpoint");
         let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
@@ -1531,11 +1525,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires QW_BENCH_MODEL pointing at a real bundled-MTP checkpoint"]
+    #[ignore = "requires the real bundled-MTP checkpoint at QW_MODEL_PATH or the default model cache path"]
     fn real_model_mtp_max_output_has_bounded_terminal_tail() {
-        let model_dir = std::env::var_os("QW_BENCH_MODEL")
-            .map(PathBuf::from)
-            .expect("QW_BENCH_MODEL must point at a real checkpoint");
+        let model_dir = crate::resolve_model_path(None).expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
         let mut provider = Qwen35Provider::load(&model_dir, KVCacheMode::Turbo4)
             .expect("load real bundled-MTP checkpoint");
         let prompt = provider
@@ -1589,11 +1581,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires QW_BENCH_MODEL pointing at a real bundled-MTP checkpoint"]
+    #[ignore = "requires the real bundled-MTP checkpoint at QW_MODEL_PATH or the default model cache path"]
     fn real_model_cancelled_mtp_snapshot_portable_resume_matches_uninterrupted_greedy() {
-        let model_dir = std::env::var_os("QW_BENCH_MODEL")
-            .map(PathBuf::from)
-            .expect("QW_BENCH_MODEL must point at a real checkpoint");
+        let model_dir = crate::resolve_model_path(None).expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
         let mut provider = Qwen35Provider::load(&model_dir, KVCacheMode::Turbo4)
             .expect("load real bundled-MTP checkpoint");
         let messages = vec![

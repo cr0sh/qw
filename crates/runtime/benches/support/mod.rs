@@ -6,7 +6,6 @@ use qw_runtime::{
     ChatMessage, ChatMessageContent, GenerationRequest, KVCacheMode, Qwen35Provider,
 };
 
-pub const MODEL_ENV: &str = "QW_BENCH_MODEL";
 pub const DECODE_MAX_TOKENS: usize = 128;
 pub const MTP_BLOCK_SIZE: usize = 3;
 pub const PROMPT: &str = concat!(
@@ -46,12 +45,10 @@ pub fn request(max_tokens: usize) -> GenerationRequest {
 }
 
 pub fn load_provider() -> Qwen35Provider {
-    // Checkpoints are intentionally not vendored. QW_BENCH_MODEL points at the
-    // deterministic local Qwen fixture used by the runtime and CLI.
-    let model_dir = PathBuf::from(
-        std::env::var_os(MODEL_ENV)
-            .unwrap_or_else(|| panic!("{MODEL_ENV} must point to a local Qwen checkpoint")),
-    );
+    // Unified with `qw generate` / `qw serve`: QW_MODEL_PATH override, else
+    // the model cache path for the resolver's default identifier.
+    let model_dir = qw_runtime::resolve_model_path(None)
+        .unwrap_or_else(|error| panic!("failed to resolve benchmark model path: {error:#}"));
     Qwen35Provider::load(&model_dir, KVCacheMode::Turbo4)
         .unwrap_or_else(|error| panic!("failed to load {}: {error:#}", model_dir.display()))
 }

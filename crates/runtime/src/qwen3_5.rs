@@ -2765,11 +2765,9 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires QW_BENCH_MODEL pointing at a real dense Qwen3.5 checkpoint"]
+    #[ignore = "requires the real dense Qwen3.5 checkpoint at QW_MODEL_PATH or the default model cache path"]
     fn restored_mixed_target_snapshot_matches_uninterrupted_next_token_and_text() {
-        let model_dir = std::env::var_os("QW_BENCH_MODEL")
-            .map(std::path::PathBuf::from)
-            .expect("QW_BENCH_MODEL must point at a real checkpoint");
+        let model_dir = crate::resolve_model_path(None).expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
         let tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
             .expect("load tokenizer");
         let model = Qwen35Model::load(&model_dir, KVCacheMode::Fp16).expect("load Qwen3.5 model");
