@@ -1,6 +1,7 @@
 mod chat_template;
 mod gated_delta;
 mod model_owned;
+mod model_resolver;
 mod qwen3_5;
 mod qwen3_5_mtp;
 mod qwen3_next;
@@ -23,6 +24,10 @@ pub use provider::{
     ChatTool, ChatToolCall, ChatToolCallFunction, ChatToolFunction, GenerationOutput,
     GenerationRequest, MtpPrefixReuse, MtpPromptSnapshot, PreparedMultimodalPrefill,
     PromptSnapshot, Qwen35Provider,
+};
+pub use model_resolver::{
+    DEFAULT_MODEL_IDENTIFIER, model_cache_path, resolve_model_dir, resolve_model_path,
+    validate_identifier,
 };
 pub use portable_snapshot::{PortableArray, PortableModelState, PortablePromptSnapshot};
 pub use qwen_vl::{ExpandedImageTokens, insert_qwen_vl_image_tokens};

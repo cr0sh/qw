@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, ensure};
 use clap_derive::{Args as DeriveArgs, ValueEnum};
 use qw_prefix_cache::CacheConfig;
-use qw_runtime::KVCacheMode;
+use qw_runtime::{KVCacheMode, resolve_model_path};
 use tracing::info;
 
 use crate::{Engine, router};
@@ -17,9 +17,9 @@ enum OutputFormat {
 
 #[derive(Debug, DeriveArgs)]
 pub struct ServerArgs {
-    /// Local Qwen3.5 checkpoint directory.
+    /// Checkpoint directory or HF identifier; defaults to the qw model cache unless QW_MODEL_PATH is set.
     #[arg(long)]
-    model: PathBuf,
+    model: Option<PathBuf>,
 
     /// Only accept requests for this exact model ID.
     #[arg(long)]
@@ -91,8 +91,9 @@ pub async fn serve(cli: ServerArgs) -> Result<()> {
     info!(phase = "server.starting", bind = %bind);
 
     let kv_cache_mode = cli.kv_cache_mode();
+    let model = resolve_model_path(cli.model.as_deref())?;
     let engine = Engine::start_qwen(
-        cli.model,
+        model,
         cli.model_id,
         CacheConfig {
             memory_bytes: cli.prefix_cache_memory_bytes,
@@ -123,6 +124,12 @@ mod tests {
     struct TestCli {
         #[command(flatten)]
         args: ServerArgs,
+    }
+
+    #[test]
+    fn cli_model_is_optional() {
+        let cli = TestCli::try_parse_from(["qw-server"]).expect("CLI");
+        assert_eq!(cli.args.model, None);
     }
 
     #[test]

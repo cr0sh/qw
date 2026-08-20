@@ -7,7 +7,7 @@ use std::thread;
 
 use clap::Parser as _;
 use clap_derive::{Args, Parser, Subcommand};
-use qw_runtime::{GenerationRequest, KVCacheMode, Qwen35Provider};
+use qw_runtime::{GenerationRequest, KVCacheMode, Qwen35Provider, model_cache_path, validate_identifier};
 use qw_server::serve;
 
 #[derive(Debug, Parser)]
@@ -39,9 +39,9 @@ struct DownloadArgs {
 
 #[derive(Debug, Args)]
 struct GenerateArgs {
-    /// Local Qwen3.5 checkpoint directory.
+    /// Checkpoint directory or HF identifier; defaults to the qw model cache unless QW_MODEL_PATH is set.
     #[arg(long)]
-    model: PathBuf,
+    model: Option<PathBuf>,
 
     /// User prompt text.
     #[arg(long)]
@@ -83,31 +83,6 @@ impl GenerateArgs {
 
 fn invalid_input(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::InvalidInput, message.into())
-}
-
-fn validate_identifier(identifier: &str) -> Result<Vec<&str>, Error> {
-    let components: Vec<_> = identifier.split('/').collect();
-    if components.is_empty()
-        || components.len() > 2
-        || components
-            .iter()
-            .any(|component| component.is_empty() || *component == "." || *component == "..")
-        || identifier.starts_with('/')
-        || identifier.contains('\\')
-    {
-        return Err(invalid_input(format!(
-            "invalid Hugging Face model identifier `{identifier}`"
-        )));
-    }
-    Ok(components)
-}
-
-fn model_cache_path(home: &Path, identifier: &str) -> Result<PathBuf, Error> {
-    let mut destination = home.join(".cache/qw/models");
-    for component in validate_identifier(identifier)? {
-        destination.push(component);
-    }
-    Ok(destination)
 }
 
 fn sibling_path(destination: &Path, filename: &str) -> Result<PathBuf, Error> {
@@ -310,8 +285,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             download_model(&args.identifier)?;
         }
         Command::Generate(args) => {
-            eprintln!("Loading model from {}", args.model.display());
-            let mut provider = Qwen35Provider::load(&args.model, KVCacheMode::Fp16)?;
+            let model = qw_runtime::resolve_model_path(args.model.as_deref())?;
+            eprintln!("Loading model from {}", model.display());
+            let mut provider = Qwen35Provider::load(&model, KVCacheMode::Fp16)?;
             let stdout = std::io::stdout();
             let mut stdout = stdout.lock();
             let mut io_error = None;
@@ -402,35 +378,6 @@ mod tests {
     }
 
     #[test]
-    fn model_cache_path_preserves_namespace() {
-        assert_eq!(
-            model_cache_path(Path::new("/home/user"), "Qwen/Qwen3.5-0.8B")
-                .expect("valid identifier"),
-            Path::new("/home/user/.cache/qw/models/Qwen/Qwen3.5-0.8B")
-        );
-    }
-
-    #[test]
-    fn model_cache_path_rejects_unsafe_identifiers() {
-        for identifier in [
-            "",
-            "/Qwen/model",
-            ".",
-            "..",
-            "Qwen/.",
-            "Qwen/..",
-            "Qwen//model",
-            "Qwen/model/extra",
-            r"Qwen\model",
-        ] {
-            assert!(
-                model_cache_path(Path::new("/home/user"), identifier).is_err(),
-                "{identifier:?} should be rejected"
-            );
-        }
-    }
-
-    #[test]
     fn sibling_paths_cannot_escape_destination() {
         let destination = Path::new("/home/user/.cache/qw/models/Qwen/model");
         assert_eq!(
@@ -449,7 +396,9 @@ mod tests {
     fn generate_requires_model_and_prompt() {
         assert!(Cli::try_parse_from(["qw", "generate"]).is_err());
         assert!(Cli::try_parse_from(["qw", "generate", "--model", "/tmp/model"]).is_err());
-        assert!(Cli::try_parse_from(["qw", "generate", "--prompt", "hello"]).is_err());
+        let cli = Cli::try_parse_from(["qw", "generate", "--prompt", "hello"])
+            .expect("model is optional");
+        assert!(matches!(cli.command, Command::Generate(args) if args.model.is_none()));
     }
 
     #[test]
