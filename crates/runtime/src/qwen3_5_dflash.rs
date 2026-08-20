@@ -1528,7 +1528,7 @@ fn concatenate_hiddens(hiddens: &[UniquePtr<MlxArray>]) -> UniquePtr<MlxArray> {
     debug_assert!(n > 0, "DFlash2 verify must capture hidden states");
     // Concatenate along the last (hidden) axis, mirroring the SGLang target
     // feature capture (`extract_context_feature`).
-    let mut acc = mlxcel_core::copy(hiddens[0].as_ref().expect("captured hidden"));
+    let mut acc = mlxcel_core::share(hiddens[0].as_ref().expect("captured hidden"));
     for hid in &hiddens[1..] {
         acc = concatenate(&acc, hid.as_ref().expect("captured hidden"), -1);
     }
