@@ -1425,6 +1425,7 @@ impl Qwen35Dflash2Generator {
             let out = self
                 .model
                 .propose(&inputs, &hidden_concat, &mut self.caches, target)?;
+            mlxcel_core::async_eval(&out.path);
             stats.draft_time += phase_start.elapsed();
 
             // Verify the block against the target in a single batched forward.
