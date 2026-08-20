@@ -935,19 +935,12 @@ pub(crate) fn greedy_walk_device_proposals(
     committed_history: &[i32],
     max_new_tokens: usize,
 ) -> (WalkResult, Vec<i32>) {
-    let draft_tokens_host = || {
-        mlxcel_core::eval(draft_tokens);
-        let shape = mlxcel_core::array_shape(draft_tokens);
-        let mut tokens = Vec::with_capacity((shape[0] * shape[1]) as usize);
-        for position in 0..shape[1] {
-            let token = mlxcel_core::slice(
-                draft_tokens,
-                &[0, position],
-                &[shape[0], position + 1],
-            );
-            tokens.push(mlxcel_core::item_i32(&token));
-        }
-        tokens
+    let materialize_ids = |array: &MlxArray| {
+        mlxcel_core::eval(array);
+        mlxcel_core::array_to_raw_bytes(array)
+            .chunks_exact(4)
+            .map(|bytes| i32::from_ne_bytes(bytes.try_into().expect("i32 token bytes")))
+            .collect::<Vec<_>>()
     };
     let history_independent = sampling.repetition_penalty == 1.0
         && sampling.dry_multiplier == 0.0
@@ -955,7 +948,7 @@ pub(crate) fn greedy_walk_device_proposals(
         && sampling.presence_penalty == 0.0
         && sampling.xtc_probability == 0.0;
     if !history_independent {
-        let draft_tokens = draft_tokens_host();
+        let draft_tokens = materialize_ids(draft_tokens);
         let walk = greedy_walk(
             &draft_tokens,
             verify_logits,
@@ -970,17 +963,8 @@ pub(crate) fn greedy_walk_device_proposals(
         mlxcel_core::sampling::apply_token_bias(verify_logits, &sampling.token_bias);
     let targets = mlxcel_core::argmax_last_axis(&biased_logits);
     mlxcel_core::async_eval_pair(&targets, eager_hidden);
-    let draft_tokens = draft_tokens_host();
-    let shape = mlxcel_core::array_shape(&targets);
-    let mut target_tokens = Vec::with_capacity(draft_tokens.len() + 1);
-    for position in 0..=draft_tokens.len() {
-        let token = mlxcel_core::slice(
-            &targets,
-            &[0, position as i32],
-            &[shape[0], position as i32 + 1],
-        );
-        target_tokens.push(mlxcel_core::item_i32(&token));
-    }
+    let draft_tokens = materialize_ids(draft_tokens);
+    let target_tokens = materialize_ids(&targets);
     (
         speculative_walk(&draft_tokens, &target_tokens, max_new_tokens),
         draft_tokens,
