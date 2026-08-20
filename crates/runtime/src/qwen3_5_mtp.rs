@@ -883,7 +883,7 @@ fn commit_constraint_transaction<T>(
     }
 }
 
-fn greedy_walk(
+pub(crate) fn greedy_walk(
     draft_tokens: &[i32],
     verify_logits: &MlxArray,
     sampling: &SamplingConfig,
@@ -1345,7 +1345,7 @@ fn constrained_stochastic_walk(
     })
 }
 
-fn emit_walk_tokens<F: FnMut(i32) -> bool>(
+pub(crate) fn emit_walk_tokens<F: FnMut(i32) -> bool>(
     tokens: &[i32],
     eos_tokens: &[i32],
     max_tokens: usize,

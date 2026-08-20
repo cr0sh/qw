@@ -26,6 +26,7 @@ use crate::qwen_vl_processor::{PreparedImage, QwenVLProcessor};
 use crate::qwen3_5::Qwen35Model;
 use crate::qwen3_5_mtp::Qwen35MtpGenerator;
 pub use crate::qwen3_5_mtp::{MtpGenerationStats, MtpPrefixReuse, MtpPromptSnapshot};
+pub use crate::qwen3_5_dflash::Dflash2GenerationStats;
 
 const DEFAULT_MTP_BLOCK_SIZE: usize = 3;
 
@@ -158,6 +159,7 @@ pub struct Qwen35Provider {
     defaults: GenerationDefaults,
     generator: CxxGenerator,
     mtp_generator: Option<Qwen35MtpGenerator>,
+    dflash2_generator: Option<crate::qwen3_5_dflash::Qwen35Dflash2Generator>,
     vision_processor: Option<QwenVLProcessor>,
 }
 
@@ -230,6 +232,7 @@ impl Qwen35Provider {
             defaults,
             generator,
             mtp_generator,
+            dflash2_generator: None,
             vision_processor,
         })
     }
@@ -725,6 +728,65 @@ impl Qwen35Provider {
         )
         .map(|(generation, _)| generation)
     }
+
+    /// Generate with the DFlash2 block-diffusion drafter loaded from
+    /// `draft_dir`, decoding deltas through the provider tokenizer.
+    ///
+    /// The generator is constructed lazily on first use and kept for
+    /// subsequent calls (drafter weights + per-layer KV caches survive across
+    /// calls). Greedy-only: `request.temperature` must be 0 / `top_k` 1.
+    #[tracing::instrument(name = "runtime.generate_dflash2", skip_all, fields(max_tokens), err)]
+    pub fn generate_dflash2_streaming<F: FnMut(&str) -> bool>(
+        &mut self,
+        request: &GenerationRequest,
+        draft_dir: &Path,
+        mut on_delta: F,
+    ) -> Result<(GenerationOutput, Dflash2GenerationStats)> {
+        if self.dflash2_generator.is_none() {
+            self.dflash2_generator = Some(
+                crate::qwen3_5_dflash::Qwen35Dflash2Generator::new(&self.model, draft_dir)
+                    .map_err(|error| anyhow::anyhow!("failed to load DFlash2 drafter: {error}"))?,
+            );
+        }
+        let (prompt_ids, sampling) = self.prepare_generation(request)?;
+        let generator = self
+            .dflash2_generator
+            .as_mut()
+            .expect("DFlash2 generator was initialized");
+        let mut decoder = IncrementalTextDecoder::new(&self.tokenizer);
+        let mut decode_error = None;
+        let generation = generator
+            .generate_streaming(
+                &self.model,
+                &prompt_ids,
+                request.max_tokens,
+                &sampling,
+                |token_id| match decoder.push(token_id) {
+                    Ok(delta) => on_delta(&delta),
+                    Err(error) => {
+                        decode_error = Some(error);
+                        false
+                    }
+                },
+            )
+            .map_err(anyhow::Error::msg)
+            .context("DFlash2 generation failed")?;
+        if let Some(error) = decode_error {
+            return Err(error);
+        }
+        let final_delta = decoder.finish()?;
+        if !final_delta.is_empty() {
+            let _ = on_delta(&final_delta);
+        }
+        Ok((
+            GenerationOutput {
+                text: decoder.emitted,
+                token_ids: generation.token_ids,
+            },
+            generation.stats,
+        ))
+    }
+
     #[tracing::instrument(
         name = "runtime.generate_mtp",
         skip_all,
