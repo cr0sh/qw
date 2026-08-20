@@ -1,7 +1,9 @@
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::io::{Error, ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
+use std::thread;
 
 use clap::Parser as _;
 use clap_derive::{Args, Parser, Subcommand};
@@ -146,6 +148,82 @@ fn add_hf_token(command: &mut ProcessCommand) {
     }
 }
 
+const MAX_CONCURRENT_DOWNLOADS: usize = 4;
+
+struct DownloadJob {
+    filename: String,
+    file_path: PathBuf,
+    partial_path: PathBuf,
+}
+
+fn run_bounded<T, F>(items: &[T], limit: usize, operation: &F) -> Result<(), Error>
+where
+    T: Sync,
+    F: Fn(&T) -> Result<(), Error> + Sync,
+{
+    assert!(limit > 0, "concurrency limit must be positive");
+    for batch in items.chunks(limit) {
+        thread::scope(|scope| {
+            let handles: Vec<_> = batch
+                .iter()
+                .map(|item| scope.spawn(move || operation(item)))
+                .collect();
+            let mut first_error = None;
+            for handle in handles {
+                let result = handle
+                    .join()
+                    .unwrap_or_else(|_| Err(Error::other("download worker panicked")));
+                if first_error.is_none() {
+                    first_error = result.err();
+                }
+            }
+            first_error.map_or(Ok(()), Err)
+        })?;
+    }
+    Ok(())
+}
+
+fn download_sibling(identifier: &str, job: &DownloadJob) -> Result<(), Error> {
+    let file_url = format!(
+        "https://huggingface.co/{}/resolve/main/{}",
+        encode_url_path(identifier),
+        encode_url_path(&job.filename)
+    );
+    eprintln!("Downloading {}", job.filename);
+    let mut command = ProcessCommand::new("curl");
+    command.args(["--fail", "--location", "--show-error"]);
+    if job
+        .partial_path
+        .metadata()
+        .map(|metadata| metadata.len() > 0)
+        .unwrap_or(false)
+    {
+        command.args(["--continue-at", "-"]);
+    }
+    add_hf_token(&mut command);
+    let status = command
+        .arg("--output")
+        .arg(&job.partial_path)
+        .arg(&file_url)
+        .status()
+        .map_err(|error| {
+            Error::new(
+                error.kind(),
+                format!(
+                    "failed to run curl while downloading `{}`: {error}",
+                    job.filename
+                ),
+            )
+        })?;
+    if !status.success() {
+        return Err(Error::other(format!(
+            "curl failed while downloading `{}` ({status})",
+            job.filename
+        )));
+    }
+    std::fs::rename(&job.partial_path, &job.file_path)
+}
+
 fn download_model(identifier: &str) -> Result<(), Box<dyn std::error::Error>> {
     validate_identifier(identifier)?;
     let home = std::env::var_os("HOME")
@@ -184,6 +262,8 @@ fn download_model(identifier: &str) -> Result<(), Box<dyn std::error::Error>> {
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| Error::other("Hugging Face model API response did not contain `siblings`"))?;
 
+    let mut jobs = Vec::with_capacity(siblings.len());
+    let mut seen = HashSet::with_capacity(siblings.len());
     for sibling in siblings {
         let filename = sibling
             .get("rfilename")
@@ -192,6 +272,9 @@ fn download_model(identifier: &str) -> Result<(), Box<dyn std::error::Error>> {
                 Error::other("Hugging Face model API returned a sibling without `rfilename`")
             })?;
         let file_path = sibling_path(&destination, filename)?;
+        if !seen.insert(file_path.clone()) {
+            continue;
+        }
         if file_path.is_file() {
             eprintln!("Already downloaded {filename}");
             continue;
@@ -206,41 +289,16 @@ fn download_model(identifier: &str) -> Result<(), Box<dyn std::error::Error>> {
             .to_os_string();
         partial_name.push(".qw-part");
         let partial_path = file_path.with_file_name(partial_name);
-        let file_url = format!(
-            "https://huggingface.co/{}/resolve/main/{}",
-            encode_url_path(identifier),
-            encode_url_path(filename)
-        );
-        eprintln!("Downloading {filename}");
-        let mut command = ProcessCommand::new("curl");
-        command.args(["--fail", "--location", "--show-error"]);
-        if partial_path
-            .metadata()
-            .map(|metadata| metadata.len() > 0)
-            .unwrap_or(false)
-        {
-            command.args(["--continue-at", "-"]);
-        }
-        add_hf_token(&mut command);
-        let status = command
-            .arg("--output")
-            .arg(&partial_path)
-            .arg(&file_url)
-            .status()
-            .map_err(|error| {
-                Error::new(
-                    error.kind(),
-                    format!("failed to run curl while downloading `{filename}`: {error}"),
-                )
-            })?;
-        if !status.success() {
-            return Err(Error::other(format!(
-                "curl failed while downloading `{filename}` ({status})"
-            ))
-            .into());
-        }
-        std::fs::rename(&partial_path, &file_path)?;
+        jobs.push(DownloadJob {
+            filename: filename.to_owned(),
+            file_path,
+            partial_path,
+        });
     }
+
+    run_bounded(&jobs, MAX_CONCURRENT_DOWNLOADS, &|job| {
+        download_sibling(identifier, job)
+    })?;
 
     eprintln!("Downloaded {identifier} to {}", destination.display());
     Ok(())
@@ -292,6 +350,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
     use clap::CommandFactory as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn bounded_runner_visits_each_item_without_exceeding_limit() {
+        let active = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let completed = AtomicUsize::new(0);
+        let items = [0; 12];
+
+        run_bounded(&items, 4, &|_| {
+            let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(current, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            active.fetch_sub(1, Ordering::SeqCst);
+            completed.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .expect("bounded work succeeds");
+
+        assert_eq!(completed.load(Ordering::SeqCst), items.len());
+        assert!(peak.load(Ordering::SeqCst) <= 4);
+        assert!(peak.load(Ordering::SeqCst) > 1);
+    }
+
+    #[test]
+    fn bounded_runner_propagates_worker_failure() {
+        let completed = AtomicUsize::new(0);
+        let error = run_bounded(&[0, 1, 2], 2, &|item| {
+            completed.fetch_add(1, Ordering::SeqCst);
+            if *item == 0 {
+                Err(Error::other("expected failure"))
+            } else {
+                Ok(())
+            }
+        })
+        .expect_err("worker failure should be returned");
+
+        assert_eq!(error.to_string(), "expected failure");
+        assert_eq!(completed.load(Ordering::SeqCst), 2);
+    }
+
     #[test]
     fn download_accepts_positional_identifier() {
         let cli = Cli::try_parse_from(["qw", "download", "Qwen/Qwen3.5-0.8B"])
