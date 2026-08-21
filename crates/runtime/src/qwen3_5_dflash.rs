@@ -1490,7 +1490,7 @@ impl Qwen35Dflash2Generator {
             let verify = target.forward_dflash_verify(
                 &verify_input,
                 &self.target_layer_ids,
-                compact_verify && target.has_compact_draft_head(),
+                compact_verify && target.has_compact_dflash_verify_head(),
             );
             stats.target_forward_calls += 1;
             stats.speculative_rounds += 1;
@@ -1498,7 +1498,7 @@ impl Qwen35Dflash2Generator {
             let (walk, draft_tokens) = crate::qwen3_5_mtp::greedy_walk_device_proposals(
                 &out.path,
                 &verify.logits,
-                compact_verify && target.has_compact_draft_head(),
+                compact_verify && target.has_compact_dflash_verify_head(),
                 sampling,
                 &history,
                 remaining,

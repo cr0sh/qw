@@ -85,6 +85,14 @@ fn single_user_throughput(criterion: &mut Criterion) {
     let decode_request = decode_fixture.request;
     let baseline_token_ids = decode_fixture.baseline_token_ids;
     let mtp_token_ids = decode_fixture.mtp_token_ids;
+    let mtp_token_edit_distance = token_edit_distance(&mtp_token_ids, &baseline_token_ids);
+    assert!(
+        mtp_token_edit_distance * 20 <= baseline_token_ids.len(),
+        "MTP token edit distance {mtp_token_edit_distance} exceeds 5% of the baseline"
+    );
+    eprintln!(
+        "MTP_CORRECTNESS token_edit_distance={mtp_token_edit_distance}"
+    );
     let mtp_decode_tokens = generation_elements(1, prompt_tokens, decode_fixture.mtp_decode_tokens)
         .decode as usize;
 
