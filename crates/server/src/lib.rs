@@ -29,7 +29,7 @@ use engine::{
     Admission, CompletionRecord, FailureKind, FinishReason, GeneratedToolCall, WorkerDelta,
     WorkerEvent, WorkerFailure,
 };
-pub use engine::{Engine, SubmitError};
+pub use engine::{Engine, SpecPrefillPolicyConfig, SubmitError};
 use protocol::{Endpoint, RequestError};
 
 #[derive(Clone)]
