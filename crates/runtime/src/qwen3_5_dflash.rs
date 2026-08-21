@@ -1492,13 +1492,15 @@ impl Qwen35Dflash2Generator {
     }
 }
 
-
 /// Concatenate a `[1, L, H]` per-target-layer hidden list along `-1`.
 fn concatenate_hiddens(
     hiddens: &[UniquePtr<MlxArray>],
     prefix_len: usize,
 ) -> UniquePtr<MlxArray> {
-    debug_assert!(!hiddens.is_empty(), "DFlash2 verify must capture hidden states");
+    debug_assert!(
+        !hiddens.is_empty(),
+        "DFlash2 verify must capture hidden states"
+    );
     let prefix = |hidden: &MlxArray| {
         let shape = mlxcel_core::array_shape(hidden);
         mlxcel_core::slice(
