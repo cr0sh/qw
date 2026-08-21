@@ -281,6 +281,7 @@ pub(crate) struct Qwen35MtpVerifyOutput {
     pub(crate) gdn_states: Vec<GdnRollbackSnapshot>,
 }
 
+#[cfg(any(feature = "dflash2", test))]
 /// DFlash2 verify output: the post-layer hidden state at each
 /// `target_layer_ids[i]` (copied before the final norm), the final logits,
 /// and the GDN rollback snapshots. Mirrors the SGLang DFLASH verify forward,
@@ -292,6 +293,7 @@ pub(crate) struct Qwen35DflashVerifyOutput {
     pub(crate) gdn_states: Vec<GdnRollbackSnapshot>,
 }
 
+#[cfg(any(feature = "dflash2", test))]
 /// DFlash2 prefill output: `hidden_concat` is the per-layer captured hidden
 /// states concatenated along the hidden axis `[1, P', K * hidden]`; the
 /// drafter consumes it as its context buffer. `first_logits` is the last
@@ -1275,6 +1277,7 @@ impl Qwen35Model {
         output
     }
 
+    #[cfg(any(feature = "dflash2", test))]
     /// DFlash2 target verify: run the backbone over `input_ids` exactly like
     /// `forward_mtp_verify` but additionally retain the post-layer hidden
     /// handle at each `target_layer_ids[i]`. `target_layer_ids` is a small
@@ -1336,6 +1339,7 @@ impl Qwen35Model {
         output
     }
 
+    #[cfg(any(feature = "dflash2", test))]
     /// DFlash2 prefill: chunked backbone forward that also captures the
     /// post-layer hidden state at each `target_layer_ids[i]`, keeping only the
     /// last `hidden_limit` rows per layer (dropping leading rows once over the

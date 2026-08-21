@@ -3,6 +3,7 @@ mod gated_delta;
 mod model_owned;
 mod model_resolver;
 mod qwen3_5;
+#[cfg(any(feature = "dflash2", test))]
 mod qwen3_5_dflash;
 mod qwen3_5_mtp;
 mod qwen3_next;
@@ -22,10 +23,12 @@ pub use mlxcel_core::cache::KVCacheMode;
 pub use provider::{
     BaselineGeneration, ChatContentPart, ChatContentRef, ChatCustomToolCall, ChatFile,
     ChatImageUrl, ChatInputAudio, ChatMessage, ChatMessageContent, ChatPromptCacheBreakpoint,
-    ChatTool, ChatToolCall, ChatToolCallFunction, ChatToolFunction, Dflash2GenerationStats,
+    ChatTool, ChatToolCall, ChatToolCallFunction, ChatToolFunction,
     GenerationOutput, GenerationRequest, MtpPrefixReuse, MtpPromptSnapshot,
     PreparedMultimodalPrefill, PromptSnapshot, Qwen35Provider,
 };
+#[cfg(any(feature = "dflash2", test))]
+pub use provider::Dflash2GenerationStats;
 pub use model_resolver::{
     DEFAULT_MODEL_IDENTIFIER, model_cache_path, resolve_model_dir, resolve_model_path,
     validate_identifier,

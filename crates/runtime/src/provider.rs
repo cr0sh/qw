@@ -26,6 +26,7 @@ use crate::qwen_vl_processor::{PreparedImage, QwenVLProcessor};
 use crate::qwen3_5::Qwen35Model;
 use crate::qwen3_5_mtp::Qwen35MtpGenerator;
 pub use crate::qwen3_5_mtp::{MtpGenerationStats, MtpPrefixReuse, MtpPromptSnapshot};
+#[cfg(any(feature = "dflash2", test))]
 pub use crate::qwen3_5_dflash::Dflash2GenerationStats;
 
 const DEFAULT_MTP_BLOCK_SIZE: usize = 3;
@@ -159,6 +160,7 @@ pub struct Qwen35Provider {
     defaults: GenerationDefaults,
     generator: CxxGenerator,
     mtp_generator: Option<Qwen35MtpGenerator>,
+    #[cfg(any(feature = "dflash2", test))]
     dflash2_generator: Option<crate::qwen3_5_dflash::Qwen35Dflash2Generator>,
     vision_processor: Option<QwenVLProcessor>,
 }
@@ -232,6 +234,7 @@ impl Qwen35Provider {
             defaults,
             generator,
             mtp_generator,
+            #[cfg(any(feature = "dflash2", test))]
             dflash2_generator: None,
             vision_processor,
         })
@@ -729,6 +732,7 @@ impl Qwen35Provider {
         .map(|(generation, _)| generation)
     }
 
+    #[cfg(any(feature = "dflash2", test))]
     /// Generate with the DFlash2 block-diffusion drafter loaded from
     /// `draft_dir`, decoding deltas through the provider tokenizer.
     ///

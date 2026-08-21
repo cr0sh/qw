@@ -3,6 +3,10 @@ name = "qw-cli"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+dflash2 = ["qw-runtime/dflash2"]
+
 [[bin]]
 name = "qw"
 path = "src/main.rs"

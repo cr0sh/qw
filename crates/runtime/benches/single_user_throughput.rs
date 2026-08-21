@@ -161,6 +161,7 @@ fn single_user_throughput(criterion: &mut Criterion) {
         group.finish();
     }
 
+    #[cfg(feature = "dflash2")]
     // DFlash2 block-diffusion drafter, same deterministic decode fixture.
     // Keep token-level edit distance within 5% of the baseline so model-
     // invasive performance work cannot silently introduce a major regression.
