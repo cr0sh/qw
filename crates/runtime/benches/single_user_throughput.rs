@@ -75,6 +75,7 @@ fn single_user_throughput(criterion: &mut Criterion) {
         min_tokens: 1,
         keep_rate: 0.25,
         protected_prefix_tokens: 0,
+        ..Default::default()
     };
     let specprefill_warmup = provider
         .generate_baseline_streaming(
