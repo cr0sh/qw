@@ -1215,11 +1215,11 @@ impl Qwen35Model {
     }
 
     /// DFlash2 target verify: run the backbone over `input_ids` exactly like
-    /// `forward_mtp_verify` but additionally capture a post-layer hidden copy
-    /// at each `target_layer_ids[i]`. `target_layer_ids` is a small sorted
-    /// slice (5 ids for the Qwen3.8-27B-DFlash2 checkpoint); a linear scan per
-    /// layer is fine. The captured hiddens feed the next draft round's context
-    /// buffer (SGLang `DFLASH` verify captures the same per-layer features).
+    /// `forward_mtp_verify` but additionally retain the post-layer hidden
+    /// handle at each `target_layer_ids[i]`. `target_layer_ids` is a small
+    /// sorted slice (5 ids for the Qwen3.8-27B-DFlash2 checkpoint); a linear
+    /// scan per layer is fine. The captured hiddens feed the next draft
+    /// round's context buffer (SGLang `DFLASH` captures the same features).
     pub(crate) fn forward_dflash_verify(
         &self,
         input_ids: &MlxArray,
@@ -1251,7 +1251,7 @@ impl Qwen35Model {
                     &mut gdn_states,
                 );
                 if target_layer_ids.contains(&layer_idx) {
-                    hidden_by_layer.push(mlxcel_core::copy(&hidden));
+                    hidden_by_layer.push(mlxcel_core::share(&hidden));
                 }
             }
             let logits = self.project_logits(&self.norm.forward(&hidden));

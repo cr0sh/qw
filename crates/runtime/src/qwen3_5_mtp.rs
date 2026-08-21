@@ -925,6 +925,51 @@ pub(crate) fn greedy_walk(
     speculative_walk(draft_tokens, &target_tokens, max_new_tokens)
 }
 
+/// Greedy verification with proposals retained on-device until the target
+/// posterior has been evaluated.
+pub(crate) fn greedy_walk_device_proposals(
+    draft_tokens: &MlxArray,
+    verify_logits: &MlxArray,
+    sampling: &SamplingConfig,
+    committed_history: &[i32],
+    max_new_tokens: usize,
+) -> (WalkResult, Vec<i32>) {
+    let materialize_ids = |array: &MlxArray| {
+        mlxcel_core::eval(array);
+        mlxcel_core::array_evaluated_bytes(array)
+            .chunks_exact(4)
+            .map(|bytes| i32::from_ne_bytes(bytes.try_into().expect("i32 token bytes")))
+            .collect::<Vec<_>>()
+    };
+    let history_independent = sampling.repetition_penalty == 1.0
+        && sampling.dry_multiplier == 0.0
+        && sampling.frequency_penalty == 0.0
+        && sampling.presence_penalty == 0.0
+        && sampling.xtc_probability == 0.0;
+    if !history_independent {
+        let draft_tokens = materialize_ids(draft_tokens);
+        let walk = greedy_walk(
+            &draft_tokens,
+            verify_logits,
+            sampling,
+            committed_history,
+            max_new_tokens,
+        );
+        return (walk, draft_tokens);
+    }
+
+    let biased_logits =
+        mlxcel_core::sampling::apply_token_bias(verify_logits, &sampling.token_bias);
+    let targets = mlxcel_core::argmax_last_axis(&biased_logits);
+    mlxcel_core::async_eval(&targets);
+    let draft_tokens = materialize_ids(draft_tokens);
+    let target_tokens = materialize_ids(&targets);
+    (
+        speculative_walk(&draft_tokens, &target_tokens, max_new_tokens),
+        draft_tokens,
+    )
+}
+
 fn stochastic_walk(
     proposals: &[MtpProposal],
     verify_logits: &MlxArray,

@@ -1404,6 +1404,8 @@ impl Qwen35Dflash2Generator {
             let _ = on_token(bonus);
         }
         let decode_start = Instant::now();
+        let mut draft_block =
+            vec![self.model.config.mask_token_id; self.block_size];
 
         while generated.len() < max_tokens {
             let remaining = max_tokens - generated.len();
@@ -1414,45 +1416,36 @@ impl Qwen35Dflash2Generator {
             let proposal_count = bs - 1;
             let phase_start = Instant::now();
 
-            // Propose a draft block over mask tokens: [bonus, mask, ..., mask].
-            let mut block = Vec::with_capacity(bs);
-            block.push(bonus);
-            block.extend(std::iter::repeat_n(
-                self.model.config.mask_token_id,
-                proposal_count,
-            ));
-            let inputs = mlxcel_core::from_slice_i32(&block, &[1, bs as i32]);
+            // Reuse the host block buffer; only the staged anchor changes.
+            draft_block[0] = bonus;
+            let inputs =
+                mlxcel_core::from_slice_i32(&draft_block[..bs], &[1, bs as i32]);
             let out = self
                 .model
                 .propose(&inputs, &hidden_concat, &mut self.caches, target)?;
-            let draft_tokens = materialize_i32(&out.path);
+            mlxcel_core::async_eval(&out.path);
             stats.draft_time += phase_start.elapsed();
 
             // Verify the block against the target in a single batched forward.
-            let mut verify_tokens = Vec::with_capacity(bs);
-            verify_tokens.push(bonus);
-            verify_tokens.extend_from_slice(&draft_tokens);
-            let verify_input = mlxcel_core::from_slice_i32(
-                &verify_tokens,
-                &[1, i32::try_from(verify_tokens.len()).unwrap_or(i32::MAX)],
-            );
+            // Keep the proposal on-device. This mirrors dflash-mlx's fast
+            // path: target verification consumes the draft array directly,
+            // so draft and verify can be submitted without an intervening
+            // device-to-host synchronization.
+            let bonus_input = mlxcel_core::slice(&inputs, &[0, 0], &[1, 1]);
+            let verify_input = mlxcel_core::concatenate(&bonus_input, &out.path, 1);
             let phase_start = Instant::now();
             let verify = target.forward_dflash_verify(&verify_input, &self.target_layer_ids);
-            mlxcel_core::eval(&verify.logits);
-            stats.target_verify_time += phase_start.elapsed();
             stats.target_forward_calls += 1;
             stats.speculative_rounds += 1;
 
-            // Greedy walk over the verified block.
-            let phase_start = Instant::now();
-            let walk = crate::qwen3_5_mtp::greedy_walk(
-                &draft_tokens,
+            let (walk, draft_tokens) = crate::qwen3_5_mtp::greedy_walk_device_proposals(
+                &out.path,
                 &verify.logits,
                 sampling,
                 &history,
                 remaining,
             );
-            stats.walk_time += phase_start.elapsed();
+            stats.target_verify_time += phase_start.elapsed();
             stats.record_round(walk.accepted, draft_tokens.len());
 
             // Emit the accepted prefix (and possibly a corrected token).
@@ -1469,16 +1462,10 @@ impl Qwen35Dflash2Generator {
                 target.rollback_mtp_verify(&verify.gdn_states, walk.accepted, bs, false);
             }
 
-            // Next context: the target-layer hidden states of the accepted
-            // prefix (the verify captured hiddens for the whole block).
-            let verify_retained = concatenate_hiddens(&verify.hidden_by_layer);
-            let retained_shape = mlxcel_core::array_shape(&verify_retained);
-            let accepted_plus_one = i32::try_from(walk.accepted + 1).unwrap_or(i32::MAX);
-            hidden_concat = mlxcel_core::slice(
-                &verify_retained,
-                &[0, 0, 0],
-                &[retained_shape[0], accepted_plus_one, retained_shape[2]],
-            );
+            // Concatenate only committed rows; rejected verify rows never feed
+            // the next draft round.
+            hidden_concat =
+                concatenate_hiddens(&verify.hidden_by_layer, walk.accepted + 1);
             bonus = *walk
                 .new_tokens
                 .last()
@@ -1505,32 +1492,27 @@ impl Qwen35Dflash2Generator {
     }
 }
 
-/// Materialize a `[1, L]` int32 array into a host `Vec<i32>`.
-fn materialize_i32(array: &MlxArray) -> Vec<i32> {
-    mlxcel_core::eval(array);
-    let shape = mlxcel_core::array_shape(array);
-    let total = shape[0] * shape[1];
-    let mut out = Vec::with_capacity(total as usize);
-    for i in 0..total {
-        let pos = mlxcel_core::slice(
-            array,
-            &[(i / shape[1]) as i32, (i % shape[1]) as i32],
-            &[(i / shape[1]) as i32 + 1, (i % shape[1]) as i32 + 1],
-        );
-        out.push(mlxcel_core::item_i32(&pos));
-    }
-    out
-}
-
 /// Concatenate a `[1, L, H]` per-target-layer hidden list along `-1`.
-fn concatenate_hiddens(hiddens: &[UniquePtr<MlxArray>]) -> UniquePtr<MlxArray> {
-    let n = hiddens.len();
-    debug_assert!(n > 0, "DFlash2 verify must capture hidden states");
-    // Concatenate along the last (hidden) axis, mirroring the SGLang target
-    // feature capture (`extract_context_feature`).
-    let mut acc = mlxcel_core::copy(hiddens[0].as_ref().expect("captured hidden"));
-    for hid in &hiddens[1..] {
-        acc = concatenate(&acc, hid.as_ref().expect("captured hidden"), -1);
+fn concatenate_hiddens(
+    hiddens: &[UniquePtr<MlxArray>],
+    prefix_len: usize,
+) -> UniquePtr<MlxArray> {
+    debug_assert!(
+        !hiddens.is_empty(),
+        "DFlash2 verify must capture hidden states"
+    );
+    let prefix = |hidden: &MlxArray| {
+        let shape = mlxcel_core::array_shape(hidden);
+        mlxcel_core::slice(
+            hidden,
+            &[0, 0, 0],
+            &[shape[0], prefix_len as i32, shape[2]],
+        )
+    };
+    let mut acc = prefix(hiddens[0].as_ref().expect("captured hidden"));
+    for hidden in &hiddens[1..] {
+        let hidden = prefix(hidden.as_ref().expect("captured hidden"));
+        acc = concatenate(&acc, &hidden, -1);
     }
     acc
 }
