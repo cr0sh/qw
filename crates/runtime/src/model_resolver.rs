@@ -6,6 +6,8 @@ use anyhow::{Result, bail};
 /// and the runtime benchmarks use when neither `--model` nor `QW_MODEL_PATH`
 /// is given. Users override the *path* to a checkpoint, never this identifier.
 pub const DEFAULT_MODEL_IDENTIFIER: &str = "Jundot/Qwen3.8-27B-oQ4e-fp16-mtp";
+pub const DEFAULT_SPECPREFILL_DRAFT_MODEL_IDENTIFIER: &str =
+    "mlx-community/Qwen3.5-0.8B-MLX-8bit";
 
 /// Split a Hugging Face model identifier into the namespace and model
 /// components that form the cache subdirectory. Rejects identifiers that could
@@ -67,9 +69,39 @@ pub fn resolve_model_path(cli_override: Option<&Path>) -> Result<PathBuf> {
     resolve_model_dir(cli_override, env_override.as_deref(), home.as_deref())
 }
 
+fn resolve_specprefill_draft_dir(
+    cli_override: Option<&Path>,
+    env_override: Option<&Path>,
+    home: Option<&Path>,
+) -> Result<PathBuf> {
+    if let Some(path) = cli_override {
+        return Ok(path.to_path_buf());
+    }
+    if let Some(path) = env_override {
+        return Ok(path.to_path_buf());
+    }
+    let Some(home) = home else {
+        bail!("HOME is not set");
+    };
+    model_cache_path(home, DEFAULT_SPECPREFILL_DRAFT_MODEL_IDENTIFIER)
+}
+
+pub fn resolve_specprefill_draft_path(cli_override: Option<&Path>) -> Result<PathBuf> {
+    let env_override = std::env::var_os("QW_SPECPREFILL_DRAFT_MODEL_PATH")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let home = std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    resolve_specprefill_draft_dir(cli_override, env_override.as_deref(), home.as_deref())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_MODEL_IDENTIFIER, model_cache_path, resolve_model_dir};
+    use super::{
+        DEFAULT_MODEL_IDENTIFIER, DEFAULT_SPECPREFILL_DRAFT_MODEL_IDENTIFIER, model_cache_path,
+        resolve_model_dir, resolve_specprefill_draft_dir,
+    };
     use std::path::Path;
 
     #[test]
@@ -136,6 +168,37 @@ mod tests {
             model_cache_path(Path::new("/home/user"), DEFAULT_MODEL_IDENTIFIER)
                 .expect("default identifier is valid"),
             Path::new("/home/user/.cache/qw/models/Jundot/Qwen3.8-27B-oQ4e-fp16-mtp")
+        );
+    }
+
+    #[test]
+    fn specprefill_draft_default_path_and_precedence() {
+        assert_eq!(
+            resolve_specprefill_draft_dir(
+                Some(Path::new("/cli-draft")),
+                Some(Path::new("/env-draft")),
+                Some(Path::new("/home")),
+            )
+            .expect("explicit override"),
+            Path::new("/cli-draft")
+        );
+        assert_eq!(
+            resolve_specprefill_draft_dir(
+                None,
+                Some(Path::new("/env-draft")),
+                Some(Path::new("/home")),
+            )
+            .expect("environment override"),
+            Path::new("/env-draft")
+        );
+        assert_eq!(
+            resolve_specprefill_draft_dir(None, None, Some(Path::new("/home")))
+                .expect("default draft cache"),
+            model_cache_path(
+                Path::new("/home"),
+                DEFAULT_SPECPREFILL_DRAFT_MODEL_IDENTIFIER,
+            )
+            .expect("valid pinned identifier")
         );
     }
 }

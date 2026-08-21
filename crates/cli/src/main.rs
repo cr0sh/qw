@@ -7,7 +7,10 @@ use std::thread;
 
 use clap::Parser as _;
 use clap_derive::{Args, Parser, Subcommand};
-use qw_runtime::{GenerationRequest, KVCacheMode, Qwen35Provider, model_cache_path, validate_identifier};
+use qw_runtime::{
+    DEFAULT_SPECPREFILL_DRAFT_MODEL_IDENTIFIER, GenerationRequest, KVCacheMode, Qwen35Provider,
+    model_cache_path, validate_identifier,
+};
 use qw_server::serve;
 
 #[derive(Debug, Parser)]
@@ -199,7 +202,7 @@ fn download_sibling(identifier: &str, job: &DownloadJob) -> Result<(), Error> {
     std::fs::rename(&job.partial_path, &job.file_path)
 }
 
-fn download_model(identifier: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn download_snapshot(identifier: &str) -> Result<(), Box<dyn std::error::Error>> {
     validate_identifier(identifier)?;
     let home = std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
@@ -276,6 +279,22 @@ fn download_model(identifier: &str) -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     eprintln!("Downloaded {identifier} to {}", destination.display());
+    Ok(())
+}
+
+fn download_identifiers(requested: &str) -> Vec<&str> {
+    if requested == DEFAULT_SPECPREFILL_DRAFT_MODEL_IDENTIFIER {
+        vec![requested]
+    } else {
+        vec![requested, DEFAULT_SPECPREFILL_DRAFT_MODEL_IDENTIFIER]
+    }
+}
+
+fn download_model(identifier: &str) -> Result<(), Box<dyn std::error::Error>> {
+    validate_identifier(identifier)?;
+    for identifier in download_identifiers(identifier) {
+        download_snapshot(identifier)?;
+    }
     Ok(())
 }
 
@@ -377,6 +396,25 @@ mod tests {
         assert_eq!(args.identifier, "Qwen/Qwen3.5-0.8B");
     }
 
+
+    #[test]
+    fn download_orders_target_before_specprefill_draft() {
+        assert_eq!(
+            download_identifiers("Qwen/target"),
+            vec![
+                "Qwen/target",
+                DEFAULT_SPECPREFILL_DRAFT_MODEL_IDENTIFIER,
+            ]
+        );
+    }
+
+    #[test]
+    fn download_deduplicates_requested_specprefill_draft() {
+        assert_eq!(
+            download_identifiers(DEFAULT_SPECPREFILL_DRAFT_MODEL_IDENTIFIER),
+            vec![DEFAULT_SPECPREFILL_DRAFT_MODEL_IDENTIFIER]
+        );
+    }
     #[test]
     fn sibling_paths_cannot_escape_destination() {
         let destination = Path::new("/home/user/.cache/qw/models/Qwen/model");

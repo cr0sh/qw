@@ -31,8 +31,8 @@ pub use provider::{
 #[cfg(any(feature = "dflash2", test))]
 pub use provider::Dflash2GenerationStats;
 pub use model_resolver::{
-    DEFAULT_MODEL_IDENTIFIER, model_cache_path, resolve_model_dir, resolve_model_path,
-    validate_identifier,
+    DEFAULT_MODEL_IDENTIFIER, DEFAULT_SPECPREFILL_DRAFT_MODEL_IDENTIFIER, model_cache_path,
+    resolve_model_dir, resolve_model_path, resolve_specprefill_draft_path, validate_identifier,
 };
 pub use specprefill::{
     PrefillMode, SPECPREFILL_DRAFT_MODEL_IDENTIFIER, SpecPrefillConfig, SpecPrefillStats,

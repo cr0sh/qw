@@ -360,9 +360,17 @@ struct GenerationDefaults {
 }
 
 impl Qwen35Provider {
-    #[tracing::instrument(name = "runtime.model_load", skip(model_dir), err)]
     pub fn load(model_dir: impl AsRef<Path>, kv_cache_mode: KVCacheMode) -> Result<Self> {
-        Self::load_target_only(model_dir.as_ref(), kv_cache_mode)
+        let draft_model_dir = crate::resolve_specprefill_draft_path(None)?;
+        Self::load_with_specprefill_draft(model_dir, &draft_model_dir, kv_cache_mode).with_context(
+            || {
+                format!(
+                    "failed to load required SpecPrefill draft at {}; rerun `qw download {}`",
+                    draft_model_dir.display(),
+                    crate::DEFAULT_MODEL_IDENTIFIER
+                )
+            },
+        )
     }
     
     fn load_target_only(model_dir: &Path, kv_cache_mode: KVCacheMode) -> Result<Self> {
@@ -1613,7 +1621,7 @@ mod tests {
         std::fs::write(fixture.0.join("tokenizer_config.json"), b"{}")
             .expect("write tokenizer config");
 
-        let error = match Qwen35Provider::load(&fixture.0, KVCacheMode::Fp16) {
+        let error = match Qwen35Provider::load_target_only(&fixture.0, KVCacheMode::Fp16) {
             Ok(_) => panic!("provider load must reject an absent chat template"),
             Err(error) => error.to_string(),
         };
