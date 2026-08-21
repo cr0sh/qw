@@ -1222,6 +1222,14 @@ impl Qwen35Model {
     }
 
     pub(crate) fn forward_mtp_verify(&self, input_ids: &MlxArray) -> Qwen35MtpVerifyOutput {
+        self.forward_mtp_verify_with_compact(input_ids, false)
+    }
+
+    pub(crate) fn forward_mtp_verify_with_compact(
+        &self,
+        input_ids: &MlxArray,
+        compact_logits: bool,
+    ) -> Qwen35MtpVerifyOutput {
         let input_len = mlxcel_core::array_shape(input_ids)[1];
         let projected = self.sequence_state.with_internal(|caches| {
             caches.first().map(Qwen3NextCache::offset).unwrap_or(0) + input_len
@@ -1247,7 +1255,12 @@ impl Qwen35Model {
                     &mut gdn_states,
                 );
             }
-            let logits = self.project_logits(&self.norm.forward(&hidden));
+            let normalized = self.norm.forward(&hidden);
+            let logits = if compact_logits {
+                self.project_dflash_verify_logits(&normalized)
+            } else {
+                self.project_logits(&normalized)
+            };
             let offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
             (
                 Qwen35MtpVerifyOutput {
