@@ -11,8 +11,11 @@ use qw_prefix_cache::{
     SnapshotRoute as CacheSnapshotRoute, namespace_hash,
 };
 #[cfg(test)]
-use qw_runtime::{ChatContentRef, ChatMessage};
-use qw_runtime::{KVCacheMode, MtpPrefixReuse, PrefillMode, PromptSnapshot, Qwen35Provider};
+use qw_runtime::ChatContentRef;
+use qw_runtime::{
+    ChatMessage, KVCacheMode, MtpPrefixReuse, PrefillMode, PromptSnapshot, Qwen35Provider,
+    SpecPrefillConfig,
+};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{Span, error, info, info_span, warn};
@@ -29,6 +32,82 @@ use crate::tool_calls::{ToolCallGate, parse_assistant_output};
 const JOB_QUEUE_CAPACITY: usize = 8;
 const EVENT_QUEUE_CAPACITY: usize = 32;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpecPrefillPolicyConfig {
+    pub min_turn_tokens: usize,
+    pub keep_rate: f32,
+    pub keep_first_tokens: usize,
+    pub keep_last_tokens: usize,
+}
+
+impl Default for SpecPrefillPolicyConfig {
+    fn default() -> Self {
+        Self {
+            min_turn_tokens: 8_000,
+            keep_rate: 0.25,
+            keep_first_tokens: 256,
+            keep_last_tokens: 256,
+        }
+    }
+}
+
+impl SpecPrefillPolicyConfig {
+    pub(crate) fn validate(self) -> Result<()> {
+        ensure!(
+            self.min_turn_tokens > 0,
+            "--specprefill-min-turn-tokens must be greater than zero"
+        );
+        ensure!(
+            self.keep_rate.is_finite() && self.keep_rate > 0.0 && self.keep_rate <= 1.0,
+            "--specprefill-keep-rate must be in (0, 1]"
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CurrentTurnPolicy {
+    current_turn_tokens: Option<usize>,
+    prefill_mode: PrefillMode,
+}
+
+fn messages_before_latest_user(messages: &[ChatMessage]) -> Option<&[ChatMessage]> {
+    let latest_user = messages.iter().rposition(|message| message.role == "user")?;
+    messages[..latest_user]
+        .iter()
+        .any(|message| message.role == "user")
+        .then_some(&messages[..latest_user])
+}
+
+fn current_turn_policy(
+    prompt_ids: &[i32],
+    preceding_ids: Option<&[i32]>,
+    specprefill_allowed: bool,
+    config: SpecPrefillPolicyConfig,
+) -> CurrentTurnPolicy {
+    let Some(preceding_ids) = preceding_ids.filter(|ids| prompt_ids.starts_with(ids)) else {
+        return CurrentTurnPolicy {
+            current_turn_tokens: None,
+            prefill_mode: PrefillMode::Dense,
+        };
+    };
+    let current_turn_tokens = prompt_ids.len() - preceding_ids.len();
+    let prefill_mode = if specprefill_allowed && current_turn_tokens > config.min_turn_tokens {
+        PrefillMode::SpecPrefill(SpecPrefillConfig {
+            min_tokens: config.min_turn_tokens,
+            keep_rate: config.keep_rate,
+            protected_prefix_tokens: preceding_ids.len(),
+            keep_first_tokens: config.keep_first_tokens,
+            keep_last_tokens: config.keep_last_tokens,
+        })
+    } else {
+        PrefillMode::Dense
+    };
+    CurrentTurnPolicy {
+        current_turn_tokens: Some(current_turn_tokens),
+        prefill_mode,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QwenGenerationRoute {
@@ -41,13 +120,17 @@ enum QwenGenerationRoute {
 fn qwen_generation_route(
     has_mtp: bool,
     has_images: bool,
-    _has_constraint: bool,
+    use_specprefill: bool,
 ) -> QwenGenerationRoute {
-    match (has_mtp, has_images) {
-        (true, false) => QwenGenerationRoute::MtpText,
-        (true, true) => QwenGenerationRoute::MtpMultimodal,
-        (false, false) => QwenGenerationRoute::BaselineText,
-        (false, true) => QwenGenerationRoute::BaselineMultimodal,
+    if use_specprefill && !has_images {
+        QwenGenerationRoute::BaselineText
+    } else {
+        match (has_mtp, has_images) {
+            (true, false) => QwenGenerationRoute::MtpText,
+            (true, true) => QwenGenerationRoute::MtpMultimodal,
+            (false, false) => QwenGenerationRoute::BaselineText,
+            (false, true) => QwenGenerationRoute::BaselineMultimodal,
+        }
     }
 }
 
@@ -428,15 +511,23 @@ impl Engine {
         cache_config: CacheConfig,
         mtp_k: usize,
         kv_cache_mode: KVCacheMode,
+        specprefill_policy: SpecPrefillPolicyConfig,
     ) -> Result<Self> {
         cache_config.validate().map_err(anyhow::Error::msg)?;
         validate_mtp_k(mtp_k)?;
+        specprefill_policy.validate()?;
         let (jobs_tx, jobs_rx) = mpsc::channel(JOB_QUEUE_CAPACITY);
         let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
         thread::Builder::new()
             .name("qw-generation".to_string())
             .spawn(move || {
-                match QwenWorker::load(&model_path, cache_config, mtp_k, kv_cache_mode) {
+                match QwenWorker::load(
+                    &model_path,
+                    cache_config,
+                    mtp_k,
+                    kv_cache_mode,
+                    specprefill_policy,
+                ) {
                     Ok(mut worker) => {
                         let supports_image_inputs = worker.provider.supports_image_inputs();
                         let _ = ready_tx.send(Ok(supports_image_inputs));
@@ -849,6 +940,7 @@ pub enum SubmitError {
 }
 
 struct QwenWorker {
+    specprefill_policy: SpecPrefillPolicyConfig,
     provider: Qwen35Provider,
     grammar: GrammarFactory,
     prefix_cache: AdaptivePrefixCache,
@@ -861,8 +953,10 @@ impl QwenWorker {
         cache_config: CacheConfig,
         mtp_k: usize,
         kv_cache_mode: KVCacheMode,
+        specprefill_policy: SpecPrefillPolicyConfig,
     ) -> Result<Self> {
         validate_mtp_k(mtp_k)?;
+        specprefill_policy.validate()?;
         let provider = Qwen35Provider::load(model_path, kv_cache_mode)?;
         ensure!(
             provider.supports_qwen35_tool_calls(),
@@ -919,6 +1013,7 @@ impl QwenWorker {
             AdaptivePrefixCache::new(namespaces, cache_config).map_err(anyhow::Error::msg)?;
         Ok(Self {
             provider,
+            specprefill_policy,
             grammar,
             prefix_cache,
             mtp_k,
@@ -1035,6 +1130,43 @@ impl QwenWorker {
                 }
             }
         };
+        let preceding_ids = if has_images {
+            None
+        } else if let Some(messages) = messages_before_latest_user(&job.request.messages) {
+            match self.provider.tokenize_history(
+                messages,
+                effective_tools,
+                reasoning_effort,
+                enable_thinking,
+            ) {
+                Ok(ids) => Some(ids),
+                Err(error) => {
+                    warn!(phase = "specprefill.policy", error = %error);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let specprefill_policy = current_turn_policy(
+            &prompt_ids,
+            preceding_ids.as_deref(),
+            !has_images
+                && constraint.is_none()
+                && job.request.resume_response_id.is_none(),
+            self.specprefill_policy,
+        );
+        let specprefill_active = matches!(
+            specprefill_policy.prefill_mode,
+            PrefillMode::SpecPrefill(_)
+        );
+        info!(
+            phase = "specprefill.policy",
+            current_turn_tokens = specprefill_policy.current_turn_tokens.unwrap_or(0),
+            current_turn_boundary_valid = specprefill_policy.current_turn_tokens.is_some(),
+            prefill_mode = ?specprefill_policy.prefill_mode,
+            specprefill_active,
+        );
         let mut checkpoint_token_lengths = Vec::new();
         if !has_images {
             match self.provider.tokenize_history(
@@ -1076,7 +1208,7 @@ impl QwenWorker {
         );
         let mtp_available =
             self.provider.has_mtp() && std::env::var_os("QW_BENCH_DISABLE_MTP").is_none();
-        let route = qwen_generation_route(mtp_available, has_images, constraint.is_some());
+        let route = qwen_generation_route(mtp_available, has_images, specprefill_active);
         let cache_route = cache_snapshot_route(route);
         if job.request.resume_response_id.is_some() && cache_route.is_none() {
             send_failure(
@@ -1323,7 +1455,7 @@ impl QwenWorker {
                     .as_mut()
                     .map(|value| value as &mut dyn mlxcel_core::generate::TokenConstraint),
                 &checkpoint_token_lengths,
-                PrefillMode::Dense,
+                specprefill_policy.prefill_mode,
                 &mut emit_delta,
             ),
         };
@@ -1775,28 +1907,152 @@ mod tests {
         assert_eq!(parsed.tool_calls[0].name, "weather");
     }
 
+    fn message(role: &str) -> ChatMessage {
+        ChatMessage {
+            role: role.to_string(),
+            name: None,
+            content: None,
+            reasoning_content: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }
+    }
+
     #[test]
-    fn mtp_routing_matrix_includes_constrained_capable_requests() {
+    fn first_conversational_user_has_no_specprefill_boundary() {
+        assert!(messages_before_latest_user(&[message("user")]).is_none());
+        assert!(
+            messages_before_latest_user(&[message("system"), message("user")]).is_none()
+        );
+        assert_eq!(
+            current_turn_policy(&[1, 2, 3], None, true, Default::default()).prefill_mode,
+            PrefillMode::Dense
+        );
+    }
+
+    #[test]
+    fn current_turn_threshold_is_strict_and_protects_the_boundary() {
+        let preceding_ids = vec![11, 12, 13];
+        let mut prompt_ids = preceding_ids.clone();
+        prompt_ids.resize(preceding_ids.len() + 8_000, 20);
+        let at_threshold = current_turn_policy(
+            &prompt_ids,
+            Some(&preceding_ids),
+            true,
+            Default::default(),
+        );
+        assert_eq!(at_threshold.current_turn_tokens, Some(8_000));
+        assert_eq!(at_threshold.prefill_mode, PrefillMode::Dense);
+
+        prompt_ids.push(21);
+        let over_threshold = current_turn_policy(
+            &prompt_ids,
+            Some(&preceding_ids),
+            true,
+            Default::default(),
+        );
+        assert_eq!(over_threshold.current_turn_tokens, Some(8_001));
+        assert_eq!(
+            over_threshold.prefill_mode,
+            PrefillMode::SpecPrefill(SpecPrefillConfig {
+                min_tokens: 8_000,
+                keep_rate: 0.25,
+                protected_prefix_tokens: 3,
+                keep_first_tokens: 256,
+                keep_last_tokens: 256,
+            })
+        );
+    }
+
+    #[test]
+    fn messages_after_latest_user_belong_to_the_current_turn() {
+        let messages = [
+            message("user"),
+            message("assistant"),
+            message("user"),
+            message("assistant"),
+            message("tool"),
+        ];
+        let preceding_messages =
+            messages_before_latest_user(&messages).expect("second user has prior history");
+        assert_eq!(preceding_messages.len(), 2);
+
+        let config = SpecPrefillPolicyConfig {
+            min_turn_tokens: 8,
+            ..Default::default()
+        };
+        let policy = current_turn_policy(
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+            Some(&[1, 2]),
+            true,
+            config,
+        );
+        assert_eq!(policy.current_turn_tokens, Some(9));
+        assert!(matches!(
+            policy.prefill_mode,
+            PrefillMode::SpecPrefill(_)
+        ));
+    }
+
+    #[test]
+    fn invalid_boundary_or_ineligible_route_stays_dense() {
+        let config = SpecPrefillPolicyConfig {
+            min_turn_tokens: 1,
+            ..Default::default()
+        };
+        for preceding in [vec![9, 9], vec![1, 2, 3, 4]] {
+            let policy = current_turn_policy(&[1, 2, 3], Some(&preceding), true, config);
+            assert_eq!(policy.current_turn_tokens, None);
+            assert_eq!(policy.prefill_mode, PrefillMode::Dense);
+        }
+        let disallowed = current_turn_policy(&[1, 2, 3], Some(&[1]), false, config);
+        assert_eq!(disallowed.current_turn_tokens, Some(2));
+        assert_eq!(disallowed.prefill_mode, PrefillMode::Dense);
+    }
+
+    #[test]
+    fn configured_policy_values_flow_to_runtime_config() {
+        let config = SpecPrefillPolicyConfig {
+            min_turn_tokens: 2,
+            keep_rate: 0.4,
+            keep_first_tokens: 0,
+            keep_last_tokens: 64,
+        };
+        let policy = current_turn_policy(&[1, 2, 3, 4], Some(&[1]), true, config);
+        assert_eq!(
+            policy.prefill_mode,
+            PrefillMode::SpecPrefill(SpecPrefillConfig {
+                min_tokens: 2,
+                keep_rate: 0.4,
+                protected_prefix_tokens: 1,
+                keep_first_tokens: 0,
+                keep_last_tokens: 64,
+            })
+        );
+    }
+
+    #[test]
+    fn dense_routing_matrix_is_unchanged() {
         for has_mtp in [false, true] {
             for has_images in [false, true] {
-                for constrained in [false, true] {
-                    for temperature in [0.0f32, 0.7] {
-                        let route = qwen_generation_route(has_mtp, has_images, constrained);
-                        let expected = match (has_mtp, has_images) {
-                            (true, false) => QwenGenerationRoute::MtpText,
-                            (true, true) => QwenGenerationRoute::MtpMultimodal,
-                            (false, false) => QwenGenerationRoute::BaselineText,
-                            (false, true) => QwenGenerationRoute::BaselineMultimodal,
-                        };
-                        assert_eq!(
-                            route, expected,
-                            "has_mtp={has_mtp} has_images={has_images} \
-                             constrained={constrained} temperature={temperature}"
-                        );
-                    }
-                }
+                let route = qwen_generation_route(has_mtp, has_images, false);
+                let expected = match (has_mtp, has_images) {
+                    (true, false) => QwenGenerationRoute::MtpText,
+                    (true, true) => QwenGenerationRoute::MtpMultimodal,
+                    (false, false) => QwenGenerationRoute::BaselineText,
+                    (false, true) => QwenGenerationRoute::BaselineMultimodal,
+                };
+                assert_eq!(route, expected, "has_mtp={has_mtp} has_images={has_images}");
             }
         }
+        assert_eq!(
+            qwen_generation_route(true, false, true),
+            QwenGenerationRoute::BaselineText
+        );
+        assert_eq!(
+            qwen_generation_route(true, true, true),
+            QwenGenerationRoute::MtpMultimodal
+        );
     }
 
     #[test]
@@ -1819,6 +2075,37 @@ mod tests {
             qwen_generation_route(true, true, false),
             QwenGenerationRoute::BaselineText
         );
+    }
+
+    #[test]
+    fn specprefill_policy_validation_accepts_zero_edges_and_rejects_invalid_admission() {
+        assert!(
+            SpecPrefillPolicyConfig {
+                keep_first_tokens: 0,
+                keep_last_tokens: 0,
+                ..Default::default()
+            }
+            .validate()
+            .is_ok()
+        );
+        assert!(
+            SpecPrefillPolicyConfig {
+                min_turn_tokens: 0,
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+        for keep_rate in [0.0, 1.01, f32::NAN] {
+            assert!(
+                SpecPrefillPolicyConfig {
+                    keep_rate,
+                    ..Default::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
     }
 
     #[test]

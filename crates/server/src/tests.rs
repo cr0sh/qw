@@ -452,6 +452,7 @@ async fn real_responses_sse_latency_stays_bounded_across_cold_fork_and_continuat
         },
         3,
         KVCacheMode::Turbo4,
+        SpecPrefillPolicyConfig::default(),
     )
     .expect("start real Qwen engine");
     let app = router(engine);

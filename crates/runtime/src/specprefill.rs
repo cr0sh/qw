@@ -21,13 +21,14 @@ pub const SPECPREFILL_DRAFT_MODEL_IDENTIFIER: &str =
 const LOOKAHEAD_TOKENS: usize = 8;
 const POOL_WIDTH: i32 = 13;
 const CHUNK_TOKENS: usize = 32;
-const MANDATORY_TAIL_TOKENS: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SpecPrefillConfig {
     pub min_tokens: usize,
     pub keep_rate: f32,
     pub protected_prefix_tokens: usize,
+    pub keep_first_tokens: usize,
+    pub keep_last_tokens: usize,
 }
 
 impl Default for SpecPrefillConfig {
@@ -36,6 +37,8 @@ impl Default for SpecPrefillConfig {
             min_tokens: 8192,
             keep_rate: 0.25,
             protected_prefix_tokens: 0,
+            keep_first_tokens: 256,
+            keep_last_tokens: 256,
         }
     }
 }
@@ -203,14 +206,14 @@ pub(crate) fn select_target_indices(
     importance: &[f32],
     eligible_start: usize,
     prompt_len: usize,
-    keep_rate: f32,
+    config: SpecPrefillConfig,
 ) -> Vec<usize> {
     debug_assert_eq!(importance.len(), prompt_len - eligible_start);
-    if keep_rate >= 1.0 {
+    if config.keep_rate >= 1.0 {
         return (eligible_start..prompt_len).collect();
     }
     let chunk_count = importance.len().div_ceil(CHUNK_TOKENS);
-    let keep_chunks = ((chunk_count as f32) * keep_rate).ceil() as usize;
+    let keep_chunks = ((chunk_count as f32) * config.keep_rate).ceil() as usize;
     let mut ranked = (0..chunk_count)
         .map(|chunk| {
             let start = chunk * CHUNK_TOKENS;
@@ -231,8 +234,10 @@ pub(crate) fn select_target_indices(
         let end = (start + CHUNK_TOKENS).min(importance.len());
         selected[start..end].fill(true);
     }
-    let tail_start = importance.len().saturating_sub(MANDATORY_TAIL_TOKENS);
-    selected[tail_start..].fill(true);
+    let prefix_end = importance.len().min(config.keep_first_tokens);
+    selected[..prefix_end].fill(true);
+    let suffix_start = importance.len().saturating_sub(config.keep_last_tokens);
+    selected[suffix_start..].fill(true);
     selected
         .into_iter()
         .enumerate()
@@ -247,11 +252,21 @@ mod tests {
     #[test]
     fn specprefill_config_validation() {
         assert_eq!(SpecPrefillConfig::default().keep_rate, 0.25);
+        assert_eq!(SpecPrefillConfig::default().keep_first_tokens, 256);
+        assert_eq!(SpecPrefillConfig::default().keep_last_tokens, 256);
         assert!(SpecPrefillConfig { min_tokens: 0, ..Default::default() }.validate(10).is_err());
         assert!(SpecPrefillConfig { keep_rate: 0.0, ..Default::default() }.validate(10).is_err());
         assert!(SpecPrefillConfig { keep_rate: 1.01, ..Default::default() }.validate(10).is_err());
         assert!(SpecPrefillConfig { protected_prefix_tokens: 11, ..Default::default() }.validate(10).is_err());
-        assert!(SpecPrefillConfig { min_tokens: 1, keep_rate: 1.0, protected_prefix_tokens: 10 }.validate(10).is_ok());
+        assert!(SpecPrefillConfig {
+            min_tokens: 1,
+            keep_rate: 1.0,
+            protected_prefix_tokens: 10,
+            keep_first_tokens: 0,
+            keep_last_tokens: 0,
+        }
+        .validate(10)
+        .is_ok());
     }
 
     #[test]
@@ -268,28 +283,70 @@ mod tests {
         assert_eq!(dense_prefix_end(60, config), 60);
     }
 
-    #[test]
-    fn partial_final_chunk_and_tail_are_selected() {
-        let importance = (0..545).map(|index| index as f32).collect::<Vec<_>>();
-        let selected = select_target_indices(&importance, 10, 555, 0.01);
-        assert_eq!(selected.first(), Some(&(555 - MANDATORY_TAIL_TOKENS)));
-        assert_eq!(selected.last(), Some(&554));
-        assert_eq!(selected.len(), MANDATORY_TAIL_TOKENS);
-        assert!(!selected.contains(&(555 - MANDATORY_TAIL_TOKENS - 1)));
+    fn selection_config(keep_rate: f32) -> SpecPrefillConfig {
+        SpecPrefillConfig {
+            keep_rate,
+            ..Default::default()
+        }
     }
 
     #[test]
-    fn mandatory_tail_can_exceed_nominal_budget_and_is_sorted_unique() {
+    fn mandatory_disjoint_ends_are_selected_exactly() {
         let importance = vec![0.0; 1024];
-        let selected = select_target_indices(&importance, 7, 1031, 0.01);
-        assert!(selected.len() >= MANDATORY_TAIL_TOKENS);
+        let selected =
+            select_target_indices(&importance, 7, 1031, selection_config(0.01));
+        let expected = (7..263).chain(775..1031).collect::<Vec<_>>();
+        assert_eq!(selected, expected);
+    }
+
+    #[test]
+    fn overlapping_mandatory_ends_select_every_token_once() {
+        let selected =
+            select_target_indices(&vec![0.0; 400], 10, 410, selection_config(0.01));
+        assert_eq!(selected, (10..410).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn partial_ranked_chunk_joins_mandatory_ends() {
+        let mut importance = vec![0.0; 525];
+        importance[256..288].fill(1.0);
+        let selected =
+            select_target_indices(&importance, 5, 530, selection_config(0.01));
+        assert_eq!(selected, (5..530).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn mandatory_ends_can_exceed_budget_and_are_sorted_unique() {
+        let mut importance = vec![0.0; 1024];
+        importance[512..544].fill(1.0);
+        let selected =
+            select_target_indices(&importance, 7, 1031, selection_config(0.01));
+        assert_eq!(selected.len(), 2 * 256 + CHUNK_TOKENS);
         assert!(selected.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(selected.first(), Some(&7));
         assert_eq!(selected.last(), Some(&1030));
+        assert!(selected.contains(&(7 + 512)));
+    }
+
+    #[test]
+    fn zero_edge_counts_disable_mandatory_selection() {
+        let mut importance = vec![0.0; 1024];
+        importance[512..544].fill(1.0);
+        let config = SpecPrefillConfig {
+            keep_first_tokens: 0,
+            keep_last_tokens: 0,
+            ..selection_config(0.01)
+        };
+        assert_eq!(
+            select_target_indices(&importance, 7, 1031, config),
+            (519..551).collect::<Vec<_>>()
+        );
     }
 
     #[test]
     fn complete_keep_rate_selects_every_eligible_token() {
-        let selected = select_target_indices(&vec![0.0; 65], 35, 100, 1.0);
+        let selected =
+            select_target_indices(&vec![0.0; 65], 35, 100, selection_config(1.0));
         assert_eq!(selected, (35..100).collect::<Vec<_>>());
     }
 }

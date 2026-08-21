@@ -105,6 +105,7 @@ fn main() -> Result<()> {
             min_tokens: 5_000,
             keep_rate: 0.30,
             protected_prefix_tokens,
+            ..Default::default()
         }),
         |_| true,
     )?;

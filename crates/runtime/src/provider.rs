@@ -116,7 +116,7 @@ fn generate_specprefill_tokens<F: FnMut(i32) -> bool>(
     let importance = score_tokens(draft, eligible)?;
     let draft_scoring_time = scoring_start.elapsed();
     mlxcel_core::clear_memory_cache();
-    let selected = select_target_indices(&importance, dense_end, prompt_ids.len(), config.keep_rate);
+    let selected = select_target_indices(&importance, dense_end, prompt_ids.len(), config);
 
     let target_start = Instant::now();
     let (mut logits, cached_tokens) = model
@@ -1746,6 +1746,7 @@ mod tests {
                     min_tokens: 512,
                     keep_rate: 0.30,
                     protected_prefix_tokens: 0,
+                    ..Default::default()
                 }),
                 |_| true,
             )

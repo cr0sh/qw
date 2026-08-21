@@ -7,7 +7,7 @@ use qw_prefix_cache::CacheConfig;
 use qw_runtime::{KVCacheMode, resolve_model_path};
 use tracing::info;
 
-use crate::{Engine, router};
+use crate::{Engine, SpecPrefillPolicyConfig, router};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum OutputFormat {
@@ -44,6 +44,19 @@ pub struct ServerArgs {
     /// MTP verify input block size (bonus token plus proposals).
     #[arg(long = "mtp-k", default_value_t = 3)]
     mtp_k: usize,
+
+    /// Current-turn token threshold above which SpecPrefill activates.
+    #[arg(long, default_value_t = 8_000)]
+    specprefill_min_turn_tokens: usize,
+    /// Fraction of score-ranked prompt chunks retained by SpecPrefill.
+    #[arg(long, default_value_t = 0.25)]
+    specprefill_keep_rate: f32,
+    /// Tokens force-kept at the start of the SpecPrefill-eligible suffix.
+    #[arg(long, default_value_t = 256)]
+    specprefill_keep_first_tokens: usize,
+    /// Tokens force-kept at the end of the SpecPrefill-eligible suffix.
+    #[arg(long, default_value_t = 256)]
+    specprefill_keep_last_tokens: usize,
     /// Disable the default 4-bit TurboQuant KV cache.
     #[arg(long)]
     no_kv_quantization: bool,
@@ -61,6 +74,15 @@ impl ServerArgs {
             KVCacheMode::Turbo4
         }
     }
+
+    fn specprefill_policy(&self) -> SpecPrefillPolicyConfig {
+        SpecPrefillPolicyConfig {
+            min_turn_tokens: self.specprefill_min_turn_tokens,
+            keep_rate: self.specprefill_keep_rate,
+            keep_first_tokens: self.specprefill_keep_first_tokens,
+            keep_last_tokens: self.specprefill_keep_last_tokens,
+        }
+    }
 }
 
 fn validate_cli(cli: &ServerArgs) -> Result<()> {
@@ -73,6 +95,7 @@ fn validate_cli(cli: &ServerArgs) -> Result<()> {
         "--prefix-cache-filesystem-bytes must be greater than zero"
     );
     ensure!(cli.mtp_k >= 2, "--mtp-k must be at least 2");
+    cli.specprefill_policy().validate()?;
     Ok(())
 }
 
@@ -102,6 +125,7 @@ pub async fn serve(cli: ServerArgs) -> Result<()> {
     info!(phase = "server.starting", bind = %bind);
 
     let kv_cache_mode = cli.kv_cache_mode();
+    let specprefill_policy = cli.specprefill_policy();
     let model = resolve_model_path(cli.model.as_deref())?;
     let prefix_cache_directory = resolve_prefix_cache_directory(cli.prefix_cache_directory)?;
     let engine = Engine::start_qwen(
@@ -114,6 +138,7 @@ pub async fn serve(cli: ServerArgs) -> Result<()> {
         },
         cli.mtp_k,
         kv_cache_mode,
+        specprefill_policy,
     )?;
     let listener = tokio::net::TcpListener::bind(bind)
         .await
@@ -281,6 +306,67 @@ mod tests {
         assert!(help.contains("--prefix-cache-directory"), "{help}");
         assert!(help.contains("--prefix-cache-filesystem-bytes"), "{help}");
         assert!(!help.contains("--prefix-cache-max-tokens"), "{help}");
+    }
+
+    #[test]
+    fn cli_configures_specprefill_policy() {
+        let defaults =
+            TestCli::try_parse_from(["qw-server", "--model", "/tmp/checkpoint"]).expect("CLI");
+        let policy = defaults.args.specprefill_policy();
+        assert_eq!(policy.min_turn_tokens, 8_000);
+        assert_eq!(policy.keep_rate, 0.25);
+        assert_eq!(policy.keep_first_tokens, 256);
+        assert_eq!(policy.keep_last_tokens, 256);
+        validate_cli(&defaults.args).expect("default SpecPrefill policy");
+
+        let custom = TestCli::try_parse_from([
+            "qw-server",
+            "--model",
+            "/tmp/checkpoint",
+            "--specprefill-min-turn-tokens",
+            "12000",
+            "--specprefill-keep-rate",
+            "0.4",
+            "--specprefill-keep-first-tokens",
+            "0",
+            "--specprefill-keep-last-tokens",
+            "64",
+        ])
+        .expect("custom SpecPrefill CLI");
+        let policy = custom.args.specprefill_policy();
+        assert_eq!(policy.min_turn_tokens, 12_000);
+        assert_eq!(policy.keep_rate, 0.4);
+        assert_eq!(policy.keep_first_tokens, 0);
+        assert_eq!(policy.keep_last_tokens, 64);
+        validate_cli(&custom.args).expect("custom SpecPrefill policy");
+
+        let invalid_threshold = TestCli::try_parse_from([
+            "qw-server",
+            "--specprefill-min-turn-tokens",
+            "0",
+        ])
+        .expect("threshold reaches startup validation");
+        assert!(validate_cli(&invalid_threshold.args).is_err());
+
+        for rate in ["0", "1.1", "NaN"] {
+            let invalid_rate = TestCli::try_parse_from([
+                "qw-server",
+                "--specprefill-keep-rate",
+                rate,
+            ])
+            .expect("keep rate reaches startup validation");
+            assert!(validate_cli(&invalid_rate.args).is_err(), "rate={rate}");
+        }
+
+        let help = TestCli::command().render_long_help().to_string();
+        for option in [
+            "--specprefill-min-turn-tokens",
+            "--specprefill-keep-rate",
+            "--specprefill-keep-first-tokens",
+            "--specprefill-keep-last-tokens",
+        ] {
+            assert!(help.contains(option), "{help}");
+        }
     }
 
     #[test]
