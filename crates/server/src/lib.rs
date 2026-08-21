@@ -22,7 +22,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use futures_util::stream;
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{Instrument, Span, error, info, info_span, warn};
 
 use engine::{
@@ -332,6 +332,7 @@ struct SseState {
     sequence: u64,
     response_message_open: bool,
     terminal_enqueued: bool,
+    pending_acknowledgment: Option<oneshot::Sender<()>>,
     span: Span,
     guard: CancelGuard,
 }
@@ -354,6 +355,7 @@ impl SseState {
             sequence: 0,
             response_message_open: false,
             terminal_enqueued: false,
+            pending_acknowledgment: None,
             guard: CancelGuard {
                 cancelled,
                 armed: true,
@@ -371,6 +373,9 @@ impl SseState {
                 return Some(event);
             }
             if self.terminal_enqueued {
+                if let Some(acknowledged) = self.pending_acknowledgment.take() {
+                    let _ = acknowledged.send(());
+                }
                 return None;
             }
             match self.receiver.recv().await {
@@ -383,9 +388,7 @@ impl SseState {
                     self.enqueue_complete(record);
                     self.terminal_enqueued = true;
                     self.guard.armed = false;
-                    if let Some(acknowledged) = acknowledged {
-                        let _ = acknowledged.send(());
-                    }
+                    self.pending_acknowledgment = acknowledged;
                 }
                 Some(WorkerEvent::Failed(failure)) => {
                     self.enqueue_failure(failure);

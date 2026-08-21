@@ -598,11 +598,8 @@ async fn streamed_chat_emits_role_content_terminal_usage_and_done() {
     assert!(body.trim_end().ends_with("data: [DONE]"), "{body}");
 }
 
-#[tokio::test]
-async fn stream_ends_after_terminal_events_while_worker_channel_remains_open() {
-    let (events_tx, events_rx) = mpsc::channel(1);
-    let (acknowledged, acknowledged_rx) = oneshot::channel();
-    let record = CompletionRecord {
+fn terminal_chat_record() -> CompletionRecord {
+    CompletionRecord {
         admission: Admission {
             response_id: "chatcmpl-terminal-eof".to_string(),
             message_id: "msg-terminal-eof".to_string(),
@@ -618,7 +615,15 @@ async fn stream_ends_after_terminal_events_while_worker_channel_remains_open() {
         cached_tokens: 0,
         finish_reason: FinishReason::Stop,
         stream_include_usage: false,
-    };
+    }
+}
+
+#[tokio::test]
+async fn completion_acknowledgment_waits_for_terminal_events_to_drain() {
+    let (events_tx, events_rx) = mpsc::channel(1);
+    let (acknowledged, mut acknowledged_rx) = oneshot::channel();
+    let record = terminal_chat_record();
+    let admission = record.admission.clone();
     events_tx
         .send(WorkerEvent::Complete {
             record,
@@ -628,11 +633,7 @@ async fn stream_ends_after_terminal_events_while_worker_channel_remains_open() {
         .expect("send completion");
     let mut state = SseState::new(
         Endpoint::Chat,
-        Admission {
-            response_id: "chatcmpl-terminal-eof".to_string(),
-            message_id: "msg-terminal-eof".to_string(),
-            created: 0,
-        },
+        admission,
         MODEL.to_string(),
         events_rx,
         Arc::new(AtomicBool::new(false)),
@@ -641,13 +642,66 @@ async fn stream_ends_after_terminal_events_while_worker_channel_remains_open() {
 
     assert!(state.next_event().await.is_some(), "initial event");
     assert!(state.next_event().await.is_some(), "terminal event");
-    assert_eq!(acknowledged_rx.await, Ok(()));
+    assert!(
+        matches!(
+            acknowledged_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ),
+        "cache work must not begin before all terminal events are consumed"
+    );
     assert!(state.next_event().await.is_some(), "done event");
+    assert!(
+        matches!(
+            acknowledged_rx.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ),
+        "cache work must not begin before the stream reaches EOF"
+    );
     assert!(
         tokio::time::timeout(Duration::from_millis(100), state.next_event())
             .await
             .expect("terminal EOF should not wait for channel closure")
             .is_none()
+    );
+    assert_eq!(
+        acknowledged_rx.try_recv(),
+        Ok(()),
+        "cache work begins at the EOF boundary"
+    );
+}
+
+#[tokio::test]
+async fn dropping_stream_releases_pending_completion_acknowledgment() {
+    let (events_tx, events_rx) = mpsc::channel(1);
+    let (acknowledged, acknowledged_rx) = oneshot::channel();
+    let record = terminal_chat_record();
+    let admission = record.admission.clone();
+    events_tx
+        .send(WorkerEvent::Complete {
+            record,
+            acknowledged: Some(acknowledged),
+        })
+        .await
+        .expect("send completion");
+    let mut state = SseState::new(
+        Endpoint::Chat,
+        admission,
+        MODEL.to_string(),
+        events_rx,
+        Arc::new(AtomicBool::new(false)),
+        tracing::info_span!("stream_drop_acknowledgment_test"),
+    );
+
+    assert!(state.next_event().await.is_some(), "initial event");
+    assert!(state.next_event().await.is_some(), "terminal event");
+    drop(state);
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), acknowledged_rx)
+            .await
+            .expect("dropping the stream should release the worker")
+            .is_err(),
+        "disconnect must drop rather than send the pending acknowledgment"
     );
 }
 
