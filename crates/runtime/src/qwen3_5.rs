@@ -39,34 +39,44 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::Path;
 
-const DRAFT_PREFIX: i32 = 131_072;
+const MTP_DRAFT_PREFIX: i32 = 65_536;
+const MTP_DRAFT_PADDED: i32 = 65_568;
+const DFLASH_VERIFY_PREFIX: i32 = 131_072;
+const DFLASH_VERIFY_PADDED: i32 = 131_104;
 const DRAFT_CONTROL_START: i32 = 248_044;
 const DRAFT_CONTROL_END: i32 = 248_070;
-const DRAFT_PADDED: i32 = 131_104;
 
-fn compact_rows(array: &MlxArray) -> UniquePtr<MlxArray> {
+fn compact_rows(array: &MlxArray, prefix_len: i32, padded_len: i32) -> UniquePtr<MlxArray> {
     let columns = mlxcel_core::array_shape(array)[1];
-    let prefix = mlxcel_core::slice(array, &[0, 0], &[DRAFT_PREFIX, columns]);
+    let prefix = mlxcel_core::slice(array, &[0, 0], &[prefix_len, columns]);
     let controls = mlxcel_core::slice(
         array,
         &[DRAFT_CONTROL_START, 0],
         &[DRAFT_CONTROL_END, columns],
     );
-    let real = DRAFT_PREFIX + DRAFT_CONTROL_END - DRAFT_CONTROL_START;
-    let padding = mlxcel_core::slice(array, &[0, 0], &[DRAFT_PADDED - real, columns]);
+    let real = prefix_len + DRAFT_CONTROL_END - DRAFT_CONTROL_START;
+    let padding = mlxcel_core::slice(array, &[0, 0], &[padded_len - real, columns]);
     let compact = concatenate(&prefix, &controls, 0);
     concatenate(&compact, &padding, 0)
 }
 
-fn compact_draft_head(head: &UnifiedLinear, vocab_size: usize) -> Option<UnifiedLinear> {
+fn compact_head(
+    head: &UnifiedLinear,
+    vocab_size: usize,
+    prefix_len: i32,
+    padded_len: i32,
+) -> Option<UnifiedLinear> {
     let UnifiedLinear::Quantized { weight, bias: None } = head else {
         return None;
     };
     (vocab_size == 248_320).then(|| UnifiedLinear::Quantized {
         weight: QuantizedWeight {
-            weight: compact_rows(&weight.weight),
-            scales: compact_rows(&weight.scales),
-            biases: weight.biases.as_ref().map(|x| compact_rows(x)),
+            weight: compact_rows(&weight.weight, prefix_len, padded_len),
+            scales: compact_rows(&weight.scales, prefix_len, padded_len),
+            biases: weight
+                .biases
+                .as_ref()
+                .map(|x| compact_rows(x, prefix_len, padded_len)),
             group_size: weight.group_size,
             bits: weight.bits,
             mode: weight.mode.clone(),
@@ -893,6 +903,7 @@ pub struct Qwen35Model {
     pub(crate) norm: RMSNorm,
     pub(crate) lm_head: Option<UnifiedLinear>,
     compact_draft_head: Option<UnifiedLinear>,
+    compact_dflash_verify_head: Option<UnifiedLinear>,
     pub(crate) config: Qwen35Config,
     mtp: Option<Qwen35MtpDraftModel>,
     kv_cache_mode: KVCacheMode,
@@ -931,7 +942,27 @@ impl Qwen35Model {
     }
 
     pub(crate) fn project_draft_logits(&self, hidden: &MlxArray) -> UniquePtr<MlxArray> {
-        self.compact_draft_head.as_ref().map_or_else(
+        self.project_compact_logits(hidden, &self.compact_draft_head, MTP_DRAFT_PREFIX)
+    }
+
+    pub(crate) fn project_dflash_verify_logits(
+        &self,
+        hidden: &MlxArray,
+    ) -> UniquePtr<MlxArray> {
+        self.project_compact_logits(
+            hidden,
+            &self.compact_dflash_verify_head,
+            DFLASH_VERIFY_PREFIX,
+        )
+    }
+
+    fn project_compact_logits(
+        &self,
+        hidden: &MlxArray,
+        head: &Option<UnifiedLinear>,
+        prefix_len: i32,
+    ) -> UniquePtr<MlxArray> {
+        head.as_ref().map_or_else(
             || self.project_logits(hidden),
             |head| {
                 let padded = head.forward(hidden);
@@ -942,7 +973,7 @@ impl Qwen35Model {
                     &[
                         shape[0],
                         shape[1],
-                        DRAFT_PREFIX + DRAFT_CONTROL_END - DRAFT_CONTROL_START,
+                        prefix_len + DRAFT_CONTROL_END - DRAFT_CONTROL_START,
                     ],
                 )
             },
@@ -953,11 +984,23 @@ impl Qwen35Model {
         self.compact_draft_head.is_some()
     }
 
+    pub(crate) fn has_compact_dflash_verify_head(&self) -> bool {
+        self.compact_dflash_verify_head.is_some()
+    }
+
     pub(crate) fn map_draft_token(token: i32) -> i32 {
-        if token < DRAFT_PREFIX {
+        if token < MTP_DRAFT_PREFIX {
             token
         } else {
-            token + DRAFT_CONTROL_START - DRAFT_PREFIX
+            token + DRAFT_CONTROL_START - MTP_DRAFT_PREFIX
+        }
+    }
+
+    pub(crate) fn map_dflash_verify_token(token: i32) -> i32 {
+        if token < DFLASH_VERIFY_PREFIX {
+            token
+        } else {
+            token + DRAFT_CONTROL_START - DFLASH_VERIFY_PREFIX
         }
     }
 
@@ -1262,7 +1305,7 @@ impl Qwen35Model {
             }
             let normalized = self.norm.forward(&hidden);
             let logits = if compact_logits {
-                self.project_draft_logits(&normalized)
+                self.project_dflash_verify_logits(&normalized)
             } else {
                 self.project_logits(&normalized)
             };
@@ -1810,9 +1853,22 @@ impl Qwen35Model {
                 weights, "lm_head", group_size, bits,
             )?)
         };
-        let compact_draft_head = lm_head
-            .as_ref()
-            .and_then(|head| compact_draft_head(head, config.vocab_size));
+        let compact_draft_head = lm_head.as_ref().and_then(|head| {
+            compact_head(
+                head,
+                config.vocab_size,
+                MTP_DRAFT_PREFIX,
+                MTP_DRAFT_PADDED,
+            )
+        });
+        let compact_dflash_verify_head = lm_head.as_ref().and_then(|head| {
+            compact_head(
+                head,
+                config.vocab_size,
+                DFLASH_VERIFY_PREFIX,
+                DFLASH_VERIFY_PADDED,
+            )
+        });
         let internal_caches = layers
             .iter()
             .map(|layer| {
@@ -1830,6 +1886,7 @@ impl Qwen35Model {
             norm: RMSNorm::new(norm_weight, config.rms_norm_eps),
             lm_head,
             compact_draft_head,
+            compact_dflash_verify_head,
             config: config.clone(),
             kv_cache_mode,
             mtp: None,

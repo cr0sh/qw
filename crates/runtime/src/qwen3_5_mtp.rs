@@ -968,7 +968,7 @@ pub(crate) fn greedy_walk_device_proposals(
     if compact_logits {
         target_tokens
             .iter_mut()
-            .for_each(|token| *token = Qwen35Model::map_draft_token(*token));
+            .for_each(|token| *token = Qwen35Model::map_dflash_verify_token(*token));
     }
     (
         speculative_walk(&draft_tokens, &target_tokens, max_new_tokens),
