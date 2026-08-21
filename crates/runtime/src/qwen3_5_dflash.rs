@@ -1323,6 +1323,8 @@ pub fn load_draft_weights(dir: &std::path::Path) -> Result<(WeightMap, DFlash2Co
 pub struct Dflash2GenerationStats {
     pub accepted_draft_tokens: usize,
     pub proposed_draft_tokens: usize,
+    /// Wall-clock time spent processing the uncached prompt.
+    pub prefill_time: Duration,
     /// Wall-clock time spent in the post-prefill DFlash2 decode loop.
     pub decode_time: Duration,
     pub draft_time: Duration,
@@ -1413,6 +1415,7 @@ impl Qwen35Dflash2Generator {
 
         // Prefill: capture the target-layer hidden states the drafter attends
         // to (trimmed to the sliding window) and sample the first token.
+        let prefill_start = Instant::now();
         let prompt_array = mlxcel_core::from_slice_i32(
             prompt_tokens,
             &[1, i32::try_from(prompt_tokens.len()).unwrap_or(i32::MAX)],
@@ -1441,9 +1444,13 @@ impl Qwen35Dflash2Generator {
             mlxcel_core::eval(&token);
             mlxcel_core::item_i32(&token)
         };
+        let prefill_time = prefill_start.elapsed();
         let mut generated = Vec::with_capacity(max_tokens);
         let mut history = prompt_tokens.to_vec();
-        let mut stats = Dflash2GenerationStats::default();
+        let mut stats = Dflash2GenerationStats {
+            prefill_time,
+            ..Dflash2GenerationStats::default()
+        };
         if eos_tokens.contains(&bonus) {
             // No tokens emitted; the caller observes the empty token list.
         } else {
