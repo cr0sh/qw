@@ -33,12 +33,12 @@ pub struct ServerArgs {
     #[arg(long, default_value_t = 2 * 1024 * 1024 * 1024_u64)]
     prefix_cache_memory_bytes: u64,
 
-    /// Optional directory for persistent prefix snapshots.
+    /// Directory for persistent prefix snapshots; defaults to `~/.cache/qw/checkpoint`.
     #[arg(long)]
     prefix_cache_directory: Option<PathBuf>,
 
     /// Byte capacity of the filesystem prefix snapshot tier.
-    #[arg(long, default_value_t = 20 * 1024 * 1024 * 1024_u64)]
+    #[arg(long, default_value_t = 16 * 1024 * 1024 * 1024_u64)]
     prefix_cache_filesystem_bytes: u64,
 
     /// MTP verify input block size (bonus token plus proposals).
@@ -68,14 +68,25 @@ fn validate_cli(cli: &ServerArgs) -> Result<()> {
         cli.prefix_cache_memory_bytes > 0,
         "--prefix-cache-memory-bytes must be greater than zero"
     );
-    if cli.prefix_cache_directory.is_some() {
-        ensure!(
-            cli.prefix_cache_filesystem_bytes > 0,
-            "--prefix-cache-filesystem-bytes must be greater than zero"
-        );
-    }
+    ensure!(
+        cli.prefix_cache_filesystem_bytes > 0,
+        "--prefix-cache-filesystem-bytes must be greater than zero"
+    );
     ensure!(cli.mtp_k >= 2, "--mtp-k must be at least 2");
     Ok(())
+}
+
+fn default_prefix_cache_directory() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .context("HOME is not set; cannot resolve the default prefix cache directory")?;
+    Ok(PathBuf::from(home).join(".cache/qw/checkpoint"))
+}
+
+fn resolve_prefix_cache_directory(directory: Option<PathBuf>) -> Result<PathBuf> {
+    directory
+        .map(Ok)
+        .unwrap_or_else(default_prefix_cache_directory)
 }
 
 pub async fn serve(cli: ServerArgs) -> Result<()> {
@@ -92,12 +103,13 @@ pub async fn serve(cli: ServerArgs) -> Result<()> {
 
     let kv_cache_mode = cli.kv_cache_mode();
     let model = resolve_model_path(cli.model.as_deref())?;
+    let prefix_cache_directory = resolve_prefix_cache_directory(cli.prefix_cache_directory)?;
     let engine = Engine::start_qwen(
         model,
         cli.model_id,
         CacheConfig {
             memory_bytes: cli.prefix_cache_memory_bytes,
-            directory: cli.prefix_cache_directory,
+            directory: Some(prefix_cache_directory),
             filesystem_bytes: cli.prefix_cache_filesystem_bytes,
         },
         cli.mtp_k,
@@ -114,7 +126,7 @@ pub async fn serve(cli: ServerArgs) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{OutputFormat, ServerArgs, validate_cli};
+    use super::{OutputFormat, ServerArgs, resolve_prefix_cache_directory, validate_cli};
     use clap::{CommandFactory as _, Parser as _};
     use clap_derive::Parser;
     use qw_runtime::KVCacheMode;
@@ -197,7 +209,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_configures_memory_and_optional_filesystem_cache_tiers() {
+    fn cli_configures_memory_and_filesystem_cache_tiers() {
         let defaults =
             TestCli::try_parse_from(["qw-server", "--model", "/tmp/checkpoint"]).expect("CLI");
         assert_eq!(
@@ -207,7 +219,12 @@ mod tests {
         assert_eq!(defaults.args.prefix_cache_directory, None);
         assert_eq!(
             defaults.args.prefix_cache_filesystem_bytes,
-            20 * 1024 * 1024 * 1024
+            16 * 1024 * 1024 * 1024
+        );
+        let home = std::env::var_os("HOME").expect("HOME is set in the test environment");
+        assert_eq!(
+            resolve_prefix_cache_directory(None).expect("default cache directory"),
+            std::path::PathBuf::from(home).join(".cache/qw/checkpoint")
         );
         validate_cli(&defaults.args).expect("default cache configuration");
 
@@ -242,6 +259,21 @@ mod tests {
         assert_eq!(
             validate_cli(&invalid_memory.args).unwrap_err().to_string(),
             "--prefix-cache-memory-bytes must be greater than zero"
+        );
+
+        let invalid_filesystem = TestCli::try_parse_from([
+            "qw-server",
+            "--model",
+            "/tmp/checkpoint",
+            "--prefix-cache-filesystem-bytes",
+            "0",
+        ])
+        .expect("CLI");
+        assert_eq!(
+            validate_cli(&invalid_filesystem.args)
+                .unwrap_err()
+                .to_string(),
+            "--prefix-cache-filesystem-bytes must be greater than zero"
         );
 
         let help = TestCli::command().render_long_help().to_string();
