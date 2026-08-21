@@ -1481,13 +1481,24 @@ impl Qwen35Dflash2Generator {
             let bonus_input = mlxcel_core::slice(&inputs, &[0, 0], &[1, 1]);
             let verify_input = mlxcel_core::concatenate(&bonus_input, &out.path, 1);
             let phase_start = Instant::now();
-            let verify = target.forward_dflash_verify(&verify_input, &self.target_layer_ids);
+            let compact_verify = sampling.token_bias.is_empty()
+                && sampling.repetition_penalty == 1.0
+                && sampling.dry_multiplier == 0.0
+                && sampling.frequency_penalty == 0.0
+                && sampling.presence_penalty == 0.0
+                && sampling.xtc_probability == 0.0;
+            let verify = target.forward_dflash_verify(
+                &verify_input,
+                &self.target_layer_ids,
+                compact_verify && target.has_compact_draft_head(),
+            );
             stats.target_forward_calls += 1;
             stats.speculative_rounds += 1;
 
             let (walk, draft_tokens) = crate::qwen3_5_mtp::greedy_walk_device_proposals(
                 &out.path,
                 &verify.logits,
+                compact_verify && target.has_compact_draft_head(),
                 sampling,
                 &history,
                 remaining,
