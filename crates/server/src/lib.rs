@@ -331,6 +331,7 @@ struct SseState {
     pending: VecDeque<Event>,
     sequence: u64,
     response_message_open: bool,
+    terminal_enqueued: bool,
     span: Span,
     guard: CancelGuard,
 }
@@ -352,6 +353,7 @@ impl SseState {
             pending: VecDeque::new(),
             sequence: 0,
             response_message_open: false,
+            terminal_enqueued: false,
             guard: CancelGuard {
                 cancelled,
                 armed: true,
@@ -368,6 +370,9 @@ impl SseState {
             if let Some(event) = self.pending.pop_front() {
                 return Some(event);
             }
+            if self.terminal_enqueued {
+                return None;
+            }
             match self.receiver.recv().await {
                 Some(WorkerEvent::Started(_)) => continue,
                 Some(WorkerEvent::Delta(delta)) => self.enqueue_delta(delta),
@@ -376,6 +381,7 @@ impl SseState {
                     acknowledged,
                 }) => {
                     self.enqueue_complete(record);
+                    self.terminal_enqueued = true;
                     self.guard.armed = false;
                     if let Some(acknowledged) = acknowledged {
                         let _ = acknowledged.send(());
@@ -383,6 +389,7 @@ impl SseState {
                 }
                 Some(WorkerEvent::Failed(failure)) => {
                     self.enqueue_failure(failure);
+                    self.terminal_enqueued = true;
                     self.guard.armed = false;
                 }
                 None => {

@@ -1,8 +1,14 @@
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::time::{Duration, Instant};
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
+use futures_util::StreamExt;
+use qw_prefix_cache::CacheConfig;
+use qw_runtime::{KVCacheMode, resolve_model_path};
 use serde_json::{Value, json};
+use tokio::sync::{mpsc, oneshot};
 use tower::ServiceExt;
 
 use super::*;
@@ -343,6 +349,212 @@ fn parse_sse(body: &str) -> (Vec<SseFrame>, bool) {
     (frames, done)
 }
 
+#[derive(Debug)]
+struct ResponsesSseMeasurement {
+    completed_response: Value,
+    assistant_text: String,
+    ttft: Duration,
+    terminal_tail: Duration,
+}
+
+async fn read_responses_sse(app: Router, body: Value) -> Result<ResponsesSseMeasurement, String> {
+    let started = Instant::now();
+    let response = app
+        .oneshot(
+            Request::post("/v1/responses")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .map_err(|error| format!("request: {error}"))?,
+        )
+        .await
+        .map_err(|error| format!("router response: {error}"))?;
+    if response.status() != StatusCode::OK {
+        return Err(format!("unexpected HTTP status {}", response.status()));
+    }
+
+    let mut stream = response.into_body().into_data_stream();
+    let mut buffer = Vec::new();
+    let mut assistant_text = String::new();
+    let mut first_delta_at = None;
+    let mut last_delta_at = None;
+    let mut completed_response = None;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| format!("SSE body stream: {error}"))?;
+        buffer.extend_from_slice(&chunk);
+        while let Some(separator) = buffer.windows(2).position(|window| window == b"\n\n") {
+            let block = buffer.drain(..separator).collect::<Vec<_>>();
+            buffer.drain(..2);
+            let block = String::from_utf8(block).map_err(|error| format!("SSE UTF-8: {error}"))?;
+            let event = block
+                .lines()
+                .find_map(|line| line.strip_prefix("event: "))
+                .ok_or_else(|| "SSE event is missing its event name".to_string())?;
+            let data = block
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .ok_or_else(|| format!("SSE event {event} is missing data"))?;
+            if data == "[DONE]" {
+                continue;
+            }
+            let value: Value = serde_json::from_str(data)
+                .map_err(|error| format!("SSE event {event} JSON: {error}"))?;
+            match event {
+                "response.output_text.delta" => {
+                    let delta = value["delta"]
+                        .as_str()
+                        .ok_or_else(|| "output delta is not a string".to_string())?;
+                    let now = Instant::now();
+                    first_delta_at.get_or_insert(now);
+                    last_delta_at = Some(now);
+                    assistant_text.push_str(delta);
+                }
+                "response.completed" => {
+                    completed_response = Some(
+                        value
+                            .get("response")
+                            .cloned()
+                            .ok_or_else(|| "response.completed lacks response".to_string())?,
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    if !buffer.is_empty() {
+        return Err("SSE body ended with an incomplete event".to_string());
+    }
+    let eof = Instant::now();
+    let first_delta_at = first_delta_at.ok_or_else(|| {
+        "Responses SSE ended without a response.output_text.delta event".to_string()
+    })?;
+    let last_delta_at = last_delta_at.expect("first and last delta timestamps are paired");
+    let completed_response = completed_response
+        .ok_or_else(|| "Responses SSE ended without response.completed".to_string())?;
+    Ok(ResponsesSseMeasurement {
+        completed_response,
+        assistant_text,
+        ttft: first_delta_at.duration_since(started),
+        terminal_tail: eof.duration_since(last_delta_at),
+    })
+}
+
+#[tokio::test]
+#[ignore = "requires the resolver's default bundled-MTP checkpoint"]
+async fn real_responses_sse_latency_stays_bounded_across_cold_fork_and_continuation() {
+    let model_dir = resolve_model_path(None)
+        .expect("resolver's default bundled-MTP checkpoint must be available");
+    let engine = Engine::start_qwen(
+        model_dir,
+        Some(MODEL.to_string()),
+        CacheConfig {
+            directory: None,
+            ..CacheConfig::default()
+        },
+        3,
+        KVCacheMode::Turbo4,
+    )
+    .expect("start real Qwen engine");
+    let app = router(engine);
+    let shared_prefix = || {
+        vec![
+            json!({
+                "role": "system",
+                "content": "You are a deterministic benchmark assistant. Follow the user's visible-answer instruction exactly."
+            }),
+            json!({
+                "role": "user",
+                "content": "A deterministic cache benchmark paragraph. ".repeat(128)
+            }),
+            json!({
+                "role": "assistant",
+                "content": "The shared benchmark prefix is acknowledged."
+            }),
+        ]
+    };
+    let request = |input: Vec<Value>| {
+        json!({
+            "model": MODEL,
+            "input": input,
+            "stream": true,
+            "temperature": 0,
+            "top_p": 1,
+            "max_output_tokens": 128
+        })
+    };
+    let mut cold_input = shared_prefix();
+    cold_input.push(json!({
+        "role": "user",
+        "content": "Output exactly the single plain word COLD and then stop. Do not explain, reason, or output any other text."
+    }));
+    let cold = tokio::time::timeout(
+        Duration::from_secs(30),
+        read_responses_sse(app.clone(), request(cold_input)),
+    )
+    .await
+    .expect("cold Responses SSE exceeded the 30-second hang guard")
+    .expect("cold Responses SSE");
+    let mut fork_input = shared_prefix();
+
+    fork_input.push(json!({
+        "role": "user",
+        "content": "Output exactly the single plain word FORK and then stop. Do not explain, reason, or output any other text."
+    }));
+    let fork = tokio::time::timeout(
+        Duration::from_secs(30),
+        read_responses_sse(app.clone(), request(fork_input)),
+    )
+    .await
+    .expect("fork Responses SSE exceeded the 30-second hang guard")
+    .expect("fork Responses SSE");
+
+    let mut continuation_input = shared_prefix();
+    continuation_input.push(json!({
+        "role": "assistant",
+        "content": cold.assistant_text.clone()
+    }));
+    continuation_input.push(json!({
+        "role": "user",
+        "content": "Output exactly the single plain word CONTINUATION and then stop. Do not explain, reason, or output any other text."
+    }));
+    let continuation = tokio::time::timeout(
+        Duration::from_secs(30),
+        read_responses_sse(app, request(continuation_input)),
+    )
+    .await
+    .expect("continuation Responses SSE exceeded the 30-second hang guard")
+    .expect("continuation Responses SSE");
+
+    let cached_tokens = |measurement: &ResponsesSseMeasurement| {
+        measurement.completed_response["usage"]["input_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .expect("Responses completion cached token count")
+    };
+    let cold_cached = cached_tokens(&cold);
+    let fork_cached = cached_tokens(&fork);
+    let continuation_cached = cached_tokens(&continuation);
+    let diagnostics = format!(
+        "cold(ttft={:?}, tail={:?}, cached={cold_cached}), \
+         fork(ttft={:?}, tail={:?}, cached={fork_cached}), \
+         continuation(ttft={:?}, tail={:?}, cached={continuation_cached})",
+        cold.ttft,
+        cold.terminal_tail,
+        fork.ttft,
+        fork.terminal_tail,
+        continuation.ttft,
+        continuation.terminal_tail,
+    );
+    assert!(cold.terminal_tail < Duration::from_secs(1), "{diagnostics}");
+    assert!(fork.terminal_tail < Duration::from_secs(1), "{diagnostics}");
+    assert!(
+        continuation.terminal_tail < Duration::from_secs(1),
+        "{diagnostics}"
+    );
+    assert!(fork_cached > 0, "{diagnostics}");
+    assert!(continuation_cached > 0, "{diagnostics}");
+    assert!(fork.ttft < cold.ttft, "{diagnostics}");
+    assert!(continuation.ttft < cold.ttft, "{diagnostics}");
+}
+
 fn responses_replay_call(item: &Value) -> Value {
     json!({
         "type": "function_call",
@@ -384,6 +596,59 @@ async fn streamed_chat_emits_role_content_terminal_usage_and_done() {
     assert!(body.contains("\"finish_reason\":\"stop\""), "{body}");
     assert!(body.contains("\"usage\":"), "{body}");
     assert!(body.trim_end().ends_with("data: [DONE]"), "{body}");
+}
+
+#[tokio::test]
+async fn stream_ends_after_terminal_events_while_worker_channel_remains_open() {
+    let (events_tx, events_rx) = mpsc::channel(1);
+    let (acknowledged, acknowledged_rx) = oneshot::channel();
+    let record = CompletionRecord {
+        admission: Admission {
+            response_id: "chatcmpl-terminal-eof".to_string(),
+            message_id: "msg-terminal-eof".to_string(),
+            created: 0,
+        },
+        endpoint: Endpoint::Chat,
+        model: MODEL.to_string(),
+        content: "done".to_string(),
+        reasoning_content: String::new(),
+        tool_calls: Vec::new(),
+        prompt_tokens: 3,
+        completion_tokens: 1,
+        cached_tokens: 0,
+        finish_reason: FinishReason::Stop,
+        stream_include_usage: false,
+    };
+    events_tx
+        .send(WorkerEvent::Complete {
+            record,
+            acknowledged: Some(acknowledged),
+        })
+        .await
+        .expect("send completion");
+    let mut state = SseState::new(
+        Endpoint::Chat,
+        Admission {
+            response_id: "chatcmpl-terminal-eof".to_string(),
+            message_id: "msg-terminal-eof".to_string(),
+            created: 0,
+        },
+        MODEL.to_string(),
+        events_rx,
+        Arc::new(AtomicBool::new(false)),
+        tracing::info_span!("stream_terminal_eof_test"),
+    );
+
+    assert!(state.next_event().await.is_some(), "initial event");
+    assert!(state.next_event().await.is_some(), "terminal event");
+    assert_eq!(acknowledged_rx.await, Ok(()));
+    assert!(state.next_event().await.is_some(), "done event");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), state.next_event())
+            .await
+            .expect("terminal EOF should not wait for channel closure")
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -841,7 +1106,10 @@ async fn structured_tracing_covers_request_stream_error_and_cancellation_without
     }
     assert!(!traces.contains(SECRET_PROMPT), "{traces}");
     assert!(!traces.contains(SECRET_ARGUMENTS), "{traces}");
-    assert!(!traces.contains("response.stream_worker_closed"), "{traces}");
+    assert!(
+        !traces.contains("response.stream_worker_closed"),
+        "{traces}"
+    );
 }
 
 #[test]
