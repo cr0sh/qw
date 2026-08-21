@@ -163,7 +163,7 @@ impl Qwen3NextAttention {
         cache: &mut KVCache,
         mask: Option<&MlxArray>,
         position_ids: Option<&MlxArray>,
-        target_verify: bool,
+        _target_verify: bool,
     ) -> UniquePtr<MlxArray> {
         let shape = mlxcel_core::array_shape(x);
         let b = shape[0];
@@ -277,9 +277,7 @@ impl Qwen3NextAttention {
             }
         } else {
             let (cache_k, cache_v) = cache.update_and_fetch(keys, values);
-            if target_verify && l > 1 {
-                self.attend_per_position(&queries, &cache_k, &cache_v)
-            } else if l > 1 && mask.is_none() {
+            if l > 1 && mask.is_none() {
                 mlxcel_core::causal_attention(
                     &queries,
                     &cache_k,
