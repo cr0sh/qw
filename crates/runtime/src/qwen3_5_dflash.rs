@@ -1437,12 +1437,10 @@ impl Qwen35Dflash2Generator {
             let verify = target.forward_dflash_verify(&verify_input, &self.target_layer_ids);
             stats.target_forward_calls += 1;
             stats.speculative_rounds += 1;
-            let verify_retained = concatenate_hiddens(&verify.hidden_by_layer);
 
             let (walk, draft_tokens) = crate::qwen3_5_mtp::greedy_walk_device_proposals(
                 &out.path,
                 &verify.logits,
-                &verify_retained,
                 sampling,
                 &history,
                 remaining,
@@ -1464,15 +1462,10 @@ impl Qwen35Dflash2Generator {
                 target.rollback_mtp_verify(&verify.gdn_states, walk.accepted, bs, false);
             }
 
-            // Next context: the target-layer hidden states of the accepted
-            // prefix (the verify captured hiddens for the whole block).
-            let retained_shape = mlxcel_core::array_shape(&verify_retained);
-            let accepted_plus_one = i32::try_from(walk.accepted + 1).unwrap_or(i32::MAX);
-            hidden_concat = mlxcel_core::slice(
-                &verify_retained,
-                &[0, 0, 0],
-                &[retained_shape[0], accepted_plus_one, retained_shape[2]],
-            );
+            // Concatenate only committed rows; rejected verify rows never feed
+            // the next draft round.
+            hidden_concat =
+                concatenate_hiddens(&verify.hidden_by_layer, walk.accepted + 1);
             bonus = *walk
                 .new_tokens
                 .last()
@@ -1501,14 +1494,23 @@ impl Qwen35Dflash2Generator {
 
 
 /// Concatenate a `[1, L, H]` per-target-layer hidden list along `-1`.
-fn concatenate_hiddens(hiddens: &[UniquePtr<MlxArray>]) -> UniquePtr<MlxArray> {
-    let n = hiddens.len();
-    debug_assert!(n > 0, "DFlash2 verify must capture hidden states");
-    // Concatenate along the last (hidden) axis, mirroring the SGLang target
-    // feature capture (`extract_context_feature`).
-    let mut acc = mlxcel_core::share(hiddens[0].as_ref().expect("captured hidden"));
-    for hid in &hiddens[1..] {
-        acc = concatenate(&acc, hid.as_ref().expect("captured hidden"), -1);
+fn concatenate_hiddens(
+    hiddens: &[UniquePtr<MlxArray>],
+    prefix_len: usize,
+) -> UniquePtr<MlxArray> {
+    debug_assert!(!hiddens.is_empty(), "DFlash2 verify must capture hidden states");
+    let prefix = |hidden: &MlxArray| {
+        let shape = mlxcel_core::array_shape(hidden);
+        mlxcel_core::slice(
+            hidden,
+            &[0, 0, 0],
+            &[shape[0], prefix_len as i32, shape[2]],
+        )
+    };
+    let mut acc = prefix(hiddens[0].as_ref().expect("captured hidden"));
+    for hidden in &hiddens[1..] {
+        let hidden = prefix(hidden.as_ref().expect("captured hidden"));
+        acc = concatenate(&acc, &hidden, -1);
     }
     acc
 }

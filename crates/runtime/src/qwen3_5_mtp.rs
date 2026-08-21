@@ -930,7 +930,6 @@ pub(crate) fn greedy_walk(
 pub(crate) fn greedy_walk_device_proposals(
     draft_tokens: &MlxArray,
     verify_logits: &MlxArray,
-    eager_hidden: &MlxArray,
     sampling: &SamplingConfig,
     committed_history: &[i32],
     max_new_tokens: usize,
@@ -962,7 +961,7 @@ pub(crate) fn greedy_walk_device_proposals(
     let biased_logits =
         mlxcel_core::sampling::apply_token_bias(verify_logits, &sampling.token_bias);
     let targets = mlxcel_core::argmax_last_axis(&biased_logits);
-    mlxcel_core::async_eval_pair(&targets, eager_hidden);
+    mlxcel_core::async_eval(&targets);
     let draft_tokens = materialize_ids(draft_tokens);
     let target_tokens = materialize_ids(&targets);
     (
