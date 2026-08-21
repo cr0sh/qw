@@ -937,7 +937,7 @@ pub(crate) fn greedy_walk_device_proposals(
 ) -> (WalkResult, Vec<i32>) {
     let materialize_ids = |array: &MlxArray| {
         mlxcel_core::eval(array);
-        mlxcel_core::array_to_raw_bytes(array)
+        mlxcel_core::array_evaluated_bytes(array)
             .chunks_exact(4)
             .map(|bytes| i32::from_ne_bytes(bytes.try_into().expect("i32 token bytes")))
             .collect::<Vec<_>>()
