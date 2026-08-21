@@ -187,7 +187,10 @@ async fn buffered_response_inner(mut submission: engine::Submission) -> Response
     while let Some(event) = submission.events.recv().await {
         match event {
             WorkerEvent::Started(_) | WorkerEvent::Delta(_) => {}
-            WorkerEvent::Complete(record) => {
+            WorkerEvent::Complete {
+                record,
+                acknowledged,
+            } => {
                 guard.armed = false;
                 info!(
                     phase = "response.buffered_complete",
@@ -197,7 +200,11 @@ async fn buffered_response_inner(mut submission: engine::Submission) -> Response
                     cached_tokens = record.cached_tokens,
                     finish_reason = ?record.finish_reason,
                 );
-                return Json(buffered_json(&record)).into_response();
+                let response = Json(buffered_json(&record)).into_response();
+                if let Some(acknowledged) = acknowledged {
+                    let _ = acknowledged.send(());
+                }
+                return response;
             }
             WorkerEvent::Failed(failure) => {
                 guard.armed = false;
@@ -254,14 +261,21 @@ async fn streaming_response_inner(
             );
             return ApiError::from_worker(failure).into_response();
         }
-        Some(WorkerEvent::Complete(record)) => {
+        Some(WorkerEvent::Complete {
+            record,
+            acknowledged,
+        }) => {
             admission_guard.armed = false;
             info!(
                 phase = "response.completed_before_stream",
                 prompt_tokens = record.prompt_tokens,
                 completion_tokens = record.completion_tokens,
             );
-            return Json(buffered_json(&record)).into_response();
+            let response = Json(buffered_json(&record)).into_response();
+            if let Some(acknowledged) = acknowledged {
+                let _ = acknowledged.send(());
+            }
+            return response;
         }
         Some(WorkerEvent::Delta(_)) => {
             error!(phase = "response.streaming_protocol_error");
@@ -357,9 +371,15 @@ impl SseState {
             match self.receiver.recv().await {
                 Some(WorkerEvent::Started(_)) => continue,
                 Some(WorkerEvent::Delta(delta)) => self.enqueue_delta(delta),
-                Some(WorkerEvent::Complete(record)) => {
+                Some(WorkerEvent::Complete {
+                    record,
+                    acknowledged,
+                }) => {
                     self.enqueue_complete(record);
                     self.guard.armed = false;
+                    if let Some(acknowledged) = acknowledged {
+                        let _ = acknowledged.send(());
+                    }
                 }
                 Some(WorkerEvent::Failed(failure)) => {
                     self.enqueue_failure(failure);

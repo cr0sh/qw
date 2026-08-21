@@ -14,7 +14,7 @@ use qw_prefix_cache::{
 use qw_runtime::{ChatContentRef, ChatMessage};
 use qw_runtime::{KVCacheMode, MtpPrefixReuse, PromptSnapshot, Qwen35Provider};
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{Span, error, info, info_span, warn};
 
 use crate::grammar::GrammarFactory;
@@ -127,7 +127,10 @@ pub enum WorkerDelta {
 pub enum WorkerEvent {
     Started(Admission),
     Delta(WorkerDelta),
-    Complete(CompletionRecord),
+    Complete {
+        record: CompletionRecord,
+        acknowledged: Option<oneshot::Sender<()>>,
+    },
     Failed(WorkerFailure),
 }
 
@@ -825,7 +828,10 @@ impl Engine {
                     finish_reason = ?record.finish_reason,
                     generated_tool_count = record.tool_calls.len(),
                 );
-                let _ = job.events.blocking_send(WorkerEvent::Complete(record));
+                let _ = job.events.blocking_send(WorkerEvent::Complete {
+                    record,
+                    acknowledged: None,
+                });
             }
         });
         Self {
@@ -1364,19 +1370,19 @@ impl QwenWorker {
         }
         let cancelled = job.cancelled.load(Ordering::Acquire)
             || generated.finish_outcome == GenerationStopReason::CallbackCancelled;
-        if let Some(cache_route) = cache_route {
-            let prompt_snapshots = std::mem::take(&mut generated.prompt_snapshots);
-            if !prompt_snapshots.is_empty() {
-                cache.insert(&generation_prompt_ids, prompt_snapshots, cache_route);
-            }
-            if let Some(final_snapshot) = generated.final_snapshot.take() {
-                let mut completed_tokens =
-                    Vec::with_capacity(generation_prompt_ids.len() + generated.token_ids.len());
-                completed_tokens.extend_from_slice(&generation_prompt_ids);
-                completed_tokens.extend_from_slice(&generated.token_ids);
-                completed_tokens.truncate(final_snapshot.token_len());
-                if completed_tokens.len() == final_snapshot.token_len() {
-                    if cancelled {
+        if cancelled {
+            if let Some(cache_route) = cache_route {
+                let prompt_snapshots = std::mem::take(&mut generated.prompt_snapshots);
+                if !prompt_snapshots.is_empty() {
+                    cache.insert(&generation_prompt_ids, prompt_snapshots, cache_route);
+                }
+                if let Some(final_snapshot) = generated.final_snapshot.take() {
+                    let mut completed_tokens =
+                        Vec::with_capacity(generation_prompt_ids.len() + generated.token_ids.len());
+                    completed_tokens.extend_from_slice(&generation_prompt_ids);
+                    completed_tokens.extend_from_slice(&generated.token_ids);
+                    completed_tokens.truncate(final_snapshot.token_len());
+                    if completed_tokens.len() == final_snapshot.token_len() {
                         let metadata = ResponseResumeMetadata {
                             response_id: job.admission.response_id.clone(),
                             message_id: job.admission.message_id.clone(),
@@ -1401,13 +1407,9 @@ impl QwenWorker {
                             cache_route,
                             metadata,
                         );
-                    } else {
-                        cache.insert(&completed_tokens, vec![final_snapshot], cache_route);
                     }
                 }
             }
-        }
-        if cancelled {
             info!(phase = "generation.cancelled");
             return;
         }
@@ -1517,7 +1519,24 @@ impl QwenWorker {
             finish_reason = ?record.finish_reason,
             generated_tool_count = record.tool_calls.len(),
         );
-        let _ = job.events.blocking_send(WorkerEvent::Complete(record));
+        publish_completion_before_cache(&job.events, record, || {
+            if let Some(cache_route) = cache_route {
+                let prompt_snapshots = std::mem::take(&mut generated.prompt_snapshots);
+                if !prompt_snapshots.is_empty() {
+                    cache.insert(&generation_prompt_ids, prompt_snapshots, cache_route);
+                }
+                if let Some(final_snapshot) = generated.final_snapshot.take() {
+                    let mut completed_tokens =
+                        Vec::with_capacity(generation_prompt_ids.len() + generated.token_ids.len());
+                    completed_tokens.extend_from_slice(&generation_prompt_ids);
+                    completed_tokens.extend_from_slice(&generated.token_ids);
+                    completed_tokens.truncate(final_snapshot.token_len());
+                    if completed_tokens.len() == final_snapshot.token_len() {
+                        cache.insert(&completed_tokens, vec![final_snapshot], cache_route);
+                    }
+                }
+            }
+        });
     }
 }
 
@@ -1538,6 +1557,24 @@ fn generated_tool_call(
         name,
         arguments,
     }
+}
+
+fn publish_completion_before_cache(
+    events: &mpsc::Sender<WorkerEvent>,
+    record: CompletionRecord,
+    cache_work: impl FnOnce(),
+) {
+    let (acknowledged, completed) = oneshot::channel();
+    if events
+        .blocking_send(WorkerEvent::Complete {
+            record,
+            acknowledged: Some(acknowledged),
+        })
+        .is_ok()
+    {
+        let _ = completed.blocking_recv();
+    }
+    cache_work();
 }
 
 fn send_failure(job: &Job, kind: FailureKind, message: String, param: Option<String>) {
@@ -1794,5 +1831,76 @@ mod tests {
             validate_mtp_k(0).expect_err("invalid K").to_string(),
             "--mtp-k must be at least 2"
         );
+    }
+    fn test_completion_record() -> CompletionRecord {
+        CompletionRecord {
+            admission: Admission {
+                response_id: "chatcmpl-test".to_string(),
+                message_id: "msg-test".to_string(),
+                created: 0,
+            },
+            endpoint: Endpoint::Chat,
+            model: "test-model".to_string(),
+            content: "complete".to_string(),
+            reasoning_content: String::new(),
+            tool_calls: Vec::new(),
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            cached_tokens: 0,
+            finish_reason: FinishReason::Stop,
+            stream_include_usage: false,
+        }
+    }
+
+    #[test]
+    fn completion_is_acknowledged_before_cache_insertion() {
+        let (events, mut received) = mpsc::channel(1);
+        let completion_processed = Arc::new(AtomicBool::new(false));
+        let completion_processed_by_consumer = Arc::clone(&completion_processed);
+        let consumer = thread::spawn(move || match received.blocking_recv() {
+            Some(WorkerEvent::Complete {
+                record,
+                acknowledged: Some(acknowledged),
+            }) => {
+                assert_eq!(record.content, "complete");
+                completion_processed_by_consumer.store(true, Ordering::Release);
+                acknowledged
+                    .send(())
+                    .expect("worker is waiting for completion");
+            }
+            event => panic!("unexpected worker event: {event:?}"),
+        });
+
+        let cache_started = Arc::new(AtomicBool::new(false));
+        let cache_started_by_worker = Arc::clone(&cache_started);
+        publish_completion_before_cache(&events, test_completion_record(), || {
+            assert!(completion_processed.load(Ordering::Acquire));
+            cache_started_by_worker.store(true, Ordering::Release);
+        });
+        consumer.join().expect("completion consumer did not finish");
+        assert!(cache_started.load(Ordering::Acquire));
+
+        let (events, mut received) = mpsc::channel(1);
+        let consumer = thread::spawn(move || match received.blocking_recv() {
+            Some(WorkerEvent::Complete {
+                acknowledged: Some(_),
+                ..
+            }) => {}
+            event => panic!("unexpected worker event: {event:?}"),
+        });
+        let (progress, progressed) = std_mpsc::sync_channel(0);
+        let worker = thread::spawn(move || {
+            publish_completion_before_cache(&events, test_completion_record(), || {
+                progress.send(()).expect("test worker is still waiting");
+            });
+        });
+        assert!(
+            progressed
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .is_ok(),
+            "dropped completion acknowledgment deadlocked cache work"
+        );
+        worker.join().expect("worker thread panicked");
+        consumer.join().expect("completion consumer did not finish");
     }
 }
