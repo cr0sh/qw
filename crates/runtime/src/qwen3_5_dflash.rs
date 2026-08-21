@@ -51,12 +51,51 @@
 use std::time::{Duration, Instant};
 
 use mlxcel_core::generate::LanguageModel;
-use mlxcel_core::layers::{KVCache, Linear, RMSNorm, RotatingKVCache, UnifiedEmbedding};
+use mlxcel_core::layers::{
+    KVCache, QuantizedWeight, RMSNorm, RotatingKVCache, UnifiedEmbedding, UnifiedLinear,
+};
 use mlxcel_core::weights::{WeightMap, load_weights_from_dir};
 use mlxcel_core::{MlxArray, UniquePtr, concatenate, multiply_scalar};
 use serde_json::Value;
 
 use crate::qwen3_5::Qwen35Model;
+const DRAFT_QUANT_GROUP_SIZE: i32 = 64;
+const DRAFT_QUANT_BITS: i32 = 4;
+
+fn quantized_draft_linear(
+    weights: &WeightMap,
+    prefix: &str,
+) -> Result<UnifiedLinear, String> {
+    let weight_name = format!("{prefix}.weight");
+    let dense = weights
+        .get(&weight_name)
+        .ok_or_else(|| format!("Weight not found: {weight_name}"))?;
+    let quantized =
+        mlxcel_core::quantize_weights(dense, DRAFT_QUANT_GROUP_SIZE, DRAFT_QUANT_BITS);
+    let weight = mlxcel_core::quantized_weights_w(&quantized);
+    let scales = mlxcel_core::quantized_weights_scales(&quantized);
+    if !mlxcel_core::quantized_weights_has_biases(&quantized) {
+        return Err(format!("Affine quantization produced no biases for {prefix}"));
+    }
+    let biases = mlxcel_core::quantized_weights_biases(&quantized);
+    mlxcel_core::eval(&weight);
+    mlxcel_core::eval(&scales);
+    mlxcel_core::eval(&biases);
+    let bias = weights
+        .get(&format!("{prefix}.bias"))
+        .map(|value| mlxcel_core::copy(value));
+    Ok(UnifiedLinear::new(
+        QuantizedWeight::new(
+            weight,
+            scales,
+            biases,
+            DRAFT_QUANT_GROUP_SIZE,
+            DRAFT_QUANT_BITS,
+        ),
+        bias,
+    ))
+}
+
 
 // ---------------------------------------------------------------------------
 // # 1. DFlash2 config
@@ -369,7 +408,7 @@ pub struct DFlash2GroupedConv {
     /// export stores (`base_kernel`).
     base_kernel: UniquePtr<MlxArray>,
     /// `[2 * taps * groups, hidden]`.
-    kernel_projection: Linear,
+    kernel_projection: UnifiedLinear,
     block_size: i32,
     taps: i32,
     group_size: i32,
@@ -387,7 +426,7 @@ impl DFlash2GroupedConv {
             .map(|w| mlxcel_core::copy(w))
             .ok_or_else(|| format!("Weight not found: {prefix}.base_kernel"))?;
         let kernel_projection =
-            Linear::from_weights(weights, &format!("{prefix}.kernel_projection"))?;
+            quantized_draft_linear(weights, &format!("{prefix}.kernel_projection"))?;
         let taps = config.conv_kernel_size as i32;
         Ok(Self {
             base_kernel,
@@ -603,10 +642,10 @@ impl DFlash2KVCache {
 /// layers additionally bound the attended context through the rotating
 /// cache, and `config.is_causal` may force causal attention.
 pub struct DFlash2Attention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    q_proj: UnifiedLinear,
+    k_proj: UnifiedLinear,
+    v_proj: UnifiedLinear,
+    o_proj: UnifiedLinear,
     q_norm: RMSNorm,
     k_norm: RMSNorm,
     n_heads: i32,
@@ -626,10 +665,10 @@ impl DFlash2Attention {
         config: &DFlash2Config,
         layer_idx: usize,
     ) -> Result<Self, String> {
-        let q_proj = Linear::from_weights(weights, &format!("{prefix}.q_proj"))?;
-        let k_proj = Linear::from_weights(weights, &format!("{prefix}.k_proj"))?;
-        let v_proj = Linear::from_weights(weights, &format!("{prefix}.v_proj"))?;
-        let o_proj = Linear::from_weights(weights, &format!("{prefix}.o_proj"))?;
+        let q_proj = quantized_draft_linear(weights, &format!("{prefix}.q_proj"))?;
+        let k_proj = quantized_draft_linear(weights, &format!("{prefix}.k_proj"))?;
+        let v_proj = quantized_draft_linear(weights, &format!("{prefix}.v_proj"))?;
+        let o_proj = quantized_draft_linear(weights, &format!("{prefix}.o_proj"))?;
         let q_norm_w = weights
             .get(&format!("{prefix}.q_norm.weight"))
             .map(|w| mlxcel_core::copy(w))
@@ -828,16 +867,16 @@ impl DFlash2Attention {
 
 /// SwiGLU MLP: `down(silu(gate(x)) * up(x))` (SGLang `DFlashMLP`).
 pub struct DFlash2Mlp {
-    gate: Linear,
-    up: Linear,
-    down: Linear,
+    gate: UnifiedLinear,
+    up: UnifiedLinear,
+    down: UnifiedLinear,
 }
 
 impl DFlash2Mlp {
     pub fn from_weights(weights: &WeightMap, prefix: &str) -> Result<Self, String> {
-        let gate = Linear::from_weights(weights, &format!("{prefix}.gate_proj"))?;
-        let up = Linear::from_weights(weights, &format!("{prefix}.up_proj"))?;
-        let down = Linear::from_weights(weights, &format!("{prefix}.down_proj"))?;
+        let gate = quantized_draft_linear(weights, &format!("{prefix}.gate_proj"))?;
+        let up = quantized_draft_linear(weights, &format!("{prefix}.up_proj"))?;
+        let down = quantized_draft_linear(weights, &format!("{prefix}.down_proj"))?;
         Ok(Self { gate, up, down })
     }
 
@@ -968,7 +1007,7 @@ pub struct CandidateSelector {
     pub top_k: usize,
     predecessor_codebook: UniquePtr<MlxArray>, // [vocab, rank]
     successor_codebook: UniquePtr<MlxArray>,   // [vocab, rank]
-    hidden_projection: Linear,                 // hidden -> rank
+    hidden_projection: UnifiedLinear,          // hidden -> rank
 }
 
 impl CandidateSelector {
@@ -982,7 +1021,7 @@ impl CandidateSelector {
             .map(|w| mlxcel_core::copy(w))
             .ok_or("Weight not found: candidate_selector.successor_codebook")?;
         let hidden_projection =
-            Linear::from_weights(weights, "candidate_selector.hidden_projection")?;
+            quantized_draft_linear(weights, "candidate_selector.hidden_projection")?;
         Ok(Self {
             top_k: config.selector_top_k,
             predecessor_codebook,
@@ -1080,7 +1119,7 @@ impl CandidateSelector {
 /// (SGLang `compute_candidates`).
 pub struct DFlash2DraftModel {
     pub config: DFlash2Config,
-    fc: Linear, // [len(target_layer_ids) * hidden, hidden]
+    fc: UnifiedLinear, // [len(target_layer_ids) * hidden, hidden]
     hidden_norm: RMSNorm,
     layers: Vec<DFlash2DecoderLayer>,
     norm: RMSNorm,
@@ -1096,7 +1135,7 @@ impl DFlash2DraftModel {
         config: DFlash2Config,
         embed_tokens: UnifiedEmbedding,
     ) -> Result<Self, String> {
-        let fc = Linear::from_weights(weights, "fc")?;
+        let fc = quantized_draft_linear(weights, "fc")?;
         let hidden_norm_w = weights
             .get("hidden_norm.weight")
             .map(|w| mlxcel_core::copy(w))
@@ -1413,7 +1452,6 @@ impl Qwen35Dflash2Generator {
             if bs <= 1 {
                 break;
             }
-            let proposal_count = bs - 1;
             let phase_start = Instant::now();
 
             // Reuse the host block buffer; only the staged anchor changes.
