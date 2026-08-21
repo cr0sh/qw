@@ -1,12 +1,47 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mlxcel_core::generate::ModelStateSnapshot;
 
 use super::*;
+
+#[derive(Clone)]
+struct InfoCounter(Arc<AtomicUsize>);
+
+impl tracing::Subscriber for InfoCounter {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        *metadata.level() <= tracing::Level::INFO
+    }
+
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        Some(tracing::level_filters::LevelFilter::INFO)
+    }
+
+    fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+    fn event(&self, event: &tracing::Event<'_>) {
+        if *event.metadata().level() == tracing::Level::INFO {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn enter(&self, _span: &tracing::span::Id) {}
+
+    fn exit(&self, _span: &tracing::span::Id) {}
+
+    fn clone_span(&self, span: &tracing::span::Id) -> tracing::span::Id {
+        span.clone()
+    }
+}
 
 const NAMESPACE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const MTP_NAMESPACE: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
@@ -687,4 +722,39 @@ fn resume_record_survives_persistent_restart_and_is_removed_on_take() {
             .is_empty(),
         "taking a resume checkpoint removes persistent one-shot state"
     );
+}
+
+#[test]
+fn cache_block_churn_emits_no_info_events() {
+    let info_events = Arc::new(AtomicUsize::new(0));
+    let subscriber = InfoCounter(Arc::clone(&info_events));
+
+    tracing::subscriber::with_default(subscriber, || {
+        let mut cache =
+            AdaptivePrefixCache::new(namespaces(), memory_config(1)).expect("short cache");
+        let before_short = info_events.load(Ordering::Relaxed);
+        cache.insert(
+            &[1],
+            vec![snapshot(1, &[1.0])],
+            SnapshotRoute::Baseline,
+        );
+        let short_events = info_events.load(Ordering::Relaxed) - before_short;
+
+        let mut cache =
+            AdaptivePrefixCache::new(namespaces(), memory_config(1)).expect("long cache");
+        let before_long = info_events.load(Ordering::Relaxed);
+        cache.insert(
+            &[1, 2, 3, 4],
+            vec![
+                snapshot(1, &[1.0]),
+                snapshot(2, &[2.0]),
+                snapshot(3, &[3.0]),
+                snapshot(4, &[4.0]),
+            ],
+            SnapshotRoute::Baseline,
+        );
+        let long_events = info_events.load(Ordering::Relaxed) - before_long;
+
+        assert_eq!((short_events, long_events), (0, 0));
+    });
 }
