@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use mlxcel_core::cache::KVCacheMode;
@@ -11,7 +11,7 @@ use mlxcel_core::generate::{
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use tokenizers::Tokenizer;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::chat_template::ChatTemplateProcessor;
 pub use crate::chat_template::{
@@ -24,12 +24,48 @@ use crate::qwen_vl_merge::merge_llava;
 use crate::qwen_vl_position::compute_rope_index;
 use crate::qwen_vl_processor::{PreparedImage, QwenVLProcessor};
 use crate::qwen3_5::Qwen35Model;
-use crate::qwen3_5_mtp::Qwen35MtpGenerator;
-pub use crate::qwen3_5_mtp::{MtpGenerationStats, MtpPrefixReuse, MtpPromptSnapshot};
 #[cfg(any(feature = "dflash2", test))]
 pub use crate::qwen3_5_dflash::Dflash2GenerationStats;
+use crate::qwen3_5_mtp::Qwen35MtpGenerator;
+pub use crate::qwen3_5_mtp::{MtpGenerationStats, MtpPrefixReuse, MtpPromptSnapshot};
 
 const DEFAULT_MTP_BLOCK_SIZE: usize = 3;
+
+fn tokens_per_second(tokens: usize, elapsed: Duration) -> f64 {
+    let seconds = elapsed.as_secs_f64();
+    if seconds > 0.0 {
+        tokens as f64 / seconds
+    } else {
+        0.0
+    }
+}
+
+fn log_generation_metrics(
+    route: &'static str,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    cached_tokens: usize,
+    prefill_time: Duration,
+    decode_time: Duration,
+) {
+    let prefill_tokens = prompt_tokens.saturating_sub(cached_tokens);
+    info!(
+        phase = "generation.prefill",
+        route,
+        prompt_tokens,
+        cached_tokens,
+        prefill_tokens,
+        elapsed_ms = prefill_time.as_secs_f64() * 1_000.0,
+        tokens_per_second = tokens_per_second(prefill_tokens, prefill_time),
+    );
+    info!(
+        phase = "generation.decode",
+        route,
+        completion_tokens,
+        elapsed_ms = decode_time.as_secs_f64() * 1_000.0,
+        tokens_per_second = tokens_per_second(completion_tokens, decode_time),
+    );
+}
 
 #[derive(Debug, Clone)]
 pub struct GenerationRequest {
@@ -70,8 +106,9 @@ pub struct BaselineGeneration {
     pub finish_outcome: GenerationStopReason,
     pub prompt_snapshots: Vec<PromptSnapshot>,
     pub final_snapshot: Option<PromptSnapshot>,
-    /// Wall time strictly after the first sampled token.
-    #[doc(hidden)]
+    /// Wall time spent processing uncached prompt tokens.
+    pub prefill_time: Duration,
+    /// Wall time spent sampling and forwarding generated tokens.
     pub decode_time: Duration,
 }
 
@@ -511,7 +548,6 @@ impl Qwen35Provider {
         let mut decoder = IncrementalTextDecoder::new(&self.tokenizer);
         let mut decode_error = None;
         let mut callback_active = true;
-        let mut decode_start = None;
         let controlled: ControlledGeneration = self
             .generator
             .generate_streaming_controlled(
@@ -523,7 +559,6 @@ impl Qwen35Provider {
                 constraint,
                 checkpoint_token_lengths,
                 |token_id| {
-                    decode_start.get_or_insert_with(Instant::now);
                     if buffer_output {
                         callback_active = on_delta("");
                         return callback_active;
@@ -565,8 +600,17 @@ impl Qwen35Provider {
         }
         let text = decoder.emitted;
         let completion_tokens = controlled.token_ids.len();
-        let decode_time = decode_start.map_or(Duration::ZERO, |start| start.elapsed());
-        info!(
+        let prefill_time = controlled.prefill_time;
+        let decode_time = controlled.decode_time;
+        log_generation_metrics(
+            "baseline",
+            prompt_ids.len(),
+            completion_tokens,
+            controlled.cached_tokens,
+            prefill_time,
+            decode_time,
+        );
+        debug!(
             phase = "model.complete",
             prompt_tokens = prompt_ids.len(),
             completion_tokens,
@@ -587,6 +631,7 @@ impl Qwen35Provider {
                 .map(PromptSnapshot::Baseline)
                 .collect(),
             final_snapshot: controlled.final_snapshot.map(PromptSnapshot::Baseline),
+            prefill_time,
             decode_time,
         })
     }
@@ -616,7 +661,6 @@ impl Qwen35Provider {
         let mut callback_active = true;
         let mut decoder = IncrementalTextDecoder::new(&self.tokenizer);
         let mut decode_error = None;
-        let mut decode_start = None;
         let controlled = self
             .generator
             .generate_streaming_controlled_with_embeddings(
@@ -629,7 +673,6 @@ impl Qwen35Provider {
                 sampling,
                 constraint,
                 |token_id| {
-                    decode_start.get_or_insert_with(Instant::now);
                     if buffer_output {
                         callback_active = on_delta("");
                         return callback_active;
@@ -666,7 +709,17 @@ impl Qwen35Provider {
             }
         }
         let completion_tokens = controlled.token_ids.len();
-        info!(
+        let prefill_time = controlled.prefill_time;
+        let decode_time = controlled.decode_time;
+        log_generation_metrics(
+            "multimodal",
+            prefill.prompt_ids.len(),
+            completion_tokens,
+            0,
+            prefill_time,
+            decode_time,
+        );
+        debug!(
             phase = "model.complete",
             prompt_tokens = prefill.prompt_ids.len(),
             completion_tokens,
@@ -682,7 +735,8 @@ impl Qwen35Provider {
             finish_outcome: controlled.stop_reason,
             prompt_snapshots: Vec::new(),
             final_snapshot: None,
-            decode_time: decode_start.map_or(Duration::ZERO, |start| start.elapsed()),
+            prefill_time,
+            decode_time,
         })
     }
 
@@ -778,16 +832,22 @@ impl Qwen35Provider {
         if let Some(error) = decode_error {
             return Err(error);
         }
-        let final_delta = decoder.finish()?;
-        if !final_delta.is_empty() {
-            let _ = on_delta(&final_delta);
-        }
+        let completion_tokens = generation.token_ids.len();
+        let stats = generation.stats;
+        log_generation_metrics(
+            "dflash2",
+            prompt_ids.len(),
+            completion_tokens,
+            0,
+            stats.prefill_time,
+            stats.decode_time,
+        );
         Ok((
             GenerationOutput {
                 text: decoder.emitted,
                 token_ids: generation.token_ids,
             },
-            generation.stats,
+            stats,
         ))
     }
 
@@ -909,7 +969,17 @@ impl Qwen35Provider {
             }
         }
         let completion_tokens = generated.token_ids.len();
-        info!(
+        let prefill_time = generated.stats.prefill_time;
+        let decode_time = generated.stats.decode_time;
+        log_generation_metrics(
+            "mtp",
+            prompt_tokens,
+            completion_tokens,
+            generated.cached_tokens,
+            prefill_time,
+            decode_time,
+        );
+        debug!(
             phase = "model.complete",
             prompt_tokens,
             completion_tokens,
@@ -918,7 +988,7 @@ impl Qwen35Provider {
             mtp_proposed_draft_tokens = generated.stats.proposed_draft_tokens,
             mtp_accepted_draft_tokens = generated.stats.accepted_draft_tokens,
             mtp_acceptance_percentage = generated.stats.acceptance_percentage(),
-            mtp_decode_seconds = generated.stats.decode_time.as_secs_f64(),
+            mtp_decode_seconds = decode_time.as_secs_f64(),
             mtp_cache_clear_count = generated.stats.cache_clear_count,
             mtp_draft_seconds = generated.stats.draft_time.as_secs_f64(),
             mtp_target_verify_seconds = generated.stats.target_verify_time.as_secs_f64(),
@@ -944,7 +1014,8 @@ impl Qwen35Provider {
                     .map(PromptSnapshot::Mtp)
                     .collect(),
                 final_snapshot: generated.final_snapshot.map(PromptSnapshot::Mtp),
-                decode_time: generated.stats.decode_time,
+                prefill_time,
+                decode_time,
             },
             generated.stats,
         ))
@@ -1212,6 +1283,13 @@ fn load_generation_defaults(model_dir: &Path) -> Result<GenerationDefaults> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    #[test]
+    fn generation_metric_throughput_uses_elapsed_seconds() {
+        assert_eq!(tokens_per_second(25, Duration::from_millis(500)), 50.0);
+        assert_eq!(tokens_per_second(25, Duration::ZERO), 0.0);
+    }
 
     struct TestDir(PathBuf);
 

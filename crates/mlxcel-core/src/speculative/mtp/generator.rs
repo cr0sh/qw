@@ -141,7 +141,7 @@ impl MtpRoundDiagnostics {
         generated_tokens: usize,
         decode_time: Duration,
     ) {
-        tracing::info!(
+        tracing::debug!(
             block_size,
             prompt_tokens,
             generated_tokens,

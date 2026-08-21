@@ -25,6 +25,7 @@
 //! - Shared decode setup delegated to `crate::generation_policy`
 
 use std::borrow::Cow;
+use std::time::{Duration, Instant};
 
 use crate::cache::{CachePool, KVCacheMode, SequenceId};
 use crate::ffi;
@@ -261,6 +262,10 @@ pub struct ControlledGeneration {
     /// attached continuation logits.
     pub final_snapshot: Option<ModelStateSnapshot>,
     pub cached_tokens: usize,
+    /// Wall-clock time spent processing uncached prompt tokens.
+    pub prefill_time: Duration,
+    /// Wall-clock time spent sampling and forwarding generated tokens.
+    pub decode_time: Duration,
 }
 
 /// Exact-prefix state supplied to a controlled generation call.
@@ -1464,9 +1469,7 @@ impl CxxGenerator {
         let eos_tokens = merged_eos_token_ids(model.eos_token_ids(), &sampling.stop_token_ids);
         let sequence_id = SequenceId::from_raw(0);
 
-        let requested_cached_tokens = prefix_reuse
-            .as_ref()
-            .map_or(0, |reuse| reuse.cached_tokens);
+        let requested_cached_tokens = prefix_reuse.as_ref().map_or(0, |reuse| reuse.cached_tokens);
         let mut cached_tokens = 0;
         let mut cached_logits = None;
         if let Some(reuse) = prefix_reuse
@@ -1483,7 +1486,7 @@ impl CxxGenerator {
             }
         }
         let prefill_tokens = &prompt_tokens[cached_tokens..];
-        tracing::info!(
+        tracing::debug!(
             phase = "prefill.started",
             prompt_tokens = prompt_tokens.len(),
             requested_cached_tokens,
@@ -1493,6 +1496,7 @@ impl CxxGenerator {
         );
         let retain_prompt_snapshot = (!checkpoint_token_lengths.is_empty() || constraint.is_some())
             && model.supports_snapshot_reuse();
+        let prefill_start = Instant::now();
         let mut effective_checkpoint_lengths = checkpoint_token_lengths.to_vec();
         if constraint.is_some()
             && effective_checkpoint_lengths.last().copied() != Some(prompt_tokens.len())
@@ -1544,7 +1548,9 @@ impl CxxGenerator {
                 prompt_snapshots.push(snapshot);
             }
         }
+        let prefill_time = prefill_start.elapsed();
         ffi::clear_memory_cache();
+        let decode_start = Instant::now();
 
         let needs_history = sampling.needs_token_history() || constraint.is_some();
         let mut token_history = initial_token_history(prompt_tokens, needs_history);
@@ -1689,6 +1695,7 @@ impl CxxGenerator {
                 aligned_token_len = final_token_len;
             }
         }
+        let decode_time = decode_start.elapsed();
 
         let final_snapshot = (!self.generated_tokens.is_empty() && model.supports_snapshot_reuse())
             .then(|| model.snapshot_sequence_state(sequence_id, aligned_token_len))
@@ -1704,13 +1711,14 @@ impl CxxGenerator {
                 .binary_search(&snapshot.token_len())
                 .is_ok()
         });
-
         Ok(ControlledGeneration {
             token_ids: self.generated_tokens.clone(),
             stop_reason,
             prompt_snapshots,
             final_snapshot,
             cached_tokens,
+            prefill_time,
+            decode_time,
         })
     }
 
@@ -1774,6 +1782,7 @@ impl CxxGenerator {
             }
         }
 
+        let prefill_start = Instant::now();
         let prefill_tokens = &prompt_tokens[cached_tokens..];
         let mut logits = if let Some(logits) = cached_logits {
             logits
@@ -1814,6 +1823,8 @@ impl CxxGenerator {
             );
         }
         ffi::clear_memory_cache();
+        let prefill_time = prefill_start.elapsed();
+        let decode_start = Instant::now();
 
         let needs_history = sampling.needs_token_history() || constraint.is_some();
         let mut token_history = initial_token_history(prompt_tokens, needs_history);
@@ -1929,17 +1940,18 @@ impl CxxGenerator {
             if replay {
                 continue;
             }
-
             let next_input = ffi::reshape_token_for_forward(&token);
             logits = model.forward_last_logits(&next_input, &mut self.caches, None, 0);
         }
-
+        let decode_time = decode_start.elapsed();
         Ok(ControlledGeneration {
             token_ids: self.generated_tokens.clone(),
             stop_reason,
             prompt_snapshots: Vec::new(),
             final_snapshot: None,
             cached_tokens,
+            prefill_time,
+            decode_time,
         })
     }
 
