@@ -70,6 +70,15 @@ fn quantized_draft_linear(
     let dense = weights
         .get(&weight_name)
         .ok_or_else(|| format!("Weight not found: {weight_name}"))?;
+    let dense_shape = mlxcel_core::array_shape(dense);
+    if dense_shape.last().copied().unwrap_or_default() % DRAFT_QUANT_GROUP_SIZE != 0 {
+        return UnifiedLinear::from_weights(
+            weights,
+            prefix,
+            DRAFT_QUANT_GROUP_SIZE,
+            DRAFT_QUANT_BITS,
+        );
+    }
     let quantized =
         mlxcel_core::quantize_weights(dense, DRAFT_QUANT_GROUP_SIZE, DRAFT_QUANT_BITS);
     let weight = mlxcel_core::quantized_weights_w(&quantized);
