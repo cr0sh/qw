@@ -34,7 +34,7 @@ impl Default for SpecPrefillConfig {
     fn default() -> Self {
         Self {
             min_tokens: 8192,
-            keep_rate: 0.20,
+            keep_rate: 0.25,
             protected_prefix_tokens: 0,
         }
     }
@@ -246,6 +246,7 @@ mod tests {
 
     #[test]
     fn specprefill_config_validation() {
+        assert_eq!(SpecPrefillConfig::default().keep_rate, 0.25);
         assert!(SpecPrefillConfig { min_tokens: 0, ..Default::default() }.validate(10).is_err());
         assert!(SpecPrefillConfig { keep_rate: 0.0, ..Default::default() }.validate(10).is_err());
         assert!(SpecPrefillConfig { keep_rate: 1.01, ..Default::default() }.validate(10).is_err());

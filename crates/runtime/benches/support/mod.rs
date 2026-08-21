@@ -59,7 +59,7 @@ pub fn load_provider() -> Qwen35Provider {
 }
 
 #[allow(dead_code)]
-pub fn prompt_tokens(provider: &Qwen35Provider) -> usize {
+pub fn prompt_token_ids(provider: &Qwen35Provider) -> Vec<i32> {
     provider
         .tokenize_messages(
             &[ChatMessage {
@@ -75,7 +75,6 @@ pub fn prompt_tokens(provider: &Qwen35Provider) -> usize {
             true,
         )
         .expect("tokenize single-user benchmark prompt")
-        .len()
 }
 
 /// Resolve the DFlash2 drafter directory: `QW_BENCH_DRAFT_MODEL` when set,

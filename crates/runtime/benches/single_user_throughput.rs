@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use qw_runtime::provider::Qwen35GenerationMode;
-use support::{MTP_BLOCK_SIZE, prepare_decode_fixture, prompt_tokens};
+use qw_runtime::{PrefillMode, SpecPrefillConfig};
+use support::{MTP_BLOCK_SIZE, prepare_decode_fixture, prompt_token_ids};
 
 struct GenerationElements {
     prefill: u64,
@@ -45,8 +46,8 @@ fn token_edit_distance(left: &[i32], right: &[i32]) -> usize {
 
 fn single_user_throughput(criterion: &mut Criterion) {
     let mut provider = support::load_provider();
-    let prompt_tokens = prompt_tokens(&provider);
-
+    let prefill_prompt_ids = prompt_token_ids(&provider);
+    let prompt_tokens = prefill_prompt_ids.len();
     let prefill_request = support::request(1);
     let (prefill_output, _) = provider
         .generate_streaming_in_mode(&prefill_request, Qwen35GenerationMode::Automatic, |delta| {
@@ -57,6 +58,38 @@ fn single_user_throughput(criterion: &mut Criterion) {
     assert!(!prefill_output.token_ids.is_empty());
     let prefill_elements =
         generation_elements(1, prompt_tokens, prefill_output.token_ids.len()).prefill;
+    let specprefill_sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
+    let specprefill_config = SpecPrefillConfig {
+        min_tokens: 1,
+        keep_rate: 0.25,
+        protected_prefix_tokens: 0,
+    };
+    let specprefill_warmup = provider
+        .generate_baseline_streaming(
+            &prefill_prompt_ids,
+            1,
+            &specprefill_sampling,
+            None,
+            None,
+            &[],
+            PrefillMode::SpecPrefill(specprefill_config),
+            |delta| {
+                black_box(delta);
+                true
+            },
+        )
+        .expect("warm up single-user SpecPrefill");
+    let specprefill_token_ids = specprefill_warmup.token_ids.clone();
+    let specprefill_stats = specprefill_warmup
+        .specprefill_stats
+        .as_ref()
+        .expect("SpecPrefill warmup must activate sparse admission");
+    assert!(specprefill_stats.eligible_target_tokens > specprefill_config.min_tokens);
+    assert!(specprefill_stats.selected_target_tokens > 0);
+    assert!(
+        specprefill_stats.selected_target_tokens <= specprefill_stats.eligible_target_tokens
+    );
+    black_box(specprefill_warmup);
 
     {
         let mut group = criterion.benchmark_group("single_user_prefill");
@@ -75,6 +108,34 @@ fn single_user_throughput(criterion: &mut Criterion) {
                     .expect("benchmark single-user prefill")
                     .0;
                 assert_eq!(output.token_ids, prefill_output.token_ids);
+                black_box(output);
+            });
+        });
+        group.bench_function("specprefill", |bencher| {
+            bencher.iter(|| {
+                let output = provider
+                    .generate_baseline_streaming(
+                        &prefill_prompt_ids,
+                        1,
+                        &specprefill_sampling,
+                        None,
+                        None,
+                        &[],
+                        PrefillMode::SpecPrefill(specprefill_config),
+                        |delta| {
+                            black_box(delta);
+                            true
+                        },
+                    )
+                    .expect("benchmark single-user SpecPrefill");
+                assert_eq!(output.token_ids, specprefill_token_ids);
+                let stats = output
+                    .specprefill_stats
+                    .as_ref()
+                    .expect("SpecPrefill benchmark must activate sparse admission");
+                assert!(stats.eligible_target_tokens > specprefill_config.min_tokens);
+                assert!(stats.selected_target_tokens > 0);
+                assert!(stats.selected_target_tokens <= stats.eligible_target_tokens);
                 black_box(output);
             });
         });
