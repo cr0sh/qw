@@ -725,10 +725,9 @@ fn materialize_detached(array: UniquePtr<MlxArray>) -> UniquePtr<MlxArray> {
 fn mtp_round_reaches_cache_clear(previous: usize, emitted: usize, interval: usize) -> bool {
     mlxcel_core::memory::should_clear_cache_crossing(previous, emitted, interval)
 }
-/// Number of target tokens to retain when a speculative round did not emit
-/// the bonus token, such as the final max-token round.
-fn target_cache_accepted_count(accepted: usize, emitted: usize) -> usize {
-    accepted.saturating_sub(usize::from(emitted <= accepted))
+/// Number of target tokens to retain before the emitted round bonus.
+fn target_cache_accepted_count(emitted: usize) -> usize {
+    emitted.saturating_sub(1)
 }
 
 const MTP_STATE_MATERIALIZE_INTERVAL: usize = 128;
@@ -1855,6 +1854,13 @@ fn rebuild_mtp_state(
     })
 }
 
+fn aligned_terminal_verify_row(emitted_in_round: usize) -> Result<i32, String> {
+    let aligned = emitted_in_round
+        .checked_sub(1)
+        .ok_or_else(|| "MTP final snapshot requires an emitted token".to_string())?;
+    i32::try_from(aligned).map_err(|_| "MTP final snapshot verify row exceeds i32".to_string())
+}
+
 fn capture_mtp_snapshot_from_verify(
     model: &Qwen35Model,
     drafter: &Qwen35MtpDraftModel,
@@ -1862,25 +1868,30 @@ fn capture_mtp_snapshot_from_verify(
     generated_tokens: usize,
     verify_hidden: &MlxArray,
     verify_logits: &MlxArray,
-    accepted: usize,
+    compact_logits: bool,
+    emitted_in_round: usize,
 ) -> Result<MtpPromptSnapshot, String> {
     let token_len = prompt_tokens
         .checked_add(generated_tokens)
         .and_then(|length| length.checked_sub(1))
         .ok_or_else(|| "MTP final snapshot requires generated tokens".to_string())?;
-    let aligned = i32::try_from(accepted).unwrap_or(i32::MAX);
+    let aligned = aligned_terminal_verify_row(emitted_in_round)?;
     let hidden_shape = mlxcel_core::array_shape(verify_hidden);
     let last_hidden = mlxcel_core::slice(
         verify_hidden,
         &[0, aligned, 0],
         &[hidden_shape[0], aligned + 1, hidden_shape[2]],
     );
-    let logits_shape = mlxcel_core::array_shape(verify_logits);
-    let continuation_logits = mlxcel_core::slice(
-        verify_logits,
-        &[0, aligned, 0],
-        &[logits_shape[0], aligned + 1, logits_shape[2]],
-    );
+    let continuation_logits = if compact_logits {
+        model.project_mtp_continuation_logits(&last_hidden)
+    } else {
+        let logits_shape = mlxcel_core::array_shape(verify_logits);
+        mlxcel_core::slice(
+            verify_logits,
+            &[0, aligned, 0],
+            &[logits_shape[0], aligned + 1, logits_shape[2]],
+        )
+    };
     model.materialize_mtp_cache_state();
     let target = model
         .snapshot_sequence_state(mlxcel_core::cache::SequenceId::from_raw(0), token_len)
@@ -2223,8 +2234,7 @@ impl Qwen35MtpGenerator {
                     && sampling.xtc_probability == 0.0
                     && remaining > block_size;
                 let phase_start = Instant::now();
-                let verify =
-                    model.forward_mtp_verify_with_compact(&verify_input, compact_verify);
+                let verify = model.forward_mtp_verify_with_compact(&verify_input, compact_verify);
                 mlxcel_core::eval(&verify.logits);
                 mtp_stats.target_verify_time += phase_start.elapsed();
                 mtp_stats.target_forward_calls += 1;
@@ -2261,12 +2271,12 @@ impl Qwen35MtpGenerator {
                     &mut history,
                     &mut on_token,
                 );
+                let emitted_in_round = generated.len() - emitted_before;
                 if let Some(reason) = round_stop_reason {
                     stop_reason = reason;
                 }
 
-                let rollback_accepted =
-                    target_cache_accepted_count(walk.accepted, walk.new_tokens.len());
+                let rollback_accepted = target_cache_accepted_count(emitted_in_round);
                 if rollback_accepted < draft_tokens.len() {
                     model.rollback_mtp_verify(
                         &verify.gdn_states,
@@ -2290,23 +2300,20 @@ impl Qwen35MtpGenerator {
                     walk.accepted,
                     &walk.new_tokens,
                 );
-                let can_capture_round_snapshot = !compact_verify
+                let can_capture_round_snapshot = matches!(prefill_input, MtpPrefill::Text { .. })
                     && round_stop_reason.is_some()
-                    && generated.len() - emitted_before == walk.new_tokens.len();
+                    && emitted_in_round > 0;
                 if can_capture_round_snapshot {
-                    let final_snapshot = if matches!(prefill_input, MtpPrefill::Text { .. }) {
-                        Some(capture_mtp_snapshot_from_verify(
-                            model,
-                            drafter,
-                            prompt_tokens.len(),
-                            generated.len(),
-                            &verify.hidden,
-                            &verify.logits,
-                            walk.accepted,
-                        )?)
-                    } else {
-                        None
-                    };
+                    let final_snapshot = Some(capture_mtp_snapshot_from_verify(
+                        model,
+                        drafter,
+                        prompt_tokens.len(),
+                        generated.len(),
+                        &verify.hidden,
+                        &verify.logits,
+                        compact_verify,
+                        emitted_in_round,
+                    )?);
                     mtp_stats.reconcile_time += phase_start.elapsed();
                     mtp_stats.decode_time = decode_start.elapsed();
                     return Ok(MtpGeneration {
@@ -3077,9 +3084,21 @@ mod tests {
 
     #[test]
     fn final_budget_round_rolls_back_unemitted_bonus() {
-        assert_eq!(target_cache_accepted_count(2, 3), 2);
-        assert_eq!(target_cache_accepted_count(2, 2), 1);
-        assert_eq!(target_cache_accepted_count(0, 1), 0);
+        assert_eq!(target_cache_accepted_count(3), 2);
+        assert_eq!(target_cache_accepted_count(2), 1);
+        assert_eq!(target_cache_accepted_count(1), 0);
+    }
+
+    #[test]
+    fn terminal_snapshot_alignment_uses_emitted_tokens() {
+        // Full accepted round including its bonus.
+        assert_eq!(aligned_terminal_verify_row(3), Ok(2));
+        // EOS is recognized before it can be emitted.
+        assert_eq!(aligned_terminal_verify_row(2), Ok(1));
+        // Max-token truncation leaves one emitted token.
+        assert_eq!(aligned_terminal_verify_row(1), Ok(0));
+        // A round that emitted only EOS cannot donate a snapshot.
+        assert!(aligned_terminal_verify_row(0).is_err());
     }
 
     #[test]

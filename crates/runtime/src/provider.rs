@@ -1318,7 +1318,8 @@ mod tests {
     #[test]
     #[ignore = "requires the real bundled-MTP checkpoint at QW_MODEL_PATH or the default model cache path"]
     fn real_model_baseline_and_mtp_greedy_outputs_match() {
-        let model_dir = crate::resolve_model_path(None).expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
+        let model_dir = crate::resolve_model_path(None)
+            .expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
         let mut provider =
             Qwen35Provider::load(&model_dir, KVCacheMode::Fp16).expect("load real Qwen checkpoint");
         let request = GenerationRequest {
@@ -1353,7 +1354,8 @@ mod tests {
     #[test]
     #[ignore = "requires the real bundled-MTP checkpoint at QW_MODEL_PATH or the default model cache path"]
     fn real_model_mtp_prefix_reuse_matches_cold_and_reduces_ttft() {
-        let model_dir = crate::resolve_model_path(None).expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
+        let model_dir = crate::resolve_model_path(None)
+            .expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
         let mut provider = Qwen35Provider::load(&model_dir, KVCacheMode::Turbo4)
             .expect("load real bundled-MTP checkpoint");
         let base = provider
@@ -1473,7 +1475,8 @@ mod tests {
     #[test]
     #[ignore = "requires the real bundled-MTP checkpoint at QW_MODEL_PATH or the default model cache path"]
     fn real_model_mtp_prefix_reuse_covers_reasoning_and_plain_history() {
-        let model_dir = crate::resolve_model_path(None).expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
+        let model_dir = crate::resolve_model_path(None)
+            .expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
         let mut provider = Qwen35Provider::load(&model_dir, KVCacheMode::Turbo4)
             .expect("load real bundled-MTP checkpoint");
         let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
@@ -1593,7 +1596,8 @@ mod tests {
     #[test]
     #[ignore = "requires the real bundled-MTP checkpoint at QW_MODEL_PATH or the default model cache path"]
     fn real_model_mtp_max_output_has_bounded_terminal_tail() {
-        let model_dir = crate::resolve_model_path(None).expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
+        let model_dir = crate::resolve_model_path(None)
+            .expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
         let mut provider = Qwen35Provider::load(&model_dir, KVCacheMode::Turbo4)
             .expect("load real bundled-MTP checkpoint");
         let prompt = provider
@@ -1628,12 +1632,11 @@ mod tests {
                 },
             )
             .expect("long MTP generation");
-        let tail = last_callback.expect("long generation emitted a token").elapsed();
+        let tail = last_callback
+            .expect("long generation emitted a token")
+            .elapsed();
         assert_eq!(callback_count, 1024);
-        assert_eq!(
-            generated.finish_outcome,
-            GenerationStopReason::MaxTokens
-        );
+        assert_eq!(generated.finish_outcome, GenerationStopReason::MaxTokens);
         eprintln!(
             "MTP terminal-tail benchmark: completion_tokens={}, callbacks={}, tail_ms={:.2}",
             generated.completion_tokens,
@@ -1648,8 +1651,149 @@ mod tests {
 
     #[test]
     #[ignore = "requires the real bundled-MTP checkpoint at QW_MODEL_PATH or the default model cache path"]
+    fn real_model_mtp_eos_has_bounded_terminal_tail_and_resumable_snapshot() {
+        let model_dir = crate::resolve_model_path(None)
+            .expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
+        let mut provider = Qwen35Provider::load(&model_dir, KVCacheMode::Turbo4)
+            .expect("load real MTP checkpoint");
+        let prompt = provider
+            .tokenizer
+            .encode(
+                "Continue this deterministic numbered sequence with one number per line: \
+                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10.",
+                true,
+            )
+            .expect("encode deterministic MTP prompt");
+        let prompt_ids = prompt
+            .get_ids()
+            .iter()
+            .map(|&token| token as i32)
+            .collect::<Vec<_>>();
+        let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
+        let mut generator = provider
+            .mtp_generator
+            .take()
+            .expect("real checkpoint must contain an MTP generator");
+        let control = generator
+            .generate_streaming(
+                &provider.model,
+                &prompt_ids,
+                96,
+                &sampling,
+                DEFAULT_MTP_BLOCK_SIZE,
+                None,
+                &[],
+                None,
+                |_| true,
+            )
+            .expect("generate deterministic greedy control sequence");
+        let candidate = control
+            .token_ids
+            .iter()
+            .enumerate()
+            .skip(4)
+            .find_map(|(index, &token)| {
+                (!control.token_ids[..index].contains(&token)).then_some((index, token))
+            })
+            .or_else(|| {
+                control
+                    .token_ids
+                    .iter()
+                    .enumerate()
+                    .skip(1)
+                    .find_map(|(index, &token)| {
+                        (!control.token_ids[..index].contains(&token)).then_some((index, token))
+                    })
+            })
+            .expect("control sequence must contain a stop-token candidate after its first token");
+        let (candidate_index, candidate_token) = candidate;
+        assert!(candidate_index > 0);
+
+        let mut stop_sampling = sampling.clone();
+        stop_sampling.stop_token_ids = vec![candidate_token];
+        let mut callback_tokens = Vec::new();
+        let mut last_callback = None;
+        let stopped = generator
+            .generate_streaming(
+                &provider.model,
+                &prompt_ids,
+                96,
+                &stop_sampling,
+                DEFAULT_MTP_BLOCK_SIZE,
+                None,
+                &[],
+                None,
+                |token| {
+                    callback_tokens.push(token);
+                    last_callback = Some(Instant::now());
+                    true
+                },
+            )
+            .expect("generate until selected stop token");
+        let terminal_tail = last_callback
+            .expect("stop-token generation must emit a visible token")
+            .elapsed();
+
+        assert_eq!(stopped.stop_reason, GenerationStopReason::Eos);
+        assert_eq!(stopped.token_ids, control.token_ids[..candidate_index]);
+        assert!(!callback_tokens.contains(&candidate_token));
+        assert!(!stopped.token_ids.contains(&candidate_token));
+        assert!(
+            terminal_tail < Duration::from_secs(10),
+            "terminal snapshot must not replay the prompt: tail={terminal_tail:?}"
+        );
+        let snapshot = stopped
+            .final_snapshot
+            .expect("stop-token generation must return a final MTP snapshot");
+        assert_eq!(
+            snapshot.token_len(),
+            prompt_ids.len() + stopped.token_ids.len() - 1
+        );
+
+        let mut completed_prompt = prompt_ids.clone();
+        completed_prompt.extend_from_slice(&stopped.token_ids);
+        let resume_sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
+        let cold = generator
+            .generate_streaming(
+                &provider.model,
+                &completed_prompt,
+                8,
+                &resume_sampling,
+                DEFAULT_MTP_BLOCK_SIZE,
+                None,
+                &[],
+                None,
+                |_| true,
+            )
+            .expect("cold greedy continuation");
+        let warm = generator
+            .generate_streaming(
+                &provider.model,
+                &completed_prompt,
+                8,
+                &resume_sampling,
+                DEFAULT_MTP_BLOCK_SIZE,
+                Some(MtpPrefixReuse {
+                    snapshot: &snapshot,
+                    cached_tokens: snapshot.token_len(),
+                    continuation_token: stopped.token_ids.last().copied(),
+                }),
+                &[],
+                None,
+                |_| true,
+            )
+            .expect("snapshot-resumed greedy continuation");
+        assert_eq!(
+            warm.token_ids, cold.token_ids,
+            "terminal MTP snapshot must preserve the next greedy tokens"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the real bundled-MTP checkpoint at QW_MODEL_PATH or the default model cache path"]
     fn real_model_cancelled_mtp_snapshot_portable_resume_matches_uninterrupted_greedy() {
-        let model_dir = crate::resolve_model_path(None).expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
+        let model_dir = crate::resolve_model_path(None)
+            .expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
         let mut provider = Qwen35Provider::load(&model_dir, KVCacheMode::Turbo4)
             .expect("load real bundled-MTP checkpoint");
         let messages = vec![

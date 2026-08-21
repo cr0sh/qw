@@ -384,13 +384,7 @@ fn fuse_gated_aux_projections(
         );
         let biases = concatenate(&concatenate(biases[0], biases[1], 0), biases[2], 0);
         Some(UnifiedLinear::new(
-            QuantizedWeight::new(
-                weight,
-                scales,
-                biases,
-                z_weight.group_size,
-                z_weight.bits,
-            ),
+            QuantizedWeight::new(weight, scales, biases, z_weight.group_size, z_weight.bits),
             None,
         ))
     })();
@@ -942,15 +936,18 @@ impl Qwen35Model {
             self.embed_tokens.as_linear(hidden)
         }
     }
+    pub(crate) fn project_mtp_continuation_logits(
+        &self,
+        hidden_row: &MlxArray,
+    ) -> UniquePtr<MlxArray> {
+        self.project_logits(&self.norm.forward(hidden_row))
+    }
 
     pub(crate) fn project_draft_logits(&self, hidden: &MlxArray) -> UniquePtr<MlxArray> {
         self.project_compact_logits(hidden, &self.compact_draft_head, MTP_DRAFT_PREFIX)
     }
 
-    pub(crate) fn project_dflash_verify_logits(
-        &self,
-        hidden: &MlxArray,
-    ) -> UniquePtr<MlxArray> {
+    pub(crate) fn project_dflash_verify_logits(&self, hidden: &MlxArray) -> UniquePtr<MlxArray> {
         self.project_compact_logits(
             hidden,
             &self.compact_dflash_verify_head,
@@ -1872,12 +1869,7 @@ impl Qwen35Model {
             )?)
         };
         let compact_draft_head = lm_head.as_ref().and_then(|head| {
-            compact_head(
-                head,
-                config.vocab_size,
-                MTP_DRAFT_PREFIX,
-                MTP_DRAFT_PADDED,
-            )
+            compact_head(head, config.vocab_size, MTP_DRAFT_PREFIX, MTP_DRAFT_PADDED)
         });
         let compact_dflash_verify_head = lm_head.as_ref().and_then(|head| {
             compact_head(
@@ -3041,7 +3033,8 @@ mod tests {
     #[test]
     #[ignore = "requires the real dense Qwen3.5 checkpoint at QW_MODEL_PATH or the default model cache path"]
     fn restored_mixed_target_snapshot_matches_uninterrupted_next_token_and_text() {
-        let model_dir = crate::resolve_model_path(None).expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
+        let model_dir = crate::resolve_model_path(None)
+            .expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
         let tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
             .expect("load tokenizer");
         let model = Qwen35Model::load(&model_dir, KVCacheMode::Fp16).expect("load Qwen3.5 model");
