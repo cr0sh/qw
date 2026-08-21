@@ -1404,6 +1404,8 @@ impl Qwen35Dflash2Generator {
             let _ = on_token(bonus);
         }
         let decode_start = Instant::now();
+        let mut draft_block =
+            vec![self.model.config.mask_token_id; self.block_size];
 
         while generated.len() < max_tokens {
             let remaining = max_tokens - generated.len();
@@ -1414,14 +1416,10 @@ impl Qwen35Dflash2Generator {
             let proposal_count = bs - 1;
             let phase_start = Instant::now();
 
-            // Propose a draft block over mask tokens: [bonus, mask, ..., mask].
-            let mut block = Vec::with_capacity(bs);
-            block.push(bonus);
-            block.extend(std::iter::repeat_n(
-                self.model.config.mask_token_id,
-                proposal_count,
-            ));
-            let inputs = mlxcel_core::from_slice_i32(&block, &[1, bs as i32]);
+            // Reuse the host block buffer; only the staged anchor changes.
+            draft_block[0] = bonus;
+            let inputs =
+                mlxcel_core::from_slice_i32(&draft_block[..bs], &[1, bs as i32]);
             let out = self
                 .model
                 .propose(&inputs, &hidden_concat, &mut self.caches, target)?;
