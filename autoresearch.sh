@@ -31,11 +31,11 @@ output="$(mktemp)"
 trap 'rm -f "$output"' EXIT
 
 CARGO_TERM_COLOR=never cargo bench -p qw-runtime --bench single_user_throughput -- \
-  'single_user_decode/dflash2$' --noplot 2>&1 | tee "$output"
+  'single_user_decode/mtp_k3$' --noplot 2>&1 | tee "$output"
 
 value="$(
   awk '
-    /^single_user_decode\/dflash2$/ { benchmark = 1; next }
+    /^single_user_decode\/mtp_k3$/ { benchmark = 1; next }
     benchmark && /^[[:space:]]*thrpt:/ && /elem\/s/ {
       print $4
       exit
@@ -44,7 +44,7 @@ value="$(
 )"
 edit_distance="$(
   awk '
-    /^DFLASH2_PROFILE / {
+    /^MTP_CORRECTNESS / {
       for (field = 1; field <= NF; field++) {
         if ($field ~ /^token_edit_distance=/) {
           split($field, parts, "=")
@@ -55,16 +55,34 @@ edit_distance="$(
     }
   ' "$output"
 )"
-
+acceptance="$(
+  awk '
+    /^MTP_PROFILE / {
+      for (field = 1; field <= NF; field++) {
+        if ($field ~ /^acceptance=/) {
+          split($field, parts, "=")
+          sub(/%$/, "", parts[2])
+          print parts[2]
+          exit
+        }
+      }
+    }
+  ' "$output"
+)"
 
 [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ ]] || {
-  echo "Failed to parse single_user_decode/dflash2 throughput" >&2
+  echo "Failed to parse single_user_decode/mtp_k3 throughput" >&2
   exit 1
 }
 [[ "$edit_distance" =~ ^[0-9]+$ ]] || {
-  echo "Failed to parse DFlash2 token edit distance" >&2
+  echo "Failed to parse MTP token edit distance" >&2
   exit 1
 }
-printf 'METRIC dflash2_decode_tokens_per_second=%s\n' "$value"
-printf 'METRIC dflash2_token_edit_distance=%s\n' "$edit_distance"
+[[ "$acceptance" =~ ^[0-9]+([.][0-9]+)?$ ]] || {
+  echo "Failed to parse MTP acceptance percentage" >&2
+  exit 1
+}
+printf 'METRIC mtp_k3_decode_tokens_per_second=%s\n' "$value"
+printf 'METRIC mtp_k3_token_edit_distance=%s\n' "$edit_distance"
+printf 'METRIC mtp_k3_acceptance_percentage=%s\n' "$acceptance"
 
