@@ -2034,7 +2034,7 @@ async fn cancelling_an_image_request_leaves_the_next_text_request_clean() {
     let mut text_submission = engine.submit(text_request).expect("submit text request");
     let record = loop {
         match text_submission.events.recv().await {
-            Some(WorkerEvent::Complete(record)) => break record,
+            Some(WorkerEvent::Complete { record, .. }) => break record,
             Some(WorkerEvent::Started(_) | WorkerEvent::Delta(_)) => {}
             Some(WorkerEvent::Failed(failure)) => panic!("text request failed: {failure:?}"),
             None => panic!("text request event channel closed"),
