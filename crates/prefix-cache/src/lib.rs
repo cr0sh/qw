@@ -383,7 +383,7 @@ impl AdaptivePrefixCache {
             }
         }
         let Some((node, token_count)) = hit else {
-            tracing::info!(phase = "cache.lookup", hit = false, route = route.as_str());
+            tracing::debug!(phase = "cache.lookup", hit = false, route = route.as_str());
             return None;
         };
         let (key, refresh_expiry) = {
@@ -408,7 +408,7 @@ impl AdaptivePrefixCache {
         if let (Some(key), Some(expiry)) = (key, refresh_expiry) {
             self.queue_refresh(key, expiry);
         }
-        tracing::info!(
+        tracing::debug!(
             phase = "cache.lookup",
             hit = true,
             route = route.as_str(),
@@ -486,7 +486,7 @@ impl AdaptivePrefixCache {
             self.try_io(IoCommand::Remove(key));
         }
         let snapshot = terminal.snapshot.ok_or(ResumeLookupError::NotFound)?;
-        tracing::info!(phase = "cache.resume", response_id, route = route.as_str());
+        tracing::debug!(phase = "cache.resume", response_id, route = route.as_str());
         Ok(ResumeEntry {
             token_ids,
             snapshot,
@@ -627,7 +627,7 @@ impl AdaptivePrefixCache {
                     response_resume: resume,
                 });
             }
-            tracing::info!(
+            tracing::debug!(
                 phase = "cache.insert",
                 route = route.as_str(),
                 token_count = token_len,
@@ -700,7 +700,7 @@ impl AdaptivePrefixCache {
                 terminal.response_resume = decoded.manifest.response_resume;
                 self.memory_bytes = self.memory_bytes.saturating_add(bytes);
                 self.evict_memory();
-                tracing::info!(
+                tracing::debug!(
                     phase = "cache.promote",
                     from = "filesystem",
                     to = "memory",
@@ -745,7 +745,7 @@ impl AdaptivePrefixCache {
                     if let Some(key) = terminal.persistent_key {
                         self.try_io(IoCommand::Remove(key));
                     }
-                    tracing::info!(phase = "cache.expire", route = route.as_str());
+                    tracing::debug!(phase = "cache.expire", route = route.as_str());
                 }
             }
         }
@@ -772,7 +772,7 @@ impl AdaptivePrefixCache {
             let terminal = self.trie.terminal_mut(node, route).unwrap();
             let snapshot = terminal.snapshot.take().unwrap();
             self.memory_bytes = self.memory_bytes.saturating_sub(snapshot.nbytes() as u64);
-            tracing::info!(
+            tracing::debug!(
                 phase = "cache.evict",
                 tier = "memory",
                 route = route.as_str()
@@ -807,7 +807,7 @@ impl AdaptivePrefixCache {
                 .filesystem_bytes
                 .saturating_sub(terminal.serialized_bytes);
             self.try_io(IoCommand::Remove(key));
-            tracing::info!(
+            tracing::debug!(
                 phase = "cache.evict",
                 tier = "filesystem",
                 route = route.as_str()
