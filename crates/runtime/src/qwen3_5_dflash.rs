@@ -1375,7 +1375,7 @@ impl Qwen35Dflash2Generator {
         Ok(Self {
             model,
             caches,
-            block_size: config.block_size,
+            block_size: 6,
             target_layer_ids: config.target_layer_ids.clone(),
             hidden_limit,
         })
