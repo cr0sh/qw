@@ -986,6 +986,7 @@ impl Qwen35Model {
         self.compact_draft_head.is_some()
     }
 
+    #[cfg(any(feature = "dflash2", test))]
     pub(crate) fn has_compact_dflash_verify_head(&self) -> bool {
         self.compact_dflash_verify_head.is_some()
     }

@@ -938,6 +938,7 @@ pub(crate) fn greedy_walk(
 
 /// Greedy verification with proposals retained on-device until the target
 /// posterior has been evaluated.
+#[cfg(any(feature = "dflash2", test))]
 pub(crate) fn greedy_walk_device_proposals(
     draft_tokens: &MlxArray,
     verify_logits: &MlxArray,
