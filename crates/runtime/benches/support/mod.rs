@@ -8,6 +8,8 @@ use qw_runtime::{
 
 pub const DECODE_MAX_TOKENS: usize = 128;
 pub const MTP_BLOCK_SIZE: usize = 3;
+pub const PREFILL_MIN_TOKENS: usize = 4_096;
+pub const PREFILL_MAX_TOKENS: usize = 6_000;
 /// Environment variable pointing at the DFlash2 drafter checkpoint
 /// directory (optional; defaults to the model cache path below).
 pub const DRAFT_MODEL_ENV: &str = "QW_BENCH_DRAFT_MODEL";
@@ -58,23 +60,37 @@ pub fn load_provider() -> Qwen35Provider {
         .unwrap_or_else(|error| panic!("failed to load {}: {error:#}", model_dir.display()))
 }
 
-#[allow(dead_code)]
 pub fn prompt_token_ids(provider: &Qwen35Provider) -> Vec<i32> {
-    provider
-        .tokenize_messages(
-            &[ChatMessage {
-                role: "user".to_owned(),
-                name: None,
-                content: Some(ChatMessageContent::Text(PROMPT.to_owned())),
-                reasoning_content: None,
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-            }],
-            &[],
-            None,
-            true,
-        )
-        .expect("tokenize single-user benchmark prompt")
+    let mut prompt = String::new();
+    for record_index in 1..=32 {
+        prompt.push_str(&format!(
+            "Operational record {record_index:02}\n{PROMPT}\n\n"
+        ));
+        let prompt_ids = provider
+            .tokenize_messages(
+                &[ChatMessage {
+                    role: "user".to_owned(),
+                    name: None,
+                    content: Some(ChatMessageContent::Text(prompt.clone())),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                }],
+                &[],
+                None,
+                true,
+            )
+            .expect("tokenize single-user prefill benchmark prompt");
+        if prompt_ids.len() >= PREFILL_MIN_TOKENS {
+            assert!(
+                prompt_ids.len() <= PREFILL_MAX_TOKENS,
+                "single-user prefill prompt has {} tokens, expected at most {PREFILL_MAX_TOKENS}",
+                prompt_ids.len()
+            );
+            return prompt_ids;
+        }
+    }
+    panic!("single-user prefill prompt did not reach {PREFILL_MIN_TOKENS} tokens");
 }
 
 /// Resolve the DFlash2 drafter directory: `QW_BENCH_DRAFT_MODEL` when set,

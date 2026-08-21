@@ -48,17 +48,29 @@ fn single_user_throughput(criterion: &mut Criterion) {
     let mut provider = support::load_provider();
     let prefill_prompt_ids = prompt_token_ids(&provider);
     let prompt_tokens = prefill_prompt_ids.len();
-    let prefill_request = support::request(1);
-    let (prefill_output, _) = provider
-        .generate_streaming_in_mode(&prefill_request, Qwen35GenerationMode::Automatic, |delta| {
-            black_box(delta);
-            true
-        })
-        .expect("warm up single-user prefill");
-    assert!(!prefill_output.token_ids.is_empty());
-    let prefill_elements =
-        generation_elements(1, prompt_tokens, prefill_output.token_ids.len()).prefill;
-    let specprefill_sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
+    let prefill_elements = generation_elements(1, prompt_tokens, 1).prefill;
+    let prefill_sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
+    let dense_warmup = provider
+        .generate_baseline_streaming(
+            &prefill_prompt_ids,
+            1,
+            &prefill_sampling,
+            None,
+            None,
+            &[],
+            PrefillMode::Dense,
+            |delta| {
+                black_box(delta);
+                true
+            },
+        )
+        .expect("warm up dense single-user prefill");
+    assert!(!dense_warmup.token_ids.is_empty());
+    assert!(
+        dense_warmup.specprefill_stats.is_none(),
+        "dense prefill warmup returned SpecPrefill statistics"
+    );
+    let dense_token_ids = dense_warmup.token_ids;
     let specprefill_config = SpecPrefillConfig {
         min_tokens: 1,
         keep_rate: 0.25,
@@ -68,7 +80,7 @@ fn single_user_throughput(criterion: &mut Criterion) {
         .generate_baseline_streaming(
             &prefill_prompt_ids,
             1,
-            &specprefill_sampling,
+            &prefill_sampling,
             None,
             None,
             &[],
@@ -87,7 +99,14 @@ fn single_user_throughput(criterion: &mut Criterion) {
     assert!(specprefill_stats.eligible_target_tokens > specprefill_config.min_tokens);
     assert!(specprefill_stats.selected_target_tokens > 0);
     assert!(
-        specprefill_stats.selected_target_tokens <= specprefill_stats.eligible_target_tokens
+        specprefill_stats.selected_target_tokens < specprefill_stats.eligible_target_tokens
+    );
+    assert!(
+        specprefill_stats.selected_target_tokens * 2
+            <= specprefill_stats.eligible_target_tokens,
+        "SpecPrefill selected {} of {} eligible target tokens",
+        specprefill_stats.selected_target_tokens,
+        specprefill_stats.eligible_target_tokens
     );
     black_box(specprefill_warmup);
 
@@ -97,17 +116,25 @@ fn single_user_throughput(criterion: &mut Criterion) {
         group.bench_function("qwen", |bencher| {
             bencher.iter(|| {
                 let output = provider
-                    .generate_streaming_in_mode(
-                        &prefill_request,
-                        Qwen35GenerationMode::Automatic,
+                    .generate_baseline_streaming(
+                        &prefill_prompt_ids,
+                        1,
+                        &prefill_sampling,
+                        None,
+                        None,
+                        &[],
+                        PrefillMode::Dense,
                         |delta| {
                             black_box(delta);
                             true
                         },
                     )
-                    .expect("benchmark single-user prefill")
-                    .0;
-                assert_eq!(output.token_ids, prefill_output.token_ids);
+                    .expect("benchmark dense single-user prefill");
+                assert_eq!(output.token_ids, dense_token_ids);
+                assert!(
+                    output.specprefill_stats.is_none(),
+                    "dense prefill benchmark returned SpecPrefill statistics"
+                );
                 black_box(output);
             });
         });
@@ -117,7 +144,7 @@ fn single_user_throughput(criterion: &mut Criterion) {
                     .generate_baseline_streaming(
                         &prefill_prompt_ids,
                         1,
-                        &specprefill_sampling,
+                        &prefill_sampling,
                         None,
                         None,
                         &[],
@@ -135,7 +162,13 @@ fn single_user_throughput(criterion: &mut Criterion) {
                     .expect("SpecPrefill benchmark must activate sparse admission");
                 assert!(stats.eligible_target_tokens > specprefill_config.min_tokens);
                 assert!(stats.selected_target_tokens > 0);
-                assert!(stats.selected_target_tokens <= stats.eligible_target_tokens);
+                assert!(stats.selected_target_tokens < stats.eligible_target_tokens);
+                assert!(
+                    stats.selected_target_tokens * 2 <= stats.eligible_target_tokens,
+                    "SpecPrefill selected {} of {} eligible target tokens",
+                    stats.selected_target_tokens,
+                    stats.eligible_target_tokens
+                );
                 black_box(output);
             });
         });
