@@ -39,10 +39,10 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::Path;
 
-const DRAFT_PREFIX: i32 = 65_536;
+const DRAFT_PREFIX: i32 = 131_072;
 const DRAFT_CONTROL_START: i32 = 248_044;
 const DRAFT_CONTROL_END: i32 = 248_070;
-const DRAFT_PADDED: i32 = 65_568;
+const DRAFT_PADDED: i32 = 131_104;
 
 fn compact_rows(array: &MlxArray) -> UniquePtr<MlxArray> {
     let columns = mlxcel_core::array_shape(array)[1];
@@ -935,10 +935,15 @@ impl Qwen35Model {
             || self.project_logits(hidden),
             |head| {
                 let padded = head.forward(hidden);
+                let shape = mlxcel_core::array_shape(&padded);
                 mlxcel_core::slice(
                     &padded,
                     &[0, 0, 0],
-                    &[1, 1, DRAFT_PREFIX + DRAFT_CONTROL_END - DRAFT_CONTROL_START],
+                    &[
+                        shape[0],
+                        shape[1],
+                        DRAFT_PREFIX + DRAFT_CONTROL_END - DRAFT_CONTROL_START,
+                    ],
                 )
             },
         )
@@ -1224,6 +1229,7 @@ impl Qwen35Model {
         &self,
         input_ids: &MlxArray,
         target_layer_ids: &[usize],
+        compact_logits: bool,
     ) -> Qwen35DflashVerifyOutput {
         let input_len = mlxcel_core::array_shape(input_ids)[1];
         let projected = self.sequence_state.with_internal(|caches| {
@@ -1254,7 +1260,12 @@ impl Qwen35Model {
                     hidden_by_layer.push(mlxcel_core::share(&hidden));
                 }
             }
-            let logits = self.project_logits(&self.norm.forward(&hidden));
+            let normalized = self.norm.forward(&hidden);
+            let logits = if compact_logits {
+                self.project_draft_logits(&normalized)
+            } else {
+                self.project_logits(&normalized)
+            };
             let offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
             (
                 Qwen35DflashVerifyOutput {

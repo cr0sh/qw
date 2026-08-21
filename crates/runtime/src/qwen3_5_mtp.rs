@@ -930,6 +930,7 @@ pub(crate) fn greedy_walk(
 pub(crate) fn greedy_walk_device_proposals(
     draft_tokens: &MlxArray,
     verify_logits: &MlxArray,
+    compact_logits: bool,
     sampling: &SamplingConfig,
     committed_history: &[i32],
     max_new_tokens: usize,
@@ -963,7 +964,12 @@ pub(crate) fn greedy_walk_device_proposals(
     let targets = mlxcel_core::argmax_last_axis(&biased_logits);
     mlxcel_core::async_eval(&targets);
     let draft_tokens = materialize_ids(draft_tokens);
-    let target_tokens = materialize_ids(&targets);
+    let mut target_tokens = materialize_ids(&targets);
+    if compact_logits {
+        target_tokens
+            .iter_mut()
+            .for_each(|token| *token = Qwen35Model::map_draft_token(*token));
+    }
     (
         speculative_walk(&draft_tokens, &target_tokens, max_new_tokens),
         draft_tokens,
