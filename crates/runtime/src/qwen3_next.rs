@@ -138,8 +138,24 @@ impl Qwen3NextAttention {
         mask: Option<&MlxArray>,
         position_ids: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        let output = self.forward_impl(x, cache, mask, position_ids);
+        let (output, _) = self.forward_impl(x, cache, mask, position_ids, false);
         self.o_proj.forward(&output)
+    }
+
+    /// Draft-lookahead entry point used by SpecPrefill. The captured tensor is
+    /// the normalized, post-RoPE query in `[B, H, L, D]` layout.
+    pub(crate) fn forward_with_query_capture(
+        &self,
+        x: &MlxArray,
+        cache: &mut KVCache,
+        mask: Option<&MlxArray>,
+        position_ids: Option<&MlxArray>,
+    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        let (output, queries) = self.forward_impl(x, cache, mask, position_ids, true);
+        (
+            self.o_proj.forward(&output),
+            queries.expect("query capture was requested"),
+        )
     }
 
     /// Verify-only entry point. Multi-token blocks use bottom-right causal
@@ -151,7 +167,7 @@ impl Qwen3NextAttention {
         mask: Option<&MlxArray>,
         position_ids: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        let output = self.forward_impl(x, cache, mask, position_ids);
+        let (output, _) = self.forward_impl(x, cache, mask, position_ids, false);
         self.o_proj.forward(&output)
     }
 
@@ -163,7 +179,8 @@ impl Qwen3NextAttention {
         cache: &mut KVCache,
         mask: Option<&MlxArray>,
         position_ids: Option<&MlxArray>,
-    ) -> UniquePtr<MlxArray> {
+        capture_query: bool,
+    ) -> (UniquePtr<MlxArray>, Option<UniquePtr<MlxArray>>) {
         let shape = mlxcel_core::array_shape(x);
         let b = shape[0];
         let l = shape[1];
@@ -254,6 +271,8 @@ impl Qwen3NextAttention {
             );
         }
 
+        let captured_query = capture_query.then(|| mlxcel_core::share(&queries));
+
         // Symmetric Turbo4 stays in the rotated codec basis. Multi-token
         // calls use native causal SDPA metadata rather than a materialized
         // additive mask.
@@ -301,7 +320,8 @@ impl Qwen3NextAttention {
 
         // Apply sigmoid gating to output
         let gate_sigmoid = mlxcel_core::sigmoid(&gate);
-        mlxcel_core::multiply(&output, &gate_sigmoid)
+        let gated = mlxcel_core::multiply(&output, &gate_sigmoid);
+        (gated, captured_query)
     }
 
 

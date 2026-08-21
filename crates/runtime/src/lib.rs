@@ -15,6 +15,7 @@ mod qwen_vl;
 mod qwen_vl_merge;
 mod qwen_vl_position;
 mod qwen_vl_processor;
+mod specprefill;
 
 pub mod provider;
 mod portable_snapshot;
@@ -32,6 +33,9 @@ pub use provider::Dflash2GenerationStats;
 pub use model_resolver::{
     DEFAULT_MODEL_IDENTIFIER, model_cache_path, resolve_model_dir, resolve_model_path,
     validate_identifier,
+};
+pub use specprefill::{
+    PrefillMode, SPECPREFILL_DRAFT_MODEL_IDENTIFIER, SpecPrefillConfig, SpecPrefillStats,
 };
 pub use portable_snapshot::{PortableArray, PortableModelState, PortablePromptSnapshot};
 pub use qwen_vl::{ExpandedImageTokens, insert_qwen_vl_image_tokens};

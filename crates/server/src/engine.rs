@@ -12,7 +12,7 @@ use qw_prefix_cache::{
 };
 #[cfg(test)]
 use qw_runtime::{ChatContentRef, ChatMessage};
-use qw_runtime::{KVCacheMode, MtpPrefixReuse, PromptSnapshot, Qwen35Provider};
+use qw_runtime::{KVCacheMode, MtpPrefixReuse, PrefillMode, PromptSnapshot, Qwen35Provider};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{Span, error, info, info_span, warn};
@@ -1323,6 +1323,7 @@ impl QwenWorker {
                     .as_mut()
                     .map(|value| value as &mut dyn mlxcel_core::generate::TokenConstraint),
                 &checkpoint_token_lengths,
+                PrefillMode::Dense,
                 &mut emit_delta,
             ),
         };
