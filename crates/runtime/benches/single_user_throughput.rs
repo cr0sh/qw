@@ -4,8 +4,8 @@ use std::hint::black_box;
 use std::time::Duration;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use qw_runtime::provider::Qwen35GenerationMode;
 use qw_runtime::Qwen35Provider;
+use qw_runtime::provider::Qwen35GenerationMode;
 #[cfg(feature = "specprefill")]
 use qw_runtime::{PrefillMode, SpecPrefillConfig};
 use support::{
@@ -338,8 +338,7 @@ fn single_user_throughput(criterion: &mut Criterion) {
         group.finish();
     }
 
-    let long_10k =
-        prepare_long_conversation_fixture(&mut provider, "10k", LONG_CONTEXT_MIN_TOKENS);
+    let long_10k = prepare_long_conversation_fixture(&mut provider, "10k", LONG_CONTEXT_MIN_TOKENS);
     assert!(long_10k.prefix_tokens >= LONG_CONTEXT_MIN_TOKENS);
     let long_64k =
         prepare_long_conversation_fixture(&mut provider, "64k", LONG_CONTEXT_64K_MIN_TOKENS);
