@@ -5,11 +5,13 @@ use std::time::Duration;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use qw_runtime::provider::Qwen35GenerationMode;
+use qw_runtime::Qwen35Provider;
 #[cfg(feature = "specprefill")]
 use qw_runtime::{PrefillMode, SpecPrefillConfig};
 use support::{
-    DECODE_MAX_TOKENS, MTP_BLOCK_SIZE, prepare_decode_fixture, prepare_long_conversation_fixture,
-    prompt_token_ids,
+    DECODE_MAX_TOKENS, LONG_CONTEXT_64K_MIN_TOKENS, LONG_CONTEXT_MIN_TOKENS,
+    LongConversationFixture, MTP_BLOCK_SIZE, prepare_decode_fixture,
+    prepare_long_conversation_fixture, prompt_token_ids,
 };
 
 struct GenerationElements {
@@ -46,6 +48,143 @@ fn token_edit_distance(left: &[i32], right: &[i32]) -> usize {
         std::mem::swap(&mut previous, &mut current);
     }
     previous[right.len()]
+}
+
+fn benchmark_long_conversation(
+    criterion: &mut Criterion,
+    provider: &mut Qwen35Provider,
+    fixture: &LongConversationFixture,
+) {
+    let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
+    let prefill_name = format!("long_{}_qwen", fixture.context_label);
+    let baseline_name = format!("long_{}_baseline", fixture.context_label);
+    let mtp_name = format!("long_{}_mtp_k3", fixture.context_label);
+
+    let mtp_token_edit_distance =
+        token_edit_distance(&fixture.mtp_token_ids, &fixture.baseline_token_ids);
+    assert!(
+        mtp_token_edit_distance * 20 <= fixture.baseline_token_ids.len(),
+        "{} MTP token edit distance {mtp_token_edit_distance} exceeds 5% of the baseline",
+        fixture.context_label
+    );
+    eprintln!(
+        "MTP_LONG_CONTEXT_CORRECTNESS context={} token_edit_distance={mtp_token_edit_distance}",
+        fixture.context_label
+    );
+
+    {
+        let mut group = criterion.benchmark_group("single_user_prefill");
+        group.throughput(Throughput::Elements(fixture.new_prompt_tokens as u64));
+        group.bench_function(prefill_name, |bencher| {
+            bencher.iter(|| {
+                let (output, stats) = provider
+                    .benchmark_cached_streaming_in_mode(
+                        &fixture.prompt_ids,
+                        1,
+                        &sampling,
+                        &fixture.baseline_snapshot,
+                        Qwen35GenerationMode::Baseline,
+                        |delta| {
+                            black_box(delta);
+                            true
+                        },
+                    )
+                    .expect("benchmark long-conversation single-user prefill");
+                assert_eq!(output.cached_tokens, fixture.prefix_tokens);
+                assert_eq!(
+                    output.token_ids.as_slice(),
+                    &fixture.baseline_token_ids[..1]
+                );
+                assert!(
+                    stats.is_none(),
+                    "long-conversation baseline mode returned MTP statistics"
+                );
+                black_box(output);
+            });
+        });
+        group.finish();
+    }
+
+    {
+        let baseline_decode_tokens = fixture.baseline_token_ids.len().saturating_sub(1);
+        let mut group = criterion.benchmark_group("single_user_decode");
+        group.throughput(Throughput::Elements(baseline_decode_tokens as u64));
+        group.bench_function(baseline_name, |bencher| {
+            bencher.iter_custom(|iters| {
+                let mut decode_time = Duration::ZERO;
+                for _ in 0..iters {
+                    let (output, stats) = provider
+                        .benchmark_cached_streaming_in_mode(
+                            &fixture.prompt_ids,
+                            DECODE_MAX_TOKENS,
+                            &sampling,
+                            &fixture.baseline_snapshot,
+                            Qwen35GenerationMode::Baseline,
+                            |delta| {
+                                black_box(delta);
+                                true
+                            },
+                        )
+                        .expect("benchmark long-conversation controlled baseline");
+                    assert_eq!(output.cached_tokens, fixture.prefix_tokens);
+                    assert_eq!(&output.token_ids, &fixture.baseline_token_ids);
+                    assert!(
+                        stats.is_none(),
+                        "long-conversation baseline mode returned MTP statistics"
+                    );
+                    decode_time += output.decode_time;
+                    black_box(output);
+                }
+                decode_time
+            });
+        });
+        group.finish();
+    }
+
+    {
+        let mtp_decode_tokens =
+            generation_elements(1, fixture.new_prompt_tokens, fixture.mtp_decode_tokens).decode;
+        let mut group = criterion.benchmark_group("single_user_decode");
+        group.throughput(Throughput::Elements(mtp_decode_tokens));
+        group.bench_function(mtp_name, |bencher| {
+            bencher.iter_custom(|iters| {
+                let mut decode_time = Duration::ZERO;
+                for _ in 0..iters {
+                    let (output, stats) = provider
+                        .benchmark_cached_streaming_in_mode(
+                            &fixture.prompt_ids,
+                            DECODE_MAX_TOKENS,
+                            &sampling,
+                            &fixture.mtp_snapshot,
+                            Qwen35GenerationMode::Mtp,
+                            |delta| {
+                                black_box(delta);
+                                true
+                            },
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "benchmark long-conversation MTP k={MTP_BLOCK_SIZE}: {error:#}"
+                            )
+                        });
+                    assert_eq!(output.cached_tokens, fixture.prefix_tokens);
+                    assert_eq!(
+                        &output.token_ids, &fixture.mtp_token_ids,
+                        "deterministic long-conversation bundled-MTP k={MTP_BLOCK_SIZE} greedy token IDs changed"
+                    );
+                    let stats = stats.expect("explicit MTP mode must return MTP statistics");
+                    assert!(
+                        stats.proposed_draft_tokens > 0,
+                        "long-conversation MTP k={MTP_BLOCK_SIZE} must propose draft tokens"
+                    );
+                    decode_time += stats.decode_time;
+                    black_box(output);
+                }
+                decode_time
+            });
+        });
+        group.finish();
+    }
 }
 
 fn single_user_throughput(criterion: &mut Criterion) {
@@ -199,41 +338,12 @@ fn single_user_throughput(criterion: &mut Criterion) {
         group.finish();
     }
 
-    let long_context = prepare_long_conversation_fixture(&mut provider);
-    assert!(long_context.prefix_tokens >= support::LONG_CONTEXT_MIN_TOKENS);
-    let long_sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
-    {
-        let mut group = criterion.benchmark_group("single_user_prefill");
-        group.throughput(Throughput::Elements(long_context.new_prompt_tokens as u64));
-        group.bench_function("long_10k_qwen", |bencher| {
-            bencher.iter(|| {
-                let (output, stats) = provider
-                    .benchmark_cached_streaming_in_mode(
-                        &long_context.prompt_ids,
-                        1,
-                        &long_sampling,
-                        &long_context.baseline_snapshot,
-                        Qwen35GenerationMode::Baseline,
-                        |delta| {
-                            black_box(delta);
-                            true
-                        },
-                    )
-                    .expect("benchmark long-conversation single-user prefill");
-                assert_eq!(output.cached_tokens, long_context.prefix_tokens);
-                assert_eq!(
-                    output.token_ids.as_slice(),
-                    &long_context.baseline_token_ids[..1]
-                );
-                assert!(
-                    stats.is_none(),
-                    "long-conversation baseline mode returned MTP statistics"
-                );
-                black_box(output);
-            });
-        });
-        group.finish();
-    }
+    let long_10k =
+        prepare_long_conversation_fixture(&mut provider, "10k", LONG_CONTEXT_MIN_TOKENS);
+    assert!(long_10k.prefix_tokens >= LONG_CONTEXT_MIN_TOKENS);
+    let long_64k =
+        prepare_long_conversation_fixture(&mut provider, "64k", LONG_CONTEXT_64K_MIN_TOKENS);
+    assert!(long_64k.prefix_tokens >= LONG_CONTEXT_64K_MIN_TOKENS);
 
     let decode_fixture = prepare_decode_fixture(&mut provider);
     let decode_request = decode_fixture.request;
@@ -315,97 +425,8 @@ fn single_user_throughput(criterion: &mut Criterion) {
         group.finish();
     }
 
-    let long_mtp_token_edit_distance = token_edit_distance(
-        &long_context.mtp_token_ids,
-        &long_context.baseline_token_ids,
-    );
-    assert!(
-        long_mtp_token_edit_distance * 20 <= long_context.baseline_token_ids.len(),
-        "long-context MTP token edit distance {long_mtp_token_edit_distance} exceeds 5% of the baseline"
-    );
-    eprintln!("MTP_LONG_CONTEXT_CORRECTNESS token_edit_distance={long_mtp_token_edit_distance}");
-
-    {
-        let baseline_decode_tokens = long_context.baseline_token_ids.len().saturating_sub(1);
-        let mut group = criterion.benchmark_group("single_user_decode");
-        group.throughput(Throughput::Elements(baseline_decode_tokens as u64));
-        group.bench_function("long_10k_baseline", |bencher| {
-            bencher.iter_custom(|iters| {
-                let mut decode_time = Duration::ZERO;
-                for _ in 0..iters {
-                    let (output, stats) = provider
-                        .benchmark_cached_streaming_in_mode(
-                            &long_context.prompt_ids,
-                            DECODE_MAX_TOKENS,
-                            &long_sampling,
-                            &long_context.baseline_snapshot,
-                            Qwen35GenerationMode::Baseline,
-                            |delta| {
-                                black_box(delta);
-                                true
-                            },
-                        )
-                        .expect("benchmark long-conversation controlled baseline");
-                    assert_eq!(output.cached_tokens, long_context.prefix_tokens);
-                    assert_eq!(&output.token_ids, &long_context.baseline_token_ids);
-                    assert!(
-                        stats.is_none(),
-                        "long-conversation baseline mode returned MTP statistics"
-                    );
-                    decode_time += output.decode_time;
-                    black_box(output);
-                }
-                decode_time
-            });
-        });
-        group.finish();
-    }
-
-    {
-        let mtp_decode_tokens = generation_elements(
-            1,
-            long_context.new_prompt_tokens,
-            long_context.mtp_decode_tokens,
-        )
-        .decode;
-        let mut group = criterion.benchmark_group("single_user_decode");
-        group.throughput(Throughput::Elements(mtp_decode_tokens));
-        group.bench_function("long_10k_mtp_k3", |bencher| {
-            bencher.iter_custom(|iters| {
-                let mut decode_time = Duration::ZERO;
-                for _ in 0..iters {
-                    let (output, stats) = provider
-                        .benchmark_cached_streaming_in_mode(
-                            &long_context.prompt_ids,
-                            DECODE_MAX_TOKENS,
-                            &long_sampling,
-                            &long_context.mtp_snapshot,
-                            Qwen35GenerationMode::Mtp,
-                            |delta| {
-                                black_box(delta);
-                                true
-                            },
-                        )
-                        .unwrap_or_else(|error| {
-                            panic!(
-                                "benchmark long-conversation MTP k={MTP_BLOCK_SIZE}: {error:#}"
-                            )
-                        });
-                    assert_eq!(output.cached_tokens, long_context.prefix_tokens);
-                    assert_eq!(
-                        &output.token_ids, &long_context.mtp_token_ids,
-                        "deterministic long-conversation bundled-MTP k={MTP_BLOCK_SIZE} greedy token IDs changed"
-                    );
-                    decode_time += stats
-                        .expect("explicit MTP mode must return MTP statistics")
-                        .decode_time;
-                    black_box(output);
-                }
-                decode_time
-            });
-        });
-        group.finish();
-    }
+    benchmark_long_conversation(criterion, &mut provider, &long_10k);
+    benchmark_long_conversation(criterion, &mut provider, &long_64k);
 
     #[cfg(feature = "dflash2")]
     // DFlash2 block-diffusion drafter, same deterministic decode fixture.

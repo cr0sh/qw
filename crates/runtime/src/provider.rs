@@ -471,6 +471,11 @@ impl Qwen35Provider {
         self.model.vocab_size()
     }
 
+    #[doc(hidden)]
+    pub fn supported_context_tokens(&self) -> usize {
+        self.model.config.max_position_embeddings
+    }
+
     pub fn eos_token_id(&self) -> u32 {
         self.defaults.stop_token_ids[0] as u32
     }

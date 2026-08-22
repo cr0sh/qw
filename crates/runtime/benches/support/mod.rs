@@ -13,6 +13,7 @@ pub const MTP_BLOCK_SIZE: usize = 3;
 pub const PREFILL_MIN_TOKENS: usize = 4_096;
 pub const PREFILL_MAX_TOKENS: usize = 6_000;
 pub const LONG_CONTEXT_MIN_TOKENS: usize = 10_000;
+pub const LONG_CONTEXT_64K_MIN_TOKENS: usize = 64_000;
 /// Environment variable pointing at the DFlash2 drafter checkpoint
 /// directory (optional; defaults to the model cache path below).
 pub const DRAFT_MODEL_ENV: &str = "QW_BENCH_DRAFT_MODEL";
@@ -44,6 +45,7 @@ pub struct DecodeFixture {
 }
 
 pub struct LongConversationFixture {
+    pub context_label: &'static str,
     pub prompt_ids: Vec<i32>,
     pub prefix_tokens: usize,
     pub new_prompt_tokens: usize,
@@ -183,36 +185,50 @@ fn text_message(role: &str, content: String) -> ChatMessage {
     }
 }
 
-fn long_conversation_token_ids(provider: &Qwen35Provider) -> (Vec<i32>, usize) {
+fn long_conversation_token_ids(
+    provider: &Qwen35Provider,
+    context_label: &str,
+    min_prefix_tokens: usize,
+) -> (Vec<i32>, usize) {
+    let supported_context_tokens = provider.supported_context_tokens();
+    assert!(
+        min_prefix_tokens + DECODE_MAX_TOKENS < supported_context_tokens,
+        "{context_label} minimum prefix of {min_prefix_tokens} tokens leaves no room in the model's {supported_context_tokens}-token context"
+    );
+
     let mut messages = Vec::new();
-    let history_ids = (1..=128)
-        .find_map(|turn| {
-            messages.push(text_message(
-                "user",
-                format!("Conversation incident record {turn:03}\n{PROMPT}"),
-            ));
-            messages.push(text_message(
-                "assistant",
-                concat!(
-                    r#"{"severity":"high","summary":"Payment capture failures remain active.","#,
-                    r#""affected_order_ids":["A-1042","A-1047"],"#,
-                    r#""next_action":"Escalate INC-4821 and pause catalog imports.","#,
-                    r#""needs_escalation":true}"#
-                )
-                .to_owned(),
-            ));
-            let history_ids = provider
-                .tokenize_history(&messages, &[], None, true)
-                .expect("tokenize long-conversation benchmark history");
-            (history_ids.len() >= LONG_CONTEXT_MIN_TOKENS).then_some(history_ids)
-        })
-        .unwrap_or_else(|| {
-            panic!("long-conversation history did not reach {LONG_CONTEXT_MIN_TOKENS} tokens")
-        });
+    let mut turn = 1;
+    let history_ids = loop {
+        messages.push(text_message(
+            "user",
+            format!("Conversation incident record {turn:03}\n{PROMPT}"),
+        ));
+        messages.push(text_message(
+            "assistant",
+            concat!(
+                r#"{"severity":"high","summary":"Payment capture failures remain active.","#,
+                r#""affected_order_ids":["A-1042","A-1047"],"#,
+                r#""next_action":"Escalate INC-4821 and pause catalog imports.","#,
+                r#""needs_escalation":true}"#
+            )
+            .to_owned(),
+        ));
+        let history_ids = provider
+            .tokenize_history(&messages, &[], None, true)
+            .expect("tokenize long-conversation benchmark history");
+        if history_ids.len() >= min_prefix_tokens {
+            break history_ids;
+        }
+        assert!(
+            history_ids.len() + DECODE_MAX_TOKENS < supported_context_tokens,
+            "{context_label} long-conversation history cannot reach {min_prefix_tokens} tokens within the model's {supported_context_tokens}-token context"
+        );
+        turn += 1;
+    };
     let prefix_tokens = history_ids.len();
     assert!(
-        prefix_tokens >= LONG_CONTEXT_MIN_TOKENS,
-        "long-conversation prefix has {prefix_tokens} tokens, expected at least {LONG_CONTEXT_MIN_TOKENS}"
+        prefix_tokens >= min_prefix_tokens,
+        "{context_label} long-conversation prefix has {prefix_tokens} tokens, expected at least {min_prefix_tokens}"
     );
 
     messages.push(text_message("user", PROMPT.to_owned()));
@@ -221,17 +237,27 @@ fn long_conversation_token_ids(provider: &Qwen35Provider) -> (Vec<i32>, usize) {
         .expect("tokenize long-conversation benchmark continuation");
     assert!(
         prompt_ids.starts_with(&history_ids),
-        "long-conversation history must be an exact prefix of the continuation prompt"
+        "{context_label} long-conversation history must be an exact prefix of the continuation prompt"
     );
     assert!(
         prompt_ids.len() > prefix_tokens,
-        "long-conversation continuation must add prompt tokens"
+        "{context_label} long-conversation continuation must add prompt tokens"
+    );
+    assert!(
+        prompt_ids.len() + DECODE_MAX_TOKENS <= supported_context_tokens,
+        "{context_label} prompt and decode budget require {} tokens, exceeding the model's {supported_context_tokens}-token context",
+        prompt_ids.len() + DECODE_MAX_TOKENS
     );
     (prompt_ids, prefix_tokens)
 }
 
-pub fn prepare_long_conversation_fixture(provider: &mut Qwen35Provider) -> LongConversationFixture {
-    let (prompt_ids, prefix_tokens) = long_conversation_token_ids(provider);
+pub fn prepare_long_conversation_fixture(
+    provider: &mut Qwen35Provider,
+    context_label: &'static str,
+    min_prefix_tokens: usize,
+) -> LongConversationFixture {
+    let (prompt_ids, prefix_tokens) =
+        long_conversation_token_ids(provider, context_label, min_prefix_tokens);
     let history_ids = &prompt_ids[..prefix_tokens];
     let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
 
@@ -328,7 +354,8 @@ pub fn prepare_long_conversation_fixture(provider: &mut Qwen35Provider) -> LongC
         "long-conversation MTP k={MTP_BLOCK_SIZE} must propose draft tokens"
     );
     eprintln!(
-        "MTP_LONG_CONTEXT_PROFILE tokens={} prefix_tokens={} accepted={} proposed={} acceptance={:.2}% forwards={} draft_ms={:.3} verify_ms={:.3} walk_ms={:.3} reconcile_ms={:.3} materializations={} snapshots={}",
+        "MTP_LONG_CONTEXT_PROFILE context={} tokens={} prefix_tokens={} accepted={} proposed={} acceptance={:.2}% forwards={} draft_ms={:.3} verify_ms={:.3} walk_ms={:.3} reconcile_ms={:.3} materializations={} snapshots={}",
+        context_label,
         mtp_output.token_ids.len(),
         prefix_tokens,
         mtp_stats.accepted_draft_tokens,
@@ -346,6 +373,7 @@ pub fn prepare_long_conversation_fixture(provider: &mut Qwen35Provider) -> LongC
     let new_prompt_tokens = prompt_ids.len() - prefix_tokens;
     let mtp_decode_tokens = mtp_output.token_ids.len();
     LongConversationFixture {
+        context_label,
         prompt_ids,
         prefix_tokens,
         new_prompt_tokens,
