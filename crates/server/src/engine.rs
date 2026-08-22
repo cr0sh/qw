@@ -12,7 +12,9 @@ use qw_prefix_cache::{
 };
 #[cfg(test)]
 use qw_runtime::ChatContentRef;
-use qw_runtime::{ChatMessage, KVCacheMode, MtpPrefixReuse, PromptSnapshot, Qwen35Provider};
+use qw_runtime::{KVCacheMode, MtpPrefixReuse, PromptSnapshot, Qwen35Provider};
+#[cfg(any(feature = "specprefill", test))]
+use qw_runtime::ChatMessage;
 #[cfg(feature = "specprefill")]
 use qw_runtime::{PrefillMode, SpecPrefillConfig};
 use serde_json::Value;

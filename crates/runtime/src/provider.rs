@@ -10,10 +10,13 @@ use mlxcel_core::generate::{
     ControlledGeneration, CxxGenerator, GenerationStopReason, LanguageModel, ModelStateSnapshot,
     PrefixReuse, SamplingConfig, TokenConstraint,
 };
+#[cfg(any(feature = "specprefill", test))]
 use mlxcel_core::generation_policy::{
     initial_token_history, merged_eos_token_ids, seed_rng_if_needed,
 };
+#[cfg(any(feature = "specprefill", test))]
 use mlxcel_core::loop_detection::detect_repetition_loop;
+#[cfg(any(feature = "specprefill", test))]
 use mlxcel_core::sampling::{
     SamplerState, sample_token_optimized, sample_token_optimized_with_state,
 };
