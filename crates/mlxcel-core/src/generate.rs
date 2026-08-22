@@ -468,6 +468,7 @@ fn prefill_with_checkpoints<M: LanguageModel + ?Sized>(
     caches: &mut [KVCache],
     prompt_tokens: &[i32],
     cached_tokens: usize,
+    configured_prefill_chunk: usize,
     checkpoint_token_lengths: &[usize],
     sequence_id: SequenceId,
 ) -> (UniquePtr<MlxArray>, Vec<ModelStateSnapshot>) {
@@ -484,10 +485,19 @@ fn prefill_with_checkpoints<M: LanguageModel + ?Sized>(
             continue;
         }
         let piece = &prompt_tokens[range_start..range_end];
-        let input = ffi::from_slice_i32(piece, &[1, piece.len() as i32]);
-        let piece_logits =
-            model.forward_last_logits(&input, caches, None, piece.len().saturating_sub(1));
-        ffi::eval(&piece_logits);
+        let piece_logits = if let Some(chunk) = effective_prefill_chunk(
+            configured_prefill_chunk,
+            model.supports_chunked_prefill(),
+            piece.len(),
+        ) {
+            chunked_prefill_last_logits(model, caches, piece, chunk)
+        } else {
+            let input = ffi::from_slice_i32(piece, &[1, piece.len() as i32]);
+            let logits =
+                model.forward_last_logits(&input, caches, None, piece.len().saturating_sub(1));
+            ffi::eval(&logits);
+            logits
+        };
         if checkpoint_token_lengths.binary_search(&range_end).is_ok()
             && let Some(mut snapshot) = model.snapshot_sequence_state(sequence_id, range_end)
         {
@@ -1511,6 +1521,7 @@ impl CxxGenerator {
                 &mut self.caches,
                 prompt_tokens,
                 cached_tokens,
+                prefill_chunk_len(),
                 &effective_checkpoint_lengths,
                 sequence_id,
             )
@@ -3192,6 +3203,71 @@ mod tests {
         }
     }
 
+    struct CheckpointStubModel {
+        supports_chunking: bool,
+        seen: std::cell::RefCell<Vec<i32>>,
+        forward_lengths: std::cell::RefCell<Vec<usize>>,
+        snapshot_lengths: std::cell::RefCell<Vec<(usize, usize)>>,
+    }
+
+    impl CheckpointStubModel {
+        fn new(supports_chunking: bool, cached_prefix: &[i32]) -> Self {
+            Self {
+                supports_chunking,
+                seen: std::cell::RefCell::new(cached_prefix.to_vec()),
+                forward_lengths: std::cell::RefCell::new(Vec::new()),
+                snapshot_lengths: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl LanguageModel for CheckpointStubModel {
+        fn forward(
+            &self,
+            input_ids: &MlxArray,
+            _caches: &mut [KVCache],
+            _mask: Option<&MlxArray>,
+        ) -> UniquePtr<MlxArray> {
+            let len = ffi::array_shape(input_ids)[1] as usize;
+            ffi::eval(input_ids);
+            self.forward_lengths.borrow_mut().push(len);
+            let tokens = ffi::array_to_raw_bytes(input_ids)
+                .chunks_exact(4)
+                .map(|bytes| i32::from_ne_bytes(bytes.try_into().expect("i32 token bytes")))
+                .collect::<Vec<_>>();
+            self.seen.borrow_mut().extend(tokens);
+            let total = self.seen.borrow().iter().sum::<i32>() as f32;
+            ffi::from_slice_f32(&vec![total; len * 4], &[1, len as i32, 4])
+        }
+
+        fn make_caches(&self) -> Vec<KVCache> {
+            vec![KVCache::new()]
+        }
+
+        fn num_layers(&self) -> usize {
+            1
+        }
+
+        fn eos_token_ids(&self) -> Vec<i32> {
+            vec![99]
+        }
+
+        fn supports_chunked_prefill(&self) -> bool {
+            self.supports_chunking
+        }
+
+        fn snapshot_sequence_state(
+            &self,
+            _seq_id: SequenceId,
+            token_len: usize,
+        ) -> Option<ModelStateSnapshot> {
+            self.snapshot_lengths
+                .borrow_mut()
+                .push((token_len, self.seen.borrow().len()));
+            Some(ModelStateSnapshot::new("checkpoint-stub", token_len))
+        }
+    }
+
     /// The chunk gate applies only when configured, supported, and useful.
     #[test]
     fn effective_prefill_chunk_gates_correctly() {
@@ -3274,6 +3350,91 @@ mod tests {
                 ffi::item_f32(&first),
                 ffi::item_f32(&single_first),
                 "chunk={chunk} final logits diverged from single-pass"
+            );
+        }
+    }
+
+    #[test]
+    fn checkpointed_prefill_chunks_ranges_and_snapshots_exact_boundaries() {
+        let prompt = (1..=12).collect::<Vec<_>>();
+        let model = CheckpointStubModel::new(true, &prompt[..3]);
+        let mut caches = model.make_caches();
+
+        let (logits, snapshots) = prefill_with_checkpoints(
+            &model,
+            &mut caches,
+            &prompt,
+            3,
+            2,
+            &[8, 11],
+            SequenceId::from_raw(7),
+        );
+
+        assert_eq!(
+            model.forward_lengths.borrow().as_slice(),
+            &[2, 2, 1, 2, 1, 1],
+            "each checkpoint range and the final tail must be chunked independently"
+        );
+        assert_eq!(model.seen.borrow().as_slice(), prompt.as_slice());
+        assert_eq!(
+            model.snapshot_lengths.borrow().as_slice(),
+            &[(8, 8), (11, 11)],
+            "snapshots must be taken only after reaching their exact boundary"
+        );
+        assert_eq!(
+            snapshots
+                .iter()
+                .map(ModelStateSnapshot::token_len)
+                .collect::<Vec<_>>(),
+            vec![8, 11]
+        );
+
+        for (snapshot, expected) in snapshots.iter().zip([36.0f32, 66.0]) {
+            let continuation = snapshot
+                .continuation_logits()
+                .expect("checkpoint continuation logits");
+            let first = ffi::slice(continuation, &[0, 0, 0], &[1, 1, 1]);
+            ffi::eval(&first);
+            assert_eq!(ffi::item_f32(&first), expected);
+        }
+        let first = ffi::slice(&logits, &[0, 0, 0], &[1, 1, 1]);
+        ffi::eval(&first);
+        assert_eq!(ffi::item_f32(&first), 78.0);
+    }
+
+    #[test]
+    fn checkpointed_prefill_stays_single_pass_when_chunking_is_disabled() {
+        let prompt = (1..=12).collect::<Vec<_>>();
+
+        for (supports_chunking, configured_chunk) in [(true, 0), (false, 2)] {
+            let model = CheckpointStubModel::new(supports_chunking, &prompt[..2]);
+            let mut caches = model.make_caches();
+            let (_logits, snapshots) = prefill_with_checkpoints(
+                &model,
+                &mut caches,
+                &prompt,
+                2,
+                configured_chunk,
+                &[5, 10],
+                SequenceId::from_raw(9),
+            );
+
+            assert_eq!(
+                model.forward_lengths.borrow().as_slice(),
+                &[3, 5, 2],
+                "disabled chunking must forward each checkpoint range once"
+            );
+            assert_eq!(model.seen.borrow().as_slice(), prompt.as_slice());
+            assert_eq!(
+                model.snapshot_lengths.borrow().as_slice(),
+                &[(5, 5), (10, 10)]
+            );
+            assert_eq!(
+                snapshots
+                    .iter()
+                    .map(ModelStateSnapshot::token_len)
+                    .collect::<Vec<_>>(),
+                vec![5, 10]
             );
         }
     }
