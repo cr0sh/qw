@@ -25,6 +25,7 @@ trap 'rm -f "$OUTPUT"' EXIT
     cd "$ROOT_DIR"
     CARGO_TERM_COLOR=never \
     QW_MODEL_PATH="$MODEL_DIR" \
+    QW_BENCH_LONG_CONTEXT_ONLY=64k \
         cargo bench -p qw-runtime --bench single_user_throughput -- \
         single_user_decode/long_64k_mtp_k3 --quick
 ) 2>&1 | tee "$OUTPUT"

@@ -1,5 +1,6 @@
 mod support;
 
+use std::env;
 use std::hint::black_box;
 use std::time::Duration;
 
@@ -13,6 +14,8 @@ use support::{
     LongConversationFixture, MTP_BLOCK_SIZE, prepare_decode_fixture,
     prepare_long_conversation_fixture, prompt_token_ids,
 };
+
+const LONG_CONTEXT_ONLY_ENV: &str = "QW_BENCH_LONG_CONTEXT_ONLY";
 
 struct GenerationElements {
     prefill: u64,
@@ -82,7 +85,7 @@ fn benchmark_long_conversation(
                         &fixture.prompt_ids,
                         1,
                         &sampling,
-                        &fixture.baseline_snapshot,
+                        &fixture.mtp_snapshot,
                         Qwen35GenerationMode::Baseline,
                         |delta| {
                             black_box(delta);
@@ -118,7 +121,7 @@ fn benchmark_long_conversation(
                             &fixture.prompt_ids,
                             DECODE_MAX_TOKENS,
                             &sampling,
-                            &fixture.baseline_snapshot,
+                            &fixture.mtp_snapshot,
                             Qwen35GenerationMode::Baseline,
                             |delta| {
                                 black_box(delta);
@@ -188,7 +191,24 @@ fn benchmark_long_conversation(
 }
 
 fn single_user_throughput(criterion: &mut Criterion) {
+    let long_context_only = match env::var(LONG_CONTEXT_ONLY_ENV) {
+        Ok(value) if value == "64k" => true,
+        Ok(value) => panic!(
+            "{LONG_CONTEXT_ONLY_ENV} must be `64k` when set, got `{value}`"
+        ),
+        Err(env::VarError::NotPresent) => false,
+        Err(env::VarError::NotUnicode(_)) => {
+            panic!("{LONG_CONTEXT_ONLY_ENV} must contain valid Unicode")
+        }
+    };
     let mut provider = support::load_provider();
+    if long_context_only {
+        let long_64k =
+            prepare_long_conversation_fixture(&mut provider, "64k", LONG_CONTEXT_64K_MIN_TOKENS);
+        assert!(long_64k.prefix_tokens >= LONG_CONTEXT_64K_MIN_TOKENS);
+        benchmark_long_conversation(criterion, &mut provider, &long_64k);
+        return;
+    }
     let prefill_prompt_ids = prompt_token_ids(&provider);
     let prompt_tokens = prefill_prompt_ids.len();
     let prefill_elements = generation_elements(1, prompt_tokens, 1).prefill;

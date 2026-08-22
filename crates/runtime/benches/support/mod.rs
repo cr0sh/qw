@@ -1,8 +1,6 @@
 use std::hint::black_box;
 use std::path::PathBuf;
 
-#[cfg(feature = "specprefill")]
-use qw_runtime::PrefillMode;
 use qw_runtime::provider::Qwen35GenerationMode;
 use qw_runtime::{
     ChatMessage, ChatMessageContent, GenerationRequest, KVCacheMode, PromptSnapshot, Qwen35Provider,
@@ -49,7 +47,6 @@ pub struct LongConversationFixture {
     pub prompt_ids: Vec<i32>,
     pub prefix_tokens: usize,
     pub new_prompt_tokens: usize,
-    pub baseline_snapshot: PromptSnapshot,
     pub mtp_snapshot: PromptSnapshot,
     pub baseline_token_ids: Vec<i32>,
     pub mtp_token_ids: Vec<i32>,
@@ -261,30 +258,6 @@ pub fn prepare_long_conversation_fixture(
     let history_ids = &prompt_ids[..prefix_tokens];
     let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
 
-    let baseline_prefix = provider
-        .generate_baseline_streaming(
-            history_ids,
-            1,
-            &sampling,
-            None,
-            None,
-            &[prefix_tokens],
-            #[cfg(feature = "specprefill")]
-            PrefillMode::Dense,
-            |_| true,
-        )
-        .expect("prefill long-conversation baseline prefix");
-    let baseline_snapshot = baseline_prefix
-        .prompt_snapshots
-        .into_iter()
-        .next()
-        .expect("capture long-conversation baseline prefix snapshot");
-    assert!(
-        matches!(&baseline_snapshot, PromptSnapshot::Baseline(_)),
-        "baseline prefix generation returned the wrong snapshot family"
-    );
-    assert_eq!(baseline_snapshot.token_len(), prefix_tokens);
-
     let mtp_prefix = provider
         .generate_mtp_streaming(
             history_ids,
@@ -313,7 +286,7 @@ pub fn prepare_long_conversation_fixture(
             &prompt_ids,
             DECODE_MAX_TOKENS,
             &sampling,
-            &baseline_snapshot,
+            &mtp_snapshot,
             Qwen35GenerationMode::Baseline,
             |delta| {
                 black_box(delta);
@@ -377,7 +350,6 @@ pub fn prepare_long_conversation_fixture(
         prompt_ids,
         prefix_tokens,
         new_prompt_tokens,
-        baseline_snapshot,
         mtp_snapshot,
         baseline_token_ids: baseline_output.token_ids,
         mtp_token_ids: mtp_output.token_ids,

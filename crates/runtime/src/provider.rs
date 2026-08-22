@@ -1445,7 +1445,11 @@ impl Qwen35Provider {
         on_delta: F,
     ) -> Result<(BaselineGeneration, Option<MtpGenerationStats>)> {
         match (mode, snapshot) {
-            (Qwen35GenerationMode::Baseline, PromptSnapshot::Baseline(snapshot)) => {
+            (Qwen35GenerationMode::Baseline, snapshot) => {
+                let snapshot = match snapshot {
+                    PromptSnapshot::Baseline(snapshot) => snapshot,
+                    PromptSnapshot::Mtp(snapshot) => snapshot.target_snapshot(),
+                };
                 let generation = self.generate_baseline_streaming(
                     prompt_ids,
                     max_tokens,
@@ -1482,8 +1486,7 @@ impl Qwen35Provider {
             (Qwen35GenerationMode::Automatic, _) => {
                 anyhow::bail!("cached benchmark mode must be explicit")
             }
-            (Qwen35GenerationMode::Baseline, PromptSnapshot::Mtp(_))
-            | (Qwen35GenerationMode::Mtp, PromptSnapshot::Baseline(_)) => {
+            (Qwen35GenerationMode::Mtp, PromptSnapshot::Baseline(_)) => {
                 anyhow::bail!("cached benchmark mode does not match the snapshot family")
             }
         }
@@ -1940,6 +1943,37 @@ mod tests {
                 },
             )
             .expect("warm MTP generation");
+
+        let baseline_cold = provider
+            .generate_baseline_streaming(
+                &full_ids,
+                32,
+                &sampling,
+                None,
+                None,
+                &[],
+                PrefillMode::Dense,
+                |_| true,
+            )
+            .expect("cold baseline generation");
+        let mtp_snapshot = PromptSnapshot::Mtp(snapshot);
+        let (baseline_warm, baseline_stats) = provider
+            .benchmark_cached_streaming_in_mode(
+                &full_ids,
+                32,
+                &sampling,
+                &mtp_snapshot,
+                Qwen35GenerationMode::Baseline,
+                |_| true,
+            )
+            .expect("baseline generation from MTP target snapshot");
+        assert_eq!(baseline_warm.cached_tokens, base_ids.len());
+        assert_eq!(baseline_warm.token_ids, baseline_cold.token_ids);
+        assert_eq!(baseline_warm.text, baseline_cold.text);
+        assert!(
+            baseline_stats.is_none(),
+            "explicit baseline mode returned MTP statistics"
+        );
 
         assert_eq!(warm.cached_tokens, base_ids.len());
         assert_eq!(warm.token_ids, cold.token_ids);
