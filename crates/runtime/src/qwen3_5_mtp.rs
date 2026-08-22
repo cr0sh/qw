@@ -2195,15 +2195,20 @@ impl Qwen35MtpGenerator {
             let mut next_hidden =
                 finish_drafter_prefill(model, drafter, prefill_input, prefill, first_token);
             let mut bonus = first_token;
+            let mut extend_greedy_draft = false;
 
             while generated.len() < max_tokens {
                 let emitted_before = generated.len();
                 let remaining = max_tokens - generated.len();
-                let proposal_count = round_proposal_count(block_size, remaining);
+                let greedy = sampler_is_greedy(&sampling);
+                let proposal_count = if greedy && extend_greedy_draft {
+                    block_size.min(remaining)
+                } else {
+                    round_proposal_count(block_size, remaining)
+                };
                 if proposal_count == 0 {
                     break;
                 }
-                let greedy = sampler_is_greedy(&sampling);
                 let phase_start = Instant::now();
                 let (draft_tokens, proposal_probs) = if greedy {
                     (
@@ -2280,6 +2285,7 @@ impl Qwen35MtpGenerator {
                 mtp_stats.walk_time += phase_start.elapsed();
                 let phase_start = Instant::now();
                 mtp_stats.record_round(walk.accepted, draft_tokens.len());
+                extend_greedy_draft = greedy && walk.accepted == draft_tokens.len();
 
                 let round_stop_reason = emit_walk_tokens(
                     &walk.new_tokens,
