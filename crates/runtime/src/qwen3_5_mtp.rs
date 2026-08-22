@@ -744,6 +744,7 @@ fn target_cache_accepted_count(emitted: usize) -> usize {
 }
 
 const MTP_STATE_MATERIALIZE_INTERVAL: usize = 128;
+const MTP_ADAPTIVE_DEPTH_MIN_CONTEXT: usize = 8_192;
 
 // Variable MTP verify shapes accumulate reusable Metal buffers much faster than
 // ordinary one-token decode. Keep a bounded cache, but retain those buffers
@@ -2285,8 +2286,9 @@ impl Qwen35MtpGenerator {
                 mtp_stats.walk_time += phase_start.elapsed();
                 let phase_start = Instant::now();
                 mtp_stats.record_round(walk.accepted, draft_tokens.len());
-                extend_greedy_draft =
-                    greedy && walk.accepted.saturating_add(1) >= draft_tokens.len();
+                extend_greedy_draft = greedy
+                    && prompt_tokens.len() >= MTP_ADAPTIVE_DEPTH_MIN_CONTEXT
+                    && walk.accepted.saturating_add(1) >= draft_tokens.len();
 
                 let round_stop_reason = emit_walk_tokens(
                     &walk.new_tokens,
