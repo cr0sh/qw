@@ -420,17 +420,21 @@ impl Qwen35MtpDraftModel {
     ) -> Vec<i32> {
         let mut state = self.state.borrow_mut();
         state.round_appended = 0;
+        let compact = target.has_compact_draft_head();
         let mut tokens = Vec::with_capacity(proposal_count);
-        let mut history = committed_history.to_vec();
+        let mut history = (!compact).then(|| committed_history.to_vec());
         let mut hidden = self.draft_seed_hidden(target, last_bonus, target_hidden, &mut state);
         let mut logits = target.project_draft_logits(&hidden);
-        let compact = target.has_compact_draft_head();
-
         while tokens.len() < proposal_count {
             let token_array = if compact && sampler_is_greedy(sampling) {
                 mlxcel_core::argmax_last_axis(&logits)
             } else {
-                sample_token_optimized(&logits, sampling, &history).0
+                sample_token_optimized(
+                    &logits,
+                    sampling,
+                    history.as_deref().expect("non-compact drafting keeps history"),
+                )
+                .0
             };
             mlxcel_core::eval(&token_array);
             let sampled = mlxcel_core::item_i32(&token_array);
@@ -443,7 +447,9 @@ impl Qwen35MtpDraftModel {
             if eos_tokens.contains(&token) || tokens.len() == proposal_count {
                 break;
             }
-            history.push(token);
+            if let Some(history) = &mut history {
+                history.push(token);
+            }
             let token_array = mlxcel_core::from_slice_i32(&[token], &[1, 1]);
             hidden = self.forward_tokens(target, &token_array, &hidden, &mut state);
             state.round_appended += 1;
