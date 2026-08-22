@@ -418,6 +418,8 @@ pub struct KVCache {
     /// Deterministic seed for the Turbo4 sign vectors. Set at construction
     /// time so detach/adopt round-trip without recomputing rotations.
     pub(crate) turbo_seed: u32,
+    /// Whether FP16 writes are quantized once before being retained as FP16.
+    fp16_v_quantize_on_write: bool,
     /// Number of tokens currently folded into cold V storage (Turbo4Delegated
     /// only).
     ///
@@ -525,6 +527,7 @@ impl KVCache {
             turbo_params: None,
             turbo3_params: None,
             turbo_seed: TURBO_DEFAULT_SEED,
+            fp16_v_quantize_on_write: false,
             cold_offset: 0,
             hot_threshold: turbo::DELEGATED_HOT_THRESHOLD,
             delegated_fp16_fast_path: turbo::delegated_fp16_fast_path_enabled(),
@@ -573,6 +576,7 @@ impl KVCache {
             turbo_params: None,
             turbo3_params: None,
             turbo_seed,
+            fp16_v_quantize_on_write: false,
             cold_offset: 0,
             hot_threshold: turbo::DELEGATED_HOT_THRESHOLD,
             delegated_fp16_fast_path: turbo::delegated_fp16_fast_path_enabled(),
@@ -583,7 +587,7 @@ impl KVCache {
     /// Quantize V once on each FP16 write while retaining FP16 cache storage.
     pub fn enable_fp16_v_quantization_on_write(&mut self) {
         assert_eq!(self.mode, KVCacheMode::Fp16);
-        self.turbo_seed = 0;
+        self.fp16_v_quantize_on_write = true;
     }
 
     /// Return the packed sidecars needed for an exact-prefix Turbo4 snapshot.
@@ -973,7 +977,7 @@ impl KVCache {
     /// so RoPE positions for subsequent Q tokens stay correct after a
     /// [`Self::trim_front`] has shifted `self.live_start` forward.
     fn update_fp16(&mut self, new_keys: UniquePtr<MlxArray>, new_values: UniquePtr<MlxArray>) {
-        let new_values = if self.turbo_seed == 0 {
+        let new_values = if self.fp16_v_quantize_on_write {
             if self.turbo_params.is_none() {
                 let value_shape = ffi::array_shape(&new_values);
                 self.turbo_params = Some(turbo::TurboQuantParams::new(value_shape[3] as u32, 0));
