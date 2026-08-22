@@ -432,7 +432,9 @@ impl Qwen35MtpDraftModel {
                 sample_token_optimized(
                     &logits,
                     sampling,
-                    history.as_deref().expect("non-compact drafting keeps history"),
+                    history
+                        .as_deref()
+                        .expect("non-compact drafting keeps history"),
                 )
                 .0
             };
@@ -843,7 +845,6 @@ fn should_extend_greedy_draft(
         && prompt_tokens >= MTP_ADAPTIVE_DEPTH_MIN_CONTEXT
         && accepted.saturating_add(1) >= proposed
 }
-
 
 fn logits_at(logits: &MlxArray, position: usize) -> UniquePtr<MlxArray> {
     let shape = mlxcel_core::array_shape(logits);
