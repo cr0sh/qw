@@ -114,6 +114,11 @@ impl MtpPromptSnapshot {
         self.target.token_len()
     }
 
+    /// Exact target-model state embedded in this speculative prompt snapshot.
+    pub fn target_snapshot(&self) -> &ModelStateSnapshot {
+        &self.target
+    }
+
     pub fn nbytes(&self) -> usize {
         self.target.nbytes()
             + self
@@ -2761,6 +2766,7 @@ mod tests {
             last_hidden: materialize_detached(mlxcel_core::copy(&hidden)),
             continuation_logits: materialize_detached(mlxcel_core::copy(&logits)),
         };
+        assert!(std::ptr::eq(snapshot.target_snapshot(), &snapshot.target));
         drop((keys, values, hidden, logits));
         mlxcel_core::clear_memory_cache();
 
