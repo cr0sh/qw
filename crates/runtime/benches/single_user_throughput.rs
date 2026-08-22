@@ -93,6 +93,10 @@ fn single_user_throughput(criterion: &mut Criterion) {
         )
         .expect("warm up single-user SpecPrefill");
     let specprefill_token_ids = specprefill_warmup.token_ids.clone();
+    assert_eq!(
+        specprefill_token_ids, dense_token_ids,
+        "SpecPrefill changed the deterministic greedy output token"
+    );
     let specprefill_stats = specprefill_warmup
         .specprefill_stats
         .as_ref()

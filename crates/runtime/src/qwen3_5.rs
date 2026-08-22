@@ -45,6 +45,7 @@ const DFLASH_VERIFY_PREFIX: i32 = 131_072;
 const DFLASH_VERIFY_PADDED: i32 = 131_104;
 const DRAFT_CONTROL_START: i32 = 248_044;
 const DRAFT_CONTROL_END: i32 = 248_070;
+const SPECPREFILL_TARGET_CHUNK_TOKENS: usize = 512;
 
 fn compact_rows(array: &MlxArray, prefix_len: i32, padded_len: i32) -> UniquePtr<MlxArray> {
     let columns = mlxcel_core::array_shape(array)[1];
@@ -2031,26 +2032,34 @@ impl Qwen35Model {
             });
         }
 
-        let sparse_ids = selected_indices
-            .iter()
-            .map(|&index| prompt_ids[index])
-            .collect::<Vec<_>>();
-        let one_axis_positions = selected_indices
-            .iter()
-            .map(|&index| i32::try_from(index).unwrap_or(i32::MAX))
-            .collect::<Vec<_>>();
-        let positions = one_axis_positions
-            .iter()
-            .chain(&one_axis_positions)
-            .chain(&one_axis_positions)
-            .copied()
-            .collect::<Vec<_>>();
-        let input = mlxcel_core::from_slice_i32(&sparse_ids, &[1, sparse_ids.len() as i32]);
-        let position_ids =
-            mlxcel_core::from_slice_i32(&positions, &[3, 1, sparse_ids.len() as i32]);
-        let hidden = self.sequence_state.with_internal(|caches| {
-            self.forward_backbone_with_inputs(&input, None, caches, Some(&position_ids))
-        });
+        if selected_indices.is_empty() {
+            return Err("SpecPrefill selected no target tokens".to_string());
+        }
+        let mut final_hidden = None;
+        for indices in selected_indices.chunks(SPECPREFILL_TARGET_CHUNK_TOKENS) {
+            let sparse_ids = indices
+                .iter()
+                .map(|&index| prompt_ids[index])
+                .collect::<Vec<_>>();
+            let one_axis_positions = indices
+                .iter()
+                .map(|&index| i32::try_from(index).unwrap_or(i32::MAX))
+                .collect::<Vec<_>>();
+            let positions = one_axis_positions
+                .iter()
+                .chain(&one_axis_positions)
+                .chain(&one_axis_positions)
+                .copied()
+                .collect::<Vec<_>>();
+            let input =
+                mlxcel_core::from_slice_i32(&sparse_ids, &[1, sparse_ids.len() as i32]);
+            let position_ids =
+                mlxcel_core::from_slice_i32(&positions, &[3, 1, sparse_ids.len() as i32]);
+            final_hidden = Some(self.sequence_state.with_internal(|caches| {
+                self.forward_backbone_with_inputs(&input, None, caches, Some(&position_ids))
+            }));
+        }
+        let hidden = final_hidden.expect("non-empty SpecPrefill selection produces hidden states");
         let shape = mlxcel_core::array_shape(&hidden);
         let last = shape[1] - 1;
         let last_hidden = mlxcel_core::slice(
