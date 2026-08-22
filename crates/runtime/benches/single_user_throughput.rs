@@ -162,7 +162,7 @@ fn single_user_throughput(criterion: &mut Criterion) {
             });
         });
         #[cfg(feature = "specprefill")]
-        group.bench_function("fresh_specprefill", |bencher| {
+        group.bench_function("specprefill", |bencher| {
             bencher.iter(|| {
                 let output = provider
                     .generate_baseline_streaming(
