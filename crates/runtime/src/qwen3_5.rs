@@ -1045,7 +1045,7 @@ impl Qwen35Model {
                     Qwen3NextCache::Linear(GatedDeltaCache::new())
                 } else {
                     let mut cache = KVCache::new_with_mode(self.kv_cache_mode);
-                    if self.bounded_mtp_fp16 && index >= 32 {
+                    if self.bounded_mtp_fp16 && index >= 48 {
                         cache.enable_fp16_v_quantization_on_write();
                     }
                     Qwen3NextCache::Attention(Box::new(cache))
@@ -2854,7 +2854,7 @@ impl LanguageModel for Qwen35Model {
                 cache.keys = Some(mlxcel_core::copy(keys));
                 cache.values = Some(mlxcel_core::copy(values));
                 cache.offset = token_len;
-                if self.bounded_mtp_fp16 && index >= 32 {
+                if self.bounded_mtp_fp16 && index >= 48 {
                     cache.enable_fp16_v_quantization_on_write();
                 }
                 restored.push(Qwen3NextCache::Attention(Box::new(cache)));
