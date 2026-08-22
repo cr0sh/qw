@@ -3,6 +3,10 @@ name = "qw-server"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+specprefill = ["qw-runtime/specprefill"]
+
 [[bin]]
 name = "qw-server"
 path = "src/main.rs"

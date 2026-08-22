@@ -8,9 +8,10 @@ use std::thread;
 use clap::Parser as _;
 use clap_derive::{Args, Parser, Subcommand};
 use qw_runtime::{
-    DEFAULT_SPECPREFILL_DRAFT_MODEL_IDENTIFIER, GenerationRequest, KVCacheMode, Qwen35Provider,
-    model_cache_path, validate_identifier,
+    GenerationRequest, KVCacheMode, Qwen35Provider, model_cache_path, validate_identifier,
 };
+#[cfg(feature = "specprefill")]
+use qw_runtime::DEFAULT_SPECPREFILL_DRAFT_MODEL_IDENTIFIER;
 use qw_server::serve;
 
 #[derive(Debug, Parser)]
@@ -283,6 +284,11 @@ fn download_snapshot(identifier: &str) -> Result<(), Box<dyn std::error::Error>>
 }
 
 fn download_identifiers(requested: &str) -> Vec<&str> {
+    #[cfg(not(feature = "specprefill"))]
+    {
+        return vec![requested];
+    }
+    #[cfg(feature = "specprefill")]
     if requested == DEFAULT_SPECPREFILL_DRAFT_MODEL_IDENTIFIER {
         vec![requested]
     } else {
@@ -397,6 +403,13 @@ mod tests {
     }
 
 
+    #[cfg(not(feature = "specprefill"))]
+    #[test]
+    fn download_requests_only_target_without_specprefill() {
+        assert_eq!(download_identifiers("Qwen/target"), vec!["Qwen/target"]);
+    }
+
+    #[cfg(feature = "specprefill")]
     #[test]
     fn download_orders_target_before_specprefill_draft() {
         assert_eq!(
@@ -408,6 +421,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "specprefill")]
     #[test]
     fn download_deduplicates_requested_specprefill_draft() {
         assert_eq!(
@@ -493,6 +507,7 @@ mod tests {
         assert_eq!(request.seed, Some(42));
     }
 
+    #[cfg(feature = "specprefill")]
     #[test]
     fn serve_accepts_server_options() {
         let cli = Cli::try_parse_from([
@@ -548,19 +563,25 @@ mod tests {
             "{serve_help}"
         );
         assert!(serve_help.contains("--mtp-k"), "{serve_help}");
+        #[cfg(feature = "specprefill")]
         assert!(
             serve_help.contains("--specprefill-min-turn-tokens"),
             "{serve_help}"
         );
+        #[cfg(feature = "specprefill")]
         assert!(serve_help.contains("--specprefill-keep-rate"), "{serve_help}");
+        #[cfg(feature = "specprefill")]
         assert!(
             serve_help.contains("--specprefill-keep-first-tokens"),
             "{serve_help}"
         );
+        #[cfg(feature = "specprefill")]
         assert!(
             serve_help.contains("--specprefill-keep-last-tokens"),
             "{serve_help}"
         );
+        #[cfg(not(feature = "specprefill"))]
+        assert!(!serve_help.contains("--specprefill-"), "{serve_help}");
         assert!(serve_help.contains("--no-kv-quantization"), "{serve_help}");
         assert!(serve_help.contains("--output-format"), "{serve_help}");
     }

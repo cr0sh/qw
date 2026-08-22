@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use qw_runtime::provider::Qwen35GenerationMode;
+#[cfg(feature = "specprefill")]
 use qw_runtime::{PrefillMode, SpecPrefillConfig};
 use support::{MTP_BLOCK_SIZE, prepare_decode_fixture, prompt_token_ids};
 
@@ -58,6 +59,7 @@ fn single_user_throughput(criterion: &mut Criterion) {
             None,
             None,
             &[],
+            #[cfg(feature = "specprefill")]
             PrefillMode::Dense,
             |delta| {
                 black_box(delta);
@@ -66,17 +68,20 @@ fn single_user_throughput(criterion: &mut Criterion) {
         )
         .expect("warm up dense single-user prefill");
     assert!(!dense_warmup.token_ids.is_empty());
+    #[cfg(feature = "specprefill")]
     assert!(
         dense_warmup.specprefill_stats.is_none(),
         "dense prefill warmup returned SpecPrefill statistics"
     );
     let dense_token_ids = dense_warmup.token_ids;
+    #[cfg(feature = "specprefill")]
     let specprefill_config = SpecPrefillConfig {
         min_tokens: 1,
         keep_rate: 0.25,
         protected_prefix_tokens: 0,
         ..Default::default()
     };
+    #[cfg(feature = "specprefill")]
     let specprefill_warmup = provider
         .generate_baseline_streaming(
             &prefill_prompt_ids,
@@ -92,20 +97,27 @@ fn single_user_throughput(criterion: &mut Criterion) {
             },
         )
         .expect("warm up single-user SpecPrefill");
+    #[cfg(feature = "specprefill")]
     let specprefill_token_ids = specprefill_warmup.token_ids.clone();
+    #[cfg(feature = "specprefill")]
     assert_eq!(
         specprefill_token_ids, dense_token_ids,
         "SpecPrefill changed the deterministic greedy output token"
     );
+    #[cfg(feature = "specprefill")]
     let specprefill_stats = specprefill_warmup
         .specprefill_stats
         .as_ref()
         .expect("SpecPrefill warmup must activate sparse admission");
+    #[cfg(feature = "specprefill")]
     assert!(specprefill_stats.eligible_target_tokens > specprefill_config.min_tokens);
+    #[cfg(feature = "specprefill")]
     assert!(specprefill_stats.selected_target_tokens > 0);
+    #[cfg(feature = "specprefill")]
     assert!(
         specprefill_stats.selected_target_tokens < specprefill_stats.eligible_target_tokens
     );
+    #[cfg(feature = "specprefill")]
     assert!(
         specprefill_stats.selected_target_tokens * 2
             <= specprefill_stats.eligible_target_tokens,
@@ -113,6 +125,7 @@ fn single_user_throughput(criterion: &mut Criterion) {
         specprefill_stats.selected_target_tokens,
         specprefill_stats.eligible_target_tokens
     );
+    #[cfg(feature = "specprefill")]
     black_box(specprefill_warmup);
 
     {
@@ -128,6 +141,7 @@ fn single_user_throughput(criterion: &mut Criterion) {
                         None,
                         None,
                         &[],
+                        #[cfg(feature = "specprefill")]
                         PrefillMode::Dense,
                         |delta| {
                             black_box(delta);
@@ -136,6 +150,7 @@ fn single_user_throughput(criterion: &mut Criterion) {
                     )
                     .expect("benchmark dense single-user prefill");
                 assert_eq!(output.token_ids, dense_token_ids);
+                #[cfg(feature = "specprefill")]
                 assert!(
                     output.specprefill_stats.is_none(),
                     "dense prefill benchmark returned SpecPrefill statistics"
@@ -143,6 +158,7 @@ fn single_user_throughput(criterion: &mut Criterion) {
                 black_box(output);
             });
         });
+        #[cfg(feature = "specprefill")]
         group.bench_function("specprefill", |bencher| {
             bencher.iter(|| {
                 let output = provider

@@ -45,6 +45,7 @@ const DFLASH_VERIFY_PREFIX: i32 = 131_072;
 const DFLASH_VERIFY_PADDED: i32 = 131_104;
 const DRAFT_CONTROL_START: i32 = 248_044;
 const DRAFT_CONTROL_END: i32 = 248_070;
+#[cfg(any(feature = "specprefill", test))]
 const SPECPREFILL_TARGET_CHUNK_TOKENS: usize = 512;
 
 fn compact_rows(array: &MlxArray, prefix_len: i32, padded_len: i32) -> UniquePtr<MlxArray> {
@@ -772,6 +773,7 @@ impl Qwen35DecoderLayer {
         mlxcel_core::add(&hidden, &mlp)
     }
 
+    #[cfg(any(feature = "specprefill", test))]
     fn forward_with_query_capture(
         &self,
         x: &MlxArray,
@@ -1862,6 +1864,7 @@ impl Qwen35Model {
         Ok(model)
     }
 
+    #[cfg(any(feature = "specprefill", test))]
     pub(crate) fn load_specprefill_draft(model_dir: &Path) -> Result<Self> {
         use crate::specprefill::SPECPREFILL_DRAFT_MODEL_IDENTIFIER;
 
@@ -1931,6 +1934,7 @@ impl Qwen35Model {
             })
     }
 
+    #[cfg(any(feature = "specprefill", test))]
     pub(crate) fn specprefill_draft_prefill(&self, prompt_ids: &[i32]) -> Result<UniquePtr<MlxArray>> {
         ensure!(!prompt_ids.is_empty(), "SpecPrefill draft prompt must not be empty");
         self.reset_runtime_state();
@@ -1961,6 +1965,7 @@ impl Qwen35Model {
         Ok(final_logits.expect("non-empty draft prompt produces logits"))
     }
 
+    #[cfg(any(feature = "specprefill", test))]
     pub(crate) fn specprefill_draft_lookahead(
         &self,
         token_id: i32,
@@ -1980,6 +1985,7 @@ impl Qwen35Model {
         })
     }
 
+    #[cfg(any(feature = "specprefill", test))]
     pub(crate) fn specprefill_draft_prompt_keys(
         &self,
         prompt_len: usize,
@@ -2004,6 +2010,7 @@ impl Qwen35Model {
         })
     }
 
+    #[cfg(any(feature = "specprefill", test))]
     pub(crate) fn specprefill_sparse_prefill(
         &self,
         prompt_ids: &[i32],
@@ -2073,6 +2080,7 @@ impl Qwen35Model {
         ))
     }
 
+    #[cfg(any(feature = "specprefill", test))]
     pub(crate) fn specprefill_decode(
         &self,
         token_id: i32,
