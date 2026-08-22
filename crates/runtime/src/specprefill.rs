@@ -92,11 +92,7 @@ pub(crate) fn score_tokens(draft: &Qwen35Model, prompt_ids: &[i32]) -> Result<Ve
         ..SamplingConfig::default()
     };
     seed_rng_if_needed(&sampling);
-    let mut captures: Vec<Vec<UniquePtr<MlxArray>>> = draft
-        .specprefill_draft_prompt_keys(prompt_ids.len())
-        .iter()
-        .map(|_| Vec::with_capacity(LOOKAHEAD_TOKENS))
-        .collect();
+    let mut captures: Vec<Vec<UniquePtr<MlxArray>>> = Vec::new();
     let mut history = prompt_ids.to_vec();
     let mut token = sample_token_optimized(&logits, &sampling, &history).0;
     mlxcel_core::eval(&token);
@@ -105,12 +101,27 @@ pub(crate) fn score_tokens(draft: &Qwen35Model, prompt_ids: &[i32]) -> Result<Ve
         let token_id = mlxcel_core::item_i32(&token);
         history.push(token_id);
         let (next_logits, queries) = draft.specprefill_draft_lookahead(token_id);
-        ensure!(
-            queries.len() == captures.len(),
-            "SpecPrefill draft attention capture topology changed"
-        );
-        for (layer, query) in captures.iter_mut().zip(queries) {
-            layer.push(query);
+        if captures.is_empty() {
+            ensure!(
+                !queries.is_empty(),
+                "SpecPrefill draft captured no full-attention queries"
+            );
+            captures = queries
+                .into_iter()
+                .map(|query| {
+                    let mut layer = Vec::with_capacity(LOOKAHEAD_TOKENS);
+                    layer.push(query);
+                    layer
+                })
+                .collect();
+        } else {
+            ensure!(
+                queries.len() == captures.len(),
+                "SpecPrefill draft attention capture topology changed"
+            );
+            for (layer, query) in captures.iter_mut().zip(queries) {
+                layer.push(query);
+            }
         }
         logits = next_logits;
         token = sample_token_optimized(&logits, &sampling, &history).0;
