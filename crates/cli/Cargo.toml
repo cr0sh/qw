@@ -6,6 +6,7 @@ edition = "2024"
 [features]
 default = []
 dflash2 = ["qw-runtime/dflash2"]
+specprefill = ["qw-runtime/specprefill", "qw-server/specprefill"]
 
 [[bin]]
 name = "qw"

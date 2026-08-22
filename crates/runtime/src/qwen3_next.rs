@@ -142,6 +142,7 @@ impl Qwen3NextAttention {
         self.o_proj.forward(&output)
     }
 
+    #[cfg(any(feature = "specprefill", test))]
     /// Draft-lookahead entry point used by SpecPrefill. The captured tensor is
     /// the normalized, post-RoPE query in `[B, H, L, D]` layout.
     pub(crate) fn forward_with_query_capture(

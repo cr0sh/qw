@@ -29,7 +29,9 @@ use engine::{
     Admission, CompletionRecord, FailureKind, FinishReason, GeneratedToolCall, WorkerDelta,
     WorkerEvent, WorkerFailure,
 };
-pub use engine::{Engine, SpecPrefillPolicyConfig, SubmitError};
+pub use engine::{Engine, SubmitError};
+#[cfg(feature = "specprefill")]
+pub use engine::SpecPrefillPolicyConfig;
 use protocol::{Endpoint, RequestError};
 
 #[derive(Clone)]

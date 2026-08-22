@@ -7,7 +7,9 @@ use qw_prefix_cache::CacheConfig;
 use qw_runtime::{KVCacheMode, resolve_model_path};
 use tracing::info;
 
-use crate::{Engine, SpecPrefillPolicyConfig, router};
+use crate::{Engine, router};
+#[cfg(feature = "specprefill")]
+use crate::SpecPrefillPolicyConfig;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum OutputFormat {
@@ -45,15 +47,19 @@ pub struct ServerArgs {
     #[arg(long = "mtp-k", default_value_t = 3)]
     mtp_k: usize,
 
+    #[cfg(feature = "specprefill")]
     /// Current-turn token threshold above which SpecPrefill activates.
     #[arg(long, default_value_t = 8_000)]
     specprefill_min_turn_tokens: usize,
+    #[cfg(feature = "specprefill")]
     /// Fraction of score-ranked prompt chunks retained by SpecPrefill.
     #[arg(long, default_value_t = 0.25)]
     specprefill_keep_rate: f32,
+    #[cfg(feature = "specprefill")]
     /// Tokens force-kept at the start of the SpecPrefill-eligible suffix.
     #[arg(long, default_value_t = 256)]
     specprefill_keep_first_tokens: usize,
+    #[cfg(feature = "specprefill")]
     /// Tokens force-kept at the end of the SpecPrefill-eligible suffix.
     #[arg(long, default_value_t = 256)]
     specprefill_keep_last_tokens: usize,
@@ -75,6 +81,7 @@ impl ServerArgs {
         }
     }
 
+    #[cfg(feature = "specprefill")]
     fn specprefill_policy(&self) -> SpecPrefillPolicyConfig {
         SpecPrefillPolicyConfig {
             min_turn_tokens: self.specprefill_min_turn_tokens,
@@ -95,6 +102,7 @@ fn validate_cli(cli: &ServerArgs) -> Result<()> {
         "--prefix-cache-filesystem-bytes must be greater than zero"
     );
     ensure!(cli.mtp_k >= 2, "--mtp-k must be at least 2");
+    #[cfg(feature = "specprefill")]
     cli.specprefill_policy().validate()?;
     Ok(())
 }
@@ -125,6 +133,7 @@ pub async fn serve(cli: ServerArgs) -> Result<()> {
     info!(phase = "server.starting", bind = %bind);
 
     let kv_cache_mode = cli.kv_cache_mode();
+    #[cfg(feature = "specprefill")]
     let specprefill_policy = cli.specprefill_policy();
     let model = resolve_model_path(cli.model.as_deref())?;
     let prefix_cache_directory = resolve_prefix_cache_directory(cli.prefix_cache_directory)?;
@@ -138,6 +147,7 @@ pub async fn serve(cli: ServerArgs) -> Result<()> {
         },
         cli.mtp_k,
         kv_cache_mode,
+        #[cfg(feature = "specprefill")]
         specprefill_policy,
     )?;
     let listener = tokio::net::TcpListener::bind(bind)
@@ -308,6 +318,14 @@ mod tests {
         assert!(!help.contains("--prefix-cache-max-tokens"), "{help}");
     }
 
+    #[cfg(not(feature = "specprefill"))]
+    #[test]
+    fn cli_omits_specprefill_controls_without_feature() {
+        let help = TestCli::command().render_long_help().to_string();
+        assert!(!help.contains("--specprefill-"), "{help}");
+    }
+
+    #[cfg(feature = "specprefill")]
     #[test]
     fn cli_configures_specprefill_policy() {
         let defaults =

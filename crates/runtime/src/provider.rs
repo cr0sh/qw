@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(any(feature = "specprefill", test))]
+use std::time::Instant;
 
 use anyhow::{Context, Result, ensure};
 use mlxcel_core::cache::KVCacheMode;
@@ -35,6 +37,7 @@ use crate::qwen3_5::Qwen35Model;
 pub use crate::qwen3_5_dflash::Dflash2GenerationStats;
 use crate::qwen3_5_mtp::Qwen35MtpGenerator;
 pub use crate::qwen3_5_mtp::{MtpGenerationStats, MtpPrefixReuse, MtpPromptSnapshot};
+#[cfg(any(feature = "specprefill", test))]
 use crate::specprefill::{
     PrefillMode, SpecPrefillConfig, SpecPrefillStats, dense_prefix_end, score_tokens,
     select_target_indices, should_activate,
@@ -78,6 +81,7 @@ fn log_generation_metrics(
         tokens_per_second = tokens_per_second(completion_tokens, decode_time),
     );
 }
+#[cfg(any(feature = "specprefill", test))]
 struct SparseGeneration {
     token_ids: Vec<i32>,
     stop_reason: GenerationStopReason,
@@ -87,6 +91,7 @@ struct SparseGeneration {
     stats: SpecPrefillStats,
 }
 
+#[cfg(any(feature = "specprefill", test))]
 #[allow(clippy::too_many_arguments)]
 fn generate_specprefill_tokens<F: FnMut(i32) -> bool>(
     model: &Qwen35Model,
@@ -237,6 +242,7 @@ pub struct BaselineGeneration {
     pub prefill_time: Duration,
     /// Wall time spent sampling and forwarding generated tokens.
     pub decode_time: Duration,
+    #[cfg(any(feature = "specprefill", test))]
     pub specprefill_stats: Option<SpecPrefillStats>,
 }
 
@@ -321,6 +327,7 @@ pub enum Qwen35GenerationMode {
 pub struct Qwen35Provider {
     model: Qwen35Model,
     tokenizer: Tokenizer,
+    #[cfg(any(feature = "specprefill", test))]
     specprefill_draft: Option<Qwen35Model>,
     chat_template: ChatTemplateProcessor,
     defaults: GenerationDefaults,
@@ -359,16 +366,20 @@ struct GenerationDefaults {
 
 impl Qwen35Provider {
     pub fn load(model_dir: impl AsRef<Path>, kv_cache_mode: KVCacheMode) -> Result<Self> {
-        let draft_model_dir = crate::resolve_specprefill_draft_path(None)?;
-        Self::load_with_specprefill_draft(model_dir, &draft_model_dir, kv_cache_mode).with_context(
-            || {
-                format!(
-                    "failed to load required SpecPrefill draft at {}; rerun `qw download {}`",
-                    draft_model_dir.display(),
-                    crate::DEFAULT_MODEL_IDENTIFIER
-                )
-            },
-        )
+        #[cfg(feature = "specprefill")]
+        {
+            let draft_model_dir = crate::resolve_specprefill_draft_path(None)?;
+            return Self::load_with_specprefill_draft(model_dir, &draft_model_dir, kv_cache_mode)
+                .with_context(|| {
+                    format!(
+                        "failed to load required SpecPrefill draft at {}; rerun `qw download {}`",
+                        draft_model_dir.display(),
+                        crate::DEFAULT_MODEL_IDENTIFIER
+                    )
+                });
+        }
+        #[cfg(not(feature = "specprefill"))]
+        Self::load_target_only(model_dir.as_ref(), kv_cache_mode)
     }
     
     fn load_target_only(model_dir: &Path, kv_cache_mode: KVCacheMode) -> Result<Self> {
@@ -410,6 +421,7 @@ impl Qwen35Provider {
             chat_template,
             defaults,
             generator,
+            #[cfg(any(feature = "specprefill", test))]
             specprefill_draft: None,
             mtp_generator,
             #[cfg(any(feature = "dflash2", test))]
@@ -418,6 +430,7 @@ impl Qwen35Provider {
         })
     }
 
+    #[cfg(any(feature = "specprefill", test))]
     pub fn load_with_specprefill_draft(
         model_dir: impl AsRef<Path>,
         draft_model_dir: impl AsRef<Path>,
@@ -712,9 +725,11 @@ impl Qwen35Provider {
         prefix_reuse: Option<PrefixReuse<'_>>,
         constraint: Option<&mut dyn TokenConstraint>,
         checkpoint_token_lengths: &[usize],
+        #[cfg(any(feature = "specprefill", test))]
         prefill_mode: PrefillMode,
         mut on_delta: F,
     ) -> Result<BaselineGeneration> {
+        #[cfg(any(feature = "specprefill", test))]
         if let PrefillMode::SpecPrefill(config) = prefill_mode {
             config.validate(prompt_ids.len())?;
             ensure!(
@@ -799,6 +814,7 @@ impl Qwen35Provider {
                     final_snapshot: None,
                     prefill_time: sparse.prefill_time,
                     decode_time: sparse.decode_time,
+                    #[cfg(any(feature = "specprefill", test))]
                     specprefill_stats: Some(sparse.stats),
                 });
             }
@@ -893,6 +909,7 @@ impl Qwen35Provider {
             final_snapshot: controlled.final_snapshot.map(PromptSnapshot::Baseline),
             prefill_time,
             decode_time,
+            #[cfg(any(feature = "specprefill", test))]
             specprefill_stats: None,
         })
     }
@@ -998,6 +1015,7 @@ impl Qwen35Provider {
             final_snapshot: None,
             prefill_time,
             decode_time,
+            #[cfg(any(feature = "specprefill", test))]
             specprefill_stats: None,
         })
     }
@@ -1278,6 +1296,7 @@ impl Qwen35Provider {
                 final_snapshot: generated.final_snapshot.map(PromptSnapshot::Mtp),
                 prefill_time,
                 decode_time,
+                #[cfg(any(feature = "specprefill", test))]
                 specprefill_stats: None,
             },
             generated.stats,
@@ -1317,6 +1336,7 @@ impl Qwen35Provider {
                 None,
                 None,
                 &[],
+                #[cfg(any(feature = "specprefill", test))]
                 PrefillMode::Dense,
                 on_delta,
             )?;
@@ -1368,6 +1388,7 @@ impl Qwen35Provider {
                 None,
                 None,
                 &[],
+                #[cfg(any(feature = "specprefill", test))]
                 PrefillMode::Dense,
                 on_delta,
             )?;

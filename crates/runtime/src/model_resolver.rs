@@ -6,6 +6,7 @@ use anyhow::{Result, bail};
 /// and the runtime benchmarks use when neither `--model` nor `QW_MODEL_PATH`
 /// is given. Users override the *path* to a checkpoint, never this identifier.
 pub const DEFAULT_MODEL_IDENTIFIER: &str = "Jundot/Qwen3.8-27B-oQ4e-fp16-mtp";
+#[cfg(any(feature = "specprefill", test))]
 pub const DEFAULT_SPECPREFILL_DRAFT_MODEL_IDENTIFIER: &str =
     "mlx-community/Qwen3.5-0.8B-MLX-8bit";
 
@@ -69,6 +70,7 @@ pub fn resolve_model_path(cli_override: Option<&Path>) -> Result<PathBuf> {
     resolve_model_dir(cli_override, env_override.as_deref(), home.as_deref())
 }
 
+#[cfg(any(feature = "specprefill", test))]
 fn resolve_specprefill_draft_dir(
     cli_override: Option<&Path>,
     env_override: Option<&Path>,
@@ -86,6 +88,7 @@ fn resolve_specprefill_draft_dir(
     model_cache_path(home, DEFAULT_SPECPREFILL_DRAFT_MODEL_IDENTIFIER)
 }
 
+#[cfg(any(feature = "specprefill", test))]
 pub fn resolve_specprefill_draft_path(cli_override: Option<&Path>) -> Result<PathBuf> {
     let env_override = std::env::var_os("QW_SPECPREFILL_DRAFT_MODEL_PATH")
         .filter(|value| !value.is_empty())

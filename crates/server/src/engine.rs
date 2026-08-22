@@ -12,10 +12,9 @@ use qw_prefix_cache::{
 };
 #[cfg(test)]
 use qw_runtime::ChatContentRef;
-use qw_runtime::{
-    ChatMessage, KVCacheMode, MtpPrefixReuse, PrefillMode, PromptSnapshot, Qwen35Provider,
-    SpecPrefillConfig,
-};
+use qw_runtime::{ChatMessage, KVCacheMode, MtpPrefixReuse, PromptSnapshot, Qwen35Provider};
+#[cfg(feature = "specprefill")]
+use qw_runtime::{PrefillMode, SpecPrefillConfig};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{Span, error, info, info_span, warn};
@@ -32,6 +31,7 @@ use crate::tool_calls::{ToolCallGate, parse_assistant_output};
 const JOB_QUEUE_CAPACITY: usize = 8;
 const EVENT_QUEUE_CAPACITY: usize = 32;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+#[cfg(feature = "specprefill")]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SpecPrefillPolicyConfig {
     pub min_turn_tokens: usize,
@@ -40,6 +40,7 @@ pub struct SpecPrefillPolicyConfig {
     pub keep_last_tokens: usize,
 }
 
+#[cfg(feature = "specprefill")]
 impl Default for SpecPrefillPolicyConfig {
     fn default() -> Self {
         Self {
@@ -51,6 +52,7 @@ impl Default for SpecPrefillPolicyConfig {
     }
 }
 
+#[cfg(feature = "specprefill")]
 impl SpecPrefillPolicyConfig {
     pub(crate) fn validate(self) -> Result<()> {
         ensure!(
@@ -65,12 +67,14 @@ impl SpecPrefillPolicyConfig {
     }
 }
 
+#[cfg(feature = "specprefill")]
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct CurrentTurnPolicy {
     current_turn_tokens: Option<usize>,
     prefill_mode: PrefillMode,
 }
 
+#[cfg(feature = "specprefill")]
 fn messages_before_model_input_turn(messages: &[ChatMessage]) -> Option<&[ChatMessage]> {
     let boundary = if messages.last().is_some_and(|message| message.role == "tool") {
         messages
@@ -89,6 +93,7 @@ fn messages_before_model_input_turn(messages: &[ChatMessage]) -> Option<&[ChatMe
         .then_some(preceding)
 }
 
+#[cfg(feature = "specprefill")]
 fn current_turn_policy(
     prompt_ids: &[i32],
     preceding_ids: Option<&[i32]>,
@@ -130,17 +135,18 @@ enum QwenGenerationRoute {
 fn qwen_generation_route(
     has_mtp: bool,
     has_images: bool,
+    #[cfg(feature = "specprefill")]
     use_specprefill: bool,
 ) -> QwenGenerationRoute {
+    #[cfg(feature = "specprefill")]
     if use_specprefill && !has_images {
-        QwenGenerationRoute::BaselineText
-    } else {
-        match (has_mtp, has_images) {
-            (true, false) => QwenGenerationRoute::MtpText,
-            (true, true) => QwenGenerationRoute::MtpMultimodal,
-            (false, false) => QwenGenerationRoute::BaselineText,
-            (false, true) => QwenGenerationRoute::BaselineMultimodal,
-        }
+        return QwenGenerationRoute::BaselineText;
+    }
+    match (has_mtp, has_images) {
+        (true, false) => QwenGenerationRoute::MtpText,
+        (true, true) => QwenGenerationRoute::MtpMultimodal,
+        (false, false) => QwenGenerationRoute::BaselineText,
+        (false, true) => QwenGenerationRoute::BaselineMultimodal,
     }
 }
 
@@ -154,14 +160,16 @@ fn cache_snapshot_route(route: QwenGenerationRoute) -> Option<CacheSnapshotRoute
 
 fn cache_lookup_route(
     route: QwenGenerationRoute,
+    #[cfg(feature = "specprefill")]
     mtp_available: bool,
+    #[cfg(feature = "specprefill")]
     specprefill_active: bool,
 ) -> Option<CacheSnapshotRoute> {
+    #[cfg(feature = "specprefill")]
     if route == QwenGenerationRoute::BaselineText && mtp_available && specprefill_active {
-        Some(CacheSnapshotRoute::Mtp)
-    } else {
-        cache_snapshot_route(route)
+        return Some(CacheSnapshotRoute::Mtp);
     }
+    cache_snapshot_route(route)
 }
 
 fn validate_mtp_k(mtp_k: usize) -> Result<()> {
@@ -533,10 +541,12 @@ impl Engine {
         cache_config: CacheConfig,
         mtp_k: usize,
         kv_cache_mode: KVCacheMode,
+        #[cfg(feature = "specprefill")]
         specprefill_policy: SpecPrefillPolicyConfig,
     ) -> Result<Self> {
         cache_config.validate().map_err(anyhow::Error::msg)?;
         validate_mtp_k(mtp_k)?;
+        #[cfg(feature = "specprefill")]
         specprefill_policy.validate()?;
         let (jobs_tx, jobs_rx) = mpsc::channel(JOB_QUEUE_CAPACITY);
         let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
@@ -548,6 +558,7 @@ impl Engine {
                     cache_config,
                     mtp_k,
                     kv_cache_mode,
+                    #[cfg(feature = "specprefill")]
                     specprefill_policy,
                 ) {
                     Ok(mut worker) => {
@@ -962,6 +973,7 @@ pub enum SubmitError {
 }
 
 struct QwenWorker {
+    #[cfg(feature = "specprefill")]
     specprefill_policy: SpecPrefillPolicyConfig,
     provider: Qwen35Provider,
     grammar: GrammarFactory,
@@ -975,9 +987,11 @@ impl QwenWorker {
         cache_config: CacheConfig,
         mtp_k: usize,
         kv_cache_mode: KVCacheMode,
+        #[cfg(feature = "specprefill")]
         specprefill_policy: SpecPrefillPolicyConfig,
     ) -> Result<Self> {
         validate_mtp_k(mtp_k)?;
+        #[cfg(feature = "specprefill")]
         specprefill_policy.validate()?;
         let provider = Qwen35Provider::load(model_path, kv_cache_mode)?;
         ensure!(
@@ -1035,6 +1049,7 @@ impl QwenWorker {
             AdaptivePrefixCache::new(namespaces, cache_config).map_err(anyhow::Error::msg)?;
         Ok(Self {
             provider,
+            #[cfg(feature = "specprefill")]
             specprefill_policy,
             grammar,
             prefix_cache,
@@ -1152,6 +1167,7 @@ impl QwenWorker {
                 }
             }
         };
+        #[cfg(feature = "specprefill")]
         let preceding_ids = if has_images {
             None
         } else if let Some(messages) = messages_before_model_input_turn(&job.request.messages) {
@@ -1170,6 +1186,7 @@ impl QwenWorker {
         } else {
             None
         };
+        #[cfg(feature = "specprefill")]
         let specprefill_policy = current_turn_policy(
             &prompt_ids,
             preceding_ids.as_deref(),
@@ -1178,10 +1195,12 @@ impl QwenWorker {
                 && job.request.resume_response_id.is_none(),
             self.specprefill_policy,
         );
+        #[cfg(feature = "specprefill")]
         let specprefill_active = matches!(
             specprefill_policy.prefill_mode,
             PrefillMode::SpecPrefill(_)
         );
+        #[cfg(feature = "specprefill")]
         info!(
             phase = "specprefill.policy",
             current_turn_tokens = specprefill_policy.current_turn_tokens.unwrap_or(0),
@@ -1230,9 +1249,16 @@ impl QwenWorker {
         );
         let mtp_available =
             self.provider.has_mtp() && std::env::var_os("QW_BENCH_DISABLE_MTP").is_none();
+        #[cfg(feature = "specprefill")]
         let route = qwen_generation_route(mtp_available, has_images, specprefill_active);
+        #[cfg(not(feature = "specprefill"))]
+        let route = qwen_generation_route(mtp_available, has_images);
         let cache_route = cache_snapshot_route(route);
-        let lookup_cache_route = cache_lookup_route(route, mtp_available, specprefill_active);
+        #[cfg(feature = "specprefill")]
+        let lookup_cache_route =
+            cache_lookup_route(route, mtp_available, specprefill_active);
+        #[cfg(not(feature = "specprefill"))]
+        let lookup_cache_route = cache_lookup_route(route);
         if job.request.resume_response_id.is_some() && cache_route.is_none() {
             send_failure(
                 &job,
@@ -1482,6 +1508,7 @@ impl QwenWorker {
                     .as_mut()
                     .map(|value| value as &mut dyn mlxcel_core::generate::TokenConstraint),
                 &checkpoint_token_lengths,
+                #[cfg(feature = "specprefill")]
                 specprefill_policy.prefill_mode,
                 &mut emit_delta,
             ),
@@ -1934,6 +1961,7 @@ mod tests {
         assert_eq!(parsed.tool_calls[0].name, "weather");
     }
 
+    #[cfg(feature = "specprefill")]
     fn message(role: &str) -> ChatMessage {
         ChatMessage {
             role: role.to_string(),
@@ -1945,6 +1973,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "specprefill")]
     #[test]
     fn initial_system_developer_and_user_input_has_no_later_turn_boundary() {
         for messages in [
@@ -1960,6 +1989,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "specprefill")]
     #[test]
     fn second_user_input_is_a_later_model_input_turn() {
         let messages = [
@@ -1973,6 +2003,7 @@ mod tests {
         assert_eq!(preceding.len(), 3);
     }
 
+    #[cfg(feature = "specprefill")]
     #[test]
     fn trailing_tool_results_form_one_later_model_input_turn() {
         let single = [
@@ -2003,6 +2034,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "specprefill")]
     #[test]
     fn assistant_absent_keeps_user_and_tool_input_dense() {
         assert!(
@@ -2023,6 +2055,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "specprefill")]
     #[test]
     fn tool_turn_threshold_is_strict_and_protects_exact_history() {
         let config = SpecPrefillPolicyConfig {
@@ -2053,6 +2086,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "specprefill")]
     #[test]
     fn invalid_boundary_or_ineligible_route_stays_dense() {
         let config = SpecPrefillPolicyConfig {
@@ -2069,6 +2103,7 @@ mod tests {
         assert_eq!(disallowed.prefill_mode, PrefillMode::Dense);
     }
 
+    #[cfg(feature = "specprefill")]
     #[test]
     fn configured_policy_values_flow_to_runtime_config() {
         let config = SpecPrefillPolicyConfig {
@@ -2094,7 +2129,12 @@ mod tests {
     fn dense_routing_matrix_is_unchanged() {
         for has_mtp in [false, true] {
             for has_images in [false, true] {
-                let route = qwen_generation_route(has_mtp, has_images, false);
+                let route = qwen_generation_route(
+                    has_mtp,
+                    has_images,
+                    #[cfg(feature = "specprefill")]
+                    false,
+                );
                 let expected = match (has_mtp, has_images) {
                     (true, false) => QwenGenerationRoute::MtpText,
                     (true, true) => QwenGenerationRoute::MtpMultimodal,
@@ -2104,10 +2144,12 @@ mod tests {
                 assert_eq!(route, expected, "has_mtp={has_mtp} has_images={has_images}");
             }
         }
+        #[cfg(feature = "specprefill")]
         assert_eq!(
             qwen_generation_route(true, false, true),
             QwenGenerationRoute::BaselineText
         );
+        #[cfg(feature = "specprefill")]
         assert_eq!(
             qwen_generation_route(true, true, true),
             QwenGenerationRoute::MtpMultimodal
@@ -2131,11 +2173,17 @@ mod tests {
             );
         }
         assert_ne!(
-            qwen_generation_route(true, true, false),
+            qwen_generation_route(
+                true,
+                true,
+                #[cfg(feature = "specprefill")]
+                false,
+            ),
             QwenGenerationRoute::BaselineText
         );
     }
 
+    #[cfg(feature = "specprefill")]
     #[test]
     fn specprefill_over_mtp_looks_up_the_mtp_target_snapshot() {
         let sparse_route = qwen_generation_route(true, false, true);
@@ -2163,6 +2211,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "specprefill")]
     #[test]
     fn specprefill_policy_validation_accepts_zero_edges_and_rejects_invalid_admission() {
         assert!(
