@@ -71,12 +71,22 @@ struct CurrentTurnPolicy {
     prefill_mode: PrefillMode,
 }
 
-fn messages_before_latest_user(messages: &[ChatMessage]) -> Option<&[ChatMessage]> {
-    let latest_user = messages.iter().rposition(|message| message.role == "user")?;
-    messages[..latest_user]
+fn messages_before_model_input_turn(messages: &[ChatMessage]) -> Option<&[ChatMessage]> {
+    let boundary = if messages.last().is_some_and(|message| message.role == "tool") {
+        messages
+            .iter()
+            .rposition(|message| message.role != "tool")
+            .map_or(0, |index| index + 1)
+    } else {
+        messages
+            .iter()
+            .rposition(|message| message.role == "user")?
+    };
+    let preceding = &messages[..boundary];
+    preceding
         .iter()
-        .any(|message| message.role == "user")
-        .then_some(&messages[..latest_user])
+        .any(|message| message.role == "assistant")
+        .then_some(preceding)
 }
 
 fn current_turn_policy(
@@ -139,6 +149,18 @@ fn cache_snapshot_route(route: QwenGenerationRoute) -> Option<CacheSnapshotRoute
         QwenGenerationRoute::BaselineText => Some(CacheSnapshotRoute::Baseline),
         QwenGenerationRoute::MtpText => Some(CacheSnapshotRoute::Mtp),
         QwenGenerationRoute::BaselineMultimodal | QwenGenerationRoute::MtpMultimodal => None,
+    }
+}
+
+fn cache_lookup_route(
+    route: QwenGenerationRoute,
+    mtp_available: bool,
+    specprefill_active: bool,
+) -> Option<CacheSnapshotRoute> {
+    if route == QwenGenerationRoute::BaselineText && mtp_available && specprefill_active {
+        Some(CacheSnapshotRoute::Mtp)
+    } else {
+        cache_snapshot_route(route)
     }
 }
 
@@ -1132,7 +1154,7 @@ impl QwenWorker {
         };
         let preceding_ids = if has_images {
             None
-        } else if let Some(messages) = messages_before_latest_user(&job.request.messages) {
+        } else if let Some(messages) = messages_before_model_input_turn(&job.request.messages) {
             match self.provider.tokenize_history(
                 messages,
                 effective_tools,
@@ -1210,6 +1232,7 @@ impl QwenWorker {
             self.provider.has_mtp() && std::env::var_os("QW_BENCH_DISABLE_MTP").is_none();
         let route = qwen_generation_route(mtp_available, has_images, specprefill_active);
         let cache_route = cache_snapshot_route(route);
+        let lookup_cache_route = cache_lookup_route(route, mtp_available, specprefill_active);
         if job.request.resume_response_id.is_some() && cache_route.is_none() {
             send_failure(
                 &job,
@@ -1293,16 +1316,17 @@ impl QwenWorker {
         let mtp_k = self.mtp_k;
         let (provider, cache) = (&mut self.provider, &mut self.prefix_cache);
         if resume_entry.is_none()
-            && let Some(cache_route) = cache_route
+            && let Some(lookup_cache_route) = lookup_cache_route
         {
             checkpoint_token_lengths = cache.checkpoint_lengths(
                 &generation_prompt_ids,
                 &checkpoint_token_lengths,
-                cache_route,
+                lookup_cache_route,
             );
         }
         let hit = if resume_entry.is_none() {
-            cache_route.and_then(|cache_route| cache.lookup(&generation_prompt_ids, cache_route))
+            lookup_cache_route
+                .and_then(|route| cache.lookup(&generation_prompt_ids, route))
         } else {
             None
         };
@@ -1344,16 +1368,19 @@ impl QwenWorker {
                     return;
                 }
             },
-            (QwenGenerationRoute::BaselineText, None, Some(hit)) => match hit.snapshot {
-                PromptSnapshot::Baseline(snapshot) => (
+            (QwenGenerationRoute::BaselineText, None, Some(hit)) => {
+                let snapshot = match hit.snapshot {
+                    PromptSnapshot::Baseline(snapshot) => snapshot,
+                    PromptSnapshot::Mtp(snapshot) => snapshot.target_snapshot(),
+                };
+                (
                     Some(PrefixReuse {
                         snapshot,
                         cached_tokens: hit.token_count,
                     }),
                     None,
-                ),
-                PromptSnapshot::Mtp(_) => (None, None),
-            },
+                )
+            }
             (QwenGenerationRoute::MtpText, None, Some(hit)) => match hit.snapshot {
                 PromptSnapshot::Mtp(snapshot) => (
                     None,
@@ -1919,11 +1946,14 @@ mod tests {
     }
 
     #[test]
-    fn first_conversational_user_has_no_specprefill_boundary() {
-        assert!(messages_before_latest_user(&[message("user")]).is_none());
-        assert!(
-            messages_before_latest_user(&[message("system"), message("user")]).is_none()
-        );
+    fn initial_system_developer_and_user_input_has_no_later_turn_boundary() {
+        for messages in [
+            vec![message("user")],
+            vec![message("system"), message("user")],
+            vec![message("system"), message("developer"), message("user")],
+        ] {
+            assert!(messages_before_model_input_turn(&messages).is_none());
+        }
         assert_eq!(
             current_turn_policy(&[1, 2, 3], None, true, Default::default()).prefill_mode,
             PrefillMode::Dense
@@ -1931,67 +1961,96 @@ mod tests {
     }
 
     #[test]
-    fn current_turn_threshold_is_strict_and_protects_the_boundary() {
-        let preceding_ids = vec![11, 12, 13];
-        let mut prompt_ids = preceding_ids.clone();
-        prompt_ids.resize(preceding_ids.len() + 8_000, 20);
-        let at_threshold = current_turn_policy(
-            &prompt_ids,
-            Some(&preceding_ids),
-            true,
-            Default::default(),
-        );
-        assert_eq!(at_threshold.current_turn_tokens, Some(8_000));
-        assert_eq!(at_threshold.prefill_mode, PrefillMode::Dense);
-
-        prompt_ids.push(21);
-        let over_threshold = current_turn_policy(
-            &prompt_ids,
-            Some(&preceding_ids),
-            true,
-            Default::default(),
-        );
-        assert_eq!(over_threshold.current_turn_tokens, Some(8_001));
-        assert_eq!(
-            over_threshold.prefill_mode,
-            PrefillMode::SpecPrefill(SpecPrefillConfig {
-                min_tokens: 8_000,
-                keep_rate: 0.25,
-                protected_prefix_tokens: 3,
-                keep_first_tokens: 256,
-                keep_last_tokens: 256,
-            })
-        );
+    fn second_user_input_is_a_later_model_input_turn() {
+        let messages = [
+            message("system"),
+            message("user"),
+            message("assistant"),
+            message("user"),
+        ];
+        let preceding =
+            messages_before_model_input_turn(&messages).expect("assistant precedes second user");
+        assert_eq!(preceding.len(), 3);
     }
 
     #[test]
-    fn messages_after_latest_user_belong_to_the_current_turn() {
-        let messages = [
-            message("user"),
-            message("assistant"),
+    fn trailing_tool_results_form_one_later_model_input_turn() {
+        let single = [
+            message("system"),
             message("user"),
             message("assistant"),
             message("tool"),
         ];
-        let preceding_messages =
-            messages_before_latest_user(&messages).expect("second user has prior history");
-        assert_eq!(preceding_messages.len(), 2);
+        assert_eq!(
+            messages_before_model_input_turn(&single)
+                .expect("tool result follows model output")
+                .len(),
+            3
+        );
 
+        let parallel = [
+            message("system"),
+            message("user"),
+            message("assistant"),
+            message("tool"),
+            message("tool"),
+        ];
+        assert_eq!(
+            messages_before_model_input_turn(&parallel)
+                .expect("parallel tool results follow model output")
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn assistant_absent_keeps_user_and_tool_input_dense() {
+        assert!(
+            messages_before_model_input_turn(&[
+                message("system"),
+                message("developer"),
+                message("user"),
+            ])
+            .is_none()
+        );
+        assert!(
+            messages_before_model_input_turn(&[
+                message("system"),
+                message("user"),
+                message("tool"),
+            ])
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn tool_turn_threshold_is_strict_and_protects_exact_history() {
         let config = SpecPrefillPolicyConfig {
-            min_turn_tokens: 8,
+            min_turn_tokens: 512,
             ..Default::default()
         };
-        let policy = current_turn_policy(
-            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
-            Some(&[1, 2]),
-            true,
-            config,
-        );
-        assert_eq!(policy.current_turn_tokens, Some(9));
-        assert!(matches!(
-            policy.prefill_mode,
-            PrefillMode::SpecPrefill(_)
-        ));
+        let preceding_ids = vec![11; 37];
+        for current_turn_tokens in [512, 513, 580, 1_948] {
+            let mut prompt_ids = preceding_ids.clone();
+            prompt_ids.resize(preceding_ids.len() + current_turn_tokens, 20);
+            let policy =
+                current_turn_policy(&prompt_ids, Some(&preceding_ids), true, config);
+            assert_eq!(policy.current_turn_tokens, Some(current_turn_tokens));
+            if current_turn_tokens == 512 {
+                assert_eq!(policy.prefill_mode, PrefillMode::Dense);
+            } else {
+                assert_eq!(
+                    policy.prefill_mode,
+                    PrefillMode::SpecPrefill(SpecPrefillConfig {
+                        min_tokens: 512,
+                        keep_rate: 0.25,
+                        protected_prefix_tokens: preceding_ids.len(),
+                        keep_first_tokens: 256,
+                        keep_last_tokens: 256,
+                    })
+                );
+            }
+        }
     }
 
     #[test]
@@ -2074,6 +2133,33 @@ mod tests {
         assert_ne!(
             qwen_generation_route(true, true, false),
             QwenGenerationRoute::BaselineText
+        );
+    }
+
+    #[test]
+    fn specprefill_over_mtp_looks_up_the_mtp_target_snapshot() {
+        let sparse_route = qwen_generation_route(true, false, true);
+        assert_eq!(sparse_route, QwenGenerationRoute::BaselineText);
+        assert_eq!(
+            cache_lookup_route(sparse_route, true, true),
+            Some(CacheSnapshotRoute::Mtp)
+        );
+        assert_eq!(
+            cache_snapshot_route(sparse_route),
+            Some(CacheSnapshotRoute::Baseline)
+        );
+
+        assert_eq!(
+            cache_lookup_route(QwenGenerationRoute::MtpText, true, false),
+            Some(CacheSnapshotRoute::Mtp)
+        );
+        assert_eq!(
+            cache_lookup_route(QwenGenerationRoute::BaselineText, false, true),
+            Some(CacheSnapshotRoute::Baseline)
+        );
+        assert_eq!(
+            cache_lookup_route(QwenGenerationRoute::BaselineMultimodal, true, true),
+            None
         );
     }
 
