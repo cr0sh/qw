@@ -45,6 +45,7 @@ const DFLASH_VERIFY_PREFIX: i32 = 131_072;
 const DFLASH_VERIFY_PADDED: i32 = 131_104;
 const DRAFT_CONTROL_START: i32 = 248_044;
 const DRAFT_CONTROL_END: i32 = 248_070;
+const SPECPREFILL_TARGET_CHUNK_TOKENS: usize = 512;
 
 fn compact_rows(array: &MlxArray, prefix_len: i32, padded_len: i32) -> UniquePtr<MlxArray> {
     let columns = mlxcel_core::array_shape(array)[1];
@@ -2035,7 +2036,7 @@ impl Qwen35Model {
             return Err("SpecPrefill selected no target tokens".to_string());
         }
         let mut final_hidden = None;
-        for indices in selected_indices.chunks(512) {
+        for indices in selected_indices.chunks(SPECPREFILL_TARGET_CHUNK_TOKENS) {
             let sparse_ids = indices
                 .iter()
                 .map(|&index| prompt_ids[index])
