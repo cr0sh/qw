@@ -2285,7 +2285,8 @@ impl Qwen35MtpGenerator {
                 mtp_stats.walk_time += phase_start.elapsed();
                 let phase_start = Instant::now();
                 mtp_stats.record_round(walk.accepted, draft_tokens.len());
-                extend_greedy_draft = greedy && walk.accepted == draft_tokens.len();
+                extend_greedy_draft =
+                    greedy && walk.accepted.saturating_add(1) >= draft_tokens.len();
 
                 let round_stop_reason = emit_walk_tokens(
                     &walk.new_tokens,
