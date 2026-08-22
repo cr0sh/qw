@@ -124,7 +124,6 @@ pub struct Qwen35Config {
     #[serde(default)]
     pub tie_word_embeddings: bool,
     pub vocab_size: usize,
-    #[cfg(any(feature = "specprefill", test))]
     #[serde(default)]
     pub max_position_embeddings: usize,
     #[serde(default, alias = "quantization_config")]
