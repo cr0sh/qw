@@ -154,17 +154,24 @@ fn compute_importance(
             key_shape[2] >= prompt_len as i32,
             "SpecPrefill draft cache does not span the scored prompt"
         );
-        let expanded_keys = if query_shape[1] == key_shape[1] {
-            mlxcel_core::copy(keys)
-        } else {
-            ensure!(
-                query_shape[1] % key_shape[1] == 0,
-                "SpecPrefill draft query/KV head ratio is not integral"
-            );
-            mlxcel_core::repeat(keys, query_shape[1] / key_shape[1], 1)
-        };
-        let transposed_keys = mlxcel_core::transpose_axes(&expanded_keys, &[0, 1, 3, 2]);
-        let scores = mlxcel_core::matmul(&stacked, &transposed_keys);
+        ensure!(
+            query_shape[1] % key_shape[1] == 0,
+            "SpecPrefill draft query/KV head ratio is not integral"
+        );
+        let query_groups = query_shape[1] / key_shape[1];
+        let grouped_queries = mlxcel_core::reshape(
+            &stacked,
+            &[
+                query_shape[0],
+                key_shape[1],
+                query_groups,
+                query_shape[2],
+                query_shape[3],
+            ],
+        );
+        let transposed_keys = mlxcel_core::transpose_axes(keys, &[0, 1, 3, 2]);
+        let grouped_keys = mlxcel_core::expand_dims(&transposed_keys, 2);
+        let scores = mlxcel_core::matmul(&grouped_queries, &grouped_keys);
         let scale = mlxcel_core::full_f32(&[1], 1.0 / (key_shape[3] as f32).sqrt(), mlxcel_core::dtype::FLOAT32);
         let scores = mlxcel_core::multiply(&mlxcel_core::astype(&scores, mlxcel_core::dtype::FLOAT32), &scale);
         let weights = mlxcel_core::softmax_precise(&scores, -1);
