@@ -6,6 +6,7 @@ use clap_derive::{Args as DeriveArgs, ValueEnum};
 use qw_prefix_cache::CacheConfig;
 use qw_runtime::{KVCacheMode, resolve_model_path};
 use tracing::info;
+use tracing_subscriber::EnvFilter;
 
 use crate::{Engine, router};
 #[cfg(feature = "specprefill")]
@@ -123,8 +124,8 @@ fn resolve_prefix_cache_directory(directory: Option<PathBuf>) -> Result<PathBuf>
 pub async fn serve(cli: ServerArgs) -> Result<()> {
     validate_cli(&cli)?;
     match cli.output_format {
-        OutputFormat::Human => tracing_subscriber::fmt().init(),
-        OutputFormat::Json => tracing_subscriber::fmt().json().init(),
+        OutputFormat::Human => tracing_subscriber::fmt::init(),
+        OutputFormat::Json => tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env()).json().init(),
     }
     let bind: SocketAddr = cli
         .bind
