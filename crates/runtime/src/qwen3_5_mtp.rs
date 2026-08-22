@@ -744,6 +744,7 @@ fn target_cache_accepted_count(emitted: usize) -> usize {
 }
 
 const MTP_STATE_MATERIALIZE_INTERVAL: usize = 128;
+/// Minimum context where one wider verify block amortizes target-weight reads.
 const MTP_ADAPTIVE_DEPTH_MIN_CONTEXT: usize = 8_192;
 
 // Variable MTP verify shapes accumulate reusable Metal buffers much faster than
@@ -824,6 +825,25 @@ fn trim_draft_cache(cache: &mut KVCache, round_appended: usize, accepted: usize)
 fn round_proposal_count(block_size: usize, remaining: usize) -> usize {
     block_size.saturating_sub(1).min(remaining)
 }
+fn adaptive_proposal_count(block_size: usize, remaining: usize, extend: bool) -> usize {
+    if extend {
+        block_size.min(remaining)
+    } else {
+        round_proposal_count(block_size, remaining)
+    }
+}
+
+fn should_extend_greedy_draft(
+    greedy: bool,
+    prompt_tokens: usize,
+    accepted: usize,
+    proposed: usize,
+) -> bool {
+    greedy
+        && prompt_tokens >= MTP_ADAPTIVE_DEPTH_MIN_CONTEXT
+        && accepted.saturating_add(1) >= proposed
+}
+
 
 fn logits_at(logits: &MlxArray, position: usize) -> UniquePtr<MlxArray> {
     let shape = mlxcel_core::array_shape(logits);
@@ -2202,11 +2222,8 @@ impl Qwen35MtpGenerator {
                 let emitted_before = generated.len();
                 let remaining = max_tokens - generated.len();
                 let greedy = sampler_is_greedy(&sampling);
-                let proposal_count = if greedy && extend_greedy_draft {
-                    block_size.min(remaining)
-                } else {
-                    round_proposal_count(block_size, remaining)
-                };
+                let proposal_count =
+                    adaptive_proposal_count(block_size, remaining, extend_greedy_draft);
                 if proposal_count == 0 {
                     break;
                 }
@@ -2286,9 +2303,12 @@ impl Qwen35MtpGenerator {
                 mtp_stats.walk_time += phase_start.elapsed();
                 let phase_start = Instant::now();
                 mtp_stats.record_round(walk.accepted, draft_tokens.len());
-                extend_greedy_draft = greedy
-                    && prompt_tokens.len() >= MTP_ADAPTIVE_DEPTH_MIN_CONTEXT
-                    && walk.accepted.saturating_add(1) >= draft_tokens.len();
+                extend_greedy_draft = should_extend_greedy_draft(
+                    greedy,
+                    prompt_tokens.len(),
+                    walk.accepted,
+                    draft_tokens.len(),
+                );
 
                 let round_stop_reason = emit_walk_tokens(
                     &walk.new_tokens,
@@ -3100,6 +3120,14 @@ mod tests {
         assert_eq!(round_proposal_count(2, 8), 1);
         assert_eq!(round_proposal_count(3, 8), 2);
         assert_eq!(round_proposal_count(3, 1), 1);
+        assert_eq!(adaptive_proposal_count(3, 8, false), 2);
+        assert_eq!(adaptive_proposal_count(3, 8, true), 3);
+        assert_eq!(adaptive_proposal_count(3, 2, true), 2);
+        assert!(!should_extend_greedy_draft(true, 8_191, 2, 2));
+        assert!(should_extend_greedy_draft(true, 8_192, 1, 2));
+        assert!(should_extend_greedy_draft(true, 8_192, 2, 3));
+        assert!(!should_extend_greedy_draft(true, 8_192, 1, 3));
+        assert!(!should_extend_greedy_draft(false, 8_192, 3, 3));
         assert_eq!(speculative_walk(&[1], &[1, 2], 2).new_tokens, [1, 2]);
         assert_eq!(
             speculative_walk(&[1, 2], &[1, 2, 3], 3).new_tokens,
