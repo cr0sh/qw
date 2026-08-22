@@ -746,7 +746,9 @@ fn target_cache_accepted_count(emitted: usize) -> usize {
 }
 
 const MTP_STATE_MATERIALIZE_INTERVAL: usize = 128;
-/// Minimum context where one wider verify block amortizes target-weight reads.
+/// Context range where one wider verify block amortizes target-weight reads.
+/// At 32k and beyond, long-context attention is query-row dominated, so the
+/// configured base depth is faster.
 const MTP_ADAPTIVE_DEPTH_MIN_CONTEXT: usize = 8_192;
 const MTP_ADAPTIVE_DEPTH_MAX_CONTEXT: usize = 32_768;
 
@@ -3132,6 +3134,8 @@ mod tests {
         assert!(should_extend_greedy_draft(true, 8_192, 2, 3));
         assert!(!should_extend_greedy_draft(true, 8_192, 1, 3));
         assert!(!should_extend_greedy_draft(false, 8_192, 3, 3));
+        assert!(should_extend_greedy_draft(true, 32_767, 2, 2));
+        assert!(!should_extend_greedy_draft(true, 32_768, 2, 2));
         assert_eq!(speculative_walk(&[1], &[1, 2], 2).new_tokens, [1, 2]);
         assert_eq!(
             speculative_walk(&[1, 2], &[1, 2, 3], 3).new_tokens,
