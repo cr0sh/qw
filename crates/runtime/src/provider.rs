@@ -115,7 +115,6 @@ fn generate_specprefill_tokens<F: FnMut(i32) -> bool>(
     let scoring_start = Instant::now();
     let importance = score_tokens(draft, eligible)?;
     let draft_scoring_time = scoring_start.elapsed();
-    mlxcel_core::clear_memory_cache();
     let selected = select_target_indices(&importance, dense_end, prompt_ids.len(), config);
 
     let target_start = Instant::now();
@@ -125,7 +124,6 @@ fn generate_specprefill_tokens<F: FnMut(i32) -> bool>(
         .context("sparse target prefill failed")?;
     mlxcel_core::eval(&logits);
     let target_prefill_time = target_start.elapsed();
-    mlxcel_core::clear_memory_cache();
 
     let mut effective_sampling = sampling.clone();
     effective_sampling
