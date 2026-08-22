@@ -418,6 +418,8 @@ pub struct KVCache {
     /// Deterministic seed for the Turbo4 sign vectors. Set at construction
     /// time so detach/adopt round-trip without recomputing rotations.
     pub(crate) turbo_seed: u32,
+    /// Whether FP16 writes are quantized once before being retained as FP16.
+    fp16_v_quantize_on_write: bool,
     /// Number of tokens currently folded into cold V storage (Turbo4Delegated
     /// only).
     ///
@@ -525,6 +527,7 @@ impl KVCache {
             turbo_params: None,
             turbo3_params: None,
             turbo_seed: TURBO_DEFAULT_SEED,
+            fp16_v_quantize_on_write: false,
             cold_offset: 0,
             hot_threshold: turbo::DELEGATED_HOT_THRESHOLD,
             delegated_fp16_fast_path: turbo::delegated_fp16_fast_path_enabled(),
@@ -573,6 +576,7 @@ impl KVCache {
             turbo_params: None,
             turbo3_params: None,
             turbo_seed,
+            fp16_v_quantize_on_write: false,
             cold_offset: 0,
             hot_threshold: turbo::DELEGATED_HOT_THRESHOLD,
             delegated_fp16_fast_path: turbo::delegated_fp16_fast_path_enabled(),
@@ -580,6 +584,12 @@ impl KVCache {
             paged_backing: None,
         }
     }
+    /// Quantize V once on each FP16 write while retaining FP16 cache storage.
+    pub fn enable_fp16_v_quantization_on_write(&mut self) {
+        assert_eq!(self.mode, KVCacheMode::Fp16);
+        self.fp16_v_quantize_on_write = true;
+    }
+
     /// Return the packed sidecars needed for an exact-prefix Turbo4 snapshot.
     pub fn turbo4_snapshot_tensors(&self) -> Option<Turbo4SnapshotTensors<'_>> {
         (self.mode == KVCacheMode::Turbo4).then_some(Turbo4SnapshotTensors {
@@ -967,6 +977,21 @@ impl KVCache {
     /// so RoPE positions for subsequent Q tokens stay correct after a
     /// [`Self::trim_front`] has shifted `self.live_start` forward.
     fn update_fp16(&mut self, new_keys: UniquePtr<MlxArray>, new_values: UniquePtr<MlxArray>) {
+        let new_values = if self.fp16_v_quantize_on_write {
+            if self.turbo_params.is_none() {
+                let value_shape = ffi::array_shape(&new_values);
+                self.turbo_params = Some(turbo::TurboQuantParams::new(value_shape[3] as u32, 0));
+            }
+            let params = self
+                .turbo_params
+                .as_ref()
+                .expect("FP16 V quantization parameters just initialized");
+            let (packed_values, value_norms, _) =
+                turbo::quant::quantize_v_turbo4(&new_values, params);
+            turbo::quant::dequantize_v_turbo4(&packed_values, &value_norms, params)
+        } else {
+            new_values
+        };
         let key_shape = ffi::array_shape(&new_keys);
         let new_seq_len = key_shape[2];
         let prev = self.buffer_idx();

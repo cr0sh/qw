@@ -1039,11 +1039,16 @@ impl Qwen35Model {
     fn make_internal_caches(&self) -> Vec<Qwen3NextCache> {
         self.layers
             .iter()
-            .map(|layer| {
+            .enumerate()
+            .map(|(index, layer)| {
                 if layer.is_linear {
                     Qwen3NextCache::Linear(GatedDeltaCache::new())
                 } else {
-                    Qwen3NextCache::Attention(Box::new(KVCache::new_with_mode(self.kv_cache_mode)))
+                    let mut cache = KVCache::new_with_mode(self.kv_cache_mode);
+                    if self.bounded_mtp_fp16 && index >= 48 {
+                        cache.enable_fp16_v_quantization_on_write();
+                    }
+                    Qwen3NextCache::Attention(Box::new(cache))
                 }
             })
             .collect()
@@ -1835,6 +1840,9 @@ impl Qwen35Model {
                 )
             })?;
         model.bounded_mtp_fp16 = weights.mtp.is_some() && kv_cache_mode == KVCacheMode::Turbo4;
+        model
+            .sequence_state
+            .replace_internal(model.make_internal_caches());
         if let Some(mtp_weights) = weights.mtp.as_ref() {
             model.mtp = Some(
                 Qwen35MtpDraftModel::from_weights(mtp_weights, &config)
@@ -2846,6 +2854,9 @@ impl LanguageModel for Qwen35Model {
                 cache.keys = Some(mlxcel_core::copy(keys));
                 cache.values = Some(mlxcel_core::copy(values));
                 cache.offset = token_len;
+                if self.bounded_mtp_fp16 && index >= 48 {
+                    cache.enable_fp16_v_quantization_on_write();
+                }
                 restored.push(Qwen3NextCache::Attention(Box::new(cache)));
             }
         }
