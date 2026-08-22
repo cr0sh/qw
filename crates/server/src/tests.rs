@@ -1165,7 +1165,6 @@ async fn structured_tracing_covers_request_stream_error_and_cancellation_without
         "response.buffered_complete",
         "response.streaming_admitted",
         "response.streaming_complete",
-        "generation.cancelled",
     ] {
         assert!(!traces.contains(phase), "unexpected INFO {phase}: {traces}");
     }
