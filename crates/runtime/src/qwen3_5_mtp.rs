@@ -2218,6 +2218,7 @@ impl Qwen35MtpGenerator {
                 finish_drafter_prefill(model, drafter, prefill_input, prefill, first_token);
             let mut bonus = first_token;
             let mut extend_greedy_draft = false;
+            let mut verify_tokens = Vec::with_capacity(block_size.saturating_add(1));
 
             while generated.len() < max_tokens {
                 let emitted_before = generated.len();
@@ -2260,7 +2261,7 @@ impl Qwen35MtpGenerator {
                     break;
                 }
 
-                let mut verify_tokens = Vec::with_capacity(draft_tokens.len() + 1);
+                verify_tokens.clear();
                 verify_tokens.push(bonus);
                 verify_tokens.extend_from_slice(&draft_tokens);
                 let verify_input = mlxcel_core::from_slice_i32(
