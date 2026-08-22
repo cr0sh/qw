@@ -23,7 +23,7 @@ use mlxcel_core::sampling::{
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use tokenizers::Tokenizer;
-use tracing::{debug, info};
+use tracing::debug;
 
 use crate::chat_template::ChatTemplateProcessor;
 pub use crate::chat_template::{
@@ -66,17 +66,16 @@ fn log_generation_metrics(
     decode_time: Duration,
 ) {
     let prefill_tokens = prompt_tokens.saturating_sub(cached_tokens);
-    info!(
+    debug!(
         phase = "generation.prefill",
         route,
         prompt_tokens,
         cached_tokens,
         prefill_tokens,
-
         elapsed_ms = prefill_time.as_secs_f64() * 1_000.0,
         tokens_per_second = tokens_per_second(prefill_tokens, prefill_time),
     );
-    info!(
+    debug!(
         phase = "generation.decode",
         route,
         completion_tokens,
@@ -537,7 +536,7 @@ impl Qwen35Provider {
             !prompt_ids.is_empty(),
             "rendered messages tokenized to an empty sequence"
         );
-        info!(
+        debug!(
             phase = "tokenization.complete",
             prompt_tokens = prompt_ids.len(),
         );
@@ -675,7 +674,7 @@ impl Qwen35Provider {
             video_token_id,
         )?;
         let position_ids = positions.to_mlx();
-        info!(
+        debug!(
             phase = "multimodal_prefill.complete",
             prompt_tokens = prompt_ids.len(),
             image_tokens = expansion.total_image_tokens,
@@ -790,7 +789,7 @@ impl Qwen35Provider {
                     let _ = on_delta(&final_delta);
                 }
                 let completion_tokens = sparse.token_ids.len();
-                info!(
+                debug!(
                     route = "specprefill",
                     draft_scoring_ms = sparse.stats.draft_scoring_time.as_secs_f64() * 1_000.0,
                     target_prefill_ms = sparse.stats.target_prefill_time.as_secs_f64() * 1_000.0,

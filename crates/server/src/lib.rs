@@ -23,7 +23,7 @@ use axum::routing::post;
 use futures_util::stream;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
-use tracing::{Instrument, Span, error, info, info_span, warn};
+use tracing::{Instrument, Span, debug, error, info_span, warn};
 
 use engine::{
     Admission, CompletionRecord, FailureKind, FinishReason, GeneratedToolCall, WorkerDelta,
@@ -84,7 +84,7 @@ async fn handle_inner(
     payload: Result<Json<Value>, JsonRejection>,
     endpoint: Endpoint,
 ) -> Response {
-    info!(phase = "request.received");
+    debug!(phase = "request.received");
     let value = match payload {
         Ok(Json(value)) => value,
         Err(json_error) => {
@@ -96,7 +96,7 @@ async fn handle_inner(
                 .into_response();
         }
     };
-    info!(phase = "request.validation_started");
+    debug!(phase = "request.validation_started");
     let request = match endpoint {
         Endpoint::Chat => protocol::parse_chat(value),
         Endpoint::Responses => protocol::parse_responses(value),
@@ -118,7 +118,7 @@ async fn handle_inner(
     request_span.record("message_count", request.messages.len());
     request_span.record("tool_count", request.tools.len());
     request_span.record("image_count", request.image_params.len());
-    info!(
+    debug!(
         phase = "request.validation_complete",
         max_tokens = request.max_tokens,
     );
@@ -151,7 +151,7 @@ async fn handle_inner(
     }
     let stream_requested = request.stream;
     let response_model = request.model.clone();
-    info!(phase = "dispatch.started");
+    debug!(phase = "dispatch.started");
     let submission = match state.engine.submit(request) {
         Ok(submission) => submission,
         Err(SubmitError::Full) => {
@@ -163,7 +163,7 @@ async fn handle_inner(
             return ApiError::server("generation worker is unavailable").into_response();
         }
     };
-    info!(
+    debug!(
         phase = "dispatch.complete",
         response_id = %submission.admission.response_id,
     );
@@ -180,7 +180,7 @@ async fn buffered_response(submission: engine::Submission) -> Response {
 }
 
 async fn buffered_response_inner(mut submission: engine::Submission) -> Response {
-    info!(phase = "response.buffered_wait_started");
+    debug!(phase = "response.buffered_wait_started");
     let mut guard = CancelGuard {
         cancelled: submission.cancelled.clone(),
         span: submission.span.clone(),
@@ -194,7 +194,7 @@ async fn buffered_response_inner(mut submission: engine::Submission) -> Response
                 acknowledged,
             } => {
                 guard.armed = false;
-                info!(
+                debug!(
                     phase = "response.buffered_complete",
                     response_id = %record.admission.response_id,
                     prompt_tokens = record.prompt_tokens,
@@ -240,7 +240,7 @@ async fn streaming_response_inner(
     model: String,
     mut submission: engine::Submission,
 ) -> Response {
-    info!(phase = "response.streaming_admission_started");
+    debug!(phase = "response.streaming_admission_started");
     let mut admission_guard = CancelGuard {
         cancelled: submission.cancelled.clone(),
         span: submission.span.clone(),
@@ -251,7 +251,7 @@ async fn streaming_response_inner(
         Some(WorkerEvent::Started(admission)) => {
             submission.admission = admission;
             admission_guard.armed = false;
-            info!(phase = "response.streaming_admitted");
+            debug!(phase = "response.streaming_admitted");
         }
         Some(WorkerEvent::Failed(failure)) => {
             admission_guard.armed = false;
@@ -268,7 +268,7 @@ async fn streaming_response_inner(
             acknowledged,
         }) => {
             admission_guard.armed = false;
-            info!(
+            debug!(
                 phase = "response.completed_before_stream",
                 prompt_tokens = record.prompt_tokens,
                 completion_tokens = record.completion_tokens,
@@ -525,7 +525,7 @@ impl SseState {
     }
 
     fn enqueue_complete(&mut self, record: CompletionRecord) {
-        info!(
+        debug!(
             phase = "response.streaming_complete",
             response_id = %record.admission.response_id,
             prompt_tokens = record.prompt_tokens,

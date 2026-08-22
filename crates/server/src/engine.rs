@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc as std_mpsc};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};
 use mlxcel_core::generate::{GenerationStopReason, PrefixReuse};
@@ -19,7 +19,7 @@ use qw_runtime::ChatMessage;
 use qw_runtime::{PrefillMode, SpecPrefillConfig};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{Span, error, info, info_span, warn};
+use tracing::{Span, debug, error, info, info_span, warn};
 
 use crate::grammar::GrammarFactory;
 #[cfg(test)]
@@ -33,6 +33,74 @@ use crate::tool_calls::{ToolCallGate, parse_assistant_output};
 const JOB_QUEUE_CAPACITY: usize = 8;
 const EVENT_QUEUE_CAPACITY: usize = 32;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct GenerationMetrics {
+    prefill_tps: f64,
+    decode_tps: f64,
+    total_tokens: usize,
+    prefilled_tokens: usize,
+    prefix_reused_tokens: usize,
+}
+
+fn tokens_per_second(tokens: usize, elapsed: Duration) -> f64 {
+    let seconds = elapsed.as_secs_f64();
+    if seconds > 0.0 {
+        tokens as f64 / seconds
+    } else {
+        0.0
+    }
+}
+
+fn generation_metrics(
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    cached_tokens: usize,
+    prefill_time: Duration,
+    decode_time: Duration,
+) -> GenerationMetrics {
+    let prefilled_tokens = prompt_tokens.saturating_sub(cached_tokens);
+    GenerationMetrics {
+        prefill_tps: tokens_per_second(prefilled_tokens, prefill_time),
+        decode_tps: tokens_per_second(completion_tokens, decode_time),
+        total_tokens: prompt_tokens.saturating_add(completion_tokens),
+        prefilled_tokens,
+        prefix_reused_tokens: cached_tokens,
+    }
+}
+
+pub(super) fn log_generation_metrics(
+    chat_id: &str,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    cached_tokens: usize,
+    prefill_time: Duration,
+    decode_time: Duration,
+) {
+    let metrics = generation_metrics(
+        prompt_tokens,
+        completion_tokens,
+        cached_tokens,
+        prefill_time,
+        decode_time,
+    );
+    info!(
+        event = "prefill.complete",
+        chat_id,
+        tps = metrics.prefill_tps,
+        total_tokens = prompt_tokens,
+        prefilled_tokens = metrics.prefilled_tokens,
+        prefix_reused_tokens = metrics.prefix_reused_tokens,
+    );
+    info!(
+        event = "decode.complete",
+        chat_id,
+        tps = metrics.decode_tps,
+        total_tokens = metrics.total_tokens,
+        decoded_tokens = completion_tokens,
+        prefix_reused_tokens = metrics.prefix_reused_tokens,
+    );
+}
 #[cfg(feature = "specprefill")]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SpecPrefillPolicyConfig {
@@ -502,7 +570,7 @@ impl StreamOutputTracker {
 
 fn send_delta(job: &Job, delta: WorkerDelta) -> bool {
     if job.cancelled.load(Ordering::Acquire) {
-        info!(phase = "generation.cancelled");
+        debug!(phase = "generation.cancelled");
         return false;
     }
     if job.events.blocking_send(WorkerEvent::Delta(delta)).is_err() {
@@ -617,7 +685,7 @@ impl Engine {
             mpsc::error::TrySendError::Full(_) => SubmitError::Full,
             mpsc::error::TrySendError::Closed(_) => SubmitError::Closed,
         })?;
-        info!(parent: &span, phase = "dispatch.enqueued");
+        debug!(parent: &span, phase = "dispatch.enqueued");
         Ok(Submission {
             admission,
             events: events_rx,
@@ -685,7 +753,7 @@ impl Engine {
             while let Some(mut job) = jobs_rx.blocking_recv() {
                 let span = job.span.clone();
                 let _entered = span.enter();
-                info!(phase = "worker.accepted");
+                debug!(phase = "worker.accepted");
                 if let Err(error) = grammar.compile(&job.request.output_format) {
                     send_failure(
                         &job,
@@ -732,7 +800,7 @@ impl Engine {
                     job.admission = checkpoint.admission.clone();
                     resumed = Some(checkpoint);
                 }
-                info!(phase = "generation.started");
+                debug!(phase = "generation.started");
                 if job
                     .events
                     .blocking_send(WorkerEvent::Started(job.admission.clone()))
@@ -745,7 +813,7 @@ impl Engine {
                     while !job.cancelled.load(Ordering::Acquire) {
                         std::thread::sleep(std::time::Duration::from_millis(5));
                     }
-                    info!(phase = "generation.cancelled");
+                    debug!(phase = "generation.cancelled");
                     continue;
                 }
                 if message_text(&job.request.messages[0]) == "fail-after-start" {
@@ -898,7 +966,7 @@ impl Engine {
                     }
                 }
                 if job.cancelled.load(Ordering::Acquire) {
-                    info!(phase = "generation.cancelled");
+                    debug!(phase = "generation.cancelled");
                     continue;
                 }
                 if interrupt {
@@ -911,7 +979,7 @@ impl Engine {
                             completion_tokens: "echo:resume-".len(),
                         },
                     );
-                    info!(phase = "generation.cancelled");
+                    debug!(phase = "generation.cancelled");
                     continue;
                 }
                 cached_prompt = (!has_images && prompt.len() <= 16).then_some(prompt.clone());
@@ -946,7 +1014,7 @@ impl Engine {
                     finish_reason,
                     stream_include_usage: job.request.stream_include_usage,
                 };
-                info!(
+                debug!(
                     phase = "generation.complete",
                     prompt_tokens = record.prompt_tokens,
                     completion_tokens = record.completion_tokens,
@@ -1068,7 +1136,7 @@ impl QwenWorker {
     fn process(&mut self, mut job: Job) {
         let span = job.span.clone();
         let _entered = span.enter();
-        info!(phase = "worker.accepted");
+        debug!(phase = "worker.accepted");
         let mut constraint = match self.grammar.compile(&job.request.output_format) {
             Ok(constraint) => constraint,
             Err(error) => {
@@ -1203,7 +1271,7 @@ impl QwenWorker {
             PrefillMode::SpecPrefill(_)
         );
         #[cfg(feature = "specprefill")]
-        info!(
+        debug!(
             phase = "specprefill.policy",
             current_turn_tokens = specprefill_policy.current_turn_tokens.unwrap_or(0),
             current_turn_boundary_valid = specprefill_policy.current_turn_tokens.is_some(),
@@ -1237,7 +1305,7 @@ impl QwenWorker {
             }
             checkpoint_token_lengths.push(prompt_ids.len());
         }
-        info!(
+        debug!(
             phase = "prompt.prepared",
             prompt_tokens = prompt_ids.len(),
             image_count = prepared_images.len(),
@@ -1422,7 +1490,7 @@ impl QwenWorker {
             },
             _ => (None, None),
         };
-        info!(
+        debug!(
             phase = "model_generation.started",
             route = ?route,
             mtp_k,
@@ -1531,7 +1599,15 @@ impl QwenWorker {
                 return;
             }
         };
-        info!(
+        log_generation_metrics(
+            &job.admission.response_id,
+            generated.prompt_tokens,
+            generated.completion_tokens,
+            generated.cached_tokens,
+            generated.prefill_time,
+            generated.decode_time,
+        );
+        debug!(
             phase = "model_generation.complete",
             prompt_tokens = generated.prompt_tokens,
             completion_tokens = generated.completion_tokens,
@@ -1599,7 +1675,7 @@ impl QwenWorker {
                     }
                 }
             }
-            info!(phase = "generation.cancelled");
+            debug!(phase = "generation.cancelled");
             return;
         }
         generated.text = combined_raw_text;
@@ -1700,7 +1776,7 @@ impl QwenWorker {
             finish_reason,
             stream_include_usage: job.request.stream_include_usage,
         };
-        info!(
+        debug!(
             phase = "generation.complete",
             prompt_tokens = record.prompt_tokens,
             completion_tokens = record.completion_tokens,
@@ -1808,6 +1884,39 @@ fn new_admission(endpoint: Endpoint) -> Admission {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generation_metrics_account_for_cache_totals_and_zero_durations() {
+        let metrics = generation_metrics(
+            100,
+            40,
+            25,
+            Duration::from_secs(3),
+            Duration::ZERO,
+        );
+
+        assert_eq!(
+            metrics,
+            GenerationMetrics {
+                prefill_tps: 25.0,
+                decode_tps: 0.0,
+                total_tokens: 140,
+                prefilled_tokens: 75,
+                prefix_reused_tokens: 25,
+            }
+        );
+        assert_eq!(
+            generation_metrics(
+                usize::MAX,
+                1,
+                usize::MAX,
+                Duration::ZERO,
+                Duration::ZERO,
+            )
+            .total_tokens,
+            usize::MAX,
+        );
+    }
 
     fn parse_fragments(fragments: &[&str]) -> (String, String) {
         let mut parser = ReasoningTraceParser::default();

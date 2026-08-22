@@ -1082,6 +1082,14 @@ async fn documented_optional_chat_inputs_reach_the_handler() {
 async fn structured_tracing_covers_request_stream_error_and_cancellation_without_bodies() {
     trace_capture::install();
     trace_capture::clear();
+    engine::log_generation_metrics(
+        "chatcmpl-metric-test",
+        10,
+        3,
+        4,
+        Duration::ZERO,
+        Duration::ZERO,
+    );
 
     const SECRET_PROMPT: &str = "trace-secret-prompt-7b5c";
     const SECRET_ARGUMENTS: &str = "trace-secret-tool-arguments-29af";
@@ -1148,18 +1156,45 @@ async fn structured_tracing_covers_request_stream_error_and_cancellation_without
             .any(|line| line.contains("span generation") && line.contains("parent=Some")),
         "{traces}"
     );
+    assert!(traces.contains("response.streaming_failed"), "{traces}");
     for phase in [
         "request.validation_complete",
         "dispatch.enqueued",
+        "model_generation.complete",
         "generation.complete",
         "response.buffered_complete",
         "response.streaming_admitted",
         "response.streaming_complete",
-        "response.streaming_failed",
         "generation.cancelled",
     ] {
-        assert!(traces.contains(phase), "missing {phase}: {traces}");
+        assert!(!traces.contains(phase), "unexpected INFO {phase}: {traces}");
     }
+    let metric_lines = traces
+        .lines()
+        .filter(|line| {
+            line.contains("event=\"prefill.complete\"")
+                || line.contains("event=\"decode.complete\"")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(metric_lines.len(), 2, "{traces}");
+    assert!(metric_lines[0].contains("event=\"prefill.complete\""), "{traces}");
+    assert!(metric_lines[0].contains("chat_id=\"chatcmpl-metric-test\""), "{traces}");
+    assert!(metric_lines[0].contains("tps=0.0"), "{traces}");
+    assert!(metric_lines[0].contains("total_tokens=10"), "{traces}");
+    assert!(metric_lines[0].contains("prefilled_tokens=6"), "{traces}");
+    assert!(
+        metric_lines[0].contains("prefix_reused_tokens=4"),
+        "{traces}"
+    );
+    assert!(metric_lines[1].contains("event=\"decode.complete\""), "{traces}");
+    assert!(metric_lines[1].contains("chat_id=\"chatcmpl-metric-test\""), "{traces}");
+    assert!(metric_lines[1].contains("tps=0.0"), "{traces}");
+    assert!(metric_lines[1].contains("total_tokens=13"), "{traces}");
+    assert!(metric_lines[1].contains("decoded_tokens=3"), "{traces}");
+    assert!(
+        metric_lines[1].contains("prefix_reused_tokens=4"),
+        "{traces}"
+    );
     assert!(!traces.contains(SECRET_PROMPT), "{traces}");
     assert!(!traces.contains(SECRET_ARGUMENTS), "{traces}");
     assert!(
