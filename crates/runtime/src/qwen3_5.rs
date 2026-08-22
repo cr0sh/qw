@@ -912,7 +912,10 @@ impl Qwen35DecoderLayer {
 }
 
 // Qwen3.5 Model.
-const MTP_FP16_TARGET_MAX_TOKENS: i32 = 32_768;
+// The 27B Qwen3.5 target uses 4 GiB of FP16 K/V at this boundary. Keeping
+// 64k native avoids the much slower compressed-attention path; longer contexts
+// still transition to bounded Turbo4 storage.
+const MTP_FP16_TARGET_MAX_TOKENS: i32 = 65_536;
 
 fn mtp_target_cache_mode(has_mtp: bool, requested: KVCacheMode) -> KVCacheMode {
     if has_mtp && requested == KVCacheMode::Turbo4 {
@@ -2933,9 +2936,9 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_mtp_fp16_cap_is_two_gibibytes() {
+    fn qwen35_mtp_fp16_cap_is_four_gibibytes() {
         let bytes = 16_u64 * 4 * MTP_FP16_TARGET_MAX_TOKENS as u64 * 256 * 2 * 2;
-        assert_eq!(bytes, 2_u64 << 30);
+        assert_eq!(bytes, 4_u64 << 30);
     }
 
     #[test]

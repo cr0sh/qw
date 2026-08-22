@@ -26,7 +26,7 @@ trap 'rm -f "$OUTPUT"' EXIT
     CARGO_TERM_COLOR=never \
     QW_MODEL_PATH="$MODEL_DIR" \
         cargo bench -p qw-runtime --bench single_user_throughput -- \
-        single_user_decode/long_10k_mtp_k3 --quick
+        single_user_decode/long_64k_mtp_k3 --quick
 ) 2>&1 | tee "$OUTPUT"
 
 python3 - "$OUTPUT" <<'PY'
@@ -41,30 +41,30 @@ throughput = re.findall(
 )
 if len(throughput) != 1:
     raise SystemExit(
-        f"expected one long_10k_mtp_k3 elem/s result, found {len(throughput)}"
+        f"expected one long_64k_mtp_k3 elem/s result, found {len(throughput)}"
     )
 throughput_value = float(throughput[0])
 if not throughput_value > 0.0:
-    raise SystemExit(f"invalid long_10k_mtp_k3 throughput: {throughput_value}")
+    raise SystemExit(f"invalid long_64k_mtp_k3 throughput: {throughput_value}")
 
 profiles = re.findall(
-    r"MTP_LONG_CONTEXT_PROFILE .*?acceptance=([0-9.]+)% forwards=(\d+)",
+    r"MTP_LONG_CONTEXT_PROFILE context=64k .*?acceptance=([0-9.]+)% forwards=(\d+)",
     text,
 )
 if len(profiles) != 1:
-    raise SystemExit(f"expected one long-context MTP profile, found {len(profiles)}")
+    raise SystemExit(f"expected one 64k-context MTP profile, found {len(profiles)}")
 acceptance_pct, target_forwards = profiles[0]
 
 distances = re.findall(
-    r"MTP_LONG_CONTEXT_CORRECTNESS token_edit_distance=(\d+)",
+    r"MTP_LONG_CONTEXT_CORRECTNESS context=64k token_edit_distance=(\d+)",
     text,
 )
 if len(distances) != 1:
     raise SystemExit(
-        f"expected one long-context correctness result, found {len(distances)}"
+        f"expected one 64k-context correctness result, found {len(distances)}"
     )
 
-print(f"METRIC long_10k_mtp_k3_elem_s={throughput_value:.6f}")
+print(f"METRIC long_64k_mtp_k3_elem_s={throughput_value:.6f}")
 print(f"METRIC token_edit_distance={distances[0]}")
 print(f"METRIC acceptance_pct={float(acceptance_pct):.6f}")
 print(f"METRIC target_forwards={target_forwards}")
