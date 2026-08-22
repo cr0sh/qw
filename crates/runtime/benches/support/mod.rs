@@ -1,13 +1,12 @@
 use std::hint::black_box;
 use std::path::PathBuf;
 
-use qw_runtime::provider::Qwen35GenerationMode;
-use qw_runtime::{
-    ChatMessage, ChatMessageContent, GenerationRequest, KVCacheMode, PromptSnapshot,
-    Qwen35Provider,
-};
 #[cfg(feature = "specprefill")]
 use qw_runtime::PrefillMode;
+use qw_runtime::provider::Qwen35GenerationMode;
+use qw_runtime::{
+    ChatMessage, ChatMessageContent, GenerationRequest, KVCacheMode, PromptSnapshot, Qwen35Provider,
+};
 
 pub const DECODE_MAX_TOKENS: usize = 128;
 pub const MTP_BLOCK_SIZE: usize = 3;
@@ -208,9 +207,7 @@ fn long_conversation_token_ids(provider: &Qwen35Provider) -> (Vec<i32>, usize) {
             (history_ids.len() >= LONG_CONTEXT_MIN_TOKENS).then_some(history_ids)
         })
         .unwrap_or_else(|| {
-            panic!(
-                "long-conversation history did not reach {LONG_CONTEXT_MIN_TOKENS} tokens"
-            )
+            panic!("long-conversation history did not reach {LONG_CONTEXT_MIN_TOKENS} tokens")
         });
     let prefix_tokens = history_ids.len();
     assert!(
@@ -233,9 +230,7 @@ fn long_conversation_token_ids(provider: &Qwen35Provider) -> (Vec<i32>, usize) {
     (prompt_ids, prefix_tokens)
 }
 
-pub fn prepare_long_conversation_fixture(
-    provider: &mut Qwen35Provider,
-) -> LongConversationFixture {
+pub fn prepare_long_conversation_fixture(provider: &mut Qwen35Provider) -> LongConversationFixture {
     let (prompt_ids, prefix_tokens) = long_conversation_token_ids(provider);
     let history_ids = &prompt_ids[..prefix_tokens];
     let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));

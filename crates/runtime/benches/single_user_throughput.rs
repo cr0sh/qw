@@ -8,8 +8,8 @@ use qw_runtime::provider::Qwen35GenerationMode;
 #[cfg(feature = "specprefill")]
 use qw_runtime::{PrefillMode, SpecPrefillConfig};
 use support::{
-    DECODE_MAX_TOKENS, MTP_BLOCK_SIZE, prepare_decode_fixture,
-    prepare_long_conversation_fixture, prompt_token_ids,
+    DECODE_MAX_TOKENS, MTP_BLOCK_SIZE, prepare_decode_fixture, prepare_long_conversation_fixture,
+    prompt_token_ids,
 };
 
 struct GenerationElements {
@@ -315,15 +315,15 @@ fn single_user_throughput(criterion: &mut Criterion) {
         group.finish();
     }
 
-    let long_mtp_token_edit_distance =
-        token_edit_distance(&long_context.mtp_token_ids, &long_context.baseline_token_ids);
+    let long_mtp_token_edit_distance = token_edit_distance(
+        &long_context.mtp_token_ids,
+        &long_context.baseline_token_ids,
+    );
     assert!(
         long_mtp_token_edit_distance * 20 <= long_context.baseline_token_ids.len(),
         "long-context MTP token edit distance {long_mtp_token_edit_distance} exceeds 5% of the baseline"
     );
-    eprintln!(
-        "MTP_LONG_CONTEXT_CORRECTNESS token_edit_distance={long_mtp_token_edit_distance}"
-    );
+    eprintln!("MTP_LONG_CONTEXT_CORRECTNESS token_edit_distance={long_mtp_token_edit_distance}");
 
     {
         let baseline_decode_tokens = long_context.baseline_token_ids.len().saturating_sub(1);
