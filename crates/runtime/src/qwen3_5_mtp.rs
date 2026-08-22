@@ -748,6 +748,7 @@ fn target_cache_accepted_count(emitted: usize) -> usize {
 const MTP_STATE_MATERIALIZE_INTERVAL: usize = 128;
 /// Minimum context where one wider verify block amortizes target-weight reads.
 const MTP_ADAPTIVE_DEPTH_MIN_CONTEXT: usize = 8_192;
+const MTP_ADAPTIVE_DEPTH_MAX_CONTEXT: usize = 32_768;
 
 // Variable MTP verify shapes accumulate reusable Metal buffers much faster than
 // ordinary one-token decode. Keep a bounded cache, but retain those buffers
@@ -843,6 +844,7 @@ fn should_extend_greedy_draft(
 ) -> bool {
     greedy
         && prompt_tokens >= MTP_ADAPTIVE_DEPTH_MIN_CONTEXT
+        && prompt_tokens < MTP_ADAPTIVE_DEPTH_MAX_CONTEXT
         && accepted.saturating_add(1) >= proposed
 }
 
