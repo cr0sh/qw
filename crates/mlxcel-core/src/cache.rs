@@ -580,6 +580,12 @@ impl KVCache {
             paged_backing: None,
         }
     }
+    /// Quantize V once on each FP16 write while retaining FP16 cache storage.
+    pub fn enable_fp16_v_quantization_on_write(&mut self) {
+        assert_eq!(self.mode, KVCacheMode::Fp16);
+        self.turbo_seed = 0;
+    }
+
     /// Return the packed sidecars needed for an exact-prefix Turbo4 snapshot.
     pub fn turbo4_snapshot_tensors(&self) -> Option<Turbo4SnapshotTensors<'_>> {
         (self.mode == KVCacheMode::Turbo4).then_some(Turbo4SnapshotTensors {
@@ -967,6 +973,21 @@ impl KVCache {
     /// so RoPE positions for subsequent Q tokens stay correct after a
     /// [`Self::trim_front`] has shifted `self.live_start` forward.
     fn update_fp16(&mut self, new_keys: UniquePtr<MlxArray>, new_values: UniquePtr<MlxArray>) {
+        let new_values = if self.turbo_seed == 0 {
+            if self.turbo_params.is_none() {
+                let value_shape = ffi::array_shape(&new_values);
+                self.turbo_params = Some(turbo::TurboQuantParams::new(value_shape[3] as u32, 0));
+            }
+            let params = self
+                .turbo_params
+                .as_ref()
+                .expect("FP16 V quantization parameters just initialized");
+            let (packed_values, value_norms, _) =
+                turbo::quant::quantize_v_turbo4(&new_values, params);
+            turbo::quant::dequantize_v_turbo4(&packed_values, &value_norms, params)
+        } else {
+            new_values
+        };
         let key_shape = ffi::array_shape(&new_keys);
         let new_seq_len = key_shape[2];
         let prev = self.buffer_idx();
