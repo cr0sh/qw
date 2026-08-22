@@ -8,10 +8,9 @@ use std::thread;
 use clap::Parser as _;
 use clap_derive::{Args, Parser, Subcommand};
 use qw_runtime::{
-    GenerationRequest, KVCacheMode, Qwen35Provider, model_cache_path, validate_identifier,
+    DEFAULT_MODEL_IDENTIFIER, GenerationRequest, KVCacheMode, Qwen35Provider, model_cache_path,
+    validate_identifier,
 };
-#[cfg(feature = "specprefill")]
-use qw_runtime::DEFAULT_SPECPREFILL_DRAFT_MODEL_IDENTIFIER;
 use qw_server::serve;
 
 #[derive(Debug, Parser)]
@@ -37,8 +36,8 @@ enum Command {
 
 #[derive(Debug, Args)]
 struct DownloadArgs {
-    /// Hugging Face model identifier, such as Qwen/Qwen3.5-0.8B.
-    identifier: String,
+    /// Hugging Face model identifier, such as Qwen/Qwen3.5-0.8B; defaults to the resolver model.
+    identifier: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -283,31 +282,19 @@ fn download_snapshot(identifier: &str) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
-fn download_identifiers(requested: &str) -> Vec<&str> {
-    #[cfg(not(feature = "specprefill"))]
-    {
-        return vec![requested];
-    }
-    #[cfg(feature = "specprefill")]
-    if requested == DEFAULT_SPECPREFILL_DRAFT_MODEL_IDENTIFIER {
-        vec![requested]
-    } else {
-        vec![requested, DEFAULT_SPECPREFILL_DRAFT_MODEL_IDENTIFIER]
-    }
+fn resolve_download_identifier(identifier: Option<&str>) -> &str {
+    identifier.unwrap_or(DEFAULT_MODEL_IDENTIFIER)
 }
 
 fn download_model(identifier: &str) -> Result<(), Box<dyn std::error::Error>> {
     validate_identifier(identifier)?;
-    for identifier in download_identifiers(identifier) {
-        download_snapshot(identifier)?;
-    }
-    Ok(())
+    download_snapshot(identifier)
 }
 
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::Download(args) => {
-            download_model(&args.identifier)?;
+            download_model(resolve_download_identifier(args.identifier.as_deref()))?;
         }
         Command::Generate(args) => {
             let model = qw_runtime::resolve_model_path(args.model.as_deref())?;
@@ -393,40 +380,29 @@ mod tests {
     }
 
     #[test]
-    fn download_accepts_positional_identifier() {
+    fn download_defaults_to_resolver_model() {
+        let cli = Cli::try_parse_from(["qw", "download"]).expect("parse download command");
+        let Command::Download(args) = cli.command else {
+            panic!("expected download command");
+        };
+        assert_eq!(args.identifier, None);
+        assert_eq!(
+            resolve_download_identifier(args.identifier.as_deref()),
+            DEFAULT_MODEL_IDENTIFIER
+        );
+    }
+
+    #[test]
+    fn download_accepts_explicit_identifier_override() {
         let cli = Cli::try_parse_from(["qw", "download", "Qwen/Qwen3.5-0.8B"])
             .expect("parse download command");
         let Command::Download(args) = cli.command else {
             panic!("expected download command");
         };
-        assert_eq!(args.identifier, "Qwen/Qwen3.5-0.8B");
-    }
-
-
-    #[cfg(not(feature = "specprefill"))]
-    #[test]
-    fn download_requests_only_target_without_specprefill() {
-        assert_eq!(download_identifiers("Qwen/target"), vec!["Qwen/target"]);
-    }
-
-    #[cfg(feature = "specprefill")]
-    #[test]
-    fn download_orders_target_before_specprefill_draft() {
+        assert_eq!(args.identifier.as_deref(), Some("Qwen/Qwen3.5-0.8B"));
         assert_eq!(
-            download_identifiers("Qwen/target"),
-            vec![
-                "Qwen/target",
-                DEFAULT_SPECPREFILL_DRAFT_MODEL_IDENTIFIER,
-            ]
-        );
-    }
-
-    #[cfg(feature = "specprefill")]
-    #[test]
-    fn download_deduplicates_requested_specprefill_draft() {
-        assert_eq!(
-            download_identifiers(DEFAULT_SPECPREFILL_DRAFT_MODEL_IDENTIFIER),
-            vec![DEFAULT_SPECPREFILL_DRAFT_MODEL_IDENTIFIER]
+            resolve_download_identifier(args.identifier.as_deref()),
+            "Qwen/Qwen3.5-0.8B"
         );
     }
     #[test]
