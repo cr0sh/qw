@@ -1425,6 +1425,65 @@ impl Qwen35Provider {
         ))
     }
 
+    /// Controlled cached-context benchmark route. The snapshot is reusable:
+    /// each call restores the same production prefix state before processing
+    /// the uncached prompt suffix.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn benchmark_cached_streaming_in_mode<F: FnMut(&str) -> bool>(
+        &mut self,
+        prompt_ids: &[i32],
+        max_tokens: usize,
+        sampling: &SamplingConfig,
+        snapshot: &PromptSnapshot,
+        mode: Qwen35GenerationMode,
+        on_delta: F,
+    ) -> Result<(BaselineGeneration, Option<MtpGenerationStats>)> {
+        match (mode, snapshot) {
+            (Qwen35GenerationMode::Baseline, PromptSnapshot::Baseline(snapshot)) => {
+                let generation = self.generate_baseline_streaming(
+                    prompt_ids,
+                    max_tokens,
+                    sampling,
+                    Some(PrefixReuse {
+                        snapshot,
+                        cached_tokens: snapshot.token_len(),
+                    }),
+                    None,
+                    &[],
+                    #[cfg(any(feature = "specprefill", test))]
+                    PrefillMode::Dense,
+                    on_delta,
+                )?;
+                Ok((generation, None))
+            }
+            (Qwen35GenerationMode::Mtp, PromptSnapshot::Mtp(snapshot)) => {
+                let (generation, stats) = self.generate_mtp_streaming_for_prompt(
+                    MtpPrompt::Text { prompt_ids },
+                    max_tokens,
+                    sampling,
+                    DEFAULT_MTP_BLOCK_SIZE,
+                    Some(MtpPrefixReuse {
+                        snapshot,
+                        cached_tokens: snapshot.token_len(),
+                        continuation_token: None,
+                    }),
+                    &[],
+                    None,
+                    on_delta,
+                )?;
+                Ok((generation, Some(stats)))
+            }
+            (Qwen35GenerationMode::Automatic, _) => {
+                anyhow::bail!("cached benchmark mode must be explicit")
+            }
+            (Qwen35GenerationMode::Baseline, PromptSnapshot::Mtp(_))
+            | (Qwen35GenerationMode::Mtp, PromptSnapshot::Baseline(_)) => {
+                anyhow::bail!("cached benchmark mode does not match the snapshot family")
+            }
+        }
+    }
+
     fn resolve_generation_mode(&self, mode: Qwen35GenerationMode) -> Result<bool> {
         match mode {
             Qwen35GenerationMode::Automatic => Ok(self.mtp_generator.is_some()),

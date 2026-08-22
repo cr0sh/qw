@@ -3,13 +3,17 @@ use std::path::PathBuf;
 
 use qw_runtime::provider::Qwen35GenerationMode;
 use qw_runtime::{
-    ChatMessage, ChatMessageContent, GenerationRequest, KVCacheMode, Qwen35Provider,
+    ChatMessage, ChatMessageContent, GenerationRequest, KVCacheMode, PromptSnapshot,
+    Qwen35Provider,
 };
+#[cfg(feature = "specprefill")]
+use qw_runtime::PrefillMode;
 
 pub const DECODE_MAX_TOKENS: usize = 128;
 pub const MTP_BLOCK_SIZE: usize = 3;
 pub const PREFILL_MIN_TOKENS: usize = 4_096;
 pub const PREFILL_MAX_TOKENS: usize = 6_000;
+pub const LONG_CONTEXT_MIN_TOKENS: usize = 10_000;
 /// Environment variable pointing at the DFlash2 drafter checkpoint
 /// directory (optional; defaults to the model cache path below).
 pub const DRAFT_MODEL_ENV: &str = "QW_BENCH_DRAFT_MODEL";
@@ -35,6 +39,17 @@ pub const PROMPT: &str = concat!(
 
 pub struct DecodeFixture {
     pub request: GenerationRequest,
+    pub baseline_token_ids: Vec<i32>,
+    pub mtp_token_ids: Vec<i32>,
+    pub mtp_decode_tokens: usize,
+}
+
+pub struct LongConversationFixture {
+    pub prompt_ids: Vec<i32>,
+    pub prefix_tokens: usize,
+    pub new_prompt_tokens: usize,
+    pub baseline_snapshot: PromptSnapshot,
+    pub mtp_snapshot: PromptSnapshot,
     pub baseline_token_ids: Vec<i32>,
     pub mtp_token_ids: Vec<i32>,
     pub mtp_decode_tokens: usize,
@@ -153,6 +168,195 @@ pub fn prepare_decode_fixture(provider: &mut Qwen35Provider) -> DecodeFixture {
     DecodeFixture {
         request,
         baseline_token_ids,
+        mtp_token_ids: mtp_output.token_ids,
+        mtp_decode_tokens,
+    }
+}
+
+fn text_message(role: &str, content: String) -> ChatMessage {
+    ChatMessage {
+        role: role.to_owned(),
+        name: None,
+        content: Some(ChatMessageContent::Text(content)),
+        reasoning_content: None,
+        tool_calls: Vec::new(),
+        tool_call_id: None,
+    }
+}
+
+fn long_conversation_token_ids(provider: &Qwen35Provider) -> (Vec<i32>, usize) {
+    let mut messages = Vec::new();
+    let history_ids = (1..=128)
+        .find_map(|turn| {
+            messages.push(text_message(
+                "user",
+                format!("Conversation incident record {turn:03}\n{PROMPT}"),
+            ));
+            messages.push(text_message(
+                "assistant",
+                concat!(
+                    r#"{"severity":"high","summary":"Payment capture failures remain active.","#,
+                    r#""affected_order_ids":["A-1042","A-1047"],"#,
+                    r#""next_action":"Escalate INC-4821 and pause catalog imports.","#,
+                    r#""needs_escalation":true}"#
+                )
+                .to_owned(),
+            ));
+            let history_ids = provider
+                .tokenize_history(&messages, &[], None, true)
+                .expect("tokenize long-conversation benchmark history");
+            (history_ids.len() >= LONG_CONTEXT_MIN_TOKENS).then_some(history_ids)
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "long-conversation history did not reach {LONG_CONTEXT_MIN_TOKENS} tokens"
+            )
+        });
+    let prefix_tokens = history_ids.len();
+    assert!(
+        prefix_tokens >= LONG_CONTEXT_MIN_TOKENS,
+        "long-conversation prefix has {prefix_tokens} tokens, expected at least {LONG_CONTEXT_MIN_TOKENS}"
+    );
+
+    messages.push(text_message("user", PROMPT.to_owned()));
+    let prompt_ids = provider
+        .tokenize_messages(&messages, &[], None, true)
+        .expect("tokenize long-conversation benchmark continuation");
+    assert!(
+        prompt_ids.starts_with(&history_ids),
+        "long-conversation history must be an exact prefix of the continuation prompt"
+    );
+    assert!(
+        prompt_ids.len() > prefix_tokens,
+        "long-conversation continuation must add prompt tokens"
+    );
+    (prompt_ids, prefix_tokens)
+}
+
+pub fn prepare_long_conversation_fixture(
+    provider: &mut Qwen35Provider,
+) -> LongConversationFixture {
+    let (prompt_ids, prefix_tokens) = long_conversation_token_ids(provider);
+    let history_ids = &prompt_ids[..prefix_tokens];
+    let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
+
+    let baseline_prefix = provider
+        .generate_baseline_streaming(
+            history_ids,
+            1,
+            &sampling,
+            None,
+            None,
+            &[prefix_tokens],
+            #[cfg(feature = "specprefill")]
+            PrefillMode::Dense,
+            |_| true,
+        )
+        .expect("prefill long-conversation baseline prefix");
+    let baseline_snapshot = baseline_prefix
+        .prompt_snapshots
+        .into_iter()
+        .next()
+        .expect("capture long-conversation baseline prefix snapshot");
+    assert!(
+        matches!(&baseline_snapshot, PromptSnapshot::Baseline(_)),
+        "baseline prefix generation returned the wrong snapshot family"
+    );
+    assert_eq!(baseline_snapshot.token_len(), prefix_tokens);
+
+    let mtp_prefix = provider
+        .generate_mtp_streaming(
+            history_ids,
+            1,
+            &sampling,
+            MTP_BLOCK_SIZE,
+            None,
+            &[prefix_tokens],
+            None,
+            |_| true,
+        )
+        .expect("prefill long-conversation MTP prefix");
+    let mtp_snapshot = mtp_prefix
+        .prompt_snapshots
+        .into_iter()
+        .next()
+        .expect("capture long-conversation MTP prefix snapshot");
+    assert!(
+        matches!(&mtp_snapshot, PromptSnapshot::Mtp(_)),
+        "MTP prefix generation returned the wrong snapshot family"
+    );
+    assert_eq!(mtp_snapshot.token_len(), prefix_tokens);
+
+    let (baseline_output, baseline_stats) = provider
+        .benchmark_cached_streaming_in_mode(
+            &prompt_ids,
+            DECODE_MAX_TOKENS,
+            &sampling,
+            &baseline_snapshot,
+            Qwen35GenerationMode::Baseline,
+            |delta| {
+                black_box(delta);
+                true
+            },
+        )
+        .expect("warm up long-conversation baseline decode");
+    assert_eq!(baseline_output.cached_tokens, prefix_tokens);
+    assert!(
+        baseline_stats.is_none(),
+        "long-conversation baseline mode returned MTP statistics"
+    );
+    assert!(!baseline_output.token_ids.is_empty());
+
+    let (mtp_output, mtp_stats) = provider
+        .benchmark_cached_streaming_in_mode(
+            &prompt_ids,
+            DECODE_MAX_TOKENS,
+            &sampling,
+            &mtp_snapshot,
+            Qwen35GenerationMode::Mtp,
+            |delta| {
+                black_box(delta);
+                true
+            },
+        )
+        .unwrap_or_else(|error| {
+            panic!("warm up long-conversation MTP k={MTP_BLOCK_SIZE}: {error:#}")
+        });
+    assert_eq!(mtp_output.cached_tokens, prefix_tokens);
+    let mtp_stats = mtp_stats.expect("explicit MTP mode must return MTP statistics");
+    assert!(
+        !mtp_output.token_ids.is_empty(),
+        "the deterministic long-conversation prompt must produce completion tokens"
+    );
+    assert!(
+        mtp_stats.proposed_draft_tokens > 0,
+        "long-conversation MTP k={MTP_BLOCK_SIZE} must propose draft tokens"
+    );
+    eprintln!(
+        "MTP_LONG_CONTEXT_PROFILE tokens={} prefix_tokens={} accepted={} proposed={} acceptance={:.2}% forwards={} draft_ms={:.3} verify_ms={:.3} walk_ms={:.3} reconcile_ms={:.3} materializations={} snapshots={}",
+        mtp_output.token_ids.len(),
+        prefix_tokens,
+        mtp_stats.accepted_draft_tokens,
+        mtp_stats.proposed_draft_tokens,
+        mtp_stats.acceptance_percentage(),
+        mtp_stats.target_forward_calls,
+        mtp_stats.draft_time.as_secs_f64() * 1_000.0,
+        mtp_stats.target_verify_time.as_secs_f64() * 1_000.0,
+        mtp_stats.walk_time.as_secs_f64() * 1_000.0,
+        mtp_stats.reconcile_time.as_secs_f64() * 1_000.0,
+        mtp_stats.full_state_materializations,
+        mtp_stats.cache_snapshot_count,
+    );
+
+    let new_prompt_tokens = prompt_ids.len() - prefix_tokens;
+    let mtp_decode_tokens = mtp_output.token_ids.len();
+    LongConversationFixture {
+        prompt_ids,
+        prefix_tokens,
+        new_prompt_tokens,
+        baseline_snapshot,
+        mtp_snapshot,
+        baseline_token_ids: baseline_output.token_ids,
         mtp_token_ids: mtp_output.token_ids,
         mtp_decode_tokens,
     }
