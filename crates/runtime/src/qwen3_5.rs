@@ -912,7 +912,7 @@ impl Qwen35DecoderLayer {
 }
 
 // Qwen3.5 Model.
-const MTP_FP16_TARGET_MAX_TOKENS: i32 = 32_768;
+const MTP_FP16_TARGET_MAX_TOKENS: i32 = 65_536;
 
 fn mtp_target_cache_mode(has_mtp: bool, requested: KVCacheMode) -> KVCacheMode {
     if has_mtp && requested == KVCacheMode::Turbo4 {
