@@ -89,6 +89,7 @@ fn long_context_cache_identity(context_label: &str, min_prefix_tokens: usize) ->
         std::env::consts::OS.as_bytes(),
         std::env::consts::ARCH.as_bytes(),
         b"alternating-user-assistant-history-v1".as_slice(),
+        b"bounded-mtp-fp16-65536-v1".as_slice(),
         PROMPT.as_bytes(),
         include_bytes!("../../src/portable_snapshot.rs").as_slice(),
         include_bytes!("../../src/qwen3_5_mtp.rs").as_slice(),

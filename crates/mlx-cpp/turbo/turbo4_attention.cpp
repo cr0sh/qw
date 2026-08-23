@@ -34,9 +34,9 @@ namespace {
 constexpr int SIMD_WIDTH = 32;
 constexpr int THREADGROUP_BUDGET_BYTES = 28 * 1024;
 constexpr int MAX_NUM_WARPS = 8;
-constexpr int MAX_QUERY_ROWS = 4;
+constexpr int MAX_QUERY_ROWS = 2;
 constexpr int MAX_ACCUMULATOR_FLOATS = 32;
-constexpr int TURBO4_ATTENTION_CHUNK_SIZE = 4096;
+constexpr int TURBO4_ATTENTION_CHUNK_SIZE = 2048;
 
 // One threadgroup owns one (batch, query tile, key chunk, KV head, GQA head
 // group). Lanes partition D; SIMD groups stripe the key chunk. Packed K/V are

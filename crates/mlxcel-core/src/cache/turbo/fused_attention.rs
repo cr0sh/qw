@@ -21,14 +21,19 @@ use crate::{MlxArray, dtype, ffi};
 use super::quant::{TurboQuantParams, turbo4_k_rotate, turbo4_v_inverse_rotate};
 
 pub const TURBO4_FUSED_ATTENTION_ENV_VAR: &str = "MLXCEL_TURBO4_FUSED_ATTENTION";
-static TURBO4_FUSED_ATTENTION_ENABLED: LazyLock<bool> =
-    LazyLock::new(|| match std::env::var(TURBO4_FUSED_ATTENTION_ENV_VAR) {
-        Ok(value) => !matches!(
+fn parse_fused_attention_enabled(value: Option<&str>, default: bool) -> bool {
+    value.map_or(default, |value| {
+        matches!(
             value.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        ),
-        Err(_) => true,
-    });
+            "1" | "true" | "on" | "yes"
+        )
+    })
+}
+
+static TURBO4_FUSED_ATTENTION_ENABLED: LazyLock<bool> = LazyLock::new(|| {
+    let value = std::env::var(TURBO4_FUSED_ATTENTION_ENV_VAR).ok();
+    parse_fused_attention_enabled(value.as_deref(), cfg!(test))
+});
 
 pub fn turbo4_fused_attention_enabled() -> bool {
     cfg!(target_os = "macos") && ffi::metal_is_available() && *TURBO4_FUSED_ATTENTION_ENABLED
@@ -115,4 +120,20 @@ pub fn attention_turbo4_fused(
         &q_rot, k_packed, k_rescale, v_packed, v_rescale, &codebook, scale, causal,
     );
     Some(turbo4_v_inverse_rotate(&rotated, params))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_fused_attention_enabled;
+
+    #[test]
+    fn turbo4_production_gate_is_default_off_and_accepts_only_true_literals() {
+        assert!(!parse_fused_attention_enabled(None, false));
+        for value in ["1", "true", "on", "yes", " TRUE "] {
+            assert!(parse_fused_attention_enabled(Some(value), false));
+        }
+        for value in ["0", "false", "off", "no", "", "invalid"] {
+            assert!(!parse_fused_attention_enabled(Some(value), false));
+        }
+    }
 }
