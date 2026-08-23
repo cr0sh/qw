@@ -1061,8 +1061,8 @@ pub fn attention_turbo4_dequant_sdpa(
 ) -> UniquePtr<MlxArray> {
     let q_rot_f32 = super::quant::turbo4_k_rotate(q, params);
     let q_rot = ffi::astype(&q_rot_f32, ffi::array_dtype(q));
-    let k_rot = super::quant::dequantize_k_turbo4_rotated(k_packed, k_rescale, params);
-    let v_rot = dequantize_v_turbo4_rotated_for_sdpa(v_packed, v_rescale, params);
+    let k_rot = dequantize_turbo4_rotated_for_sdpa(k_packed, k_rescale, params);
+    let v_rot = dequantize_turbo4_rotated_for_sdpa(v_packed, v_rescale, params);
     let rot_out = if causal {
         crate::causal_attention(&q_rot, &k_rot, &v_rot, scale, 0.0, 0)
     } else {
@@ -1093,7 +1093,7 @@ pub fn attention_turbo4_asym_dequant_sdpa(
     scale: f32,
     mask: Option<&MlxArray>,
 ) -> UniquePtr<MlxArray> {
-    let v_rot = dequantize_v_turbo4_rotated_for_sdpa(v_packed, v_rescale, params);
+    let v_rot = dequantize_turbo4_rotated_for_sdpa(v_packed, v_rescale, params);
     let rot_out = crate::layers::attention(q, k, &v_rot, scale, mask, 0.0, 0);
     super::quant::turbo4_v_inverse_rotate(&rot_out, params)
 }
@@ -1165,7 +1165,7 @@ pub fn attention_turbo4_delegated_dequant_sdpa(
     let cold_v_rotated = {
         let vp = v_packed.expect("v_packed must exist when cold_offset > 0");
         let vr = v_rescale.expect("v_rescale must exist when cold_offset > 0");
-        dequantize_v_turbo4_rotated_for_sdpa(vp, vr, params)
+        dequantize_turbo4_rotated_for_sdpa(vp, vr, params)
     };
 
     let hot_v_rotated = if hot_offset > 0 {
@@ -1185,24 +1185,24 @@ pub fn attention_turbo4_delegated_dequant_sdpa(
     Some(super::quant::turbo4_v_inverse_rotate(&rotated_out, params))
 }
 
-fn dequantize_v_turbo4_rotated_for_sdpa(
-    v_packed: &MlxArray,
-    v_rescale: &MlxArray,
+fn dequantize_turbo4_rotated_for_sdpa(
+    packed: &MlxArray,
+    rescale: &MlxArray,
     params: &TurboQuantParams,
 ) -> UniquePtr<MlxArray> {
-    dequantize_v_turbo4_rotated_fused(v_packed, v_rescale, params)
-        .unwrap_or_else(|| super::quant::dequantize_v_turbo4_rotated(v_packed, v_rescale, params))
+    dequantize_turbo4_rotated_fused(packed, rescale, params)
+        .unwrap_or_else(|| super::quant::dequantize_v_turbo4_rotated(packed, rescale, params))
 }
 
-fn dequantize_v_turbo4_rotated_fused(
-    v_packed: &MlxArray,
-    v_rescale: &MlxArray,
+fn dequantize_turbo4_rotated_fused(
+    packed: &MlxArray,
+    rescale: &MlxArray,
     params: &TurboQuantParams,
 ) -> Option<UniquePtr<MlxArray>> {
     if !kernel_enabled() {
         return None;
     }
-    let shape = ffi::array_shape(v_packed);
+    let shape = ffi::array_shape(packed);
     if shape.len() != 4 || shape[3] * 2 != params.head_dim as i32 {
         return None;
     }
@@ -1210,8 +1210,8 @@ fn dequantize_v_turbo4_rotated_fused(
     let centroids_vec: Vec<f32> = params.codebook.centroids.as_ref().to_vec();
     let codebook = ffi::from_slice_f32(&centroids_vec, &[centroids_vec.len() as i32]);
     Some(ffi::turbo4_delegated_bulk_dequant_rotated(
-        v_packed,
-        v_rescale,
+        packed,
+        rescale,
         &codebook,
         params.head_dim as i32,
     ))
@@ -1534,7 +1534,7 @@ mod tests {
         let (packed, _norms, rescale) = super::super::quant::quantize_v_turbo4(&v, &params);
 
         let graph = super::super::quant::dequantize_v_turbo4_rotated(&packed, &rescale, &params);
-        let fused = dequantize_v_turbo4_rotated_fused(&packed, &rescale, &params)
+        let fused = dequantize_turbo4_rotated_fused(&packed, &rescale, &params)
             .expect("kernel_enabled should allow fused bulk rotated dequant");
 
         let graph_vec = flatten_fp32(&graph);
