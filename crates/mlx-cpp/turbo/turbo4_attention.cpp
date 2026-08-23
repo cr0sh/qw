@@ -63,26 +63,28 @@ constexpr const char* TURBO4_MTP_VERIFY_PARTIAL_SOURCE = R"(
     uint hkv_count = (uint)k_packed_shape[1];
     float scale_log2e = scale[0] * 1.4426950408889634f;
 
-    uint rows[QueriesPerGroup];
-    float q[QueriesPerGroup][DimsPerThread];
-    float out[QueriesPerGroup][DimsPerThread];
-    float max_score[QueriesPerGroup];
-    float sum_score[QueriesPerGroup];
-    for (uint qi = 0; qi < (uint)QueriesPerGroup; qi++) {
-        uint repeat = query_group * (uint)QueriesPerGroup + qi;
-        uint q_head = kv_head * (uint)RepeatCount + repeat;
-        rows[qi] =
-            (batch * hq_count + q_head) * (uint)QRows + query_row;
-        for (uint j = 0; j < dpt; j++) {
-            uint d = d0 + j;
-            q[qi][j] = d < dim
-                ? q_rot[rows[qi] * dim + d] * scale_log2e
-                : 0.0f;
-            out[qi][j] = 0.0f;
-        }
-        max_score[qi] = -INFINITY;
-        sum_score[qi] = 0.0f;
+    uint rows[2];
+    rows[0] =
+        (batch * hq_count
+         + kv_head * (uint)RepeatCount
+         + query_group * (uint)QueriesPerGroup)
+        * (uint)QRows + query_row;
+    rows[1] = rows[0] + (uint)QRows;
+    float2 q[DimsPerThread];
+    float2 out[DimsPerThread];
+    for (uint j = 0; j < dpt; j++) {
+        uint d = d0 + j;
+        float q0 = d < dim
+            ? q_rot[rows[0] * dim + d] * scale_log2e
+            : 0.0f;
+        float q1 = (uint)QueriesPerGroup == 2u && d < dim
+            ? q_rot[rows[1] * dim + d] * scale_log2e
+            : 0.0f;
+        q[j] = float2(q0, q1);
+        out[j] = float2(0.0f);
     }
+    float2 max_score = float2(-INFINITY);
+    float2 sum_score = float2(0.0f);
 
     threadgroup half staged_k[StageRows * Dim];
     threadgroup half staged_v[StageRows * Dim];
@@ -134,32 +136,23 @@ constexpr const char* TURBO4_MTP_VERIFY_PARTIAL_SOURCE = R"(
             }
             threadgroup const half *k_row = staged_k + rr * dim;
             threadgroup const half *v_row = staged_v + rr * dim;
-            float dots[QueriesPerGroup];
+            float2 dots = float2(0.0f);
             float v[DimsPerThread];
-            for (uint qi = 0; qi < (uint)QueriesPerGroup; qi++) {
-                dots[qi] = 0.0f;
-            }
             for (uint j = 0; j < dpt; j++) {
                 uint d = d0 + j;
                 float k_value = (float)k_row[d];
                 v[j] = (float)v_row[d];
-                for (uint qi = 0; qi < (uint)QueriesPerGroup; qi++) {
-                    dots[qi] += q[qi][j] * k_value;
-                }
+                dots += q[j] * k_value;
             }
-            for (uint qi = 0; qi < (uint)QueriesPerGroup; qi++) {
-                float score = simd_sum(dots[qi]);
-                float next_max = fmax(max_score[qi], score);
-                float correction = fast::exp2(max_score[qi] - next_max);
-                float probability = fast::exp2(score - next_max);
-                sum_score[qi] =
-                    sum_score[qi] * correction + probability;
-                for (uint j = 0; j < dpt; j++) {
-                    out[qi][j] =
-                        out[qi][j] * correction + probability * v[j];
-                }
-                max_score[qi] = next_max;
+            float2 score = simd_sum(dots);
+            float2 next_max = fmax(max_score, score);
+            float2 correction = fast::exp2(max_score - next_max);
+            float2 probability = fast::exp2(score - next_max);
+            sum_score = sum_score * correction + probability;
+            for (uint j = 0; j < dpt; j++) {
+                out[j] = out[j] * correction + probability * v[j];
             }
+            max_score = next_max;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -173,7 +166,7 @@ constexpr const char* TURBO4_MTP_VERIFY_PARTIAL_SOURCE = R"(
         for (uint j = 0; j < dpt; j++) {
             uint d = d0 + j;
             if (d < dim) {
-                partial_acc[partial_row * dim + d] = out[qi][j];
+                partial_acc[partial_row * dim + d] = out[j][qi];
             }
         }
     }
