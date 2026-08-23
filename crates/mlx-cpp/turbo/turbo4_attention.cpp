@@ -33,13 +33,19 @@ namespace {
 constexpr int SIMD_WIDTH = 32;
 constexpr int MIN_MTP_VERIFY_TOKENS = 2048;
 
-// Metal topology adapted from oMLX TurboQuant's fused MTP verify pass at
-// jundot/omlx@309e8c51e7f46b6da355485018477c25c6f77b23 (Apache-2.0).
-// One SIMDgroup owns (batch, KV head, GQA repeat, block). It strides the full
-// cache by Blocks, unpacks each packed K/V token once, and updates independent
-// FP32 online-softmax state for every verify row.
+// Two-pass block decomposition adapted from oMLX TurboQuant's fused MTP verify
+// pass at jundot/omlx@309e8c51e7f46b6da355485018477c25c6f77b23
+// (Apache-2.0). The staged multi-head reuse below follows the threadgroup
+// tiling approach used by antirez/ds4's causal group-8 attention kernel at
+// antirez/ds4@84cc882352757baf628a1776badf7cc54d584e28 (MIT).
+// One threadgroup owns (batch, KV head, block). Its SIMDgroups map the GQA
+// repeats, cooperatively unpack short K/V stages once, then reuse the decoded
+// rows across all query heads and verify rows.
 constexpr const char* TURBO4_MTP_VERIFY_PARTIAL_SOURCE = R"(
+    constexpr uint StageRows = 16;
+
     uint lane = thread_index_in_simdgroup;
+    uint tid = thread_index_in_threadgroup;
     uint kv_head = threadgroup_position_in_grid.x;
     uint batch = threadgroup_position_in_grid.y;
     uint block = threadgroup_position_in_grid.z;
@@ -76,49 +82,75 @@ constexpr const char* TURBO4_MTP_VERIFY_PARTIAL_SOURCE = R"(
         }
     }
 
+    threadgroup half staged_k[StageRows * Dim];
+    threadgroup half staged_v[StageRows * Dim];
+
     float scale_log2e = scale[0] * 1.4426950408889634f;
     uint bh = batch * hkv_count + kv_head;
-    for (uint t = block; t < tk; t += (uint)Blocks) {
-        uint packed_base = (bh * tk + t) * packed_width;
-        uint sidecar = bh * tk + t;
-        float k_scale = (float)k_rescale[sidecar];
-        float v_scale = (float)v_rescale[sidecar];
-        float k[DimsPerThread];
-        float v[DimsPerThread];
-        for (uint j = 0; j < dpt; j++) {
-            uint d = d0 + j;
-            if (d < dim) {
-                uint shift = (d & 1u) * 4u;
-                uint k_byte = (uint)k_packed[packed_base + (d >> 1)];
-                uint v_byte = (uint)v_packed[packed_base + (d >> 1)];
-                k[j] = codebook[(k_byte >> shift) & 0x0fu] * k_scale;
-                v[j] = codebook[(v_byte >> shift) & 0x0fu] * v_scale;
-            } else {
-                k[j] = 0.0f;
-                v[j] = 0.0f;
-            }
+    uint block_tokens = tk > block
+        ? ((tk - 1u - block) / (uint)Blocks + 1u)
+        : 0u;
+    uint threads = 32u * (uint)RepeatCount;
+    for (uint base = 0; base < block_tokens; base += StageRows) {
+        uint stage_rows = min(StageRows, block_tokens - base);
+        uint stage_bytes = stage_rows * packed_width;
+        for (uint off = tid; off < stage_bytes; off += threads) {
+            uint rr = off / packed_width;
+            uint packed_col = off - rr * packed_width;
+            uint t = block + (base + rr) * (uint)Blocks;
+            uint packed_base = (bh * tk + t) * packed_width;
+            uint sidecar = bh * tk + t;
+            float k_scale = (float)k_rescale[sidecar];
+            float v_scale = (float)v_rescale[sidecar];
+            uint k_byte = (uint)k_packed[packed_base + packed_col];
+            uint v_byte = (uint)v_packed[packed_base + packed_col];
+            uint d = packed_col * 2u;
+            half2 k_pair = half2(
+                codebook[k_byte & 0x0fu] * k_scale,
+                codebook[(k_byte >> 4u) & 0x0fu] * k_scale);
+            half2 v_pair = half2(
+                codebook[v_byte & 0x0fu] * v_scale,
+                codebook[(v_byte >> 4u) & 0x0fu] * v_scale);
+            *((threadgroup half2 *)(staged_k + rr * dim + d)) = k_pair;
+            *((threadgroup half2 *)(staged_v + rr * dim + d)) = v_pair;
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Bottom-right causal visibility: row r is positioned at tk-QRows+r.
-        int first_visible_row = (int)t - (int)tk + QRows;
-        for (uint r = 0; r < (uint)QRows; r++) {
-            if ((int)r < first_visible_row) {
-                continue;
-            }
-            float dot = 0.0f;
+        for (uint rr = 0; rr < stage_rows; rr++) {
+            uint t = block + (base + rr) * (uint)Blocks;
+            threadgroup const half *k_row = staged_k + rr * dim;
+            threadgroup const half *v_row = staged_v + rr * dim;
+            float k[DimsPerThread];
+            float v[DimsPerThread];
             for (uint j = 0; j < dpt; j++) {
-                dot += q[r][j] * k[j];
+                uint d = d0 + j;
+                k[j] = (float)k_row[d];
+                v[j] = (float)v_row[d];
             }
-            float score = simd_sum(dot) * scale_log2e;
-            float next_max = fmax(max_score[r], score);
-            float correction = exp2(max_score[r] - next_max);
-            float probability = exp2(score - next_max);
-            sum_score[r] = sum_score[r] * correction + probability;
-            for (uint j = 0; j < dpt; j++) {
-                out[r][j] = out[r][j] * correction + probability * v[j];
+
+            // Bottom-right causal visibility: row r is positioned at
+            // tk-QRows+r.
+            int first_visible_row = (int)t - (int)tk + QRows;
+            for (uint r = 0; r < (uint)QRows; r++) {
+                if ((int)r < first_visible_row) {
+                    continue;
+                }
+                float dot = 0.0f;
+                for (uint j = 0; j < dpt; j++) {
+                    dot += q[r][j] * k[j];
+                }
+                float score = simd_sum(dot) * scale_log2e;
+                float next_max = fmax(max_score[r], score);
+                float correction = exp2(max_score[r] - next_max);
+                float probability = exp2(score - next_max);
+                sum_score[r] = sum_score[r] * correction + probability;
+                for (uint j = 0; j < dpt; j++) {
+                    out[r][j] = out[r][j] * correction + probability * v[j];
+                }
+                max_score[r] = next_max;
             }
-            max_score[r] = next_max;
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     for (uint r = 0; r < (uint)QRows; r++) {
@@ -250,7 +282,7 @@ int mtp_verify_blocks(int tokens) {
         return 128;
     }
     if (tokens <= 65536) {
-        return 256;
+        return 128;
     }
     return 512;
 }
