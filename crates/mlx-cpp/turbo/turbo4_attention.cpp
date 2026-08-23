@@ -91,9 +91,16 @@ constexpr const char* TURBO4_MTP_VERIFY_PARTIAL_SOURCE = R"(
     uint block_tokens = tk > block
         ? ((tk - 1u - block) / (uint)Blocks + 1u)
         : 0u;
+    uint visible_tk = tk - (uint)QRows + query_row + 1u;
+    uint query_block_tokens = visible_tk > block
+        ? ((visible_tk - 1u - block) / (uint)Blocks + 1u)
+        : 0u;
     uint threads = 32u * GroupCount * (uint)QRows;
     for (uint base = 0; base < block_tokens; base += StageRows) {
         uint stage_rows = min(StageRows, block_tokens - base);
+        uint consumer_rows = query_block_tokens > base
+            ? min(stage_rows, query_block_tokens - base)
+            : 0u;
         uint packed_chunks = packed_width / 16u;
         uint stage_chunks = stage_rows * packed_chunks;
         for (uint chunk = tid; chunk < stage_chunks; chunk += threads) {
@@ -127,11 +134,7 @@ constexpr const char* TURBO4_MTP_VERIFY_PARTIAL_SOURCE = R"(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint rr = 0; rr < stage_rows; rr++) {
-            uint t = block + (base + rr) * (uint)Blocks;
-            if (t + (uint)QRows > tk + query_row) {
-                continue;
-            }
+        for (uint rr = 0; rr < consumer_rows; rr++) {
             threadgroup const half *k_row = staged_k + rr * dim;
             threadgroup const half *v_row = staged_v + rr * dim;
             float dots[QueriesPerGroup];
