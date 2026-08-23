@@ -1562,17 +1562,32 @@ impl Qwen35Model {
                 let q = mlxcel_core::slice(
                     &snapshot.q,
                     &[0, 0, 0, 0],
-                    &[batch, replay_len, layer.num_k_heads as i32, layer.head_k_dim as i32],
+                    &[
+                        batch,
+                        replay_len,
+                        layer.num_k_heads as i32,
+                        layer.head_k_dim as i32,
+                    ],
                 );
                 let k = mlxcel_core::slice(
                     &snapshot.k,
                     &[0, 0, 0, 0],
-                    &[batch, replay_len, layer.num_k_heads as i32, layer.head_k_dim as i32],
+                    &[
+                        batch,
+                        replay_len,
+                        layer.num_k_heads as i32,
+                        layer.head_k_dim as i32,
+                    ],
                 );
                 let v = mlxcel_core::slice(
                     &snapshot.v,
                     &[0, 0, 0, 0],
-                    &[batch, replay_len, layer.num_v_heads as i32, layer.head_v_dim as i32],
+                    &[
+                        batch,
+                        replay_len,
+                        layer.num_v_heads as i32,
+                        layer.head_v_dim as i32,
+                    ],
                 );
                 let a = mlxcel_core::slice(
                     &snapshot.a,
