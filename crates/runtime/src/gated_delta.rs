@@ -201,7 +201,7 @@ pub fn gated_delta_ops(
     // Initialize state if not provided; use float32 for numerical precision
     // (prevents underflow/overflow in long sequences when input is bfloat16)
     let current_state = if let Some(s) = state {
-        mlxcel_core::copy(s)
+        mlxcel_core::share(s)
     } else {
         mlxcel_core::zeros(&[b, hv, dv, dk], dtype::FLOAT32)
     };
