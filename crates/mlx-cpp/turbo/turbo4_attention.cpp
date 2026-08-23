@@ -44,13 +44,14 @@ constexpr int MIN_MTP_VERIFY_TOKENS = 2048;
 // every query head and verify row.
 constexpr const char* TURBO4_MTP_VERIFY_PARTIAL_SOURCE = R"(
     constexpr uint StageRows = 32;
+    constexpr uint GroupCount = (uint)RepeatCount / (uint)QueriesPerGroup;
 
     uint lane = thread_index_in_simdgroup;
     uint tid = thread_index_in_threadgroup;
     uint kv_head = threadgroup_position_in_grid.x;
     uint batch = threadgroup_position_in_grid.y;
     uint block = threadgroup_position_in_grid.z;
-    uint repeat = thread_position_in_threadgroup.y;
+    uint query_group = thread_position_in_threadgroup.y;
     uint query_row = thread_position_in_threadgroup.z;
 
     uint dim = (uint)Dim;
@@ -60,19 +61,28 @@ constexpr const char* TURBO4_MTP_VERIFY_PARTIAL_SOURCE = R"(
     uint tk = (uint)k_packed_shape[2];
     uint packed_width = (uint)k_packed_shape[3];
     uint hkv_count = (uint)k_packed_shape[1];
-    uint q_head = kv_head * (uint)RepeatCount + repeat;
-    uint row = (batch * hq_count + q_head) * (uint)QRows + query_row;
     float scale_log2e = scale[0] * 1.4426950408889634f;
 
-    float q[DimsPerThread];
-    float out[DimsPerThread];
-    for (uint j = 0; j < dpt; j++) {
-        uint d = d0 + j;
-        q[j] = d < dim ? q_rot[row * dim + d] * scale_log2e : 0.0f;
-        out[j] = 0.0f;
+    uint rows[QueriesPerGroup];
+    float q[QueriesPerGroup][DimsPerThread];
+    float out[QueriesPerGroup][DimsPerThread];
+    float max_score[QueriesPerGroup];
+    float sum_score[QueriesPerGroup];
+    for (uint qi = 0; qi < (uint)QueriesPerGroup; qi++) {
+        uint repeat = query_group * (uint)QueriesPerGroup + qi;
+        uint q_head = kv_head * (uint)RepeatCount + repeat;
+        rows[qi] =
+            (batch * hq_count + q_head) * (uint)QRows + query_row;
+        for (uint j = 0; j < dpt; j++) {
+            uint d = d0 + j;
+            q[qi][j] = d < dim
+                ? q_rot[rows[qi] * dim + d] * scale_log2e
+                : 0.0f;
+            out[qi][j] = 0.0f;
+        }
+        max_score[qi] = -INFINITY;
+        sum_score[qi] = 0.0f;
     }
-    float max_score = -INFINITY;
-    float sum_score = 0.0f;
 
     threadgroup half staged_k[StageRows * Dim];
     threadgroup half staged_v[StageRows * Dim];
@@ -81,35 +91,38 @@ constexpr const char* TURBO4_MTP_VERIFY_PARTIAL_SOURCE = R"(
     uint block_tokens = tk > block
         ? ((tk - 1u - block) / (uint)Blocks + 1u)
         : 0u;
-    uint threads = 32u * (uint)RepeatCount * (uint)QRows;
+    uint threads = 32u * GroupCount * (uint)QRows;
     for (uint base = 0; base < block_tokens; base += StageRows) {
         uint stage_rows = min(StageRows, block_tokens - base);
-        uint packed_chunks = packed_width / 4u;
+        uint packed_chunks = packed_width / 16u;
         uint stage_chunks = stage_rows * packed_chunks;
         for (uint chunk = tid; chunk < stage_chunks; chunk += threads) {
             uint rr = chunk / packed_chunks;
-            uint packed_col = (chunk - rr * packed_chunks) * 4u;
+            uint packed_col = (chunk - rr * packed_chunks) * 16u;
             uint t = block + (base + rr) * (uint)Blocks;
             uint packed_base = (bh * tk + t) * packed_width;
             uint sidecar = bh * tk + t;
             float k_scale = (float)k_rescale[sidecar];
             float v_scale = (float)v_rescale[sidecar];
-            uchar4 k_bytes = *((device const uchar4 *)(
-                k_packed + packed_base + packed_col));
-            uchar4 v_bytes = *((device const uchar4 *)(
-                v_packed + packed_base + packed_col));
-            for (uint c = 0; c < 4u; c++) {
-                uint k_byte = (uint)k_bytes[c];
-                uint v_byte = (uint)v_bytes[c];
-                uint d = (packed_col + c) * 2u;
-                half2 k_pair = half2(
-                    codebook[k_byte & 0x0fu] * k_scale,
-                    codebook[(k_byte >> 4u) & 0x0fu] * k_scale);
-                half2 v_pair = half2(
-                    codebook[v_byte & 0x0fu] * v_scale,
-                    codebook[(v_byte >> 4u) & 0x0fu] * v_scale);
-                *((threadgroup half2 *)(staged_k + rr * dim + d)) = k_pair;
-                *((threadgroup half2 *)(staged_v + rr * dim + d)) = v_pair;
+            for (uint part = 0; part < 4u; part++) {
+                uint part_col = packed_col + part * 4u;
+                uchar4 k_bytes = *((device const uchar4 *)(
+                    k_packed + packed_base + part_col));
+                uchar4 v_bytes = *((device const uchar4 *)(
+                    v_packed + packed_base + part_col));
+                for (uint c = 0; c < 4u; c++) {
+                    uint k_byte = (uint)k_bytes[c];
+                    uint v_byte = (uint)v_bytes[c];
+                    uint d = (part_col + c) * 2u;
+                    half2 k_pair = half2(
+                        codebook[k_byte & 0x0fu] * k_scale,
+                        codebook[(k_byte >> 4u) & 0x0fu] * k_scale);
+                    half2 v_pair = half2(
+                        codebook[v_byte & 0x0fu] * v_scale,
+                        codebook[(v_byte >> 4u) & 0x0fu] * v_scale);
+                    *((threadgroup half2 *)(staged_k + rr * dim + d)) = k_pair;
+                    *((threadgroup half2 *)(staged_v + rr * dim + d)) = v_pair;
+                }
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -121,35 +134,47 @@ constexpr const char* TURBO4_MTP_VERIFY_PARTIAL_SOURCE = R"(
             }
             threadgroup const half *k_row = staged_k + rr * dim;
             threadgroup const half *v_row = staged_v + rr * dim;
-            float dot = 0.0f;
+            float dots[QueriesPerGroup];
             float v[DimsPerThread];
+            for (uint qi = 0; qi < (uint)QueriesPerGroup; qi++) {
+                dots[qi] = 0.0f;
+            }
             for (uint j = 0; j < dpt; j++) {
                 uint d = d0 + j;
-                dot += q[j] * (float)k_row[d];
+                float k_value = (float)k_row[d];
                 v[j] = (float)v_row[d];
+                for (uint qi = 0; qi < (uint)QueriesPerGroup; qi++) {
+                    dots[qi] += q[qi][j] * k_value;
+                }
             }
-            float score = simd_sum(dot);
-            float next_max = fmax(max_score, score);
-            float correction = fast::exp2(max_score - next_max);
-            float probability = fast::exp2(score - next_max);
-            sum_score = sum_score * correction + probability;
-            for (uint j = 0; j < dpt; j++) {
-                out[j] = out[j] * correction + probability * v[j];
+            for (uint qi = 0; qi < (uint)QueriesPerGroup; qi++) {
+                float score = simd_sum(dots[qi]);
+                float next_max = fmax(max_score[qi], score);
+                float correction = fast::exp2(max_score[qi] - next_max);
+                float probability = fast::exp2(score - next_max);
+                sum_score[qi] =
+                    sum_score[qi] * correction + probability;
+                for (uint j = 0; j < dpt; j++) {
+                    out[qi][j] =
+                        out[qi][j] * correction + probability * v[j];
+                }
+                max_score[qi] = next_max;
             }
-            max_score = next_max;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    uint partial_row = row * (uint)Blocks + block;
-    if (lane == 0u) {
-        partial_sums[partial_row] = sum_score;
-        partial_maxs[partial_row] = max_score;
-    }
-    for (uint j = 0; j < dpt; j++) {
-        uint d = d0 + j;
-        if (d < dim) {
-            partial_acc[partial_row * dim + d] = out[j];
+    for (uint qi = 0; qi < (uint)QueriesPerGroup; qi++) {
+        uint partial_row = rows[qi] * (uint)Blocks + block;
+        if (lane == 0u) {
+            partial_sums[partial_row] = sum_score[qi];
+            partial_maxs[partial_row] = max_score[qi];
+        }
+        for (uint j = 0; j < dpt; j++) {
+            uint d = d0 + j;
+            if (d < dim) {
+                partial_acc[partial_row * dim + d] = out[qi][j];
+            }
         }
     }
 )";
@@ -369,6 +394,8 @@ mlx::core::array turbo4_attention(
     const int hkv = k_shape[1];
     const int tk = k_shape[2];
     const int repeats = hq / hkv;
+    const int queries_per_group = repeats % 2 == 0 ? 2 : 1;
+    const int groups = repeats / queries_per_group;
     const int dims_per_thread = dim / SIMD_WIDTH;
     const int blocks = mtp_verify_blocks(tk);
     const int rows = batch * hq * tq;
@@ -378,6 +405,7 @@ mlx::core::array turbo4_attention(
         {"Dim", dim},
         {"DimsPerThread", dims_per_thread},
         {"RepeatCount", repeats},
+        {"QueriesPerGroup", queries_per_group},
         {"QRows", tq},
         {"Blocks", blocks},
         {"QType", q_rot.dtype()},
@@ -389,8 +417,8 @@ mlx::core::array turbo4_attention(
         {q_rot, k_packed, k_rescale, v_packed, v_rescale, codebook, scale_array},
         {Shape{rows * blocks, dim}, Shape{rows * blocks}, Shape{rows * blocks}},
         {mlx::core::float16, mlx::core::float32, mlx::core::float32},
-        std::make_tuple(hkv * SIMD_WIDTH, batch * repeats, blocks * tq),
-        std::make_tuple(SIMD_WIDTH, repeats, tq),
+        std::make_tuple(hkv * SIMD_WIDTH, batch * groups, blocks * tq),
+        std::make_tuple(SIMD_WIDTH, groups, tq),
         partial_template_args,
         std::nullopt,
         false,
