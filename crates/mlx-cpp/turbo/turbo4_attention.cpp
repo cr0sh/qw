@@ -84,26 +84,33 @@ constexpr const char* TURBO4_MTP_VERIFY_PARTIAL_SOURCE = R"(
     uint threads = 32u * (uint)RepeatCount * (uint)QRows;
     for (uint base = 0; base < block_tokens; base += StageRows) {
         uint stage_rows = min(StageRows, block_tokens - base);
-        uint stage_bytes = stage_rows * packed_width;
-        for (uint off = tid; off < stage_bytes; off += threads) {
-            uint rr = off / packed_width;
-            uint packed_col = off - rr * packed_width;
+        uint packed_chunks = packed_width / 4u;
+        uint stage_chunks = stage_rows * packed_chunks;
+        for (uint chunk = tid; chunk < stage_chunks; chunk += threads) {
+            uint rr = chunk / packed_chunks;
+            uint packed_col = (chunk - rr * packed_chunks) * 4u;
             uint t = block + (base + rr) * (uint)Blocks;
             uint packed_base = (bh * tk + t) * packed_width;
             uint sidecar = bh * tk + t;
             float k_scale = (float)k_rescale[sidecar];
             float v_scale = (float)v_rescale[sidecar];
-            uint k_byte = (uint)k_packed[packed_base + packed_col];
-            uint v_byte = (uint)v_packed[packed_base + packed_col];
-            uint d = packed_col * 2u;
-            half2 k_pair = half2(
-                codebook[k_byte & 0x0fu] * k_scale,
-                codebook[(k_byte >> 4u) & 0x0fu] * k_scale);
-            half2 v_pair = half2(
-                codebook[v_byte & 0x0fu] * v_scale,
-                codebook[(v_byte >> 4u) & 0x0fu] * v_scale);
-            *((threadgroup half2 *)(staged_k + rr * dim + d)) = k_pair;
-            *((threadgroup half2 *)(staged_v + rr * dim + d)) = v_pair;
+            uchar4 k_bytes = *((device const uchar4 *)(
+                k_packed + packed_base + packed_col));
+            uchar4 v_bytes = *((device const uchar4 *)(
+                v_packed + packed_base + packed_col));
+            for (uint c = 0; c < 4u; c++) {
+                uint k_byte = (uint)k_bytes[c];
+                uint v_byte = (uint)v_bytes[c];
+                uint d = (packed_col + c) * 2u;
+                half2 k_pair = half2(
+                    codebook[k_byte & 0x0fu] * k_scale,
+                    codebook[(k_byte >> 4u) & 0x0fu] * k_scale);
+                half2 v_pair = half2(
+                    codebook[v_byte & 0x0fu] * v_scale,
+                    codebook[(v_byte >> 4u) & 0x0fu] * v_scale);
+                *((threadgroup half2 *)(staged_k + rr * dim + d)) = k_pair;
+                *((threadgroup half2 *)(staged_v + rr * dim + d)) = v_pair;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
