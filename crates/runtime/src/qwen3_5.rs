@@ -28,9 +28,7 @@ use crate::qwen3_vl_vision::{Qwen3VLVisionConfig, Qwen3VLVisionEncoder};
 use anyhow::{Context, Result, ensure};
 use mlxcel_core::cache::{KVCacheMode, SequenceId};
 use mlxcel_core::generate::{LanguageModel, ModelStateSnapshot};
-use mlxcel_core::layers::{
-    KVCache, QuantizedWeight, RMSNorm, UnifiedEmbedding, UnifiedLinear,
-};
+use mlxcel_core::layers::{KVCache, QuantizedWeight, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::utils::silu;
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr, concatenate};
@@ -784,7 +782,10 @@ impl Qwen35DecoderLayer {
             (Qwen35AttentionVariant::Linear(attention), Qwen3NextCache::Linear(cache)) => {
                 (attention.forward(&normed, None, Some(cache)), None)
             }
-            (Qwen35AttentionVariant::FullAttention(attention), Qwen3NextCache::Attention(cache)) => {
+            (
+                Qwen35AttentionVariant::FullAttention(attention),
+                Qwen3NextCache::Attention(cache),
+            ) => {
                 let (output, query) =
                     attention.forward_with_query_capture(&normed, cache, None, None);
                 (output, Some(query))
@@ -912,17 +913,8 @@ impl Qwen35DecoderLayer {
 }
 
 // Qwen3.5 Model.
-// The 27B Qwen3.5 target uses 4 GiB of FP16 K/V at this boundary. Keeping
-// 64k native avoids the much slower compressed-attention path; longer contexts
-// still transition to bounded Turbo4 storage.
-const MTP_FP16_TARGET_MAX_TOKENS: i32 = 65_536;
-
-fn mtp_target_cache_mode(has_mtp: bool, requested: KVCacheMode) -> KVCacheMode {
-    if has_mtp && requested == KVCacheMode::Turbo4 {
-        KVCacheMode::Fp16
-    } else {
-        requested
-    }
+fn mtp_target_cache_mode(requested: KVCacheMode) -> KVCacheMode {
+    requested
 }
 
 pub struct Qwen35Model {
@@ -935,7 +927,6 @@ pub struct Qwen35Model {
     pub(crate) config: Qwen35Config,
     mtp: Option<Qwen35MtpDraftModel>,
     kv_cache_mode: KVCacheMode,
-    bounded_mtp_fp16: bool,
     vision: Option<Qwen3VLVisionEncoder>,
     /// Model-owned heterogeneous cache state used by one synchronous sequence.
     sequence_state: ModelOwnedSequenceState<Qwen3NextCache>,
@@ -1039,16 +1030,11 @@ impl Qwen35Model {
     fn make_internal_caches(&self) -> Vec<Qwen3NextCache> {
         self.layers
             .iter()
-            .enumerate()
-            .map(|(index, layer)| {
+            .map(|layer| {
                 if layer.is_linear {
                     Qwen3NextCache::Linear(GatedDeltaCache::new())
                 } else {
-                    let mut cache = KVCache::new_with_mode(self.kv_cache_mode);
-                    if self.bounded_mtp_fp16 && index >= 48 {
-                        cache.enable_fp16_v_quantization_on_write();
-                    }
-                    Qwen3NextCache::Attention(Box::new(cache))
+                    Qwen3NextCache::Attention(Box::new(KVCache::new_with_mode(self.kv_cache_mode)))
                 }
             })
             .collect()
@@ -1106,22 +1092,6 @@ impl Qwen35Model {
     pub(crate) fn mtp(&self) -> Option<&Qwen35MtpDraftModel> {
         self.mtp.as_ref()
     }
-    fn enforce_mtp_cache_bound(&self, projected_tokens: i32) {
-        if !self.bounded_mtp_fp16 || projected_tokens <= MTP_FP16_TARGET_MAX_TOKENS {
-            return;
-        }
-        self.sequence_state.with_internal(|caches| {
-            for cache in caches {
-                if let Qwen3NextCache::Attention(cache) = cache {
-                    if cache.offset == 0 {
-                        cache.mode = KVCacheMode::Turbo4;
-                    } else {
-                        cache.demote_fp16_to_turbo4();
-                    }
-                }
-            }
-        });
-    }
 
     pub(crate) fn forward_mtp_prefill_chunks<F>(
         &self,
@@ -1148,7 +1118,6 @@ impl Qwen35Model {
                 .unwrap_or(prompt_len as usize) as i32;
         let mut final_chunk = None;
         let mut final_logits = None;
-        self.enforce_mtp_cache_bound(prompt_len);
         let mut start = 0;
         while start < prompt_len {
             let end = (start + chunk_len).min(prompt_len);
@@ -1219,10 +1188,6 @@ impl Qwen35Model {
         if suffix_len == 0 {
             return Err("MTP suffix prefill requires at least one token".to_string());
         }
-        let cached_len = self
-            .sequence_state
-            .with_internal(|caches| caches.first().map(Qwen3NextCache::offset).unwrap_or(0));
-        self.enforce_mtp_cache_bound(cached_len + suffix_len);
         let configured = mlxcel_core::generate::prefill_chunk_len();
         let chunk_len =
             mlxcel_core::generate::effective_prefill_chunk(configured, true, suffix_len as usize)
@@ -1267,11 +1232,6 @@ impl Qwen35Model {
         input_ids: &MlxArray,
         compact_logits: bool,
     ) -> Qwen35MtpVerifyOutput {
-        let input_len = mlxcel_core::array_shape(input_ids)[1];
-        let projected = self.sequence_state.with_internal(|caches| {
-            caches.first().map(Qwen3NextCache::offset).unwrap_or(0) + input_len
-        });
-        self.enforce_mtp_cache_bound(projected);
         let rope_delta = self.mrope_state.rope_delta();
         let (output, offset) = self.sequence_state.with_internal(|caches| {
             let mut hidden = self.embed_tokens.forward(input_ids);
@@ -1325,11 +1285,6 @@ impl Qwen35Model {
         target_layer_ids: &[usize],
         compact_logits: bool,
     ) -> Qwen35DflashVerifyOutput {
-        let input_len = mlxcel_core::array_shape(input_ids)[1];
-        let projected = self.sequence_state.with_internal(|caches| {
-            caches.first().map(Qwen3NextCache::offset).unwrap_or(0) + input_len
-        });
-        self.enforce_mtp_cache_bound(projected);
         let rope_delta = self.mrope_state.rope_delta();
         let (output, offset) = self.sequence_state.with_internal(|caches| {
             let mut hidden = self.embed_tokens.forward(input_ids);
@@ -1398,7 +1353,6 @@ impl Qwen35Model {
         let chunk_len =
             mlxcel_core::generate::effective_prefill_chunk(configured, true, prompt_len as usize)
                 .unwrap_or(prompt_len as usize) as i32;
-        self.enforce_mtp_cache_bound(prompt_len);
         // One captured hidden buffer per target layer, kept under `hidden_limit`
         // rows.
         let mut layer_hiddens: Vec<Option<UniquePtr<MlxArray>>> =
@@ -1824,11 +1778,10 @@ impl Qwen35Model {
             model_dir.display()
         );
         let weights = sanitize_language_model_weights(weights, &config, model_dir)?;
-        let target_cache_mode = mtp_target_cache_mode(weights.mtp.is_some(), kv_cache_mode);
+        let target_cache_mode = mtp_target_cache_mode(kv_cache_mode);
         tracing::info!(
             requested_cache_mode = ?kv_cache_mode,
             effective_target_cache_mode = ?target_cache_mode,
-            mtp_fp16_target_cap_tokens = MTP_FP16_TARGET_MAX_TOKENS,
             "selected Qwen3.5 target cache policy"
         );
         let mut model = Self::from_weights(&weights.target, &config, target_cache_mode)
@@ -1839,7 +1792,6 @@ impl Qwen35Model {
                     model_dir.display()
                 )
             })?;
-        model.bounded_mtp_fp16 = weights.mtp.is_some() && kv_cache_mode == KVCacheMode::Turbo4;
         model
             .sequence_state
             .replace_internal(model.make_internal_caches());
@@ -1898,9 +1850,8 @@ impl Qwen35Model {
                 && config.num_key_value_heads == 2
                 && config.vocab_size == 248_320
                 && config.max_position_embeddings == 262_144
-                && quantization.is_some_and(|q| {
-                    q.mode == "affine" && q.bits == 8 && q.group_size == 64
-                }),
+                && quantization
+                    .is_some_and(|q| { q.mode == "affine" && q.bits == 8 && q.group_size == 64 }),
             "checkpoint {} does not match pinned SpecPrefill draft architecture {}",
             model_dir.display(),
             SPECPREFILL_DRAFT_MODEL_IDENTIFIER
@@ -1946,16 +1897,19 @@ impl Qwen35Model {
     }
 
     #[cfg(any(feature = "specprefill", test))]
-    pub(crate) fn specprefill_draft_prefill(&self, prompt_ids: &[i32]) -> Result<UniquePtr<MlxArray>> {
-        ensure!(!prompt_ids.is_empty(), "SpecPrefill draft prompt must not be empty");
+    pub(crate) fn specprefill_draft_prefill(
+        &self,
+        prompt_ids: &[i32],
+    ) -> Result<UniquePtr<MlxArray>> {
+        ensure!(
+            !prompt_ids.is_empty(),
+            "SpecPrefill draft prompt must not be empty"
+        );
         self.reset_runtime_state();
         let configured = mlxcel_core::generate::prefill_chunk_len();
-        let chunk_len = mlxcel_core::generate::effective_prefill_chunk(
-            configured,
-            true,
-            prompt_ids.len(),
-        )
-        .unwrap_or(prompt_ids.len());
+        let chunk_len =
+            mlxcel_core::generate::effective_prefill_chunk(configured, true, prompt_ids.len())
+                .unwrap_or(prompt_ids.len());
         let mut final_logits = None;
         for (chunk_index, chunk) in prompt_ids.chunks(chunk_len).enumerate() {
             let input = mlxcel_core::from_slice_i32(chunk, &[1, chunk.len() as i32]);
@@ -1965,11 +1919,8 @@ impl Qwen35Model {
             if (chunk_index + 1) * chunk_len >= prompt_ids.len() {
                 let shape = mlxcel_core::array_shape(&hidden);
                 let last = shape[1] - 1;
-                let last_hidden = mlxcel_core::slice(
-                    &hidden,
-                    &[0, last, 0],
-                    &[shape[0], last + 1, shape[2]],
-                );
+                let last_hidden =
+                    mlxcel_core::slice(&hidden, &[0, last, 0], &[shape[0], last + 1, shape[2]]);
                 final_logits = Some(self.project_logits(&self.norm.forward(&last_hidden)));
             }
         }
@@ -1984,7 +1935,8 @@ impl Qwen35Model {
         let input = mlxcel_core::from_slice_i32(&[token_id], &[1, 1]);
         self.sequence_state.with_internal(|caches| {
             let mut hidden = self.embed_tokens.forward(&input);
-            let mut queries = Vec::with_capacity(self.layers.len() / self.config.full_attention_interval);
+            let mut queries =
+                Vec::with_capacity(self.layers.len() / self.config.full_attention_interval);
             for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
                 let (next, query) = layer.forward_with_query_capture(&hidden, cache);
                 hidden = next;
@@ -2069,8 +2021,7 @@ impl Qwen35Model {
                 .chain(&one_axis_positions)
                 .copied()
                 .collect::<Vec<_>>();
-            let input =
-                mlxcel_core::from_slice_i32(&sparse_ids, &[1, sparse_ids.len() as i32]);
+            let input = mlxcel_core::from_slice_i32(&sparse_ids, &[1, sparse_ids.len() as i32]);
             let position_ids =
                 mlxcel_core::from_slice_i32(&positions, &[3, 1, sparse_ids.len() as i32]);
             final_hidden = Some(self.sequence_state.with_internal(|caches| {
@@ -2080,11 +2031,8 @@ impl Qwen35Model {
         let hidden = final_hidden.expect("non-empty SpecPrefill selection produces hidden states");
         let shape = mlxcel_core::array_shape(&hidden);
         let last = shape[1] - 1;
-        let last_hidden = mlxcel_core::slice(
-            &hidden,
-            &[0, last, 0],
-            &[shape[0], last + 1, shape[2]],
-        );
+        let last_hidden =
+            mlxcel_core::slice(&hidden, &[0, last, 0], &[shape[0], last + 1, shape[2]]);
         Ok((
             self.project_logits(&self.norm.forward(&last_hidden)),
             cached_tokens,
@@ -2099,8 +2047,7 @@ impl Qwen35Model {
     ) -> UniquePtr<MlxArray> {
         let input = mlxcel_core::from_slice_i32(&[token_id], &[1, 1]);
         let position = i32::try_from(logical_position).unwrap_or(i32::MAX);
-        let position_ids =
-            mlxcel_core::from_slice_i32(&[position, position, position], &[3, 1, 1]);
+        let position_ids = mlxcel_core::from_slice_i32(&[position, position, position], &[3, 1, 1]);
         let hidden = self.sequence_state.with_internal(|caches| {
             self.forward_backbone_with_inputs(&input, None, caches, Some(&position_ids))
         });
@@ -2172,7 +2119,6 @@ impl Qwen35Model {
             config: config.clone(),
             kv_cache_mode,
             mtp: None,
-            bounded_mtp_fp16: false,
             vision: None,
             sequence_state: ModelOwnedSequenceState::new(internal_caches),
             mrope_state: MRopeState::new(),
@@ -2455,6 +2401,8 @@ fn sanitize_mtp_weights(mut weights: WeightMap, raw_layout: bool) -> WeightMap {
 }
 
 const QWEN35_SNAPSHOT_FAMILY: &str = "qwen3.5-target-v1";
+const QWEN35_TURBO4_SNAPSHOT_SUFFIXES: [&str; 5] =
+    ["k_packed", "k_rescale", "v_packed", "v_norms", "v_rescale"];
 
 fn snapshot_i32(snapshot: &ModelStateSnapshot, name: &str) -> std::result::Result<i32, String> {
     let value = snapshot
@@ -2471,28 +2419,16 @@ fn push_snapshot_i32(snapshot: &mut ModelStateSnapshot, name: &str, value: i32) 
     snapshot.push_tensor(name, &array);
 }
 
-fn snapshot_cache_mode(value: i32) -> std::result::Result<KVCacheMode, String> {
-    match value {
-        0 => Ok(KVCacheMode::Fp16),
-        1 => Ok(KVCacheMode::Turbo4),
-        _ => Err("Qwen3.5 snapshot contains an unsupported adaptive cache mode".to_string()),
-    }
-}
-
 fn validate_snapshot_tensor_names(
     snapshot: &ModelStateSnapshot,
     layers: &[Qwen35DecoderLayer],
     kv_cache_mode: KVCacheMode,
-    bounded_mtp_fp16: bool,
 ) -> std::result::Result<(), String> {
     let mut expected = BTreeSet::from([
         "meta.layer_count".to_string(),
         "mrope.position".to_string(),
         "mrope.rope_delta".to_string(),
     ]);
-    if bounded_mtp_fp16 {
-        expected.insert("meta.adaptive_mtp_cache".to_string());
-    }
     if snapshot.tensor("mrope.position_ids").is_some() {
         expected.insert("mrope.position_ids".to_string());
     }
@@ -2504,15 +2440,8 @@ fn validate_snapshot_tensor_names(
             expected.insert(format!("layer.{index}.state_cache"));
             continue;
         }
-        let mode = if bounded_mtp_fp16 {
-            let name = format!("layer.{index}.mode");
-            expected.insert(name.clone());
-            snapshot_cache_mode(snapshot_i32(snapshot, &name)?)?
-        } else {
-            kv_cache_mode
-        };
-        if mode == KVCacheMode::Turbo4 {
-            for suffix in ["k_packed", "k_norms", "v_packed", "v_norms", "v_rescale"] {
+        if kv_cache_mode == KVCacheMode::Turbo4 {
+            for suffix in QWEN35_TURBO4_SNAPSHOT_SUFFIXES {
                 expected.insert(format!("layer.{index}.{suffix}"));
             }
         } else {
@@ -2660,9 +2589,6 @@ impl LanguageModel for Qwen35Model {
             "meta.layer_count",
             i32::try_from(self.layers.len()).ok()?,
         );
-        if self.bounded_mtp_fp16 {
-            push_snapshot_i32(&mut snapshot, "meta.adaptive_mtp_cache", 1);
-        }
         push_snapshot_i32(&mut snapshot, "mrope.position", self.mrope_state.position());
         push_snapshot_i32(
             &mut snapshot,
@@ -2695,21 +2621,17 @@ impl LanguageModel for Qwen35Model {
                 );
                 match cache {
                     Qwen3NextCache::Attention(cache) => {
-                        if self.bounded_mtp_fp16 {
-                            let mode = match cache.mode {
-                                KVCacheMode::Fp16 => 0,
-                                KVCacheMode::Turbo4 => 1,
-                                _ => return false,
-                            };
-                            push_snapshot_i32(&mut snapshot, &format!("layer.{index}.mode"), mode);
+                        if cache.mode != self.kv_cache_mode {
+                            return false;
                         }
-                        if cache.mode == KVCacheMode::Turbo4 {
+                        if self.kv_cache_mode == KVCacheMode::Turbo4 {
                             let Some(tensors) = cache.turbo4_snapshot_tensors() else {
                                 return false;
                             };
                             snapshot
                                 .push_tensor(format!("layer.{index}.k_packed"), tensors.k_packed);
-                            snapshot.push_tensor(format!("layer.{index}.k_norms"), tensors.k_norms);
+                            snapshot
+                                .push_tensor(format!("layer.{index}.k_rescale"), tensors.k_rescale);
                             snapshot
                                 .push_tensor(format!("layer.{index}.v_packed"), tensors.v_packed);
                             snapshot.push_tensor(format!("layer.{index}.v_norms"), tensors.v_norms);
@@ -2759,15 +2681,7 @@ impl LanguageModel for Qwen35Model {
         {
             return Err("Qwen3.5 snapshot layer count does not match the loaded model".to_string());
         }
-        if self.bounded_mtp_fp16 && snapshot_i32(snapshot, "meta.adaptive_mtp_cache")? != 1 {
-            return Err("Qwen3.5 snapshot adaptive cache policy mismatch".to_string());
-        }
-        validate_snapshot_tensor_names(
-            snapshot,
-            &self.layers,
-            self.kv_cache_mode,
-            self.bounded_mtp_fp16,
-        )?;
+        validate_snapshot_tensor_names(snapshot, &self.layers, self.kv_cache_mode)?;
 
         let mut restored = Vec::with_capacity(self.layers.len());
         for (index, layer) in self.layers.iter().enumerate() {
@@ -2803,12 +2717,7 @@ impl LanguageModel for Qwen35Model {
                     state_cache: Some(mlxcel_core::copy(state_cache)),
                     offset: token_len,
                 }));
-            } else if (if self.bounded_mtp_fp16 {
-                snapshot_cache_mode(snapshot_i32(snapshot, &format!("layer.{index}.mode"))?)?
-            } else {
-                self.kv_cache_mode
-            }) == KVCacheMode::Turbo4
-            {
+            } else if self.kv_cache_mode == KVCacheMode::Turbo4 {
                 let tensor = |suffix: &str| {
                     snapshot
                         .tensor(&format!("layer.{index}.{suffix}"))
@@ -2821,7 +2730,7 @@ impl LanguageModel for Qwen35Model {
                 cache.restore_turbo4_snapshot(
                     token_len,
                     tensor("k_packed")?,
-                    tensor("k_norms")?,
+                    tensor("k_rescale")?,
                     tensor("v_packed")?,
                     tensor("v_norms")?,
                     tensor("v_rescale")?,
@@ -2845,18 +2754,10 @@ impl LanguageModel for Qwen35Model {
                         "Qwen3.5 snapshot layer {index} attention cache layout mismatch"
                     ));
                 }
-                let mode = if self.bounded_mtp_fp16 {
-                    snapshot_cache_mode(snapshot_i32(snapshot, &format!("layer.{index}.mode"))?)?
-                } else {
-                    self.kv_cache_mode
-                };
-                let mut cache = KVCache::new_with_mode(mode);
+                let mut cache = KVCache::new_with_mode(self.kv_cache_mode);
                 cache.keys = Some(mlxcel_core::copy(keys));
                 cache.values = Some(mlxcel_core::copy(values));
                 cache.offset = token_len;
-                if self.bounded_mtp_fp16 && index >= 48 {
-                    cache.enable_fp16_v_quantization_on_write();
-                }
                 restored.push(Qwen3NextCache::Attention(Box::new(cache)));
             }
         }
@@ -2931,38 +2832,33 @@ mod tests {
     }
 
     #[test]
-    fn bundled_mtp_uses_bounded_native_target_cache() {
+    fn bundled_mtp_preserves_requested_target_cache_mode() {
         assert_eq!(
-            mtp_target_cache_mode(true, KVCacheMode::Turbo4),
-            KVCacheMode::Fp16
-        );
-        assert_eq!(
-            mtp_target_cache_mode(false, KVCacheMode::Turbo4),
+            mtp_target_cache_mode(KVCacheMode::Turbo4),
             KVCacheMode::Turbo4
         );
+        assert_eq!(mtp_target_cache_mode(KVCacheMode::Int8), KVCacheMode::Int8);
+    }
+
+    #[test]
+    fn turbo4_snapshot_uses_k_rescale_sidecar() {
         assert_eq!(
-            mtp_target_cache_mode(true, KVCacheMode::Int8),
-            KVCacheMode::Int8
+            QWEN35_TURBO4_SNAPSHOT_SUFFIXES,
+            ["k_packed", "k_rescale", "v_packed", "v_norms", "v_rescale"]
         );
     }
 
     #[test]
-    fn qwen35_mtp_fp16_cap_is_four_gibibytes() {
-        let bytes = 16_u64 * 4 * MTP_FP16_TARGET_MAX_TOKENS as u64 * 256 * 2 * 2;
-        assert_eq!(bytes, 4_u64 << 30);
-    }
+    fn removed_adaptive_snapshot_metadata_is_rejected() {
+        let mut snapshot = ModelStateSnapshot::new(QWEN35_SNAPSHOT_FAMILY, 0);
+        push_snapshot_i32(&mut snapshot, "meta.layer_count", 0);
+        push_snapshot_i32(&mut snapshot, "mrope.position", 0);
+        push_snapshot_i32(&mut snapshot, "mrope.rope_delta", i32::MIN);
+        push_snapshot_i32(&mut snapshot, "meta.adaptive_mtp_cache", 1);
 
-    #[test]
-    fn adaptive_snapshot_mode_round_trips_fp16_and_turbo4() {
-        for (encoded, expected) in [(0, KVCacheMode::Fp16), (1, KVCacheMode::Turbo4)] {
-            let mut snapshot = ModelStateSnapshot::new("test", 32_768);
-            push_snapshot_i32(&mut snapshot, "layer.0.mode", encoded);
-            let restored =
-                snapshot_cache_mode(snapshot_i32(&snapshot, "layer.0.mode").expect("mode field"))
-                    .expect("supported adaptive cache mode");
-            assert_eq!(restored, expected);
-        }
-        assert!(snapshot_cache_mode(2).is_err());
+        let error = validate_snapshot_tensor_names(&snapshot, &[], KVCacheMode::Turbo4)
+            .expect_err("removed adaptive metadata must not be accepted");
+        assert!(error.contains("tensor layout"));
     }
 
     fn insert_required_mtp_weights(weights: &mut WeightMap) {
@@ -3307,12 +3203,12 @@ mod tests {
 
     #[test]
     #[ignore = "requires the real dense Qwen3.5 checkpoint at QW_MODEL_PATH or the default model cache path"]
-    fn restored_mixed_target_snapshot_matches_uninterrupted_next_token_and_text() {
+    fn restored_turbo4_target_snapshot_matches_uninterrupted_next_token_and_text() {
         let model_dir = crate::resolve_model_path(None)
             .expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
         let tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
             .expect("load tokenizer");
-        let model = Qwen35Model::load(&model_dir, KVCacheMode::Fp16).expect("load Qwen3.5 model");
+        let model = Qwen35Model::load(&model_dir, KVCacheMode::Turbo4).expect("load Qwen3.5 model");
         let prompt = tokenizer
             .encode("Snapshot restore invariant", true)
             .expect("encode prompt");
@@ -3328,7 +3224,14 @@ mod tests {
         let first_id = mlxcel_core::item_i32(&first);
         let snapshot = model
             .snapshot_sequence_state(SequenceId::from_raw(7), prompt_ids.len())
-            .expect("capture complete mixed-state snapshot");
+            .expect("capture complete Turbo4 target snapshot");
+        assert!(
+            snapshot
+                .tensor_names()
+                .any(|name| name.ends_with(".k_rescale")),
+            "Turbo4 snapshot must serialize K rescale sidecars"
+        );
+        assert!(snapshot.tensor("meta.adaptive_mtp_cache").is_none());
 
         let first_array = mlxcel_core::from_slice_i32(&[first_id], &[1, 1]);
         let uninterrupted_logits = model.forward_last_logits(&first_array, &mut [], None, 0);
@@ -3339,7 +3242,7 @@ mod tests {
         model.reset_runtime_state();
         model
             .restore_sequence_state(SequenceId::from_raw(9), &snapshot)
-            .expect("restore complete mixed-state snapshot");
+            .expect("restore complete Turbo4 target snapshot");
         let restored_logits = model.forward_last_logits(&first_array, &mut [], None, 0);
         let restored = mlxcel_core::argmax_last_axis(&restored_logits);
         mlxcel_core::eval(&restored);

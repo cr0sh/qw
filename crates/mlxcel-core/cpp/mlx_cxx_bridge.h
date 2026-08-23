@@ -2030,6 +2030,18 @@ std::unique_ptr<MlxArray> fused_metal4_attention(
     bool use_metal4
 );
 
+// Direct symmetric-Turbo4 attention over packed K/V. Q and the returned FP32
+// tensor use the codec's rotated K and V bases respectively.
+std::unique_ptr<MlxArray> turbo4_attention(
+    const MlxArray& q_rot,
+    const MlxArray& k_packed,
+    const MlxArray& k_rescale,
+    const MlxArray& v_packed,
+    const MlxArray& v_rescale,
+    const MlxArray& codebook,
+    float scale,
+    bool causal);
+
 // Fused Sparse-V SDPA Metal kernel launcher.
 // Wraps `mlxcel::turbo::sparse_v_weighted_sum` so the cxx bridge can expose it
 // via the `turbo_sparse_v_weighted_sum` FFI symbol. Implementation lives in

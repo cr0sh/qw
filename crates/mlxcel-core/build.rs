@@ -75,6 +75,8 @@ fn main() {
         // FP16 cold body never materialises in global memory; the host
         // pairs this with a hot-V matmul to produce the final SDPA output.
         .file("../mlx-cpp/turbo/turbo4_delegated_sdpa.cpp")
+        // Direct symmetric-Turbo4 packed K/V attention kernels.
+        .file("../mlx-cpp/turbo/turbo4_attention.cpp")
         // Fused paged-attention decode kernel launcher (epic #116 Phase 6,
         // #123). Reads scattered KV blocks out of the global pool via a block
         // table with no separate gather copy; the gather-then-SDPA path stays
@@ -213,6 +215,8 @@ fn main() {
     // Turbo4Delegated cold-V fused weighted-sum kernel launcher.
     println!("cargo:rerun-if-changed=../mlx-cpp/turbo/turbo4_delegated_sdpa.h");
     println!("cargo:rerun-if-changed=../mlx-cpp/turbo/turbo4_delegated_sdpa.cpp");
+    println!("cargo:rerun-if-changed=../mlx-cpp/turbo/turbo4_attention.h");
+    println!("cargo:rerun-if-changed=../mlx-cpp/turbo/turbo4_attention.cpp");
     // Fused paged-attention decode kernel launcher (#123).
     println!("cargo:rerun-if-changed=../mlx-cpp/turbo/paged_attention.h");
     println!("cargo:rerun-if-changed=../mlx-cpp/turbo/paged_attention.cpp");

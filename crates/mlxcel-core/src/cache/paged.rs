@@ -350,7 +350,7 @@ pub(crate) struct PagedTurboPageSidecars {
     pub v_packed: HashMap<PagedBlockId, UniquePtr<MlxArray>>,
     pub v_norms: HashMap<PagedBlockId, UniquePtr<MlxArray>>,
     pub k_packed: HashMap<PagedBlockId, UniquePtr<MlxArray>>,
-    pub k_norms: HashMap<PagedBlockId, UniquePtr<MlxArray>>,
+    pub k_rescale: HashMap<PagedBlockId, UniquePtr<MlxArray>>,
     pub cold_keys: HashMap<PagedBlockId, UniquePtr<MlxArray>>,
 }
 
@@ -360,7 +360,7 @@ impl std::fmt::Debug for PagedTurboPageSidecars {
             .field("v_packed_pages", &self.v_packed.len())
             .field("v_norms_pages", &self.v_norms.len())
             .field("k_packed_pages", &self.k_packed.len())
-            .field("k_norms_pages", &self.k_norms.len())
+            .field("k_rescale_pages", &self.k_rescale.len())
             .field("cold_keys_pages", &self.cold_keys.len())
             .finish()
     }
@@ -375,7 +375,7 @@ impl PagedTurboPageSidecars {
         sum_map(&self.v_packed)
             + sum_map(&self.v_norms)
             + sum_map(&self.k_packed)
-            + sum_map(&self.k_norms)
+            + sum_map(&self.k_rescale)
             + sum_map(&self.cold_keys)
     }
 
@@ -384,7 +384,7 @@ impl PagedTurboPageSidecars {
         self.v_packed.remove(&block_id);
         self.v_norms.remove(&block_id);
         self.k_packed.remove(&block_id);
-        self.k_norms.remove(&block_id);
+        self.k_rescale.remove(&block_id);
         self.cold_keys.remove(&block_id);
     }
 }
@@ -420,7 +420,7 @@ struct PagedPoolMeta {
 /// until then the pool storage added here is exercised only by unit tests.
 ///
 /// In Turbo4 modes the pool also owns per-page sidecar MLX arrays (`v_packed`,
-/// `v_norms`, optionally `k_packed`, `k_norms`, `cold_keys`) so packed
+/// `v_norms`, optionally `k_packed`, `k_rescale`, `cold_keys`) so packed
 /// quantization state survives across detach/adopt round-trips and
 /// prefix-cache handoffs. INT8 quantization scales stay in the dense
 /// `DetachedKVCache` path; only the INT8 main K/V int-typed array flows
@@ -1137,22 +1137,22 @@ impl PagedBlockPool {
 
     /// Install or replace the per-page K-norms tensor for `block_id`
     /// (symmetric Turbo4 only).
-    pub fn install_k_norms(
+    pub fn install_k_rescale(
         &mut self,
         block_id: PagedBlockId,
-        k_norms: UniquePtr<MlxArray>,
+        k_rescale: UniquePtr<MlxArray>,
     ) -> Result<(), String> {
-        self.assert_turbo_mode("install_k_norms")?;
+        self.assert_turbo_mode("install_k_rescale")?;
         if self.layout.cache_mode != KVCacheMode::Turbo4 {
             return Err(format!(
-                "PagedBlockPool::install_k_norms: cache_mode {:?} does not store K norms",
+                "PagedBlockPool::install_k_rescale: cache_mode {:?} does not store K norms",
                 self.layout.cache_mode
             ));
         }
         if !self.blocks.contains_key(&block_id) {
             return Err(format!("PagedBlockPool: unknown block {block_id}"));
         }
-        self.turbo_sidecars.k_norms.insert(block_id, k_norms);
+        self.turbo_sidecars.k_rescale.insert(block_id, k_rescale);
         Ok(())
     }
 
@@ -1193,8 +1193,8 @@ impl PagedBlockPool {
     }
 
     /// Read-only access to the per-page K-norms tensor for `block_id`.
-    pub fn k_norms_for(&self, block_id: PagedBlockId) -> Option<&MlxArray> {
-        self.turbo_sidecars.k_norms.get(&block_id).map(|u| &**u)
+    pub fn k_rescale_for(&self, block_id: PagedBlockId) -> Option<&MlxArray> {
+        self.turbo_sidecars.k_rescale.get(&block_id).map(|u| &**u)
     }
 
     /// Read-only access to the per-page cold-K tensor for `block_id`.
@@ -1219,8 +1219,8 @@ impl PagedBlockPool {
     }
 
     /// Move the per-page K-norms tensor out of the pool.
-    pub fn take_k_norms(&mut self, block_id: PagedBlockId) -> Option<UniquePtr<MlxArray>> {
-        self.turbo_sidecars.k_norms.remove(&block_id)
+    pub fn take_k_rescale(&mut self, block_id: PagedBlockId) -> Option<UniquePtr<MlxArray>> {
+        self.turbo_sidecars.k_rescale.remove(&block_id)
     }
 
     /// Move the per-page cold-K tensor out of the pool.
@@ -1239,7 +1239,7 @@ impl PagedBlockPool {
         self.turbo_sidecars.v_packed.contains_key(&block_id)
             || self.turbo_sidecars.v_norms.contains_key(&block_id)
             || self.turbo_sidecars.k_packed.contains_key(&block_id)
-            || self.turbo_sidecars.k_norms.contains_key(&block_id)
+            || self.turbo_sidecars.k_rescale.contains_key(&block_id)
             || self.turbo_sidecars.cold_keys.contains_key(&block_id)
     }
 

@@ -1051,7 +1051,7 @@ pub fn attention_turbo4_delegated_fused(
 pub fn attention_turbo4_dequant_sdpa(
     q: &MlxArray,
     k_packed: &MlxArray,
-    k_norms: &MlxArray,
+    k_rescale: &MlxArray,
     v_packed: &MlxArray,
     v_rescale: &MlxArray,
     params: &TurboQuantParams,
@@ -1061,7 +1061,7 @@ pub fn attention_turbo4_dequant_sdpa(
 ) -> UniquePtr<MlxArray> {
     let q_rot_f32 = super::quant::turbo4_k_rotate(q, params);
     let q_rot = ffi::astype(&q_rot_f32, ffi::array_dtype(q));
-    let k_rot = super::quant::dequantize_k_turbo4_rotated(k_packed, k_norms, params);
+    let k_rot = super::quant::dequantize_k_turbo4_rotated(k_packed, k_rescale, params);
     let v_rot = dequantize_v_turbo4_rotated_for_sdpa(v_packed, v_rescale, params);
     let rot_out = if causal {
         crate::causal_attention(&q_rot, &k_rot, &v_rot, scale, 0.0, 0)

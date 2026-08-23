@@ -341,7 +341,7 @@ pub(crate) const TURBO_DEFAULT_SEED: u32 = 0x7B4_70404; // "TUR" 0x474 + B2 issu
 /// [`turbo::quant`]. The standard `values` field stays `None` in this mode.
 ///
 /// When `mode` is `KVCacheMode::Turbo4` (symmetric), the K
-/// buffers are *also* replaced by `k_packed` + `k_norms` sidecars; the
+/// buffers are *also* replaced by `k_packed` + `k_rescale` sidecars; the
 /// `keys` field stays `None`. The same `turbo_params` instance carries an
 /// independent K-side sign-vector pair so the K and V quantization noise
 /// is uncorrelated.
@@ -399,7 +399,7 @@ pub struct KVCache {
     // Turbo4-mode (symmetric) K-side packed indices: [B, H, L, head_dim/2] u8
     pub(crate) k_packed: Option<UniquePtr<MlxArray>>,
     // Turbo4-mode (symmetric) K-side per-token norms: [B, H, L, 1] fp16
-    pub(crate) k_norms: Option<UniquePtr<MlxArray>>,
+    pub(crate) k_rescale: Option<UniquePtr<MlxArray>>,
     /// Cached PolarQuant params (sign vectors + codebook) for Turbo4* modes
     /// (Turbo4Asym / Turbo4 symmetric / Turbo4Delegated).
     ///
@@ -467,12 +467,11 @@ pub struct KVCache {
 /// across an exact-prefix snapshot.
 pub struct Turbo4SnapshotTensors<'a> {
     pub k_packed: &'a MlxArray,
-    pub k_norms: &'a MlxArray,
+    pub k_rescale: &'a MlxArray,
     pub v_packed: &'a MlxArray,
     pub v_norms: &'a MlxArray,
     pub v_rescale: &'a MlxArray,
 }
-
 
 /// Shared handle that makes one [`KVCache`] write/read through a pooled paged
 /// KV store instead of its own dense buffers.
@@ -523,7 +522,7 @@ impl KVCache {
             v_norms: None,
             v_rescale: None,
             k_packed: None,
-            k_norms: None,
+            k_rescale: None,
             turbo_params: None,
             turbo3_params: None,
             turbo_seed: TURBO_DEFAULT_SEED,
@@ -572,7 +571,7 @@ impl KVCache {
             v_norms: None,
             v_rescale: None,
             k_packed: None,
-            k_norms: None,
+            k_rescale: None,
             turbo_params: None,
             turbo3_params: None,
             turbo_seed,
@@ -594,7 +593,7 @@ impl KVCache {
     pub fn turbo4_snapshot_tensors(&self) -> Option<Turbo4SnapshotTensors<'_>> {
         (self.mode == KVCacheMode::Turbo4).then_some(Turbo4SnapshotTensors {
             k_packed: self.k_packed.as_deref()?,
-            k_norms: self.k_norms.as_deref()?,
+            k_rescale: self.k_rescale.as_deref()?,
             v_packed: self.v_packed.as_deref()?,
             v_norms: self.v_norms.as_deref()?,
             v_rescale: self.v_rescale.as_deref()?,
@@ -607,7 +606,7 @@ impl KVCache {
         &mut self,
         offset: i32,
         k_packed: UniquePtr<MlxArray>,
-        k_norms: UniquePtr<MlxArray>,
+        k_rescale: UniquePtr<MlxArray>,
         v_packed: UniquePtr<MlxArray>,
         v_norms: UniquePtr<MlxArray>,
         v_rescale: UniquePtr<MlxArray>,
@@ -622,7 +621,7 @@ impl KVCache {
         }
         let tensors = [
             ("k_packed", k_packed.as_ref()),
-            ("k_norms", k_norms.as_ref()),
+            ("k_rescale", k_rescale.as_ref()),
             ("v_packed", v_packed.as_ref()),
             ("v_norms", v_norms.as_ref()),
             ("v_rescale", v_rescale.as_ref()),
@@ -639,7 +638,7 @@ impl KVCache {
         self.keys = None;
         self.values = None;
         self.k_packed = Some(k_packed);
-        self.k_norms = Some(k_norms);
+        self.k_rescale = Some(k_rescale);
         self.v_packed = Some(v_packed);
         self.v_norms = Some(v_norms);
         self.v_rescale = Some(v_rescale);
@@ -648,7 +647,6 @@ impl KVCache {
         self.turbo_params = None;
         Ok(())
     }
-
 
     /// Create a transparently pool-backed empty KV cache for one layer.
     ///
@@ -1447,7 +1445,7 @@ impl KVCache {
     ///
     /// Layout of stored buffers (step-aligned, grown lazily):
     /// - `k_packed`: `[B, H, capacity, K_dim/2]` UINT8 (K-side nibble-packed indices).
-    /// - `k_norms`:  `[B, H, capacity, 1]` FP16 (per-token L2 of original K).
+    /// - `k_rescale`:  `[B, H, capacity, 1]` FP16 (per-token L2 of original K).
     /// - `v_packed`: `[B, H, capacity, V_dim/2]` UINT8 (V-side nibble-packed indices).
     /// - `v_norms`:  `[B, H, capacity, 1]` FP16 (per-token L2 of original V).
     ///
@@ -1494,7 +1492,7 @@ impl KVCache {
             .as_ref()
             .expect("turbo_params just initialised");
 
-        let (k_packed_new, k_norms_new) = turbo::quant::quantize_k_turbo4(&new_keys_f16, params);
+        let (k_packed_new, k_rescale_new) = turbo::quant::quantize_k_turbo4(&new_keys_f16, params);
         let (v_packed_new, v_norms_new, v_rescale_new) =
             turbo::quant::quantize_v_turbo4(&new_values_f16, params);
 
@@ -1506,7 +1504,7 @@ impl KVCache {
 
         if prev == 0 && self.is_empty() && direct_prefill_cache_store_enabled() {
             self.k_packed = Some(ffi::contiguous(&k_packed_new, false));
-            self.k_norms = Some(ffi::contiguous(&k_norms_new, false));
+            self.k_rescale = Some(ffi::contiguous(&k_rescale_new, false));
             self.v_packed = Some(ffi::contiguous(&v_packed_new, false));
             self.v_norms = Some(ffi::contiguous(&v_norms_new, false));
             self.v_rescale = Some(ffi::contiguous(&v_rescale_new, false));
@@ -1536,8 +1534,8 @@ impl KVCache {
                         &[0, 0, 0, 0],
                         &[b, n_kv_heads, prev, k_packed_dim],
                     ));
-                    self.k_norms = Some(ffi::slice(
-                        self.k_norms.as_ref().unwrap(),
+                    self.k_rescale = Some(ffi::slice(
+                        self.k_rescale.as_ref().unwrap(),
                         &[0, 0, 0, 0],
                         &[b, n_kv_heads, prev, 1],
                     ));
@@ -1557,7 +1555,11 @@ impl KVCache {
                     }
                 }
                 self.k_packed = Some(concatenate(self.k_packed.as_ref().unwrap(), &new_kp_buf, 2));
-                self.k_norms = Some(concatenate(self.k_norms.as_ref().unwrap(), &new_kn_buf, 2));
+                self.k_rescale = Some(concatenate(
+                    self.k_rescale.as_ref().unwrap(),
+                    &new_kn_buf,
+                    2,
+                ));
                 self.v_packed = Some(concatenate(self.v_packed.as_ref().unwrap(), &new_vp_buf, 2));
                 self.v_norms = Some(concatenate(self.v_norms.as_ref().unwrap(), &new_vn_buf, 2));
                 self.v_rescale = match self.v_rescale.as_ref() {
@@ -1566,7 +1568,7 @@ impl KVCache {
                 };
             } else {
                 self.k_packed = Some(new_kp_buf);
-                self.k_norms = Some(new_kn_buf);
+                self.k_rescale = Some(new_kn_buf);
                 self.v_packed = Some(new_vp_buf);
                 self.v_norms = Some(new_vn_buf);
                 self.v_rescale = Some(new_vr_buf);
@@ -1576,7 +1578,7 @@ impl KVCache {
         self.offset += new_seq_len;
 
         let kp_shape = ffi::array_shape(self.k_packed.as_ref().unwrap());
-        let kn_shape = ffi::array_shape(self.k_norms.as_ref().unwrap());
+        let kn_shape = ffi::array_shape(self.k_rescale.as_ref().unwrap());
         let vp_shape = ffi::array_shape(self.v_packed.as_ref().unwrap());
         let vn_shape = ffi::array_shape(self.v_norms.as_ref().unwrap());
 
@@ -1586,9 +1588,9 @@ impl KVCache {
             &[0, 0, prev, 0],
             &[kp_shape[0], kp_shape[1], self.offset, kp_shape[3]],
         ));
-        self.k_norms = Some(ffi::slice_update(
-            self.k_norms.as_ref().unwrap(),
-            &k_norms_new,
+        self.k_rescale = Some(ffi::slice_update(
+            self.k_rescale.as_ref().unwrap(),
+            &k_rescale_new,
             &[0, 0, prev, 0],
             &[kn_shape[0], kn_shape[1], self.offset, 1],
         ));
@@ -2319,7 +2321,7 @@ impl KVCache {
             self.v_norms = None;
             self.v_rescale = None;
             self.k_packed = None;
-            self.k_norms = None;
+            self.k_rescale = None;
             self.cold_offset = 0;
             // Clear turbo_params so the next quantize call rebuilds it from
             // scratch (required if the caller reuses this cache slot with a
@@ -2482,9 +2484,9 @@ impl KVCache {
                         &[kp_shape[0], kp_shape[1], self.offset, kp_shape[3]],
                     ));
                 }
-                if let Some(ref kn) = self.k_norms {
+                if let Some(ref kn) = self.k_rescale {
                     let kn_shape = ffi::array_shape(kn);
-                    self.k_norms = Some(ffi::slice(
+                    self.k_rescale = Some(ffi::slice(
                         kn,
                         &[0, 0, 0, 0],
                         &[kn_shape[0], kn_shape[1], self.offset, 1],
@@ -2799,7 +2801,7 @@ impl KVCache {
             }
             KVCacheMode::Turbo4 => {
                 let kp = self.k_packed.as_ref().unwrap();
-                let kn = self.k_norms.as_ref().unwrap();
+                let kn = self.k_rescale.as_ref().unwrap();
                 let vp = self.v_packed.as_ref().unwrap();
                 let vn = self.v_norms.as_ref().unwrap();
                 let params = self
@@ -3095,7 +3097,7 @@ impl KVCache {
         let vn_bytes = self.v_norms.as_ref().map_or(0, |v| ffi::array_nbytes(v));
         let vr_bytes = self.v_rescale.as_ref().map_or(0, |v| ffi::array_nbytes(v));
         let kp_bytes = self.k_packed.as_ref().map_or(0, |v| ffi::array_nbytes(v));
-        let kn_bytes = self.k_norms.as_ref().map_or(0, |v| ffi::array_nbytes(v));
+        let kn_bytes = self.k_rescale.as_ref().map_or(0, |v| ffi::array_nbytes(v));
         // retired the earlier `cold_v_dequant_cache` memo: the
         // fused kernel reads packed cold V directly so there is no longer a
         // FP16 cold-V working set to count here.
@@ -3118,7 +3120,7 @@ impl KVCache {
     /// mirrors that pattern: it calls `ffi::eval` on every non-`None` tensor
     /// field that contributes to the cache state (`keys`, `values`,
     /// `key_scales`, `val_scales`, `v_packed`, `v_norms`, `v_rescale`,
-    /// `k_packed`, `k_norms`), then returns. Evaluating only the cache state
+    /// `k_packed`, `k_rescale`), then returns. Evaluating only the cache state
     /// avoids forcing the LM-head matmul (and the resulting peak allocation)
     /// that would follow from evaluating the full `[1, step, vocab_size]`
     /// logits tensor.
@@ -3149,7 +3151,7 @@ impl KVCache {
         if let Some(kp) = self.k_packed.as_ref() {
             ffi::eval(kp);
         }
-        if let Some(kn) = self.k_norms.as_ref() {
+        if let Some(kn) = self.k_rescale.as_ref() {
             ffi::eval(kn);
         }
     }
@@ -3171,7 +3173,7 @@ impl KVCache {
             self.v_norms.as_deref(),
             self.v_rescale.as_deref(),
             self.k_packed.as_deref(),
-            self.k_norms.as_deref(),
+            self.k_rescale.as_deref(),
         ]
         .into_iter()
         .flatten()
@@ -3424,8 +3426,8 @@ impl KVCache {
     /// Combined update + `Turbo4Asym` dequant-first native SDPA dispatch.
     ///
     /// This is the asymmetric analogue of
-    /// [`Self::update_and_turbo4_dequant_sdpa_attention`]: only the V side is
-    /// packed, so K is sliced from the FP16 `keys` buffer as-is and only V is
+    /// [`Self::update_and_turbo4_attention`]: only the V side is packed, so K
+    /// is sliced from the FP16 `keys` buffer as-is and only V is
     /// transiently dequantized into its rotated codec basis. Native SDPA runs
     /// against the FP16 K and the small output is inverse-rotated through the V
     /// basis (`rotate(SDPA(q,k,v)) == SDPA(q,k,rotate(v))`), skipping the
@@ -3516,23 +3518,9 @@ impl KVCache {
         )
     }
 
-    /// Returns `true` iff this cache can route symmetric `Turbo4` through the
-    /// Swift-LM-style dequant-first SDPA path.
-    pub fn turbo4_dequant_sdpa_available(&self) -> bool {
-        self.mode == KVCacheMode::Turbo4
-    }
-
-    /// Combined update + symmetric Turbo4 dequant-first SDPA dispatch.
-    ///
-    /// This mirrors `references/mlx-swift-lm`'s default compressed K/V route
-    /// for the Rust symmetric `Turbo4` mode: cache state stays packed, K/V are
-    /// transiently dequantized in their rotated codec bases for the current
-    /// attention call, Q is forward-rotated into the K basis, and only the
-    /// small output tensor is inverse-rotated through the V basis.
-    ///
-    /// Used by: model attention call sites when `mode == KVCacheMode::Turbo4`
-    /// and [`turbo::sparse_v::turbo4_dequant_sdpa_enabled`] is true.
-    pub fn update_and_turbo4_dequant_sdpa_attention(
+    /// Append symmetric Turbo4 K/V exactly once, prefer direct packed-cache
+    /// attention, and fall back to the permanent dequant-first oracle.
+    pub fn update_and_turbo4_attention(
         &mut self,
         q: &MlxArray,
         new_keys: UniquePtr<MlxArray>,
@@ -3540,36 +3528,37 @@ impl KVCache {
         scale: f32,
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        assert!(
-            self.turbo4_dequant_sdpa_available(),
-            "update_and_turbo4_dequant_sdpa_attention called on a cache that is not in \
-             Turbo4 mode (mode={:?})",
-            self.mode
+        assert_eq!(
+            self.mode,
+            KVCacheMode::Turbo4,
+            "update_and_turbo4_attention requires Turbo4 mode"
         );
         self.update(new_keys, new_values);
+        if mask.is_none()
+            && let Some(output) = self.turbo4_fused_attention_prefix(q, self.offset, scale, false)
+        {
+            return output;
+        }
         self.turbo4_dequant_sdpa_prefix(q, self.offset, scale, mask, false)
     }
 
-    /// Multi-token causal variant of the symmetric Turbo4 path.
-    ///
-    /// Packed K/V are dequantized in codec space and passed to MLX's native
-    /// causal SDPA metadata path. This preserves the query-to-key offset
-    /// implied by `q_len` and the updated cache length without allocating an
-    /// additive `T x T` mask.
-    pub fn update_and_turbo4_dequant_sdpa_causal_attention(
+    /// Multi-token bottom-right causal variant of symmetric Turbo4 attention.
+    pub fn update_and_turbo4_causal_attention(
         &mut self,
         q: &MlxArray,
         new_keys: UniquePtr<MlxArray>,
         new_values: UniquePtr<MlxArray>,
         scale: f32,
     ) -> UniquePtr<MlxArray> {
-        assert!(
-            self.turbo4_dequant_sdpa_available(),
-            "update_and_turbo4_dequant_sdpa_causal_attention called on a cache that is not in \
-             Turbo4 mode (mode={:?})",
-            self.mode
+        assert_eq!(
+            self.mode,
+            KVCacheMode::Turbo4,
+            "update_and_turbo4_causal_attention requires Turbo4 mode"
         );
         self.update(new_keys, new_values);
+        if let Some(output) = self.turbo4_fused_attention_prefix(q, self.offset, scale, true) {
+            return output;
+        }
         self.turbo4_dequant_sdpa_prefix(q, self.offset, scale, None, true)
     }
 
@@ -3589,6 +3578,51 @@ impl KVCache {
         true
     }
 
+    fn turbo4_fused_attention_prefix(
+        &self,
+        q: &MlxArray,
+        prefix_len: i32,
+        scale: f32,
+        causal: bool,
+    ) -> Option<UniquePtr<MlxArray>> {
+        let kp = self.k_packed.as_ref().expect("k_packed must exist");
+        let kr = self.k_rescale.as_ref().expect("k_rescale must exist");
+        let vp = self.v_packed.as_ref().expect("v_packed must exist");
+        let vr = self.v_rescale.as_ref().expect("v_rescale must exist");
+        let params = self
+            .turbo_params
+            .as_ref()
+            .expect("turbo_params must be initialised after first update_turbo4_sym");
+
+        let kp_shape = ffi::array_shape(kp);
+        let kr_shape = ffi::array_shape(kr);
+        let vp_shape = ffi::array_shape(vp);
+        let vr_shape = ffi::array_shape(vr);
+        let kp_slice = ffi::slice(
+            kp,
+            &[0, 0, 0, 0],
+            &[kp_shape[0], kp_shape[1], prefix_len, kp_shape[3]],
+        );
+        let kr_slice = ffi::slice(
+            kr,
+            &[0, 0, 0, 0],
+            &[kr_shape[0], kr_shape[1], prefix_len, 1],
+        );
+        let vp_slice = ffi::slice(
+            vp,
+            &[0, 0, 0, 0],
+            &[vp_shape[0], vp_shape[1], prefix_len, vp_shape[3]],
+        );
+        let vr_slice = ffi::slice(
+            vr,
+            &[0, 0, 0, 0],
+            &[vr_shape[0], vr_shape[1], prefix_len, 1],
+        );
+        turbo::fused_attention::attention_turbo4_fused(
+            q, &kp_slice, &kr_slice, &vp_slice, &vr_slice, params, scale, causal,
+        )
+    }
+
     fn turbo4_dequant_sdpa_prefix(
         &self,
         q: &MlxArray,
@@ -3598,7 +3632,7 @@ impl KVCache {
         causal: bool,
     ) -> UniquePtr<MlxArray> {
         let kp = self.k_packed.as_ref().expect("k_packed must exist");
-        let kn = self.k_norms.as_ref().expect("k_norms must exist");
+        let kr = self.k_rescale.as_ref().expect("k_rescale must exist");
         let vp = self.v_packed.as_ref().expect("v_packed must exist");
         let vr = self.v_rescale.as_ref().expect("v_rescale must exist");
         let params = self
@@ -3607,7 +3641,7 @@ impl KVCache {
             .expect("turbo_params must be initialised after first update_turbo4_sym");
 
         let kp_shape = ffi::array_shape(kp);
-        let kn_shape = ffi::array_shape(kn);
+        let kr_shape = ffi::array_shape(kr);
         let vp_shape = ffi::array_shape(vp);
         let vr_shape = ffi::array_shape(vr);
         let kp_slice = ffi::slice(
@@ -3615,10 +3649,10 @@ impl KVCache {
             &[0, 0, 0, 0],
             &[kp_shape[0], kp_shape[1], prefix_len, kp_shape[3]],
         );
-        let kn_slice = ffi::slice(
-            kn,
+        let kr_slice = ffi::slice(
+            kr,
             &[0, 0, 0, 0],
-            &[kn_shape[0], kn_shape[1], prefix_len, 1],
+            &[kr_shape[0], kr_shape[1], prefix_len, 1],
         );
         let vp_slice = ffi::slice(
             vp,
@@ -3632,7 +3666,7 @@ impl KVCache {
         );
 
         turbo::sparse_v::attention_turbo4_dequant_sdpa(
-            q, &kp_slice, &kn_slice, &vp_slice, &vr_slice, params, scale, mask, causal,
+            q, &kp_slice, &kr_slice, &vp_slice, &vr_slice, params, scale, mask, causal,
         )
     }
 

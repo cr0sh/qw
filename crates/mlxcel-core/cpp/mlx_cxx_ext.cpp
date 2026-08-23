@@ -5,6 +5,7 @@
 #include "mlx_cxx_internal.h"
 #include "sparse_v_sdpa.h"          // fused Sparse-V SDPA kernel.
 #include "turbo4_delegated_sdpa.h"  // fused Turbo4Delegated SDPA kernel.
+#include "turbo4_attention.h"       // direct symmetric-Turbo4 attention.
 #include "paged_attention.h"        // fused paged-attention decode kernel (#123).
 #include "paged_attention_v2.h"     // paged decode v2 + merge kernels (#898).
 #include "fused_norm.h"             // fused residual-add + RMSNorm kernel (#905).
@@ -103,6 +104,27 @@ std::unique_ptr<MlxArray> fused_metal4_attention(
     return std::make_unique<MlxArray>(mlx::core::fast::scaled_dot_product_attention(
         q.inner, k.inner, v.inner, scale, mask_mode, mask_opt
     ));
+}
+
+std::unique_ptr<MlxArray> turbo4_attention(
+    const MlxArray& q_rot,
+    const MlxArray& k_packed,
+    const MlxArray& k_rescale,
+    const MlxArray& v_packed,
+    const MlxArray& v_rescale,
+    const MlxArray& codebook,
+    float scale,
+    bool causal) {
+    auto out = mlxcel::turbo::turbo4_attention(
+        q_rot.inner,
+        k_packed.inner,
+        k_rescale.inner,
+        v_packed.inner,
+        v_rescale.inner,
+        codebook.inner,
+        scale,
+        causal);
+    return std::make_unique<MlxArray>(std::move(out));
 }
 
 // Fused Sparse-V SDPA Metal kernel launcher. Implementation in

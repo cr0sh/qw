@@ -616,7 +616,6 @@ mod ffi {
             dt_bias: &MlxArray,
         ) -> UniquePtr<MlxArray>;
 
-
         /// Compiled GptOss SwiGLU activation with kernel fusion
         /// Matches mlx-lm gpt_oss.swiglu: clipped gate/up + sigmoid(1.702*gate).
         /// Used by: GptOss
@@ -2692,6 +2691,21 @@ mod ffi {
         /// Quantize weights — biases
         fn quantize_weights_biases(w: &MlxArray, group_size: i32, bits: i32)
         -> UniquePtr<MlxArray>;
+
+        /// Exact symmetric-Turbo4 attention over packed K/V.
+        ///
+        /// Inputs use `[B,H,T,D]` attention layout. `q_rot` and the FP32
+        /// output are in the codec's rotated K and V bases respectively.
+        fn turbo4_attention(
+            q_rot: &MlxArray,
+            k_packed: &MlxArray,
+            k_rescale: &MlxArray,
+            v_packed: &MlxArray,
+            v_rescale: &MlxArray,
+            codebook: &MlxArray,
+            scale: f32,
+            causal: bool,
+        ) -> UniquePtr<MlxArray>;
 
         // -------------------------------------------------------------------
         // Fused Sparse-V SDPA Metal kernel.
