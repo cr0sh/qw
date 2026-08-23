@@ -383,10 +383,10 @@ fn logits_at_position(logits: &MlxArray, pos: usize) -> UniquePtr<MlxArray> {
     ffi::slice(logits, &[0, pos as i32, 0], &[batch, pos as i32 + 1, vocab])
 }
 
-/// Default cache-level prefill chunk for the single-sequence CLI/bench path,
-/// matching upstream mlx-lm/mlx-vlm's `DEFAULT_PREFILL_STEP_SIZE` (issue
-/// #674). The server uses its own `prefill_chunk_size` (default 512).
-pub const DEFAULT_PREFILL_CHUNK: usize = 2048;
+/// Default cache-level prefill chunk for the single-sequence CLI/bench path.
+/// 2304 avoids a small third graph for common 4K prompts while bounding
+/// long-context transient memory. The server uses its own chunk setting.
+pub const DEFAULT_PREFILL_CHUNK: usize = 2304;
 
 /// Cache-level prefill chunk length for the single-sequence CLI/bench path,
 /// from `MLXCEL_PREFILL_CHUNK` (tokens). Unset defaults to
