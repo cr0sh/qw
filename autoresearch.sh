@@ -94,12 +94,12 @@ if int(token_fingerprint) <= 0:
     raise SystemExit(f"invalid token fingerprint: {token_fingerprint}")
 
 print(
-    "METRIC long_64k_mtp_k3_elem_s="
-    f"{results['single_user_decode/long_64k_mtp_k3']:.6f}"
-)
-print(
     "METRIC long_64k_mtp_k3_prefill_elem_s="
     f"{results['single_user_prefill/long_64k_mtp_k3']:.6f}"
+)
+print(
+    "METRIC long_64k_mtp_k3_elem_s="
+    f"{results['single_user_decode/long_64k_mtp_k3']:.6f}"
 )
 print(f"METRIC token_edit_distance={token_edit_distance}")
 print(f"METRIC token_fingerprint={token_fingerprint}")
