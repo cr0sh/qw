@@ -282,7 +282,7 @@ int mtp_verify_blocks(int tokens) {
         return 128;
     }
     if (tokens <= 65536) {
-        return 128;
+        return 160;
     }
     return 512;
 }
@@ -396,7 +396,7 @@ mlx::core::array turbo4_attention(
     auto partials = partial_kernel_holder().get()(
         {q_rot, k_packed, k_rescale, v_packed, v_rescale, codebook, scale_array},
         {Shape{rows * blocks, dim}, Shape{rows * blocks}, Shape{rows * blocks}},
-        {mlx::core::float32, mlx::core::float32, mlx::core::float32},
+        {mlx::core::float16, mlx::core::float32, mlx::core::float32},
         std::make_tuple(hkv * SIMD_WIDTH, batch * repeats, blocks),
         std::make_tuple(SIMD_WIDTH, repeats, 1),
         partial_template_args,
