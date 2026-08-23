@@ -592,7 +592,7 @@ impl Qwen35GatedDeltaNet {
                 if state_shape[0] != b {
                     None
                 } else {
-                    Some(mlxcel_core::copy(s))
+                    Some(mlxcel_core::share(s))
                 }
             })
         });
