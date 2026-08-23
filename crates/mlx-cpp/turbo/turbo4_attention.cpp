@@ -35,14 +35,15 @@ constexpr int MIN_MTP_VERIFY_TOKENS = 2048;
 
 // Two-pass block decomposition adapted from oMLX TurboQuant's fused MTP verify
 // pass at jundot/omlx@309e8c51e7f46b6da355485018477c25c6f77b23
-// (Apache-2.0). The staged multi-head reuse below follows the threadgroup
-// tiling approach used by antirez/ds4's causal group-8 attention kernel at
-// antirez/ds4@84cc882352757baf628a1776badf7cc54d584e28 (MIT).
-// One threadgroup owns (batch, KV head, block). Its SIMDgroups map the GQA
-// repeats, cooperatively unpack short K/V stages once, then reuse the decoded
-// rows across all query heads and verify rows.
+// (Apache-2.0). Cooperative K/V staging follows antirez/ds4's group-8
+// attention kernel at antirez/ds4@84cc882352757baf628a1776badf7cc54d584e28
+// (MIT). Mapping each (GQA repeat, query row) to one SIMDgroup follows MLX's
+// sdpa_vector_2pass topology at ml-explore/mlx@
+// 3a6219917e4535575ce5bce2fc2ba27a483a709b (MIT). One threadgroup owns a
+// (batch, KV head, block), unpacks each K/V stage once, and reuses it across
+// every query head and verify row.
 constexpr const char* TURBO4_MTP_VERIFY_PARTIAL_SOURCE = R"(
-    constexpr uint StageRows = 16;
+    constexpr uint StageRows = 32;
 
     uint lane = thread_index_in_simdgroup;
     uint tid = thread_index_in_threadgroup;
@@ -50,6 +51,7 @@ constexpr const char* TURBO4_MTP_VERIFY_PARTIAL_SOURCE = R"(
     uint batch = threadgroup_position_in_grid.y;
     uint block = threadgroup_position_in_grid.z;
     uint repeat = thread_position_in_threadgroup.y;
+    uint query_row = thread_position_in_threadgroup.z;
 
     uint dim = (uint)Dim;
     uint dpt = (uint)DimsPerThread;
@@ -59,38 +61,27 @@ constexpr const char* TURBO4_MTP_VERIFY_PARTIAL_SOURCE = R"(
     uint packed_width = (uint)k_packed_shape[3];
     uint hkv_count = (uint)k_packed_shape[1];
     uint q_head = kv_head * (uint)RepeatCount + repeat;
-    uint row_base = ((batch * hq_count + q_head) * (uint)QRows);
+    uint row = (batch * hq_count + q_head) * (uint)QRows + query_row;
+    float scale_log2e = scale[0] * 1.4426950408889634f;
 
-    float q[QRows][DimsPerThread];
-    for (uint r = 0; r < (uint)QRows; r++) {
-        for (uint j = 0; j < dpt; j++) {
-            uint d = d0 + j;
-            q[r][j] = d < dim
-                ? q_rot[(row_base + r) * dim + d]
-                : 0.0f;
-        }
+    float q[DimsPerThread];
+    float out[DimsPerThread];
+    for (uint j = 0; j < dpt; j++) {
+        uint d = d0 + j;
+        q[j] = d < dim ? q_rot[row * dim + d] * scale_log2e : 0.0f;
+        out[j] = 0.0f;
     }
-
-    float out[QRows][DimsPerThread];
-    float max_score[QRows];
-    float sum_score[QRows];
-    for (uint r = 0; r < (uint)QRows; r++) {
-        max_score[r] = -INFINITY;
-        sum_score[r] = 0.0f;
-        for (uint j = 0; j < dpt; j++) {
-            out[r][j] = 0.0f;
-        }
-    }
+    float max_score = -INFINITY;
+    float sum_score = 0.0f;
 
     threadgroup half staged_k[StageRows * Dim];
     threadgroup half staged_v[StageRows * Dim];
 
-    float scale_log2e = scale[0] * 1.4426950408889634f;
     uint bh = batch * hkv_count + kv_head;
     uint block_tokens = tk > block
         ? ((tk - 1u - block) / (uint)Blocks + 1u)
         : 0u;
-    uint threads = 32u * (uint)RepeatCount;
+    uint threads = 32u * (uint)RepeatCount * (uint)QRows;
     for (uint base = 0; base < block_tokens; base += StageRows) {
         uint stage_rows = min(StageRows, block_tokens - base);
         uint stage_bytes = stage_rows * packed_width;
@@ -118,52 +109,40 @@ constexpr const char* TURBO4_MTP_VERIFY_PARTIAL_SOURCE = R"(
 
         for (uint rr = 0; rr < stage_rows; rr++) {
             uint t = block + (base + rr) * (uint)Blocks;
+            if (t + (uint)QRows > tk + query_row) {
+                continue;
+            }
             threadgroup const half *k_row = staged_k + rr * dim;
             threadgroup const half *v_row = staged_v + rr * dim;
-            float k[DimsPerThread];
+            float dot = 0.0f;
             float v[DimsPerThread];
             for (uint j = 0; j < dpt; j++) {
                 uint d = d0 + j;
-                k[j] = (float)k_row[d];
+                dot += q[j] * (float)k_row[d];
                 v[j] = (float)v_row[d];
             }
-
-            // Bottom-right causal visibility: row r is positioned at
-            // tk-QRows+r.
-            int first_visible_row = (int)t - (int)tk + QRows;
-            for (uint r = 0; r < (uint)QRows; r++) {
-                if ((int)r < first_visible_row) {
-                    continue;
-                }
-                float dot = 0.0f;
-                for (uint j = 0; j < dpt; j++) {
-                    dot += q[r][j] * k[j];
-                }
-                float score = simd_sum(dot) * scale_log2e;
-                float next_max = fmax(max_score[r], score);
-                float correction = exp2(max_score[r] - next_max);
-                float probability = exp2(score - next_max);
-                sum_score[r] = sum_score[r] * correction + probability;
-                for (uint j = 0; j < dpt; j++) {
-                    out[r][j] = out[r][j] * correction + probability * v[j];
-                }
-                max_score[r] = next_max;
+            float score = simd_sum(dot);
+            float next_max = fmax(max_score, score);
+            float correction = fast::exp2(max_score - next_max);
+            float probability = fast::exp2(score - next_max);
+            sum_score = sum_score * correction + probability;
+            for (uint j = 0; j < dpt; j++) {
+                out[j] = out[j] * correction + probability * v[j];
             }
+            max_score = next_max;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    for (uint r = 0; r < (uint)QRows; r++) {
-        uint partial_row = (row_base + r) * (uint)Blocks + block;
-        if (lane == 0u) {
-            partial_sums[partial_row] = sum_score[r];
-            partial_maxs[partial_row] = max_score[r];
-        }
-        for (uint j = 0; j < dpt; j++) {
-            uint d = d0 + j;
-            if (d < dim) {
-                partial_acc[partial_row * dim + d] = out[r][j];
-            }
+    uint partial_row = row * (uint)Blocks + block;
+    if (lane == 0u) {
+        partial_sums[partial_row] = sum_score;
+        partial_maxs[partial_row] = max_score;
+    }
+    for (uint j = 0; j < dpt; j++) {
+        uint d = d0 + j;
+        if (d < dim) {
+            partial_acc[partial_row * dim + d] = out[j];
         }
     }
 )";
@@ -403,8 +382,8 @@ mlx::core::array turbo4_attention(
         {q_rot, k_packed, k_rescale, v_packed, v_rescale, codebook, scale_array},
         {Shape{rows * blocks, dim}, Shape{rows * blocks}, Shape{rows * blocks}},
         {mlx::core::float16, mlx::core::float32, mlx::core::float32},
-        std::make_tuple(hkv * SIMD_WIDTH, batch * repeats, blocks),
-        std::make_tuple(SIMD_WIDTH, repeats, 1),
+        std::make_tuple(hkv * SIMD_WIDTH, batch * repeats, blocks * tq),
+        std::make_tuple(SIMD_WIDTH, repeats, tq),
         partial_template_args,
         std::nullopt,
         false,
