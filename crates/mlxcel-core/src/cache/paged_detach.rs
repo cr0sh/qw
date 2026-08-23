@@ -103,7 +103,7 @@ pub struct DetachedPagedCacheSet {
     pub(super) v_packed_pages: HashMap<PagedBlockId, UniquePtr<MlxArray>>,
     pub(super) v_norms_pages: HashMap<PagedBlockId, UniquePtr<MlxArray>>,
     pub(super) k_packed_pages: HashMap<PagedBlockId, UniquePtr<MlxArray>>,
-    pub(super) k_norms_pages: HashMap<PagedBlockId, UniquePtr<MlxArray>>,
+    pub(super) k_rescale_pages: HashMap<PagedBlockId, UniquePtr<MlxArray>>,
     pub(super) cold_keys_pages: HashMap<PagedBlockId, UniquePtr<MlxArray>>,
 }
 
@@ -224,7 +224,7 @@ impl DetachedPagedCacheSet {
         sum_map(&self.v_packed_pages)
             + sum_map(&self.v_norms_pages)
             + sum_map(&self.k_packed_pages)
-            + sum_map(&self.k_norms_pages)
+            + sum_map(&self.k_rescale_pages)
             + sum_map(&self.cold_keys_pages)
     }
 
@@ -248,7 +248,7 @@ impl DetachedPagedCacheSet {
         all.extend(self.v_packed_pages.keys());
         all.extend(self.v_norms_pages.keys());
         all.extend(self.k_packed_pages.keys());
-        all.extend(self.k_norms_pages.keys());
+        all.extend(self.k_rescale_pages.keys());
         all.extend(self.cold_keys_pages.keys());
         all.len()
     }
@@ -439,7 +439,7 @@ impl CachePool {
         let mut v_packed_pages: HashMap<PagedBlockId, UniquePtr<MlxArray>> = HashMap::new();
         let mut v_norms_pages: HashMap<PagedBlockId, UniquePtr<MlxArray>> = HashMap::new();
         let mut k_packed_pages: HashMap<PagedBlockId, UniquePtr<MlxArray>> = HashMap::new();
-        let mut k_norms_pages: HashMap<PagedBlockId, UniquePtr<MlxArray>> = HashMap::new();
+        let mut k_rescale_pages: HashMap<PagedBlockId, UniquePtr<MlxArray>> = HashMap::new();
         let mut cold_keys_pages: HashMap<PagedBlockId, UniquePtr<MlxArray>> = HashMap::new();
         if paged_layout.is_turbo_mode()
             && let Some(pool) = self.paged_pool.as_ref()
@@ -456,8 +456,8 @@ impl CachePool {
                     if let Some(t) = pool.take_k_packed(block_id) {
                         k_packed_pages.insert(block_id, t);
                     }
-                    if let Some(t) = pool.take_k_norms(block_id) {
-                        k_norms_pages.insert(block_id, t);
+                    if let Some(t) = pool.take_k_rescale(block_id) {
+                        k_rescale_pages.insert(block_id, t);
                     }
                 }
                 if paged_layout.cache_mode == KVCacheMode::Turbo4Delegated
@@ -504,7 +504,7 @@ impl CachePool {
             v_packed_pages,
             v_norms_pages,
             k_packed_pages,
-            k_norms_pages,
+            k_rescale_pages,
             cold_keys_pages,
         })
     }
@@ -616,7 +616,7 @@ impl CachePool {
         let v_packed_pages = std::mem::take(&mut detached.v_packed_pages);
         let v_norms_pages = std::mem::take(&mut detached.v_norms_pages);
         let k_packed_pages = std::mem::take(&mut detached.k_packed_pages);
-        let k_norms_pages = std::mem::take(&mut detached.k_norms_pages);
+        let k_rescale_pages = std::mem::take(&mut detached.k_rescale_pages);
         let cold_keys_pages = std::mem::take(&mut detached.cold_keys_pages);
 
         let id = SequenceId::from_raw(self.next_id.fetch_add(1, Ordering::Relaxed));
@@ -721,10 +721,10 @@ impl CachePool {
                     );
                 }
             }
-            for (block_id, t) in k_norms_pages {
-                if let Err(err) = pool.install_k_norms(block_id, t) {
+            for (block_id, t) in k_rescale_pages {
+                if let Err(err) = pool.install_k_rescale(block_id, t) {
                     eprintln!(
-                        "[mlxcel::cache::paged_detach] adopt_paged: failed to reinstall k_norms for {block_id}: {err}"
+                        "[mlxcel::cache::paged_detach] adopt_paged: failed to reinstall k_rescale for {block_id}: {err}"
                     );
                 }
             }
@@ -948,7 +948,7 @@ impl CachePool {
             v_packed_pages: HashMap::new(),
             v_norms_pages: HashMap::new(),
             k_packed_pages: HashMap::new(),
-            k_norms_pages: HashMap::new(),
+            k_rescale_pages: HashMap::new(),
             cold_keys_pages: HashMap::new(),
         })
     }

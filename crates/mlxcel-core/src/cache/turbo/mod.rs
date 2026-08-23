@@ -47,6 +47,7 @@ use std::sync::OnceLock;
 pub mod allowlist;
 pub mod boundary;
 pub mod codebook;
+pub mod fused_attention;
 pub mod pack3;
 pub mod quant;
 pub mod quant3;

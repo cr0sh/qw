@@ -436,7 +436,7 @@ fn detach_adopt_round_trip_turbo4_sym_preserves_k_sidecars() {
             .install_k_packed(block_id, dummy_array(&[3.0, 4.0], &[1, 1, 2, 1]))
             .unwrap();
         pool_ref
-            .install_k_norms(block_id, dummy_array(&[0.6, 0.6], &[1, 1, 2, 1]))
+            .install_k_rescale(block_id, dummy_array(&[0.6, 0.6], &[1, 1, 2, 1]))
             .unwrap();
     }
 
@@ -447,7 +447,7 @@ fn detach_adopt_round_trip_turbo4_sym_preserves_k_sidecars() {
     let _new_id = pool.adopt_paged(&model, detached).unwrap();
     let pool_ref = pool.paged_pool_ref().unwrap();
     assert!(pool_ref.k_packed_for(block_id).is_some());
-    assert!(pool_ref.k_norms_for(block_id).is_some());
+    assert!(pool_ref.k_rescale_for(block_id).is_some());
     assert!(pool_ref.v_packed_for(block_id).is_some());
     assert!(pool_ref.v_norms_for(block_id).is_some());
 }

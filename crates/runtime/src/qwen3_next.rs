@@ -17,9 +17,7 @@
 use crate::gated_delta::GatedDeltaCache;
 use crate::qwen_mrope::{InterleavedMRoPE, apply_multimodal_rotary_pos_emb};
 use mlxcel_core::cache::KVCacheMode;
-use mlxcel_core::layers::{
-    FusedQKVLinear, KVCache, QuantizedWeight, RMSNorm, UnifiedLinear,
-};
+use mlxcel_core::layers::{FusedQKVLinear, KVCache, QuantizedWeight, RMSNorm, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr, concatenate};
 use serde::Deserialize;
@@ -68,12 +66,9 @@ impl Qwen3NextConfig {
             .unwrap_or((quantization.group_size, quantization.bits))
     }
 
-
     pub fn rope_dims(&self) -> i32 {
         (self.head_dim as f32 * self.partial_rotary_factor) as i32
     }
-
-
 }
 
 // Cache Types.
@@ -113,7 +108,6 @@ impl Qwen3NextCache {
     }
 }
 
-
 // Attention with Gated Output.
 pub(crate) struct Qwen3NextAttention {
     qkv_proj: FusedQKVLinear,
@@ -130,7 +124,6 @@ pub(crate) struct Qwen3NextAttention {
 }
 
 impl Qwen3NextAttention {
-
     pub(crate) fn forward_with_position_ids(
         &self,
         x: &MlxArray,
@@ -172,8 +165,6 @@ impl Qwen3NextAttention {
         self.o_proj.forward(&output)
     }
 
-
-
     fn forward_impl(
         &self,
         x: &MlxArray,
@@ -204,7 +195,6 @@ impl Qwen3NextAttention {
             &[b, l, self.num_heads, q_last_dim],
         );
         let gate = mlxcel_core::reshape(&gate, &[b, l, -1]);
-
 
         // Reshape and apply Q/K norms
         let queries = mlxcel_core::reshape(&queries, &[b, l, self.num_heads, self.head_dim]);
@@ -245,12 +235,8 @@ impl Qwen3NextAttention {
                 &[0, 0, 0, self.rope_dims],
                 &[b, self.num_kv_heads, l, self.head_dim],
             );
-            let (query_rotary, key_rotary) = apply_multimodal_rotary_pos_emb(
-                &query_rotary,
-                &key_rotary,
-                &cosine,
-                &sine,
-            );
+            let (query_rotary, key_rotary) =
+                apply_multimodal_rotary_pos_emb(&query_rotary, &key_rotary, &cosine, &sine);
             queries = mlxcel_core::concatenate(&query_rotary, &query_pass, -1);
             keys = mlxcel_core::concatenate(&key_rotary, &key_pass, -1);
         } else {
@@ -262,49 +248,25 @@ impl Qwen3NextAttention {
                 1.0,
                 offset,
             );
-            keys = mlxcel_core::fast_rope(
-                &keys,
-                self.rope_dims,
-                false,
-                self.rope_base,
-                1.0,
-                offset,
-            );
+            keys =
+                mlxcel_core::fast_rope(&keys, self.rope_dims, false, self.rope_base, 1.0, offset);
         }
 
         let captured_query = capture_query.then(|| mlxcel_core::share(&queries));
 
-        // Symmetric Turbo4 stays in the rotated codec basis. Multi-token
-        // calls use native causal SDPA metadata rather than a materialized
-        // additive mask.
+        // Symmetric Turbo4 reads packed K/V directly only for the specialized
+        // long-context MTP verify envelope. Other multi-token calls retain
+        // bottom-right causal metadata and use the exact dequant-SDPA fallback.
         let attn_out = if cache.mode == KVCacheMode::Turbo4 {
             if l > 1 && mask.is_none() {
-                cache.update_and_turbo4_dequant_sdpa_causal_attention(
-                    &queries,
-                    keys,
-                    values,
-                    self.scale,
-                )
+                cache.update_and_turbo4_causal_attention(&queries, keys, values, self.scale)
             } else {
-                cache.update_and_turbo4_dequant_sdpa_attention(
-                    &queries,
-                    keys,
-                    values,
-                    self.scale,
-                    mask,
-                )
+                cache.update_and_turbo4_attention(&queries, keys, values, self.scale, mask)
             }
         } else {
             let (cache_k, cache_v) = cache.update_and_fetch(keys, values);
             if l > 1 && mask.is_none() {
-                mlxcel_core::causal_attention(
-                    &queries,
-                    &cache_k,
-                    &cache_v,
-                    self.scale,
-                    0.0,
-                    0,
-                )
+                mlxcel_core::causal_attention(&queries, &cache_k, &cache_v, self.scale, 0.0, 0)
             } else {
                 let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
                 unsafe {
@@ -324,8 +286,6 @@ impl Qwen3NextAttention {
         let gated = mlxcel_core::multiply(&output, &gate_sigmoid);
         (gated, captured_query)
     }
-
-
 
     pub(crate) fn from_weights(
         weights: &WeightMap,
@@ -485,8 +445,7 @@ impl Mlp {
         let (gate_group_size, gate_bits) = config.quant_params(&gate_prefix);
         let (up_group_size, up_bits) = config.quant_params(&up_prefix);
         let (down_group_size, down_bits) = config.quant_params(&down_prefix);
-        let gate =
-            UnifiedLinear::from_weights(weights, &gate_prefix, gate_group_size, gate_bits)?;
+        let gate = UnifiedLinear::from_weights(weights, &gate_prefix, gate_group_size, gate_bits)?;
         let up = UnifiedLinear::from_weights(weights, &up_prefix, up_group_size, up_bits)?;
 
         Ok(Self {
@@ -551,18 +510,8 @@ mod tests {
             &[HIDDEN_SIZE, ATTENTION_WIDTH],
             0.0,
         );
-        insert_f32(
-            &mut weights,
-            "self_attn.q_norm.weight",
-            &[HEAD_DIM],
-            1.0,
-        );
-        insert_f32(
-            &mut weights,
-            "self_attn.k_norm.weight",
-            &[HEAD_DIM],
-            1.0,
-        );
+        insert_f32(&mut weights, "self_attn.q_norm.weight", &[HEAD_DIM], 1.0);
+        insert_f32(&mut weights, "self_attn.k_norm.weight", &[HEAD_DIM], 1.0);
 
         Qwen3NextAttention::from_weights(
             &weights,
@@ -587,8 +536,7 @@ mod tests {
         let input = mlxcel_core::from_slice_f32(&[0.0; 6], &[1, 2, 3]);
 
         let mut ordinary_cache = KVCache::new();
-        let ordinary =
-            attention.forward_with_position_ids(&input, &mut ordinary_cache, None, None);
+        let ordinary = attention.forward_with_position_ids(&input, &mut ordinary_cache, None, None);
         assert_eq!(mlxcel_core::array_shape(&ordinary), vec![1, 2, 3]);
 
         let mut verify_cache = KVCache::new();

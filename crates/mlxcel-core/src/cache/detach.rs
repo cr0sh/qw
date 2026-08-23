@@ -117,7 +117,7 @@ pub struct DetachedKVCache {
     /// reuse paths preserve the precomputed rescale.
     pub(super) v_rescale: Option<UniquePtr<MlxArray>>,
     pub(super) k_packed: Option<UniquePtr<MlxArray>>,
-    pub(super) k_norms: Option<UniquePtr<MlxArray>>,
+    pub(super) k_rescale: Option<UniquePtr<MlxArray>>,
     pub(super) turbo_seed: u32,
     pub(super) cold_offset: i32,
     pub(super) hot_threshold: i32,
@@ -149,7 +149,7 @@ impl DetachedKVCache {
             || self.v_norms.is_some()
             || self.v_rescale.is_some()
             || self.k_packed.is_some()
-            || self.k_norms.is_some()
+            || self.k_rescale.is_some()
         {
             return None;
         }
@@ -165,7 +165,7 @@ impl DetachedKVCache {
             v_norms: None,
             v_rescale: None,
             k_packed: None,
-            k_norms: None,
+            k_rescale: None,
             turbo_seed: self.turbo_seed,
             cold_offset: 0,
             hot_threshold: self.hot_threshold,
@@ -181,7 +181,7 @@ impl DetachedKVCache {
 
     /// Total byte footprint of the detached tensors (keys + values + INT8
     /// scales + Turbo4Asym v_packed/v_norms + Turbo4 symmetric
-    /// k_packed/k_norms). Turbo4Delegated caches no longer carry
+    /// k_packed/k_rescale). Turbo4Delegated caches no longer carry
     /// a separate `cold_keys` tensor — the unified K buffer is already
     /// counted under `keys`.
     pub fn nbytes(&self) -> usize {
@@ -193,7 +193,7 @@ impl DetachedKVCache {
         let vn = self.v_norms.as_ref().map_or(0, |a| ffi::array_nbytes(a));
         let vr = self.v_rescale.as_ref().map_or(0, |a| ffi::array_nbytes(a));
         let kp = self.k_packed.as_ref().map_or(0, |a| ffi::array_nbytes(a));
-        let kn = self.k_norms.as_ref().map_or(0, |a| ffi::array_nbytes(a));
+        let kn = self.k_rescale.as_ref().map_or(0, |a| ffi::array_nbytes(a));
         k + v + ks + vs + vp + vn + vr + kp + kn
     }
 
@@ -240,7 +240,7 @@ impl DetachedKVCache {
     /// `try_adopt_cached_prefix` in `src/server/batch/scheduler.rs`.
     ///
     /// INT8 scale tensors and the Turbo4* per-token sidecars (`v_packed`,
-    /// `v_norms`, `v_rescale`, `k_packed`, `k_norms`) are sliced in lockstep
+    /// `v_norms`, `v_rescale`, `k_packed`, `k_rescale`) are sliced in lockstep
     /// so a subsequent install + dequantize stays bit-identical to the
     /// already-trimmed live cache.
     ///
@@ -273,7 +273,7 @@ impl DetachedKVCache {
             self.v_norms = None;
             self.v_rescale = None;
             self.k_packed = None;
-            self.k_norms = None;
+            self.k_rescale = None;
             self.cold_offset = 0;
             self.offset = 0;
             return Ok(());
@@ -390,7 +390,7 @@ impl DetachedKVCache {
             // K-side sidecars exist only in symmetric Turbo4.
             if self.mode == KVCacheMode::Turbo4 {
                 self.k_packed = trim_axis_seq(&self.k_packed, 0);
-                self.k_norms = trim_axis_seq(&self.k_norms, 1);
+                self.k_rescale = trim_axis_seq(&self.k_rescale, 1);
             }
 
             self.offset = new_len;
@@ -420,7 +420,7 @@ impl std::fmt::Debug for DetachedKVCache {
             .field("has_v_norms", &self.v_norms.is_some())
             .field("has_v_rescale", &self.v_rescale.is_some())
             .field("has_k_packed", &self.k_packed.is_some())
-            .field("has_k_norms", &self.k_norms.is_some())
+            .field("has_k_rescale", &self.k_rescale.is_some())
             .field("turbo_seed", &self.turbo_seed)
             .field("cold_offset", &self.cold_offset)
             .field("hot_threshold", &self.hot_threshold)
@@ -509,7 +509,7 @@ impl KVCache {
             v_norms: self.v_norms.take(),
             v_rescale: self.v_rescale.take(),
             k_packed: self.k_packed.take(),
-            k_norms: self.k_norms.take(),
+            k_rescale: self.k_rescale.take(),
             turbo_seed: self.turbo_seed,
             cold_offset: std::mem::replace(&mut self.cold_offset, 0),
             hot_threshold: self.hot_threshold,
@@ -553,7 +553,7 @@ impl KVCache {
         self.v_norms = detached.v_norms;
         self.v_rescale = detached.v_rescale;
         self.k_packed = detached.k_packed;
-        self.k_norms = detached.k_norms;
+        self.k_rescale = detached.k_rescale;
         self.turbo_seed = detached.turbo_seed;
         self.cold_offset = detached.cold_offset;
         self.hot_threshold = detached.hot_threshold;

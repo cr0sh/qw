@@ -53,6 +53,17 @@ fn token_edit_distance(left: &[i32], right: &[i32]) -> usize {
     previous[right.len()]
 }
 
+fn token_fingerprint(tokens: &[i32]) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+
+    tokens.iter().fold(FNV_OFFSET_BASIS, |hash, token| {
+        token.to_le_bytes().into_iter().fold(hash, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME)
+        })
+    })
+}
+
 fn benchmark_long_conversation(
     criterion: &mut Criterion,
     provider: &mut Qwen35Provider,
@@ -63,6 +74,7 @@ fn benchmark_long_conversation(
     let baseline_name = format!("long_{}_baseline", fixture.context_label);
     let mtp_name = format!("long_{}_mtp_k3", fixture.context_label);
 
+    let mtp_token_fingerprint = token_fingerprint(&fixture.mtp_token_ids);
     let mtp_token_edit_distance =
         token_edit_distance(&fixture.mtp_token_ids, &fixture.baseline_token_ids);
     assert!(
@@ -71,7 +83,7 @@ fn benchmark_long_conversation(
         fixture.context_label
     );
     eprintln!(
-        "MTP_LONG_CONTEXT_CORRECTNESS context={} token_edit_distance={mtp_token_edit_distance}",
+        "MTP_LONG_CONTEXT_CORRECTNESS context={} token_edit_distance={mtp_token_edit_distance} token_fingerprint={mtp_token_fingerprint}",
         fixture.context_label
     );
 
@@ -103,6 +115,54 @@ fn benchmark_long_conversation(
                     "long-conversation baseline mode returned MTP statistics"
                 );
                 black_box(output);
+            });
+        });
+        group.finish();
+    }
+
+    {
+        let mut group = criterion.benchmark_group("single_user_prefill");
+        group.throughput(Throughput::Elements(fixture.new_prompt_tokens as u64));
+        group.bench_function(&mtp_name, |bencher| {
+            bencher.iter_custom(|iters| {
+                let mut prefill_time = Duration::ZERO;
+                for _ in 0..iters {
+                    let (output, stats) = provider
+                        .benchmark_cached_streaming_in_mode(
+                            &fixture.prompt_ids,
+                            DECODE_MAX_TOKENS,
+                            &sampling,
+                            &fixture.mtp_snapshot,
+                            Qwen35GenerationMode::Mtp,
+                            |delta| {
+                                black_box(delta);
+                                true
+                            },
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "benchmark long-conversation MTP k={MTP_BLOCK_SIZE} prefill: {error:#}"
+                            )
+                        });
+                    assert_eq!(output.cached_tokens, fixture.prefix_tokens);
+                    assert_eq!(
+                        &output.token_ids, &fixture.mtp_token_ids,
+                        "deterministic long-conversation bundled-MTP k={MTP_BLOCK_SIZE} greedy token IDs changed"
+                    );
+                    assert_eq!(
+                        token_fingerprint(&output.token_ids),
+                        mtp_token_fingerprint,
+                        "deterministic long-conversation bundled-MTP k={MTP_BLOCK_SIZE} greedy token fingerprint changed"
+                    );
+                    let stats = stats.expect("explicit MTP mode must return MTP statistics");
+                    assert!(
+                        stats.proposed_draft_tokens > 0,
+                        "long-conversation MTP k={MTP_BLOCK_SIZE} must propose draft tokens"
+                    );
+                    prefill_time += stats.prefill_time;
+                    black_box(output);
+                }
+                prefill_time
             });
         });
         group.finish();
@@ -175,6 +235,11 @@ fn benchmark_long_conversation(
                         &output.token_ids, &fixture.mtp_token_ids,
                         "deterministic long-conversation bundled-MTP k={MTP_BLOCK_SIZE} greedy token IDs changed"
                     );
+                    assert_eq!(
+                        token_fingerprint(&output.token_ids),
+                        mtp_token_fingerprint,
+                        "deterministic long-conversation bundled-MTP k={MTP_BLOCK_SIZE} greedy token fingerprint changed"
+                    );
                     let stats = stats.expect("explicit MTP mode must return MTP statistics");
                     assert!(
                         stats.proposed_draft_tokens > 0,
@@ -193,9 +258,7 @@ fn benchmark_long_conversation(
 fn single_user_throughput(criterion: &mut Criterion) {
     let long_context_only = match env::var(LONG_CONTEXT_ONLY_ENV) {
         Ok(value) if value == "64k" => true,
-        Ok(value) => panic!(
-            "{LONG_CONTEXT_ONLY_ENV} must be `64k` when set, got `{value}`"
-        ),
+        Ok(value) => panic!("{LONG_CONTEXT_ONLY_ENV} must be `64k` when set, got `{value}`"),
         Err(env::VarError::NotPresent) => false,
         Err(env::VarError::NotUnicode(_)) => {
             panic!("{LONG_CONTEXT_ONLY_ENV} must contain valid Unicode")
@@ -276,13 +339,10 @@ fn single_user_throughput(criterion: &mut Criterion) {
     #[cfg(feature = "specprefill")]
     assert!(specprefill_stats.selected_target_tokens > 0);
     #[cfg(feature = "specprefill")]
-    assert!(
-        specprefill_stats.selected_target_tokens < specprefill_stats.eligible_target_tokens
-    );
+    assert!(specprefill_stats.selected_target_tokens < specprefill_stats.eligible_target_tokens);
     #[cfg(feature = "specprefill")]
     assert!(
-        specprefill_stats.selected_target_tokens * 2
-            <= specprefill_stats.eligible_target_tokens,
+        specprefill_stats.selected_target_tokens * 2 <= specprefill_stats.eligible_target_tokens,
         "SpecPrefill selected {} of {} eligible target tokens",
         specprefill_stats.selected_target_tokens,
         specprefill_stats.eligible_target_tokens
@@ -373,11 +433,9 @@ fn single_user_throughput(criterion: &mut Criterion) {
         mtp_token_edit_distance * 20 <= baseline_token_ids.len(),
         "MTP token edit distance {mtp_token_edit_distance} exceeds 5% of the baseline"
     );
-    eprintln!(
-        "MTP_CORRECTNESS token_edit_distance={mtp_token_edit_distance}"
-    );
-    let mtp_decode_tokens = generation_elements(1, prompt_tokens, decode_fixture.mtp_decode_tokens)
-        .decode as usize;
+    eprintln!("MTP_CORRECTNESS token_edit_distance={mtp_token_edit_distance}");
+    let mtp_decode_tokens =
+        generation_elements(1, prompt_tokens, decode_fixture.mtp_decode_tokens).decode as usize;
 
     {
         let baseline_decode_tokens = baseline_token_ids.len().saturating_sub(1);

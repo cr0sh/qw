@@ -139,7 +139,7 @@ fn turbo4_causal_attention_preserves_per_position_shape_and_offset() {
     );
 
     let queries = synth_kv_tensor(1, 2, query_len, head_dim, 103);
-    let output = cache.update_and_turbo4_dequant_sdpa_causal_attention(
+    let output = cache.update_and_turbo4_causal_attention(
         &queries,
         synth_kv_tensor(1, 1, query_len, head_dim, 104),
         synth_kv_tensor(1, 1, query_len, head_dim, 105),
@@ -1130,6 +1130,138 @@ fn turbo4_reference_attention(
     crate::layers::attention(q, &cache_k, &cache_v, scale, None, 0.0, 0)
 }
 
+fn fixed_projection_argmax(values: &[f32], dim: usize) -> Vec<usize> {
+    const CLASSES: usize = 11;
+    values
+        .chunks_exact(dim)
+        .map(|row| {
+            (0..CLASSES)
+                .map(|class| {
+                    let score = row.iter().enumerate().fold(0.0_f32, |score, (d, value)| {
+                        let weight = ((d * 31 + class * 17 + 13) % 101) as f32 / 50.0 - 1.0;
+                        score + value * weight
+                    });
+                    (class, score)
+                })
+                .max_by(|left, right| left.1.total_cmp(&right.1))
+                .expect("fixed projection has classes")
+                .0
+        })
+        .collect()
+}
+
+fn assert_turbo4_fused_parity(tq: i32, tk: i32, causal: bool, seed: u32) {
+    if !crate::metal_is_available() {
+        return;
+    }
+
+    const B: i32 = 1;
+    const HQ: i32 = 6;
+    const HKV: i32 = 2;
+    const D: i32 = 64;
+    let params = super::turbo::quant::TurboQuantParams::new(D as u32, seed);
+    let q = ffi::astype(
+        &synth_kv_tensor(B, HQ, tq, D, seed.wrapping_add(1)),
+        dtype::FLOAT16,
+    );
+    let k = ffi::astype(
+        &synth_kv_tensor(B, HKV, tk, D, seed.wrapping_add(2)),
+        dtype::FLOAT16,
+    );
+    let v = ffi::astype(
+        &synth_kv_tensor(B, HKV, tk, D, seed.wrapping_add(3)),
+        dtype::FLOAT16,
+    );
+    let (k_packed, k_rescale) = super::turbo::quant::quantize_k_turbo4(&k, &params);
+    let (v_packed, _v_norms, v_rescale) = super::turbo::quant::quantize_v_turbo4(&v, &params);
+    let scale = 1.0 / (D as f32).sqrt();
+
+    let fused = super::turbo::fused_attention::attention_turbo4_fused(
+        &q, &k_packed, &k_rescale, &v_packed, &v_rescale, &params, scale, causal,
+    )
+    .expect("supported Metal geometry must dispatch fused Turbo4 attention");
+    let reference = super::turbo::sparse_v::attention_turbo4_dequant_sdpa(
+        &q, &k_packed, &k_rescale, &v_packed, &v_rescale, &params, scale, None, causal,
+    );
+    ffi::eval(&fused);
+    ffi::eval(&reference);
+
+    assert_eq!(ffi::array_shape(&fused), [B, HQ, tq, D]);
+    assert_eq!(ffi::array_shape(&fused), ffi::array_shape(&reference));
+    assert_eq!(ffi::array_dtype(&fused), ffi::array_dtype(&reference));
+
+    let fused_values = flatten_fp32(&fused);
+    let reference_values = flatten_fp32(&reference);
+    let squared_error = fused_values
+        .iter()
+        .zip(reference_values.iter())
+        .map(|(left, right)| {
+            let error = f64::from(*left - *right);
+            error * error
+        })
+        .sum::<f64>();
+    let rms = (squared_error / fused_values.len() as f64).sqrt();
+    assert!(
+        rms < 5e-3,
+        "fused Turbo4 attention RMS {rms:.4e} exceeds 5e-3"
+    );
+    assert_eq!(
+        fixed_projection_argmax(&fused_values, D as usize),
+        fixed_projection_argmax(&reference_values, D as usize),
+        "fixed-projection greedy argmax changed"
+    );
+}
+
+#[test]
+fn turbo4_fused_attention_matches_dequant_mtp_verify_rows_2_to_4() {
+    assert_turbo4_fused_parity(2, 2_053, true, 0xD3C0_DE02);
+    assert_turbo4_fused_parity(3, 4_105, true, 0xD3C0_DE03);
+    assert_turbo4_fused_parity(4, 8_207, true, 0xD3C0_DE04);
+}
+
+#[test]
+fn turbo4_fused_attention_maps_gqa_and_reuses_packed_nibbles() {
+    assert_turbo4_fused_parity(4, 2_063, true, 0x6A5A_4B1E);
+}
+
+#[test]
+fn turbo4_fused_attention_honors_causal_tail_and_ragged_long_blocks() {
+    assert_turbo4_fused_parity(3, 65_537, true, 0xCA55_A1A5);
+}
+
+#[test]
+fn turbo4_fused_attention_fallback_updates_once() {
+    const CHILD_ENV: &str = "MLXCEL_TURBO4_FALLBACK_TEST_CHILD";
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("resolve current test executable"),
+        )
+        .arg("turbo4_fused_attention_fallback_updates_once")
+        .arg("--nocapture")
+        .env(CHILD_ENV, "1")
+        .env(
+            super::turbo::fused_attention::TURBO4_FUSED_ATTENTION_ENV_VAR,
+            "0",
+        )
+        .status()
+        .expect("run kill-switch fallback child");
+        assert!(status.success(), "kill-switch fallback child failed");
+        return;
+    }
+
+    let mut cache = KVCache::new_with_mode(KVCacheMode::Turbo4);
+    let q = ffi::astype(&synth_kv_tensor(1, 6, 3, 64, 0xFA11_BACC), dtype::FLOAT16);
+    let output = cache.update_and_turbo4_causal_attention(
+        &q,
+        ffi::astype(&synth_kv_tensor(1, 2, 3, 64, 0xFA11_BACD), dtype::FLOAT16),
+        ffi::astype(&synth_kv_tensor(1, 2, 3, 64, 0xFA11_BACE), dtype::FLOAT16),
+        1.0 / 8.0,
+    );
+    ffi::eval(&output);
+    assert_eq!(cache.offset, 3, "fallback must append exactly once");
+    assert_eq!(ffi::array_shape(&output), [1, 6, 3, 64]);
+}
+
 #[test]
 #[ignore = "runs a multi-step GPU dequantization/attention parity stress test"]
 fn turbo4_dequant_sdpa_matches_full_dequant_attention() {
@@ -1156,8 +1288,9 @@ fn turbo4_dequant_sdpa_matches_full_dequant_attention() {
         let v_b = ffi::copy(&v_a);
         let q = synth_kv_tensor(1, 2, 1, head_dim, 22_000 + step as u32);
 
+        cache_dequant.update(k_a, v_a);
         let out_dequant =
-            cache_dequant.update_and_turbo4_dequant_sdpa_attention(&q, k_a, v_a, scale, None);
+            cache_dequant.turbo4_dequant_sdpa_prefix(&q, cache_dequant.offset, scale, None, false);
         let out_ref = turbo4_reference_attention(&mut cache_ref, &q, k_b, v_b, scale);
 
         let flat_a = flatten_fp32(&out_dequant);
@@ -3550,14 +3683,14 @@ fn symmetric_turbo4_snapshot_restore_keeps_packed_storage_and_offset() {
         .turbo4_snapshot_tensors()
         .expect("populated Turbo4 sidecars");
     let k_packed = ffi::copy(tensors.k_packed);
-    let k_norms = ffi::copy(tensors.k_norms);
+    let k_rescale = ffi::copy(tensors.k_rescale);
     let v_packed = ffi::copy(tensors.v_packed);
     let v_norms = ffi::copy(tensors.v_norms);
     let v_rescale = ffi::copy(tensors.v_rescale);
 
     let mut restored = KVCache::new_with_mode(KVCacheMode::Turbo4);
     restored
-        .restore_turbo4_snapshot(4, k_packed, k_norms, v_packed, v_norms, v_rescale)
+        .restore_turbo4_snapshot(4, k_packed, k_rescale, v_packed, v_norms, v_rescale)
         .expect("restore packed Turbo4 prefix");
 
     assert_eq!(restored.seq_len(), 4);

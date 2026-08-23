@@ -313,8 +313,7 @@ fn quantize_into_packed(
         while start < t {
             let end = (start + NON_METAL_TOKEN_CHUNK).min(t);
             let piece = ffi::slice(x, &[0, 0, start, 0], &[shape[0], shape[1], end, d]);
-            let (packed, norms, rescale) =
-                quantize_into_packed(&piece, params, signs1, signs2);
+            let (packed, norms, rescale) = quantize_into_packed(&piece, params, signs1, signs2);
             packed_acc = Some(match packed_acc {
                 Some(acc) => crate::concatenate(&acc, &packed, 2),
                 None => packed,
@@ -335,8 +334,10 @@ fn quantize_into_packed(
             for array in arrays {
                 ffi::eval(array);
             }
-            let ptrs: Vec<*const MlxArray> =
-                arrays.into_iter().map(|array| array as *const MlxArray).collect();
+            let ptrs: Vec<*const MlxArray> = arrays
+                .into_iter()
+                .map(|array| array as *const MlxArray)
+                .collect();
             unsafe { crate::detach_all(&ptrs) };
             start = end;
         }
@@ -373,10 +374,14 @@ fn quantize_into_packed(
 
     // 3. Select the nearest codebook centroid, nibble-pack the indices, and
     //    produce the final fp16 sidecars without leaving device memory.
-    let boundaries =
-        ffi::from_slice_f32(&params.codebook.boundaries, &[params.codebook.boundaries.len() as i32]);
-    let centroids =
-        ffi::from_slice_f32(&params.codebook.centroids, &[params.codebook.centroids.len() as i32]);
+    let boundaries = ffi::from_slice_f32(
+        &params.codebook.boundaries,
+        &[params.codebook.boundaries.len() as i32],
+    );
+    let centroids = ffi::from_slice_f32(
+        &params.codebook.centroids,
+        &[params.codebook.centroids.len() as i32],
+    );
     if ffi::metal_is_available() {
         let mut packed = UniquePtr::null();
         let mut norms = UniquePtr::null();
@@ -423,8 +428,7 @@ fn quantize_into_packed(
 
         let reconstructed = ffi::take(&centroids, &indices, 0);
         let reconstructed_sq = ffi::multiply(&reconstructed, &reconstructed);
-        let reconstructed_norm =
-            ffi::sqrt(&ffi::sum_axis(&reconstructed_sq, -1, true));
+        let reconstructed_norm = ffi::sqrt(&ffi::sum_axis(&reconstructed_sq, -1, true));
         let eps = ffi::full_f32(&[1], 1e-10, dtype::FLOAT32);
         let safe_reconstructed_norm = ffi::maximum(&reconstructed_norm, &eps);
         let rescale = ffi::astype(
@@ -465,20 +469,20 @@ pub fn quantize_v_turbo4(
 /// resulting indices are statistically independent from any V-side
 /// quantization noise.
 ///
-/// Returns `(k_packed, k_norms)` analogous to [`quantize_v_turbo4`] but
-/// without the K-side rescale precompute — the symmetric-Turbo4 K-side has
-/// no analogue of the fused V-side kernel today ('s K dequant runs on the standard graph path), so the precompute would be wasted work.
-/// Storage layout otherwise matches the V-side path bit-for-bit, so the cache
-/// layer can reuse the same packing/unpacking helpers.
+/// Returns `(k_packed, k_rescale)` analogous to [`quantize_v_turbo4`], where
+/// `k_rescale` is the FP16 per-token `original_norm / max(reconstruction_norm,
+/// 1e-10)` sidecar consumed directly by rotated and fused attention.
+/// Storage layout matches the V-side path bit-for-bit, so the cache layer can
+/// reuse the same packing/unpacking helpers.
 ///
 /// Used by: `KVCache::update` (Turbo4 symmetric mode).
 pub fn quantize_k_turbo4(
     k: &MlxArray,
     params: &TurboQuantParams,
 ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
-    let (k_packed, k_norms, _k_rescale) =
+    let (k_packed, _k_original_norms, k_rescale) =
         quantize_into_packed(k, params, &params.k_signs1, &params.k_signs2);
-    (k_packed, k_norms)
+    (k_packed, k_rescale)
 }
 
 /// Shared core for [`dequantize_v_turbo4`] and [`dequantize_k_turbo4`].
@@ -606,11 +610,11 @@ pub fn dequantize_v_turbo4_rotated(
 /// Symmetric `KVCacheMode::Turbo4` can run Swift-LM-style dequant-first SDPA
 /// without fully inverse-rotating cached K. The caller forward-rotates Q into
 /// the same K basis, runs SDPA, then inverse-rotates only the V-side output.
-/// This helper mirrors the norm-correction half of [`dequantize_k_turbo4`]
-/// and deliberately skips the inverse WHT/sign rotation.
+/// This helper gathers centroids and applies the precomputed K rescale while
+/// deliberately skipping the inverse WHT/sign rotation.
 pub fn dequantize_k_turbo4_rotated(
     k_packed: &MlxArray,
-    k_norms: &MlxArray,
+    k_rescale: &MlxArray,
     params: &TurboQuantParams,
 ) -> UniquePtr<MlxArray> {
     let (indices_u8, _b, _h, _t, d) = unpack_turbo4_indices(k_packed);
@@ -623,14 +627,8 @@ pub fn dequantize_k_turbo4_rotated(
     let centroids_arr =
         ffi::from_slice_f32(&centroids_vec, &[params.codebook.centroids.len() as i32]);
     let y_hat = ffi::take(&centroids_arr, &indices_u8, 0);
-    let y_hat_sq = ffi::multiply(&y_hat, &y_hat);
-    let y_hat_sum_sq = ffi::sum_axis(&y_hat_sq, -1, true);
-    let y_hat_norm = ffi::sqrt(&y_hat_sum_sq);
-    let eps = ffi::full_f32(&[1], 1e-10, dtype::FLOAT32);
-    let safe_y_norm = ffi::maximum(&y_hat_norm, &eps);
-    let y_hat_unit = ffi::divide(&y_hat, &safe_y_norm);
-    let norms_f32 = ffi::astype(k_norms, dtype::FLOAT32);
-    let rotated_f32 = ffi::multiply(&y_hat_unit, &norms_f32);
+    let rescale_f32 = ffi::astype(k_rescale, dtype::FLOAT32);
+    let rotated_f32 = ffi::multiply(&y_hat, &rescale_f32);
     ffi::astype(&rotated_f32, dtype::FLOAT16)
 }
 
@@ -657,24 +655,25 @@ pub fn dequantize_v_turbo4(
 
 /// Dequantize a packed-K slice back to fp16 for the attention kernel.
 ///
-/// Mirrors [`dequantize_v_turbo4`] but uses the K-side sign vectors. The
-/// caller is responsible for slicing `k_packed` and `k_norms` to the visible
+/// caller is responsible for slicing `k_packed` and `k_rescale` to the visible
 /// portion of the cache (the same way the V-side path does in
 /// `KVCache::update_and_fetch`).
 ///
 /// Used by: `KVCache::update_and_fetch` (Turbo4 symmetric mode).
 pub fn dequantize_k_turbo4(
     k_packed: &MlxArray,
-    k_norms: &MlxArray,
+    k_rescale: &MlxArray,
     params: &TurboQuantParams,
 ) -> UniquePtr<MlxArray> {
-    dequantize_from_packed(
-        k_packed,
-        k_norms,
-        params,
-        &params.k_signs1,
-        &params.k_signs2,
-    )
+    let rotated = dequantize_k_turbo4_rotated(k_packed, k_rescale, params);
+    let d = params.head_dim as i32;
+    let signs1_arr = ffi::from_slice_f32(&params.k_signs1, &[1, 1, 1, d]);
+    let signs2_arr = ffi::from_slice_f32(&params.k_signs2, &[1, 1, 1, d]);
+    let rotated_f32 = ffi::astype(&rotated, dtype::FLOAT32);
+    let pre_h = ffi::multiply(&rotated_f32, &signs2_arr);
+    let post_h = wht(&pre_h);
+    let full_f32 = ffi::multiply(&post_h, &signs1_arr);
+    ffi::astype(&full_f32, dtype::FLOAT16)
 }
 
 // ---------------------------------------------------------------------------
@@ -806,6 +805,15 @@ mod tests {
         );
     }
 
+    fn array_f32_values(array: &MlxArray) -> Vec<f32> {
+        let array_f32 = ffi::astype(array, dtype::FLOAT32);
+        ffi::eval(&array_f32);
+        ffi::array_to_raw_bytes(&array_f32)
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect()
+    }
+
     #[test]
     fn lcg32_is_deterministic() {
         let mut a = Lcg32::new(42);
@@ -880,34 +888,44 @@ mod tests {
         }
         let k = ffi::from_slice_f32(&k_data, &[1, 1, n_tokens as i32, head_dim]);
 
-        let (packed, norms) = quantize_k_turbo4(&k, &params);
+        let (packed, rescale) = quantize_k_turbo4(&k, &params);
         let pshape = ffi::array_shape(&packed);
         assert_eq!(pshape, vec![1_i32, 1, n_tokens as i32, head_dim / 2]);
+        assert_eq!(
+            ffi::array_shape(&rescale),
+            vec![1_i32, 1, n_tokens as i32, 1]
+        );
+        assert_eq!(ffi::array_dtype(&rescale), dtype::FLOAT16);
 
-        let k_hat = dequantize_k_turbo4(&packed, &norms, &params);
+        let k_hat = dequantize_k_turbo4(&packed, &rescale, &params);
         assert_eq!(ffi::array_dtype(&k_hat), dtype::FLOAT16);
-        let k_hat_f32 = ffi::astype(&k_hat, dtype::FLOAT32);
-        ffi::eval(&k_hat_f32);
-        let bytes = ffi::array_to_raw_bytes(&k_hat_f32);
-        let k_hat_vec: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
+        let k_hat_vec = array_f32_values(&k_hat);
 
-        for tok in 0..n_tokens {
-            let off = tok * hd_usize;
-            let mut num = 0.0_f32;
-            let mut den = 0.0_f32;
-            for k_i in 0..hd_usize {
-                let diff = k_data[off + k_i] - k_hat_vec[off + k_i];
-                num += diff * diff;
-                den += k_data[off + k_i] * k_data[off + k_i];
+        let k_rotated = turbo4_k_rotate(&k, &params);
+        let k_rotated_hat = dequantize_k_turbo4_rotated(&packed, &rescale, &params);
+        assert_eq!(ffi::array_dtype(&k_rotated_hat), dtype::FLOAT16);
+        let k_rotated_vec = array_f32_values(&k_rotated);
+        let k_rotated_hat_vec = array_f32_values(&k_rotated_hat);
+
+        for (label, expected, actual) in [
+            ("full", &k_data, &k_hat_vec),
+            ("rotated", &k_rotated_vec, &k_rotated_hat_vec),
+        ] {
+            for tok in 0..n_tokens {
+                let off = tok * hd_usize;
+                let mut num = 0.0_f32;
+                let mut den = 0.0_f32;
+                for k_i in 0..hd_usize {
+                    let diff = expected[off + k_i] - actual[off + k_i];
+                    num += diff * diff;
+                    den += expected[off + k_i] * expected[off + k_i];
+                }
+                let rel = (num / den.max(1e-12)).sqrt();
+                assert!(
+                    rel < 0.15,
+                    "token {tok}: {label} K-side relative L2 error {rel:.4} exceeds 15% bound"
+                );
             }
-            let rel = (num / den.max(1e-12)).sqrt();
-            assert!(
-                rel < 0.15,
-                "token {tok}: K-side relative L2 error {rel:.4} exceeds 15% bound"
-            );
         }
     }
 
