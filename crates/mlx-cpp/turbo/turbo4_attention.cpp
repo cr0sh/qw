@@ -68,11 +68,13 @@ constexpr const char* TURBO4_MTP_VERIFY_PARTIAL_SOURCE = R"(
     float out[QueriesPerGroup][DimsPerThread];
     float max_score[QueriesPerGroup];
     float sum_score[QueriesPerGroup];
+    #pragma unroll
     for (uint qi = 0; qi < (uint)QueriesPerGroup; qi++) {
         uint repeat = query_group * (uint)QueriesPerGroup + qi;
         uint q_head = kv_head * (uint)RepeatCount + repeat;
         rows[qi] =
             (batch * hq_count + q_head) * (uint)QRows + query_row;
+        #pragma unroll
         for (uint j = 0; j < dpt; j++) {
             uint d = d0 + j;
             q[qi][j] = d < dim
@@ -111,12 +113,14 @@ constexpr const char* TURBO4_MTP_VERIFY_PARTIAL_SOURCE = R"(
             uint sidecar = bh * tk + t;
             float k_scale = (float)k_rescale[sidecar];
             float v_scale = (float)v_rescale[sidecar];
+            #pragma unroll
             for (uint part = 0; part < 4u; part++) {
                 uint part_col = packed_col + part * 4u;
                 uchar4 k_bytes = *((device const uchar4 *)(
                     k_packed + packed_base + part_col));
                 uchar4 v_bytes = *((device const uchar4 *)(
                     v_packed + packed_base + part_col));
+                #pragma unroll
                 for (uint c = 0; c < 4u; c++) {
                     uint k_byte = (uint)k_bytes[c];
                     uint v_byte = (uint)v_bytes[c];
@@ -139,17 +143,21 @@ constexpr const char* TURBO4_MTP_VERIFY_PARTIAL_SOURCE = R"(
             threadgroup const half *v_row = staged_v + rr * dim;
             float dots[QueriesPerGroup];
             float v[DimsPerThread];
+            #pragma unroll
             for (uint qi = 0; qi < (uint)QueriesPerGroup; qi++) {
                 dots[qi] = 0.0f;
             }
+            #pragma unroll
             for (uint j = 0; j < dpt; j++) {
                 uint d = d0 + j;
                 float k_value = (float)k_row[d];
                 v[j] = (float)v_row[d];
+                #pragma unroll
                 for (uint qi = 0; qi < (uint)QueriesPerGroup; qi++) {
                     dots[qi] += q[qi][j] * k_value;
                 }
             }
+            #pragma unroll
             for (uint qi = 0; qi < (uint)QueriesPerGroup; qi++) {
                 float score = simd_sum(dots[qi]);
                 float next_max = fmax(max_score[qi], score);
@@ -157,6 +165,7 @@ constexpr const char* TURBO4_MTP_VERIFY_PARTIAL_SOURCE = R"(
                 float probability = fast::exp2(score - next_max);
                 sum_score[qi] =
                     sum_score[qi] * correction + probability;
+                #pragma unroll
                 for (uint j = 0; j < dpt; j++) {
                     out[qi][j] =
                         out[qi][j] * correction + probability * v[j];
@@ -167,12 +176,14 @@ constexpr const char* TURBO4_MTP_VERIFY_PARTIAL_SOURCE = R"(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
+    #pragma unroll
     for (uint qi = 0; qi < (uint)QueriesPerGroup; qi++) {
         uint partial_row = rows[qi] * (uint)Blocks + block;
         if (lane == 0u) {
             partial_sums[partial_row] = sum_score[qi];
             partial_maxs[partial_row] = max_score[qi];
         }
+        #pragma unroll
         for (uint j = 0; j < dpt; j++) {
             uint d = d0 + j;
             if (d < dim) {
