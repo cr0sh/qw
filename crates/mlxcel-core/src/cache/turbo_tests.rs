@@ -1213,28 +1213,20 @@ fn assert_turbo4_fused_parity(tq: i32, tk: i32, causal: bool, seed: u32) {
 }
 
 #[test]
-fn turbo4_fused_attention_matches_dequant_decode() {
-    assert_turbo4_fused_parity(1, 4_103, false, 0xD3C0_DE01);
-}
-
-#[test]
-fn turbo4_fused_attention_matches_dequant_mtp_verify() {
+fn turbo4_fused_attention_matches_dequant_mtp_verify_rows_2_to_4() {
+    assert_turbo4_fused_parity(2, 2_053, true, 0xD3C0_DE02);
     assert_turbo4_fused_parity(3, 4_105, true, 0xD3C0_DE03);
+    assert_turbo4_fused_parity(4, 8_207, true, 0xD3C0_DE04);
 }
 
 #[test]
-fn turbo4_fused_attention_matches_dequant_cached_prefill() {
-    assert_turbo4_fused_parity(17, 4_111, true, 0xD3C0_DE17);
+fn turbo4_fused_attention_maps_gqa_and_reuses_packed_nibbles() {
+    assert_turbo4_fused_parity(4, 2_063, true, 0x6A5A_4B1E);
 }
 
 #[test]
-fn turbo4_fused_attention_maps_gqa_and_nibbles() {
-    assert_turbo4_fused_parity(2, 97, false, 0x6A5A_4B1E);
-}
-
-#[test]
-fn turbo4_fused_attention_honors_causal_and_ragged_tiles() {
-    assert_turbo4_fused_parity(5, 4_101, true, 0xCA55_A1A5);
+fn turbo4_fused_attention_honors_causal_tail_and_ragged_long_blocks() {
+    assert_turbo4_fused_parity(3, 65_537, true, 0xCA55_A1A5);
 }
 
 #[test]

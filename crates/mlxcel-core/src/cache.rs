@@ -3518,8 +3518,8 @@ impl KVCache {
         )
     }
 
-    /// Append symmetric Turbo4 K/V exactly once, prefer direct packed-cache
-    /// attention, and fall back to the permanent dequant-first oracle.
+    /// Append symmetric Turbo4 K/V exactly once and use the permanent
+    /// dequant-first oracle for general attention shapes.
     pub fn update_and_turbo4_attention(
         &mut self,
         q: &MlxArray,
@@ -3534,15 +3534,12 @@ impl KVCache {
             "update_and_turbo4_attention requires Turbo4 mode"
         );
         self.update(new_keys, new_values);
-        if mask.is_none()
-            && let Some(output) = self.turbo4_fused_attention_prefix(q, self.offset, scale, false)
-        {
-            return output;
-        }
         self.turbo4_dequant_sdpa_prefix(q, self.offset, scale, mask, false)
     }
 
     /// Multi-token bottom-right causal variant of symmetric Turbo4 attention.
+    /// Decode-shaped MTP verify calls may use the packed two-pass kernel;
+    /// continuation prefill and unsupported shapes use the exact fallback.
     pub fn update_and_turbo4_causal_attention(
         &mut self,
         q: &MlxArray,

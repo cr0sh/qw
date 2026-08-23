@@ -21,18 +21,18 @@ use crate::{MlxArray, dtype, ffi};
 use super::quant::{TurboQuantParams, turbo4_k_rotate, turbo4_v_inverse_rotate};
 
 pub const TURBO4_FUSED_ATTENTION_ENV_VAR: &str = "MLXCEL_TURBO4_FUSED_ATTENTION";
-fn parse_fused_attention_enabled(value: Option<&str>, default: bool) -> bool {
-    value.map_or(default, |value| {
+fn parse_fused_attention_enabled(value: Option<&str>) -> bool {
+    !value.is_some_and(|value| {
         matches!(
             value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "on" | "yes"
+            "0" | "false" | "off" | "no"
         )
     })
 }
 
 static TURBO4_FUSED_ATTENTION_ENABLED: LazyLock<bool> = LazyLock::new(|| {
     let value = std::env::var(TURBO4_FUSED_ATTENTION_ENV_VAR).ok();
-    parse_fused_attention_enabled(value.as_deref(), cfg!(test))
+    parse_fused_attention_enabled(value.as_deref())
 });
 
 pub fn turbo4_fused_attention_enabled() -> bool {
@@ -77,12 +77,13 @@ fn supported_inputs(
     batch > 0
         && hq > 0
         && hkv > 0
-        && tq > 0
-        && tk > 0
+        && (2..=4).contains(&tq)
+        && tk > 2048
         && hq % hkv == 0
-        && dim > 0
+        && hq / hkv <= 32
+        && dim >= 32
         && dim <= 256
-        && dim % 2 == 0
+        && dim % 32 == 0
         && (dim & (dim - 1)) == 0
         && dim as u32 == params.head_dim
         && k_batch == batch
@@ -90,7 +91,7 @@ fn supported_inputs(
         && v_shape == k_shape
         && kr_shape == [batch, hkv, tk, 1]
         && vr_shape == [batch, hkv, tk, 1]
-        && (!causal || tk >= tq)
+        && causal
         && params.codebook.centroids.len() == 16
 }
 
@@ -127,13 +128,13 @@ mod tests {
     use super::parse_fused_attention_enabled;
 
     #[test]
-    fn turbo4_production_gate_is_default_off_and_accepts_only_true_literals() {
-        assert!(!parse_fused_attention_enabled(None, false));
-        for value in ["1", "true", "on", "yes", " TRUE "] {
-            assert!(parse_fused_attention_enabled(Some(value), false));
+    fn turbo4_mtp_verify_gate_is_default_on_and_accepts_false_literals() {
+        assert!(parse_fused_attention_enabled(None));
+        for value in ["1", "true", "on", "yes", "", "invalid"] {
+            assert!(parse_fused_attention_enabled(Some(value)));
         }
-        for value in ["0", "false", "off", "no", "", "invalid"] {
-            assert!(!parse_fused_attention_enabled(Some(value), false));
+        for value in ["0", "false", "off", "no", " FALSE "] {
+            assert!(!parse_fused_attention_enabled(Some(value)));
         }
     }
 }
