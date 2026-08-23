@@ -168,16 +168,17 @@ constexpr const char* TURBO4_MTP_VERIFY_PARTIAL_SOURCE = R"(
     }
 )";
 
-// Stable oMLX-style second pass. Thirty-two SIMDgroups reduce block-local
-// states in parallel, then transpose their value accumulators through
-// threadgroup memory for the final SIMD reductions.
+// Eight SIMDgroups reduce block-local FP16 value partials in parallel. One
+// SIMDgroup then applies the shared softmax corrections and writes the
+// normalized FP32 output, requiring a single threadgroup synchronization.
 constexpr const char* TURBO4_MTP_VERIFY_MERGE_SOURCE = R"(
-    constexpr int BN = 32;
-    constexpr int BD = 32;
-    constexpr int ElementsPerThread = Dim / BD;
+    constexpr uint BN = 8;
+    constexpr uint ElementsPerThread = Dim / 32;
 
     float value[ElementsPerThread] = {};
-    threadgroup float outputs[BN * BD];
+    threadgroup float partial_values[BN * Dim];
+    threadgroup float simd_maxs[BN];
+    threadgroup float simd_sums[BN];
 
     uint row = threadgroup_position_in_grid.x;
     uint simd_group = simdgroup_index_in_threadgroup;
@@ -188,7 +189,7 @@ constexpr const char* TURBO4_MTP_VERIFY_MERGE_SOURCE = R"(
     float max_score = -INFINITY;
     float sum_score = 0.0f;
 
-    for (uint block = simd_group; block < (uint)Blocks; block += (uint)BN) {
+    for (uint block = simd_group; block < (uint)Blocks; block += BN) {
         float block_max = maxs[block];
         float block_sum = sums[block];
         float next_max = fmax(max_score, block_max);
@@ -204,30 +205,35 @@ constexpr const char* TURBO4_MTP_VERIFY_MERGE_SOURCE = R"(
         max_score = next_max;
     }
 
-    threadgroup float simd_maxs[BN];
-    threadgroup float simd_sums[BN];
     if (lane == 0u) {
         simd_maxs[simd_group] = max_score;
         simd_sums[simd_group] = sum_score;
     }
+    for (uint i = 0; i < (uint)ElementsPerThread; i++) {
+        partial_values[(simd_group * (uint)Dim)
+                       + lane * (uint)ElementsPerThread + i] = value[i];
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float group_max = simd_max(simd_maxs[lane]);
-    float group_correction = exp2(simd_maxs[lane] - group_max);
-    float total_sum = simd_sum(simd_sums[lane] * group_correction);
-    float my_correction = exp2(max_score - group_max);
-
-    for (uint i = 0; i < (uint)ElementsPerThread; i++) {
-        outputs[lane * (uint)BD + simd_group] = value[i] * my_correction;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        value[i] = simd_sum(outputs[simd_group * (uint)BD + lane]);
-        value[i] = total_sum > 0.0f ? value[i] / total_sum : 0.0f;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    if (lane == 0u) {
+    if (simd_group == 0u) {
+        float lane_max = lane < BN ? simd_maxs[lane] : -INFINITY;
+        float group_max = simd_max(lane_max);
+        float lane_correction = lane < BN
+            ? exp2(simd_maxs[lane] - group_max)
+            : 0.0f;
+        float lane_sum = lane < BN
+            ? simd_sums[lane] * lane_correction
+            : 0.0f;
+        float total_sum = simd_sum(lane_sum);
         for (uint i = 0; i < (uint)ElementsPerThread; i++) {
-            out[row * (uint)Dim + simd_group * (uint)ElementsPerThread + i] = value[i];
+            uint d = lane * (uint)ElementsPerThread + i;
+            float merged = 0.0f;
+            for (uint group = 0; group < BN; group++) {
+                merged += partial_values[group * (uint)Dim + d]
+                    * simd_broadcast(lane_correction, group);
+            }
+            out[row * (uint)Dim + d] =
+                total_sum > 0.0f ? merged / total_sum : 0.0f;
         }
     }
 )";
@@ -414,8 +420,8 @@ mlx::core::array turbo4_attention(
         {partials[0], partials[1], partials[2]},
         {Shape{batch, hq, tq, dim}},
         {mlx::core::float32},
-        std::make_tuple(rows * 1024, 1, 1),
-        std::make_tuple(1024, 1, 1),
+        std::make_tuple(rows * 256, 1, 1),
+        std::make_tuple(256, 1, 1),
         merge_template_args,
         std::nullopt,
         false,
