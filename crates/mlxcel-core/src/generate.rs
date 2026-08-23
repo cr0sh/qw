@@ -384,9 +384,9 @@ fn logits_at_position(logits: &MlxArray, pos: usize) -> UniquePtr<MlxArray> {
 }
 
 /// Default cache-level prefill chunk for the single-sequence CLI/bench path.
-/// 2304 avoids a small third graph for common 4K prompts while bounding
-/// long-context transient memory. The server uses its own chunk setting.
-pub const DEFAULT_PREFILL_CHUNK: usize = 2304;
+/// 1536 bounds graph growth for ordinary prompts and long-context prefill.
+/// The server uses its own chunk setting.
+pub const DEFAULT_PREFILL_CHUNK: usize = 1536;
 
 /// Cache-level prefill chunk length for the single-sequence CLI/bench path,
 /// from `MLXCEL_PREFILL_CHUNK` (tokens). Unset defaults to
