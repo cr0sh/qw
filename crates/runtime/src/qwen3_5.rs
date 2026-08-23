@@ -265,6 +265,7 @@ impl Qwen35Config {
 
 pub(crate) struct GdnRollbackSnapshot {
     layer_idx: usize,
+    batch: i32,
     q: UniquePtr<MlxArray>,
     k: UniquePtr<MlxArray>,
     v: UniquePtr<MlxArray>,
@@ -592,7 +593,7 @@ impl Qwen35GatedDeltaNet {
                 if state_shape[0] != b {
                     None
                 } else {
-                    Some(mlxcel_core::copy(s))
+                    Some(mlxcel_core::share(s))
                 }
             })
         });
@@ -607,6 +608,7 @@ impl Qwen35GatedDeltaNet {
         if let Some((layer_idx, snapshots)) = snapshot {
             snapshots.push(GdnRollbackSnapshot {
                 layer_idx,
+                batch: b,
                 q: mlxcel_core::share(&q),
                 k: mlxcel_core::share(&k),
                 v: mlxcel_core::share(&v),
@@ -1322,7 +1324,7 @@ impl Qwen35Model {
             );
             let position_ids =
                 rope_delta.map(|delta| decode_rope_positions(cache_offset, seq_len, delta));
-            let mut gdn_states = Vec::new();
+            let mut gdn_states = Vec::with_capacity(self.layers.len());
             for (layer_idx, (layer, cache)) in self.layers.iter().zip(caches.iter_mut()).enumerate()
             {
                 hidden = layer.forward_with_capture(
@@ -1556,35 +1558,31 @@ impl Qwen35Model {
                     continue;
                 };
                 let replay_len = plan.accepted_block_len;
-                let q_shape = mlxcel_core::array_shape(&snapshot.q);
-                let k_shape = mlxcel_core::array_shape(&snapshot.k);
-                let v_shape = mlxcel_core::array_shape(&snapshot.v);
-                let a_shape = mlxcel_core::array_shape(&snapshot.a);
-                let b_shape = mlxcel_core::array_shape(&snapshot.b);
+                let batch = snapshot.batch;
                 let q = mlxcel_core::slice(
                     &snapshot.q,
                     &[0, 0, 0, 0],
-                    &[q_shape[0], replay_len, q_shape[2], q_shape[3]],
+                    &[batch, replay_len, layer.num_k_heads as i32, layer.head_k_dim as i32],
                 );
                 let k = mlxcel_core::slice(
                     &snapshot.k,
                     &[0, 0, 0, 0],
-                    &[k_shape[0], replay_len, k_shape[2], k_shape[3]],
+                    &[batch, replay_len, layer.num_k_heads as i32, layer.head_k_dim as i32],
                 );
                 let v = mlxcel_core::slice(
                     &snapshot.v,
                     &[0, 0, 0, 0],
-                    &[v_shape[0], replay_len, v_shape[2], v_shape[3]],
+                    &[batch, replay_len, layer.num_v_heads as i32, layer.head_v_dim as i32],
                 );
                 let a = mlxcel_core::slice(
                     &snapshot.a,
                     &[0, 0, 0],
-                    &[a_shape[0], replay_len, a_shape[2]],
+                    &[batch, replay_len, layer.num_v_heads as i32],
                 );
                 let b = mlxcel_core::slice(
                     &snapshot.b,
                     &[0, 0, 0],
-                    &[b_shape[0], replay_len, b_shape[2]],
+                    &[batch, replay_len, layer.num_v_heads as i32],
                 );
                 let (_, replayed_state) = gated_delta_update(
                     (&q, &k, &v),
@@ -1594,13 +1592,12 @@ impl Qwen35Model {
                 );
                 cache.state_cache = Some(replayed_state);
 
-                let conv_shape = mlxcel_core::array_shape(&snapshot.conv_input);
                 let start = plan.accepted_block_len;
                 let end = start + layer.conv_kernel_size as i32 - 1;
                 let conv_state = mlxcel_core::slice(
                     &snapshot.conv_input,
                     &[0, start, 0],
-                    &[conv_shape[0], end, conv_shape[2]],
+                    &[batch, end, layer.conv_dim as i32],
                 );
                 cache.conv_state = Some(mlxcel_core::contiguous(&conv_state, false));
                 cache.offset = plan.final_offset;
