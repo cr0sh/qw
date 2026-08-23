@@ -1322,7 +1322,7 @@ impl Qwen35Model {
             );
             let position_ids =
                 rope_delta.map(|delta| decode_rope_positions(cache_offset, seq_len, delta));
-            let mut gdn_states = Vec::new();
+            let mut gdn_states = Vec::with_capacity(self.layers.len());
             for (layer_idx, (layer, cache)) in self.layers.iter().zip(caches.iter_mut()).enumerate()
             {
                 hidden = layer.forward_with_capture(
