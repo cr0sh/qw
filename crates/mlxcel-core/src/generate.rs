@@ -383,14 +383,15 @@ fn logits_at_position(logits: &MlxArray, pos: usize) -> UniquePtr<MlxArray> {
     ffi::slice(logits, &[0, pos as i32, 0], &[batch, pos as i32 + 1, vocab])
 }
 
-/// Default cache-level prefill chunk for the single-sequence CLI/bench path,
-/// matching upstream mlx-lm/mlx-vlm's `DEFAULT_PREFILL_STEP_SIZE` (issue
-/// #674). The server uses its own `prefill_chunk_size` (default 512).
+/// Default cache-level prefill chunk for non-Metal single-sequence paths,
+/// matching upstream mlx-lm/mlx-vlm. Metal uses a smaller measured default;
+/// the server uses its own `prefill_chunk_size`.
 pub const DEFAULT_PREFILL_CHUNK: usize = 2048;
+const DEFAULT_METAL_PREFILL_CHUNK: usize = 1536;
 
 /// Cache-level prefill chunk length for the single-sequence CLI/bench path,
-/// from `MLXCEL_PREFILL_CHUNK` (tokens). Unset defaults to
-/// [`DEFAULT_PREFILL_CHUNK`]; `0` forces single-pass prefill.
+/// from `MLXCEL_PREFILL_CHUNK` (tokens). Unset defaults to 1536 on Metal and
+/// [`DEFAULT_PREFILL_CHUNK`] elsewhere; `0` forces single-pass prefill.
 ///
 /// When enabled, the prompt is fed through `forward_last_logits` in chunks of
 /// this many tokens, evaluating each chunk before the next so the lazy graph
@@ -407,7 +408,13 @@ pub fn prefill_chunk_len() -> usize {
         std::env::var("MLXCEL_PREFILL_CHUNK")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(DEFAULT_PREFILL_CHUNK)
+            .unwrap_or_else(|| {
+                if ffi::metal_is_available() {
+                    DEFAULT_METAL_PREFILL_CHUNK
+                } else {
+                    DEFAULT_PREFILL_CHUNK
+                }
+            })
     });
     *CHUNK
 }

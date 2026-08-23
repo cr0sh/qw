@@ -16,6 +16,7 @@ use support::{
 };
 
 const LONG_CONTEXT_ONLY_ENV: &str = "QW_BENCH_LONG_CONTEXT_ONLY";
+const FRESH_PREFILL_ONLY_ENV: &str = "QW_BENCH_FRESH_PREFILL_ONLY";
 
 struct GenerationElements {
     prefill: u64,
@@ -264,6 +265,18 @@ fn single_user_throughput(criterion: &mut Criterion) {
             panic!("{LONG_CONTEXT_ONLY_ENV} must contain valid Unicode")
         }
     };
+    let fresh_prefill_only = match env::var(FRESH_PREFILL_ONLY_ENV) {
+        Ok(value) if value == "1" => true,
+        Ok(value) => panic!("{FRESH_PREFILL_ONLY_ENV} must be `1` when set, got `{value}`"),
+        Err(env::VarError::NotPresent) => false,
+        Err(env::VarError::NotUnicode(_)) => {
+            panic!("{FRESH_PREFILL_ONLY_ENV} must contain valid Unicode")
+        }
+    };
+    assert!(
+        !(long_context_only && fresh_prefill_only),
+        "{LONG_CONTEXT_ONLY_ENV} and {FRESH_PREFILL_ONLY_ENV} cannot both be set"
+    );
     let mut provider = support::load_provider();
     if long_context_only {
         let long_64k =
@@ -417,6 +430,10 @@ fn single_user_throughput(criterion: &mut Criterion) {
         });
         group.finish();
     }
+    if fresh_prefill_only {
+        return;
+    }
+
 
     let long_10k = prepare_long_conversation_fixture(&mut provider, "10k", LONG_CONTEXT_MIN_TOKENS);
     assert!(long_10k.prefix_tokens >= LONG_CONTEXT_MIN_TOKENS);
