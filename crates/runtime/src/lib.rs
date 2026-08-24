@@ -43,6 +43,8 @@ pub use model_resolver::{
 pub use specprefill::{
     PrefillMode, SPECPREFILL_DRAFT_MODEL_IDENTIFIER, SpecPrefillConfig, SpecPrefillStats,
 };
-pub use portable_snapshot::{PortableArray, PortableModelState, PortablePromptSnapshot};
+pub use portable_snapshot::{
+    PortableArray, PortableModelState, PortablePage, PortablePagedTensor, PortablePromptSnapshot,
+};
 pub use qwen_vl::{ExpandedImageTokens, insert_qwen_vl_image_tokens};
 pub use qwen_vl_processor::{PreparedImage, QwenVLProcessor};
