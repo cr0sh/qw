@@ -31,7 +31,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
-
+use tracing::Level;
 use crate::cache::{CachePool, KVCacheMode, SequenceId};
 use crate::ffi;
 use crate::ffi::{MlxArray, MlxThreadLocalStream};
@@ -151,10 +151,22 @@ impl SnapshotPage {
     pub fn portable_bytes(&self) -> Arc<[u8]> {
         self.portable
             .get_or_init(|| {
+                let trace_enabled = tracing::enabled!(Level::DEBUG);
+                let started = trace_enabled.then(Instant::now);
                 ffi::eval(self.array.as_ref().expect("page array"));
-                Arc::<[u8]>::from(ffi::array_to_raw_bytes(
+                let bytes = Arc::<[u8]>::from(ffi::array_to_raw_bytes(
                     self.array.as_ref().expect("page array"),
-                ))
+                ));
+                if let Some(started) = started {
+                    tracing::debug!(
+                        phase = "snapshot.page_materialize",
+                        token_start = self.token_start,
+                        token_end = self.token_end,
+                        page_bytes = bytes.len(),
+                        duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
+                    );
+                }
+                bytes
             })
             .clone()
     }
@@ -177,13 +189,25 @@ impl SnapshotPagedTensor {
         let mut seen = HashSet::new();
         self.pages.iter().filter(|p| seen.insert(p.identity())).map(|p| p.nbytes()).sum()
     }
-
     /// Gather pages only when a dense attention boundary requires it.
     pub fn materialize(&self) -> Option<UniquePtr<MlxArray>> {
         let first = self.pages.first()?.array();
+        let trace_enabled = tracing::enabled!(Level::DEBUG);
+        let started = trace_enabled.then(Instant::now);
         let mut dense = ffi::copy(first);
         for page in self.pages.iter().skip(1) {
             dense = crate::concatenate(&dense, page.array(), self.token_axis as i32);
+        }
+        if let Some(started) = started {
+            let page_bytes = self.pages.iter().map(|page| page.nbytes()).sum::<usize>();
+            tracing::debug!(
+                phase = "snapshot.sparse_materialize",
+                tensor = %self.name,
+                page_count = self.pages.len(),
+                page_bytes,
+                token_len = self.token_len,
+                duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
+            );
         }
         Some(dense)
     }
@@ -209,6 +233,11 @@ impl ModelStateSnapshot {
         }
         let token_len = self.token_len.min(shape[token_axis].max(0) as usize);
         let old = previous.and_then(|s| s.paged_tensors.iter().find(|t| t.name == name));
+        let trace_enabled = tracing::enabled!(Level::DEBUG);
+        let started = trace_enabled.then(Instant::now);
+        let mut reused_pages = 0usize;
+        let mut new_pages = 0usize;
+        let mut new_page_bytes = 0usize;
         let mut pages = Vec::with_capacity(token_len.div_ceil(SNAPSHOT_PAGE_TOKENS));
         let mut start = 0;
         while start < token_len {
@@ -221,15 +250,37 @@ impl ModelStateSnapshot {
                             && p.dtype() == ffi::array_dtype(array))
                 });
             if reusable {
-                pages.push(old.unwrap().pages.iter().find(|p| p.token_range() == (start..end)).unwrap().clone());
+                let page = old.unwrap().pages.iter().find(|p| p.token_range() == (start..end)).unwrap().clone();
+                if trace_enabled {
+                    reused_pages += 1;
+                }
+                pages.push(page);
             } else {
                 let mut lo = vec![0; shape.len()];
                 let mut hi = shape.clone();
                 hi[token_axis] = end as i32;
                 lo[token_axis] = start as i32;
-                pages.push(SnapshotPage::new(start, end, ffi::slice(array, &lo, &hi)));
+                let page = SnapshotPage::new(start, end, ffi::slice(array, &lo, &hi));
+                if trace_enabled {
+                    new_pages += 1;
+                    new_page_bytes += page.nbytes();
+                }
+                pages.push(page);
             }
             start = end;
+        }
+        if let Some(started) = started {
+            let logical_bytes = pages.iter().map(|page| page.nbytes()).sum::<usize>();
+            tracing::debug!(
+                phase = "snapshot.sparse_capture",
+                tensor = %name,
+                token_len,
+                logical_bytes,
+                reused_pages,
+                new_pages,
+                new_page_bytes,
+                duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
+            );
         }
         self.paged_tensors.push(SnapshotPagedTensor { name, token_axis, token_len, pages });
         Ok(())
