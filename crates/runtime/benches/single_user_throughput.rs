@@ -255,6 +255,51 @@ fn benchmark_long_conversation(
         group.finish();
     }
 }
+const FRESH_MTP_BENCHMARK: &str = "single_user_decode/fresh_mtp_k3";
+
+fn is_exclusive_fresh_mtp_selection() -> bool {
+    env::args().skip(1).any(|arg| arg == FRESH_MTP_BENCHMARK)
+}
+
+fn benchmark_fresh_mtp(
+    criterion: &mut Criterion,
+    provider: &mut Qwen35Provider,
+    decode_request: &qw_runtime::GenerationRequest,
+    mtp_token_ids: &[i32],
+    mtp_decode_tokens: usize,
+) {
+    let mut group = criterion.benchmark_group("single_user_decode");
+    group.throughput(Throughput::Elements(mtp_decode_tokens as u64));
+    // Report tokens per second against the MTP decode phase only. The
+    // generation call still executes prompt preparation and prefill.
+    group.bench_function("fresh_mtp_k3", |bencher| {
+        bencher.iter_custom(|iters| {
+            let mut decode_time = Duration::ZERO;
+            for _ in 0..iters {
+                let (output, stats) = provider
+                    .generate_streaming_in_mode(
+                        decode_request,
+                        Qwen35GenerationMode::Mtp,
+                        |delta| {
+                            black_box(delta);
+                            true
+                        },
+                    )
+                    .unwrap_or_else(|error| panic!("benchmark MTP k={MTP_BLOCK_SIZE}: {error:#}"));
+                assert_eq!(
+                    &output.token_ids, mtp_token_ids,
+                    "deterministic bundled-MTP k={MTP_BLOCK_SIZE} greedy token IDs changed"
+                );
+                decode_time += stats
+                    .expect("explicit MTP mode must return MTP statistics")
+                    .decode_time;
+                black_box(output);
+            }
+            decode_time
+        });
+    });
+    group.finish();
+}
 
 fn single_user_throughput(criterion: &mut Criterion) {
     let long_context_only = match env::var(LONG_CONTEXT_ONLY_ENV) {
@@ -278,6 +323,18 @@ fn single_user_throughput(criterion: &mut Criterion) {
         "{LONG_CONTEXT_ONLY_ENV} and {FRESH_PREFILL_ONLY_ENV} cannot both be set"
     );
     let mut provider = support::load_provider();
+    if is_exclusive_fresh_mtp_selection() {
+        let decode_fixture = prepare_decode_fixture(&mut provider);
+        benchmark_fresh_mtp(
+            criterion,
+            &mut provider,
+            &decode_fixture.request,
+            &decode_fixture.mtp_token_ids,
+            decode_fixture.mtp_decode_tokens,
+        );
+        return;
+    }
+
     if long_context_only {
         let long_64k =
             prepare_long_conversation_fixture(&mut provider, "64k", LONG_CONTEXT_64K_MIN_TOKENS);
@@ -434,7 +491,6 @@ fn single_user_throughput(criterion: &mut Criterion) {
         return;
     }
 
-
     let long_10k = prepare_long_conversation_fixture(&mut provider, "10k", LONG_CONTEXT_MIN_TOKENS);
     assert!(long_10k.prefix_tokens >= LONG_CONTEXT_MIN_TOKENS);
     let long_64k =
@@ -483,41 +539,13 @@ fn single_user_throughput(criterion: &mut Criterion) {
         group.finish();
     }
 
-    {
-        let mut group = criterion.benchmark_group("single_user_decode");
-        group.throughput(Throughput::Elements(mtp_decode_tokens as u64));
-        // Report tokens per second against the MTP decode phase only. The
-        // generation call still executes prompt preparation and prefill.
-        group.bench_function("fresh_mtp_k3", |bencher| {
-            bencher.iter_custom(|iters| {
-                let mut decode_time = Duration::ZERO;
-                for _ in 0..iters {
-                    let (output, stats) = provider
-                        .generate_streaming_in_mode(
-                            &decode_request,
-                            Qwen35GenerationMode::Mtp,
-                            |delta| {
-                                black_box(delta);
-                                true
-                            },
-                        )
-                        .unwrap_or_else(|error| {
-                            panic!("benchmark MTP k={MTP_BLOCK_SIZE}: {error:#}")
-                        });
-                    assert_eq!(
-                        &output.token_ids, &mtp_token_ids,
-                        "deterministic bundled-MTP k={MTP_BLOCK_SIZE} greedy token IDs changed"
-                    );
-                    decode_time += stats
-                        .expect("explicit MTP mode must return MTP statistics")
-                        .decode_time;
-                    black_box(output);
-                }
-                decode_time
-            });
-        });
-        group.finish();
-    }
+    benchmark_fresh_mtp(
+        criterion,
+        &mut provider,
+        &decode_request,
+        &mtp_token_ids,
+        mtp_decode_tokens,
+    );
 
     benchmark_long_conversation(criterion, &mut provider, &long_10k);
     benchmark_long_conversation(criterion, &mut provider, &long_64k);
