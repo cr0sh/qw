@@ -1735,12 +1735,15 @@ fn capture_mtp_prompt_snapshot(
     drafter: &Qwen35MtpDraftModel,
     token_len: usize,
     prefill: &crate::qwen3_5::Qwen35MtpPrefill,
+    previous: Option<&MtpPromptSnapshot>,
 ) -> Option<MtpPromptSnapshot> {
-    let target =
-        model.snapshot_sequence_state(mlxcel_core::cache::SequenceId::from_raw(0), token_len)?;
+    let target = model.snapshot_sequence_state(
+        mlxcel_core::cache::SequenceId::from_raw(0),
+        token_len,
+        previous.map(MtpPromptSnapshot::target_snapshot),
+    )?;
     let shape = mlxcel_core::array_shape(&prefill.hidden);
     let last = shape[1] - 1;
-
     let last_hidden = mlxcel_core::slice(
         &prefill.hidden,
         &[0, last, 0],
@@ -1792,7 +1795,13 @@ fn prefill_text_with_checkpoints(
         }
         let requested = checkpoint_token_lengths.binary_search(&token_len).is_ok();
         if requested {
-            let snapshot = capture_mtp_prompt_snapshot(model, drafter, token_len, &prefill)
+            let snapshot = capture_mtp_prompt_snapshot(
+                model,
+                drafter,
+                token_len,
+                &prefill,
+                snapshots.last(),
+            )
                 .ok_or_else(|| format!("failed to capture MTP checkpoint at {token_len} tokens"))?;
             if token_len == prompt_tokens.len() {
                 snapshots.push(snapshot);
@@ -1933,7 +1942,11 @@ fn capture_mtp_snapshot_from_verify(
     };
     model.materialize_mtp_cache_state();
     let target = model
-        .snapshot_sequence_state(mlxcel_core::cache::SequenceId::from_raw(0), token_len)
+        .snapshot_sequence_state(
+            mlxcel_core::cache::SequenceId::from_raw(0),
+            token_len,
+            None,
+        )
         .ok_or_else(|| "failed to capture aligned MTP target state".to_string())?;
     drafter
         .capture_prompt_snapshot(target, token_len, &last_hidden, &continuation_logits)
@@ -1965,15 +1978,17 @@ fn capture_mtp_final_snapshot(
         None => prefill_for_input(model, drafter, prefill_input)?,
     };
     if generated.len() == 1 {
-        let snapshot = capture_mtp_prompt_snapshot(model, drafter, prompt_tokens.len(), &prefill)
-            .map(Some)
-            .ok_or_else(|| "failed to capture aligned MTP final snapshot".to_string())?;
+        let snapshot = capture_mtp_prompt_snapshot(
+            model,
+            drafter,
+            prompt_tokens.len(),
+            &prefill,
+            None,
+        )
+        .map(Some)
+        .ok_or_else(|| "failed to capture aligned MTP final snapshot".to_string())?;
         debug!(
-            phase = "mtp.final_snapshot.complete",
-            token_len = snapshot
-                .as_ref()
-                .expect("MTP final snapshot must be present")
-                .token_len(),
+            token_len = snapshot.as_ref().expect("MTP final snapshot must be present").token_len(),
             elapsed_seconds = snapshot_start.elapsed().as_secs_f64(),
         );
         return Ok(snapshot);
@@ -2014,7 +2029,11 @@ fn capture_mtp_final_snapshot(
     );
     let token_len = prompt_tokens.len() + generated.len() - 1;
     let target = model
-        .snapshot_sequence_state(mlxcel_core::cache::SequenceId::from_raw(0), token_len)
+        .snapshot_sequence_state(
+            mlxcel_core::cache::SequenceId::from_raw(0),
+            token_len,
+            None,
+        )
         .ok_or_else(|| "failed to capture aligned MTP target state".to_string())?;
     let snapshot = drafter
         .capture_prompt_snapshot(target, token_len, &last_hidden, &continuation_logits)
