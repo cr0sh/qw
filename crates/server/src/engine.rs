@@ -19,7 +19,7 @@ use qw_runtime::ChatMessage;
 use qw_runtime::{PrefillMode, SpecPrefillConfig};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{Span, debug, error, info, info_span, warn};
+use tracing::{Span, debug, error, info, info_span, trace, warn};
 
 use crate::grammar::GrammarFactory;
 #[cfg(test)]
@@ -91,6 +91,15 @@ pub(super) fn log_generation_metrics(
         total_tokens = prompt_tokens,
         prefilled_tokens = metrics.prefilled_tokens,
         prefix_reused_tokens = metrics.prefix_reused_tokens,
+    );
+    trace!(
+        event = "ttft.prefill",
+        chat_id,
+        prompt_tokens,
+        cached_tokens,
+        prefilled_tokens = metrics.prefilled_tokens,
+        prefill_duration_ms = prefill_time.as_secs_f64() * 1_000.0,
+        cache_reused = cached_tokens > 0,
     );
     info!(
         event = "decode.complete",

@@ -6,8 +6,11 @@ use clap_derive::{Args as DeriveArgs, ValueEnum};
 use qw_prefix_cache::CacheConfig;
 use qw_runtime::{KVCacheMode, resolve_model_path};
 use tracing::info;
-use tracing_subscriber::EnvFilter;
-
+use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
+use tracing_subscriber::{EnvFilter, fmt, registry};
+use tracing_subscriber::Layer as _;
 use crate::{Engine, router};
 #[cfg(feature = "specprefill")]
 use crate::SpecPrefillPolicyConfig;
@@ -68,6 +71,10 @@ pub struct ServerArgs {
     #[arg(long)]
     no_kv_quantization: bool,
 
+    /// Disable the daily trace log file under `~/.cache/qw/logs`.
+    #[arg(long)]
+    no_file_logging: bool,
+
     /// Tracing output format.
     #[arg(long, value_enum, default_value = "human")]
     output_format: OutputFormat,
@@ -115,18 +122,58 @@ fn default_prefix_cache_directory() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".cache/qw/checkpoint"))
 }
 
+fn init_tracing(cli: &ServerArgs) -> Result<Option<WorkerGuard>> {
+    let file_guard = if cli.no_file_logging {
+        None
+    } else {
+        let home = std::env::var_os("HOME")
+            .filter(|home| !home.is_empty())
+            .context("HOME is not set; cannot resolve the trace log directory")?;
+        let log_directory = PathBuf::from(home).join(".cache/qw/logs");
+        std::fs::create_dir_all(&log_directory)
+            .with_context(|| format!("failed to create {}", log_directory.display()))?;
+        let appender = tracing_appender::rolling::daily(log_directory, "qw.log");
+        let (non_blocking, guard) = tracing_appender::non_blocking(appender);
+        let file_layer = fmt::layer()
+            .with_ansi(false)
+            .with_writer(non_blocking)
+            .with_filter(tracing_subscriber::filter::LevelFilter::TRACE);
+        match cli.output_format {
+            OutputFormat::Human => registry()
+                .with(fmt::layer().with_filter(EnvFilter::from_default_env()))
+                .with(file_layer)
+                .init(),
+            OutputFormat::Json => registry()
+                .with(
+                    fmt::layer()
+                        .json()
+                        .with_filter(EnvFilter::from_default_env()),
+                )
+                .with(file_layer)
+                .init(),
+        }
+        Some(guard)
+    };
+    if cli.no_file_logging {
+        match cli.output_format {
+            OutputFormat::Human => fmt::init(),
+            OutputFormat::Json => fmt::Subscriber::builder()
+                .with_env_filter(EnvFilter::from_default_env())
+                .json()
+                .init(),
+        }
+    }
+    Ok(file_guard)
+}
+
 fn resolve_prefix_cache_directory(directory: Option<PathBuf>) -> Result<PathBuf> {
     directory
         .map(Ok)
         .unwrap_or_else(default_prefix_cache_directory)
 }
-
 pub async fn serve(cli: ServerArgs) -> Result<()> {
     validate_cli(&cli)?;
-    match cli.output_format {
-        OutputFormat::Human => tracing_subscriber::fmt::init(),
-        OutputFormat::Json => tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env()).json().init(),
-    }
+    let _file_guard = init_tracing(&cli)?;
     let bind: SocketAddr = cli
         .bind
         .parse()
