@@ -3,9 +3,8 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-
 use mlxcel_core::generate::ModelStateSnapshot;
-
+use crate::codec::ContentBlob;
 use super::*;
 
 #[derive(Clone)]
@@ -127,7 +126,7 @@ fn persistent_store_contract_requires_no_filesystem_types() {
 
 #[derive(Default)]
 struct RecordingState {
-    entries: HashMap<EntryKey, (Vec<u8>, Vec<Vec<u8>>)>,
+    entries: HashMap<EntryKey, (Vec<u8>, Vec<ContentBlob>)>,
     refreshes: Vec<(EntryKey, u64)>,
 }
 
@@ -501,15 +500,16 @@ fn mtp_manifest_round_trip_preserves_route_and_offset_validation() {
         dtype: mlxcel_core::dtype::FLOAT32,
         bytes,
     };
+    let model = || qw_runtime::PortableModelState {
+        family: "test".to_string(),
+        token_len: 1,
+        tensors: Vec::new(),
+        paged_tensors: Vec::new(),
+        continuation_logits: None,
+    };
     let portable = qw_runtime::PortablePromptSnapshot::Mtp {
-        target: qw_runtime::PortableModelState {
-            family: "test".to_string(),
-            token_len: 1,
-            tensors: Vec::new(),
-            continuation_logits: None,
-        },
-        draft_keys: None,
-        draft_values: None,
+        target: model(),
+        draft: model(),
         draft_offset: 0,
         last_hidden: array(vec![0; 8]),
         continuation_logits: array(vec![1; 8]),
