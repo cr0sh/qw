@@ -695,7 +695,11 @@ fn prefill_with_checkpoints<M: LanguageModel + ?Sized>(
             logits
         };
         if checkpoint_token_lengths.binary_search(&range_end).is_ok()
-            && let Some(mut snapshot) = model.snapshot_sequence_state(sequence_id, range_end)
+            && let Some(mut snapshot) = model.snapshot_sequence_state(
+                sequence_id,
+                range_end,
+                snapshots.last(),
+            )
         {
             snapshot.set_continuation_logits(
                 piece_logits
@@ -943,6 +947,7 @@ pub trait LanguageModel {
         &self,
         _seq_id: SequenceId,
         _token_len: usize,
+        _previous: Option<&ModelStateSnapshot>,
     ) -> Option<ModelStateSnapshot> {
         None
     }
@@ -1747,7 +1752,7 @@ impl CxxGenerator {
                 .all(|snapshot| snapshot.token_len() != prompt_tokens.len())
         {
             if let Some(mut snapshot) =
-                model.snapshot_sequence_state(sequence_id, prompt_tokens.len())
+                model.snapshot_sequence_state(sequence_id, prompt_tokens.len(), prompt_snapshots.last())
             {
                 snapshot.set_continuation_logits(
                     logits.as_ref().expect("generation logits must not be null"),
@@ -1905,7 +1910,7 @@ impl CxxGenerator {
         let decode_time = decode_start.elapsed();
 
         let final_snapshot = (!self.generated_tokens.is_empty() && model.supports_snapshot_reuse())
-            .then(|| model.snapshot_sequence_state(sequence_id, aligned_token_len))
+            .then(|| model.snapshot_sequence_state(sequence_id, aligned_token_len, prompt_snapshots.last()))
             .flatten()
             .map(|mut snapshot| {
                 snapshot.set_continuation_logits(
@@ -2022,7 +2027,7 @@ impl CxxGenerator {
         }
         let retain_prompt_snapshot = constraint.is_some() && model.supports_snapshot_reuse();
         let mut prompt_snapshot = retain_prompt_snapshot
-            .then(|| model.snapshot_sequence_state(sequence_id, prompt_tokens.len()))
+            .then(|| model.snapshot_sequence_state(sequence_id, prompt_tokens.len(), None))
             .flatten();
         if let Some(snapshot) = prompt_snapshot.as_mut() {
             snapshot.set_continuation_logits(
@@ -3308,6 +3313,7 @@ mod tests {
             &self,
             _seq_id: SequenceId,
             token_len: usize,
+            _previous: Option<&ModelStateSnapshot>,
         ) -> Option<ModelStateSnapshot> {
             Some(ModelStateSnapshot::new("stub", token_len))
         }
@@ -3456,6 +3462,7 @@ mod tests {
             &self,
             _seq_id: SequenceId,
             token_len: usize,
+            _previous: Option<&ModelStateSnapshot>,
         ) -> Option<ModelStateSnapshot> {
             self.snapshot_lengths
                 .borrow_mut()
