@@ -1,11 +1,11 @@
+use super::*;
+use crate::codec::ContentBlob;
+use mlxcel_core::generate::ModelStateSnapshot;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
-use mlxcel_core::generate::ModelStateSnapshot;
-use crate::codec::ContentBlob;
-use super::*;
 
 #[derive(Clone)]
 struct InfoCounter(Arc<AtomicUsize>);
@@ -63,18 +63,23 @@ fn paged_snapshot_chain() -> Vec<PromptSnapshot> {
     let values = (0..768 * 2).map(|i| i as f32).collect::<Vec<_>>();
     let array = mlxcel_core::from_slice_f32(&values, &[1, 768, 2]);
     let mut first = ModelStateSnapshot::new("test", 256);
-    first.push_paged_tensor(None, "kv", &array, 1).expect("first page");
+    first
+        .push_paged_tensor(None, "kv", &array, 1)
+        .expect("first page");
     let mut second = ModelStateSnapshot::new("test", 512);
-    second.push_paged_tensor(Some(&first), "kv", &array, 1).expect("second pages");
+    second
+        .push_paged_tensor(Some(&first), "kv", &array, 1)
+        .expect("second pages");
     let mut third = ModelStateSnapshot::new("test", 768);
-    third.push_paged_tensor(Some(&second), "kv", &array, 1).expect("third pages");
+    third
+        .push_paged_tensor(Some(&second), "kv", &array, 1)
+        .expect("third pages");
     vec![
         PromptSnapshot::Baseline(first),
         PromptSnapshot::Baseline(second),
         PromptSnapshot::Baseline(third),
     ]
 }
-
 
 fn resume_metadata(response_id: &str, fingerprint: &str) -> ResponseResumeMetadata {
     ResponseResumeMetadata {
@@ -294,7 +299,11 @@ fn divergent_long_prompt_keeps_only_full_checkpoint() {
 
     let mut divergent_prompt = prompt.clone();
     divergent_prompt[900] = 10_000;
-    assert!(cache.lookup(&divergent_prompt, SnapshotRoute::Baseline).is_none());
+    assert!(
+        cache
+            .lookup(&divergent_prompt, SnapshotRoute::Baseline)
+            .is_none()
+    );
 }
 
 #[test]
@@ -317,7 +326,6 @@ fn first_observation_of_long_prompt_is_sparse() {
 #[test]
 fn ttl_progression_expiry_and_byte_eviction_are_adaptive() {
     assert_eq!(
-
         (0..8).map(reuse_ttl_ms).collect::<Vec<_>>(),
         vec![
             2 * 60 * 60 * 1000,
@@ -348,7 +356,10 @@ fn ttl_progression_expiry_and_byte_eviction_are_adaptive() {
         0,
         "snapshot-byte budget evicts oversized state"
     );
-    assert!(cache.memory_pages.is_empty(), "evicted terminal has no page accounting");
+    assert!(
+        cache.memory_pages.is_empty(),
+        "evicted terminal has no page accounting"
+    );
 
     let mut cache = AdaptivePrefixCache::with_store_and_clock(
         namespaces(),
@@ -424,7 +435,10 @@ fn filesystem_byte_cap_evicts_persistent_entries_by_snapshot_bytes() {
     );
     cache.flush_persistence();
     assert_eq!(cache.filesystem_bytes, 0);
-    assert!(cache.filesystem_blobs.is_empty(), "evicted terminal has no blob accounting");
+    assert!(
+        cache.filesystem_blobs.is_empty(),
+        "evicted terminal has no blob accounting"
+    );
     assert!(
         state
             .lock()
@@ -470,19 +484,16 @@ fn filesystem_restart_promotes_valid_entry_and_deletes_corrupt_payload() {
         .join(NAMESPACE)
         .join(format!("{}.json", key.0.split('/').nth(1).unwrap()));
     let manifest: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&entry_path).expect("entry manifest")).expect("manifest");
+        serde_json::from_slice(&std::fs::read(&entry_path).expect("entry manifest"))
+            .expect("manifest");
     let digest = manifest["blob_sha256"][0].as_str().expect("blob digest");
-    std::fs::write(directory.path.join("blobs").join(digest), b"corrupt")
-        .expect("corrupt blob");
+    std::fs::write(directory.path.join("blobs").join(digest), b"corrupt").expect("corrupt blob");
     {
         let mut restarted =
             AdaptivePrefixCache::new(namespaces(), config).expect("restart corrupt");
         assert!(restarted.lookup(&tokens, SnapshotRoute::Baseline).is_none());
     }
-    assert!(
-        !entry_path.exists(),
-        "corrupt entry is deletion-as-miss"
-    );
+    assert!(!entry_path.exists(), "corrupt entry is deletion-as-miss");
 }
 
 #[test]
@@ -622,7 +633,10 @@ fn filesystem_namespace_isolation_and_partial_recovery_are_misses() {
         },
     )
     .expect("recovered cache");
-    assert!(!partial.exists(), "startup removes interrupted temporary entries");
+    assert!(
+        !partial.exists(),
+        "startup removes interrupted temporary entries"
+    );
 }
 
 struct TempDirectory {
@@ -809,11 +823,7 @@ fn cache_block_churn_emits_no_info_events() {
         let mut cache =
             AdaptivePrefixCache::new(namespaces(), memory_config(1)).expect("short cache");
         let before_short = info_events.load(Ordering::Relaxed);
-        cache.insert(
-            &[1],
-            vec![snapshot(1, &[1.0])],
-            SnapshotRoute::Baseline,
-        );
+        cache.insert(&[1], vec![snapshot(1, &[1.0])], SnapshotRoute::Baseline);
         let short_events = info_events.load(Ordering::Relaxed) - before_short;
 
         let mut cache =

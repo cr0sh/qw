@@ -18,19 +18,10 @@ mod qwen_vl_processor;
 #[cfg(any(feature = "specprefill", test))]
 mod specprefill;
 
-pub mod provider;
 mod portable_snapshot;
+pub mod provider;
 
 pub use mlxcel_core::cache::KVCacheMode;
-pub use provider::{
-    BaselineGeneration, ChatContentPart, ChatContentRef, ChatCustomToolCall, ChatFile,
-    ChatImageUrl, ChatInputAudio, ChatMessage, ChatMessageContent, ChatPromptCacheBreakpoint,
-    ChatTool, ChatToolCall, ChatToolCallFunction, ChatToolFunction,
-    GenerationOutput, GenerationRequest, MtpPrefixReuse, MtpPromptSnapshot,
-    PreparedMultimodalPrefill, PromptSnapshot, Qwen35Provider,
-};
-#[cfg(any(feature = "dflash2", test))]
-pub use provider::Dflash2GenerationStats;
 pub use model_resolver::{
     DEFAULT_MODEL_IDENTIFIER, model_cache_path, resolve_model_dir, resolve_model_path,
     validate_identifier,
@@ -39,12 +30,21 @@ pub use model_resolver::{
 pub use model_resolver::{
     DEFAULT_SPECPREFILL_DRAFT_MODEL_IDENTIFIER, resolve_specprefill_draft_path,
 };
+pub use portable_snapshot::{
+    PortableArray, PortableModelState, PortablePage, PortablePagedTensor, PortablePromptSnapshot,
+};
+#[cfg(any(feature = "dflash2", test))]
+pub use provider::Dflash2GenerationStats;
+pub use provider::{
+    BaselineGeneration, ChatContentPart, ChatContentRef, ChatCustomToolCall, ChatFile,
+    ChatImageUrl, ChatInputAudio, ChatMessage, ChatMessageContent, ChatPromptCacheBreakpoint,
+    ChatTool, ChatToolCall, ChatToolCallFunction, ChatToolFunction, GenerationOutput,
+    GenerationRequest, MtpPrefixReuse, MtpPromptSnapshot, PreparedMultimodalPrefill,
+    PromptSnapshot, Qwen35Provider,
+};
+pub use qwen_vl::{ExpandedImageTokens, insert_qwen_vl_image_tokens};
+pub use qwen_vl_processor::{PreparedImage, QwenVLProcessor};
 #[cfg(any(feature = "specprefill", test))]
 pub use specprefill::{
     PrefillMode, SPECPREFILL_DRAFT_MODEL_IDENTIFIER, SpecPrefillConfig, SpecPrefillStats,
 };
-pub use portable_snapshot::{
-    PortableArray, PortableModelState, PortablePage, PortablePagedTensor, PortablePromptSnapshot,
-};
-pub use qwen_vl::{ExpandedImageTokens, insert_qwen_vl_image_tokens};
-pub use qwen_vl_processor::{PreparedImage, QwenVLProcessor};
