@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::io::{Error, ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -9,7 +10,7 @@ use clap::Parser as _;
 use clap_derive::{Args, Parser, Subcommand};
 use qw_runtime::{
     DEFAULT_MODEL_IDENTIFIER, GenerationRequest, KVCacheMode, Qwen35Provider, model_cache_path,
-    validate_identifier,
+    resolve_model_path, validate_identifier,
 };
 use qw_server::serve;
 
@@ -28,6 +29,8 @@ struct Cli {
 enum Command {
     /// Download a Hugging Face model snapshot.
     Download(DownloadArgs),
+    /// Show local cache usage and model resolver status.
+    Stats,
     /// Generate one response from a local checkpoint.
     Generate(GenerateArgs),
     /// Run the OpenAI-compatible HTTP server.
@@ -86,6 +89,61 @@ impl GenerateArgs {
 
 fn invalid_input(message: impl Into<String>) -> Error {
     Error::new(ErrorKind::InvalidInput, message.into())
+}
+fn cache_usage(path: &Path) -> Result<(u64, u64), Error> {
+    let entries = match std::fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok((0, 0)),
+        Err(error) => return Err(error),
+    };
+    let mut files = 0_u64;
+    let mut bytes = 0_u64;
+    for entry in entries {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            let (child_files, child_bytes) = cache_usage(&entry.path())?;
+            files += child_files;
+            bytes += child_bytes;
+        } else if file_type.is_file() {
+            files += 1;
+            bytes += entry.metadata()?.len();
+        }
+    }
+    Ok((files, bytes))
+}
+
+fn stats_report() -> Result<String, Box<dyn std::error::Error>> {
+    let home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| Error::new(ErrorKind::NotFound, "HOME is not set"))?;
+    let cache_root = home.join(".cache/qw");
+    let (cache_files, cache_bytes) = cache_usage(&cache_root)?;
+    let model_path = resolve_model_path(None)?;
+    let model_override = std::env::var_os("QW_MODEL_PATH")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let selected_model = model_override.as_deref().map_or_else(
+        || DEFAULT_MODEL_IDENTIFIER.to_owned(),
+        |path| path.display().to_string(),
+    );
+    let model_exists = model_path.try_exists()?;
+
+    let mut report = String::new();
+    writeln!(report, "Cache root: {}", cache_root.display())?;
+    writeln!(
+        report,
+        "Cache usage: {cache_files} files, {cache_bytes} bytes"
+    )?;
+    writeln!(report, "Selected model: {selected_model}")?;
+    writeln!(report, "Model path: {}", model_path.display())?;
+    writeln!(
+        report,
+        "Model exists locally: {}",
+        if model_exists { "yes" } else { "no" }
+    )?;
+    Ok(report)
 }
 
 fn sibling_path(destination: &Path, filename: &str) -> Result<PathBuf, Error> {
@@ -238,7 +296,9 @@ fn download_snapshot(identifier: &str) -> Result<(), Box<dyn std::error::Error>>
     let siblings = response
         .get("siblings")
         .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| Error::other("Hugging Face model API response did not contain `siblings`"))?;
+        .ok_or_else(|| {
+            Error::other("Hugging Face model API response did not contain `siblings`")
+        })?;
 
     let mut jobs = Vec::with_capacity(siblings.len());
     let mut seen = HashSet::with_capacity(siblings.len());
@@ -295,6 +355,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::Download(args) => {
             download_model(resolve_download_identifier(args.identifier.as_deref()))?;
+        }
+        Command::Stats => {
+            print!("{}", stats_report()?);
         }
         Command::Generate(args) => {
             let model = qw_runtime::resolve_model_path(args.model.as_deref())?;
@@ -412,7 +475,13 @@ mod tests {
             sibling_path(destination, "weights/model.safetensors").expect("safe sibling"),
             destination.join("weights/model.safetensors")
         );
-        for filename in ["", "/etc/passwd", "../token", "weights/../../token", r"..\token"] {
+        for filename in [
+            "",
+            "/etc/passwd",
+            "../token",
+            "weights/../../token",
+            r"..\token",
+        ] {
             assert!(
                 sibling_path(destination, filename).is_err(),
                 "{filename:?} should be rejected"
@@ -518,10 +587,10 @@ mod tests {
         .expect("parse serve command");
         assert!(matches!(cli.command, Command::Serve(_)));
     }
-
     #[test]
-    fn help_documents_serve_command_and_server_options() {
+    fn help_documents_stats_and_serve_commands_and_server_options() {
         let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("stats"), "{help}");
         assert!(help.contains("serve"), "{help}");
 
         let serve_help = Cli::try_parse_from(["qw", "serve", "--help"])
@@ -545,7 +614,10 @@ mod tests {
             "{serve_help}"
         );
         #[cfg(feature = "specprefill")]
-        assert!(serve_help.contains("--specprefill-keep-rate"), "{serve_help}");
+        assert!(
+            serve_help.contains("--specprefill-keep-rate"),
+            "{serve_help}"
+        );
         #[cfg(feature = "specprefill")]
         assert!(
             serve_help.contains("--specprefill-keep-first-tokens"),
