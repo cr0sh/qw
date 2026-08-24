@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use mlxcel_core::generate::{ModelStateSnapshot, SnapshotPage};
 use mlxcel_core::{MlxArray, UniquePtr};
@@ -12,7 +13,7 @@ pub struct PortablePage {
     pub token_end: usize,
     pub shape: Vec<i32>,
     pub dtype: i32,
-    pub bytes: Vec<u8>,
+    pub bytes: Arc<[u8]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,7 +143,7 @@ fn model_to_portable(snapshot: &ModelStateSnapshot) -> PortableModelState {
                     token_end: page.token_range().end,
                     shape: page.shape().to_vec(),
                     dtype: page.dtype(),
-                    bytes: page.portable_bytes().to_vec(),
+                    bytes: page.portable_bytes(),
                 }).collect(),
             }))
             .collect(),
