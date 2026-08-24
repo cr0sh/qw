@@ -113,6 +113,17 @@ fn cache_usage(path: &Path) -> Result<(u64, u64), Error> {
     Ok((files, bytes))
 }
 
+fn human_readable_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 7] = ["B", "K", "M", "G", "T", "P", "E"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1_000.0 && unit < UNITS.len() - 1 {
+        value /= 1_000.0;
+        unit += 1;
+    }
+    format!("{value:.2}{}", UNITS[unit])
+}
+
 fn stats_report() -> Result<String, Box<dyn std::error::Error>> {
     let home = std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
@@ -134,7 +145,8 @@ fn stats_report() -> Result<String, Box<dyn std::error::Error>> {
     writeln!(report, "Cache root: {}", cache_root.display())?;
     writeln!(
         report,
-        "Cache usage: {cache_files} files, {cache_bytes} bytes"
+        "Cache usage: {cache_files} files, {cache_bytes} bytes ({})",
+        human_readable_bytes(cache_bytes)
     )?;
     writeln!(report, "Selected model: {selected_model}")?;
     writeln!(report, "Model path: {}", model_path.display())?;

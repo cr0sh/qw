@@ -61,7 +61,8 @@ fn stats_reports_default_model_cache_usage_and_local_presence() {
     let model_path =
         model_cache_path(&home, DEFAULT_MODEL_IDENTIFIER).expect("default model cache path");
     std::fs::create_dir_all(&model_path).expect("create cached model");
-    std::fs::write(model_path.join("config.json"), b"test").expect("write cached model file");
+    std::fs::write(model_path.join("config.json"), vec![0_u8; 16_000])
+        .expect("write cached model file");
 
     let output = run_stats(&home, None);
 
@@ -72,7 +73,7 @@ fn stats_reports_default_model_cache_usage_and_local_presence() {
         stdout,
         format!(
             "Cache root: {}\n\
-             Cache usage: 1 files, 4 bytes\n\
+             Cache usage: 1 files, 16000 bytes (16.00K)\n\
              Selected model: {DEFAULT_MODEL_IDENTIFIER}\n\
              Model path: {}\n\
              Model exists locally: yes\n",
@@ -98,7 +99,7 @@ fn stats_reports_missing_model_selected_by_environment() {
         stdout,
         format!(
             "Cache root: {}\n\
-             Cache usage: 0 files, 0 bytes\n\
+             Cache usage: 0 files, 0 bytes (0.00B)\n\
              Selected model: {}\n\
              Model path: {}\n\
              Model exists locally: no\n",
