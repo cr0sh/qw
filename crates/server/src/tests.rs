@@ -1176,8 +1176,14 @@ async fn structured_tracing_covers_request_stream_error_and_cancellation_without
         })
         .collect::<Vec<_>>();
     assert_eq!(metric_lines.len(), 2, "{traces}");
-    assert!(metric_lines[0].contains("event=\"prefill.complete\""), "{traces}");
-    assert!(metric_lines[0].contains("chat_id=\"chatcmpl-metric-test\""), "{traces}");
+    assert!(
+        metric_lines[0].contains("event=\"prefill.complete\""),
+        "{traces}"
+    );
+    assert!(
+        metric_lines[0].contains("chat_id=\"chatcmpl-metric-test\""),
+        "{traces}"
+    );
     assert!(metric_lines[0].contains("tps=0.0"), "{traces}");
     assert!(metric_lines[0].contains("total_tokens=10"), "{traces}");
     assert!(metric_lines[0].contains("prefilled_tokens=6"), "{traces}");
@@ -1185,8 +1191,14 @@ async fn structured_tracing_covers_request_stream_error_and_cancellation_without
         metric_lines[0].contains("prefix_reused_tokens=4"),
         "{traces}"
     );
-    assert!(metric_lines[1].contains("event=\"decode.complete\""), "{traces}");
-    assert!(metric_lines[1].contains("chat_id=\"chatcmpl-metric-test\""), "{traces}");
+    assert!(
+        metric_lines[1].contains("event=\"decode.complete\""),
+        "{traces}"
+    );
+    assert!(
+        metric_lines[1].contains("chat_id=\"chatcmpl-metric-test\""),
+        "{traces}"
+    );
     assert!(metric_lines[1].contains("tps=0.0"), "{traces}");
     assert!(metric_lines[1].contains("total_tokens=13"), "{traces}");
     assert!(metric_lines[1].contains("decoded_tokens=3"), "{traces}");
@@ -1237,6 +1249,36 @@ fn chat_protocol_accepts_documented_reasoning_efforts() {
 }
 
 #[test]
+fn chat_protocol_accepts_nested_reasoning_effort_with_top_level_precedence() {
+    let mut request = chat_request("hello");
+    request["chat_template_kwargs"] = json!({
+        "enable_thinking": true,
+        "preserve_thinking": true,
+        "reasoning_effort": "medium"
+    });
+    let parsed = protocol::parse_chat(request).expect("nested reasoning effort");
+    assert_eq!(
+        parsed.reasoning_effort,
+        Some(protocol::ReasoningEffort::Medium)
+    );
+    assert!(parsed.enable_thinking);
+
+    let mut request = chat_request("hello");
+    request["reasoning_effort"] = json!("high");
+    request["chat_template_kwargs"] = json!({"reasoning_effort": "medium"});
+    let parsed = protocol::parse_chat(request).expect("top-level reasoning effort");
+    assert_eq!(
+        parsed.reasoning_effort,
+        Some(protocol::ReasoningEffort::High)
+    );
+
+    let mut request = chat_request("hello");
+    request["chat_template_kwargs"] = json!({"reasoning_effort": null});
+    let parsed = protocol::parse_chat(request).expect("null nested reasoning effort");
+    assert_eq!(parsed.reasoning_effort, None);
+}
+
+#[test]
 fn chat_protocol_accepts_qwen_thinking_extensions() {
     let mut request = chat_request("hello");
     request["preserve_thinking"] = json!(true);
@@ -1269,6 +1311,29 @@ fn chat_protocol_rejects_invalid_reasoning_efforts() {
     }
 }
 
+#[test]
+fn chat_protocol_rejects_invalid_nested_reasoning_efforts_at_exact_param() {
+    for (value, message) in [
+        (
+            json!("unknown"),
+            "chat_template_kwargs.reasoning_effort is not a documented value",
+        ),
+        (
+            json!(1),
+            "chat_template_kwargs.reasoning_effort must be a string or null",
+        ),
+    ] {
+        let mut request = chat_request("hello");
+        request["chat_template_kwargs"] = json!({"reasoning_effort": value});
+        let error = protocol::parse_chat(request).expect_err("invalid nested reasoning effort");
+        assert_eq!(
+            error.param.as_deref(),
+            Some("chat_template_kwargs.reasoning_effort")
+        );
+        assert_eq!(error.message, message);
+    }
+}
+
 #[tokio::test]
 async fn documented_reasoning_efforts_reach_the_handler() {
     let app = router(Engine::start_fake(Some(MODEL), 8));
@@ -1278,6 +1343,19 @@ async fn documented_reasoning_efforts_reach_the_handler() {
         let (status, _, body) = post(app.clone(), "/v1/chat/completions", request).await;
         assert_eq!(status, StatusCode::OK, "{body}");
     }
+}
+
+#[tokio::test]
+async fn nested_reasoning_effort_reaches_the_handler() {
+    let app = router(Engine::start_fake(Some(MODEL), 8));
+    let mut request = chat_request("hello");
+    request["chat_template_kwargs"] = json!({
+        "enable_thinking": true,
+        "preserve_thinking": true,
+        "reasoning_effort": "medium"
+    });
+    let (status, _, body) = post(app, "/v1/chat/completions", request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 #[test]
 fn chat_protocol_replays_assistant_reasoning_content() {
