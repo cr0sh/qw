@@ -201,8 +201,7 @@ struct ChatWire {
     #[serde(rename = "preserve_thinking")]
     _preserve_thinking: Option<bool>,
     enable_thinking: Option<bool>,
-    #[serde(rename = "chat_template_kwargs")]
-    _chat_template_kwargs: Option<Map<String, Value>>,
+    chat_template_kwargs: Option<Map<String, Value>>,
     #[serde(rename = "mcp_timeout")]
     _mcp_timeout: Option<Value>,
     temperature: Option<f32>,
@@ -392,9 +391,30 @@ pub fn parse_chat(value: Value) -> Result<CompletionRequest, RequestError> {
         .or(wire.max_tokens)
         .unwrap_or(DEFAULT_MAX_TOKENS);
     validate_sampling(max_tokens, wire.temperature, wire.top_p)?;
-    let reasoning_effort = parse_reasoning_effort(wire.reasoning_effort.as_deref())?;
+    let reasoning_effort =
+        parse_reasoning_effort(wire.reasoning_effort.as_deref(), "reasoning_effort")?;
+    let template_reasoning_effort = wire
+        .chat_template_kwargs
+        .as_ref()
+        .and_then(|kwargs| kwargs.get("reasoning_effort"))
+        .map(|value| {
+            if value.is_null() {
+                Ok(None)
+            } else {
+                let value = value.as_str().ok_or_else(|| {
+                    RequestError::at(
+                        "chat_template_kwargs.reasoning_effort must be a string or null",
+                        "chat_template_kwargs.reasoning_effort",
+                    )
+                })?;
+                parse_reasoning_effort(Some(value), "chat_template_kwargs.reasoning_effort")
+            }
+        })
+        .transpose()?
+        .flatten();
+    let reasoning_effort = reasoning_effort.or(template_reasoning_effort);
     let template_enable_thinking = wire
-        ._chat_template_kwargs
+        .chat_template_kwargs
         .as_ref()
         .and_then(|kwargs| kwargs.get("enable_thinking"))
         .map(|value| {
@@ -748,7 +768,10 @@ fn parse_tool_choice(value: Option<&Value>) -> Result<ToolChoice, RequestError> 
     }
 }
 
-fn parse_reasoning_effort(value: Option<&str>) -> Result<Option<ReasoningEffort>, RequestError> {
+fn parse_reasoning_effort(
+    value: Option<&str>,
+    param: &'static str,
+) -> Result<Option<ReasoningEffort>, RequestError> {
     match value {
         None => Ok(None),
         Some("none") => Ok(Some(ReasoningEffort::None)),
@@ -759,8 +782,8 @@ fn parse_reasoning_effort(value: Option<&str>) -> Result<Option<ReasoningEffort>
         Some("xhigh") => Ok(Some(ReasoningEffort::XHigh)),
         Some("max") => Ok(Some(ReasoningEffort::Max)),
         Some(_) => Err(RequestError::at(
-            "reasoning_effort is not a documented value",
-            "reasoning_effort",
+            format!("{param} is not a documented value"),
+            param,
         )),
     }
 }
