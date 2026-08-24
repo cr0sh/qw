@@ -11,15 +11,80 @@ use qw_runtime::{KVCacheMode, resolve_model_path};
 use tracing::info;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::Layer as _;
+use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
-use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::{EnvFilter, fmt, registry};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum OutputFormat {
     Human,
     Json,
+}
+
+fn parse_si_bytes(value: &str) -> Result<u64, String> {
+    let value_without_b = value.strip_suffix(['B', 'b']).unwrap_or(value);
+    let (number, multiplier) = match value_without_b.as_bytes().last().copied() {
+        Some(b'K' | b'k') => (&value_without_b[..value_without_b.len() - 1], 1_000_u64),
+        Some(b'M' | b'm') => (&value_without_b[..value_without_b.len() - 1], 1_000_000),
+        Some(b'G' | b'g') => (&value_without_b[..value_without_b.len() - 1], 1_000_000_000),
+        Some(b'T' | b't') => (
+            &value_without_b[..value_without_b.len() - 1],
+            1_000_000_000_000,
+        ),
+        Some(b'P' | b'p') => (
+            &value_without_b[..value_without_b.len() - 1],
+            1_000_000_000_000_000,
+        ),
+        Some(b'E' | b'e') => (
+            &value_without_b[..value_without_b.len() - 1],
+            1_000_000_000_000_000_000,
+        ),
+        _ => (value_without_b, 1),
+    };
+    let invalid = || {
+        format!(
+            "invalid byte size '{value}': expected a non-negative integer or decimal with an optional SI suffix K, M, G, T, P, or E (optional B)"
+        )
+    };
+    let (whole, fraction) = number
+        .split_once('.')
+        .map_or((number, None), |(whole, fraction)| (whole, Some(fraction)));
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || fraction.is_some_and(|fraction| {
+            fraction.is_empty()
+                || fraction.len() > 2
+                || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    {
+        return Err(invalid());
+    }
+    let whole = whole.parse::<u64>().map_err(|_| invalid())?;
+    let mut bytes = whole
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("byte size '{value}' overflows u64"))?;
+    if let Some(fraction) = fraction {
+        if multiplier == 1 {
+            return Err(format!(
+                "byte size '{value}' is not a whole number of bytes"
+            ));
+        }
+        let denominator = 10_u64.pow(fraction.len() as u32);
+        let numerator = fraction.parse::<u64>().map_err(|_| invalid())?;
+        let scaled = numerator
+            .checked_mul(multiplier)
+            .ok_or_else(|| format!("byte size '{value}' overflows u64"))?;
+        if scaled % denominator != 0 {
+            return Err(format!(
+                "byte size '{value}' is not a whole number of bytes"
+            ));
+        }
+        bytes = bytes
+            .checked_add(scaled / denominator)
+            .ok_or_else(|| format!("byte size '{value}' overflows u64"))?;
+    }
+    Ok(bytes)
 }
 
 #[derive(Debug, DeriveArgs)]
@@ -36,16 +101,24 @@ pub struct ServerArgs {
     #[arg(long, default_value = "127.0.0.1:8000")]
     bind: String,
 
-    /// Byte capacity of the in-memory prefix snapshot tier.
-    #[arg(long, default_value_t = 2 * 1024 * 1024 * 1024_u64)]
+    /// Byte capacity of the in-memory prefix snapshot tier (decimal SI suffixes K-E accepted).
+    #[arg(
+        long,
+        default_value_t = 2 * 1024 * 1024 * 1024_u64,
+        value_parser = parse_si_bytes
+    )]
     prefix_cache_memory_bytes: u64,
 
     /// Directory for persistent prefix snapshots; defaults to `~/.cache/qw/checkpoint`.
     #[arg(long)]
     prefix_cache_directory: Option<PathBuf>,
 
-    /// Byte capacity of the filesystem prefix snapshot tier.
-    #[arg(long, default_value_t = 16 * 1024 * 1024 * 1024_u64)]
+    /// Byte capacity of the filesystem prefix snapshot tier (decimal SI suffixes K-E accepted).
+    #[arg(
+        long,
+        default_value_t = 16 * 1024 * 1024 * 1024_u64,
+        value_parser = parse_si_bytes
+    )]
     prefix_cache_filesystem_bytes: u64,
 
     /// MTP verify input block size (bonus token plus proposals).
@@ -183,11 +256,7 @@ fn init_tracing(cli: &ServerArgs) -> Result<Option<WorkerGuard>> {
                 )
                 .init(),
             OutputFormat::Json => registry()
-                .with(
-                    fmt::layer()
-                        .json()
-                        .with_filter(rust_log_filter()),
-                )
+                .with(fmt::layer().json().with_filter(rust_log_filter()))
                 .with(
                     fmt::layer()
                         .fmt_fields(fmt::format::JsonFields::new())
@@ -257,8 +326,8 @@ pub async fn serve(cli: ServerArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        OutputFormat, ServerArgs, persistent_log_format, resolve_persistent_log_filter,
-        resolve_prefix_cache_directory, validate_cli,
+        OutputFormat, ServerArgs, parse_si_bytes, persistent_log_format,
+        resolve_persistent_log_filter, resolve_prefix_cache_directory, validate_cli,
     };
     use clap::{CommandFactory as _, Parser as _};
     use clap_derive::Parser;
@@ -503,6 +572,65 @@ mod tests {
         assert!(help.contains("--prefix-cache-directory"), "{help}");
         assert!(help.contains("--prefix-cache-filesystem-bytes"), "{help}");
         assert!(!help.contains("--prefix-cache-max-tokens"), "{help}");
+    }
+
+    #[test]
+    fn cli_parses_decimal_si_cache_byte_capacities() {
+        let parsed = TestCli::try_parse_from([
+            "qw-server",
+            "--model",
+            "/tmp/checkpoint",
+            "--prefix-cache-memory-bytes",
+            "1.25KB",
+            "--prefix-cache-filesystem-bytes",
+            "2.5g",
+        ])
+        .expect("SI byte capacities");
+        assert_eq!(parsed.args.prefix_cache_memory_bytes, 1_250);
+        assert_eq!(parsed.args.prefix_cache_filesystem_bytes, 2_500_000_000);
+
+        assert_eq!(parse_si_bytes("18446744073709551615").unwrap(), u64::MAX);
+        assert_eq!(parse_si_bytes("18E").unwrap(), 18_000_000_000_000_000_000);
+        assert_eq!(parse_si_bytes("1b").unwrap(), 1);
+    }
+
+    #[test]
+    fn cli_rejects_invalid_or_overflowing_cache_byte_capacities() {
+        for value in [
+            "1.5",
+            ".5K",
+            "1.001K",
+            "0.0001K",
+            "1KiB",
+            "1e3",
+            "19E",
+            "18446744073709551616",
+        ] {
+            let error = TestCli::try_parse_from([
+                "qw-server",
+                "--model",
+                "/tmp/checkpoint",
+                "--prefix-cache-memory-bytes",
+                value,
+            ])
+            .expect_err("invalid byte capacity");
+            assert!(
+                error.to_string().contains("invalid value"),
+                "{value}: {error}"
+            );
+        }
+
+        let negative = TestCli::try_parse_from([
+            "qw-server",
+            "--model",
+            "/tmp/checkpoint",
+            "--prefix-cache-memory-bytes=-1",
+        ])
+        .expect_err("negative byte capacity");
+        assert!(
+            negative.to_string().contains("invalid byte size '-1'"),
+            "{negative}"
+        );
     }
 
     #[cfg(not(feature = "specprefill"))]

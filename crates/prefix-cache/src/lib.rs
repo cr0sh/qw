@@ -136,6 +136,12 @@ pub enum ResumeLookupError {
     Mismatch,
 }
 
+/// Persistent resume records and writes already in flight may temporarily exceed the
+/// evictable filesystem capacity, but together they may use at most one extra capacity.
+fn filesystem_hard_cap(capacity: u64) -> u64 {
+    capacity.saturating_add(capacity)
+}
+
 pub struct AdaptivePrefixCache {
     namespaces: CacheNamespaces,
     trie: RadixTrie,
@@ -144,6 +150,7 @@ pub struct AdaptivePrefixCache {
     memory_pages: HashMap<u64, (usize, u64)>,
     filesystem_cap: Option<u64>,
     filesystem_bytes: u64,
+    pending_filesystem_bytes: u64,
     filesystem_blobs: HashMap<String, (usize, u64)>,
     io: Option<CacheIo>,
     clock: Box<dyn Clock>,
@@ -161,6 +168,7 @@ struct PutCompletion {
     route: SnapshotRoute,
     token_ids: Vec<i32>,
     key: EntryKey,
+    reserved_bytes: u64,
     result: Result<(Vec<(String, u64)>, u64), String>,
 }
 enum IoCommand {
@@ -172,6 +180,7 @@ enum IoCommand {
         key: EntryKey,
         namespace: String,
         route: SnapshotRoute,
+        reserved_bytes: u64,
         token_ids: Vec<i32>,
         portable: PortablePromptSnapshot,
         retention: RetentionMetadata,
@@ -308,6 +317,7 @@ impl AdaptivePrefixCache {
                 .map(|_| config.filesystem_bytes)
                 .or_else(|| io.as_ref().map(|_| config.filesystem_bytes)),
             filesystem_bytes: filesystem_blobs.values().map(|(_, bytes)| *bytes).sum(),
+            pending_filesystem_bytes: 0,
             filesystem_blobs,
             io,
             clock,
@@ -333,6 +343,9 @@ impl AdaptivePrefixCache {
             return;
         };
         while let Ok(completion) = io.completions.try_recv() {
+            self.pending_filesystem_bytes = self
+                .pending_filesystem_bytes
+                .saturating_sub(completion.reserved_bytes);
             let Some((node, _)) = self
                 .trie
                 .path(&completion.token_ids, completion.route)
@@ -535,7 +548,7 @@ impl AdaptivePrefixCache {
             .filesystem_bytes
             .saturating_sub(terminal.serialized_bytes);
         if let Some(key) = terminal.persistent_key {
-            self.try_io(IoCommand::Remove(key));
+            self.queue_remove(key);
         }
         let snapshot = terminal.snapshot.ok_or(ResumeLookupError::NotFound)?;
         self.rebuild_accounting();
@@ -588,19 +601,16 @@ impl AdaptivePrefixCache {
                 .then(|| response_resume.clone())
                 .flatten();
             let node = self.trie.ensure_node(prefix);
-            let (previous, previous_persistent_bytes, previous_resume) = self
+            let (previous, previous_persistent_key, previous_resume) = self
                 .trie
                 .terminal_mut(node, route)
                 .map(|terminal| {
-                    let previous_persistent_bytes = terminal
-                        .persistent_key
-                        .take()
-                        .map(|_| terminal.serialized_bytes);
+                    let previous_persistent_key = terminal.persistent_key.take();
                     terminal.blob_refs.clear();
                     terminal.serialized_bytes = 0;
                     (
                         terminal.snapshot.take(),
-                        previous_persistent_bytes,
+                        previous_persistent_key,
                         terminal.response_resume.take(),
                     )
                 })
@@ -608,12 +618,13 @@ impl AdaptivePrefixCache {
             if let Some(previous) = previous {
                 self.memory_bytes = self.memory_bytes.saturating_sub(previous.nbytes() as u64);
             }
-            if let Some(previous_bytes) = previous_persistent_bytes {
-                self.filesystem_bytes = self.filesystem_bytes.saturating_sub(previous_bytes);
+            if let Some(previous_key) = previous_persistent_key {
+                self.queue_remove(previous_key);
             }
             if let Some(previous_resume) = previous_resume {
                 self.resumes.remove(&previous_resume.response_id);
             }
+            self.rebuild_accounting();
             let bytes = snapshot.nbytes() as u64;
             let summary = snapshot.storage_summary();
             inserted_logical_bytes = inserted_logical_bytes.saturating_add(bytes);
@@ -627,14 +638,15 @@ impl AdaptivePrefixCache {
             let expiry = now.saturating_add(INITIAL_TTL_MS);
             let namespace = self.namespaces.get(route);
             let key = entry_key(namespace, route, prefix);
+            let persist = self.io.is_some() && self.can_reserve_persistence(bytes);
             let (observations, reuse_count, last_access) =
                 if let Some(terminal) = self.trie.terminal_mut(node, route) {
                     terminal.snapshot = Some(snapshot);
                     terminal.page_refs = summary.pages.clone();
                     terminal.local_bytes = summary.local_bytes;
                     terminal.expires_at_unix_ms = expiry;
-                    terminal.serialized_bytes = bytes;
-                    terminal.persistent_key = self.io.as_ref().map(|_| key.clone());
+                    terminal.serialized_bytes = 0;
+                    terminal.persistent_key = persist.then(|| key.clone());
                     terminal.response_resume = resume.clone();
                     (
                         terminal.observations.max(1),
@@ -651,12 +663,12 @@ impl AdaptivePrefixCache {
                             reuse_count: 0,
                             last_access_unix_ms: now,
                             expires_at_unix_ms: expiry,
-                            serialized_bytes: bytes,
+                            serialized_bytes: 0,
                             page_refs: summary.pages.clone(),
                             local_bytes: summary.local_bytes,
                             blob_refs: Vec::new(),
                             snapshot: Some(snapshot),
-                            persistent_key: self.io.as_ref().map(|_| key.clone()),
+                            persistent_key: persist.then(|| key.clone()),
                             response_resume: resume.clone(),
                         },
                     );
@@ -669,12 +681,14 @@ impl AdaptivePrefixCache {
             }
             // MLX array handles are thread-bound and !Send, so materialize only after the
             // hot snapshot is installed, then hand portable bytes to the I/O thread.
-            let portable = self.io.as_ref().and_then(|_| {
-                self.trie
-                    .terminal(node, route)
-                    .and_then(|terminal| terminal.snapshot.as_ref())
-                    .and_then(|snapshot| snapshot.to_portable().ok())
-            });
+            let portable = persist
+                .then(|| {
+                    self.trie
+                        .terminal(node, route)
+                        .and_then(|terminal| terminal.snapshot.as_ref())
+                        .and_then(|snapshot| snapshot.to_portable().ok())
+                })
+                .flatten();
             if let Some(portable) = portable {
                 let queued = self.try_io(IoCommand::Put {
                     key: key.clone(),
@@ -682,6 +696,7 @@ impl AdaptivePrefixCache {
                     route,
                     token_ids: prefix.to_vec(),
                     portable,
+                    reserved_bytes: bytes,
                     retention: RetentionMetadata {
                         observations,
                         reuse_count,
@@ -690,12 +705,13 @@ impl AdaptivePrefixCache {
                     expires_at_unix_ms: expiry,
                     response_resume: resume,
                 });
-                if !queued {
-                    if let Some(terminal) = self.trie.terminal_mut(node, route) {
-                        terminal.persistent_key = None;
-                        terminal.blob_refs.clear();
-                        terminal.serialized_bytes = 0;
-                    }
+                if queued {
+                    self.pending_filesystem_bytes =
+                        self.pending_filesystem_bytes.saturating_add(bytes);
+                } else if let Some(terminal) = self.trie.terminal_mut(node, route) {
+                    terminal.persistent_key = None;
+                    terminal.blob_refs.clear();
+                    terminal.serialized_bytes = 0;
                 }
             } else if let Some(terminal) = self.trie.terminal_mut(node, route) {
                 terminal.persistent_key = None;
@@ -881,7 +897,7 @@ impl AdaptivePrefixCache {
                         .filesystem_bytes
                         .saturating_sub(terminal.serialized_bytes);
                     if let Some(key) = terminal.persistent_key {
-                        self.try_io(IoCommand::Remove(key));
+                        self.queue_remove(key);
                     }
                     tracing::debug!(phase = "cache.expire", route = route.as_str());
                 }
@@ -929,14 +945,21 @@ impl AdaptivePrefixCache {
         let Some(cap) = self.filesystem_cap else {
             return;
         };
-        while self.filesystem_bytes > cap {
+        self.evict_persistent_to(cap, false);
+        self.evict_persistent_to(filesystem_hard_cap(cap), true);
+        self.rebuild_accounting();
+    }
+
+    fn evict_persistent_to(&mut self, limit: u64, include_resumes: bool) {
+        while self.filesystem_bytes > limit {
             let victim = self
                 .trie
                 .terminal_ids()
                 .into_iter()
                 .filter(|(node, route)| {
                     self.trie.terminal(*node, *route).is_some_and(|terminal| {
-                        terminal.persistent_key.is_some() && terminal.response_resume.is_none()
+                        terminal.persistent_key.is_some()
+                            && (include_resumes || terminal.response_resume.is_none())
                     })
                 })
                 .min_by_key(|(node, route)| {
@@ -953,7 +976,7 @@ impl AdaptivePrefixCache {
             terminal.serialized_bytes = 0;
             self.rebuild_accounting();
             let reclaimed_bytes = before.saturating_sub(self.filesystem_bytes);
-            self.try_io(IoCommand::Remove(key));
+            self.queue_remove(key);
             tracing::debug!(
                 phase = "cache.evict",
                 tier = "filesystem",
@@ -961,7 +984,15 @@ impl AdaptivePrefixCache {
                 reclaimed_bytes,
             );
         }
-        self.rebuild_accounting();
+    }
+
+    fn can_reserve_persistence(&self, bytes: u64) -> bool {
+        self.filesystem_cap.is_some_and(|cap| {
+            self.filesystem_bytes
+                .saturating_add(self.pending_filesystem_bytes)
+                .saturating_add(bytes)
+                <= filesystem_hard_cap(cap)
+        })
     }
 
     fn try_io(&self, command: IoCommand) -> bool {
@@ -984,6 +1015,17 @@ impl AdaptivePrefixCache {
                 );
                 false
             }
+        }
+    }
+    fn queue_remove(&self, key: EntryKey) {
+        let Some(io) = &self.io else {
+            return;
+        };
+        if io.tx.send(IoCommand::Remove(key)).is_err() {
+            tracing::warn!(
+                phase = "cache.persistence_error",
+                error = "cache I/O thread stopped before queuing cache removal"
+            );
         }
     }
     fn remove_persistent_sync(&self, key: &EntryKey) {
@@ -1141,6 +1183,7 @@ fn io_loop(
                 key,
                 namespace,
                 route,
+                reserved_bytes,
                 token_ids,
                 portable,
                 retention,
@@ -1182,6 +1225,7 @@ fn io_loop(
                     route,
                     token_ids: completion_tokens,
                     key,
+                    reserved_bytes,
                     result,
                 });
                 continue;
