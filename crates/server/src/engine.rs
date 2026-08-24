@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc as std_mpsc};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};
 use mlxcel_core::generate::{GenerationStopReason, PrefixReuse};
@@ -33,7 +33,13 @@ use crate::tool_calls::{ToolCallGate, parse_assistant_output};
 
 const JOB_QUEUE_CAPACITY: usize = 8;
 const EVENT_QUEUE_CAPACITY: usize = 32;
-type CacheMaintenance = Box<dyn FnOnce(&mut AdaptivePrefixCache)>;
+struct CacheMaintenance {
+    kind: &'static str,
+    enqueued_at: Instant,
+    work: CacheMaintenanceWork,
+}
+
+type CacheMaintenanceWork = Box<dyn FnOnce(&mut AdaptivePrefixCache)>;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1162,10 +1168,20 @@ impl QwenWorker {
             match next_worker_action(jobs.try_recv(), !maintenance.is_empty()) {
                 WorkerNextAction::Job(job) => self.process(job, &mut maintenance),
                 WorkerNextAction::Maintenance => {
-                    let work = maintenance
+                    let queued = maintenance
                         .pop_front()
                         .expect("maintenance action requires queued work");
-                    work(&mut self.prefix_cache);
+                    let queue_depth = maintenance.len();
+                    let queue_delay = queued.enqueued_at.elapsed();
+                    let started = Instant::now();
+                    (queued.work)(&mut self.prefix_cache);
+                    trace!(
+                        event = "cache.maintenance",
+                        kind = queued.kind,
+                        queue_depth,
+                        queue_delay_ms = queue_delay.as_secs_f64() * 1_000.0,
+                        execution_duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
+                    );
                 }
                 WorkerNextAction::Wait => match jobs.blocking_recv() {
                     Some(job) => self.process(job, &mut maintenance),
@@ -1382,6 +1398,7 @@ impl QwenWorker {
             );
             return;
         }
+        let cache_lookup_started = Instant::now();
         let fingerprint = request_fingerprint(&job.request);
         let resume_entry = if let Some(response_id) = &job.request.resume_response_id {
             match self.prefix_cache.take_resume(
@@ -1534,6 +1551,42 @@ impl QwenWorker {
             },
             _ => (None, None),
         };
+        let cache_source = if resume_entry.is_some() {
+            "response_resume"
+        } else if lookup_cache_route.is_none() {
+            "disabled"
+        } else if prefix_reuse.is_some() || mtp_prefix_reuse.is_some() {
+            "prefix_hit"
+        } else {
+            "prefix_miss"
+        };
+        trace!(
+            event = "prompt.tokenized",
+            response_id = %job.admission.response_id,
+            prompt_token_ids = ?generation_prompt_ids,
+            prompt_tokens = generation_prompt_ids.len(),
+            effective_tools = ?effective_tools,
+            tool_choice = ?job.request.tool_choice,
+            reasoning_effort = ?reasoning_effort,
+            enable_thinking,
+            max_tokens,
+            temperature = ?job.request.temperature,
+            top_p = ?job.request.top_p,
+            seed = ?job.request.seed,
+            route = ?route,
+        );
+        trace!(
+            event = "cache.decision",
+            response_id = %job.admission.response_id,
+            route = ?route,
+            source = cache_source,
+            reused_tokens = prefix_reuse.as_ref().map_or_else(
+                || mtp_prefix_reuse.as_ref().map_or(0, |reuse| reuse.cached_tokens),
+                |reuse| reuse.cached_tokens,
+            ),
+            prompt_tokens = generation_prompt_ids.len(),
+            lookup_duration_ms = cache_lookup_started.elapsed().as_secs_f64() * 1_000.0,
+        );
         debug!(
             phase = "model_generation.started",
             route = ?route,
@@ -1707,7 +1760,10 @@ impl QwenWorker {
                         .as_ref()
                         .map_or(job.request.max_tokens, |metadata| metadata.original_max_tokens),
                 });
-                maintenance.push_back(Box::new(move |cache| {
+                maintenance.push_back(CacheMaintenance {
+                    kind: "cancelled",
+                    enqueued_at: Instant::now(),
+                    work: Box::new(move |cache| {
                     if !prompt_snapshots.is_empty() {
                         cache.insert(&generation_prompt_ids, prompt_snapshots, cache_route);
                     }
@@ -1721,7 +1777,8 @@ impl QwenWorker {
                             metadata,
                         );
                     }
-                }));
+                    }),
+                });
             }
             debug!(phase = "generation.cancelled");
             return;
@@ -1844,14 +1901,18 @@ impl QwenWorker {
                 (completed_tokens.len() == final_snapshot.token_len())
                     .then_some((completed_tokens, final_snapshot))
             });
-            maintenance.push_back(Box::new(move |cache| {
+            maintenance.push_back(CacheMaintenance {
+                kind: "completed",
+                enqueued_at: Instant::now(),
+                work: Box::new(move |cache| {
                 if !prompt_snapshots.is_empty() {
                     cache.insert(&generation_prompt_ids, prompt_snapshots, cache_route);
                 }
                 if let Some((completed_tokens, final_snapshot)) = final_work {
                     cache.insert(&completed_tokens, vec![final_snapshot], cache_route);
                 }
-            }));
+                }),
+            });
         }
     }
 }

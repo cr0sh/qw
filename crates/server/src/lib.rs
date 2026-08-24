@@ -126,12 +126,24 @@ async fn handle_inner(
     if tracing::enabled!(tracing::Level::TRACE) {
         trace!(
             phase = "prompt.composed",
+            endpoint = ?request.endpoint,
             model = %request.model,
-            message_count = request.messages.len(),
-            tool_count = request.tools.len(),
+            messages = ?request.messages,
+            tools = ?request.tools,
+            tool_choice = ?request.tool_choice,
+            parallel_tool_calls = request.parallel_tool_calls,
+            reasoning_effort = ?request.reasoning_effort,
+            enable_thinking = request.enable_thinking,
+            output_format = ?request.output_format,
             max_tokens = request.max_tokens,
+            temperature = ?request.temperature,
+            top_p = ?request.top_p,
+            seed = ?request.seed,
+            resume_response_id = ?request.resume_response_id,
+            image_params = ?request.image_params,
+            stream = request.stream,
+            stream_include_usage = request.stream_include_usage,
             validation_elapsed_ms = request_started.elapsed().as_secs_f64() * 1_000.0,
-            prompt = ?request.messages,
         );
     }
     if !request.image_params.is_empty() && !state.engine.supports_image_inputs() {
