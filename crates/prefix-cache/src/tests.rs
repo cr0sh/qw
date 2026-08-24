@@ -453,6 +453,71 @@ fn filesystem_byte_cap_evicts_persistent_entries_by_snapshot_bytes() {
 }
 
 #[test]
+fn in_flight_persistence_is_reserved_against_the_grace_ceiling() {
+    let blocking = Arc::new((Mutex::new(BlockingState::default()), Condvar::new()));
+    let first = snapshot(1, &[1.0, 2.0]);
+    let snapshot_bytes = first.nbytes() as u64;
+    let config = CacheConfig {
+        memory_bytes: 1_000_000,
+        directory: None,
+        filesystem_bytes: snapshot_bytes / 2,
+    };
+    let mut cache = AdaptivePrefixCache::with_store(
+        namespaces(),
+        config,
+        Box::new(BlockingStore(Arc::clone(&blocking))),
+    )
+    .expect("cache");
+    assert_eq!(
+        filesystem_hard_cap(cache.filesystem_cap.unwrap()),
+        snapshot_bytes,
+        "the first write lands exactly on the grace boundary"
+    );
+    cache.insert(&[1], vec![first], SnapshotRoute::Baseline);
+
+    let (state_lock, wake) = &*blocking;
+    let state = state_lock.lock().expect("blocking store lock");
+    let (state, timeout) = wake
+        .wait_timeout_while(state, std::time::Duration::from_secs(5), |state| {
+            !state.entered
+        })
+        .expect("blocking store wait");
+    assert!(!timeout.timed_out() && state.entered, "write did not start");
+    drop(state);
+
+    cache.insert(
+        &[2],
+        vec![snapshot(1, &[3.0, 4.0])],
+        SnapshotRoute::Baseline,
+    );
+    assert_eq!(cache.pending_filesystem_bytes, snapshot_bytes);
+    let second_node = cache
+        .trie
+        .path(&[2], SnapshotRoute::Baseline)
+        .into_iter()
+        .last()
+        .unwrap()
+        .0;
+    assert!(
+        cache
+            .trie
+            .terminal(second_node, SnapshotRoute::Baseline)
+            .unwrap()
+            .persistent_key
+            .is_none(),
+        "a queued write beyond the hard grace ceiling must not be admitted"
+    );
+
+    let mut state = state_lock.lock().expect("blocking store lock");
+    state.released = true;
+    wake.notify_all();
+    drop(state);
+    cache.flush_persistence();
+    assert_eq!(cache.pending_filesystem_bytes, 0);
+    assert!(cache.filesystem_bytes <= filesystem_hard_cap(cache.filesystem_cap.unwrap()));
+}
+
+#[test]
 fn failed_persistence_clears_metadata_but_keeps_memory_snapshot() {
     let state = Arc::new(Mutex::new(RecordingState {
         fail_put: true,
@@ -859,6 +924,61 @@ fn active_resume_is_exempt_from_pressure_until_consumed() {
             .is_ok()
     );
     assert_eq!(cache.memory_bytes(), 0);
+}
+
+#[test]
+fn persistent_resumes_stop_at_the_finite_grace_ceiling_but_remain_hot() {
+    let state = Arc::new(Mutex::new(RecordingState::default()));
+    let snapshot_bytes = snapshot(3, &[1.0]).nbytes() as u64;
+    let config = CacheConfig {
+        memory_bytes: 1_000_000,
+        directory: None,
+        filesystem_bytes: snapshot_bytes,
+    };
+    let mut cache = AdaptivePrefixCache::with_store(
+        namespaces(),
+        config,
+        Box::new(RecordingStore(Arc::clone(&state))),
+    )
+    .expect("cache");
+
+    for (tokens, value, response_id) in [
+        ([1, 10, 3], 1.0, "resume-one"),
+        ([2, 20, 3], 2.0, "resume-two"),
+        ([4, 30, 3], 3.0, "resume-three"),
+        ([5, 40, 3], 4.0, "resume-four"),
+    ] {
+        cache.insert_resume(
+            &tokens,
+            snapshot(3, &[value]),
+            SnapshotRoute::Baseline,
+            resume_metadata(response_id, "fingerprint"),
+        );
+        cache.flush_persistence();
+    }
+
+    let hard_cap = filesystem_hard_cap(cache.filesystem_cap.unwrap());
+    assert_eq!(hard_cap, snapshot_bytes * 2);
+    assert!(cache.filesystem_bytes <= hard_cap);
+    assert_eq!(
+        state.lock().expect("recording store lock").entries.len(),
+        3,
+        "the fourth pinned entry is beyond grace and must not reach storage"
+    );
+    for response_id in ["resume-one", "resume-two", "resume-three", "resume-four"] {
+        assert!(
+            cache
+                .take_resume(response_id, "fingerprint", SnapshotRoute::Baseline)
+                .is_ok(),
+            "capacity pressure must not break the hot resume {response_id}"
+        );
+    }
+}
+
+#[test]
+fn filesystem_grace_ceiling_saturates_without_overflow() {
+    assert_eq!(filesystem_hard_cap(5), 10);
+    assert_eq!(filesystem_hard_cap(u64::MAX), u64::MAX);
 }
 #[test]
 fn resume_is_hot_before_persistent_write_completes() {
