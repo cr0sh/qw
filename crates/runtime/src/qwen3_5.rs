@@ -3105,11 +3105,16 @@ mod tests {
             .iter()
             .map(|suffix| format!("layer.0.{suffix}"))
             .collect::<BTreeSet<_>>();
-        let actual = snapshot
+        let actual_dense = snapshot
             .tensor_names()
             .map(str::to_owned)
             .collect::<BTreeSet<_>>();
-        assert_eq!(actual, expected);
+        assert!(actual_dense.is_empty(), "Turbo4 snapshot must not use dense tensors");
+        let actual_paged = snapshot
+            .paged_tensor_names()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual_paged, expected);
         let live = attention_cache(&caches);
         assert_eq!(live.mode, KVCacheMode::Fp16);
         assert_eq!(live.offset, 2);
@@ -3120,11 +3125,10 @@ mod tests {
         );
 
         let tensor = |suffix: &str| {
-            mlxcel_core::copy(
-                snapshot
-                    .tensor(&format!("layer.0.{suffix}"))
-                    .expect("strict packed snapshot tensor"),
-            )
+            snapshot
+                .paged_tensor(&format!("layer.0.{suffix}"))
+                .and_then(|tensor| tensor.materialize())
+                .expect("strict packed snapshot tensor")
         };
         let mut restored = KVCache::new_with_mode(KVCacheMode::Turbo4);
         restored
