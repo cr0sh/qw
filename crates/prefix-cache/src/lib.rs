@@ -171,6 +171,10 @@ enum IoCommand {
         response_resume: Option<ResponseResumeMetadata>,
     },
     Remove(EntryKey),
+    RemoveSync {
+        key: EntryKey,
+        reply: mpsc::Sender<Result<(), String>>,
+    },
     FlushRefresh,
     Flush(mpsc::Sender<()>),
 }
@@ -723,7 +727,7 @@ impl AdaptivePrefixCache {
                     terminal.serialized_bytes = 0;
                 }
                 self.rebuild_accounting();
-                self.try_io(IoCommand::Remove(key.clone()));
+                self.remove_persistent_sync(key);
                 return false;
             }
             Err(_) => return false,
@@ -772,7 +776,7 @@ impl AdaptivePrefixCache {
                     terminal.serialized_bytes = 0;
                 }
                 self.rebuild_accounting();
-                self.try_io(IoCommand::Remove(key.clone()));
+                self.remove_persistent_sync(key);
                 false
             }
         }
@@ -896,6 +900,38 @@ impl AdaptivePrefixCache {
             ),
         }
     }
+    fn remove_persistent_sync(&self, key: &EntryKey) {
+        let Some(io) = &self.io else {
+            return;
+        };
+        let (reply_tx, reply_rx) = mpsc::channel();
+        if io
+            .tx
+            .send(IoCommand::RemoveSync {
+                key: key.clone(),
+                reply: reply_tx,
+            })
+            .is_err()
+        {
+            tracing::warn!(
+                phase = "cache.persistence_error",
+                error = "cache I/O thread stopped before removing corrupt entry"
+            );
+            return;
+        }
+        match reply_rx.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(phase = "cache.persistence_error", error = %error);
+            }
+            Err(_) => {
+                tracing::warn!(
+                    phase = "cache.persistence_error",
+                    error = "cache I/O thread stopped before reporting corrupt entry removal"
+                );
+            }
+        }
+    }
 
     fn rebuild_accounting(&mut self) {
         let mut pages = HashMap::<u64, (usize, u64)>::new();
@@ -984,6 +1020,10 @@ fn io_loop(
         let result = match command {
             IoCommand::Load { key, reply } => {
                 let _ = reply.send(store.load(&key));
+                continue;
+            }
+            IoCommand::RemoveSync { key, reply } => {
+                let _ = reply.send(store.remove(&key));
                 continue;
             }
             IoCommand::Put {

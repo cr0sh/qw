@@ -462,6 +462,7 @@ fn filesystem_restart_promotes_valid_entry_and_deletes_corrupt_payload() {
             .lookup(&[4, 5, 6, 7], SnapshotRoute::Baseline)
             .expect("filesystem hit");
         assert_eq!(hit.token_count, 3);
+        restarted.flush_persistence();
     }
     let entry_path = directory
         .path
@@ -477,7 +478,6 @@ fn filesystem_restart_promotes_valid_entry_and_deletes_corrupt_payload() {
         let mut restarted =
             AdaptivePrefixCache::new(namespaces(), config).expect("restart corrupt");
         assert!(restarted.lookup(&tokens, SnapshotRoute::Baseline).is_none());
-        restarted.flush_persistence();
     }
     assert!(
         !entry_path.exists(),
