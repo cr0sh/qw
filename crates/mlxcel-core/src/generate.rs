@@ -122,6 +122,24 @@ impl SnapshotPage {
     }
 
     /// Stable identity for this page during the current process.
+
+    /// Rehydrate a page from Send-safe portable storage without creating an
+    /// MLX handle until the receiving worker explicitly asks for it.
+    pub fn from_portable(
+        token_start: usize,
+        token_end: usize,
+        shape: Vec<i32>,
+        dtype: i32,
+        bytes: &[u8],
+    ) -> Result<Arc<Self>, String> {
+        let expected = shape.iter().try_fold(1usize, |n, &d| {
+            n.checked_mul(usize::try_from(d).ok()?)
+        }).and_then(|n| n.checked_mul(crate::dtype::size_bytes(dtype)?));
+        if expected != Some(bytes.len()) {
+            return Err(format!("snapshot page byte length mismatch: expected {expected:?}, got {}", bytes.len()));
+        }
+        Ok(Self::new(token_start, token_end, ffi::from_bytes(bytes, &shape, dtype)))
+    }
     pub fn identity(&self) -> u64 { self.identity }
     pub fn token_range(&self) -> std::ops::Range<usize> { self.token_start..self.token_end }
     pub fn shape(&self) -> &[i32] { &self.shape }
@@ -220,6 +238,9 @@ impl ModelStateSnapshot {
     pub fn paged_tensor(&self, name: &str) -> Option<&SnapshotPagedTensor> {
         self.paged_tensors.iter().find(|t| t.name == name)
     }
+    pub fn paged_tensor_names(&self) -> impl Iterator<Item = &str> {
+        self.paged_tensors.iter().map(SnapshotPagedTensor::name)
+    }
 
     /// Sum bytes once per page identity, allowing shared prefixes to be
     /// accounted for without charging every snapshot's references.
@@ -230,6 +251,25 @@ impl ModelStateSnapshot {
             .flat_map(|t| t.pages.iter())
             .filter(|p| seen.insert(p.identity()))
             .map(|p| p.nbytes()).sum()
+    }
+
+    pub fn push_paged_pages(
+        &mut self,
+        name: impl Into<String>,
+        token_axis: usize,
+        pages: Vec<Arc<SnapshotPage>>,
+    ) -> Result<(), String> {
+        if pages.is_empty() {
+            return Err("snapshot paged tensor must contain at least one page".to_string());
+        }
+        let token_len = pages.last().expect("nonempty").token_end;
+        if pages.iter().any(|p| p.token_start >= p.token_end) {
+            return Err("snapshot page token range must be non-empty".to_string());
+        }
+        self.paged_tensors.push(SnapshotPagedTensor {
+            name: name.into(), token_axis, token_len, pages,
+        });
+        Ok(())
     }
 }
 
