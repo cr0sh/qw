@@ -131,6 +131,9 @@ fn stats_report() -> Result<String, Box<dyn std::error::Error>> {
         .ok_or_else(|| Error::new(ErrorKind::NotFound, "HOME is not set"))?;
     let cache_root = home.join(".cache/qw");
     let (cache_files, cache_bytes) = cache_usage(&cache_root)?;
+    let (model_cache_files, model_cache_bytes) = cache_usage(&cache_root.join("models"))?;
+    let (checkpoint_cache_files, checkpoint_cache_bytes) =
+        cache_usage(&cache_root.join("checkpoint"))?;
     let model_path = resolve_model_path(None)?;
     let model_override = std::env::var_os("QW_MODEL_PATH")
         .filter(|value| !value.is_empty())
@@ -147,6 +150,16 @@ fn stats_report() -> Result<String, Box<dyn std::error::Error>> {
         report,
         "Cache usage: {cache_files} files, {cache_bytes} bytes ({})",
         human_readable_bytes(cache_bytes)
+    )?;
+    writeln!(
+        report,
+        "Model cache usage: {model_cache_files} files, {model_cache_bytes} bytes ({})",
+        human_readable_bytes(model_cache_bytes)
+    )?;
+    writeln!(
+        report,
+        "Checkpoint cache usage: {checkpoint_cache_files} files, {checkpoint_cache_bytes} bytes ({})",
+        human_readable_bytes(checkpoint_cache_bytes)
     )?;
     writeln!(report, "Selected model: {selected_model}")?;
     writeln!(report, "Model path: {}", model_path.display())?;
