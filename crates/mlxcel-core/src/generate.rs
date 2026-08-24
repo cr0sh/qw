@@ -25,6 +25,11 @@
 //! - Shared decode setup delegated to `crate::generation_policy`
 
 use std::borrow::Cow;
+use std::collections::HashSet;
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use crate::cache::{CachePool, KVCacheMode, SequenceId};
@@ -75,10 +80,156 @@ impl ModelStateTensor {
             .as_ref()
             .expect("model-state snapshot tensor must not be null")
     }
-
     /// Byte footprint of this captured tensor.
     pub fn nbytes(&self) -> usize {
         ffi::array_nbytes(self.array())
+    }
+}
+
+
+/// Number of tokens in a persistent prompt-cache page.
+pub const SNAPSHOT_PAGE_TOKENS: usize = 256;
+
+static NEXT_SNAPSHOT_PAGE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// An immutable, process-identified tensor page.
+///
+/// The MLX handle deliberately remains inside this non-`Send` type. A page's
+/// raw representation can be moved between worker threads only through
+/// [`SnapshotPage::portable_bytes`].
+pub struct SnapshotPage {
+    identity: u64,
+    token_start: usize,
+    token_end: usize,
+    shape: Vec<i32>,
+    dtype: i32,
+    array: UniquePtr<MlxArray>,
+    portable: OnceLock<Arc<[u8]>>,
+}
+
+impl SnapshotPage {
+    fn new(token_start: usize, token_end: usize, array: UniquePtr<MlxArray>) -> Arc<Self> {
+        let view = array.as_ref().expect("snapshot page must not be null");
+        Arc::new(Self {
+            identity: NEXT_SNAPSHOT_PAGE_ID.fetch_add(1, Ordering::Relaxed),
+            token_start,
+            token_end,
+            shape: ffi::array_shape(view),
+            dtype: ffi::array_dtype(view),
+            array,
+            portable: OnceLock::new(),
+        })
+    }
+
+    /// Stable identity for this page during the current process.
+    pub fn identity(&self) -> u64 { self.identity }
+    pub fn token_range(&self) -> std::ops::Range<usize> { self.token_start..self.token_end }
+    pub fn shape(&self) -> &[i32] { &self.shape }
+    pub fn dtype(&self) -> i32 { self.dtype }
+    pub fn nbytes(&self) -> usize { ffi::array_nbytes(self.array.as_ref().expect("page array")) }
+    pub fn array(&self) -> &MlxArray { self.array.as_ref().expect("page array") }
+
+    /// Materialize this page once as Send-safe shared storage.
+    pub fn portable_bytes(&self) -> Arc<[u8]> {
+        self.portable
+            .get_or_init(|| {
+                ffi::eval(self.array.as_ref().expect("page array"));
+                Arc::<[u8]>::from(ffi::array_to_raw_bytes(
+                    self.array.as_ref().expect("page array"),
+                ))
+            })
+            .clone()
+    }
+}
+
+/// A sparse tensor snapshot made of immutable token pages.
+pub struct SnapshotPagedTensor {
+    name: String,
+    token_axis: usize,
+    token_len: usize,
+    pages: Vec<Arc<SnapshotPage>>,
+}
+
+impl SnapshotPagedTensor {
+    pub fn name(&self) -> &str { &self.name }
+    pub fn token_len(&self) -> usize { self.token_len }
+    pub fn token_axis(&self) -> usize { self.token_axis }
+    pub fn pages(&self) -> &[Arc<SnapshotPage>] { &self.pages }
+    pub fn nbytes(&self) -> usize {
+        let mut seen = HashSet::new();
+        self.pages.iter().filter(|p| seen.insert(p.identity())).map(|p| p.nbytes()).sum()
+    }
+
+    /// Gather pages only when a dense attention boundary requires it.
+    pub fn materialize(&self) -> Option<UniquePtr<MlxArray>> {
+        let first = self.pages.first()?.array();
+        let mut dense = ffi::copy(first);
+        for page in self.pages.iter().skip(1) {
+            dense = crate::concatenate(&dense, page.array(), self.token_axis as i32);
+        }
+        Some(dense)
+    }
+    pub fn portable_pages(&self) -> impl Iterator<Item = Arc<[u8]>> + '_ {
+        self.pages.iter().map(|p| p.portable_bytes())
+    }
+}
+
+impl ModelStateSnapshot {
+    /// Capture a tensor as immutable pages, reusing complete compatible pages
+    /// from the immediately preceding snapshot.
+    pub fn push_paged_tensor(
+        &mut self,
+        previous: Option<&ModelStateSnapshot>,
+        name: impl Into<String>,
+        array: &MlxArray,
+        token_axis: usize,
+    ) -> Result<(), String> {
+        let name = name.into();
+        let shape = ffi::array_shape(array);
+        if token_axis >= shape.len() {
+            return Err(format!("snapshot token axis {token_axis} out of bounds for shape {shape:?}"));
+        }
+        let token_len = self.token_len.min(shape[token_axis].max(0) as usize);
+        let old = previous.and_then(|s| s.paged_tensors.iter().find(|t| t.name == name));
+        let mut pages = Vec::with_capacity(token_len.div_ceil(SNAPSHOT_PAGE_TOKENS));
+        let mut start = 0;
+        while start < token_len {
+            let end = (start + SNAPSHOT_PAGE_TOKENS).min(token_len);
+            let reusable = end - start == SNAPSHOT_PAGE_TOKENS
+                && old.is_some_and(|t| {
+                    t.token_axis == token_axis
+                        && t.pages.iter().any(|p| p.token_range() == (start..end)
+                            && p.shape().iter().enumerate().all(|(i, &d)| i == token_axis || d == shape[i])
+                            && p.dtype() == ffi::array_dtype(array))
+                });
+            if reusable {
+                pages.push(old.unwrap().pages.iter().find(|p| p.token_range() == (start..end)).unwrap().clone());
+            } else {
+                let mut lo = vec![0; shape.len()];
+                let mut hi = shape.clone();
+                hi[token_axis] = end as i32;
+                lo[token_axis] = start as i32;
+                pages.push(SnapshotPage::new(start, end, ffi::slice(array, &lo, &hi)));
+            }
+            start = end;
+        }
+        self.paged_tensors.push(SnapshotPagedTensor { name, token_axis, token_len, pages });
+        Ok(())
+    }
+
+    pub fn paged_tensor(&self, name: &str) -> Option<&SnapshotPagedTensor> {
+        self.paged_tensors.iter().find(|t| t.name == name)
+    }
+
+    /// Sum bytes once per page identity, allowing shared prefixes to be
+    /// accounted for without charging every snapshot's references.
+    pub fn unique_paged_nbytes<'a, I>(snapshots: I) -> usize
+    where I: IntoIterator<Item = &'a ModelStateSnapshot> {
+        let mut seen = HashSet::new();
+        snapshots.into_iter().flat_map(|s| s.paged_tensors.iter())
+            .flat_map(|t| t.pages.iter())
+            .filter(|p| seen.insert(p.identity()))
+            .map(|p| p.nbytes()).sum()
     }
 }
 
@@ -86,12 +237,11 @@ impl ModelStateTensor {
 ///
 /// This is deliberately separate from detached KV-cache entries: recurrent
 /// SSM / linear-attention families cannot safely share arbitrary KV blocks, so
-/// the server parks a full-state snapshot and restores copies only on an exact
-/// stored-prefix hit.
 pub struct ModelStateSnapshot {
     family: String,
     token_len: usize,
     tensors: Vec<ModelStateTensor>,
+    paged_tensors: Vec<SnapshotPagedTensor>,
     continuation_logits: Option<UniquePtr<MlxArray>>,
 }
 
@@ -102,6 +252,7 @@ impl ModelStateSnapshot {
             family: family.into(),
             token_len,
             tensors: Vec::new(),
+            paged_tensors: Vec::new(),
             continuation_logits: None,
         }
     }
@@ -142,32 +293,30 @@ impl ModelStateSnapshot {
         self.continuation_logits.as_deref()
     }
 
-    /// Number of named tensors stored in this snapshot.
+    /// Number of named dense tensors stored in this snapshot.
     pub fn tensor_count(&self) -> usize {
         self.tensors.len()
     }
 
-    /// Iterate over model-defined tensor names.
+    pub fn paged_tensor_count(&self) -> usize {
+        self.paged_tensors.len()
+    }
+
+    /// Iterate over model-defined dense tensor names.
     pub fn tensor_names(&self) -> impl Iterator<Item = &str> {
         self.tensors.iter().map(ModelStateTensor::name)
     }
 
     /// Whether no tensor payload was captured.
     pub fn is_empty(&self) -> bool {
-        self.tensors.is_empty()
+        self.tensors.is_empty() && self.paged_tensors.is_empty()
     }
 
-    /// Sum of all captured tensor byte footprints.
+    /// Sum of captured bytes (shared pages are charged once within this snapshot).
     pub fn nbytes(&self) -> usize {
-        self.tensors
-            .iter()
-            .map(ModelStateTensor::nbytes)
-            .sum::<usize>()
-            + self
-                .continuation_logits
-                .as_deref()
-                .map(ffi::array_nbytes)
-                .unwrap_or(0)
+        self.tensors.iter().map(ModelStateTensor::nbytes).sum::<usize>()
+            + self.paged_tensors.iter().map(SnapshotPagedTensor::nbytes).sum::<usize>()
+            + self.continuation_logits.as_deref().map(ffi::array_nbytes).unwrap_or(0)
     }
 }
 
