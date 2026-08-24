@@ -758,11 +758,9 @@ impl AdaptivePrefixCache {
                 .terminal_ids()
                 .into_iter()
                 .filter(|(node, route)| {
-                    self.trie
-                        .terminal(*node, *route)
-                        .is_some_and(|terminal| {
-                            terminal.snapshot.is_some() && terminal.response_resume.is_none()
-                        })
+                    self.trie.terminal(*node, *route).is_some_and(|terminal| {
+                        terminal.snapshot.is_some() && terminal.response_resume.is_none()
+                    })
                 })
                 .min_by_key(|(node, route)| {
                     let t = self.trie.terminal(*node, *route).unwrap();
@@ -792,11 +790,9 @@ impl AdaptivePrefixCache {
                 .terminal_ids()
                 .into_iter()
                 .filter(|(node, route)| {
-                    self.trie
-                        .terminal(*node, *route)
-                        .is_some_and(|terminal| {
-                            terminal.persistent_key.is_some() && terminal.response_resume.is_none()
-                        })
+                    self.trie.terminal(*node, *route).is_some_and(|terminal| {
+                        terminal.persistent_key.is_some() && terminal.response_resume.is_none()
+                    })
                 })
                 .min_by_key(|(node, route)| {
                     let t = self.trie.terminal(*node, *route).unwrap();
