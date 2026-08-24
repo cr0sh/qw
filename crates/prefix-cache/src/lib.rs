@@ -152,16 +152,26 @@ pub struct AdaptivePrefixCache {
 
 struct CacheIo {
     tx: SyncSender<IoCommand>,
+    completions: Receiver<PutCompletion>,
     refreshes: Arc<Mutex<HashMap<EntryKey, u64>>>,
     refresh_enqueued: Arc<AtomicBool>,
 }
 
+struct PutCompletion {
+    node: usize,
+    route: SnapshotRoute,
+    token_ids: Vec<i32>,
+    key: EntryKey,
+    result: Result<(Vec<(String, u64)>, u64), String>,
+}
 enum IoCommand {
     Load {
         key: EntryKey,
         reply: mpsc::Sender<Result<Option<StoredEntry>, String>>,
     },
     Put {
+        node: usize,
+        key: EntryKey,
         namespace: String,
         route: SnapshotRoute,
         token_ids: Vec<i32>,
@@ -320,6 +330,44 @@ impl AdaptivePrefixCache {
         }
         Ok(cache)
     }
+    fn drain_put_completions(&mut self) {
+        let Some(io) = &self.io else {
+            return;
+        };
+        while let Ok(completion) = io.completions.try_recv() {
+            let Some((node, _)) = self
+                .trie
+                .path(&completion.token_ids, completion.route)
+                .into_iter()
+                .last()
+            else {
+                continue;
+            };
+            if self
+                .trie
+                .terminal(node, completion.route)
+                .is_none_or(|terminal| terminal.persistent_key.as_ref() != Some(&completion.key))
+            {
+                continue;
+            }
+            let terminal = self.trie.terminal_mut(node, completion.route).unwrap();
+            match completion.result {
+                Ok((refs, bytes)) => {
+                    terminal.blob_refs = refs;
+                    terminal.serialized_bytes = bytes;
+                }
+                Err(error) => {
+                    terminal.persistent_key = None;
+                    terminal.blob_refs.clear();
+                    terminal.serialized_bytes = 0;
+                    tracing::warn!(phase = "cache.persistence_error", error = %error);
+                }
+            }
+        }
+        self.rebuild_accounting();
+        self.evict_persistent(self.clock.now_unix_ms());
+    }
+
 
     pub fn checkpoint_lengths(
         &mut self,
@@ -327,6 +375,7 @@ impl AdaptivePrefixCache {
         required: &[usize],
         route: SnapshotRoute,
     ) -> Vec<usize> {
+        self.drain_put_completions();
         if tokens.is_empty() {
             return Vec::new();
         }
@@ -362,6 +411,7 @@ impl AdaptivePrefixCache {
     }
 
     pub fn lookup(&mut self, prompt: &[i32], route: SnapshotRoute) -> Option<PrefixMatch<'_>> {
+        self.drain_put_completions();
         let now = self.clock.now_unix_ms();
         self.expire(now);
         let candidates = self.trie.path(prompt, route);
@@ -431,6 +481,7 @@ impl AdaptivePrefixCache {
         request_fingerprint: &str,
         expected_route: SnapshotRoute,
     ) -> Result<ResumeEntry, ResumeLookupError> {
+        self.drain_put_completions();
         let now = self.clock.now_unix_ms();
         self.expire(now);
         let (route, token_ids) = self
@@ -524,6 +575,7 @@ impl AdaptivePrefixCache {
         route: SnapshotRoute,
         response_resume: Option<ResponseResumeMetadata>,
     ) {
+        self.drain_put_completions();
         let now = self.clock.now_unix_ms();
         let filesystem_before = self.filesystem_bytes;
         let mut inserted_logical_bytes = 0u64;
@@ -627,28 +679,9 @@ impl AdaptivePrefixCache {
                     .and_then(|snapshot| snapshot.to_portable().ok())
             });
             if let Some(portable) = portable {
-                if let Ok(encoded) = encode_portable(
-                    self.namespaces.get(route),
-                    route,
-                    prefix,
-                    portable.clone(),
-                    RetentionMetadata {
-                        observations,
-                        reuse_count,
-                        last_access_unix_ms: last_access,
-                    },
-                    expiry,
-                    resume.clone(),
-                ) {
-                    if let Ok(manifest) =
-                        parse_manifest(self.namespaces.get(route), &encoded.manifest)
-                    {
-                        if let Some(terminal) = self.trie.terminal_mut(node, route) {
-                            terminal.blob_refs = manifest_blob_refs(&manifest);
-                        }
-                    }
-                }
-                self.try_io(IoCommand::Put {
+                let queued = self.try_io(IoCommand::Put {
+                    node,
+                    key: key.clone(),
                     namespace: self.namespaces.get(route).to_string(),
                     route,
                     token_ids: prefix.to_vec(),
@@ -661,6 +694,11 @@ impl AdaptivePrefixCache {
                     expires_at_unix_ms: expiry,
                     response_resume: resume,
                 });
+                if !queued {
+                    if let Some(terminal) = self.trie.terminal_mut(node, route) {
+                        terminal.persistent_key = None;
+                    }
+                }
             }
             tracing::debug!(
                 phase = "cache.insert",
@@ -706,13 +744,19 @@ impl AdaptivePrefixCache {
         self.memory_bytes
     }
 
-    pub fn flush_persistence(&self) {
+    pub fn flush_persistence(&mut self) {
         let Some(io) = &self.io else {
             return;
         };
+        let tx = io.tx.clone();
         let (reply_tx, reply_rx) = mpsc::channel();
-        if io.tx.send(IoCommand::Flush(reply_tx)).is_ok() {
+        if tx.send(IoCommand::Flush(reply_tx)).is_ok() {
             let _ = reply_rx.recv();
+            self.drain_put_completions();
+            let (reply_tx, reply_rx) = mpsc::channel();
+            if tx.send(IoCommand::Flush(reply_tx)).is_ok() {
+                let _ = reply_rx.recv();
+            }
         }
     }
 
@@ -913,20 +957,26 @@ impl AdaptivePrefixCache {
         self.rebuild_accounting();
     }
 
-    fn try_io(&self, command: IoCommand) {
+    fn try_io(&self, command: IoCommand) -> bool {
         let Some(io) = &self.io else {
-            return;
+            return false;
         };
         match io.tx.try_send(command) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => tracing::warn!(
-                phase = "cache.persistence_error",
-                error = "cache I/O queue is full"
-            ),
-            Err(TrySendError::Disconnected(_)) => tracing::warn!(
-                phase = "cache.persistence_error",
-                error = "cache I/O thread stopped"
-            ),
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => {
+                tracing::warn!(
+                    phase = "cache.persistence_error",
+                    error = "cache I/O queue is full"
+                );
+                false
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                tracing::warn!(
+                    phase = "cache.persistence_error",
+                    error = "cache I/O thread stopped"
+                );
+                false
+            }
         }
     }
     fn remove_persistent_sync(&self, key: &EntryKey) {
@@ -1037,16 +1087,26 @@ fn manifest_blob_refs(manifest: &Manifest) -> Vec<(String, u64)> {
 
 fn spawn_io_thread(mut store: Box<dyn PersistentSnapshotStore>) -> CacheIo {
     let (tx, rx) = mpsc::sync_channel(IO_QUEUE_CAPACITY);
+    let (completion_tx, completion_rx) = mpsc::channel();
     let refreshes = Arc::new(Mutex::new(HashMap::new()));
     let refresh_enqueued = Arc::new(AtomicBool::new(false));
     let thread_refreshes = Arc::clone(&refreshes);
     let thread_refresh_enqueued = Arc::clone(&refresh_enqueued);
     thread::Builder::new()
         .name("qw-prefix-cache-io".to_string())
-        .spawn(move || io_loop(&mut *store, rx, thread_refreshes, thread_refresh_enqueued))
+        .spawn(move || {
+            io_loop(
+                &mut *store,
+                rx,
+                completion_tx,
+                thread_refreshes,
+                thread_refresh_enqueued,
+            )
+        })
         .expect("failed to spawn prefix cache I/O thread");
     CacheIo {
         tx,
+        completions: completion_rx,
         refreshes,
         refresh_enqueued,
     }
@@ -1055,6 +1115,7 @@ fn spawn_io_thread(mut store: Box<dyn PersistentSnapshotStore>) -> CacheIo {
 fn io_loop(
     store: &mut dyn PersistentSnapshotStore,
     rx: Receiver<IoCommand>,
+    completion_tx: mpsc::Sender<PutCompletion>,
     refreshes: Arc<Mutex<HashMap<EntryKey, u64>>>,
     refresh_enqueued: Arc<AtomicBool>,
 ) {
@@ -1069,6 +1130,8 @@ fn io_loop(
                 continue;
             }
             IoCommand::Put {
+                node,
+                key,
                 namespace,
                 route,
                 token_ids,
@@ -1076,26 +1139,42 @@ fn io_loop(
                 retention,
                 expires_at_unix_ms,
                 response_resume,
-            } => encode_portable(
-                &namespace,
-                route,
-                &token_ids,
-                portable,
-                retention,
-                expires_at_unix_ms,
-                response_resume,
-            )
-            .and_then(|encoded| {
-                store.put(
-                    StoredEntry {
-                        key: encoded.key,
-                        manifest: encoded.manifest,
-
-                        blobs: encoded.blobs,
-                    },
+            } => {
+                let completion_tokens = token_ids.clone();
+                let result = encode_portable(
+                    &namespace,
+                    route,
+                    &token_ids,
+                    portable,
+                    retention,
                     expires_at_unix_ms,
+                    response_resume,
                 )
-            }),
+                .and_then(|encoded| {
+                    let refs = manifest_blob_refs(
+                        &serde_json::from_slice::<Manifest>(&encoded.manifest)
+                            .map_err(|error| error.to_string())?,
+                    );
+                    let bytes = encoded.manifest.len() as u64;
+                    store.put(
+                        StoredEntry {
+                            key: encoded.key,
+                            manifest: encoded.manifest,
+                            blobs: encoded.blobs,
+                        },
+                        expires_at_unix_ms,
+                    )?;
+                    Ok((refs, bytes))
+                });
+                let _ = completion_tx.send(PutCompletion {
+                    node,
+                    route,
+                    token_ids: completion_tokens,
+                    key,
+                    result,
+                });
+                continue;
+            }
             IoCommand::Remove(key) => store.remove(&key),
             IoCommand::FlushRefresh => {
                 loop {

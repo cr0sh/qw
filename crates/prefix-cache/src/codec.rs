@@ -158,12 +158,31 @@ pub fn encode_portable(
     let (f, off, dense, paged) = flatten(p)?;
     let mut blobs = Vec::new();
     let mut seen = HashSet::new();
-    let mut add = |b: &[u8]| {
-        let s = digest(b);
+    enum BlobBytes {
+        Dense(Vec<u8>),
+        Shared(Arc<[u8]>),
+    }
+    impl BlobBytes {
+        fn as_slice(&self) -> &[u8] {
+            match self {
+                Self::Dense(bytes) => bytes,
+                Self::Shared(bytes) => bytes,
+            }
+        }
+
+        fn into_arc(self) -> Arc<[u8]> {
+            match self {
+                Self::Dense(bytes) => Arc::from(bytes),
+                Self::Shared(bytes) => bytes,
+            }
+        }
+    }
+    let mut add = |b: BlobBytes| {
+        let s = digest(b.as_slice());
         if seen.insert(s.clone()) {
             blobs.push(ContentBlob {
                 sha256: s.clone(),
-                bytes: Arc::from(b),
+                bytes: b.into_arc(),
             })
         }
         s
@@ -177,7 +196,7 @@ pub fn encode_portable(
                 name: a.name,
                 shape: a.shape,
                 dtype: a.dtype,
-                blob_sha256: add(&a.bytes),
+                blob_sha256: add(BlobBytes::Dense(a.bytes)),
                 byte_len: n,
             }
         })
@@ -199,7 +218,7 @@ pub fn encode_portable(
                         token_end: p.token_end,
                         shape: p.shape,
                         dtype: p.dtype,
-                        blob_sha256: add(&p.bytes),
+                        blob_sha256: add(BlobBytes::Shared(p.bytes)),
                         byte_len: n,
                     }
                 })
