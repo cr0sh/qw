@@ -298,6 +298,7 @@ mod tests {
         assert!(resolve_persistent_log_filter(None, Some("server=debug")).is_ok());
         assert!(resolve_persistent_log_filter(None, None).is_ok());
 
+        let help = TestCli::command().render_long_help().to_string();
         assert!(
             help.contains("--persistent-log-filter <PERSISTENT_LOG_FILTER>"),
             "{help}"
