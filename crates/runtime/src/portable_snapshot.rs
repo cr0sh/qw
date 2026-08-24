@@ -133,20 +133,30 @@ fn model_to_portable(snapshot: &ModelStateSnapshot) -> PortableModelState {
         tensors,
         paged_tensors: snapshot
             .paged_tensor_names()
-            .filter_map(|name| snapshot.paged_tensor(name).map(|tensor| PortablePagedTensor {
-                name: name.to_string(),
-                token_axis: tensor.token_axis(),
-                token_len: tensor.token_len(),
-                pages: tensor.pages().iter().map(|page| PortablePage {
-                    token_start: page.token_range().start,
-                    token_end: page.token_range().end,
-                    shape: page.shape().to_vec(),
-                    dtype: page.dtype(),
-                    bytes: page.portable_bytes(),
-                }).collect(),
-            }))
+            .filter_map(|name| {
+                snapshot
+                    .paged_tensor(name)
+                    .map(|tensor| PortablePagedTensor {
+                        name: name.to_string(),
+                        token_axis: tensor.token_axis(),
+                        token_len: tensor.token_len(),
+                        pages: tensor
+                            .pages()
+                            .iter()
+                            .map(|page| PortablePage {
+                                token_start: page.token_range().start,
+                                token_end: page.token_range().end,
+                                shape: page.shape().to_vec(),
+                                dtype: page.dtype(),
+                                bytes: page.portable_bytes(),
+                            })
+                            .collect(),
+                    })
+            })
             .collect(),
-        continuation_logits: snapshot.continuation_logits().map(|array| array_to_portable(None, array)),
+        continuation_logits: snapshot
+            .continuation_logits()
+            .map(|array| array_to_portable(None, array)),
     }
 }
 
@@ -167,23 +177,51 @@ pub(crate) fn model_from_portable(
     let mut names = HashSet::with_capacity(portable.tensors.len() + portable.paged_tensors.len());
     let mut restored_tensors = Vec::with_capacity(portable.tensors.len());
     for tensor in portable.tensors {
-        let name = tensor.name.clone().ok_or_else(|| "portable model tensor is missing its name".to_string())?;
-        if name.is_empty() || !names.insert(name.clone()) { return Err(format!("duplicate or empty portable model tensor name {name:?}")); }
+        let name = tensor
+            .name
+            .clone()
+            .ok_or_else(|| "portable model tensor is missing its name".to_string())?;
+        if name.is_empty() || !names.insert(name.clone()) {
+            return Err(format!(
+                "duplicate or empty portable model tensor name {name:?}"
+            ));
+        }
         restored_tensors.push((name.clone(), array_from_portable(tensor, Some(&name))?));
     }
     let mut restored_pages = Vec::with_capacity(portable.paged_tensors.len());
     for tensor in portable.paged_tensors {
-        if tensor.name.is_empty() || !names.insert(tensor.name.clone()) { return Err("duplicate portable paged tensor name".into()); }
-        let pages = tensor.pages.into_iter().map(|page| {
-            SnapshotPage::from_portable(page.token_start, page.token_end, page.shape, page.dtype, &page.bytes)
-        }).collect::<Result<Vec<_>, _>>()?;
+        if tensor.name.is_empty() || !names.insert(tensor.name.clone()) {
+            return Err("duplicate portable paged tensor name".into());
+        }
+        let pages = tensor
+            .pages
+            .into_iter()
+            .map(|page| {
+                SnapshotPage::from_portable(
+                    page.token_start,
+                    page.token_end,
+                    page.shape,
+                    page.dtype,
+                    &page.bytes,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         restored_pages.push((tensor.name, tensor.token_axis, pages));
     }
-    let continuation_logits = portable.continuation_logits.map(|array| array_from_portable(array, None)).transpose()?;
+    let continuation_logits = portable
+        .continuation_logits
+        .map(|array| array_from_portable(array, None))
+        .transpose()?;
     let mut snapshot = ModelStateSnapshot::new(portable.family, portable.token_len);
-    for (name, array) in restored_tensors { snapshot.push_tensor(name, &array); }
-    for (name, axis, pages) in restored_pages { snapshot.push_paged_pages(name, axis, pages)?; }
-    if let Some(logits) = continuation_logits { snapshot.set_continuation_logits(&logits); }
+    for (name, array) in restored_tensors {
+        snapshot.push_tensor(name, &array);
+    }
+    for (name, axis, pages) in restored_pages {
+        snapshot.push_paged_pages(name, axis, pages)?;
+    }
+    if let Some(logits) = continuation_logits {
+        snapshot.set_continuation_logits(&logits);
+    }
     Ok(snapshot)
 }
 

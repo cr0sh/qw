@@ -24,14 +24,6 @@
 //! - Shared sampling policy delegated to `crate::sampling`
 //! - Shared decode setup delegated to `crate::generation_policy`
 
-use std::borrow::Cow;
-use std::collections::HashSet;
-use std::sync::{
-    Arc, OnceLock,
-    atomic::{AtomicU64, Ordering},
-};
-use std::time::{Duration, Instant};
-use tracing::Level;
 use crate::cache::{CachePool, KVCacheMode, SequenceId};
 use crate::ffi;
 use crate::ffi::{MlxArray, MlxThreadLocalStream};
@@ -47,6 +39,14 @@ use crate::sampling::{
 use crate::streams::{install_thread_local_default_stream, new_thread_local_generation_stream};
 use crate::utils::{align_to_na_tile, create_padded_prefill_mask};
 use cxx::UniquePtr;
+use std::borrow::Cow;
+use std::collections::HashSet;
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicU64, Ordering},
+};
+use std::time::{Duration, Instant};
+use tracing::Level;
 
 /// One named tensor captured from a model-owned recurrent sequence state.
 ///
@@ -85,7 +85,6 @@ impl ModelStateTensor {
         ffi::array_nbytes(self.array())
     }
 }
-
 
 /// Number of tokens in a persistent prompt-cache page.
 pub const SNAPSHOT_PAGE_TOKENS: usize = 256;
@@ -132,20 +131,40 @@ impl SnapshotPage {
         dtype: i32,
         bytes: &[u8],
     ) -> Result<Arc<Self>, String> {
-        let expected = shape.iter().try_fold(1usize, |n, &d| {
-            n.checked_mul(usize::try_from(d).ok()?)
-        }).and_then(|n| n.checked_mul(crate::dtype::size_bytes(dtype)?));
+        let expected = shape
+            .iter()
+            .try_fold(1usize, |n, &d| n.checked_mul(usize::try_from(d).ok()?))
+            .and_then(|n| n.checked_mul(crate::dtype::size_bytes(dtype)?));
         if expected != Some(bytes.len()) {
-            return Err(format!("snapshot page byte length mismatch: expected {expected:?}, got {}", bytes.len()));
+            return Err(format!(
+                "snapshot page byte length mismatch: expected {expected:?}, got {}",
+                bytes.len()
+            ));
         }
-        Ok(Self::new(token_start, token_end, ffi::from_bytes(bytes, &shape, dtype)))
+        Ok(Self::new(
+            token_start,
+            token_end,
+            ffi::from_bytes(bytes, &shape, dtype),
+        ))
     }
-    pub fn identity(&self) -> u64 { self.identity }
-    pub fn token_range(&self) -> std::ops::Range<usize> { self.token_start..self.token_end }
-    pub fn shape(&self) -> &[i32] { &self.shape }
-    pub fn dtype(&self) -> i32 { self.dtype }
-    pub fn nbytes(&self) -> usize { ffi::array_nbytes(self.array.as_ref().expect("page array")) }
-    pub fn array(&self) -> &MlxArray { self.array.as_ref().expect("page array") }
+    pub fn identity(&self) -> u64 {
+        self.identity
+    }
+    pub fn token_range(&self) -> std::ops::Range<usize> {
+        self.token_start..self.token_end
+    }
+    pub fn shape(&self) -> &[i32] {
+        &self.shape
+    }
+    pub fn dtype(&self) -> i32 {
+        self.dtype
+    }
+    pub fn nbytes(&self) -> usize {
+        ffi::array_nbytes(self.array.as_ref().expect("page array"))
+    }
+    pub fn array(&self) -> &MlxArray {
+        self.array.as_ref().expect("page array")
+    }
 
     /// Materialize this page once as Send-safe shared storage.
     pub fn portable_bytes(&self) -> Arc<[u8]> {
@@ -181,13 +200,25 @@ pub struct SnapshotPagedTensor {
 }
 
 impl SnapshotPagedTensor {
-    pub fn name(&self) -> &str { &self.name }
-    pub fn token_len(&self) -> usize { self.token_len }
-    pub fn token_axis(&self) -> usize { self.token_axis }
-    pub fn pages(&self) -> &[Arc<SnapshotPage>] { &self.pages }
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn token_len(&self) -> usize {
+        self.token_len
+    }
+    pub fn token_axis(&self) -> usize {
+        self.token_axis
+    }
+    pub fn pages(&self) -> &[Arc<SnapshotPage>] {
+        &self.pages
+    }
     pub fn nbytes(&self) -> usize {
         let mut seen = HashSet::new();
-        self.pages.iter().filter(|p| seen.insert(p.identity())).map(|p| p.nbytes()).sum()
+        self.pages
+            .iter()
+            .filter(|p| seen.insert(p.identity()))
+            .map(|p| p.nbytes())
+            .sum()
     }
     /// Gather pages only when a dense attention boundary requires it.
     pub fn materialize(&self) -> Option<UniquePtr<MlxArray>> {
@@ -229,7 +260,9 @@ impl ModelStateSnapshot {
         let name = name.into();
         let shape = ffi::array_shape(array);
         if token_axis >= shape.len() {
-            return Err(format!("snapshot token axis {token_axis} out of bounds for shape {shape:?}"));
+            return Err(format!(
+                "snapshot token axis {token_axis} out of bounds for shape {shape:?}"
+            ));
         }
         let token_len = self.token_len.min(shape[token_axis].max(0) as usize);
         let old = previous.and_then(|s| s.paged_tensors.iter().find(|t| t.name == name));
@@ -245,12 +278,23 @@ impl ModelStateSnapshot {
             let reusable = end - start == SNAPSHOT_PAGE_TOKENS
                 && old.is_some_and(|t| {
                     t.token_axis == token_axis
-                        && t.pages.iter().any(|p| p.token_range() == (start..end)
-                            && p.shape().iter().enumerate().all(|(i, &d)| i == token_axis || d == shape[i])
-                            && p.dtype() == ffi::array_dtype(array))
+                        && t.pages.iter().any(|p| {
+                            p.token_range() == (start..end)
+                                && p.shape()
+                                    .iter()
+                                    .enumerate()
+                                    .all(|(i, &d)| i == token_axis || d == shape[i])
+                                && p.dtype() == ffi::array_dtype(array)
+                        })
                 });
             if reusable {
-                let page = old.unwrap().pages.iter().find(|p| p.token_range() == (start..end)).unwrap().clone();
+                let page = old
+                    .unwrap()
+                    .pages
+                    .iter()
+                    .find(|p| p.token_range() == (start..end))
+                    .unwrap()
+                    .clone();
                 if trace_enabled {
                     reused_pages += 1;
                 }
@@ -282,7 +326,12 @@ impl ModelStateSnapshot {
                 duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
             );
         }
-        self.paged_tensors.push(SnapshotPagedTensor { name, token_axis, token_len, pages });
+        self.paged_tensors.push(SnapshotPagedTensor {
+            name,
+            token_axis,
+            token_len,
+            pages,
+        });
         Ok(())
     }
 
@@ -296,12 +345,17 @@ impl ModelStateSnapshot {
     /// Sum bytes once per page identity, allowing shared prefixes to be
     /// accounted for without charging every snapshot's references.
     pub fn unique_paged_nbytes<'a, I>(snapshots: I) -> usize
-    where I: IntoIterator<Item = &'a ModelStateSnapshot> {
+    where
+        I: IntoIterator<Item = &'a ModelStateSnapshot>,
+    {
         let mut seen = HashSet::new();
-        snapshots.into_iter().flat_map(|s| s.paged_tensors.iter())
+        snapshots
+            .into_iter()
+            .flat_map(|s| s.paged_tensors.iter())
             .flat_map(|t| t.pages.iter())
             .filter(|p| seen.insert(p.identity()))
-            .map(|p| p.nbytes()).sum()
+            .map(|p| p.nbytes())
+            .sum()
     }
 
     pub fn push_paged_pages(
@@ -318,7 +372,10 @@ impl ModelStateSnapshot {
             return Err("snapshot page token range must be non-empty".to_string());
         }
         self.paged_tensors.push(SnapshotPagedTensor {
-            name: name.into(), token_axis, token_len, pages,
+            name: name.into(),
+            token_axis,
+            token_len,
+            pages,
         });
         Ok(())
     }
@@ -347,8 +404,16 @@ impl ModelStateSnapshot {
         }
         SnapshotStorageSummary {
             pages,
-            local_bytes: self.tensors.iter().map(ModelStateTensor::nbytes).sum::<usize>()
-                + self.continuation_logits.as_deref().map(ffi::array_nbytes).unwrap_or(0),
+            local_bytes: self
+                .tensors
+                .iter()
+                .map(ModelStateTensor::nbytes)
+                .sum::<usize>()
+                + self
+                    .continuation_logits
+                    .as_deref()
+                    .map(ffi::array_nbytes)
+                    .unwrap_or(0),
         }
     }
 }
@@ -434,9 +499,20 @@ impl ModelStateSnapshot {
 
     /// Sum of captured bytes (shared pages are charged once within this snapshot).
     pub fn nbytes(&self) -> usize {
-        self.tensors.iter().map(ModelStateTensor::nbytes).sum::<usize>()
-            + self.paged_tensors.iter().map(SnapshotPagedTensor::nbytes).sum::<usize>()
-            + self.continuation_logits.as_deref().map(ffi::array_nbytes).unwrap_or(0)
+        self.tensors
+            .iter()
+            .map(ModelStateTensor::nbytes)
+            .sum::<usize>()
+            + self
+                .paged_tensors
+                .iter()
+                .map(SnapshotPagedTensor::nbytes)
+                .sum::<usize>()
+            + self
+                .continuation_logits
+                .as_deref()
+                .map(ffi::array_nbytes)
+                .unwrap_or(0)
     }
 }
 
@@ -775,11 +851,8 @@ fn prefill_with_checkpoints<M: LanguageModel + ?Sized>(
             logits
         };
         if checkpoint_token_lengths.binary_search(&range_end).is_ok()
-            && let Some(mut snapshot) = model.snapshot_sequence_state(
-                sequence_id,
-                range_end,
-                snapshots.last(),
-            )
+            && let Some(mut snapshot) =
+                model.snapshot_sequence_state(sequence_id, range_end, snapshots.last())
         {
             snapshot.set_continuation_logits(
                 piece_logits
@@ -1831,9 +1904,11 @@ impl CxxGenerator {
                 .iter()
                 .all(|snapshot| snapshot.token_len() != prompt_tokens.len())
         {
-            if let Some(mut snapshot) =
-                model.snapshot_sequence_state(sequence_id, prompt_tokens.len(), prompt_snapshots.last())
-            {
+            if let Some(mut snapshot) = model.snapshot_sequence_state(
+                sequence_id,
+                prompt_tokens.len(),
+                prompt_snapshots.last(),
+            ) {
                 snapshot.set_continuation_logits(
                     logits.as_ref().expect("generation logits must not be null"),
                 );
@@ -1990,7 +2065,13 @@ impl CxxGenerator {
         let decode_time = decode_start.elapsed();
 
         let final_snapshot = (!self.generated_tokens.is_empty() && model.supports_snapshot_reuse())
-            .then(|| model.snapshot_sequence_state(sequence_id, aligned_token_len, prompt_snapshots.last()))
+            .then(|| {
+                model.snapshot_sequence_state(
+                    sequence_id,
+                    aligned_token_len,
+                    prompt_snapshots.last(),
+                )
+            })
             .flatten()
             .map(|mut snapshot| {
                 snapshot.set_continuation_logits(
@@ -4631,11 +4712,17 @@ mod tests {
         let array = ffi::from_slice_f32(&values, &[1, 768, 2]);
 
         let mut first = ModelStateSnapshot::new("test", 256);
-        first.push_paged_tensor(None, "kv", &array, 1).expect("capture first page");
+        first
+            .push_paged_tensor(None, "kv", &array, 1)
+            .expect("capture first page");
         let mut second = ModelStateSnapshot::new("test", 512);
-        second.push_paged_tensor(Some(&first), "kv", &array, 1).expect("capture second pages");
+        second
+            .push_paged_tensor(Some(&first), "kv", &array, 1)
+            .expect("capture second pages");
         let mut third = ModelStateSnapshot::new("test", 768);
-        third.push_paged_tensor(Some(&second), "kv", &array, 1).expect("capture third pages");
+        third
+            .push_paged_tensor(Some(&second), "kv", &array, 1)
+            .expect("capture third pages");
 
         let first_pages = &first.paged_tensor("kv").expect("first tensor").pages();
         let second_pages = &second.paged_tensor("kv").expect("second tensor").pages();
@@ -4653,14 +4740,20 @@ mod tests {
     #[test]
     fn paged_snapshot_branch_shares_prefix_and_owns_divergent_partial_tail() {
         let base_values = (0..512 * 2).map(|i| i as f32).collect::<Vec<_>>();
-        let branch_values = (0..700 * 2).map(|i| (i + 10_000) as f32).collect::<Vec<_>>();
+        let branch_values = (0..700 * 2)
+            .map(|i| (i + 10_000) as f32)
+            .collect::<Vec<_>>();
         let base = ffi::from_slice_f32(&base_values, &[1, 512, 2]);
         let branch = ffi::from_slice_f32(&branch_values, &[1, 700, 2]);
 
         let mut parent = ModelStateSnapshot::new("test", 512);
-        parent.push_paged_tensor(None, "kv", &base, 1).expect("capture parent");
+        parent
+            .push_paged_tensor(None, "kv", &base, 1)
+            .expect("capture parent");
         let mut child = ModelStateSnapshot::new("test", 700);
-        child.push_paged_tensor(Some(&parent), "kv", &branch, 1).expect("capture branch");
+        child
+            .push_paged_tensor(Some(&parent), "kv", &branch, 1)
+            .expect("capture branch");
 
         let parent_pages = &parent.paged_tensor("kv").expect("parent tensor").pages();
         let child_pages = &child.paged_tensor("kv").expect("child tensor").pages();
@@ -4676,9 +4769,13 @@ mod tests {
         let values = vec![1.0f32; 512 * 2];
         let array = ffi::from_slice_f32(&values, &[1, 512, 2]);
         let mut parent = ModelStateSnapshot::new("test", 512);
-        parent.push_paged_tensor(None, "kv", &array, 1).expect("capture parent");
+        parent
+            .push_paged_tensor(None, "kv", &array, 1)
+            .expect("capture parent");
         let mut child = ModelStateSnapshot::new("test", 512);
-        child.push_paged_tensor(Some(&parent), "kv", &array, 1).expect("capture child");
+        child
+            .push_paged_tensor(Some(&parent), "kv", &array, 1)
+            .expect("capture child");
 
         let parent_summary = parent.storage_summary();
         let child_summary = child.storage_summary();
@@ -4686,8 +4783,11 @@ mod tests {
         assert_eq!(child_summary.pages, parent_summary.pages);
         assert_eq!(
             ModelStateSnapshot::unique_paged_nbytes([&parent, &child]),
-            parent_summary.pages.iter().map(|(_, bytes)| *bytes).sum::<usize>()
+            parent_summary
+                .pages
+                .iter()
+                .map(|(_, bytes)| *bytes)
+                .sum::<usize>()
         );
     }
-
 }

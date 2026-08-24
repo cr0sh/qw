@@ -1,26 +1,495 @@
-use std::{collections::{HashMap, HashSet}, sync::Arc};
-use qw_runtime::{PortableArray, PortableModelState, PortablePage, PortablePagedTensor, PortablePromptSnapshot, PromptSnapshot};
+use crate::{EntryKey, SnapshotRoute};
+use qw_runtime::{
+    PortableArray, PortableModelState, PortablePage, PortablePagedTensor, PortablePromptSnapshot,
+    PromptSnapshot,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use crate::{EntryKey, SnapshotRoute};
-#[derive(Debug,Clone,Serialize,Deserialize,PartialEq,Eq)] #[serde(deny_unknown_fields)] pub struct RetentionMetadata{pub observations:u64,pub reuse_count:u64,pub last_access_unix_ms:u64}
-#[derive(Debug,Clone,Serialize,Deserialize,PartialEq,Eq)] #[serde(deny_unknown_fields)] pub struct ResponseResumeMetadata{pub response_id:String,pub message_id:String,pub created_unix_seconds:u64,pub prompt_token_count:usize,pub request_fingerprint:String,pub generated_token_ids:Vec<i32>,pub raw_text:String,pub emitted_reasoning_text:String,pub emitted_content_text:String,pub original_max_tokens:usize}
-#[derive(Debug,Clone,Serialize,Deserialize)] #[serde(deny_unknown_fields)] pub struct Manifest{pub namespace:String,pub route:SnapshotRoute,pub token_ids:Vec<i32>,pub token_len:usize,pub family:String,#[serde(deserialize_with="required_option")]pub draft_offset:Option<i32>,pub arrays:Vec<ArrayDescriptor>,pub paged_tensors:Vec<PagedTensorDescriptor>,pub retention:RetentionMetadata,pub expires_at_unix_ms:u64,#[serde(deserialize_with="required_option")]pub response_resume:Option<ResponseResumeMetadata>,pub blob_sha256:Vec<String>,pub total_bytes:u64}
-#[derive(Debug,Clone,Serialize,Deserialize)] #[serde(deny_unknown_fields)] pub struct ArrayDescriptor{pub role:ArrayRole,#[serde(deserialize_with="required_option")]pub name:Option<String>,pub shape:Vec<i32>,pub dtype:i32,pub blob_sha256:String,pub byte_len:u64}
-#[derive(Debug,Clone,Serialize,Deserialize)] #[serde(deny_unknown_fields)] pub struct PagedTensorDescriptor{pub role:ArrayRole,pub name:String,pub token_axis:usize,pub token_len:usize,pub pages:Vec<PageDescriptor>}
-#[derive(Debug,Clone,Serialize,Deserialize)] #[serde(deny_unknown_fields)] pub struct PageDescriptor{pub token_start:usize,pub token_end:usize,pub shape:Vec<i32>,pub dtype:i32,pub blob_sha256:String,pub byte_len:u64}
-#[derive(Debug,Clone,Copy,Serialize,Deserialize,PartialEq,Eq,Hash)] #[serde(rename_all="snake_case")] pub enum ArrayRole{ModelTensor,ModelContinuation,DraftKeys,DraftValues,LastHidden,MtpContinuation,TargetTensor,TargetContinuation,DraftTensor,DraftContinuation}
-#[derive(Debug,Clone,PartialEq,Eq)] pub struct ContentBlob{pub sha256:String,pub bytes:Arc<[u8]>}
-#[derive(Debug,Clone)] pub struct EncodedEntry{pub key:EntryKey,pub manifest:Vec<u8>,pub blobs:Vec<ContentBlob>}
-pub struct DecodedEntry{pub manifest:Manifest,pub snapshot:PromptSnapshot}
-fn hex(b:&[u8])->String{b.iter().map(|x|format!("{x:02x}")).collect()}fn digest(b:&[u8])->String{hex(&Sha256::digest(b))}
-pub fn entry_key(ns:&str,r:SnapshotRoute,t:&[i32])->EntryKey{let mut h=Sha256::new();h.update(ns.as_bytes());h.update([r as u8]);for x in t{h.update(x.to_le_bytes())}EntryKey(format!("{ns}/{}",hex(&h.finalize())))}
-pub fn namespace_hash(p:&[&[u8]])->String{let mut h=Sha256::new();for x in p{h.update((x.len()as u64).to_le_bytes());h.update(x)}hex(&h.finalize())}
-pub fn encode_portable(ns:&str,r:SnapshotRoute,t:&[i32],p:PortablePromptSnapshot,ret:RetentionMetadata,exp:u64,res:Option<ResponseResumeMetadata>)->Result<EncodedEntry,String>{let len=match &p{PortablePromptSnapshot::Baseline(m)=>m.token_len,PortablePromptSnapshot::Mtp{target,..}=>target.token_len};if t.is_empty()||len!=t.len()||!matches!((r,&p),(SnapshotRoute::Baseline,PortablePromptSnapshot::Baseline(_))|(SnapshotRoute::Mtp,PortablePromptSnapshot::Mtp{..})){return Err("portable snapshot route and token length must match the cache entry".into())}validate_resume_metadata(t,res.as_ref())?;let(f,off,dense,paged)=flatten(p)?;let mut blobs=Vec::new();let mut seen=HashSet::new();let mut add=|b:&[u8]|{let s=digest(b);if seen.insert(s.clone()){blobs.push(ContentBlob{sha256:s.clone(),bytes:Arc::from(b)})}s};let arrays=dense.into_iter().map(|(role,a)|{let n=a.bytes.len()as u64;ArrayDescriptor{role,name:a.name,shape:a.shape,dtype:a.dtype,blob_sha256:add(&a.bytes),byte_len:n}}).collect();let paged_tensors=paged.into_iter().map(|(role,x)|PagedTensorDescriptor{role,name:x.name,token_axis:x.token_axis,token_len:x.token_len,pages:x.pages.into_iter().map(|p|{let n=p.bytes.len()as u64;PageDescriptor{token_start:p.token_start,token_end:p.token_end,shape:p.shape,dtype:p.dtype,blob_sha256:add(&p.bytes),byte_len:n}}).collect()}).collect();let total=blobs.iter().map(|b|b.bytes.len()as u64).sum();let m=Manifest{namespace:ns.into(),route:r,token_ids:t.to_vec(),token_len:len,family:f,draft_offset:off,arrays,paged_tensors,retention:ret,expires_at_unix_ms:exp,response_resume:res,blob_sha256:blobs.iter().map(|b|b.sha256.clone()).collect(),total_bytes:total};Ok(EncodedEntry{key:entry_key(ns,r,t),manifest:serde_json::to_vec(&m).map_err(|e|e.to_string())?,blobs})}
-pub fn decode(ns:&str,b:&[u8],blobs:Vec<ContentBlob>)->Result<DecodedEntry,String>{let m:Manifest=serde_json::from_slice(b).map_err(|e|e.to_string())?;validate_manifest(ns,&m)?;let map:HashMap<_,_>=blobs.into_iter().map(|x|(x.sha256,x.bytes)).collect();if map.len()!=m.blob_sha256.len(){return Err("cache blob set does not match manifest".into())}for d in &m.blob_sha256{let b=map.get(d).ok_or("cache blob missing")?;if digest(b)!=*d{return Err("cache blob digest mismatch".into())}}let get=|d:&str,n:u64|map.get(d).filter(|b|b.len()as u64==n).map(|b|b.to_vec()).ok_or_else(||"cache descriptor blob is missing or wrong length".to_string());let dense=m.arrays.iter().map(|x|Ok((x.role,PortableArray{name:x.name.clone(),shape:x.shape.clone(),dtype:x.dtype,bytes:get(&x.blob_sha256,x.byte_len)?}))).collect::<Result<Vec<_>,String>>()?;let paged=m.paged_tensors.iter().map(|x|Ok((x.role,PortablePagedTensor{name:x.name.clone(),token_axis:x.token_axis,token_len:x.token_len,pages:x.pages.iter().map(|p|Ok(PortablePage{token_start:p.token_start,token_end:p.token_end,shape:p.shape.clone(),dtype:p.dtype,bytes:Arc::from(get(&p.blob_sha256,p.byte_len)?) })).collect::<Result<Vec<_>,String>>()?}))).collect::<Result<Vec<_>,String>>()?;let p=inflate(&m,dense,paged)?;let s=PromptSnapshot::from_portable(p)?;if s.token_len()!=m.token_len||!m.route.matches(&s){return Err("restored snapshot does not match manifest".into())}Ok(DecodedEntry{manifest:m,snapshot:s})}
-pub fn parse_manifest(ns:&str,b:&[u8])->Result<Manifest,String>{let m:Manifest=serde_json::from_slice(b).map_err(|e|e.to_string())?;validate_manifest(ns,&m)?;Ok(m)}
-fn validate_manifest(ns:&str,m:&Manifest)->Result<(),String>{if m.namespace!=ns||m.token_ids.is_empty()||m.token_ids.len()!=m.token_len{return Err("cache manifest namespace or token length is invalid".into())}validate_resume_metadata(&m.token_ids,m.response_resume.as_ref())?;if m.family.is_empty()||(m.arrays.is_empty()&&m.paged_tensors.is_empty()){return Err("cache manifest is missing model state".into())}let mut total=0;let mut sizes=HashMap::new();for a in &m.arrays{if a.shape.is_empty()||a.shape.iter().any(|x|*x<=0)||a.byte_len==0||a.blob_sha256.len()!=64{return Err("cache array descriptor is invalid".into())}if let Some(old)=sizes.insert(a.blob_sha256.clone(),a.byte_len){if old!=a.byte_len{return Err("cache blob descriptor sizes disagree".into())}}}for t in &m.paged_tensors{let mut end=0;for p in &t.pages{if p.token_start!=end||p.token_end<=p.token_start||p.token_end>t.token_len||p.byte_len==0||p.blob_sha256.len()!=64{return Err("cache page descriptor is invalid".into())}end=p.token_end;if let Some(old)=sizes.insert(p.blob_sha256.clone(),p.byte_len){if old!=p.byte_len{return Err("cache blob descriptor sizes disagree".into())}}}if t.name.is_empty()||t.token_len==0||end!=t.token_len{return Err("cache pages do not cover token length".into())}}for n in sizes.values(){total+=*n}if total!=m.total_bytes{return Err("cache payload byte count does not match manifest".into())}Ok(())}
-pub(crate)fn validate_resume_metadata(t:&[i32],m:Option<&ResponseResumeMetadata>)->Result<(),String>{let Some(m)=m else{return Ok(())};if m.response_id.is_empty()||m.message_id.is_empty()||m.request_fingerprint.is_empty()||m.prompt_token_count==0||m.prompt_token_count>t.len()||m.generated_token_ids.is_empty()||m.generated_token_ids.len()>=m.original_max_tokens{return Err("cache response resume metadata is invalid".into())}let x=&t[m.prompt_token_count..];if x.len()>m.generated_token_ids.len()||x!=&m.generated_token_ids[..x.len()]{return Err("cache response resume tokens do not match the snapshot".into())}Ok(())}
-fn flatten(p:PortablePromptSnapshot)->Result<(String,Option<i32>,Vec<(ArrayRole,PortableArray)>,Vec<(ArrayRole,PortablePagedTensor)>),String>{fn m(mut x:PortableModelState,r:ArrayRole,cr:ArrayRole)->(String,Vec<(ArrayRole,PortableArray)>,Vec<(ArrayRole,PortablePagedTensor)>){let f=x.family;let mut d=x.tensors.into_iter().map(|a|(r,a)).collect::<Vec<_>>();if let Some(a)=x.continuation_logits.take(){d.push((cr,a));}(f,d,x.paged_tensors.into_iter().map(|a|(r,a)).collect())}match p{PortablePromptSnapshot::Baseline(x)=>{let(f,d,p)=m(x,ArrayRole::ModelTensor,ArrayRole::ModelContinuation);Ok((f,None,d,p))}PortablePromptSnapshot::Mtp{target,draft,draft_offset,last_hidden,continuation_logits}=>{let(f,mut d,mut p)=m(target,ArrayRole::TargetTensor,ArrayRole::TargetContinuation);let(df,mut dd,mut pp)=m(draft,ArrayRole::DraftTensor,ArrayRole::DraftContinuation);if f!=df{return Err("MTP target/draft families differ".into())}d.append(&mut dd);p.append(&mut pp);d.push((ArrayRole::LastHidden,last_hidden));d.push((ArrayRole::MtpContinuation,continuation_logits));Ok((f,Some(draft_offset),d,p))}}}
-fn inflate(m:&Manifest,d:Vec<(ArrayRole,PortableArray)>,p:Vec<(ArrayRole,PortablePagedTensor)>)->Result<PortablePromptSnapshot,String>{let mut t=PortableModelState{family:m.family.clone(),token_len:m.token_len,tensors:Vec::new(),paged_tensors:Vec::new(),continuation_logits:None};let mut dr=t.clone();let(mut h,mut c)=(None,None);for(r,a)in d{match r{ArrayRole::ModelTensor|ArrayRole::TargetTensor=>t.tensors.push(a),ArrayRole::ModelContinuation|ArrayRole::TargetContinuation=>t.continuation_logits=Some(a),ArrayRole::DraftTensor=>dr.tensors.push(a),ArrayRole::LastHidden=>h=Some(a),ArrayRole::MtpContinuation=>c=Some(a),_=>{}}}for(r,a)in p{match r{ArrayRole::ModelTensor|ArrayRole::TargetTensor=>t.paged_tensors.push(a),ArrayRole::DraftTensor=>dr.paged_tensors.push(a),_=>{}}}if m.route==SnapshotRoute::Baseline{Ok(PortablePromptSnapshot::Baseline(t))}else{let draft_offset=m.draft_offset.ok_or("MTP manifest is missing draft offset")?;dr.token_len=usize::try_from(draft_offset).map_err(|_|"MTP manifest draft offset is invalid")?;Ok(PortablePromptSnapshot::Mtp{target:t,draft:dr,draft_offset,last_hidden:h.ok_or("MTP manifest is missing last_hidden")?,continuation_logits:c.ok_or("MTP manifest is missing continuation logits")?})}}
-fn required_option<'de,D,T>(d:D)->Result<Option<T>,D::Error>where D:serde::Deserializer<'de>,T:Deserialize<'de>{Option::deserialize(d)}
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RetentionMetadata {
+    pub observations: u64,
+    pub reuse_count: u64,
+    pub last_access_unix_ms: u64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseResumeMetadata {
+    pub response_id: String,
+    pub message_id: String,
+    pub created_unix_seconds: u64,
+    pub prompt_token_count: usize,
+    pub request_fingerprint: String,
+    pub generated_token_ids: Vec<i32>,
+    pub raw_text: String,
+    pub emitted_reasoning_text: String,
+    pub emitted_content_text: String,
+    pub original_max_tokens: usize,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Manifest {
+    pub namespace: String,
+    pub route: SnapshotRoute,
+    pub token_ids: Vec<i32>,
+    pub token_len: usize,
+    pub family: String,
+    #[serde(deserialize_with = "required_option")]
+    pub draft_offset: Option<i32>,
+    pub arrays: Vec<ArrayDescriptor>,
+    pub paged_tensors: Vec<PagedTensorDescriptor>,
+    pub retention: RetentionMetadata,
+    pub expires_at_unix_ms: u64,
+    #[serde(deserialize_with = "required_option")]
+    pub response_resume: Option<ResponseResumeMetadata>,
+    pub blob_sha256: Vec<String>,
+    pub total_bytes: u64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArrayDescriptor {
+    pub role: ArrayRole,
+    #[serde(deserialize_with = "required_option")]
+    pub name: Option<String>,
+    pub shape: Vec<i32>,
+    pub dtype: i32,
+    pub blob_sha256: String,
+    pub byte_len: u64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PagedTensorDescriptor {
+    pub role: ArrayRole,
+    pub name: String,
+    pub token_axis: usize,
+    pub token_len: usize,
+    pub pages: Vec<PageDescriptor>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PageDescriptor {
+    pub token_start: usize,
+    pub token_end: usize,
+    pub shape: Vec<i32>,
+    pub dtype: i32,
+    pub blob_sha256: String,
+    pub byte_len: u64,
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ArrayRole {
+    ModelTensor,
+    ModelContinuation,
+    DraftKeys,
+    DraftValues,
+    LastHidden,
+    MtpContinuation,
+    TargetTensor,
+    TargetContinuation,
+    DraftTensor,
+    DraftContinuation,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentBlob {
+    pub sha256: String,
+    pub bytes: Arc<[u8]>,
+}
+#[derive(Debug, Clone)]
+pub struct EncodedEntry {
+    pub key: EntryKey,
+    pub manifest: Vec<u8>,
+    pub blobs: Vec<ContentBlob>,
+}
+pub struct DecodedEntry {
+    pub manifest: Manifest,
+    pub snapshot: PromptSnapshot,
+}
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+fn digest(b: &[u8]) -> String {
+    hex(&Sha256::digest(b))
+}
+pub fn entry_key(ns: &str, r: SnapshotRoute, t: &[i32]) -> EntryKey {
+    let mut h = Sha256::new();
+    h.update(ns.as_bytes());
+    h.update([r as u8]);
+    for x in t {
+        h.update(x.to_le_bytes())
+    }
+    EntryKey(format!("{ns}/{}", hex(&h.finalize())))
+}
+pub fn namespace_hash(p: &[&[u8]]) -> String {
+    let mut h = Sha256::new();
+    for x in p {
+        h.update((x.len() as u64).to_le_bytes());
+        h.update(x)
+    }
+    hex(&h.finalize())
+}
+pub fn encode_portable(
+    ns: &str,
+    r: SnapshotRoute,
+    t: &[i32],
+    p: PortablePromptSnapshot,
+    ret: RetentionMetadata,
+    exp: u64,
+    res: Option<ResponseResumeMetadata>,
+) -> Result<EncodedEntry, String> {
+    let len = match &p {
+        PortablePromptSnapshot::Baseline(m) => m.token_len,
+        PortablePromptSnapshot::Mtp { target, .. } => target.token_len,
+    };
+    if t.is_empty()
+        || len != t.len()
+        || !matches!(
+            (r, &p),
+            (SnapshotRoute::Baseline, PortablePromptSnapshot::Baseline(_))
+                | (SnapshotRoute::Mtp, PortablePromptSnapshot::Mtp { .. })
+        )
+    {
+        return Err("portable snapshot route and token length must match the cache entry".into());
+    }
+    validate_resume_metadata(t, res.as_ref())?;
+    let (f, off, dense, paged) = flatten(p)?;
+    let mut blobs = Vec::new();
+    let mut seen = HashSet::new();
+    let mut add = |b: &[u8]| {
+        let s = digest(b);
+        if seen.insert(s.clone()) {
+            blobs.push(ContentBlob {
+                sha256: s.clone(),
+                bytes: Arc::from(b),
+            })
+        }
+        s
+    };
+    let arrays = dense
+        .into_iter()
+        .map(|(role, a)| {
+            let n = a.bytes.len() as u64;
+            ArrayDescriptor {
+                role,
+                name: a.name,
+                shape: a.shape,
+                dtype: a.dtype,
+                blob_sha256: add(&a.bytes),
+                byte_len: n,
+            }
+        })
+        .collect();
+    let paged_tensors = paged
+        .into_iter()
+        .map(|(role, x)| PagedTensorDescriptor {
+            role,
+            name: x.name,
+            token_axis: x.token_axis,
+            token_len: x.token_len,
+            pages: x
+                .pages
+                .into_iter()
+                .map(|p| {
+                    let n = p.bytes.len() as u64;
+                    PageDescriptor {
+                        token_start: p.token_start,
+                        token_end: p.token_end,
+                        shape: p.shape,
+                        dtype: p.dtype,
+                        blob_sha256: add(&p.bytes),
+                        byte_len: n,
+                    }
+                })
+                .collect(),
+        })
+        .collect();
+    let total = blobs.iter().map(|b| b.bytes.len() as u64).sum();
+    let m = Manifest {
+        namespace: ns.into(),
+        route: r,
+        token_ids: t.to_vec(),
+        token_len: len,
+        family: f,
+        draft_offset: off,
+        arrays,
+        paged_tensors,
+        retention: ret,
+        expires_at_unix_ms: exp,
+        response_resume: res,
+        blob_sha256: blobs.iter().map(|b| b.sha256.clone()).collect(),
+        total_bytes: total,
+    };
+    Ok(EncodedEntry {
+        key: entry_key(ns, r, t),
+        manifest: serde_json::to_vec(&m).map_err(|e| e.to_string())?,
+        blobs,
+    })
+}
+pub fn decode(ns: &str, b: &[u8], blobs: Vec<ContentBlob>) -> Result<DecodedEntry, String> {
+    let m: Manifest = serde_json::from_slice(b).map_err(|e| e.to_string())?;
+    validate_manifest(ns, &m)?;
+    let map: HashMap<_, _> = blobs.into_iter().map(|x| (x.sha256, x.bytes)).collect();
+    if map.len() != m.blob_sha256.len() {
+        return Err("cache blob set does not match manifest".into());
+    }
+    for d in &m.blob_sha256 {
+        let b = map.get(d).ok_or("cache blob missing")?;
+        if digest(b) != *d {
+            return Err("cache blob digest mismatch".into());
+        }
+    }
+    let get = |d: &str, n: u64| {
+        map.get(d)
+            .filter(|b| b.len() as u64 == n)
+            .map(|b| b.to_vec())
+            .ok_or_else(|| "cache descriptor blob is missing or wrong length".to_string())
+    };
+    let dense = m
+        .arrays
+        .iter()
+        .map(|x| {
+            Ok((
+                x.role,
+                PortableArray {
+                    name: x.name.clone(),
+                    shape: x.shape.clone(),
+                    dtype: x.dtype,
+                    bytes: get(&x.blob_sha256, x.byte_len)?,
+                },
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let paged = m
+        .paged_tensors
+        .iter()
+        .map(|x| {
+            Ok((
+                x.role,
+                PortablePagedTensor {
+                    name: x.name.clone(),
+                    token_axis: x.token_axis,
+                    token_len: x.token_len,
+                    pages: x
+                        .pages
+                        .iter()
+                        .map(|p| {
+                            Ok(PortablePage {
+                                token_start: p.token_start,
+                                token_end: p.token_end,
+                                shape: p.shape.clone(),
+                                dtype: p.dtype,
+                                bytes: Arc::from(get(&p.blob_sha256, p.byte_len)?),
+                            })
+                        })
+                        .collect::<Result<Vec<_>, String>>()?,
+                },
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let p = inflate(&m, dense, paged)?;
+    let s = PromptSnapshot::from_portable(p)?;
+    if s.token_len() != m.token_len || !m.route.matches(&s) {
+        return Err("restored snapshot does not match manifest".into());
+    }
+    Ok(DecodedEntry {
+        manifest: m,
+        snapshot: s,
+    })
+}
+pub fn parse_manifest(ns: &str, b: &[u8]) -> Result<Manifest, String> {
+    let m: Manifest = serde_json::from_slice(b).map_err(|e| e.to_string())?;
+    validate_manifest(ns, &m)?;
+    Ok(m)
+}
+fn validate_manifest(ns: &str, m: &Manifest) -> Result<(), String> {
+    if m.namespace != ns || m.token_ids.is_empty() || m.token_ids.len() != m.token_len {
+        return Err("cache manifest namespace or token length is invalid".into());
+    }
+    validate_resume_metadata(&m.token_ids, m.response_resume.as_ref())?;
+    if m.family.is_empty() || (m.arrays.is_empty() && m.paged_tensors.is_empty()) {
+        return Err("cache manifest is missing model state".into());
+    }
+    let mut total = 0;
+    let mut sizes = HashMap::new();
+    for a in &m.arrays {
+        if a.shape.is_empty()
+            || a.shape.iter().any(|x| *x <= 0)
+            || a.byte_len == 0
+            || a.blob_sha256.len() != 64
+        {
+            return Err("cache array descriptor is invalid".into());
+        }
+        if let Some(old) = sizes.insert(a.blob_sha256.clone(), a.byte_len) {
+            if old != a.byte_len {
+                return Err("cache blob descriptor sizes disagree".into());
+            }
+        }
+    }
+    for t in &m.paged_tensors {
+        let mut end = 0;
+        for p in &t.pages {
+            if p.token_start != end
+                || p.token_end <= p.token_start
+                || p.token_end > t.token_len
+                || p.byte_len == 0
+                || p.blob_sha256.len() != 64
+            {
+                return Err("cache page descriptor is invalid".into());
+            }
+            end = p.token_end;
+            if let Some(old) = sizes.insert(p.blob_sha256.clone(), p.byte_len) {
+                if old != p.byte_len {
+                    return Err("cache blob descriptor sizes disagree".into());
+                }
+            }
+        }
+        if t.name.is_empty() || t.token_len == 0 || end != t.token_len {
+            return Err("cache pages do not cover token length".into());
+        }
+    }
+    for n in sizes.values() {
+        total += *n
+    }
+    if total != m.total_bytes {
+        return Err("cache payload byte count does not match manifest".into());
+    }
+    Ok(())
+}
+pub(crate) fn validate_resume_metadata(
+    t: &[i32],
+    m: Option<&ResponseResumeMetadata>,
+) -> Result<(), String> {
+    let Some(m) = m else { return Ok(()) };
+    if m.response_id.is_empty()
+        || m.message_id.is_empty()
+        || m.request_fingerprint.is_empty()
+        || m.prompt_token_count == 0
+        || m.prompt_token_count > t.len()
+        || m.generated_token_ids.is_empty()
+        || m.generated_token_ids.len() >= m.original_max_tokens
+    {
+        return Err("cache response resume metadata is invalid".into());
+    }
+    let x = &t[m.prompt_token_count..];
+    if x.len() > m.generated_token_ids.len() || x != &m.generated_token_ids[..x.len()] {
+        return Err("cache response resume tokens do not match the snapshot".into());
+    }
+    Ok(())
+}
+fn flatten(
+    p: PortablePromptSnapshot,
+) -> Result<
+    (
+        String,
+        Option<i32>,
+        Vec<(ArrayRole, PortableArray)>,
+        Vec<(ArrayRole, PortablePagedTensor)>,
+    ),
+    String,
+> {
+    fn m(
+        mut x: PortableModelState,
+        r: ArrayRole,
+        cr: ArrayRole,
+    ) -> (
+        String,
+        Vec<(ArrayRole, PortableArray)>,
+        Vec<(ArrayRole, PortablePagedTensor)>,
+    ) {
+        let f = x.family;
+        let mut d = x.tensors.into_iter().map(|a| (r, a)).collect::<Vec<_>>();
+        if let Some(a) = x.continuation_logits.take() {
+            d.push((cr, a));
+        }
+        (f, d, x.paged_tensors.into_iter().map(|a| (r, a)).collect())
+    }
+    match p {
+        PortablePromptSnapshot::Baseline(x) => {
+            let (f, d, p) = m(x, ArrayRole::ModelTensor, ArrayRole::ModelContinuation);
+            Ok((f, None, d, p))
+        }
+        PortablePromptSnapshot::Mtp {
+            target,
+            draft,
+            draft_offset,
+            last_hidden,
+            continuation_logits,
+        } => {
+            let (f, mut d, mut p) = m(
+                target,
+                ArrayRole::TargetTensor,
+                ArrayRole::TargetContinuation,
+            );
+            let (df, mut dd, mut pp) =
+                m(draft, ArrayRole::DraftTensor, ArrayRole::DraftContinuation);
+            if f != df {
+                return Err("MTP target/draft families differ".into());
+            }
+            d.append(&mut dd);
+            p.append(&mut pp);
+            d.push((ArrayRole::LastHidden, last_hidden));
+            d.push((ArrayRole::MtpContinuation, continuation_logits));
+            Ok((f, Some(draft_offset), d, p))
+        }
+    }
+}
+fn inflate(
+    m: &Manifest,
+    d: Vec<(ArrayRole, PortableArray)>,
+    p: Vec<(ArrayRole, PortablePagedTensor)>,
+) -> Result<PortablePromptSnapshot, String> {
+    let mut t = PortableModelState {
+        family: m.family.clone(),
+        token_len: m.token_len,
+        tensors: Vec::new(),
+        paged_tensors: Vec::new(),
+        continuation_logits: None,
+    };
+    let mut dr = t.clone();
+    let (mut h, mut c) = (None, None);
+    for (r, a) in d {
+        match r {
+            ArrayRole::ModelTensor | ArrayRole::TargetTensor => t.tensors.push(a),
+            ArrayRole::ModelContinuation | ArrayRole::TargetContinuation => {
+                t.continuation_logits = Some(a)
+            }
+            ArrayRole::DraftTensor => dr.tensors.push(a),
+            ArrayRole::LastHidden => h = Some(a),
+            ArrayRole::MtpContinuation => c = Some(a),
+            _ => {}
+        }
+    }
+    for (r, a) in p {
+        match r {
+            ArrayRole::ModelTensor | ArrayRole::TargetTensor => t.paged_tensors.push(a),
+            ArrayRole::DraftTensor => dr.paged_tensors.push(a),
+            _ => {}
+        }
+    }
+    if m.route == SnapshotRoute::Baseline {
+        Ok(PortablePromptSnapshot::Baseline(t))
+    } else {
+        let draft_offset = m
+            .draft_offset
+            .ok_or("MTP manifest is missing draft offset")?;
+        dr.token_len =
+            usize::try_from(draft_offset).map_err(|_| "MTP manifest draft offset is invalid")?;
+        Ok(PortablePromptSnapshot::Mtp {
+            target: t,
+            draft: dr,
+            draft_offset,
+            last_hidden: h.ok_or("MTP manifest is missing last_hidden")?,
+            continuation_logits: c.ok_or("MTP manifest is missing continuation logits")?,
+        })
+    }
+}
+fn required_option<'de, D, T>(d: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::deserialize(d)
+}

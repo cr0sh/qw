@@ -1,6 +1,9 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+#[cfg(feature = "specprefill")]
+use crate::SpecPrefillPolicyConfig;
+use crate::{Engine, router};
 use anyhow::{Context, Result, ensure};
 use clap_derive::{Args as DeriveArgs, ValueEnum};
 use qw_prefix_cache::CacheConfig;
@@ -11,9 +14,6 @@ use tracing_subscriber::Layer as _;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 use tracing_subscriber::{EnvFilter, fmt, registry};
-#[cfg(feature = "specprefill")]
-use crate::SpecPrefillPolicyConfig;
-use crate::{Engine, router};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum OutputFormat {
@@ -271,7 +271,6 @@ mod tests {
             "--model",
             "/tmp/checkpoint",
             "--model-id",
-
             "served-model",
         ])
         .expect("CLI");
@@ -290,11 +289,13 @@ mod tests {
             "server=debug",
         ])
         .expect("CLI");
-        assert!(resolve_persistent_log_filter(
-            cli.args.persistent_log_filter.as_deref(),
-            Some("server=trace"),
-        )
-        .is_ok());
+        assert!(
+            resolve_persistent_log_filter(
+                cli.args.persistent_log_filter.as_deref(),
+                Some("server=trace"),
+            )
+            .is_ok()
+        );
         assert!(resolve_persistent_log_filter(None, Some("server=debug")).is_ok());
         assert!(resolve_persistent_log_filter(None, None).is_ok());
 
@@ -477,21 +478,15 @@ mod tests {
         assert_eq!(policy.keep_last_tokens, 64);
         validate_cli(&custom.args).expect("custom SpecPrefill policy");
 
-        let invalid_threshold = TestCli::try_parse_from([
-            "qw-server",
-            "--specprefill-min-turn-tokens",
-            "0",
-        ])
-        .expect("threshold reaches startup validation");
+        let invalid_threshold =
+            TestCli::try_parse_from(["qw-server", "--specprefill-min-turn-tokens", "0"])
+                .expect("threshold reaches startup validation");
         assert!(validate_cli(&invalid_threshold.args).is_err());
 
         for rate in ["0", "1.1", "NaN"] {
-            let invalid_rate = TestCli::try_parse_from([
-                "qw-server",
-                "--specprefill-keep-rate",
-                rate,
-            ])
-            .expect("keep rate reaches startup validation");
+            let invalid_rate =
+                TestCli::try_parse_from(["qw-server", "--specprefill-keep-rate", rate])
+                    .expect("keep rate reaches startup validation");
             assert!(validate_cli(&invalid_rate.args).is_err(), "rate={rate}");
         }
 

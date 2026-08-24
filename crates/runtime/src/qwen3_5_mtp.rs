@@ -175,9 +175,13 @@ impl MtpPromptSnapshot {
         {
             return Err("MTP portable target and drafter offsets do not match".to_string());
         }
-        let paged = |name: &str| draft.paged_tensors.iter().find(|tensor| tensor.name == name);
-        if expected_offset > 0
-            && (paged("draft_keys").is_none() || paged("draft_values").is_none())
+        let paged = |name: &str| {
+            draft
+                .paged_tensors
+                .iter()
+                .find(|tensor| tensor.name == name)
+        };
+        if expected_offset > 0 && (paged("draft_keys").is_none() || paged("draft_values").is_none())
         {
             return Err("MTP portable drafter KV layout is incomplete".to_string());
         }
@@ -187,8 +191,7 @@ impl MtpPromptSnapshot {
                     || tensor.token_len != expected_offset as usize
                     || tensor.pages.iter().any(|page| {
                         let shape = &page.shape;
-                        shape.len() != 4
-                            || shape[2] != (page.token_end - page.token_start) as i32
+                        shape.len() != 4 || shape[2] != (page.token_end - page.token_start) as i32
                     }))
             {
                 return Err("MTP portable drafter page layout is invalid".to_string());
@@ -201,7 +204,9 @@ impl MtpPromptSnapshot {
             || continuation_logits.shape[0] != 1
             || continuation_logits.shape[1] != 1
         {
-            return Err("MTP portable continuation-logits layout must be [1, 1, vocab]".to_string());
+            return Err(
+                "MTP portable continuation-logits layout must be [1, 1, vocab]".to_string(),
+            );
         }
         Ok(Self {
             target,
@@ -686,9 +691,25 @@ impl Qwen35MtpDraftModel {
             return None;
         }
         let mut draft = ModelStateSnapshot::new("qwen3.5-mtp-draft", expected_offset as usize);
-        if let (Some(keys), Some(values)) = (state.cache.keys.as_deref(), state.cache.values.as_deref()) {
-            draft.push_paged_tensor(previous.map(|snapshot| &snapshot.draft), "draft_keys", keys, 2).ok()?;
-            draft.push_paged_tensor(previous.map(|snapshot| &snapshot.draft), "draft_values", values, 2).ok()?;
+        if let (Some(keys), Some(values)) =
+            (state.cache.keys.as_deref(), state.cache.values.as_deref())
+        {
+            draft
+                .push_paged_tensor(
+                    previous.map(|snapshot| &snapshot.draft),
+                    "draft_keys",
+                    keys,
+                    2,
+                )
+                .ok()?;
+            draft
+                .push_paged_tensor(
+                    previous.map(|snapshot| &snapshot.draft),
+                    "draft_values",
+                    values,
+                    2,
+                )
+                .ok()?;
         } else if expected_offset > 0 {
             return None;
         }
@@ -718,7 +739,9 @@ impl Qwen35MtpDraftModel {
             || snapshot.draft.token_len() != expected_offset as usize
             || snapshot.draft.family() != "qwen3.5-mtp-draft"
         {
-            return Err("MTP snapshot target/drafter offsets do not match the cached prefix".to_string());
+            return Err(
+                "MTP snapshot target/drafter offsets do not match the cached prefix".to_string(),
+            );
         }
         let keys = snapshot.draft.paged_tensor("draft_keys");
         let values = snapshot.draft.paged_tensor("draft_values");
@@ -1772,7 +1795,13 @@ fn capture_mtp_prompt_snapshot(
         &[0, last, 0],
         &[shape[0], last + 1, shape[2]],
     );
-    drafter.capture_prompt_snapshot(target, token_len, &last_hidden, &prefill.first_logits, previous)
+    drafter.capture_prompt_snapshot(
+        target,
+        token_len,
+        &last_hidden,
+        &prefill.first_logits,
+        previous,
+    )
 }
 fn prefill_text_with_checkpoints(
     model: &Qwen35Model,
@@ -1818,14 +1847,11 @@ fn prefill_text_with_checkpoints(
         }
         let requested = checkpoint_token_lengths.binary_search(&token_len).is_ok();
         if requested {
-            let snapshot = capture_mtp_prompt_snapshot(
-                model,
-                drafter,
-                token_len,
-                &prefill,
-                snapshots.last(),
-            )
-                .ok_or_else(|| format!("failed to capture MTP checkpoint at {token_len} tokens"))?;
+            let snapshot =
+                capture_mtp_prompt_snapshot(model, drafter, token_len, &prefill, snapshots.last())
+                    .ok_or_else(|| {
+                        format!("failed to capture MTP checkpoint at {token_len} tokens")
+                    })?;
             if token_len == prompt_tokens.len() {
                 snapshots.push(snapshot);
             } else {
@@ -1966,14 +1992,16 @@ fn capture_mtp_snapshot_from_verify(
     };
     model.materialize_mtp_cache_state();
     let target = model
-        .snapshot_sequence_state(
-            mlxcel_core::cache::SequenceId::from_raw(0),
-            token_len,
-            None,
-        )
+        .snapshot_sequence_state(mlxcel_core::cache::SequenceId::from_raw(0), token_len, None)
         .ok_or_else(|| "failed to capture aligned MTP target state".to_string())?;
     drafter
-        .capture_prompt_snapshot(target, token_len, &last_hidden, &continuation_logits, previous)
+        .capture_prompt_snapshot(
+            target,
+            token_len,
+            &last_hidden,
+            &continuation_logits,
+            previous,
+        )
         .ok_or_else(|| "failed to capture aligned MTP snapshot".to_string())
 }
 
@@ -2012,7 +2040,10 @@ fn capture_mtp_final_snapshot(
         .map(Some)
         .ok_or_else(|| "failed to capture aligned MTP final snapshot".to_string())?;
         debug!(
-            token_len = snapshot.as_ref().expect("MTP final snapshot must be present").token_len(),
+            token_len = snapshot
+                .as_ref()
+                .expect("MTP final snapshot must be present")
+                .token_len(),
             elapsed_seconds = snapshot_start.elapsed().as_secs_f64(),
         );
         return Ok(snapshot);
@@ -2053,14 +2084,16 @@ fn capture_mtp_final_snapshot(
     );
     let token_len = prompt_tokens.len() + generated.len() - 1;
     let target = model
-        .snapshot_sequence_state(
-            mlxcel_core::cache::SequenceId::from_raw(0),
-            token_len,
-            None,
-        )
+        .snapshot_sequence_state(mlxcel_core::cache::SequenceId::from_raw(0), token_len, None)
         .ok_or_else(|| "failed to capture aligned MTP target state".to_string())?;
     let snapshot = drafter
-        .capture_prompt_snapshot(target, token_len, &last_hidden, &continuation_logits, prefix_reuse.map(|reuse| reuse.snapshot))
+        .capture_prompt_snapshot(
+            target,
+            token_len,
+            &last_hidden,
+            &continuation_logits,
+            prefix_reuse.map(|reuse| reuse.snapshot),
+        )
         .map(Some)
         .ok_or_else(|| "failed to capture aligned MTP final snapshot".to_string())?;
     debug!(
@@ -2844,8 +2877,12 @@ mod tests {
         let hidden = mlxcel_core::from_slice_f32(&[5.0, 6.0], &[1, 1, 2]);
         let logits = mlxcel_core::from_slice_f32(&[7.0, 8.0], &[1, 1, 2]);
         let mut draft = ModelStateSnapshot::new("qwen3.5-mtp-draft", 1);
-        draft.push_paged_tensor(None, "draft_keys", &keys, 2).expect("draft keys");
-        draft.push_paged_tensor(None, "draft_values", &values, 2).expect("draft values");
+        draft
+            .push_paged_tensor(None, "draft_keys", &keys, 2)
+            .expect("draft keys");
+        draft
+            .push_paged_tensor(None, "draft_values", &values, 2)
+            .expect("draft values");
         let snapshot = MtpPromptSnapshot {
             target: ModelStateSnapshot::new("test", 2),
             draft,
@@ -2860,7 +2897,13 @@ mod tests {
         let expected_keys = mlxcel_core::from_slice_f32(&[1.0, 2.0], &[1, 1, 1, 2]);
         let expected_hidden = mlxcel_core::from_slice_f32(&[5.0, 6.0], &[1, 1, 2]);
         let keys_equal = mlxcel_core::allclose(
-            snapshot.draft.paged_tensor("draft_keys").unwrap().materialize().as_deref().unwrap(),
+            snapshot
+                .draft
+                .paged_tensor("draft_keys")
+                .unwrap()
+                .materialize()
+                .as_deref()
+                .unwrap(),
             &expected_keys,
             0.0,
             0.0,
@@ -2879,8 +2922,12 @@ mod tests {
         let hidden = mlxcel_core::from_slice_f32(&[3.0, 4.0], &[1, 1, 2]);
         let logits = mlxcel_core::from_slice_f32(&[5.0, 6.0], &[1, 1, 2]);
         let mut draft = ModelStateSnapshot::new("qwen3.5-mtp-draft", 1);
-        draft.push_paged_tensor(None, "draft_keys", &values, 2).expect("draft keys");
-        draft.push_paged_tensor(None, "draft_values", &values, 2).expect("draft values");
+        draft
+            .push_paged_tensor(None, "draft_keys", &values, 2)
+            .expect("draft keys");
+        draft
+            .push_paged_tensor(None, "draft_values", &values, 2)
+            .expect("draft values");
         let snapshot = crate::PromptSnapshot::Mtp(MtpPromptSnapshot {
             target: {
                 let mut target = ModelStateSnapshot::new("mtp-portable-test", 2);

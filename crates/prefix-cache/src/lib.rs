@@ -340,19 +340,19 @@ impl AdaptivePrefixCache {
             .filter(|length| *length > 0 && *length <= tokens.len())
             .collect::<Vec<_>>();
         lengths.push(tokens.len());
-        let structural = self
-            .trie
-            .path(tokens, route)
-            .into_iter()
-            .rev()
-            .find_map(|(node, length)| {
-                let terminal = self.trie.terminal(node, route)?;
-                (length < tokens.len()
-                    && terminal.observations >= 2
-                    && terminal.snapshot.is_none()
-                    && terminal.persistent_key.is_none())
-                .then_some(length)
-            });
+        let structural =
+            self.trie
+                .path(tokens, route)
+                .into_iter()
+                .rev()
+                .find_map(|(node, length)| {
+                    let terminal = self.trie.terminal(node, route)?;
+                    (length < tokens.len()
+                        && terminal.observations >= 2
+                        && terminal.snapshot.is_none()
+                        && terminal.persistent_key.is_none())
+                    .then_some(length)
+                });
         if let Some(common) = structural {
             lengths.push(common);
         }
@@ -543,8 +543,10 @@ impl AdaptivePrefixCache {
                 .trie
                 .terminal_mut(node, route)
                 .map(|terminal| {
-                    let previous_persistent_bytes =
-                        terminal.persistent_key.take().map(|_| terminal.serialized_bytes);
+                    let previous_persistent_bytes = terminal
+                        .persistent_key
+                        .take()
+                        .map(|_| terminal.serialized_bytes);
                     terminal.blob_refs.clear();
                     terminal.serialized_bytes = 0;
                     (
@@ -567,7 +569,11 @@ impl AdaptivePrefixCache {
             let summary = snapshot.storage_summary();
             inserted_logical_bytes = inserted_logical_bytes.saturating_add(bytes);
             inserted_unique_page_bytes = inserted_unique_page_bytes.saturating_add(
-                summary.pages.iter().map(|(_, page_bytes)| *page_bytes as u64).sum::<u64>(),
+                summary
+                    .pages
+                    .iter()
+                    .map(|(_, page_bytes)| *page_bytes as u64)
+                    .sum::<u64>(),
             );
             let expiry = now.saturating_add(INITIAL_TTL_MS);
             let namespace = self.namespaces.get(route);
@@ -622,11 +628,21 @@ impl AdaptivePrefixCache {
             });
             if let Some(portable) = portable {
                 if let Ok(encoded) = encode_portable(
-                    self.namespaces.get(route), route, prefix, portable.clone(),
-                    RetentionMetadata { observations, reuse_count, last_access_unix_ms: last_access },
-                    expiry, resume.clone(),
+                    self.namespaces.get(route),
+                    route,
+                    prefix,
+                    portable.clone(),
+                    RetentionMetadata {
+                        observations,
+                        reuse_count,
+                        last_access_unix_ms: last_access,
+                    },
+                    expiry,
+                    resume.clone(),
                 ) {
-                    if let Ok(manifest) = parse_manifest(self.namespaces.get(route), &encoded.manifest) {
+                    if let Ok(manifest) =
+                        parse_manifest(self.namespaces.get(route), &encoded.manifest)
+                    {
                         if let Some(terminal) = self.trie.terminal_mut(node, route) {
                             terminal.blob_refs = manifest_blob_refs(&manifest);
                         }
@@ -637,7 +653,11 @@ impl AdaptivePrefixCache {
                     route,
                     token_ids: prefix.to_vec(),
                     portable,
-                    retention: RetentionMetadata { observations, reuse_count, last_access_unix_ms: last_access },
+                    retention: RetentionMetadata {
+                        observations,
+                        reuse_count,
+                        last_access_unix_ms: last_access,
+                    },
                     expires_at_unix_ms: expiry,
                     response_resume: resume,
                 });
@@ -647,7 +667,11 @@ impl AdaptivePrefixCache {
                 route = route.as_str(),
                 token_count = token_len,
                 logical_snapshot_bytes = bytes,
-                unique_page_bytes = summary.pages.iter().map(|(_, page_bytes)| *page_bytes as u64).sum::<u64>(),
+                unique_page_bytes = summary
+                    .pages
+                    .iter()
+                    .map(|(_, page_bytes)| *page_bytes as u64)
+                    .sum::<u64>(),
             );
         }
         self.rebuild_accounting();
@@ -661,7 +685,11 @@ impl AdaptivePrefixCache {
             }
         }
         self.filesystem_blobs = blobs;
-        self.filesystem_bytes = self.filesystem_blobs.values().map(|(_, bytes)| *bytes).sum();
+        self.filesystem_bytes = self
+            .filesystem_blobs
+            .values()
+            .map(|(_, bytes)| *bytes)
+            .sum();
         self.evict_memory();
         self.evict_persistent(now);
         tracing::debug!(
@@ -669,7 +697,8 @@ impl AdaptivePrefixCache {
             route = route.as_str(),
             logical_snapshot_bytes = inserted_logical_bytes,
             unique_page_bytes = inserted_unique_page_bytes,
-            filesystem_unique_delta_bytes = self.filesystem_bytes as i128 - filesystem_before as i128,
+            filesystem_unique_delta_bytes =
+                self.filesystem_bytes as i128 - filesystem_before as i128,
         );
     }
 
@@ -936,17 +965,26 @@ impl AdaptivePrefixCache {
     fn rebuild_accounting(&mut self) {
         let mut pages = HashMap::<u64, (usize, u64)>::new();
         for (node, route) in self.trie.terminal_ids() {
-            let Some(t) = self.trie.terminal(node, route) else { continue };
+            let Some(t) = self.trie.terminal(node, route) else {
+                continue;
+            };
             for &(id, bytes) in &t.page_refs {
                 let entry = pages.entry(id).or_insert((0, bytes as u64));
                 entry.0 += 1;
             }
         }
         self.memory_pages = pages;
-        self.memory_bytes = self.memory_pages.values().map(|(_, bytes)| *bytes).sum::<u64>()
-            + self.trie.terminal_ids().into_iter().filter_map(|(n, r)| {
-                self.trie.terminal(n, r).map(|t| t.local_bytes as u64)
-            }).sum::<u64>();
+        self.memory_bytes = self
+            .memory_pages
+            .values()
+            .map(|(_, bytes)| *bytes)
+            .sum::<u64>()
+            + self
+                .trie
+                .terminal_ids()
+                .into_iter()
+                .filter_map(|(n, r)| self.trie.terminal(n, r).map(|t| t.local_bytes as u64))
+                .sum::<u64>();
         let mut blobs = HashMap::<String, (usize, u64)>::new();
         for (node, route) in self.trie.terminal_ids() {
             if let Some(t) = self.trie.terminal(node, route) {
@@ -957,7 +995,11 @@ impl AdaptivePrefixCache {
             }
         }
         self.filesystem_blobs = blobs;
-        self.filesystem_bytes = self.filesystem_blobs.values().map(|(_, bytes)| *bytes).sum();
+        self.filesystem_bytes = self
+            .filesystem_blobs
+            .values()
+            .map(|(_, bytes)| *bytes)
+            .sum();
     }
     fn queue_refresh(&self, key: EntryKey, expires_at_unix_ms: u64) {
         let Some(io) = &self.io else {
@@ -965,7 +1007,6 @@ impl AdaptivePrefixCache {
         };
         io.refreshes
             .lock()
-
             .expect("refresh map lock")
             .insert(key, expires_at_unix_ms);
         if !io.refresh_enqueued.swap(true, Ordering::AcqRel)
@@ -982,16 +1023,17 @@ impl AdaptivePrefixCache {
 fn manifest_blob_refs(manifest: &Manifest) -> Vec<(String, u64)> {
     let mut refs = HashMap::<String, u64>::new();
     for array in &manifest.arrays {
-        refs.entry(array.blob_sha256.clone()).or_insert(array.byte_len);
+        refs.entry(array.blob_sha256.clone())
+            .or_insert(array.byte_len);
     }
     for tensor in &manifest.paged_tensors {
         for page in &tensor.pages {
-            refs.entry(page.blob_sha256.clone()).or_insert(page.byte_len);
+            refs.entry(page.blob_sha256.clone())
+                .or_insert(page.byte_len);
         }
     }
     refs.into_iter().collect()
 }
-
 
 fn spawn_io_thread(mut store: Box<dyn PersistentSnapshotStore>) -> CacheIo {
     let (tx, rx) = mpsc::sync_channel(IO_QUEUE_CAPACITY);

@@ -2533,12 +2533,7 @@ fn push_turbo4_snapshot_tensors(
         ("v_norms", tensors.v_norms),
         ("v_rescale", tensors.v_rescale),
     ] {
-        snapshot.push_paged_tensor(
-            previous,
-            format!("layer.{index}.{suffix}"),
-            tensor,
-            2,
-        )?;
+        snapshot.push_paged_tensor(previous, format!("layer.{index}.{suffix}"), tensor, 2)?;
     }
     Ok(())
 }
@@ -2611,8 +2606,11 @@ fn validate_snapshot_tensor_names(
             expected.insert(format!("layer.{index}.values"));
         }
     }
-    if actual_dense.len() + actual_paged.len() != snapshot.tensor_count() + snapshot.paged_tensor_names().count()
-        || actual_dense.union(&actual_paged).any(|name| !expected.contains(name))
+    if actual_dense.len() + actual_paged.len()
+        != snapshot.tensor_count() + snapshot.paged_tensor_names().count()
+        || actual_dense
+            .union(&actual_paged)
+            .any(|name| !expected.contains(name))
     {
         return Err("Qwen3.5 snapshot tensor layout does not match the loaded model".to_string());
     }
@@ -2804,7 +2802,12 @@ impl LanguageModel for Qwen35Model {
                 match cache {
                     Qwen3NextCache::Attention(cache) => {
                         if self.kv_cache_mode == KVCacheMode::Turbo4 {
-                            if !push_turbo4_attention_snapshot(&mut snapshot, previous, index, cache) {
+                            if !push_turbo4_attention_snapshot(
+                                &mut snapshot,
+                                previous,
+                                index,
+                                cache,
+                            ) {
                                 return false;
                             }
                         } else {
@@ -2816,8 +2819,17 @@ impl LanguageModel for Qwen35Model {
                             else {
                                 return false;
                             };
-                            if snapshot.push_paged_tensor(previous, format!("layer.{index}.keys"), keys, 2).is_err()
-                                || snapshot.push_paged_tensor(previous, format!("layer.{index}.values"), values, 2).is_err()
+                            if snapshot
+                                .push_paged_tensor(previous, format!("layer.{index}.keys"), keys, 2)
+                                .is_err()
+                                || snapshot
+                                    .push_paged_tensor(
+                                        previous,
+                                        format!("layer.{index}.values"),
+                                        values,
+                                        2,
+                                    )
+                                    .is_err()
                             {
                                 return false;
                             }
@@ -2898,8 +2910,14 @@ impl LanguageModel for Qwen35Model {
                     snapshot
                         .paged_tensor(&format!("layer.{index}.{suffix}"))
                         .and_then(|p| p.materialize())
-                        .or_else(|| snapshot.tensor(&format!("layer.{index}.{suffix}")).map(mlxcel_core::copy))
-                        .ok_or_else(|| format!("Qwen3.5 snapshot is missing layer {index} {suffix}"))
+                        .or_else(|| {
+                            snapshot
+                                .tensor(&format!("layer.{index}.{suffix}"))
+                                .map(mlxcel_core::copy)
+                        })
+                        .ok_or_else(|| {
+                            format!("Qwen3.5 snapshot is missing layer {index} {suffix}")
+                        })
                 };
                 let mut cache = KVCache::new_with_mode(KVCacheMode::Turbo4);
                 cache.restore_turbo4_snapshot(
@@ -2915,15 +2933,24 @@ impl LanguageModel for Qwen35Model {
                 let keys = snapshot
                     .paged_tensor(&format!("layer.{index}.keys"))
                     .and_then(|p| p.materialize())
-                    .or_else(|| snapshot.tensor(&format!("layer.{index}.keys")).map(mlxcel_core::copy))
+                    .or_else(|| {
+                        snapshot
+                            .tensor(&format!("layer.{index}.keys"))
+                            .map(mlxcel_core::copy)
+                    })
                     .ok_or_else(|| format!("Qwen3.5 snapshot is missing layer {index} keys"))?;
                 let values = snapshot
                     .paged_tensor(&format!("layer.{index}.values"))
                     .and_then(|p| p.materialize())
-                    .or_else(|| snapshot.tensor(&format!("layer.{index}.values")).map(mlxcel_core::copy))
+                    .or_else(|| {
+                        snapshot
+                            .tensor(&format!("layer.{index}.values"))
+                            .map(mlxcel_core::copy)
+                    })
                     .ok_or_else(|| format!("Qwen3.5 snapshot is missing layer {index} values"))?;
                 let key_shape = mlxcel_core::array_shape(keys.as_ref().expect("materialized keys"));
-                let value_shape = mlxcel_core::array_shape(values.as_ref().expect("materialized values"));
+                let value_shape =
+                    mlxcel_core::array_shape(values.as_ref().expect("materialized values"));
                 if key_shape.len() != 4
                     || key_shape != value_shape
                     || key_shape[0] != 1
@@ -2935,7 +2962,9 @@ impl LanguageModel for Qwen35Model {
                 }
                 let mut cache = KVCache::new_with_mode(self.kv_cache_mode);
                 cache.keys = Some(mlxcel_core::copy(keys.as_ref().expect("materialized keys")));
-                cache.values = Some(mlxcel_core::copy(values.as_ref().expect("materialized values")));
+                cache.values = Some(mlxcel_core::copy(
+                    values.as_ref().expect("materialized values"),
+                ));
                 cache.offset = token_len;
                 restored.push(Qwen3NextCache::Attention(Box::new(cache)));
             }
@@ -3109,7 +3138,10 @@ mod tests {
             .tensor_names()
             .map(str::to_owned)
             .collect::<BTreeSet<_>>();
-        assert!(actual_dense.is_empty(), "Turbo4 snapshot must not use dense tensors");
+        assert!(
+            actual_dense.is_empty(),
+            "Turbo4 snapshot must not use dense tensors"
+        );
         let actual_paged = snapshot
             .paged_tensor_names()
             .map(str::to_owned)

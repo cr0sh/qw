@@ -178,8 +178,7 @@ fn generate_specprefill_tokens<F: FnMut(i32) -> bool>(
         if generated.len() == max_tokens {
             break;
         }
-        logits =
-            model.specprefill_decode(token_id, prompt_ids.len() + generated.len() - 1);
+        logits = model.specprefill_decode(token_id, prompt_ids.len() + generated.len() - 1);
     }
     let decode_time = decode_start.elapsed();
     let stats = SpecPrefillStats {
@@ -383,7 +382,7 @@ impl Qwen35Provider {
         #[cfg(not(feature = "specprefill"))]
         Self::load_target_only(model_dir.as_ref(), kv_cache_mode)
     }
-    
+
     fn load_target_only(model_dir: &Path, kv_cache_mode: KVCacheMode) -> Result<Self> {
         initialize_runtime()?;
         ensure!(
@@ -458,8 +457,7 @@ impl Qwen35Provider {
             provider.tokenizer.get_vocab(true) == draft_tokenizer.get_vocab(true),
             "target and SpecPrefill draft tokenizer vocabularies are incompatible"
         );
-        provider.specprefill_draft =
-            Some(Qwen35Model::load_specprefill_draft(draft_model_dir)?);
+        provider.specprefill_draft = Some(Qwen35Model::load_specprefill_draft(draft_model_dir)?);
         Ok(provider)
     }
 
@@ -732,8 +730,7 @@ impl Qwen35Provider {
         prefix_reuse: Option<PrefixReuse<'_>>,
         constraint: Option<&mut dyn TokenConstraint>,
         checkpoint_token_lengths: &[usize],
-        #[cfg(any(feature = "specprefill", test))]
-        prefill_mode: PrefillMode,
+        #[cfg(any(feature = "specprefill", test))] prefill_mode: PrefillMode,
         mut on_delta: F,
     ) -> Result<BaselineGeneration> {
         #[cfg(any(feature = "specprefill", test))]
@@ -743,12 +740,14 @@ impl Qwen35Provider {
                 constraint.is_none(),
                 "SpecPrefill does not support token constraints"
             );
-            ensure!(!prompt_ids.is_empty(), "prompt token sequence must not be empty");
+            ensure!(
+                !prompt_ids.is_empty(),
+                "prompt token sequence must not be empty"
+            );
             ensure!(max_tokens > 0, "max_tokens must be greater than zero");
-            let draft = self
-                .specprefill_draft
-                .as_ref()
-                .context("SpecPrefill capability is unavailable because no draft model is loaded")?;
+            let draft = self.specprefill_draft.as_ref().context(
+                "SpecPrefill capability is unavailable because no draft model is loaded",
+            )?;
             let requested_cached = prefix_reuse.as_ref().map_or(0, |reuse| reuse.cached_tokens);
             let reusable = prefix_reuse.as_ref().is_some_and(|reuse| {
                 reuse.cached_tokens > 0
@@ -1784,7 +1783,6 @@ mod tests {
         assert_eq!(mtp_deltas, mtp.text);
     }
 
-
     #[test]
     #[ignore = "requires QW_MODEL_PATH and QW_SPECPREFILL_DRAFT_MODEL_PATH real checkpoints"]
     fn real_model_dense_specprefill_dense_has_no_position_state_leakage() {
@@ -1792,12 +1790,9 @@ mod tests {
         let draft_dir = std::env::var_os("QW_SPECPREFILL_DRAFT_MODEL_PATH")
             .map(PathBuf::from)
             .expect("QW_SPECPREFILL_DRAFT_MODEL_PATH must identify the pinned draft");
-        let mut provider = Qwen35Provider::load_with_specprefill_draft(
-            model_dir,
-            draft_dir,
-            KVCacheMode::Fp16,
-        )
-        .expect("load target and SpecPrefill draft");
+        let mut provider =
+            Qwen35Provider::load_with_specprefill_draft(model_dir, draft_dir, KVCacheMode::Fp16)
+                .expect("load target and SpecPrefill draft");
         let prompt = provider
             .tokenizer
             .encode(
