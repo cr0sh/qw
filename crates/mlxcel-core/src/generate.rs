@@ -4625,4 +4625,69 @@ mod tests {
         assert_eq!(model.embedding_prefills.get(), 0);
         assert!(model.token_forwards.get() > 0);
     }
+    #[test]
+    fn paged_snapshot_capture_reuses_complete_pages_and_not_partial_tails() {
+        let values = (0..768 * 2).map(|i| i as f32).collect::<Vec<_>>();
+        let array = ffi::from_slice_f32(&values, &[1, 768, 2]);
+
+        let mut first = ModelStateSnapshot::new("test", 256);
+        first.push_paged_tensor(None, "kv", &array, 1).expect("capture first page");
+        let mut second = ModelStateSnapshot::new("test", 512);
+        second.push_paged_tensor(Some(&first), "kv", &array, 1).expect("capture second pages");
+        let mut third = ModelStateSnapshot::new("test", 768);
+        third.push_paged_tensor(Some(&second), "kv", &array, 1).expect("capture third pages");
+
+        let first_pages = &first.paged_tensor("kv").expect("first tensor").pages();
+        let second_pages = &second.paged_tensor("kv").expect("second tensor").pages();
+        let third_pages = &third.paged_tensor("kv").expect("third tensor").pages();
+        assert_eq!(first_pages.len(), 1);
+        assert_eq!(second_pages.len(), 2);
+        assert_eq!(third_pages.len(), 3);
+        assert_eq!(first_pages[0].identity(), second_pages[0].identity());
+        assert_eq!(second_pages[0].identity(), third_pages[0].identity());
+        assert_eq!(second_pages[1].identity(), third_pages[1].identity());
+        assert_ne!(third_pages[2].identity(), second_pages[1].identity());
+        assert_eq!(third_pages[2].token_range(), 512..768);
+    }
+
+    #[test]
+    fn paged_snapshot_branch_shares_prefix_and_owns_divergent_partial_tail() {
+        let base_values = (0..512 * 2).map(|i| i as f32).collect::<Vec<_>>();
+        let branch_values = (0..700 * 2).map(|i| (i + 10_000) as f32).collect::<Vec<_>>();
+        let base = ffi::from_slice_f32(&base_values, &[1, 512, 2]);
+        let branch = ffi::from_slice_f32(&branch_values, &[1, 700, 2]);
+
+        let mut parent = ModelStateSnapshot::new("test", 512);
+        parent.push_paged_tensor(None, "kv", &base, 1).expect("capture parent");
+        let mut child = ModelStateSnapshot::new("test", 700);
+        child.push_paged_tensor(Some(&parent), "kv", &branch, 1).expect("capture branch");
+
+        let parent_pages = &parent.paged_tensor("kv").expect("parent tensor").pages();
+        let child_pages = &child.paged_tensor("kv").expect("child tensor").pages();
+        assert_eq!(child_pages.len(), 3);
+        assert_eq!(child_pages[0].identity(), parent_pages[0].identity());
+        assert_eq!(child_pages[1].identity(), parent_pages[1].identity());
+        assert_ne!(child_pages[2].identity(), parent_pages[1].identity());
+        assert_eq!(child_pages[2].token_range(), 512..700);
+    }
+
+    #[test]
+    fn snapshot_storage_summary_counts_shared_pages_once() {
+        let values = vec![1.0f32; 512 * 2];
+        let array = ffi::from_slice_f32(&values, &[1, 512, 2]);
+        let mut parent = ModelStateSnapshot::new("test", 512);
+        parent.push_paged_tensor(None, "kv", &array, 1).expect("capture parent");
+        let mut child = ModelStateSnapshot::new("test", 512);
+        child.push_paged_tensor(Some(&parent), "kv", &array, 1).expect("capture child");
+
+        let parent_summary = parent.storage_summary();
+        let child_summary = child.storage_summary();
+        assert_eq!(parent_summary.pages.len(), 2);
+        assert_eq!(child_summary.pages, parent_summary.pages);
+        assert_eq!(
+            ModelStateSnapshot::unique_paged_nbytes([&parent, &child]),
+            parent_summary.pages.iter().map(|(_, bytes)| *bytes).sum()
+        );
+    }
+
 }

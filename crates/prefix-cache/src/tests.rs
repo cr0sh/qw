@@ -59,6 +59,22 @@ fn snapshot(token_len: usize, values: &[f32]) -> PromptSnapshot {
     snapshot.set_continuation_logits(&array);
     PromptSnapshot::Baseline(snapshot)
 }
+fn paged_snapshot_chain() -> Vec<PromptSnapshot> {
+    let values = (0..768 * 2).map(|i| i as f32).collect::<Vec<_>>();
+    let array = mlxcel_core::from_slice_f32(&values, &[1, 768, 2]);
+    let mut first = ModelStateSnapshot::new("test", 256);
+    first.push_paged_tensor(None, "kv", &array, 1).expect("first page");
+    let mut second = ModelStateSnapshot::new("test", 512);
+    second.push_paged_tensor(Some(&first), "kv", &array, 1).expect("second pages");
+    let mut third = ModelStateSnapshot::new("test", 768);
+    third.push_paged_tensor(Some(&second), "kv", &array, 1).expect("third pages");
+    vec![
+        PromptSnapshot::Baseline(first),
+        PromptSnapshot::Baseline(second),
+        PromptSnapshot::Baseline(third),
+    ]
+}
+
 
 fn resume_metadata(response_id: &str, fingerprint: &str) -> ResponseResumeMetadata {
     ResponseResumeMetadata {
@@ -800,4 +816,22 @@ fn cache_block_churn_emits_no_info_events() {
 
         assert_eq!((short_events, long_events), (0, 0));
     });
+}
+
+#[test]
+fn adaptive_memory_accounts_shared_checkpoint_pages_once() {
+    let mut cache =
+        AdaptivePrefixCache::new(namespaces(), memory_config(1_000_000)).expect("cache");
+    let snapshots = paged_snapshot_chain();
+    cache.insert(
+        &(0..768).map(|i| i as i32).collect::<Vec<_>>(),
+        snapshots,
+        SnapshotRoute::Baseline,
+    );
+
+    assert_eq!(
+        cache.memory_bytes(),
+        3 * 256 * 2 * std::mem::size_of::<f32>() as u64,
+        "linear checkpoints charge unique page bytes, not cumulative logical sizes"
+    );
 }

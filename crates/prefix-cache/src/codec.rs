@@ -3,7 +3,6 @@ use qw_runtime::{PortableArray, PortableModelState, PortablePage, PortablePagedT
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use crate::{EntryKey, SnapshotRoute};
-pub const MAX_BLOB_BYTES: usize = 20 * 1024 * 1024;
 #[derive(Debug,Clone,Serialize,Deserialize,PartialEq,Eq)] #[serde(deny_unknown_fields)] pub struct RetentionMetadata{pub observations:u64,pub reuse_count:u64,pub last_access_unix_ms:u64}
 #[derive(Debug,Clone,Serialize,Deserialize,PartialEq,Eq)] #[serde(deny_unknown_fields)] pub struct ResponseResumeMetadata{pub response_id:String,pub message_id:String,pub created_unix_seconds:u64,pub prompt_token_count:usize,pub request_fingerprint:String,pub generated_token_ids:Vec<i32>,pub raw_text:String,pub emitted_reasoning_text:String,pub emitted_content_text:String,pub original_max_tokens:usize}
 #[derive(Debug,Clone,Serialize,Deserialize)] #[serde(deny_unknown_fields)] pub struct Manifest{pub namespace:String,pub route:SnapshotRoute,pub token_ids:Vec<i32>,pub token_len:usize,pub family:String,#[serde(deserialize_with="required_option")]pub draft_offset:Option<i32>,pub arrays:Vec<ArrayDescriptor>,pub paged_tensors:Vec<PagedTensorDescriptor>,pub retention:RetentionMetadata,pub expires_at_unix_ms:u64,#[serde(deserialize_with="required_option")]pub response_resume:Option<ResponseResumeMetadata>,pub blob_sha256:Vec<String>,pub total_bytes:u64}
