@@ -39,6 +39,8 @@ pub struct Manifest {
     pub token_len: usize,
     pub family: String,
     #[serde(deserialize_with = "required_option")]
+    pub draft_family: Option<String>,
+    #[serde(deserialize_with = "required_option")]
     pub draft_offset: Option<i32>,
     pub arrays: Vec<ArrayDescriptor>,
     pub paged_tensors: Vec<PagedTensorDescriptor>,
@@ -155,7 +157,7 @@ pub fn encode_portable(
         return Err("portable snapshot route and token length must match the cache entry".into());
     }
     validate_resume_metadata(t, res.as_ref())?;
-    let (f, off, dense, paged) = flatten(p)?;
+    let (f, df, off, dense, paged) = flatten(p);
     let mut blobs = Vec::new();
     let mut seen = HashSet::new();
     enum BlobBytes {
@@ -232,6 +234,7 @@ pub fn encode_portable(
         token_ids: t.to_vec(),
         token_len: len,
         family: f,
+        draft_family: df,
         draft_offset: off,
         arrays,
         paged_tensors,
@@ -328,7 +331,15 @@ fn validate_manifest(ns: &str, m: &Manifest) -> Result<(), String> {
         return Err("cache manifest namespace or token length is invalid".into());
     }
     validate_resume_metadata(&m.token_ids, m.response_resume.as_ref())?;
-    if m.family.is_empty() || (m.arrays.is_empty() && m.paged_tensors.is_empty()) {
+    let family_metadata_valid = match (&m.route, &m.draft_offset, &m.draft_family) {
+        (SnapshotRoute::Baseline, None, None) => true,
+        (SnapshotRoute::Mtp, Some(_), Some(family)) => !family.is_empty(),
+        _ => false,
+    };
+    if m.family.is_empty()
+        || !family_metadata_valid
+        || (m.arrays.is_empty() && m.paged_tensors.is_empty())
+    {
         return Err("cache manifest is missing model state".into());
     }
     let mut total = 0;
@@ -400,15 +411,13 @@ pub(crate) fn validate_resume_metadata(
 }
 fn flatten(
     p: PortablePromptSnapshot,
-) -> Result<
-    (
-        String,
-        Option<i32>,
-        Vec<(ArrayRole, PortableArray)>,
-        Vec<(ArrayRole, PortablePagedTensor)>,
-    ),
+) -> (
     String,
-> {
+    Option<String>,
+    Option<i32>,
+    Vec<(ArrayRole, PortableArray)>,
+    Vec<(ArrayRole, PortablePagedTensor)>,
+) {
     fn m(
         mut x: PortableModelState,
         r: ArrayRole,
@@ -428,7 +437,7 @@ fn flatten(
     match p {
         PortablePromptSnapshot::Baseline(x) => {
             let (f, d, p) = m(x, ArrayRole::ModelTensor, ArrayRole::ModelContinuation);
-            Ok((f, None, d, p))
+            (f, None, None, d, p)
         }
         PortablePromptSnapshot::Mtp {
             target,
@@ -444,14 +453,11 @@ fn flatten(
             );
             let (df, mut dd, mut pp) =
                 m(draft, ArrayRole::DraftTensor, ArrayRole::DraftContinuation);
-            if f != df {
-                return Err("MTP target/draft families differ".into());
-            }
             d.append(&mut dd);
             p.append(&mut pp);
             d.push((ArrayRole::LastHidden, last_hidden));
             d.push((ArrayRole::MtpContinuation, continuation_logits));
-            Ok((f, Some(draft_offset), d, p))
+            (f, Some(df), Some(draft_offset), d, p)
         }
     }
 }
@@ -467,7 +473,13 @@ fn inflate(
         paged_tensors: Vec::new(),
         continuation_logits: None,
     };
-    let mut dr = t.clone();
+    let mut dr = PortableModelState {
+        family: String::new(),
+        token_len: 0,
+        tensors: Vec::new(),
+        paged_tensors: Vec::new(),
+        continuation_logits: None,
+    };
     let (mut h, mut c) = (None, None);
     for (r, a) in d {
         match r {
@@ -494,6 +506,10 @@ fn inflate(
         let draft_offset = m
             .draft_offset
             .ok_or("MTP manifest is missing draft offset")?;
+        dr.family = m
+            .draft_family
+            .clone()
+            .ok_or("MTP manifest is missing draft family")?;
         dr.token_len =
             usize::try_from(draft_offset).map_err(|_| "MTP manifest draft offset is invalid")?;
         Ok(PortablePromptSnapshot::Mtp {
