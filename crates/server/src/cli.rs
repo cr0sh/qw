@@ -71,9 +71,13 @@ pub struct ServerArgs {
     #[arg(long)]
     no_kv_quantization: bool,
 
-    /// Disable the daily trace log file under `~/.cache/qw/logs`.
+    /// Disable the daily trace log file under `~/.cache/qw/log/`.
     #[arg(long)]
     no_file_logging: bool,
+
+    /// Persistent log filter directives; overrides QW_LOG and defaults to `trace`.
+    #[arg(long)]
+    persistent_log_filter: Option<String>,
 
     /// Tracing output format.
     #[arg(long, value_enum, default_value = "human")]
@@ -122,6 +126,22 @@ fn default_prefix_cache_directory() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".cache/qw/checkpoint"))
 }
 
+fn resolve_persistent_log_filter(
+    cli_filter: Option<&str>,
+    env_filter: Option<&str>,
+) -> Result<EnvFilter> {
+    let (source, directives) = if let Some(filter) = cli_filter {
+        ("--persistent-log-filter", filter)
+    } else if let Some(filter) = env_filter {
+        ("QW_LOG", filter)
+    } else {
+        ("default", "trace")
+    };
+    EnvFilter::try_new(directives).with_context(|| {
+        format!("invalid persistent log filter directives from {source}: {directives:?}")
+    })
+}
+
 fn init_tracing(cli: &ServerArgs) -> Result<Option<WorkerGuard>> {
     let file_guard = if cli.no_file_logging {
         None
@@ -129,19 +149,23 @@ fn init_tracing(cli: &ServerArgs) -> Result<Option<WorkerGuard>> {
         let home = std::env::var_os("HOME")
             .filter(|home| !home.is_empty())
             .context("HOME is not set; cannot resolve the trace log directory")?;
-        let log_directory = PathBuf::from(home).join(".cache/qw/logs");
+        let log_directory = PathBuf::from(home).join(".cache/qw/log");
         std::fs::create_dir_all(&log_directory)
             .with_context(|| format!("failed to create {}", log_directory.display()))?;
         let appender = tracing_appender::rolling::daily(log_directory, "qw.log");
         let (non_blocking, guard) = tracing_appender::non_blocking(appender);
-        let file_layer = fmt::layer()
-            .with_ansi(false)
-            .with_writer(non_blocking)
-            .with_filter(tracing_subscriber::filter::LevelFilter::TRACE);
+        let env_filter = std::env::var("QW_LOG").ok();
+        let persistent_filter =
+            resolve_persistent_log_filter(cli.persistent_log_filter.as_deref(), env_filter.as_deref())?;
         match cli.output_format {
             OutputFormat::Human => registry()
                 .with(fmt::layer().with_filter(EnvFilter::from_default_env()))
-                .with(file_layer)
+                .with(
+                    fmt::layer()
+                        .with_ansi(false)
+                        .with_writer(non_blocking.clone())
+                        .with_filter(persistent_filter),
+                )
                 .init(),
             OutputFormat::Json => registry()
                 .with(
@@ -149,7 +173,12 @@ fn init_tracing(cli: &ServerArgs) -> Result<Option<WorkerGuard>> {
                         .json()
                         .with_filter(EnvFilter::from_default_env()),
                 )
-                .with(file_layer)
+                .with(
+                    fmt::layer()
+                        .with_ansi(false)
+                        .with_writer(non_blocking)
+                        .with_filter(persistent_filter),
+                )
                 .init(),
         }
         Some(guard)
@@ -206,10 +235,12 @@ pub async fn serve(cli: ServerArgs) -> Result<()> {
         .await
         .context("HTTP server failed")
 }
-
 #[cfg(test)]
 mod tests {
-    use super::{OutputFormat, ServerArgs, resolve_prefix_cache_directory, validate_cli};
+    use super::{
+        OutputFormat, ServerArgs, resolve_persistent_log_filter, resolve_prefix_cache_directory,
+        validate_cli,
+    };
     use clap::{CommandFactory as _, Parser as _};
     use clap_derive::Parser;
     use qw_runtime::KVCacheMode;
@@ -238,6 +269,7 @@ mod tests {
             "--model",
             "/tmp/checkpoint",
             "--model-id",
+
             "served-model",
         ])
         .expect("CLI");
@@ -245,6 +277,37 @@ mod tests {
 
         let help = TestCli::command().render_long_help().to_string();
         assert!(help.contains("--model-id <MODEL_ID>"), "{help}");
+    }
+    #[test]
+    fn cli_parses_persistent_log_filter_with_precedence() {
+        let cli = TestCli::try_parse_from([
+            "qw-server",
+            "--model",
+            "/tmp/checkpoint",
+            "--persistent-log-filter",
+            "server=debug",
+        ])
+        .expect("CLI");
+        assert!(resolve_persistent_log_filter(
+            cli.args.persistent_log_filter.as_deref(),
+            Some("server=trace"),
+        )
+        .is_ok());
+        assert!(resolve_persistent_log_filter(None, Some("server=debug")).is_ok());
+        assert!(resolve_persistent_log_filter(None, None).is_ok());
+
+        let help = TestCli::command().render_long_help().to_string();
+        assert!(help.contains("--persistent-log-filter <PERSISTENT_LOG_FILTER>"), "{help}");
+        assert!(help.contains("overrides QW_LOG"), "{help}");
+    }
+
+    #[test]
+    fn persistent_log_filter_reports_invalid_directives() {
+        let error = resolve_persistent_log_filter(Some("not a filter ???"), None)
+            .expect_err("invalid filter");
+        let message = error.to_string();
+        assert!(message.contains("invalid persistent log filter directives"), "{message}");
+        assert!(message.contains("--persistent-log-filter"), "{message}");
     }
 
     #[test]
