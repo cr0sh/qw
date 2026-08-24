@@ -25,7 +25,6 @@ use trie::{RadixTrie, Terminal};
 const INITIAL_TTL_MS: u64 = 2 * 60 * 60 * 1000;
 const MAX_TTL_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 const IO_QUEUE_CAPACITY: usize = 64;
-const MAX_CHECKPOINT_INTERVAL: usize = 256;
 pub trait Clock: Send {
     fn now_unix_ms(&self) -> u64;
 }
@@ -336,33 +335,22 @@ impl AdaptivePrefixCache {
             .copied()
             .filter(|length| *length > 0 && *length <= tokens.len())
             .collect::<Vec<_>>();
-        lengths.extend(
-            (MAX_CHECKPOINT_INTERVAL..=tokens.len()).step_by(MAX_CHECKPOINT_INTERVAL),
-        );
         lengths.push(tokens.len());
-        let structural =
-            self.trie
-                .path(tokens, route)
-                .into_iter()
-                .rev()
-                .find_map(|(node, length)| {
-                    let terminal = self.trie.terminal(node, route)?;
-                    (length < tokens.len()
-                        && terminal.observations >= 2
-                        && terminal.snapshot.is_none()
-                        && terminal.persistent_key.is_none())
-                    .then_some(length)
-                });
+        let structural = self
+            .trie
+            .path(tokens, route)
+            .into_iter()
+            .rev()
+            .find_map(|(node, length)| {
+                let terminal = self.trie.terminal(node, route)?;
+                (length < tokens.len()
+                    && terminal.observations >= 2
+                    && terminal.snapshot.is_none()
+                    && terminal.persistent_key.is_none())
+                .then_some(length)
+            });
         if let Some(common) = structural {
-            let boundary = required
-                .iter()
-                .copied()
-                .filter(|length| *length <= common)
-                .max()
-                .unwrap_or((common / MAX_CHECKPOINT_INTERVAL) * MAX_CHECKPOINT_INTERVAL);
-            if boundary > 0 {
-                lengths.push(boundary);
-            }
+            lengths.push(common);
         }
         lengths.sort_unstable();
         lengths.dedup();
@@ -533,6 +521,9 @@ impl AdaptivePrefixCache {
         response_resume: Option<ResponseResumeMetadata>,
     ) {
         let now = self.clock.now_unix_ms();
+        let filesystem_before = self.filesystem_bytes;
+        let mut inserted_logical_bytes = 0u64;
+        let mut inserted_unique_page_bytes = 0u64;
         self.expire(now);
         for snapshot in snapshots {
             let token_len = snapshot.token_len();
@@ -570,6 +561,10 @@ impl AdaptivePrefixCache {
             }
             let bytes = snapshot.nbytes() as u64;
             let summary = snapshot.storage_summary();
+            inserted_logical_bytes = inserted_logical_bytes.saturating_add(bytes);
+            inserted_unique_page_bytes = inserted_unique_page_bytes.saturating_add(
+                summary.pages.iter().map(|(_, page_bytes)| *page_bytes as u64).sum::<u64>(),
+            );
             let expiry = now.saturating_add(INITIAL_TTL_MS);
             let namespace = self.namespaces.get(route);
             let key = entry_key(namespace, route, prefix);
@@ -647,7 +642,8 @@ impl AdaptivePrefixCache {
                 phase = "cache.insert",
                 route = route.as_str(),
                 token_count = token_len,
-                snapshot_bytes = bytes
+                logical_snapshot_bytes = bytes,
+                unique_page_bytes = summary.pages.iter().map(|(_, page_bytes)| *page_bytes as u64).sum::<u64>(),
             );
         }
         self.rebuild_accounting();
@@ -664,6 +660,13 @@ impl AdaptivePrefixCache {
         self.filesystem_bytes = self.filesystem_blobs.values().map(|(_, bytes)| *bytes).sum();
         self.evict_memory();
         self.evict_persistent(now);
+        tracing::debug!(
+            phase = "cache.insert.summary",
+            route = route.as_str(),
+            logical_snapshot_bytes = inserted_logical_bytes,
+            unique_page_bytes = inserted_unique_page_bytes,
+            filesystem_unique_delta_bytes = self.filesystem_bytes as i128 - filesystem_before as i128,
+        );
     }
 
     pub fn memory_bytes(&self) -> u64 {
@@ -805,11 +808,13 @@ impl AdaptivePrefixCache {
             };
             let terminal = self.trie.terminal_mut(node, route).unwrap();
             let snapshot = terminal.snapshot.take().unwrap();
-            self.memory_bytes = self.memory_bytes.saturating_sub(snapshot.nbytes() as u64);
+            let reclaimed_bytes = snapshot.nbytes() as u64;
+            self.memory_bytes = self.memory_bytes.saturating_sub(reclaimed_bytes);
             tracing::debug!(
                 phase = "cache.evict",
                 tier = "memory",
-                route = route.as_str()
+                route = route.as_str(),
+                reclaimed_bytes,
             );
         }
         self.rebuild_accounting();
@@ -838,14 +843,16 @@ impl AdaptivePrefixCache {
             };
             let terminal = self.trie.terminal_mut(node, route).unwrap();
             let key = terminal.persistent_key.take().unwrap();
+            let reclaimed_bytes = terminal.serialized_bytes;
             self.filesystem_bytes = self
                 .filesystem_bytes
-                .saturating_sub(terminal.serialized_bytes);
+                .saturating_sub(reclaimed_bytes);
             self.try_io(IoCommand::Remove(key));
             tracing::debug!(
                 phase = "cache.evict",
                 tier = "filesystem",
-                route = route.as_str()
+                route = route.as_str(),
+                reclaimed_bytes,
             );
         }
         self.rebuild_accounting();
