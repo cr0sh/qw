@@ -149,6 +149,10 @@ fn rust_log_filter() -> EnvFilter {
         .from_env_lossy()
 }
 
+fn persistent_log_format() -> fmt::format::Format<fmt::format::Json> {
+    fmt::format().json()
+}
+
 fn init_tracing(cli: &ServerArgs) -> Result<Option<WorkerGuard>> {
     let file_guard = if cli.no_file_logging {
         None
@@ -171,6 +175,7 @@ fn init_tracing(cli: &ServerArgs) -> Result<Option<WorkerGuard>> {
                 .with(fmt::layer().with_filter(rust_log_filter()))
                 .with(
                     fmt::layer()
+                        .event_format(persistent_log_format())
                         .with_ansi(false)
                         .with_writer(non_blocking.clone())
                         .with_filter(persistent_filter),
@@ -184,6 +189,7 @@ fn init_tracing(cli: &ServerArgs) -> Result<Option<WorkerGuard>> {
                 )
                 .with(
                     fmt::layer()
+                        .event_format(persistent_log_format())
                         .with_ansi(false)
                         .with_writer(non_blocking)
                         .with_filter(persistent_filter),
@@ -249,18 +255,54 @@ pub async fn serve(cli: ServerArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        OutputFormat, ServerArgs, resolve_persistent_log_filter, resolve_prefix_cache_directory,
-        validate_cli,
+        OutputFormat, ServerArgs, persistent_log_format, resolve_persistent_log_filter,
+        resolve_prefix_cache_directory, validate_cli,
     };
     use clap::{CommandFactory as _, Parser as _};
     use clap_derive::Parser;
     use qw_runtime::KVCacheMode;
-
+    use std::fs::OpenOptions;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use tracing_subscriber::layer::SubscriberExt as _;
     #[derive(Debug, Parser)]
     #[command(name = "qw-server", about = "OpenAI-compatible dense Qwen3.5 server")]
     struct TestCli {
         #[command(flatten)]
         args: ServerArgs,
+    }
+
+    #[test]
+    fn persistent_log_format_emits_json_lines() {
+        let path = std::env::temp_dir().join(format!(
+            "qw-persistent-log-json-{}-{}.log",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let writer_path = path.clone();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .event_format(persistent_log_format())
+                .with_writer(move || {
+                    OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&writer_path)
+                        .unwrap()
+                }),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(request_id = 42, "persisted event");
+        });
+
+        let output = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(output.trim_end()).unwrap();
+        assert_eq!(parsed["fields"]["message"], "persisted event");
+        assert_eq!(parsed["fields"]["request_id"], 42);
     }
 
     #[test]
