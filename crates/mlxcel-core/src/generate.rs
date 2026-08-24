@@ -4686,7 +4686,7 @@ mod tests {
         assert_eq!(child_summary.pages, parent_summary.pages);
         assert_eq!(
             ModelStateSnapshot::unique_paged_nbytes([&parent, &child]),
-            parent_summary.pages.iter().map(|(_, bytes)| *bytes).sum()
+            parent_summary.pages.iter().map(|(_, bytes)| *bytes).sum::<usize>()
         );
     }
 
