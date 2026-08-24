@@ -7,7 +7,8 @@ use std::time::UNIX_EPOCH;
 use qw_runtime::provider::Qwen35GenerationMode;
 use qw_runtime::{
     ChatMessage, ChatMessageContent, GenerationRequest, KVCacheMode, PortableArray,
-    PortableModelState, PortablePromptSnapshot, PromptSnapshot, Qwen35Provider,
+    PortableModelState, PortablePage, PortablePagedTensor, PortablePromptSnapshot, PromptSnapshot,
+    Qwen35Provider,
 };
 
 pub const DECODE_MAX_TOKENS: usize = 128;
@@ -60,12 +61,12 @@ pub struct LongConversationFixture {
     pub mtp_target_forward_calls: usize,
 }
 
-const LONG_CONTEXT_CACHE_MAGIC: &[u8; 8] = b"QWLC64K\0";
-const LONG_CONTEXT_CACHE_VERSION: u32 = 1;
+const LONG_CONTEXT_CACHE_VERSION: u32 = 2;
 const MAX_CACHE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const MAX_CACHE_STRING_BYTES: usize = 1024 * 1024;
 const MAX_CACHE_TOKEN_IDS: usize = 1024 * 1024;
 const MAX_CACHE_TENSORS: usize = 4096;
+const MAX_CACHE_PAGES: usize = 1_048_576;
 const MAX_CACHE_RANK: usize = 16;
 
 fn hash_bytes(hash: &mut u64, bytes: &[u8]) {
@@ -200,6 +201,20 @@ fn write_portable_model(writer: &mut impl Write, model: &PortableModelState) -> 
     for tensor in &model.tensors {
         write_portable_array(writer, tensor)?;
     }
+    write_usize(writer, model.paged_tensors.len())?;
+    for tensor in &model.paged_tensors {
+        write_string(writer, &tensor.name)?;
+        write_usize(writer, tensor.token_axis)?;
+        write_usize(writer, tensor.token_len)?;
+        write_usize(writer, tensor.pages.len())?;
+        for page in &tensor.pages {
+            write_usize(writer, page.token_start)?;
+            write_usize(writer, page.token_end)?;
+            write_i32s(writer, &page.shape)?;
+            writer.write_all(&page.dtype.to_le_bytes())?;
+            write_bytes(writer, &page.bytes)?;
+        }
+    }
     write_optional_array(writer, model.continuation_logits.as_ref())
 }
 
@@ -214,22 +229,21 @@ fn write_portable_snapshot(
         }
         PortablePromptSnapshot::Mtp {
             target,
-            draft_keys,
-            draft_values,
+            draft,
             draft_offset,
             last_hidden,
             continuation_logits,
         } => {
             write_u8(writer, 1)?;
             write_portable_model(writer, target)?;
-            write_optional_array(writer, draft_keys.as_ref())?;
-            write_optional_array(writer, draft_values.as_ref())?;
+            write_portable_model(writer, draft)?;
             writer.write_all(&draft_offset.to_le_bytes())?;
             write_portable_array(writer, last_hidden)?;
             write_portable_array(writer, continuation_logits)
         }
     }
 }
+
 
 struct FixtureReader {
     inner: BufReader<File>,
@@ -383,11 +397,41 @@ impl FixtureReader {
         for _ in 0..tensor_count {
             tensors.push(self.read_portable_array()?);
         }
+        let paged_tensor_count = self.read_usize(MAX_CACHE_TENSORS)?;
+        let mut paged_tensors = Vec::with_capacity(paged_tensor_count);
+        for _ in 0..paged_tensor_count {
+            let name = self.read_string()?;
+            let token_axis = self.read_usize(MAX_CACHE_RANK)?;
+            let token_len = self.read_usize(MAX_CACHE_TOKEN_IDS)?;
+            let page_count = self.read_usize(MAX_CACHE_PAGES)?;
+            let mut pages = Vec::with_capacity(page_count);
+            for _ in 0..page_count {
+                let token_start = self.read_usize(MAX_CACHE_TOKEN_IDS)?;
+                let token_end = self.read_usize(MAX_CACHE_TOKEN_IDS)?;
+                let shape = self.read_i32s(MAX_CACHE_RANK)?;
+                let dtype = i32::from_le_bytes(self.read_exact()?);
+                let bytes = self.read_bytes()?.into();
+                pages.push(PortablePage {
+                    token_start,
+                    token_end,
+                    shape,
+                    dtype,
+                    bytes,
+                });
+            }
+            paged_tensors.push(PortablePagedTensor {
+                name,
+                token_axis,
+                token_len,
+                pages,
+            });
+        }
         let continuation_logits = self.read_optional_array()?;
         Ok(PortableModelState {
             family,
             token_len,
             tensors,
+            paged_tensors,
             continuation_logits,
         })
     }
@@ -399,15 +443,13 @@ impl FixtureReader {
                 .map(PortablePromptSnapshot::Baseline),
             1 => {
                 let target = self.read_portable_model()?;
-                let draft_keys = self.read_optional_array()?;
-                let draft_values = self.read_optional_array()?;
+                let draft = self.read_portable_model()?;
                 let draft_offset = i32::from_le_bytes(self.read_exact()?);
                 let last_hidden = self.read_portable_array()?;
                 let continuation_logits = self.read_portable_array()?;
                 Ok(PortablePromptSnapshot::Mtp {
                     target,
-                    draft_keys,
-                    draft_values,
+                    draft,
                     draft_offset,
                     last_hidden,
                     continuation_logits,
