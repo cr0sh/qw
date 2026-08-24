@@ -2496,16 +2496,14 @@ mod tests {
         let (
             crate::PortablePromptSnapshot::Mtp {
                 target: cold_target,
-                draft_keys: cold_draft_keys,
-                draft_values: cold_draft_values,
+                draft: cold_draft,
                 draft_offset: cold_draft_offset,
                 last_hidden: cold_last_hidden,
                 continuation_logits: cold_continuation_logits,
             },
             crate::PortablePromptSnapshot::Mtp {
                 target,
-                draft_keys,
-                draft_values,
+                draft,
                 draft_offset,
                 last_hidden,
                 continuation_logits,
@@ -2526,8 +2524,7 @@ mod tests {
         );
         assert!(cold_target == target, "cancelled target states differ");
         assert_eq!(cold_draft_offset, draft_offset, "drafter offsets differ");
-        assert!(cold_draft_keys == draft_keys, "drafter keys differ");
-        assert!(cold_draft_values == draft_values, "drafter values differ");
+        assert!(cold_draft == draft, "drafter states differ");
         assert!(cold_last_hidden == last_hidden, "last hidden states differ");
         assert!(
             cold_continuation_logits == continuation_logits,

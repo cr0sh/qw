@@ -45,8 +45,7 @@ pub enum PortablePromptSnapshot {
     Baseline(PortableModelState),
     Mtp {
         target: PortableModelState,
-        draft_keys: Option<PortableArray>,
-        draft_values: Option<PortableArray>,
+        draft: PortableModelState,
         draft_offset: i32,
         last_hidden: PortableArray,
         continuation_logits: PortableArray,
@@ -151,7 +150,7 @@ fn model_to_portable(snapshot: &ModelStateSnapshot) -> PortableModelState {
     }
 }
 
-fn model_from_portable(
+pub(crate) fn model_from_portable(
     portable: PortableModelState,
     require_continuation_logits: bool,
 ) -> Result<ModelStateSnapshot, String> {
@@ -211,15 +210,13 @@ impl PromptSnapshot {
             }
             PortablePromptSnapshot::Mtp {
                 target,
-                draft_keys,
-                draft_values,
+                draft,
                 draft_offset,
                 last_hidden,
                 continuation_logits,
             } => MtpPromptSnapshot::from_portable_parts(
                 model_from_portable(target, false)?,
-                draft_keys,
-                draft_values,
+                draft,
                 draft_offset,
                 last_hidden,
                 continuation_logits,
