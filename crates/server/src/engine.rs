@@ -1062,6 +1062,25 @@ struct QwenWorker {
     mtp_k: usize,
 }
 
+enum WorkerNextAction<T> {
+    Job(T),
+    Maintenance,
+    Wait,
+    Stop,
+}
+
+fn next_worker_action<T>(
+    job: Result<T, mpsc::error::TryRecvError>,
+    has_maintenance: bool,
+) -> WorkerNextAction<T> {
+    match job {
+        Ok(job) => WorkerNextAction::Job(job),
+        Err(mpsc::error::TryRecvError::Empty) if has_maintenance => WorkerNextAction::Maintenance,
+        Err(mpsc::error::TryRecvError::Empty) => WorkerNextAction::Wait,
+        Err(mpsc::error::TryRecvError::Disconnected) => WorkerNextAction::Stop,
+    }
+}
+
 impl QwenWorker {
     fn load(
         model_path: &Path,
@@ -1140,19 +1159,19 @@ impl QwenWorker {
     fn run(&mut self, mut jobs: mpsc::Receiver<Job>) {
         let mut maintenance = VecDeque::<CacheMaintenance>::new();
         loop {
-            match jobs.try_recv() {
-                Ok(job) => self.process(job, &mut maintenance),
-                Err(mpsc::error::TryRecvError::Empty) => {
-                    if let Some(work) = maintenance.pop_front() {
-                        work(&mut self.prefix_cache);
-                    } else {
-                        match jobs.blocking_recv() {
-                            Some(job) => self.process(job, &mut maintenance),
-                            None => break,
-                        }
-                    }
+            match next_worker_action(jobs.try_recv(), !maintenance.is_empty()) {
+                WorkerNextAction::Job(job) => self.process(job, &mut maintenance),
+                WorkerNextAction::Maintenance => {
+                    let work = maintenance
+                        .pop_front()
+                        .expect("maintenance action requires queued work");
+                    work(&mut self.prefix_cache);
                 }
-                Err(mpsc::error::TryRecvError::Disconnected) => break,
+                WorkerNextAction::Wait => match jobs.blocking_recv() {
+                    Some(job) => self.process(job, &mut maintenance),
+                    None => break,
+                },
+                WorkerNextAction::Stop => break,
             }
         }
     }
@@ -1869,23 +1888,6 @@ fn publish_completion(events: &mpsc::Sender<WorkerEvent>, record: CompletionReco
 }
 
 
-fn publish_completion_before_cache(
-    events: &mpsc::Sender<WorkerEvent>,
-    record: CompletionRecord,
-    cache_work: impl FnOnce(),
-) {
-    let (acknowledged, completed) = oneshot::channel();
-    if events
-        .blocking_send(WorkerEvent::Complete {
-            record,
-            acknowledged: Some(acknowledged),
-        })
-        .is_ok()
-    {
-        let _ = completed.blocking_recv();
-    }
-    cache_work();
-}
 
 fn send_failure(job: &Job, kind: FailureKind, message: String, param: Option<String>) {
     error!(
@@ -2411,75 +2413,22 @@ mod tests {
             "--mtp-k must be at least 2"
         );
     }
-    fn test_completion_record() -> CompletionRecord {
-        CompletionRecord {
-            admission: Admission {
-                response_id: "chatcmpl-test".to_string(),
-                message_id: "msg-test".to_string(),
-                created: 0,
-            },
-            endpoint: Endpoint::Chat,
-            model: "test-model".to_string(),
-            content: "complete".to_string(),
-            reasoning_content: String::new(),
-            tool_calls: Vec::new(),
-            prompt_tokens: 1,
-            completion_tokens: 1,
-            cached_tokens: 0,
-            finish_reason: FinishReason::Stop,
-            stream_include_usage: false,
-        }
+    #[test]
+    fn queued_job_takes_priority_over_cache_maintenance() {
+        let (jobs, mut receiver) = mpsc::channel(1);
+        jobs.try_send(7).expect("job queue accepts test job");
+
+        let action = next_worker_action(receiver.try_recv(), true);
+
+        assert!(matches!(action, WorkerNextAction::Job(7)));
     }
 
     #[test]
-    fn completion_is_acknowledged_before_cache_insertion() {
-        let (events, mut received) = mpsc::channel(1);
-        let completion_processed = Arc::new(AtomicBool::new(false));
-        let completion_processed_by_consumer = Arc::clone(&completion_processed);
-        let consumer = thread::spawn(move || match received.blocking_recv() {
-            Some(WorkerEvent::Complete {
-                record,
-                acknowledged: Some(acknowledged),
-            }) => {
-                assert_eq!(record.content, "complete");
-                completion_processed_by_consumer.store(true, Ordering::Release);
-                acknowledged
-                    .send(())
-                    .expect("worker is waiting for completion");
-            }
-            event => panic!("unexpected worker event: {event:?}"),
-        });
+    fn cache_maintenance_runs_when_job_queue_is_empty() {
+        let (_jobs, mut receiver) = mpsc::channel::<u8>(1);
 
-        let cache_started = Arc::new(AtomicBool::new(false));
-        let cache_started_by_worker = Arc::clone(&cache_started);
-        publish_completion_before_cache(&events, test_completion_record(), || {
-            assert!(completion_processed.load(Ordering::Acquire));
-            cache_started_by_worker.store(true, Ordering::Release);
-        });
-        consumer.join().expect("completion consumer did not finish");
-        assert!(cache_started.load(Ordering::Acquire));
+        let action = next_worker_action(receiver.try_recv(), true);
 
-        let (events, mut received) = mpsc::channel(1);
-        let consumer = thread::spawn(move || match received.blocking_recv() {
-            Some(WorkerEvent::Complete {
-                acknowledged: Some(_),
-                ..
-            }) => {}
-            event => panic!("unexpected worker event: {event:?}"),
-        });
-        let (progress, progressed) = std_mpsc::sync_channel(0);
-        let worker = thread::spawn(move || {
-            publish_completion_before_cache(&events, test_completion_record(), || {
-                progress.send(()).expect("test worker is still waiting");
-            });
-        });
-        assert!(
-            progressed
-                .recv_timeout(std::time::Duration::from_secs(1))
-                .is_ok(),
-            "dropped completion acknowledgment deadlocked cache work"
-        );
-        worker.join().expect("worker thread panicked");
-        consumer.join().expect("completion consumer did not finish");
+        assert!(matches!(action, WorkerNextAction::Maintenance));
     }
 }
