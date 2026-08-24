@@ -664,11 +664,7 @@ fn active_resume_is_exempt_from_pressure_until_consumed() {
     cache.insert(&[9, 9], vec![snapshot(2, &[2.0])], SnapshotRoute::Baseline);
     assert_eq!(cache.memory_bytes(), active_bytes);
     assert!(cache
-        .take_resume(
-            "chatcmpl-pressure",
-            "fingerprint",
-            SnapshotRoute::Baseline
-        )
+        .take_resume("chatcmpl-pressure", "fingerprint", SnapshotRoute::Baseline)
         .is_ok());
     assert_eq!(cache.memory_bytes(), 0);
 }
