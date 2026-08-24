@@ -3099,7 +3099,7 @@ mod tests {
         let keys_before = live.keys.as_deref().expect("live FP16 keys") as *const MlxArray;
         let mut snapshot = ModelStateSnapshot::new("test", 2);
 
-        assert!(push_turbo4_attention_snapshot(&mut snapshot, 0, live));
+        assert!(push_turbo4_attention_snapshot(&mut snapshot, None, 0, live));
 
         let expected = QWEN35_TURBO4_SNAPSHOT_SUFFIXES
             .iter()
