@@ -158,7 +158,6 @@ struct CacheIo {
 }
 
 struct PutCompletion {
-    node: usize,
     route: SnapshotRoute,
     token_ids: Vec<i32>,
     key: EntryKey,
@@ -170,7 +169,6 @@ enum IoCommand {
         reply: mpsc::Sender<Result<Option<StoredEntry>, String>>,
     },
     Put {
-        node: usize,
         key: EntryKey,
         namespace: String,
         route: SnapshotRoute,
@@ -367,7 +365,6 @@ impl AdaptivePrefixCache {
         self.rebuild_accounting();
         self.evict_persistent(self.clock.now_unix_ms());
     }
-
 
     pub fn checkpoint_lengths(
         &mut self,
@@ -680,7 +677,6 @@ impl AdaptivePrefixCache {
             });
             if let Some(portable) = portable {
                 let queued = self.try_io(IoCommand::Put {
-                    node,
                     key: key.clone(),
                     namespace: self.namespaces.get(route).to_string(),
                     route,
@@ -697,8 +693,14 @@ impl AdaptivePrefixCache {
                 if !queued {
                     if let Some(terminal) = self.trie.terminal_mut(node, route) {
                         terminal.persistent_key = None;
+                        terminal.blob_refs.clear();
+                        terminal.serialized_bytes = 0;
                     }
                 }
+            } else if let Some(terminal) = self.trie.terminal_mut(node, route) {
+                terminal.persistent_key = None;
+                terminal.blob_refs.clear();
+                terminal.serialized_bytes = 0;
             }
             tracing::debug!(
                 phase = "cache.insert",
@@ -756,6 +758,11 @@ impl AdaptivePrefixCache {
             let (reply_tx, reply_rx) = mpsc::channel();
             if tx.send(IoCommand::Flush(reply_tx)).is_ok() {
                 let _ = reply_rx.recv();
+                self.drain_put_completions();
+                let (reply_tx, reply_rx) = mpsc::channel();
+                if tx.send(IoCommand::Flush(reply_tx)).is_ok() {
+                    let _ = reply_rx.recv();
+                }
             }
         }
     }
@@ -1070,6 +1077,7 @@ impl AdaptivePrefixCache {
         }
     }
 }
+
 fn manifest_blob_refs(manifest: &Manifest) -> Vec<(String, u64)> {
     let mut refs = HashMap::<String, u64>::new();
     for array in &manifest.arrays {
@@ -1130,7 +1138,6 @@ fn io_loop(
                 continue;
             }
             IoCommand::Put {
-                node,
                 key,
                 namespace,
                 route,
@@ -1151,11 +1158,16 @@ fn io_loop(
                     response_resume,
                 )
                 .and_then(|encoded| {
-                    let refs = manifest_blob_refs(
-                        &serde_json::from_slice::<Manifest>(&encoded.manifest)
-                            .map_err(|error| error.to_string())?,
-                    );
-                    let bytes = encoded.manifest.len() as u64;
+                    let refs = encoded
+                        .blobs
+                        .iter()
+                        .map(|blob| (blob.sha256.clone(), blob.bytes.len() as u64))
+                        .collect();
+                    let bytes = encoded
+                        .blobs
+                        .iter()
+                        .map(|blob| blob.bytes.len() as u64)
+                        .sum();
                     store.put(
                         StoredEntry {
                             key: encoded.key,
@@ -1167,7 +1179,6 @@ fn io_loop(
                     Ok((refs, bytes))
                 });
                 let _ = completion_tx.send(PutCompletion {
-                    node,
                     route,
                     token_ids: completion_tokens,
                     key,

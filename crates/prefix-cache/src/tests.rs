@@ -149,6 +149,7 @@ fn persistent_store_contract_requires_no_filesystem_types() {
 struct RecordingState {
     entries: HashMap<EntryKey, (Vec<u8>, Vec<ContentBlob>)>,
     refreshes: Vec<(EntryKey, u64)>,
+    fail_put: bool,
 }
 
 struct RecordingStore(Arc<Mutex<RecordingState>>);
@@ -177,9 +178,11 @@ impl PersistentSnapshotStore for RecordingStore {
     }
 
     fn put(&mut self, entry: StoredEntry, _expires_at_unix_ms: u64) -> Result<(), String> {
-        self.0
-            .lock()
-            .expect("recording store lock")
+        let mut state = self.0.lock().expect("recording store lock");
+        if state.fail_put {
+            return Err("injected put failure".to_string());
+        }
+        state
             .entries
             .insert(entry.key, (entry.manifest, entry.blobs));
         Ok(())
@@ -447,6 +450,70 @@ fn filesystem_byte_cap_evicts_persistent_entries_by_snapshot_bytes() {
             .is_empty(),
         "write-through is followed by persistent eviction under the byte cap",
     );
+}
+
+#[test]
+fn failed_persistence_clears_metadata_but_keeps_memory_snapshot() {
+    let state = Arc::new(Mutex::new(RecordingState {
+        fail_put: true,
+        ..RecordingState::default()
+    }));
+    let mut cache = AdaptivePrefixCache::with_store(
+        namespaces(),
+        memory_config(1_000_000),
+        Box::new(RecordingStore(Arc::clone(&state))),
+    )
+    .expect("cache");
+    cache.insert(
+        &[1, 2],
+        vec![snapshot(2, &[1.0, 2.0])],
+        SnapshotRoute::Baseline,
+    );
+    cache.flush_persistence();
+    assert!(
+        cache.lookup(&[1, 2, 3], SnapshotRoute::Baseline).is_some(),
+        "failed persistence must not evict hot memory",
+    );
+    let node = cache
+        .trie
+        .path(&[1, 2], SnapshotRoute::Baseline)
+        .into_iter()
+        .last()
+        .map(|(node, _)| node)
+        .expect("terminal path");
+    let terminal = cache
+        .trie
+        .terminal(node, SnapshotRoute::Baseline)
+        .expect("terminal");
+    assert!(terminal.persistent_key.is_none());
+    assert!(terminal.blob_refs.is_empty());
+    assert_eq!(terminal.serialized_bytes, 0);
+    assert_eq!(cache.filesystem_bytes, 0);
+}
+
+#[test]
+fn persistent_accounting_uses_unique_payload_bytes() {
+    let state = Arc::new(Mutex::new(RecordingState::default()));
+    let mut cache = AdaptivePrefixCache::with_store(
+        namespaces(),
+        memory_config(1_000_000),
+        Box::new(RecordingStore(Arc::clone(&state))),
+    )
+    .expect("cache");
+    let tokens = [9, 10];
+    cache.insert(
+        &tokens,
+        vec![snapshot(tokens.len(), &[1.0, 2.0])],
+        SnapshotRoute::Baseline,
+    );
+    cache.flush_persistence();
+
+    let key = entry_key(NAMESPACE, SnapshotRoute::Baseline, &tokens);
+    let state = state.lock().expect("recording store lock");
+    let (manifest_bytes, _) = state.entries.get(&key).expect("stored entry");
+    let manifest: Manifest = serde_json::from_slice(manifest_bytes).expect("manifest");
+    assert_eq!(cache.filesystem_bytes, manifest.total_bytes);
+    assert_ne!(manifest.total_bytes, manifest_bytes.len() as u64);
 }
 
 #[test]
