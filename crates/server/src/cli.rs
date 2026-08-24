@@ -175,6 +175,7 @@ fn init_tracing(cli: &ServerArgs) -> Result<Option<WorkerGuard>> {
                 .with(fmt::layer().with_filter(rust_log_filter()))
                 .with(
                     fmt::layer()
+                        .fmt_fields(fmt::format::JsonFields::new())
                         .event_format(persistent_log_format())
                         .with_ansi(false)
                         .with_writer(non_blocking.clone())
@@ -189,6 +190,7 @@ fn init_tracing(cli: &ServerArgs) -> Result<Option<WorkerGuard>> {
                 )
                 .with(
                     fmt::layer()
+                        .fmt_fields(fmt::format::JsonFields::new())
                         .event_format(persistent_log_format())
                         .with_ansi(false)
                         .with_writer(non_blocking)
@@ -284,6 +286,7 @@ mod tests {
         let writer_path = path.clone();
         let subscriber = tracing_subscriber::registry().with(
             tracing_subscriber::fmt::layer()
+                .fmt_fields(tracing_subscriber::fmt::format::JsonFields::new())
                 .event_format(persistent_log_format())
                 .with_writer(move || {
                     OpenOptions::new()
@@ -295,12 +298,25 @@ mod tests {
         );
 
         tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!(
+                "server.request",
+                endpoint = "Chat",
+                model = tracing::field::Empty,
+                stream = tracing::field::Empty,
+            );
+            let _entered = span.enter();
+            span.record("model", "Qwen3.8-27B");
+            span.record("stream", true);
             tracing::info!(request_id = 42, "persisted event");
         });
 
         let output = std::fs::read_to_string(&path).unwrap();
         std::fs::remove_file(path).unwrap();
+        assert!(!output.contains("field_error"), "{output}");
         let parsed: serde_json::Value = serde_json::from_str(output.trim_end()).unwrap();
+        assert_eq!(parsed["spans"][0]["name"], "server.request");
+        assert_eq!(parsed["spans"][0]["model"], "Qwen3.8-27B");
+        assert_eq!(parsed["spans"][0]["stream"], true);
         assert_eq!(parsed["fields"]["message"], "persisted event");
         assert_eq!(parsed["fields"]["request_id"], 42);
     }
