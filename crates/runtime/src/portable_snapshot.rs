@@ -153,11 +153,12 @@ fn model_to_portable(snapshot: &ModelStateSnapshot) -> PortableModelState {
 pub(crate) fn model_from_portable(
     portable: PortableModelState,
     require_continuation_logits: bool,
+    allow_empty: bool,
 ) -> Result<ModelStateSnapshot, String> {
     if portable.family.is_empty() {
         return Err("portable model-state family must not be empty".to_string());
     }
-    if portable.token_len == 0 {
+    if portable.token_len == 0 && !allow_empty {
         return Err("portable model-state token length must be nonzero".to_string());
     }
     if require_continuation_logits && portable.continuation_logits.is_none() {
@@ -213,7 +214,7 @@ impl PromptSnapshot {
     pub fn from_portable(portable: PortablePromptSnapshot) -> Result<Self, String> {
         match portable {
             PortablePromptSnapshot::Baseline(snapshot) => {
-                model_from_portable(snapshot, true).map(Self::Baseline)
+                model_from_portable(snapshot, true, false).map(Self::Baseline)
             }
             PortablePromptSnapshot::Mtp {
                 target,
@@ -222,7 +223,7 @@ impl PromptSnapshot {
                 last_hidden,
                 continuation_logits,
             } => MtpPromptSnapshot::from_portable_parts(
-                model_from_portable(target, false)?,
+                model_from_portable(target, false, false)?,
                 draft,
                 draft_offset,
                 last_hidden,

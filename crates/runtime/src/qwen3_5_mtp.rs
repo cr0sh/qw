@@ -163,9 +163,15 @@ impl MtpPromptSnapshot {
                 .ok_or_else(|| "MTP portable target token length must be nonzero".to_string())?,
         )
         .map_err(|_| "MTP portable target token length exceeds i32".to_string())?;
+        let empty_draft = expected_offset == 0
+            && draft.token_len == 0
+            && draft.tensors.is_empty()
+            && draft.paged_tensors.is_empty()
+            && draft.continuation_logits.is_none();
         if draft_offset != expected_offset
             || draft.token_len != expected_offset as usize
             || draft.family != "qwen3.5-mtp-draft"
+            || (expected_offset == 0 && !empty_draft)
         {
             return Err("MTP portable target and drafter offsets do not match".to_string());
         }
@@ -199,7 +205,7 @@ impl MtpPromptSnapshot {
         }
         Ok(Self {
             target,
-            draft: crate::portable_snapshot::model_from_portable(draft, false)?,
+            draft: crate::portable_snapshot::model_from_portable(draft, false, empty_draft)?,
             draft_offset,
             last_hidden: array_from_portable(last_hidden, None)?,
             continuation_logits: array_from_portable(continuation_logits, None)?,

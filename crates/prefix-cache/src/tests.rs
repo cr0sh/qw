@@ -348,6 +348,7 @@ fn ttl_progression_expiry_and_byte_eviction_are_adaptive() {
         0,
         "snapshot-byte budget evicts oversized state"
     );
+    assert!(cache.memory_pages.is_empty(), "evicted terminal has no page accounting");
 
     let mut cache = AdaptivePrefixCache::with_store_and_clock(
         namespaces(),
@@ -422,8 +423,8 @@ fn filesystem_byte_cap_evicts_persistent_entries_by_snapshot_bytes() {
         SnapshotRoute::Baseline,
     );
     cache.flush_persistence();
-
     assert_eq!(cache.filesystem_bytes, 0);
+    assert!(cache.filesystem_blobs.is_empty(), "evicted terminal has no blob accounting");
     assert!(
         state
             .lock()
@@ -462,7 +463,15 @@ fn filesystem_restart_promotes_valid_entry_and_deletes_corrupt_payload() {
             .expect("filesystem hit");
         assert_eq!(hit.token_count, 3);
     }
-    std::fs::write(directory.path.join(&key.0).join("00000.blob"), b"corrupt")
+    let entry_path = directory
+        .path
+        .join("entries")
+        .join(NAMESPACE)
+        .join(format!("{}.json", key.0.split('/').nth(1).unwrap()));
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&entry_path).expect("entry manifest")).expect("manifest");
+    let digest = manifest["blob_sha256"][0].as_str().expect("blob digest");
+    std::fs::write(directory.path.join("blobs").join(digest), b"corrupt")
         .expect("corrupt blob");
     {
         let mut restarted =
@@ -471,7 +480,7 @@ fn filesystem_restart_promotes_valid_entry_and_deletes_corrupt_payload() {
         restarted.flush_persistence();
     }
     assert!(
-        !directory.path.join(&key.0).exists(),
+        !entry_path.exists(),
         "corrupt entry is deletion-as-miss"
     );
 }
@@ -532,15 +541,22 @@ fn mtp_manifest_round_trip_preserves_route_and_offset_validation() {
         bytes,
     };
     let model = || qw_runtime::PortableModelState {
-        family: "test".to_string(),
+        family: "qwen3.5-mtp-draft".to_string(),
         token_len: 1,
+        tensors: Vec::new(),
+        paged_tensors: Vec::new(),
+        continuation_logits: None,
+    };
+    let draft = qw_runtime::PortableModelState {
+        family: "qwen3.5-mtp-draft".to_string(),
+        token_len: 0,
         tensors: Vec::new(),
         paged_tensors: Vec::new(),
         continuation_logits: None,
     };
     let portable = qw_runtime::PortablePromptSnapshot::Mtp {
         target: model(),
-        draft: model(),
+        draft,
         draft_offset: 0,
         last_hidden: array(vec![0; 8]),
         continuation_logits: array(vec![1; 8]),
@@ -577,9 +593,13 @@ fn filesystem_namespace_isolation_and_partial_recovery_are_misses() {
         cache.insert(&[9], vec![snapshot(1, &[9.0])], SnapshotRoute::Baseline);
         cache.flush_persistence();
     }
-    let partial = directory.path.join(NAMESPACE).join(".tmp-interrupted");
-    std::fs::create_dir(&partial).expect("partial directory");
-    std::fs::write(partial.join("00000.blob"), b"partial").expect("partial blob");
+    let partial = directory
+        .path
+        .join("entries")
+        .join(NAMESPACE)
+        .join(".tmp-interrupted");
+    std::fs::create_dir_all(partial.parent().unwrap()).expect("partial directory");
+    std::fs::write(&partial, b"partial").expect("partial manifest");
 
     let other_namespace = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     let mut isolated = AdaptivePrefixCache::new(
@@ -587,11 +607,11 @@ fn filesystem_namespace_isolation_and_partial_recovery_are_misses() {
             baseline: other_namespace.to_string(),
             mtp: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string(),
         },
-        config,
+        config.clone(),
     )
     .expect("isolated cache");
     assert!(isolated.lookup(&[9], SnapshotRoute::Baseline).is_none());
-    assert!(directory.path.join(NAMESPACE).exists());
+    assert!(directory.path.join("entries").join(NAMESPACE).exists());
 
     let _recovered = AdaptivePrefixCache::new(
         namespaces(),
@@ -602,10 +622,7 @@ fn filesystem_namespace_isolation_and_partial_recovery_are_misses() {
         },
     )
     .expect("recovered cache");
-    assert!(
-        !partial.exists(),
-        "startup removes interrupted temporary entries"
-    );
+    assert!(!partial.exists(), "startup removes interrupted temporary entries");
 }
 
 struct TempDirectory {
