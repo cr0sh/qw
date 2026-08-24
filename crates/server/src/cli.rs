@@ -7,13 +7,13 @@ use qw_prefix_cache::CacheConfig;
 use qw_runtime::{KVCacheMode, resolve_model_path};
 use tracing::info;
 use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::Layer as _;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 use tracing_subscriber::{EnvFilter, fmt, registry};
-use tracing_subscriber::Layer as _;
-use crate::{Engine, router};
 #[cfg(feature = "specprefill")]
 use crate::SpecPrefillPolicyConfig;
+use crate::{Engine, router};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum OutputFormat {
@@ -155,8 +155,10 @@ fn init_tracing(cli: &ServerArgs) -> Result<Option<WorkerGuard>> {
         let appender = tracing_appender::rolling::daily(log_directory, "qw.log");
         let (non_blocking, guard) = tracing_appender::non_blocking(appender);
         let env_filter = std::env::var("QW_LOG").ok();
-        let persistent_filter =
-            resolve_persistent_log_filter(cli.persistent_log_filter.as_deref(), env_filter.as_deref())?;
+        let persistent_filter = resolve_persistent_log_filter(
+            cli.persistent_log_filter.as_deref(),
+            env_filter.as_deref(),
+        )?;
         match cli.output_format {
             OutputFormat::Human => registry()
                 .with(fmt::layer().with_filter(EnvFilter::from_default_env()))
@@ -296,8 +298,10 @@ mod tests {
         assert!(resolve_persistent_log_filter(None, Some("server=debug")).is_ok());
         assert!(resolve_persistent_log_filter(None, None).is_ok());
 
-        let help = TestCli::command().render_long_help().to_string();
-        assert!(help.contains("--persistent-log-filter <PERSISTENT_LOG_FILTER>"), "{help}");
+        assert!(
+            help.contains("--persistent-log-filter <PERSISTENT_LOG_FILTER>"),
+            "{help}"
+        );
         assert!(help.contains("overrides QW_LOG"), "{help}");
     }
 
@@ -306,7 +310,10 @@ mod tests {
         let error = resolve_persistent_log_filter(Some("target=not-a-level"), None)
             .expect_err("invalid filter");
         let message = error.to_string();
-        assert!(message.contains("invalid persistent log filter directives"), "{message}");
+        assert!(
+            message.contains("invalid persistent log filter directives"),
+            "{message}"
+        );
         assert!(message.contains("--persistent-log-filter"), "{message}");
     }
 

@@ -1192,7 +1192,6 @@ impl QwenWorker {
         }
     }
 
-
     fn process(&mut self, mut job: Job, maintenance: &mut VecDeque<CacheMaintenance>) {
         let span = job.span.clone();
         let _entered = span.enter();
@@ -1758,25 +1757,27 @@ impl QwenWorker {
                     emitted_content_text: output.emitted_content_text.clone(),
                     original_max_tokens: prior_metadata
                         .as_ref()
-                        .map_or(job.request.max_tokens, |metadata| metadata.original_max_tokens),
+                        .map_or(job.request.max_tokens, |metadata| {
+                            metadata.original_max_tokens
+                        }),
                 });
                 maintenance.push_back(CacheMaintenance {
                     kind: "cancelled",
                     enqueued_at: Instant::now(),
                     work: Box::new(move |cache| {
-                    if !prompt_snapshots.is_empty() {
-                        cache.insert(&generation_prompt_ids, prompt_snapshots, cache_route);
-                    }
-                    if let (Some((completed_tokens, final_snapshot)), Some(metadata)) =
-                        (final_work, metadata)
-                    {
-                        cache.insert_resume(
-                            &completed_tokens,
-                            final_snapshot,
-                            cache_route,
-                            metadata,
-                        );
-                    }
+                        if !prompt_snapshots.is_empty() {
+                            cache.insert(&generation_prompt_ids, prompt_snapshots, cache_route);
+                        }
+                        if let (Some((completed_tokens, final_snapshot)), Some(metadata)) =
+                            (final_work, metadata)
+                        {
+                            cache.insert_resume(
+                                &completed_tokens,
+                                final_snapshot,
+                                cache_route,
+                                metadata,
+                            );
+                        }
                     }),
                 });
             }
@@ -1905,12 +1906,12 @@ impl QwenWorker {
                 kind: "completed",
                 enqueued_at: Instant::now(),
                 work: Box::new(move |cache| {
-                if !prompt_snapshots.is_empty() {
-                    cache.insert(&generation_prompt_ids, prompt_snapshots, cache_route);
-                }
-                if let Some((completed_tokens, final_snapshot)) = final_work {
-                    cache.insert(&completed_tokens, vec![final_snapshot], cache_route);
-                }
+                    if !prompt_snapshots.is_empty() {
+                        cache.insert(&generation_prompt_ids, prompt_snapshots, cache_route);
+                    }
+                    if let Some((completed_tokens, final_snapshot)) = final_work {
+                        cache.insert(&completed_tokens, vec![final_snapshot], cache_route);
+                    }
                 }),
             });
         }
