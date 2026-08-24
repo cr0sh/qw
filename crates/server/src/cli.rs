@@ -13,6 +13,7 @@ use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::Layer as _;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
+use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::{EnvFilter, fmt, registry};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -142,6 +143,12 @@ fn resolve_persistent_log_filter(
     })
 }
 
+fn rust_log_filter() -> EnvFilter {
+    EnvFilter::builder()
+        .with_default_directive(LevelFilter::INFO.into())
+        .from_env_lossy()
+}
+
 fn init_tracing(cli: &ServerArgs) -> Result<Option<WorkerGuard>> {
     let file_guard = if cli.no_file_logging {
         None
@@ -161,7 +168,7 @@ fn init_tracing(cli: &ServerArgs) -> Result<Option<WorkerGuard>> {
         )?;
         match cli.output_format {
             OutputFormat::Human => registry()
-                .with(fmt::layer().with_filter(EnvFilter::from_default_env()))
+                .with(fmt::layer().with_filter(rust_log_filter()))
                 .with(
                     fmt::layer()
                         .with_ansi(false)
@@ -173,7 +180,7 @@ fn init_tracing(cli: &ServerArgs) -> Result<Option<WorkerGuard>> {
                 .with(
                     fmt::layer()
                         .json()
-                        .with_filter(EnvFilter::from_default_env()),
+                        .with_filter(rust_log_filter()),
                 )
                 .with(
                     fmt::layer()
@@ -187,9 +194,11 @@ fn init_tracing(cli: &ServerArgs) -> Result<Option<WorkerGuard>> {
     };
     if cli.no_file_logging {
         match cli.output_format {
-            OutputFormat::Human => fmt::init(),
+            OutputFormat::Human => fmt::Subscriber::builder()
+                .with_env_filter(rust_log_filter())
+                .init(),
             OutputFormat::Json => fmt::Subscriber::builder()
-                .with_env_filter(EnvFilter::from_default_env())
+                .with_env_filter(rust_log_filter())
                 .json()
                 .init(),
         }
