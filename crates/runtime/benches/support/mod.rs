@@ -61,7 +61,8 @@ pub struct LongConversationFixture {
     pub mtp_target_forward_calls: usize,
 }
 
-const LONG_CONTEXT_CACHE_VERSION: u32 = 2;
+const LONG_CONTEXT_CACHE_MAGIC: &[u8; 8] = b"QWLC64K\0";
+const LONG_CONTEXT_CACHE_VERSION: u32 = 1;
 const MAX_CACHE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const MAX_CACHE_STRING_BYTES: usize = 1024 * 1024;
 const MAX_CACHE_TOKEN_IDS: usize = 1024 * 1024;
@@ -243,7 +244,6 @@ fn write_portable_snapshot(
         }
     }
 }
-
 
 struct FixtureReader {
     inner: BufReader<File>,
