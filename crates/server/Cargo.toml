@@ -30,6 +30,7 @@ tokenizers.workspace = true
 toktrie.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["json"] }
+tracing-appender.workspace = true
 
 [dev-dependencies]
 tower.workspace = true

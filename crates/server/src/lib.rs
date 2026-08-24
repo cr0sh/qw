@@ -23,7 +23,7 @@ use axum::routing::post;
 use futures_util::stream;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
-use tracing::{Instrument, Span, debug, error, info_span, warn};
+use tracing::{Instrument, Span, debug, error, info_span, trace, warn};
 
 use engine::{
     Admission, CompletionRecord, FailureKind, FinishReason, GeneratedToolCall, WorkerDelta,
@@ -84,6 +84,7 @@ async fn handle_inner(
     payload: Result<Json<Value>, JsonRejection>,
     endpoint: Endpoint,
 ) -> Response {
+    let request_started = std::time::Instant::now();
     debug!(phase = "request.received");
     let value = match payload {
         Ok(Json(value)) => value,
@@ -122,6 +123,17 @@ async fn handle_inner(
         phase = "request.validation_complete",
         max_tokens = request.max_tokens,
     );
+    if tracing::enabled!(tracing::Level::TRACE) {
+        trace!(
+            phase = "prompt.composed",
+            model = %request.model,
+            message_count = request.messages.len(),
+            tool_count = request.tools.len(),
+            max_tokens = request.max_tokens,
+            validation_elapsed_ms = request_started.elapsed().as_secs_f64() * 1_000.0,
+            prompt = ?request.messages,
+        );
+    }
     if !request.image_params.is_empty() && !state.engine.supports_image_inputs() {
         warn!(
             phase = "request.capability_rejected",
@@ -166,6 +178,12 @@ async fn handle_inner(
     debug!(
         phase = "dispatch.complete",
         response_id = %submission.admission.response_id,
+    );
+    trace!(
+        phase = "request.admitted",
+        response_id = %submission.admission.response_id,
+        request_elapsed_ms = request_started.elapsed().as_secs_f64() * 1_000.0,
+        stream = stream_requested,
     );
     if stream_requested {
         streaming_response(endpoint, response_model, submission).await
