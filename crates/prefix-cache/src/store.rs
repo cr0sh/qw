@@ -8,7 +8,38 @@ impl FilesystemSnapshotStore{
  pub fn new(root:impl Into<PathBuf>)->Result<Self,String>{let r=root.into();fs::create_dir_all(r.join("entries")).map_err(|e|e.to_string())?;fs::create_dir_all(r.join("blobs")).map_err(|e|e.to_string())?;Ok(Self{root:r})}
  fn path(&self,k:&EntryKey)->Result<PathBuf,String>{let mut p=k.0.split('/');let n=p.next().ok_or("invalid cache key")?;let d=p.next().ok_or("invalid cache key")?;if p.next().is_some()||!safe(n)||!safe(d){return Err("cache key contains invalid path components".into())}Ok(self.root.join("entries").join(n).join(format!("{d}.json")))}
  fn blob(&self,d:&str)->PathBuf{self.root.join("blobs").join(d)}
- fn cleanup_orphans(&self)->Result<(),String>{let mut refs=std::collections::HashSet::new();if let Ok(names)=fs::read_dir(self.root.join("entries")){for ns in names.flatten(){if let Ok(entries)=fs::read_dir(ns.path()){for entry in entries.flatten(){if let Ok(bytes)=fs::read(entry.path()){if let Ok(m)=serde_json::from_slice::<crate::Manifest>(&bytes){refs.extend(m.blob_sha256);}}}}}}if let Ok(blobs)=fs::read_dir(self.root.join("blobs")){for b in blobs.flatten(){if let Some(d)=b.file_name().to_str(){if !refs.contains(d){let _=fs::remove_file(b.path());}}}}Ok(())}
+ fn cleanup_orphans(&self)->Result<(),String>{
+  let mut refs=std::collections::HashSet::new();
+  if let Ok(names)=fs::read_dir(self.root.join("entries")){
+   for ns in names.flatten(){
+    if let Ok(entries)=fs::read_dir(ns.path()){
+     for entry in entries.flatten(){
+      let path=entry.path();
+      let Some(name)=path.file_name().and_then(|x|x.to_str()) else { continue };
+      if name.starts_with(".tmp-") || name.contains(".json.tmp-") {
+       let _=fs::remove_file(path);
+       continue;
+      }
+      if let Ok(bytes)=fs::read(&path){
+       if let Ok(m)=serde_json::from_slice::<crate::Manifest>(&bytes){refs.extend(m.blob_sha256);}
+      }
+     }
+    }
+   }
+  }
+  if let Ok(blobs)=fs::read_dir(self.root.join("blobs")){
+   for b in blobs.flatten(){
+    let path=b.path();
+    let Some(name)=path.file_name().and_then(|x|x.to_str()) else { continue };
+    if name.starts_with(".tmp-") || name.contains(".tmp-") {
+     let _=fs::remove_file(path);
+    } else if !refs.contains(name) {
+     let _=fs::remove_file(path);
+    }
+   }
+  }
+  Ok(())
+ }
 }
 impl PersistentSnapshotStore for FilesystemSnapshotStore{
  fn scan(&mut self,ns:&str,_:u64)->Result<Vec<ScannedEntry>,String>{if !safe(ns){return Err("cache namespace is not path-safe".into())}let mut out=Vec::new();let dir=self.root.join("entries").join(ns);if let Ok(entries)=fs::read_dir(dir){for e in entries.flatten(){let path=e.path();if path.extension().and_then(|x|x.to_str())!=Some("json"){continue}let Some(stem)=path.file_stem().and_then(|x|x.to_str()).map(str::to_owned)else{continue};if let Ok(manifest)=fs::read(path){out.push(ScannedEntry{key:EntryKey(format!("{ns}/{stem}")),manifest});}}}self.cleanup_orphans()?;Ok(out)}

@@ -539,13 +539,13 @@ impl AdaptivePrefixCache {
                 .trie
                 .terminal_mut(node, route)
                 .map(|terminal| {
+                    let previous_persistent_bytes =
+                        terminal.persistent_key.take().map(|_| terminal.serialized_bytes);
                     terminal.blob_refs.clear();
+                    terminal.serialized_bytes = 0;
                     (
                         terminal.snapshot.take(),
-                        terminal
-                            .persistent_key
-                            .is_some()
-                            .then_some(terminal.serialized_bytes),
+                        previous_persistent_bytes,
                         terminal.response_resume.take(),
                     )
                 })
@@ -708,6 +708,8 @@ impl AdaptivePrefixCache {
         let Some(loaded) = loaded else {
             if let Some(terminal) = self.trie.terminal_mut(node, route) {
                 terminal.persistent_key = None;
+                terminal.blob_refs.clear();
+                terminal.serialized_bytes = 0;
             }
             return false;
         };
@@ -752,6 +754,7 @@ impl AdaptivePrefixCache {
                 if let Some(terminal) = self.trie.terminal_mut(node, route) {
                     terminal.persistent_key = None;
                     terminal.blob_refs.clear();
+                    terminal.serialized_bytes = 0;
                 }
                 self.rebuild_accounting();
                 self.try_io(IoCommand::Remove(key.clone()));
@@ -806,10 +809,13 @@ impl AdaptivePrefixCache {
             let Some((node, route)) = victim else {
                 break;
             };
+            let before = self.memory_bytes;
             let terminal = self.trie.terminal_mut(node, route).unwrap();
-            let snapshot = terminal.snapshot.take().unwrap();
-            let reclaimed_bytes = snapshot.nbytes() as u64;
-            self.memory_bytes = self.memory_bytes.saturating_sub(reclaimed_bytes);
+            terminal.snapshot.take().unwrap();
+            terminal.page_refs.clear();
+            terminal.local_bytes = 0;
+            self.rebuild_accounting();
+            let reclaimed_bytes = before.saturating_sub(self.memory_bytes);
             tracing::debug!(
                 phase = "cache.evict",
                 tier = "memory",
@@ -841,12 +847,13 @@ impl AdaptivePrefixCache {
             let Some((node, route)) = victim else {
                 break;
             };
+            let before = self.filesystem_bytes;
             let terminal = self.trie.terminal_mut(node, route).unwrap();
             let key = terminal.persistent_key.take().unwrap();
-            let reclaimed_bytes = terminal.serialized_bytes;
-            self.filesystem_bytes = self
-                .filesystem_bytes
-                .saturating_sub(reclaimed_bytes);
+            terminal.blob_refs.clear();
+            terminal.serialized_bytes = 0;
+            self.rebuild_accounting();
+            let reclaimed_bytes = before.saturating_sub(self.filesystem_bytes);
             self.try_io(IoCommand::Remove(key));
             tracing::debug!(
                 phase = "cache.evict",
