@@ -12,8 +12,10 @@ pub(crate) struct Terminal {
     pub snapshot: Option<PromptSnapshot>,
     pub persistent_key: Option<EntryKey>,
     pub response_resume: Option<ResponseResumeMetadata>,
+    pub page_refs: Vec<(u64, usize)>,
+    pub local_bytes: usize,
+    pub blob_refs: Vec<(String, u64)>,
 }
-
 impl Terminal {
     pub fn structural(route: SnapshotRoute, observations: u64, now: u64, expires_at: u64) -> Self {
         Self {
@@ -26,6 +28,9 @@ impl Terminal {
             snapshot: None,
             persistent_key: None,
             response_resume: None,
+            page_refs: Vec::new(),
+            local_bytes: 0,
+            blob_refs: Vec::new(),
         }
     }
 }

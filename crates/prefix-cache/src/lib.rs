@@ -142,8 +142,10 @@ pub struct AdaptivePrefixCache {
     trie: RadixTrie,
     memory_cap: u64,
     memory_bytes: u64,
+    memory_pages: HashMap<u64, (usize, u64)>,
     filesystem_cap: Option<u64>,
     filesystem_bytes: u64,
+    filesystem_blobs: HashMap<String, (usize, u64)>,
     io: Option<CacheIo>,
     clock: Box<dyn Clock>,
     resumes: HashMap<String, (SnapshotRoute, Vec<i32>)>,
@@ -220,6 +222,7 @@ impl AdaptivePrefixCache {
         let mut trie = RadixTrie::new();
         let mut resumes = HashMap::new();
         let mut filesystem_bytes = 0u64;
+        let mut filesystem_blobs: HashMap<String, (usize, u64)> = HashMap::new();
         if let Some(store) = store.as_mut() {
             for (expected_route, namespace) in namespaces.iter() {
                 let scanned = store.scan(namespace, now)?;
@@ -239,6 +242,10 @@ impl AdaptivePrefixCache {
                                 let _ = store.remove(&scanned_entry.key);
                                 continue;
                             }
+                            for (digest, size) in manifest_blob_refs(&manifest) {
+                                let entry = filesystem_blobs.entry(digest).or_insert((0, size));
+                                entry.0 += 1;
+                            }
                             filesystem_bytes =
                                 filesystem_bytes.saturating_add(manifest.total_bytes);
                             trie.ensure(
@@ -254,6 +261,9 @@ impl AdaptivePrefixCache {
                                     snapshot: None,
                                     persistent_key: Some(scanned_entry.key),
                                     response_resume: manifest.response_resume.clone(),
+                                    page_refs: Vec::new(),
+                                    local_bytes: 0,
+                                    blob_refs: manifest_blob_refs(&manifest),
                                 },
                             );
                             if let Some(resume) = manifest.response_resume {
@@ -280,12 +290,14 @@ impl AdaptivePrefixCache {
             trie,
             memory_cap: config.memory_bytes,
             memory_bytes: 0,
+            memory_pages: HashMap::new(),
             filesystem_cap: config
                 .directory
                 .as_ref()
                 .map(|_| config.filesystem_bytes)
                 .or_else(|| io.as_ref().map(|_| config.filesystem_bytes)),
-            filesystem_bytes,
+            filesystem_bytes: filesystem_blobs.values().map(|(_, bytes)| *bytes).sum(),
+            filesystem_blobs,
             io,
             clock,
             resumes,
@@ -486,6 +498,7 @@ impl AdaptivePrefixCache {
             self.try_io(IoCommand::Remove(key));
         }
         let snapshot = terminal.snapshot.ok_or(ResumeLookupError::NotFound)?;
+        self.rebuild_accounting();
         tracing::debug!(phase = "cache.resume", response_id, route = route.as_str());
         Ok(ResumeEntry {
             token_ids,
@@ -535,6 +548,7 @@ impl AdaptivePrefixCache {
                 .trie
                 .terminal_mut(node, route)
                 .map(|terminal| {
+                    terminal.blob_refs.clear();
                     (
                         terminal.snapshot.take(),
                         terminal
@@ -555,12 +569,15 @@ impl AdaptivePrefixCache {
                 self.resumes.remove(&previous_resume.response_id);
             }
             let bytes = snapshot.nbytes() as u64;
+            let summary = snapshot.storage_summary();
             let expiry = now.saturating_add(INITIAL_TTL_MS);
             let namespace = self.namespaces.get(route);
             let key = entry_key(namespace, route, prefix);
             let (observations, reuse_count, last_access) =
                 if let Some(terminal) = self.trie.terminal_mut(node, route) {
                     terminal.snapshot = Some(snapshot);
+                    terminal.page_refs = summary.pages.clone();
+                    terminal.local_bytes = summary.local_bytes;
                     terminal.expires_at_unix_ms = expiry;
                     terminal.serialized_bytes = bytes;
                     terminal.persistent_key = self.io.as_ref().map(|_| key.clone());
@@ -581,6 +598,9 @@ impl AdaptivePrefixCache {
                             last_access_unix_ms: now,
                             expires_at_unix_ms: expiry,
                             serialized_bytes: bytes,
+                            page_refs: summary.pages.clone(),
+                            local_bytes: summary.local_bytes,
+                            blob_refs: Vec::new(),
                             snapshot: Some(snapshot),
                             persistent_key: self.io.as_ref().map(|_| key.clone()),
                             response_resume: resume.clone(),
@@ -599,30 +619,26 @@ impl AdaptivePrefixCache {
                 self.trie
                     .terminal(node, route)
                     .and_then(|terminal| terminal.snapshot.as_ref())
-                    .and_then(|snapshot| {
-                        snapshot
-                            .to_portable()
-                            .map_err(|error| {
-                                tracing::warn!(
-                                    phase = "cache.persistence_error",
-                                    error = %error
-                                )
-                            })
-                            .ok()
-                    })
+                    .and_then(|snapshot| snapshot.to_portable().ok())
             });
             if let Some(portable) = portable {
-                self.filesystem_bytes = self.filesystem_bytes.saturating_add(bytes);
+                if let Ok(encoded) = encode_portable(
+                    self.namespaces.get(route), route, prefix, portable.clone(),
+                    RetentionMetadata { observations, reuse_count, last_access_unix_ms: last_access },
+                    expiry, resume.clone(),
+                ) {
+                    if let Ok(manifest) = parse_manifest(self.namespaces.get(route), &encoded.manifest) {
+                        if let Some(terminal) = self.trie.terminal_mut(node, route) {
+                            terminal.blob_refs = manifest_blob_refs(&manifest);
+                        }
+                    }
+                }
                 self.try_io(IoCommand::Put {
                     namespace: self.namespaces.get(route).to_string(),
                     route,
                     token_ids: prefix.to_vec(),
                     portable,
-                    retention: RetentionMetadata {
-                        observations,
-                        reuse_count,
-                        last_access_unix_ms: last_access,
-                    },
+                    retention: RetentionMetadata { observations, reuse_count, last_access_unix_ms: last_access },
                     expires_at_unix_ms: expiry,
                     response_resume: resume,
                 });
@@ -634,6 +650,18 @@ impl AdaptivePrefixCache {
                 snapshot_bytes = bytes
             );
         }
+        self.rebuild_accounting();
+        let mut blobs = HashMap::<String, (usize, u64)>::new();
+        for (node, route) in self.trie.terminal_ids() {
+            if let Some(t) = self.trie.terminal(node, route) {
+                for (digest, bytes) in &t.blob_refs {
+                    let entry = blobs.entry(digest.clone()).or_insert((0, *bytes));
+                    entry.0 += 1;
+                }
+            }
+        }
+        self.filesystem_blobs = blobs;
+        self.filesystem_bytes = self.filesystem_blobs.values().map(|(_, bytes)| *bytes).sum();
         self.evict_memory();
         self.evict_persistent(now);
     }
@@ -696,7 +724,10 @@ impl AdaptivePrefixCache {
                     .trie
                     .terminal_mut(node, route)
                     .expect("persistent terminal exists");
+                let summary = decoded.snapshot.storage_summary();
                 terminal.snapshot = Some(decoded.snapshot);
+                terminal.page_refs = summary.pages;
+                terminal.local_bytes = summary.local_bytes;
                 terminal.response_resume = decoded.manifest.response_resume;
                 self.memory_bytes = self.memory_bytes.saturating_add(bytes);
                 self.evict_memory();
@@ -717,7 +748,9 @@ impl AdaptivePrefixCache {
                 );
                 if let Some(terminal) = self.trie.terminal_mut(node, route) {
                     terminal.persistent_key = None;
+                    terminal.blob_refs.clear();
                 }
+                self.rebuild_accounting();
                 self.try_io(IoCommand::Remove(key.clone()));
                 false
             }
@@ -749,6 +782,7 @@ impl AdaptivePrefixCache {
                 }
             }
         }
+        self.rebuild_accounting();
     }
 
     fn evict_memory(&mut self) {
@@ -778,6 +812,7 @@ impl AdaptivePrefixCache {
                 route = route.as_str()
             );
         }
+        self.rebuild_accounting();
     }
 
     fn evict_persistent(&mut self, _now: u64) {
@@ -813,6 +848,7 @@ impl AdaptivePrefixCache {
                 route = route.as_str()
             );
         }
+        self.rebuild_accounting();
     }
 
     fn try_io(&self, command: IoCommand) {
@@ -832,12 +868,39 @@ impl AdaptivePrefixCache {
         }
     }
 
+    fn rebuild_accounting(&mut self) {
+        let mut pages = HashMap::<u64, (usize, u64)>::new();
+        for (node, route) in self.trie.terminal_ids() {
+            let Some(t) = self.trie.terminal(node, route) else { continue };
+            for &(id, bytes) in &t.page_refs {
+                let entry = pages.entry(id).or_insert((0, bytes as u64));
+                entry.0 += 1;
+            }
+        }
+        self.memory_pages = pages;
+        self.memory_bytes = self.memory_pages.values().map(|(_, bytes)| *bytes).sum::<u64>()
+            + self.trie.terminal_ids().into_iter().filter_map(|(n, r)| {
+                self.trie.terminal(n, r).map(|t| t.local_bytes as u64)
+            }).sum::<u64>();
+        let mut blobs = HashMap::<String, (usize, u64)>::new();
+        for (node, route) in self.trie.terminal_ids() {
+            if let Some(t) = self.trie.terminal(node, route) {
+                for (digest, bytes) in &t.blob_refs {
+                    let entry = blobs.entry(digest.clone()).or_insert((0, *bytes));
+                    entry.0 += 1;
+                }
+            }
+        }
+        self.filesystem_blobs = blobs;
+        self.filesystem_bytes = self.filesystem_blobs.values().map(|(_, bytes)| *bytes).sum();
+    }
     fn queue_refresh(&self, key: EntryKey, expires_at_unix_ms: u64) {
         let Some(io) = &self.io else {
             return;
         };
         io.refreshes
             .lock()
+
             .expect("refresh map lock")
             .insert(key, expires_at_unix_ms);
         if !io.refresh_enqueued.swap(true, Ordering::AcqRel)
@@ -851,6 +914,19 @@ impl AdaptivePrefixCache {
         }
     }
 }
+fn manifest_blob_refs(manifest: &Manifest) -> Vec<(String, u64)> {
+    let mut refs = HashMap::<String, u64>::new();
+    for array in &manifest.arrays {
+        refs.entry(array.blob_sha256.clone()).or_insert(array.byte_len);
+    }
+    for tensor in &manifest.paged_tensors {
+        for page in &tensor.pages {
+            refs.entry(page.blob_sha256.clone()).or_insert(page.byte_len);
+        }
+    }
+    refs.into_iter().collect()
+}
+
 
 fn spawn_io_thread(mut store: Box<dyn PersistentSnapshotStore>) -> CacheIo {
     let (tx, rx) = mpsc::sync_channel(IO_QUEUE_CAPACITY);
@@ -903,6 +979,7 @@ fn io_loop(
                     StoredEntry {
                         key: encoded.key,
                         manifest: encoded.manifest,
+
                         blobs: encoded.blobs,
                     },
                     expires_at_unix_ms,

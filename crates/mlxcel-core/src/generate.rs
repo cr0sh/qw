@@ -273,6 +273,35 @@ impl ModelStateSnapshot {
     }
 }
 
+/// Canonical storage accounting for a captured model state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotStorageSummary {
+    /// Shared paged storage, represented as `(identity, bytes)`.
+    pub pages: Vec<(u64, usize)>,
+    /// Dense tensors and terminal-local arrays, never shared across snapshots.
+    pub local_bytes: usize,
+}
+
+impl ModelStateSnapshot {
+    /// Return page identities and terminal-local bytes for accounting.
+    pub fn storage_summary(&self) -> SnapshotStorageSummary {
+        let mut pages = Vec::new();
+        let mut seen = HashSet::new();
+        for tensor in &self.paged_tensors {
+            for page in &tensor.pages {
+                if seen.insert(page.identity()) {
+                    pages.push((page.identity(), page.nbytes()));
+                }
+            }
+        }
+        SnapshotStorageSummary {
+            pages,
+            local_bytes: self.tensors.iter().map(ModelStateTensor::nbytes).sum::<usize>()
+                + self.continuation_logits.as_deref().map(ffi::array_nbytes).unwrap_or(0),
+        }
+    }
+}
+
 /// Inert copy of a model-owned recurrent/cache state at an exact token prefix.
 ///
 /// This is deliberately separate from detached KV-cache entries: recurrent

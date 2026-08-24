@@ -125,6 +125,20 @@ impl MtpPromptSnapshot {
             + mlxcel_core::array_nbytes(&self.continuation_logits)
     }
 
+    pub fn storage_summary(&self) -> mlxcel_core::generate::SnapshotStorageSummary {
+        let target = self.target.storage_summary();
+        let draft = self.draft.storage_summary();
+        let mut pages = target.pages;
+        pages.extend(draft.pages);
+        mlxcel_core::generate::SnapshotStorageSummary {
+            pages,
+            local_bytes: target.local_bytes
+                + draft.local_bytes
+                + mlxcel_core::array_nbytes(&self.last_hidden)
+                + mlxcel_core::array_nbytes(&self.continuation_logits),
+        }
+    }
+
     pub(crate) fn to_portable(&self) -> PortablePromptSnapshot {
         PortablePromptSnapshot::Mtp {
             target: portable_model_state(&self.target),

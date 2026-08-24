@@ -203,6 +203,13 @@ impl PromptSnapshot {
         })
     }
 
+    pub fn storage_summary(&self) -> mlxcel_core::generate::SnapshotStorageSummary {
+        match self {
+            Self::Baseline(snapshot) => snapshot.storage_summary(),
+            Self::Mtp(snapshot) => snapshot.storage_summary(),
+        }
+    }
+
     pub fn from_portable(portable: PortablePromptSnapshot) -> Result<Self, String> {
         match portable {
             PortablePromptSnapshot::Baseline(snapshot) => {
