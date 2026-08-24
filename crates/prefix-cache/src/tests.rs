@@ -642,6 +642,36 @@ fn resume_records_are_mismatch_safe_one_shot_and_expire() {
         Err(ResumeLookupError::NotFound)
     ));
 }
+
+#[test]
+fn active_resume_is_exempt_from_pressure_until_consumed() {
+    let clock = ManualClock::new(50_000);
+    let mut cache = AdaptivePrefixCache::with_store_and_clock(
+        namespaces(),
+        memory_config(1),
+        Box::new(EmptyStore),
+        Box::new(clock.clone()),
+    )
+    .expect("cache");
+    let active = snapshot(3, &[1.0]);
+    let active_bytes = active.nbytes() as u64;
+    cache.insert_resume(
+        &[1, 2, 3],
+        active,
+        SnapshotRoute::Baseline,
+        resume_metadata("chatcmpl-pressure", "fingerprint"),
+    );
+    cache.insert(&[9, 9], vec![snapshot(2, &[2.0])], SnapshotRoute::Baseline);
+    assert_eq!(cache.memory_bytes(), active_bytes);
+    assert!(cache
+        .take_resume(
+            "chatcmpl-pressure",
+            "fingerprint",
+            SnapshotRoute::Baseline
+        )
+        .is_ok());
+    assert_eq!(cache.memory_bytes(), 0);
+}
 #[test]
 fn resume_is_hot_before_persistent_write_completes() {
     let blocking = Arc::new((Mutex::new(BlockingState::default()), Condvar::new()));
