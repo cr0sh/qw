@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc as std_mpsc};
@@ -32,6 +33,7 @@ use crate::tool_calls::{ToolCallGate, parse_assistant_output};
 
 const JOB_QUEUE_CAPACITY: usize = 8;
 const EVENT_QUEUE_CAPACITY: usize = 32;
+type CacheMaintenance = Box<dyn FnOnce(&mut AdaptivePrefixCache)>;
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1135,14 +1137,28 @@ impl QwenWorker {
             mtp_k,
         })
     }
-
     fn run(&mut self, mut jobs: mpsc::Receiver<Job>) {
-        while let Some(job) = jobs.blocking_recv() {
-            self.process(job);
+        let mut maintenance = VecDeque::<CacheMaintenance>::new();
+        loop {
+            match jobs.try_recv() {
+                Ok(job) => self.process(job, &mut maintenance),
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    if let Some(work) = maintenance.pop_front() {
+                        work(&mut self.prefix_cache);
+                    } else {
+                        match jobs.blocking_recv() {
+                            Some(job) => self.process(job, &mut maintenance),
+                            None => break,
+                        }
+                    }
+                }
+                Err(mpsc::error::TryRecvError::Disconnected) => break,
+            }
         }
     }
 
-    fn process(&mut self, mut job: Job) {
+
+    fn process(&mut self, mut job: Job, maintenance: &mut VecDeque<CacheMaintenance>) {
         let span = job.span.clone();
         let _entered = span.enter();
         debug!(phase = "worker.accepted");
@@ -1647,34 +1663,38 @@ impl QwenWorker {
         if cancelled {
             if let Some(cache_route) = cache_route {
                 let prompt_snapshots = std::mem::take(&mut generated.prompt_snapshots);
-                if !prompt_snapshots.is_empty() {
-                    cache.insert(&generation_prompt_ids, prompt_snapshots, cache_route);
-                }
-                if let Some(final_snapshot) = generated.final_snapshot.take() {
+                let final_work = generated.final_snapshot.take().and_then(|final_snapshot| {
                     let mut completed_tokens =
                         Vec::with_capacity(generation_prompt_ids.len() + generated.token_ids.len());
                     completed_tokens.extend_from_slice(&generation_prompt_ids);
                     completed_tokens.extend_from_slice(&generated.token_ids);
                     completed_tokens.truncate(final_snapshot.token_len());
-                    if completed_tokens.len() == final_snapshot.token_len() {
-                        let metadata = ResponseResumeMetadata {
-                            response_id: job.admission.response_id.clone(),
-                            message_id: job.admission.message_id.clone(),
-                            created_unix_seconds: job.admission.created,
-                            prompt_token_count: prior_metadata
-                                .as_ref()
-                                .map_or(prompt_ids.len(), |metadata| metadata.prompt_token_count),
-                            request_fingerprint: fingerprint,
-                            generated_token_ids: combined_token_ids.clone(),
-                            raw_text: combined_raw_text.clone(),
-                            emitted_reasoning_text: output.emitted_reasoning_text.clone(),
-                            emitted_content_text: output.emitted_content_text.clone(),
-                            original_max_tokens: prior_metadata
-                                .as_ref()
-                                .map_or(job.request.max_tokens, |metadata| {
-                                    metadata.original_max_tokens
-                                }),
-                        };
+                    (completed_tokens.len() == final_snapshot.token_len())
+                        .then_some((completed_tokens, final_snapshot))
+                });
+                let metadata = final_work.as_ref().map(|_| ResponseResumeMetadata {
+                    response_id: job.admission.response_id.clone(),
+                    message_id: job.admission.message_id.clone(),
+                    created_unix_seconds: job.admission.created,
+                    prompt_token_count: prior_metadata
+                        .as_ref()
+                        .map_or(prompt_ids.len(), |metadata| metadata.prompt_token_count),
+                    request_fingerprint: fingerprint,
+                    generated_token_ids: combined_token_ids.clone(),
+                    raw_text: combined_raw_text.clone(),
+                    emitted_reasoning_text: output.emitted_reasoning_text.clone(),
+                    emitted_content_text: output.emitted_content_text.clone(),
+                    original_max_tokens: prior_metadata
+                        .as_ref()
+                        .map_or(job.request.max_tokens, |metadata| metadata.original_max_tokens),
+                });
+                maintenance.push_back(Box::new(move |cache| {
+                    if !prompt_snapshots.is_empty() {
+                        cache.insert(&generation_prompt_ids, prompt_snapshots, cache_route);
+                    }
+                    if let (Some((completed_tokens, final_snapshot)), Some(metadata)) =
+                        (final_work, metadata)
+                    {
                         cache.insert_resume(
                             &completed_tokens,
                             final_snapshot,
@@ -1682,7 +1702,7 @@ impl QwenWorker {
                             metadata,
                         );
                     }
-                }
+                }));
             }
             debug!(phase = "generation.cancelled");
             return;
@@ -1793,24 +1813,27 @@ impl QwenWorker {
             finish_reason = ?record.finish_reason,
             generated_tool_count = record.tool_calls.len(),
         );
-        publish_completion_before_cache(&job.events, record, || {
-            if let Some(cache_route) = cache_route {
-                let prompt_snapshots = std::mem::take(&mut generated.prompt_snapshots);
+        publish_completion(&job.events, record);
+        if let Some(cache_route) = cache_route {
+            let prompt_snapshots = std::mem::take(&mut generated.prompt_snapshots);
+            let final_work = generated.final_snapshot.take().and_then(|final_snapshot| {
+                let mut completed_tokens =
+                    Vec::with_capacity(generation_prompt_ids.len() + generated.token_ids.len());
+                completed_tokens.extend_from_slice(&generation_prompt_ids);
+                completed_tokens.extend_from_slice(&generated.token_ids);
+                completed_tokens.truncate(final_snapshot.token_len());
+                (completed_tokens.len() == final_snapshot.token_len())
+                    .then_some((completed_tokens, final_snapshot))
+            });
+            maintenance.push_back(Box::new(move |cache| {
                 if !prompt_snapshots.is_empty() {
                     cache.insert(&generation_prompt_ids, prompt_snapshots, cache_route);
                 }
-                if let Some(final_snapshot) = generated.final_snapshot.take() {
-                    let mut completed_tokens =
-                        Vec::with_capacity(generation_prompt_ids.len() + generated.token_ids.len());
-                    completed_tokens.extend_from_slice(&generation_prompt_ids);
-                    completed_tokens.extend_from_slice(&generated.token_ids);
-                    completed_tokens.truncate(final_snapshot.token_len());
-                    if completed_tokens.len() == final_snapshot.token_len() {
-                        cache.insert(&completed_tokens, vec![final_snapshot], cache_route);
-                    }
+                if let Some((completed_tokens, final_snapshot)) = final_work {
+                    cache.insert(&completed_tokens, vec![final_snapshot], cache_route);
                 }
-            }
-        });
+            }));
+        }
     }
 }
 
@@ -1832,6 +1855,19 @@ fn generated_tool_call(
         arguments,
     }
 }
+fn publish_completion(events: &mpsc::Sender<WorkerEvent>, record: CompletionRecord) {
+    let (acknowledged, completed) = oneshot::channel();
+    if events
+        .blocking_send(WorkerEvent::Complete {
+            record,
+            acknowledged: Some(acknowledged),
+        })
+        .is_ok()
+    {
+        let _ = completed.blocking_recv();
+    }
+}
+
 
 fn publish_completion_before_cache(
     events: &mpsc::Sender<WorkerEvent>,
