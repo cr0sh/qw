@@ -704,14 +704,29 @@ impl AdaptivePrefixCache {
         {
             return false;
         }
-        let loaded = reply_rx.recv().ok().and_then(Result::ok).flatten();
-        let Some(loaded) = loaded else {
-            if let Some(terminal) = self.trie.terminal_mut(node, route) {
-                terminal.persistent_key = None;
-                terminal.blob_refs.clear();
-                terminal.serialized_bytes = 0;
+        let loaded = match reply_rx.recv() {
+            Ok(Ok(Some(loaded))) => loaded,
+            Ok(Ok(None)) => {
+                if let Some(terminal) = self.trie.terminal_mut(node, route) {
+                    terminal.persistent_key = None;
+                    terminal.blob_refs.clear();
+                    terminal.serialized_bytes = 0;
+                }
+                self.rebuild_accounting();
+                return false;
             }
-            return false;
+            Ok(Err(error)) => {
+                tracing::warn!(phase = "cache.persistence_error", error = %error);
+                if let Some(terminal) = self.trie.terminal_mut(node, route) {
+                    terminal.persistent_key = None;
+                    terminal.blob_refs.clear();
+                    terminal.serialized_bytes = 0;
+                }
+                self.rebuild_accounting();
+                self.try_io(IoCommand::Remove(key.clone()));
+                return false;
+            }
+            Err(_) => return false,
         };
         let namespace = self.namespaces.get(route);
         match decode(namespace, &loaded.manifest, loaded.blobs) {
