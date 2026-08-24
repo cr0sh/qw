@@ -303,7 +303,7 @@ mod tests {
 
     #[test]
     fn persistent_log_filter_reports_invalid_directives() {
-        let error = resolve_persistent_log_filter(Some("not a filter ???"), None)
+        let error = resolve_persistent_log_filter(Some("target=not-a-level"), None)
             .expect_err("invalid filter");
         let message = error.to_string();
         assert!(message.contains("invalid persistent log filter directives"), "{message}");
