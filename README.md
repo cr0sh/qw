@@ -52,6 +52,12 @@ QW aims to be fast enough for daily use. Below is the benchmark result from
 tag v0.1.0. You can reproduce it with `cargo bench`. The benchmark was run on
 a Mac Studio with an Apple M4 Max chip, 64 GB of memory, and a 40-core GPU.
 
+   |  | fresh | 10k | 64k |
+   |---|------:|-----:|-----:|
+   | **prefill** | 254.27 | 221.07 | 97.08 |
+   | **decode baseline** | 27.20 | 21.65 | 12.80 |
+   | **decode mtp** | 58.20 | 53.38 | 35.66 |
+
 QW stores prefix caches under `~/.cache/qw/checkpoint`. Disk usage is capped at
 16 GB by default; the hard ceiling is twice the configured limit.
 
