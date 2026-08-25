@@ -956,12 +956,6 @@ fn finish_initial_attention_prefill(caches: &mut [Qwen3NextCache], configured: K
     }
 }
 
-fn finish_mtp_attention_prefill(caches: &mut [Qwen3NextCache], configured: KVCacheMode) {
-    if configured == KVCacheMode::Turbo4 {
-        demote_populated_attention_caches(caches);
-    }
-}
-
 fn prepare_attention_forward(
     caches: &mut [Qwen3NextCache],
     configured: KVCacheMode,
@@ -1119,13 +1113,6 @@ impl Qwen35Model {
         self.initial_prefill_complete.store(true, Ordering::Relaxed);
     }
 
-    fn finish_mtp_prefill(&self) {
-        self.sequence_state.with_internal(|caches| {
-            finish_mtp_attention_prefill(caches, self.kv_cache_mode);
-        });
-        self.initial_prefill_complete.store(true, Ordering::Relaxed);
-    }
-
     pub(crate) fn has_mtp(&self) -> bool {
         self.mtp.is_some()
     }
@@ -1251,7 +1238,7 @@ impl Qwen35Model {
             start = end;
         }
 
-        self.finish_mtp_prefill();
+        self.finish_initial_prefill();
 
         let offset = self
             .sequence_state
@@ -3171,25 +3158,6 @@ mod tests {
         assert_eq!(restored.mode, KVCacheMode::Turbo4);
         assert_eq!(restored.offset, 2);
         assert!(restored.turbo4_snapshot_tensors().is_some());
-    }
-
-    #[test]
-    fn short_mtp_prefill_demotes_to_canonical_turbo4_state() {
-        let mut caches = vec![new_initial_attention_cache(KVCacheMode::Turbo4)];
-        match &mut caches[0] {
-            Qwen3NextCache::Attention(cache) => {
-                cache.update(
-                    test_attention_tensor(2, 0.01),
-                    test_attention_tensor(2, 0.02),
-                );
-            }
-            Qwen3NextCache::Linear(_) => panic!("expected attention cache"),
-        }
-
-        finish_mtp_attention_prefill(&mut caches, KVCacheMode::Turbo4);
-
-        assert_eq!(attention_cache(&caches).mode, KVCacheMode::Turbo4);
-        assert!(attention_cache(&caches).turbo4_snapshot_tensors().is_some());
     }
 
     #[test]
