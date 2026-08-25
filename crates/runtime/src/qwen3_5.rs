@@ -2542,35 +2542,17 @@ fn push_turbo4_attention_snapshot(
     snapshot: &mut ModelStateSnapshot,
     previous: Option<&ModelStateSnapshot>,
     index: usize,
-    cache: &KVCache,
+    cache: &mut KVCache,
 ) -> bool {
-    if cache.mode == KVCacheMode::Turbo4 {
-        let Some(tensors) = cache.turbo4_snapshot_tensors() else {
-            return false;
-        };
-        return push_turbo4_snapshot_tensors(snapshot, previous, index, tensors).is_ok();
-    }
-    if cache.mode != KVCacheMode::Fp16 || cache.offset <= 0 {
-        return false;
-    }
-    let (Some(keys), Some(values)) = (cache.keys.as_deref(), cache.values.as_deref()) else {
-        return false;
-    };
-    let key_shape = mlxcel_core::array_shape(keys);
-    let value_shape = mlxcel_core::array_shape(values);
-    if key_shape.len() != 4
-        || key_shape != value_shape
-        || key_shape[2] < cache.offset
-        || value_shape[2] < cache.offset
+    // A donated snapshot and the live continuation must use identical cache
+    // storage; packing only the snapshot can eventually change greedy output.
+    if cache.mode == KVCacheMode::Fp16
+        && cache.offset > 0
+        && !cache.demote_fp16_to_turbo4()
     {
         return false;
     }
-    let end = [key_shape[0], key_shape[1], cache.offset, key_shape[3]];
-    let keys = mlxcel_core::slice(keys, &[0, 0, 0, 0], &end);
-    let values = mlxcel_core::slice(values, &[0, 0, 0, 0], &end);
-    let mut packed = KVCache::new_with_mode(KVCacheMode::Turbo4);
-    packed.update(keys, values);
-    let Some(tensors) = packed.turbo4_snapshot_tensors() else {
+    let Some(tensors) = cache.turbo4_snapshot_tensors() else {
         return false;
     };
     push_turbo4_snapshot_tensors(snapshot, previous, index, tensors).is_ok()
@@ -2785,7 +2767,7 @@ impl LanguageModel for Qwen35Model {
             if caches.len() != self.layers.len() {
                 return false;
             }
-            for (index, (layer, cache)) in self.layers.iter().zip(caches.iter()).enumerate() {
+            for (index, (layer, cache)) in self.layers.iter().zip(caches.iter_mut()).enumerate() {
                 if cache.offset() != token_len_i32 {
                     return false;
                 }
@@ -3112,7 +3094,7 @@ mod tests {
     }
 
     #[test]
-    fn short_fp16_resident_turbo4_snapshot_is_packed_without_mutating_live_cache() {
+    fn short_fp16_resident_turbo4_snapshot_demotes_live_cache() {
         let mut caches = vec![new_initial_attention_cache(KVCacheMode::Turbo4)];
         match &mut caches[0] {
             Qwen3NextCache::Attention(cache) => {
@@ -3124,8 +3106,10 @@ mod tests {
             Qwen3NextCache::Linear(_) => panic!("expected attention cache"),
         }
         finish_initial_attention_prefill(&mut caches, KVCacheMode::Turbo4);
-        let live = attention_cache(&caches);
-        let keys_before = live.keys.as_deref().expect("live FP16 keys") as *const MlxArray;
+        let live = match &mut caches[0] {
+            Qwen3NextCache::Attention(cache) => cache.as_mut(),
+            Qwen3NextCache::Linear(_) => panic!("expected attention cache"),
+        };
         let mut snapshot = ModelStateSnapshot::new("test", 2);
 
         assert!(push_turbo4_attention_snapshot(&mut snapshot, None, 0, live));
@@ -3148,13 +3132,10 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(actual_paged, expected);
         let live = attention_cache(&caches);
-        assert_eq!(live.mode, KVCacheMode::Fp16);
+        assert_eq!(live.mode, KVCacheMode::Turbo4);
         assert_eq!(live.offset, 2);
-        let keys_after = live.keys.as_deref().expect("live FP16 keys") as *const MlxArray;
-        assert_eq!(
-            keys_after, keys_before,
-            "snapshot must not replace live storage"
-        );
+        assert!(live.keys.is_none());
+        assert!(live.values.is_none());
 
         let tensor = |suffix: &str| {
             snapshot
