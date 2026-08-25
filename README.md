@@ -15,6 +15,9 @@ QW aims to be explicitly "focused", to achieve these goals below:
   - Fixed model: Qwen3.8 27B (dense model) only. No generalization across
     different model structures.
     - QW serves [Jundot/Qwen3.8-27B-oQ4e-fp16-mtp](https://huggingface.co/Jundot/Qwen3.8-27B-oQ4e-fp16-mtp) as the default model.
+    - If a better model with similar requirements is released, this project
+      may migrate to the new model, but it will never support more than one
+      model at a time.
   - Fixed environment: MLX only. No generalization across CUDA, ROCm, ...
 
 ## Quickstart
@@ -48,15 +51,17 @@ For a more detailed manual, use `--help` — or just ask your LLM.
 
 ## Performance
 
-QW aims to be fast enough for daily use. Below is the benchmark result from
+QW aims to be fast enough for daily use. Below is the benchmark table from
 tag v0.1.0. You can reproduce it with `cargo bench`. The benchmark was run on
 a Mac Studio with an Apple M4 Max chip, 64 GB of memory, and a 40-core GPU.
 
    |  | fresh | 10k | 64k |
    |---|------:|-----:|-----:|
    | **prefill** | 254.27 | 221.07 | 97.08 |
-   | **decode baseline** | 27.20 | 21.65 | 12.80 |
-   | **decode mtp** | 58.20 | 53.38 | 35.66 |
+   | **decode (baseline)** | 27.20 | 21.65 | 12.80 |
+   | **decode (MTP)** | 58.20 | 53.38 | 35.66 |
+
+All values are tokens/s; `10k`/`64k` are prefilled prompt lengths in tokens.
 
 QW stores prefix caches under `~/.cache/qw/checkpoint`. Disk usage is capped at
 16 GB by default; the hard ceiling is twice the configured limit.
@@ -93,6 +98,9 @@ or explicitly consent in the README.
 
 This repository is heavily AI-assisted, aka "vibe coding". Commit messages
 include an `Assisted-by` footer indicating which coding agent/model was used.
+
+This repository is inspired by antirez's [ds4](https://github.com/antirez/ds4)
+inference engine, for its minimalism and simplicity.
 
 This repository started from a stripped version of the core component
 (`mlxcel-core`) of [mlxcel](https://github.com/lablup/mlxcel). I highly
