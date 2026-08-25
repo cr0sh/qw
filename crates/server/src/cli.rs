@@ -149,7 +149,7 @@ pub struct ServerArgs {
     #[arg(long)]
     no_file_logging: bool,
 
-    /// Persistent log filter directives; overrides QW_LOG and defaults to `trace`.
+    /// Persistent log filter directives; overrides QW_LOG and defaults to `debug,qw_server=trace,qw_runtime=trace,qw_prefix_cache=trace,mlxcel_core=trace,qw_cli=trace,tokenizers=info`.
     #[arg(long)]
     persistent_log_filter: Option<String>,
 
@@ -200,6 +200,9 @@ fn default_prefix_cache_directory() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".cache/qw/checkpoint"))
 }
 
+const DEFAULT_PERSISTENT_LOG_FILTER: &str =
+    "debug,qw_server=trace,qw_runtime=trace,qw_prefix_cache=trace,mlxcel_core=trace,qw_cli=trace,tokenizers=info";
+
 fn resolve_persistent_log_filter(
     cli_filter: Option<&str>,
     env_filter: Option<&str>,
@@ -209,7 +212,7 @@ fn resolve_persistent_log_filter(
     } else if let Some(filter) = env_filter {
         ("QW_LOG", filter)
     } else {
-        ("default", "trace")
+        ("default", DEFAULT_PERSISTENT_LOG_FILTER)
     };
     EnvFilter::try_new(directives).with_context(|| {
         format!("invalid persistent log filter directives from {source}: {directives:?}")
@@ -334,7 +337,7 @@ mod tests {
     use qw_runtime::KVCacheMode;
     use std::fs::OpenOptions;
     use std::time::{SystemTime, UNIX_EPOCH};
-    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::{EnvFilter, Layer as _, layer::SubscriberExt as _};
     #[derive(Debug, Parser)]
     #[command(name = "qw-server", about = "OpenAI-compatible dense Qwen3.5 server")]
     struct TestCli {
@@ -415,25 +418,91 @@ mod tests {
         let help = TestCli::command().render_long_help().to_string();
         assert!(help.contains("--model-id <MODEL_ID>"), "{help}");
     }
+    fn capture_persistent_log_filter_events(filter: EnvFilter) -> String {
+        let path = std::env::temp_dir().join(format!(
+            "qw-persistent-log-filter-{}-{}.log",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let writer_path = path.clone();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(move || {
+                    OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&writer_path)
+                        .unwrap()
+                })
+                .with_filter(filter),
+        );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::trace!(target: "qw_server::server", "qw_server trace");
+            tracing::debug!(target: "qw_server::server", "qw_server debug");
+            tracing::info!(target: "qw_server::server", "qw_server info");
+            tracing::trace!(target: "qw_runtime::runtime", "qw_runtime trace");
+            tracing::trace!(target: "qw_prefix_cache::cache", "qw_prefix_cache trace");
+            tracing::trace!(target: "mlxcel_core::core", "mlxcel_core trace");
+            tracing::trace!(target: "qw_cli::cli", "qw_cli trace");
+            tracing::debug!(target: "third_party::worker", "third_party debug");
+            tracing::trace!(target: "third_party::worker", "third_party trace");
+            tracing::info!(target: "tokenizers::model", "tokenizer info");
+            tracing::debug!(target: "tokenizers::model", "tokenizer debug");
+            tracing::trace!(target: "tokenizers::model", "tokenizer trace");
+        });
+
+        let output = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        output
+    }
+
     #[test]
-    fn cli_parses_persistent_log_filter_with_precedence() {
+    fn persistent_log_filter_defaults_and_preserves_precedence() {
+        let default_output =
+            capture_persistent_log_filter_events(resolve_persistent_log_filter(None, None).unwrap());
+        for message in [
+            "qw_server trace",
+            "qw_runtime trace",
+            "qw_prefix_cache trace",
+            "mlxcel_core trace",
+            "qw_cli trace",
+            "third_party debug",
+            "tokenizer info",
+        ] {
+            assert!(default_output.contains(message), "{default_output}");
+        }
+        for message in ["third_party trace", "tokenizer debug", "tokenizer trace"] {
+            assert!(!default_output.contains(message), "{default_output}");
+        }
+
         let cli = TestCli::try_parse_from([
             "qw-server",
             "--model",
             "/tmp/checkpoint",
             "--persistent-log-filter",
-            "server=debug",
+            "qw_server=info",
         ])
         .expect("CLI");
-        assert!(
+        let cli_output = capture_persistent_log_filter_events(
             resolve_persistent_log_filter(
                 cli.args.persistent_log_filter.as_deref(),
-                Some("server=trace"),
+                Some("qw_server=trace"),
             )
-            .is_ok()
+            .unwrap(),
         );
-        assert!(resolve_persistent_log_filter(None, Some("server=debug")).is_ok());
-        assert!(resolve_persistent_log_filter(None, None).is_ok());
+        assert!(cli_output.contains("qw_server info"), "{cli_output}");
+        assert!(!cli_output.contains("qw_server debug"), "{cli_output}");
+        assert!(!cli_output.contains("qw_server trace"), "{cli_output}");
+
+        let env_output = capture_persistent_log_filter_events(
+            resolve_persistent_log_filter(None, Some("qw_server=debug")).unwrap(),
+        );
+        assert!(env_output.contains("qw_server debug"), "{env_output}");
+        assert!(!env_output.contains("qw_server trace"), "{env_output}");
 
         let help = TestCli::command().render_long_help().to_string();
         assert!(
@@ -441,6 +510,9 @@ mod tests {
             "{help}"
         );
         assert!(help.contains("overrides QW_LOG"), "{help}");
+        assert!(help.contains("defaults to"), "{help}");
+        assert!(help.contains("qw_server=trace"), "{help}");
+        assert!(help.contains("tokenizers=info"), "{help}");
     }
 
     #[test]
