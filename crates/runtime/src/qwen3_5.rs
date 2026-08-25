@@ -3694,7 +3694,7 @@ mod tests {
         assert!(snapshot.tensor("layer.3.mode").is_none());
         assert!(
             snapshot
-                .tensor_names()
+                .paged_tensor_names()
                 .any(|name| name.ends_with(".k_rescale")),
             "Turbo4 target snapshot must store packed K rescale sidecars"
         );
