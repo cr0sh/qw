@@ -170,14 +170,14 @@ impl SnapshotPage {
     pub fn portable_bytes(&self) -> Arc<[u8]> {
         self.portable
             .get_or_init(|| {
-                let trace_enabled = tracing::enabled!(Level::DEBUG);
+                let trace_enabled = tracing::enabled!(Level::TRACE);
                 let started = trace_enabled.then(Instant::now);
                 ffi::eval(self.array.as_ref().expect("page array"));
                 let bytes = Arc::<[u8]>::from(ffi::array_to_raw_bytes(
                     self.array.as_ref().expect("page array"),
                 ));
                 if let Some(started) = started {
-                    tracing::debug!(
+                    tracing::trace!(
                         phase = "snapshot.page_materialize",
                         token_start = self.token_start,
                         token_end = self.token_end,
