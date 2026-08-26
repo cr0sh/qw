@@ -96,18 +96,6 @@ of scope for testing by the maintainer. The default is:
 - The above configuration is tested on an M4 Max 40-core GPU with 64 GB of
   unified memory
 
-This project does not accept issues or pull requests. This is a precautionary measure
-against possible occurrence of accounts generating PRs for AI-related repositories.
-
-If you find a bug or need a feature, use your favorite LLM to fix/implement. This
-project is heavily assisted by AI, so even if an issue had been opened, I would
-have done the same.
-
-If you want to contribute, fork this repository on your GitHub account and push
-the changes, then the maintainer will merge the commits if they're considered legit.
-If you want to opt out of this behavior, duplicate the repository without forking
-or explicitly consent in the README.
-
 ## Disclosures & Acknowledgements
 
 This repository is heavily AI-assisted, aka "vibe coding". Commit messages
