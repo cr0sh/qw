@@ -11,7 +11,7 @@ use qw_runtime::{
 
 use crate::media::DecodedImage;
 
-pub const DEFAULT_MAX_TOKENS: usize = 128;
+pub const DEFAULT_MAX_TOKENS: usize = 4096;
 pub const MAX_IMAGES_PER_REQUEST: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
