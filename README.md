@@ -1,11 +1,23 @@
+<div class="oranda-hide">
+
 # QW (QuasarWave)
 
-QW is a highly opinionated LLM inference runtime targeting MLX-only,
+</div>
+
+QW (QuasarWave) is a highly opinionated LLM inference runtime targeting MLX-only,
 single-user deployments.
 
-QW aims to be explicitly "focused", to achieve these goals below:
+## Showcase
 
 [![asciicast demo implementing a QR Code generator webapp](https://asciinema.org/a/x86fzcfENyZzge26.svg)](https://asciinema.org/a/x86fzcfENyZzge26)
+
+And the Pi agent with QW runtime built this qr-code app in 2m 40s:
+
+![QR App screenshot](./static/qr-app.png)
+
+## Project Goals
+
+QW aims to be explicitly "focused", to achieve these goals below:
 
 - Smooth user experience: It should "just work" without complex first-time
   configuration. Decode TPS and TTFT (time to first token) are the top priority

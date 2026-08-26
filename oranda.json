@@ -1,0 +1,22 @@
+{
+  "project": {
+    "name": "QuasarWave"
+  },
+  "build": {
+    "path_prefix": "qw"
+  },
+  "styles": {
+    "theme": "hacker"
+  },
+  "components": {
+    "changelog": true,
+    "artifacts": {
+      "package_managers": {
+        "preferred": {
+          "cargo": "cargo install --locked --git https://github.com/cr0sh/qw [--tag TAG] qw-cli"
+        }
+      }
+    }
+  }
+}
+
