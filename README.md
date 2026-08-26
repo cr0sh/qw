@@ -118,7 +118,7 @@ inference engine, for its minimalism and simplicity.
 
 This repository started from a stripped version of the core component
 (`mlxcel-core`) of [mlxcel](https://github.com/lablup/mlxcel). I highly
-appreciate Lablup's open-source contributions.
+appreciate [Lablup](https://lablup.com/)'s open-source contributions.
 
 This repository adopts several optimization approaches from
 [oMLX](https://github.com/Jundot/oMLX), [ds4](https://github.com/antirez/ds4),
