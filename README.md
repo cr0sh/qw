@@ -1,8 +1,4 @@
-<div class="oranda-hide">
-
 # QW (QuasarWave)
-
-</div>
 
 QW (QuasarWave) is a highly opinionated LLM inference runtime targeting MLX-only,
 single-user deployments.
