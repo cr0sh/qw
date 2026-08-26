@@ -201,7 +201,7 @@ fn default_prefix_cache_directory() -> Result<PathBuf> {
 }
 
 const DEFAULT_PERSISTENT_LOG_FILTER: &str =
-    "debug,qw_server=trace,qw_runtime=trace,qw_prefix_cache=trace,mlxcel_core=trace,qw_cli=trace,tokenizers=info";
+    "debug,qw_server=trace,qw_runtime=trace,qw_prefix_cache=trace,qw_cli=trace,tokenizers=info";
 
 fn resolve_persistent_log_filter(
     cli_filter: Option<&str>,
