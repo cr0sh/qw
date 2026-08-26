@@ -36,14 +36,18 @@ QW aims to be explicitly "focused", to achieve these goals below:
 
 ## Quickstart
 
-Prerequisites:
+Install prebuilt binary via shell script:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/cr0sh/qw/releases/download/v0.1.0/qw-cli-installer.sh | sh
+ ``````
+
+Or, compile from the source. Prerequisites:
 
  1. macOS on Apple Silicon
  2. Rust 1.85 or newer
  3. CMake 3.16 or newer
  4. Xcode Command Line Tools (`xcode-select --install`)
-
-Installation:
 
 ```bash
 cargo install --locked --git https://github.com/cr0sh/qw [--tag TAG] qw-cli
