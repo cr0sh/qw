@@ -2,9 +2,6 @@
   "project": {
     "name": "QuasarWave"
   },
-  "build": {
-    "path_prefix": "qw"
-  },
   "styles": {
     "theme": "hacker"
   },
