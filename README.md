@@ -49,6 +49,13 @@ Or, compile from the source. Prerequisites:
 cargo install --locked --git https://github.com/cr0sh/qw [--tag TAG] qw-cli
 ```
 
+Download the model from Hugging Face(model ID unset means the default preferred model `Jundot/Qwen3.8-27B-oQ4e-fp16-mtp`):
+
+```bash
+qw download
+```
+
+
 Run the server:
 
 ```bash
