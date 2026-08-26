@@ -4,6 +4,7 @@ version = "0.5.1"
 edition = "2024"
 description = "Low-level MLX building blocks for mlxcel"
 license = "Apache-2.0"
+publish = false
 
 [lib]
 crate-type = ["lib"]

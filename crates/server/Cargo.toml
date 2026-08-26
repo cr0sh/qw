@@ -2,7 +2,7 @@
 name = "qw-server"
 version = "0.1.0"
 edition = "2024"
-repository = "https://github.com/cr0sh/qr"
+repository = "https://github.com/cr0sh/qw"
 publish = false
 
 [features]
