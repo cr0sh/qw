@@ -34,6 +34,8 @@ use crate::tool_calls::{ToolCallGate, parse_assistant_output};
 const JOB_QUEUE_CAPACITY: usize = 8;
 const EVENT_QUEUE_CAPACITY: usize = 32;
 const JOB_BATCH_CAPACITY: usize = 4;
+const CACHE_MAINTENANCE_CAPACITY: usize = JOB_QUEUE_CAPACITY;
+const CACHE_MAINTENANCE_GRACE: Duration = Duration::from_millis(5);
 struct CacheMaintenance {
     kind: &'static str,
     enqueued_at: Instant,
@@ -1100,6 +1102,22 @@ fn collect_job_batch<T>(first: T, jobs: &mut mpsc::Receiver<T>) -> Vec<T> {
     batch
 }
 
+fn enqueue_cache_maintenance(
+    maintenance: &mut VecDeque<CacheMaintenance>,
+    work: CacheMaintenance,
+) {
+    if maintenance.len() == CACHE_MAINTENANCE_CAPACITY {
+        warn!(
+            event = "cache.maintenance_dropped",
+            kind = work.kind,
+            queue_depth = maintenance.len(),
+            queue_capacity = CACHE_MAINTENANCE_CAPACITY,
+        );
+        return;
+    }
+    maintenance.push_back(work);
+}
+
 impl QwenWorker {
     fn load(
         model_path: &Path,
@@ -1180,41 +1198,47 @@ impl QwenWorker {
         loop {
             match next_worker_action(jobs.try_recv(), !maintenance.is_empty()) {
                 WorkerNextAction::Job(first) => {
-                    let batch = collect_job_batch(first, &mut jobs);
-                    if batch.len() > 1 {
-                        info!(
-                            event = "worker.batch",
-                            batch_size = batch.len(),
-                            batch_capacity = JOB_BATCH_CAPACITY,
-                            job_queue_capacity = JOB_QUEUE_CAPACITY,
-                        );
-                    }
-                    for job in batch {
-                        self.process(job, &mut maintenance);
-                    }
-                    self.run_cache_maintenance(&mut maintenance);
+                    self.process_job_batch(first, &mut jobs, &mut maintenance);
                 }
-                WorkerNextAction::Maintenance => self.run_cache_maintenance(&mut maintenance),
-                WorkerNextAction::Wait => match jobs.blocking_recv() {
-                    Some(first) => {
-                        let batch = collect_job_batch(first, &mut jobs);
-                        if batch.len() > 1 {
-                            info!(
-                                event = "worker.batch",
-                                batch_size = batch.len(),
-                                batch_capacity = JOB_BATCH_CAPACITY,
-                                job_queue_capacity = JOB_QUEUE_CAPACITY,
-                            );
+                WorkerNextAction::Maintenance => {
+                    thread::sleep(CACHE_MAINTENANCE_GRACE);
+                    match jobs.try_recv() {
+                        Ok(first) => self.process_job_batch(first, &mut jobs, &mut maintenance),
+                        Err(mpsc::error::TryRecvError::Empty) => {
+                            self.run_cache_maintenance(&mut maintenance);
                         }
-                        for job in batch {
-                            self.process(job, &mut maintenance);
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            self.run_cache_maintenance(&mut maintenance);
+                            break;
                         }
-                        self.run_cache_maintenance(&mut maintenance);
                     }
+                }
+                WorkerNextAction::Wait => match jobs.blocking_recv() {
+                    Some(first) => self.process_job_batch(first, &mut jobs, &mut maintenance),
                     None => break,
                 },
                 WorkerNextAction::Stop => break,
             }
+        }
+    }
+
+    fn process_job_batch(
+        &mut self,
+        first: Job,
+        jobs: &mut mpsc::Receiver<Job>,
+        maintenance: &mut VecDeque<CacheMaintenance>,
+    ) {
+        let batch = collect_job_batch(first, jobs);
+        if batch.len() > 1 {
+            info!(
+                event = "worker.batch",
+                batch_size = batch.len(),
+                batch_capacity = JOB_BATCH_CAPACITY,
+                job_queue_capacity = JOB_QUEUE_CAPACITY,
+            );
+        }
+        for job in batch {
+            self.process(job, maintenance);
         }
     }
 
@@ -1240,7 +1264,7 @@ impl QwenWorker {
             info!(
                 event = "cache.maintenance_batch",
                 batch_size,
-                batch_capacity = JOB_BATCH_CAPACITY,
+                batch_capacity = CACHE_MAINTENANCE_CAPACITY,
                 remaining_depth = maintenance.len(),
                 oldest_queue_delay_ms = oldest_delay.as_secs_f64() * 1_000.0,
                 execution_duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
@@ -1817,25 +1841,28 @@ impl QwenWorker {
                             metadata.original_max_tokens
                         }),
                 });
-                maintenance.push_back(CacheMaintenance {
-                    kind: "cancelled",
-                    enqueued_at: Instant::now(),
-                    work: Box::new(move |cache| {
-                        if !prompt_snapshots.is_empty() {
-                            cache.insert(&generation_prompt_ids, prompt_snapshots, cache_route);
-                        }
-                        if let (Some((completed_tokens, final_snapshot)), Some(metadata)) =
-                            (final_work, metadata)
-                        {
-                            cache.insert_resume(
-                                &completed_tokens,
-                                final_snapshot,
-                                cache_route,
-                                metadata,
-                            );
-                        }
-                    }),
-                });
+                enqueue_cache_maintenance(
+                    maintenance,
+                    CacheMaintenance {
+                        kind: "cancelled",
+                        enqueued_at: Instant::now(),
+                        work: Box::new(move |cache| {
+                            if !prompt_snapshots.is_empty() {
+                                cache.insert(&generation_prompt_ids, prompt_snapshots, cache_route);
+                            }
+                            if let (Some((completed_tokens, final_snapshot)), Some(metadata)) =
+                                (final_work, metadata)
+                            {
+                                cache.insert_resume(
+                                    &completed_tokens,
+                                    final_snapshot,
+                                    cache_route,
+                                    metadata,
+                                );
+                            }
+                        }),
+                    },
+                );
             }
             debug!(phase = "generation.cancelled");
             return;
@@ -1958,18 +1985,21 @@ impl QwenWorker {
                 (completed_tokens.len() == final_snapshot.token_len())
                     .then_some((completed_tokens, final_snapshot))
             });
-            maintenance.push_back(CacheMaintenance {
-                kind: "completed",
-                enqueued_at: Instant::now(),
-                work: Box::new(move |cache| {
-                    if !prompt_snapshots.is_empty() {
-                        cache.insert(&generation_prompt_ids, prompt_snapshots, cache_route);
-                    }
-                    if let Some((completed_tokens, final_snapshot)) = final_work {
-                        cache.insert(&completed_tokens, vec![final_snapshot], cache_route);
-                    }
-                }),
-            });
+            enqueue_cache_maintenance(
+                maintenance,
+                CacheMaintenance {
+                    kind: "completed",
+                    enqueued_at: Instant::now(),
+                    work: Box::new(move |cache| {
+                        if !prompt_snapshots.is_empty() {
+                            cache.insert(&generation_prompt_ids, prompt_snapshots, cache_route);
+                        }
+                        if let Some((completed_tokens, final_snapshot)) = final_work {
+                            cache.insert(&completed_tokens, vec![final_snapshot], cache_route);
+                        }
+                    }),
+                },
+            );
         }
     }
 }
@@ -2573,6 +2603,32 @@ mod tests {
             receiver.try_recv().expect("excess job remains queued"),
             JOB_BATCH_CAPACITY + 1
         );
+    }
+
+    #[test]
+    fn cache_maintenance_queue_drops_work_at_its_hard_bound() {
+        let mut maintenance = VecDeque::new();
+        for _ in 0..CACHE_MAINTENANCE_CAPACITY {
+            enqueue_cache_maintenance(
+                &mut maintenance,
+                CacheMaintenance {
+                    kind: "accepted",
+                    enqueued_at: Instant::now(),
+                    work: Box::new(|_| {}),
+                },
+            );
+        }
+        enqueue_cache_maintenance(
+            &mut maintenance,
+            CacheMaintenance {
+                kind: "dropped",
+                enqueued_at: Instant::now(),
+                work: Box::new(|_| {}),
+            },
+        );
+
+        assert_eq!(maintenance.len(), CACHE_MAINTENANCE_CAPACITY);
+        assert!(maintenance.iter().all(|work| work.kind == "accepted"));
     }
 
     #[test]
