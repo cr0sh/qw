@@ -33,6 +33,7 @@ use crate::tool_calls::{ToolCallGate, parse_assistant_output};
 
 const JOB_QUEUE_CAPACITY: usize = 8;
 const EVENT_QUEUE_CAPACITY: usize = 32;
+const JOB_BATCH_CAPACITY: usize = 4;
 struct CacheMaintenance {
     kind: &'static str,
     enqueued_at: Instant,
@@ -1087,6 +1088,18 @@ fn next_worker_action<T>(
     }
 }
 
+fn collect_job_batch<T>(first: T, jobs: &mut mpsc::Receiver<T>) -> Vec<T> {
+    let mut batch = Vec::with_capacity(JOB_BATCH_CAPACITY);
+    batch.push(first);
+    while batch.len() < JOB_BATCH_CAPACITY {
+        match jobs.try_recv() {
+            Ok(job) => batch.push(job),
+            Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => break,
+        }
+    }
+    batch
+}
+
 impl QwenWorker {
     fn load(
         model_path: &Path,
@@ -1166,29 +1179,72 @@ impl QwenWorker {
         let mut maintenance = VecDeque::<CacheMaintenance>::new();
         loop {
             match next_worker_action(jobs.try_recv(), !maintenance.is_empty()) {
-                WorkerNextAction::Job(job) => self.process(job, &mut maintenance),
-                WorkerNextAction::Maintenance => {
-                    let queued = maintenance
-                        .pop_front()
-                        .expect("maintenance action requires queued work");
-                    let queue_depth = maintenance.len();
-                    let queue_delay = queued.enqueued_at.elapsed();
-                    let started = Instant::now();
-                    (queued.work)(&mut self.prefix_cache);
-                    trace!(
-                        event = "cache.maintenance",
-                        kind = queued.kind,
-                        queue_depth,
-                        queue_delay_ms = queue_delay.as_secs_f64() * 1_000.0,
-                        execution_duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
-                    );
+                WorkerNextAction::Job(first) => {
+                    let batch = collect_job_batch(first, &mut jobs);
+                    if batch.len() > 1 {
+                        info!(
+                            event = "worker.batch",
+                            batch_size = batch.len(),
+                            batch_capacity = JOB_BATCH_CAPACITY,
+                            job_queue_capacity = JOB_QUEUE_CAPACITY,
+                        );
+                    }
+                    for job in batch {
+                        self.process(job, &mut maintenance);
+                    }
+                    self.run_cache_maintenance(&mut maintenance);
                 }
+                WorkerNextAction::Maintenance => self.run_cache_maintenance(&mut maintenance),
                 WorkerNextAction::Wait => match jobs.blocking_recv() {
-                    Some(job) => self.process(job, &mut maintenance),
+                    Some(first) => {
+                        let batch = collect_job_batch(first, &mut jobs);
+                        if batch.len() > 1 {
+                            info!(
+                                event = "worker.batch",
+                                batch_size = batch.len(),
+                                batch_capacity = JOB_BATCH_CAPACITY,
+                                job_queue_capacity = JOB_QUEUE_CAPACITY,
+                            );
+                        }
+                        for job in batch {
+                            self.process(job, &mut maintenance);
+                        }
+                        self.run_cache_maintenance(&mut maintenance);
+                    }
                     None => break,
                 },
                 WorkerNextAction::Stop => break,
             }
+        }
+    }
+
+    fn run_cache_maintenance(&mut self, maintenance: &mut VecDeque<CacheMaintenance>) {
+        let batch_size = maintenance.len();
+        let oldest_delay = maintenance
+            .front()
+            .map_or(Duration::ZERO, |queued| queued.enqueued_at.elapsed());
+        let started = Instant::now();
+        while let Some(queued) = maintenance.pop_front() {
+            let kind = queued.kind;
+            let queue_delay = queued.enqueued_at.elapsed();
+            let work_started = Instant::now();
+            (queued.work)(&mut self.prefix_cache);
+            trace!(
+                event = "cache.maintenance",
+                kind,
+                queue_delay_ms = queue_delay.as_secs_f64() * 1_000.0,
+                execution_duration_ms = work_started.elapsed().as_secs_f64() * 1_000.0,
+            );
+        }
+        if batch_size > 1 {
+            info!(
+                event = "cache.maintenance_batch",
+                batch_size,
+                batch_capacity = JOB_BATCH_CAPACITY,
+                remaining_depth = maintenance.len(),
+                oldest_queue_delay_ms = oldest_delay.as_secs_f64() * 1_000.0,
+                execution_duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
+            );
         }
     }
 
@@ -2483,6 +2539,40 @@ mod tests {
         let action = next_worker_action(receiver.try_recv(), true);
 
         assert!(matches!(action, WorkerNextAction::Job(7)));
+    }
+
+    #[test]
+    fn job_batch_drains_only_the_configured_capacity() {
+        let (jobs, mut receiver) = mpsc::channel(JOB_QUEUE_CAPACITY);
+        for value in 1..=JOB_BATCH_CAPACITY {
+            jobs.try_send(value).expect("test queue has capacity");
+        }
+
+        let first = receiver.try_recv().expect("first queued job");
+        let batch = collect_job_batch(first, &mut receiver);
+
+        assert_eq!(batch, (1..=JOB_BATCH_CAPACITY).collect::<Vec<_>>());
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn job_batch_leaves_excess_work_queued_for_backpressure() {
+        let (jobs, mut receiver) = mpsc::channel(JOB_QUEUE_CAPACITY);
+        for value in 1..=JOB_BATCH_CAPACITY + 1 {
+            jobs.try_send(value).expect("test queue has capacity");
+        }
+
+        let first = receiver.try_recv().expect("first queued job");
+        let batch = collect_job_batch(first, &mut receiver);
+
+        assert_eq!(batch.len(), JOB_BATCH_CAPACITY);
+        assert_eq!(
+            receiver.try_recv().expect("excess job remains queued"),
+            JOB_BATCH_CAPACITY + 1
+        );
     }
 
     #[test]
