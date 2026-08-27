@@ -1,3 +1,4 @@
 target/
 worktrees/
 .autoresearch.env
+/outputs
