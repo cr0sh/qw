@@ -43,7 +43,7 @@ constexpr int MIN_MTP_VERIFY_TOKENS = 2048;
 // (batch, KV head, block), unpacks each K/V stage once, and reuses it across
 // every query head and verify row.
 constexpr const char* TURBO4_MTP_VERIFY_PARTIAL_SOURCE = R"(
-    constexpr uint StageRows = 32;
+    constexpr uint StageRows = 16;
     constexpr uint GroupCount = (uint)RepeatCount / (uint)QueriesPerGroup;
 
     uint lane = thread_index_in_simdgroup;
@@ -64,7 +64,7 @@ constexpr const char* TURBO4_MTP_VERIFY_PARTIAL_SOURCE = R"(
     float scale_log2e = scale[0] * 1.4426950408889634f;
 
     uint rows[QueriesPerGroup];
-    float q[QueriesPerGroup][DimsPerThread];
+    half q[QueriesPerGroup][DimsPerThread];
     float out[QueriesPerGroup][DimsPerThread];
     float max_score[QueriesPerGroup];
     float sum_score[QueriesPerGroup];
@@ -357,8 +357,8 @@ void validate_inputs(
     if (batch <= 0 || hq <= 0 || hkv <= 0 || tk <= MIN_MTP_VERIFY_TOKENS) {
         throw std::invalid_argument("turbo4_attention requires a non-empty long target cache");
     }
-    if (!causal || tq < 2 || tq > 4 || tk < tq) {
-        throw std::invalid_argument("turbo4_attention only supports causal MTP verify rows 2..=4");
+    if (!causal || tq < 2 || tq > 5 || tk < tq) {
+        throw std::invalid_argument("turbo4_attention only supports causal MTP verify rows 2..=5");
     }
     if (hq % hkv != 0 || hq / hkv > 32) {
         throw std::invalid_argument("turbo4_attention has unsupported GQA repeat geometry");

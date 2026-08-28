@@ -77,7 +77,7 @@ fn supported_inputs(
     batch > 0
         && hq > 0
         && hkv > 0
-        && (2..=4).contains(&tq)
+        && (2..=5).contains(&tq)
         && tk > 2048
         && hq % hkv == 0
         && hq / hkv <= 32
