@@ -313,7 +313,7 @@ int mtp_verify_blocks(int tokens) {
         return 128;
     }
     if (tokens <= 65536) {
-        return 160;
+        return 128;
     }
     return 512;
 }
