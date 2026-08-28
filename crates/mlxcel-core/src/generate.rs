@@ -225,10 +225,17 @@ impl SnapshotPagedTensor {
         let first = self.pages.first()?.array();
         let trace_enabled = tracing::enabled!(Level::DEBUG);
         let started = trace_enabled.then(Instant::now);
-        let mut dense = ffi::copy(first);
-        for page in self.pages.iter().skip(1) {
-            dense = crate::concatenate(&dense, page.array(), self.token_axis as i32);
-        }
+        let dense = if self.pages.len() == 1 {
+            ffi::copy(first)
+        } else {
+            let ptrs: Vec<*const MlxArray> = self
+                .pages
+                .iter()
+                .map(|page| page.array() as *const MlxArray)
+                .collect();
+            // SAFETY: every pointer references a live array owned by `self.pages`.
+            unsafe { ffi::concatenate(&ptrs, self.token_axis as i32) }
+        };
         if let Some(started) = started {
             let page_bytes = self.pages.iter().map(|page| page.nbytes()).sum::<usize>();
             tracing::debug!(
@@ -4735,6 +4742,17 @@ mod tests {
         assert_eq!(second_pages[1].identity(), third_pages[1].identity());
         assert_ne!(third_pages[2].identity(), second_pages[1].identity());
         assert_eq!(third_pages[2].token_range(), 512..768);
+
+        let materialized = third
+            .paged_tensor("kv")
+            .expect("third tensor")
+            .materialize()
+            .expect("materialized pages");
+        ffi::eval(&materialized);
+        assert_eq!(
+            ffi::array_to_raw_bytes(&materialized),
+            ffi::array_to_raw_bytes(&array)
+        );
     }
 
     #[test]
