@@ -5,7 +5,7 @@ use anyhow::{Result, bail};
 /// Fixed default identifier for checkpoints that `qw generate`, `qw serve`,
 /// and the runtime benchmarks use when neither `--model` nor `QW_MODEL_PATH`
 /// is given. Users override the *path* to a checkpoint, never this identifier.
-pub const DEFAULT_MODEL_IDENTIFIER: &str = "Jundot/Qwen3.8-27B-oQ4e-fp16-mtp";
+pub const DEFAULT_MODEL_IDENTIFIER: &str = "sh0wie/Qwen3.8-Flash-Next-REAP-288-MLX-4bit";
 #[cfg(any(feature = "specprefill", test))]
 pub const DEFAULT_SPECPREFILL_DRAFT_MODEL_IDENTIFIER: &str =
     "mlx-community/Qwen3.5-0.8B-MLX-8bit";
@@ -151,7 +151,9 @@ mod tests {
         assert_eq!(
             resolve_model_dir(None, None, Some(Path::new("/home")))
                 .expect("default cache"),
-            Path::new("/home/.cache/qw/models/Jundot/Qwen3.8-27B-oQ4e-fp16-mtp")
+            Path::new(
+                "/home/.cache/qw/models/sh0wie/Qwen3.8-Flash-Next-REAP-288-MLX-4bit",
+            )
         );
     }
 
@@ -170,7 +172,9 @@ mod tests {
         assert_eq!(
             model_cache_path(Path::new("/home/user"), DEFAULT_MODEL_IDENTIFIER)
                 .expect("default identifier is valid"),
-            Path::new("/home/user/.cache/qw/models/Jundot/Qwen3.8-27B-oQ4e-fp16-mtp")
+            Path::new(
+                "/home/user/.cache/qw/models/sh0wie/Qwen3.8-Flash-Next-REAP-288-MLX-4bit",
+            )
         );
     }
 

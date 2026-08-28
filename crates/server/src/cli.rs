@@ -141,7 +141,7 @@ pub struct ServerArgs {
     /// Tokens force-kept at the end of the SpecPrefill-eligible suffix.
     #[arg(long, default_value_t = 256)]
     specprefill_keep_last_tokens: usize,
-    /// Disable the default 4-bit TurboQuant KV cache.
+    /// Disable the default 8-bit TurboQuant KV cache.
     #[arg(long)]
     no_kv_quantization: bool,
 
@@ -339,7 +339,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use tracing_subscriber::{EnvFilter, Layer as _, layer::SubscriberExt as _};
     #[derive(Debug, Parser)]
-    #[command(name = "qw-server", about = "OpenAI-compatible dense Qwen3.5 server")]
+    #[command(name = "qw-server", about = "OpenAI-compatible Qwen3.8 Flash Next server")]
     struct TestCli {
         #[command(flatten)]
         args: ServerArgs,
@@ -568,7 +568,7 @@ mod tests {
 
         let help = TestCli::command().render_long_help().to_string();
         assert!(help.contains("--no-kv-quantization"), "{help}");
-        assert!(help.contains("default 4-bit TurboQuant KV cache"), "{help}");
+        assert!(help.contains("default 8-bit TurboQuant KV cache"), "{help}");
     }
 
     #[test]

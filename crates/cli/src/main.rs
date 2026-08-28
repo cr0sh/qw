@@ -17,7 +17,7 @@ use qw_server::serve;
 #[derive(Debug, Parser)]
 #[command(
     name = "qw",
-    about = "Local dense Qwen3.5 inference",
+    about = "Local Qwen3.8 Flash Next REAP inference",
     disable_help_subcommand = true
 )]
 struct Cli {
@@ -39,7 +39,7 @@ enum Command {
 
 #[derive(Debug, Args)]
 struct DownloadArgs {
-    /// Hugging Face model identifier, such as Qwen/Qwen3.5-0.8B; defaults to the resolver model.
+    /// Hugging Face model identifier; defaults to the fixed Qwen3.8 Flash Next REAP model.
     identifier: Option<String>,
 }
 
