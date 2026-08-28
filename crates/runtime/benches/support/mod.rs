@@ -110,7 +110,7 @@ fn long_context_cache_identity(context_label: &str, min_prefix_tokens: usize) ->
         include_bytes!("../../src/portable_snapshot.rs").as_slice(),
         include_bytes!("../../src/qwen3_5_mtp.rs").as_slice(),
         #[cfg(feature = "dflash2")]
-        include_bytes!("../../src/qwen3_5_dflash.rs").as_slice(),
+        b"dflash2-prefix-snapshot-v1".as_slice(),
     ] {
         hash_bytes(&mut hash, bytes);
     }

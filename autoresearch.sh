@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 ENV_FILE="$ROOT_DIR/.autoresearch.env"
-RESULT_DIR="$ROOT_DIR/target/criterion/single_user_decode/fresh_dflash2/new"
+RESULT_DIR="$ROOT_DIR/target/criterion/single_user_decode/long_64k_dflash2/new"
 
 if [[ ! -f "$ENV_FILE" ]]; then
     printf 'missing benchmark environment: %s\n' "$ENV_FILE" >&2
@@ -31,7 +31,7 @@ CARGO_TERM_COLOR=never \
 QW_MODEL_PATH="$MODEL_DIR" \
 QW_BENCH_DRAFT_MODEL="$DRAFT_MODEL_DIR" \
     cargo bench --offline -p qw-runtime --bench single_user_throughput \
-    --features dflash2 -- single_user_decode/fresh_dflash2
+    --features dflash2 -- single_user_decode/long_64k_dflash2
 
 python3 - "$RESULT_DIR" <<'PY'
 import json
@@ -45,7 +45,7 @@ with (result_dir / "benchmark.json").open(encoding="utf-8") as file:
 with (result_dir / "estimates.json").open(encoding="utf-8") as file:
     estimates = json.load(file)
 
-benchmark_id = "single_user_decode/fresh_dflash2"
+benchmark_id = "single_user_decode/long_64k_dflash2"
 if benchmark.get("full_id") != benchmark_id:
     raise SystemExit(
         f"expected benchmark {benchmark_id!r}, got {benchmark.get('full_id')!r}"
