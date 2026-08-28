@@ -1213,10 +1213,11 @@ fn assert_turbo4_fused_parity(tq: i32, tk: i32, causal: bool, seed: u32) {
 }
 
 #[test]
-fn turbo4_fused_attention_matches_dequant_mtp_verify_rows_2_to_4() {
+fn turbo4_fused_attention_matches_dequant_mtp_verify_rows_2_to_5() {
     assert_turbo4_fused_parity(2, 2_053, true, 0xD3C0_DE02);
     assert_turbo4_fused_parity(3, 4_105, true, 0xD3C0_DE03);
     assert_turbo4_fused_parity(4, 8_207, true, 0xD3C0_DE04);
+    assert_turbo4_fused_parity(5, 16_399, true, 0xD3C0_DE05);
 }
 
 #[test]
