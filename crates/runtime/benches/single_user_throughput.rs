@@ -301,6 +301,82 @@ fn benchmark_fresh_mtp(
     group.finish();
 }
 
+#[cfg(feature = "dflash2")]
+const FRESH_DFLASH2_BENCHMARK: &str = "single_user_decode/fresh_dflash2";
+
+#[cfg(feature = "dflash2")]
+fn is_exclusive_fresh_dflash2_selection() -> bool {
+    env::args()
+        .skip(1)
+        .any(|arg| arg == FRESH_DFLASH2_BENCHMARK)
+}
+
+#[cfg(feature = "dflash2")]
+fn benchmark_fresh_dflash2(
+    criterion: &mut Criterion,
+    provider: &mut Qwen35Provider,
+    decode_request: &qw_runtime::GenerationRequest,
+    baseline_token_ids: &[i32],
+) {
+    let draft_dir = support::draft_model_dir();
+    let (dflash2_output, dflash2_stats) = provider
+        .generate_dflash2_streaming(decode_request, &draft_dir, |delta| {
+            black_box(delta);
+            true
+        })
+        .unwrap_or_else(|error| panic!("warm up DFlash2 single-user decode: {error:#}"));
+    let dflash2_token_edit_distance =
+        token_edit_distance(&dflash2_output.token_ids, baseline_token_ids);
+    assert!(
+        dflash2_token_edit_distance * 20 <= baseline_token_ids.len(),
+        "DFlash2 token edit distance {dflash2_token_edit_distance} exceeds 5% of the baseline"
+    );
+    assert!(
+        dflash2_stats.proposed_draft_tokens > 0,
+        "DFlash2 must propose draft tokens"
+    );
+    eprintln!(
+        "DFLASH2_PROFILE tokens={} token_edit_distance={} accepted={} proposed={} acceptance={:.2}% forwards={} draft_ms={:.3} verify_ms={:.3} walk_ms={:.3} reconcile_ms={:.3}",
+        dflash2_output.token_ids.len(),
+        dflash2_token_edit_distance,
+        dflash2_stats.accepted_draft_tokens,
+        dflash2_stats.proposed_draft_tokens,
+        dflash2_stats.acceptance_percentage(),
+        dflash2_stats.target_forward_calls,
+        dflash2_stats.draft_time.as_secs_f64() * 1_000.0,
+        dflash2_stats.target_verify_time.as_secs_f64() * 1_000.0,
+        dflash2_stats.walk_time.as_secs_f64() * 1_000.0,
+        dflash2_stats.reconcile_time.as_secs_f64() * 1_000.0,
+    );
+    let dflash2_decode_tokens = dflash2_output.token_ids.len().saturating_sub(1);
+
+    let mut group = criterion.benchmark_group("single_user_decode");
+    group.throughput(Throughput::Elements(dflash2_decode_tokens as u64));
+    group.bench_function("fresh_dflash2", |bencher| {
+        bencher.iter_custom(|iters| {
+            let mut decode_time = Duration::ZERO;
+            for _ in 0..iters {
+                let (output, stats) = provider
+                    .generate_dflash2_streaming(decode_request, &draft_dir, |delta| {
+                        black_box(delta);
+                        true
+                    })
+                    .unwrap_or_else(|error| {
+                        panic!("benchmark DFlash2 single-user decode: {error:#}")
+                    });
+                assert_eq!(
+                    output.token_ids, dflash2_output.token_ids,
+                    "deterministic DFlash2 greedy token IDs changed"
+                );
+                decode_time += stats.decode_time;
+                black_box(output);
+            }
+            decode_time
+        });
+    });
+    group.finish();
+}
+
 fn single_user_throughput(criterion: &mut Criterion) {
     let long_context_only = match env::var(LONG_CONTEXT_ONLY_ENV) {
         Ok(value) if value == "64k" => true,
@@ -331,6 +407,18 @@ fn single_user_throughput(criterion: &mut Criterion) {
             &decode_fixture.request,
             &decode_fixture.mtp_token_ids,
             decode_fixture.mtp_decode_tokens,
+        );
+        return;
+    }
+
+    #[cfg(feature = "dflash2")]
+    if is_exclusive_fresh_dflash2_selection() {
+        let decode_fixture = prepare_decode_fixture(&mut provider);
+        benchmark_fresh_dflash2(
+            criterion,
+            &mut provider,
+            &decode_fixture.request,
+            &decode_fixture.baseline_token_ids,
         );
         return;
     }
@@ -551,69 +639,12 @@ fn single_user_throughput(criterion: &mut Criterion) {
     benchmark_long_conversation(criterion, &mut provider, &long_64k);
 
     #[cfg(feature = "dflash2")]
-    // DFlash2 block-diffusion drafter, same deterministic decode fixture.
-    // Keep token-level edit distance within 5% of the baseline so model-
-    // invasive performance work cannot silently introduce a major regression.
-    {
-        let draft_dir = support::draft_model_dir();
-        let (dflash2_output, dflash2_stats) = provider
-            .generate_dflash2_streaming(&decode_request, &draft_dir, |delta| {
-                black_box(delta);
-                true
-            })
-            .unwrap_or_else(|error| panic!("warm up DFlash2 single-user decode: {error:#}"));
-        let dflash2_token_edit_distance =
-            token_edit_distance(&dflash2_output.token_ids, &baseline_token_ids);
-        assert!(
-            dflash2_token_edit_distance * 20 <= baseline_token_ids.len(),
-            "DFlash2 token edit distance {dflash2_token_edit_distance} exceeds 5% of the baseline"
-        );
-        assert!(
-            dflash2_stats.proposed_draft_tokens > 0,
-            "DFlash2 must propose draft tokens"
-        );
-        eprintln!(
-            "DFLASH2_PROFILE tokens={} token_edit_distance={} accepted={} proposed={} acceptance={:.2}% forwards={} draft_ms={:.3} verify_ms={:.3} walk_ms={:.3} reconcile_ms={:.3}",
-            dflash2_output.token_ids.len(),
-            dflash2_token_edit_distance,
-            dflash2_stats.accepted_draft_tokens,
-            dflash2_stats.proposed_draft_tokens,
-            dflash2_stats.acceptance_percentage(),
-            dflash2_stats.target_forward_calls,
-            dflash2_stats.draft_time.as_secs_f64() * 1_000.0,
-            dflash2_stats.target_verify_time.as_secs_f64() * 1_000.0,
-            dflash2_stats.walk_time.as_secs_f64() * 1_000.0,
-            dflash2_stats.reconcile_time.as_secs_f64() * 1_000.0,
-        );
-        let dflash2_decode_tokens =
-            generation_elements(1, prompt_tokens, dflash2_output.token_ids.len()).decode as usize;
-
-        let mut group = criterion.benchmark_group("single_user_decode");
-        group.throughput(Throughput::Elements(dflash2_decode_tokens as u64));
-        group.bench_function("fresh_dflash2", |bencher| {
-            bencher.iter_custom(|iters| {
-                let mut decode_time = Duration::ZERO;
-                for _ in 0..iters {
-                    let (output, stats) = provider
-                        .generate_dflash2_streaming(&decode_request, &draft_dir, |delta| {
-                            black_box(delta);
-                            true
-                        })
-                        .unwrap_or_else(|error| {
-                            panic!("benchmark DFlash2 single-user decode: {error:#}")
-                        });
-                    assert_eq!(
-                        output.token_ids, dflash2_output.token_ids,
-                        "deterministic DFlash2 greedy token IDs changed"
-                    );
-                    decode_time += stats.decode_time;
-                    black_box(output);
-                }
-                decode_time
-            });
-        });
-        group.finish();
-    }
+    benchmark_fresh_dflash2(
+        criterion,
+        &mut provider,
+        &decode_request,
+        &baseline_token_ids,
+    );
 }
 
 criterion_group! {
