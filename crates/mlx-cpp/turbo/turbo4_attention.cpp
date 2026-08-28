@@ -64,7 +64,7 @@ constexpr const char* TURBO4_MTP_VERIFY_PARTIAL_SOURCE = R"(
     float scale_log2e = scale[0] * 1.4426950408889634f;
 
     uint rows[QueriesPerGroup];
-    float q[QueriesPerGroup][DimsPerThread];
+    half q[QueriesPerGroup][DimsPerThread];
     float out[QueriesPerGroup][DimsPerThread];
     float max_score[QueriesPerGroup];
     float sum_score[QueriesPerGroup];
