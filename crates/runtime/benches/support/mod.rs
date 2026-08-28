@@ -10,6 +10,8 @@ use qw_runtime::{
     PortableModelState, PortablePage, PortablePagedTensor, PortablePromptSnapshot, PromptSnapshot,
     Qwen35Provider,
 };
+#[cfg(feature = "dflash2")]
+use qw_runtime::Dflash2PrefixReuse;
 
 pub const DECODE_MAX_TOKENS: usize = 128;
 pub const MTP_BLOCK_SIZE: usize = 3;
@@ -59,10 +61,22 @@ pub struct LongConversationFixture {
     pub mtp_accepted_draft_tokens: usize,
     pub mtp_proposed_draft_tokens: usize,
     pub mtp_target_forward_calls: usize,
+    #[cfg(feature = "dflash2")]
+    pub dflash2_snapshot: PromptSnapshot,
+    #[cfg(feature = "dflash2")]
+    pub dflash2_token_ids: Vec<i32>,
+    #[cfg(feature = "dflash2")]
+    pub dflash2_decode_tokens: usize,
+    #[cfg(feature = "dflash2")]
+    pub dflash2_accepted_draft_tokens: usize,
+    #[cfg(feature = "dflash2")]
+    pub dflash2_proposed_draft_tokens: usize,
+    #[cfg(feature = "dflash2")]
+    pub dflash2_target_forward_calls: usize,
 }
 
 const LONG_CONTEXT_CACHE_MAGIC: &[u8; 8] = b"QWLC64K\0";
-const LONG_CONTEXT_CACHE_VERSION: u32 = 1;
+const LONG_CONTEXT_CACHE_VERSION: u32 = 2;
 const MAX_CACHE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const MAX_CACHE_STRING_BYTES: usize = 1024 * 1024;
 const MAX_CACHE_TOKEN_IDS: usize = 1024 * 1024;
@@ -95,6 +109,8 @@ fn long_context_cache_identity(context_label: &str, min_prefix_tokens: usize) ->
         PROMPT.as_bytes(),
         include_bytes!("../../src/portable_snapshot.rs").as_slice(),
         include_bytes!("../../src/qwen3_5_mtp.rs").as_slice(),
+        #[cfg(feature = "dflash2")]
+        include_bytes!("../../src/qwen3_5_dflash.rs").as_slice(),
     ] {
         hash_bytes(&mut hash, bytes);
     }
@@ -125,6 +141,37 @@ fn long_context_cache_identity(context_label: &str, min_prefix_tokens: usize) ->
             .unwrap_or_default()
             .as_nanos();
         hash_bytes(&mut hash, &modified.to_le_bytes());
+    }
+    #[cfg(feature = "dflash2")]
+    {
+        let draft_dir = draft_model_dir().canonicalize()?;
+        hash_bytes(&mut hash, draft_dir.as_os_str().as_encoded_bytes());
+        let mut draft_files = fs::read_dir(&draft_dir)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<io::Result<Vec<_>>>()?;
+        draft_files.sort();
+        for path in draft_files {
+            if !path.is_file() {
+                continue;
+            }
+            let extension = path.extension().and_then(|value| value.to_str());
+            if !matches!(extension, Some("json" | "safetensors")) {
+                continue;
+            }
+            hash_bytes(&mut hash, path.as_os_str().as_encoded_bytes());
+            if extension == Some("json") {
+                hash_bytes(&mut hash, &fs::read(&path)?);
+            } else {
+                let metadata = path.metadata()?;
+                hash_bytes(&mut hash, &metadata.len().to_le_bytes());
+                let modified = metadata
+                    .modified()?
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                hash_bytes(&mut hash, &modified.to_le_bytes());
+            }
+        }
     }
     Ok(hash)
 }
@@ -240,6 +287,19 @@ fn write_portable_snapshot(
             write_portable_model(writer, draft)?;
             writer.write_all(&draft_offset.to_le_bytes())?;
             write_portable_array(writer, last_hidden)?;
+            write_portable_array(writer, continuation_logits)
+        }
+        #[cfg(feature = "dflash2")]
+        PortablePromptSnapshot::Dflash2 {
+            target,
+            hidden_concat,
+            hidden_offset,
+            continuation_logits,
+        } => {
+            write_u8(writer, 2)?;
+            write_portable_model(writer, target)?;
+            write_portable_array(writer, hidden_concat)?;
+            write_usize(writer, *hidden_offset)?;
             write_portable_array(writer, continuation_logits)
         }
     }
@@ -455,6 +515,19 @@ impl FixtureReader {
                     continuation_logits,
                 })
             }
+            #[cfg(feature = "dflash2")]
+            2 => {
+                let target = self.read_portable_model()?;
+                let hidden_concat = self.read_portable_array()?;
+                let hidden_offset = self.read_usize(MAX_CACHE_TOKEN_IDS)?;
+                let continuation_logits = self.read_portable_array()?;
+                Ok(PortablePromptSnapshot::Dflash2 {
+                    target,
+                    hidden_concat,
+                    hidden_offset,
+                    continuation_logits,
+                })
+            }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid portable-snapshot tag",
@@ -471,6 +544,11 @@ fn write_long_context_cache(
 ) -> io::Result<()> {
     let portable = fixture
         .mtp_snapshot
+        .to_portable()
+        .map_err(io::Error::other)?;
+    #[cfg(feature = "dflash2")]
+    let dflash2_portable = fixture
+        .dflash2_snapshot
         .to_portable()
         .map_err(io::Error::other)?;
     let parent = path
@@ -495,6 +573,15 @@ fn write_long_context_cache(
         write_usize(&mut writer, fixture.mtp_proposed_draft_tokens)?;
         write_usize(&mut writer, fixture.mtp_target_forward_calls)?;
         write_portable_snapshot(&mut writer, &portable)?;
+        #[cfg(feature = "dflash2")]
+        {
+            write_i32s(&mut writer, &fixture.dflash2_token_ids)?;
+            write_usize(&mut writer, fixture.dflash2_decode_tokens)?;
+            write_usize(&mut writer, fixture.dflash2_accepted_draft_tokens)?;
+            write_usize(&mut writer, fixture.dflash2_proposed_draft_tokens)?;
+            write_usize(&mut writer, fixture.dflash2_target_forward_calls)?;
+            write_portable_snapshot(&mut writer, &dflash2_portable)?;
+        }
         writer.flush()?;
         drop(writer);
         fs::rename(&temporary, path)
@@ -533,6 +620,18 @@ fn read_long_context_cache(
     let mtp_proposed_draft_tokens = reader.read_usize(MAX_CACHE_TOKEN_IDS)?;
     let mtp_target_forward_calls = reader.read_usize(MAX_CACHE_TOKEN_IDS)?;
     let portable = reader.read_portable_snapshot()?;
+    #[cfg(feature = "dflash2")]
+    let dflash2_token_ids = reader.read_i32s(DECODE_MAX_TOKENS)?;
+    #[cfg(feature = "dflash2")]
+    let dflash2_decode_tokens = reader.read_usize(DECODE_MAX_TOKENS)?;
+    #[cfg(feature = "dflash2")]
+    let dflash2_accepted_draft_tokens = reader.read_usize(MAX_CACHE_TOKEN_IDS)?;
+    #[cfg(feature = "dflash2")]
+    let dflash2_proposed_draft_tokens = reader.read_usize(MAX_CACHE_TOKEN_IDS)?;
+    #[cfg(feature = "dflash2")]
+    let dflash2_target_forward_calls = reader.read_usize(MAX_CACHE_TOKEN_IDS)?;
+    #[cfg(feature = "dflash2")]
+    let dflash2_portable = reader.read_portable_snapshot()?;
     if reader.remaining != 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -552,12 +651,34 @@ fn read_long_context_cache(
             "long-context fixture cache metadata is inconsistent",
         ));
     }
+    #[cfg(feature = "dflash2")]
+    if dflash2_token_ids.is_empty()
+        || dflash2_token_ids.len() != dflash2_decode_tokens
+        || dflash2_proposed_draft_tokens == 0
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "long-context fixture DFlash2 metadata is inconsistent",
+        ));
+    }
     let mtp_snapshot = PromptSnapshot::from_portable(portable).map_err(io::Error::other)?;
     if !matches!(&mtp_snapshot, PromptSnapshot::Mtp(_)) || mtp_snapshot.token_len() != prefix_tokens
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "long-context fixture cache snapshot is inconsistent",
+        ));
+    }
+    #[cfg(feature = "dflash2")]
+    let dflash2_snapshot =
+        PromptSnapshot::from_portable(dflash2_portable).map_err(io::Error::other)?;
+    #[cfg(feature = "dflash2")]
+    if !matches!(&dflash2_snapshot, PromptSnapshot::Dflash2(_))
+        || dflash2_snapshot.token_len() != prefix_tokens
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "long-context fixture DFlash2 snapshot is inconsistent",
         ));
     }
     Ok(Some(LongConversationFixture {
@@ -572,6 +693,18 @@ fn read_long_context_cache(
         mtp_accepted_draft_tokens,
         mtp_proposed_draft_tokens,
         mtp_target_forward_calls,
+        #[cfg(feature = "dflash2")]
+        dflash2_snapshot,
+        #[cfg(feature = "dflash2")]
+        dflash2_token_ids,
+        #[cfg(feature = "dflash2")]
+        dflash2_decode_tokens,
+        #[cfg(feature = "dflash2")]
+        dflash2_accepted_draft_tokens,
+        #[cfg(feature = "dflash2")]
+        dflash2_proposed_draft_tokens,
+        #[cfg(feature = "dflash2")]
+        dflash2_target_forward_calls,
     }))
 }
 
@@ -639,6 +772,34 @@ fn warm_cached_long_context_fixture(
         mtp_stats.full_state_materializations,
         mtp_stats.cache_snapshot_count,
     );
+    #[cfg(feature = "dflash2")]
+    {
+        let PromptSnapshot::Dflash2(snapshot) = &fixture.dflash2_snapshot else {
+            panic!("long-conversation DFlash2 fixture has the wrong snapshot family");
+        };
+        let (output, stats, cached_tokens) = provider
+            .generate_dflash2_cached_streaming(
+                &fixture.prompt_ids,
+                DECODE_MAX_TOKENS,
+                &sampling,
+                &draft_model_dir(),
+                Some(Dflash2PrefixReuse {
+                    snapshot,
+                    cached_tokens: fixture.prefix_tokens,
+                }),
+                |delta| {
+                    black_box(delta);
+                    true
+                },
+            )
+            .expect("warm restored long-conversation DFlash2 fixture");
+        assert_eq!(cached_tokens, fixture.prefix_tokens);
+        assert_eq!(output.token_ids, fixture.dflash2_token_ids);
+        assert!(
+            stats.proposed_draft_tokens > 0,
+            "restored long-conversation DFlash2 must propose draft tokens"
+        );
+    }
 }
 
 pub fn request(max_tokens: usize) -> GenerationRequest {
@@ -930,12 +1091,49 @@ fn prepare_long_conversation_fixture_uncached(
         mtp_stats.full_state_materializations,
         mtp_stats.cache_snapshot_count,
     );
+    #[cfg(feature = "dflash2")]
+    let dflash2_snapshot = provider
+        .prepare_dflash2_prefix(history_ids, &draft_model_dir())
+        .expect("prefill long-conversation DFlash2 prefix");
+    #[cfg(feature = "dflash2")]
+    let (dflash2_output, dflash2_stats, dflash2_cached_tokens) = provider
+        .generate_dflash2_cached_streaming(
+            &prompt_ids,
+            DECODE_MAX_TOKENS,
+            &sampling,
+            &draft_model_dir(),
+            Some(Dflash2PrefixReuse {
+                snapshot: &dflash2_snapshot,
+                cached_tokens: prefix_tokens,
+            }),
+            |delta| {
+                black_box(delta);
+                true
+            },
+        )
+        .expect("warm up long-conversation DFlash2");
+    #[cfg(feature = "dflash2")]
+    assert_eq!(dflash2_cached_tokens, prefix_tokens);
+    #[cfg(feature = "dflash2")]
+    assert!(
+        dflash2_stats.proposed_draft_tokens > 0,
+        "long-conversation DFlash2 must propose draft tokens"
+    );
+
 
     let new_prompt_tokens = prompt_ids.len() - prefix_tokens;
     let mtp_decode_tokens = mtp_output.token_ids.len();
     let mtp_accepted_draft_tokens = mtp_stats.accepted_draft_tokens;
     let mtp_proposed_draft_tokens = mtp_stats.proposed_draft_tokens;
     let mtp_target_forward_calls = mtp_stats.target_forward_calls;
+    #[cfg(feature = "dflash2")]
+    let dflash2_decode_tokens = dflash2_output.token_ids.len();
+    #[cfg(feature = "dflash2")]
+    let dflash2_accepted_draft_tokens = dflash2_stats.accepted_draft_tokens;
+    #[cfg(feature = "dflash2")]
+    let dflash2_proposed_draft_tokens = dflash2_stats.proposed_draft_tokens;
+    #[cfg(feature = "dflash2")]
+    let dflash2_target_forward_calls = dflash2_stats.target_forward_calls;
     LongConversationFixture {
         context_label,
         prompt_ids,
@@ -948,6 +1146,18 @@ fn prepare_long_conversation_fixture_uncached(
         mtp_accepted_draft_tokens,
         mtp_proposed_draft_tokens,
         mtp_target_forward_calls,
+        #[cfg(feature = "dflash2")]
+        dflash2_snapshot: PromptSnapshot::Dflash2(dflash2_snapshot),
+        #[cfg(feature = "dflash2")]
+        dflash2_token_ids: dflash2_output.token_ids,
+        #[cfg(feature = "dflash2")]
+        dflash2_decode_tokens,
+        #[cfg(feature = "dflash2")]
+        dflash2_accepted_draft_tokens,
+        #[cfg(feature = "dflash2")]
+        dflash2_proposed_draft_tokens,
+        #[cfg(feature = "dflash2")]
+        dflash2_target_forward_calls,
     }
 }
 

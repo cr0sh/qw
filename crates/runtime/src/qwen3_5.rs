@@ -1433,7 +1433,30 @@ impl Qwen35Model {
         target_layer_ids: &[usize],
         hidden_limit: usize,
     ) -> std::result::Result<Qwen35DflashPrefill, String> {
-        self.reset_runtime_state();
+        self.forward_dflash_prefill_impl(input_ids, target_layer_ids, hidden_limit, true)
+    }
+
+    #[cfg(any(feature = "dflash2", test))]
+    pub(crate) fn forward_dflash_continuation(
+        &self,
+        input_ids: &MlxArray,
+        target_layer_ids: &[usize],
+        hidden_limit: usize,
+    ) -> std::result::Result<Qwen35DflashPrefill, String> {
+        self.forward_dflash_prefill_impl(input_ids, target_layer_ids, hidden_limit, false)
+    }
+
+    #[cfg(any(feature = "dflash2", test))]
+    fn forward_dflash_prefill_impl(
+        &self,
+        input_ids: &MlxArray,
+        target_layer_ids: &[usize],
+        hidden_limit: usize,
+        reset: bool,
+    ) -> std::result::Result<Qwen35DflashPrefill, String> {
+        if reset {
+            self.reset_runtime_state();
+        }
         let shape = mlxcel_core::array_shape(input_ids);
         let prompt_len = shape[1];
         if prompt_len == 0 {
@@ -1448,7 +1471,6 @@ impl Qwen35Model {
         // rows.
         let mut layer_hiddens: Vec<Option<UniquePtr<MlxArray>>> =
             (0..target_layer_ids.len()).map(|_| None).collect();
-        let mut hidden_offset = 0usize;
         let rope_delta = self.mrope_state.rope_delta();
         let mut first_logits = None;
         let mut start = 0;
@@ -1480,7 +1502,6 @@ impl Qwen35Model {
                         let rows = combined_shape[1];
                         if rows as usize > hidden_limit {
                             let drop = rows as usize - hidden_limit;
-                            hidden_offset += drop;
                             combined = mlxcel_core::slice(
                                 &combined,
                                 &[0, drop as i32, 0],
@@ -1505,7 +1526,9 @@ impl Qwen35Model {
             }
             start = end;
         }
-        self.finish_initial_prefill();
+        if reset {
+            self.finish_initial_prefill();
+        }
 
         // Concatenate the per-layer captures along the hidden axis.
         let mut hidden_concat: Option<UniquePtr<MlxArray>> = None;
@@ -1518,6 +1541,8 @@ impl Qwen35Model {
         }
         let hidden_concat =
             hidden_concat.expect("DFlash2 prefill captures at least one target layer");
+        let hidden_rows = mlxcel_core::array_shape(&hidden_concat)[1] as usize;
+        let hidden_offset = prompt_len as usize - hidden_rows;
 
         let offset = self
             .sequence_state

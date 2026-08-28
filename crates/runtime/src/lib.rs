@@ -34,7 +34,9 @@ pub use portable_snapshot::{
     PortableArray, PortableModelState, PortablePage, PortablePagedTensor, PortablePromptSnapshot,
 };
 #[cfg(any(feature = "dflash2", test))]
-pub use provider::Dflash2GenerationStats;
+pub use provider::{
+    Dflash2GenerationStats, Dflash2PrefixReuse, Dflash2PromptSnapshot,
+};
 pub use provider::{
     BaselineGeneration, ChatContentPart, ChatContentRef, ChatCustomToolCall, ChatFile,
     ChatImageUrl, ChatInputAudio, ChatMessage, ChatMessageContent, ChatPromptCacheBreakpoint,
