@@ -59,7 +59,7 @@ use mlxcel_core::{MlxArray, UniquePtr, concatenate, multiply_scalar};
 use serde_json::Value;
 
 use crate::qwen3_5::Qwen35Model;
-const DRAFT_QUANT_GROUP_SIZE: i32 = 64;
+const DRAFT_QUANT_GROUP_SIZE: i32 = 128;
 const DRAFT_QUANT_BITS: i32 = 4;
 
 fn quantized_draft_linear(
