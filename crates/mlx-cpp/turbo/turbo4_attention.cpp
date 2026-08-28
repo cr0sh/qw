@@ -408,7 +408,8 @@ mlx::core::array turbo4_attention(
     const int hkv = k_shape[1];
     const int tk = k_shape[2];
     const int repeats = hq / hkv;
-    const int queries_per_group = repeats % 2 == 0 ? 2 : 1;
+    const int queries_per_group =
+        repeats % 3 == 0 ? 3 : (repeats % 2 == 0 ? 2 : 1);
     const int groups = repeats / queries_per_group;
     const int dims_per_thread = dim / SIMD_WIDTH;
     const int blocks = mtp_verify_blocks(tk);
