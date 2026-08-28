@@ -1575,7 +1575,7 @@ impl QwenWorker {
                     }),
                     None,
                 ),
-                PromptSnapshot::Mtp(_) => {
+                PromptSnapshot::Mtp(_) | PromptSnapshot::Dflash2(_) => {
                     send_failure(
                         &job,
                         FailureKind::ResumeNotFound,
@@ -1594,7 +1594,7 @@ impl QwenWorker {
                         continuation_token: resume.metadata.generated_token_ids.last().copied(),
                     }),
                 ),
-                PromptSnapshot::Baseline(_) => {
+                PromptSnapshot::Baseline(_) | PromptSnapshot::Dflash2(_) => {
                     send_failure(
                         &job,
                         FailureKind::ResumeNotFound,
@@ -1604,19 +1604,23 @@ impl QwenWorker {
                     return;
                 }
             },
-            (QwenGenerationRoute::BaselineText, None, Some(hit)) => {
-                let snapshot = match hit.snapshot {
-                    PromptSnapshot::Baseline(snapshot) => snapshot,
-                    PromptSnapshot::Mtp(snapshot) => snapshot.target_snapshot(),
-                };
-                (
+            (QwenGenerationRoute::BaselineText, None, Some(hit)) => match hit.snapshot {
+                PromptSnapshot::Baseline(snapshot) => (
                     Some(PrefixReuse {
                         snapshot,
                         cached_tokens: hit.token_count,
                     }),
                     None,
-                )
-            }
+                ),
+                PromptSnapshot::Mtp(snapshot) => (
+                    Some(PrefixReuse {
+                        snapshot: snapshot.target_snapshot(),
+                        cached_tokens: hit.token_count,
+                    }),
+                    None,
+                ),
+                PromptSnapshot::Dflash2(_) => (None, None),
+            },
             (QwenGenerationRoute::MtpText, None, Some(hit)) => match hit.snapshot {
                 PromptSnapshot::Mtp(snapshot) => (
                     None,
@@ -1626,7 +1630,7 @@ impl QwenWorker {
                         continuation_token: None,
                     }),
                 ),
-                PromptSnapshot::Baseline(_) => (None, None),
+                PromptSnapshot::Baseline(_) | PromptSnapshot::Dflash2(_) => (None, None),
             },
             _ => (None, None),
         };
