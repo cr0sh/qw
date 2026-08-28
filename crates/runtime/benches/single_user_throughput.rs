@@ -284,7 +284,7 @@ fn benchmark_long_dflash2(
     let draft_dir = support::draft_model_dir();
     let mut group = criterion.benchmark_group("single_user_decode");
     group.throughput(Throughput::Elements(decode_tokens as u64));
-    group.bench_function("long_64k_dflash", |bencher| {
+    group.bench_function("long_64k_dflash2", |bencher| {
         bencher.iter_custom(|iters| {
             let mut decode_time = Duration::ZERO;
             for _ in 0..iters {
@@ -381,7 +381,7 @@ fn benchmark_fresh_mtp(
 }
 
 #[cfg(feature = "dflash2")]
-const LONG_DFLASH2_BENCHMARK: &str = "single_user_decode/long_64k_dflash";
+const LONG_DFLASH2_BENCHMARK: &str = "single_user_decode/long_64k_dflash2";
 
 #[cfg(feature = "dflash2")]
 fn is_exclusive_long_dflash2_selection() -> bool {

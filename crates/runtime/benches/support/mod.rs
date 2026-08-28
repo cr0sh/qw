@@ -110,7 +110,7 @@ fn long_context_cache_identity(context_label: &str, min_prefix_tokens: usize) ->
         include_bytes!("../../src/portable_snapshot.rs").as_slice(),
         include_bytes!("../../src/qwen3_5_mtp.rs").as_slice(),
         #[cfg(feature = "dflash2")]
-        include_bytes!("../../src/qwen3_5_dflash.rs").as_slice(),
+        b"dflash2-prefix-snapshot-v1".as_slice(),
     ] {
         hash_bytes(&mut hash, bytes);
     }
@@ -798,6 +798,20 @@ fn warm_cached_long_context_fixture(
         assert!(
             stats.proposed_draft_tokens > 0,
             "restored long-conversation DFlash2 must propose draft tokens"
+        );
+        eprintln!(
+            "DFLASH2_LONG_CONTEXT_PROFILE context={} tokens={} prefix_tokens={} accepted={} proposed={} acceptance={:.2}% forwards={} draft_ms={:.3} verify_ms={:.3} walk_ms={:.3} reconcile_ms={:.3} fixture_cache=hit",
+            fixture.context_label,
+            output.token_ids.len(),
+            fixture.prefix_tokens,
+            stats.accepted_draft_tokens,
+            stats.proposed_draft_tokens,
+            stats.acceptance_percentage(),
+            stats.target_forward_calls,
+            stats.draft_time.as_secs_f64() * 1_000.0,
+            stats.target_verify_time.as_secs_f64() * 1_000.0,
+            stats.walk_time.as_secs_f64() * 1_000.0,
+            stats.reconcile_time.as_secs_f64() * 1_000.0,
         );
     }
 }
