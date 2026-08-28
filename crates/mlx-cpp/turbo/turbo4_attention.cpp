@@ -43,7 +43,7 @@ constexpr int MIN_MTP_VERIFY_TOKENS = 2048;
 // (batch, KV head, block), unpacks each K/V stage once, and reuses it across
 // every query head and verify row.
 constexpr const char* TURBO4_MTP_VERIFY_PARTIAL_SOURCE = R"(
-    constexpr uint StageRows = 32;
+    constexpr uint StageRows = 16;
     constexpr uint GroupCount = (uint)RepeatCount / (uint)QueriesPerGroup;
 
     uint lane = thread_index_in_simdgroup;
