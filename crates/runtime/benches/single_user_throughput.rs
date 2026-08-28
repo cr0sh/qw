@@ -9,6 +9,8 @@ use qw_runtime::Qwen35Provider;
 use qw_runtime::provider::Qwen35GenerationMode;
 #[cfg(feature = "specprefill")]
 use qw_runtime::{PrefillMode, SpecPrefillConfig};
+#[cfg(feature = "dflash2")]
+use qw_runtime::Dflash2PrefixReuse;
 use support::{
     DECODE_MAX_TOKENS, LONG_CONTEXT_64K_MIN_TOKENS, LONG_CONTEXT_MIN_TOKENS,
     LongConversationFixture, MTP_BLOCK_SIZE, prepare_decode_fixture,
@@ -255,6 +257,83 @@ fn benchmark_long_conversation(
         group.finish();
     }
 }
+#[cfg(feature = "dflash2")]
+fn benchmark_long_dflash2(
+    criterion: &mut Criterion,
+    provider: &mut Qwen35Provider,
+    fixture: &LongConversationFixture,
+) {
+    assert_eq!(fixture.context_label, "64k");
+    assert!(fixture.prefix_tokens >= LONG_CONTEXT_64K_MIN_TOKENS);
+    let qw_runtime::PromptSnapshot::Dflash2(snapshot) = &fixture.dflash2_snapshot else {
+        panic!("long-conversation DFlash2 fixture has the wrong snapshot family");
+    };
+    let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
+    let expected_fingerprint = token_fingerprint(&fixture.dflash2_token_ids);
+    let edit_distance =
+        token_edit_distance(&fixture.dflash2_token_ids, &fixture.baseline_token_ids);
+    assert!(
+        edit_distance * 20 <= fixture.baseline_token_ids.len(),
+        "64k DFlash2 token edit distance {edit_distance} exceeds 5% of the baseline"
+    );
+    assert!(
+        fixture.dflash2_proposed_draft_tokens > 0,
+        "64k DFlash2 warmup must propose draft tokens"
+    );
+    let decode_tokens = fixture.dflash2_decode_tokens.saturating_sub(1);
+    let draft_dir = support::draft_model_dir();
+    let mut group = criterion.benchmark_group("single_user_decode");
+    group.throughput(Throughput::Elements(decode_tokens as u64));
+    group.bench_function("long_64k_dflash", |bencher| {
+        bencher.iter_custom(|iters| {
+            let mut decode_time = Duration::ZERO;
+            for _ in 0..iters {
+                let (output, stats, cached_tokens) = provider
+                    .generate_dflash2_cached_streaming(
+                        &fixture.prompt_ids,
+                        DECODE_MAX_TOKENS,
+                        &sampling,
+                        &draft_dir,
+                        Some(Dflash2PrefixReuse {
+                            snapshot,
+                            cached_tokens: fixture.prefix_tokens,
+                        }),
+                        |delta| {
+                            black_box(delta);
+                            true
+                        },
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("benchmark long-conversation DFlash2: {error:#}")
+                    });
+                assert_eq!(cached_tokens, fixture.prefix_tokens);
+                assert_eq!(
+                    output.token_ids, fixture.dflash2_token_ids,
+                    "deterministic long-conversation DFlash2 greedy token IDs changed"
+                );
+                assert_eq!(
+                    token_fingerprint(&output.token_ids),
+                    expected_fingerprint,
+                    "deterministic long-conversation DFlash2 token fingerprint changed"
+                );
+                assert!(
+                    stats.proposed_draft_tokens > 0,
+                    "long-conversation DFlash2 must propose draft tokens"
+                );
+                assert!(
+                    token_edit_distance(&output.token_ids, &fixture.baseline_token_ids) * 20
+                        <= fixture.baseline_token_ids.len(),
+                    "long-conversation DFlash2 token edit distance exceeds 5% of the baseline"
+                );
+                decode_time += stats.decode_time;
+                black_box(output);
+            }
+            decode_time
+        });
+    });
+    group.finish();
+}
+
 const FRESH_MTP_BENCHMARK: &str = "single_user_decode/fresh_mtp_k3";
 
 fn is_exclusive_fresh_mtp_selection() -> bool {
@@ -299,6 +378,16 @@ fn benchmark_fresh_mtp(
         });
     });
     group.finish();
+}
+
+#[cfg(feature = "dflash2")]
+const LONG_DFLASH2_BENCHMARK: &str = "single_user_decode/long_64k_dflash";
+
+#[cfg(feature = "dflash2")]
+fn is_exclusive_long_dflash2_selection() -> bool {
+    env::args()
+        .skip(1)
+        .any(|arg| arg == LONG_DFLASH2_BENCHMARK)
 }
 
 #[cfg(feature = "dflash2")]
@@ -422,12 +511,21 @@ fn single_user_throughput(criterion: &mut Criterion) {
         );
         return;
     }
+    #[cfg(feature = "dflash2")]
+    if is_exclusive_long_dflash2_selection() {
+        let long_64k =
+            prepare_long_conversation_fixture(&mut provider, "64k", LONG_CONTEXT_64K_MIN_TOKENS);
+        benchmark_long_dflash2(criterion, &mut provider, &long_64k);
+        return;
+    }
 
     if long_context_only {
         let long_64k =
             prepare_long_conversation_fixture(&mut provider, "64k", LONG_CONTEXT_64K_MIN_TOKENS);
         assert!(long_64k.prefix_tokens >= LONG_CONTEXT_64K_MIN_TOKENS);
         benchmark_long_conversation(criterion, &mut provider, &long_64k);
+        #[cfg(feature = "dflash2")]
+        benchmark_long_dflash2(criterion, &mut provider, &long_64k);
         return;
     }
     let prefill_prompt_ids = prompt_token_ids(&provider);
@@ -637,6 +735,8 @@ fn single_user_throughput(criterion: &mut Criterion) {
 
     benchmark_long_conversation(criterion, &mut provider, &long_10k);
     benchmark_long_conversation(criterion, &mut provider, &long_64k);
+    #[cfg(feature = "dflash2")]
+    benchmark_long_dflash2(criterion, &mut provider, &long_64k);
 
     #[cfg(feature = "dflash2")]
     benchmark_fresh_dflash2(

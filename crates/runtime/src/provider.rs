@@ -37,7 +37,9 @@ use crate::qwen_vl_position::compute_rope_index;
 use crate::qwen_vl_processor::{PreparedImage, QwenVLProcessor};
 use crate::qwen3_5::Qwen35Model;
 #[cfg(any(feature = "dflash2", test))]
-pub use crate::qwen3_5_dflash::Dflash2GenerationStats;
+pub use crate::qwen3_5_dflash::{
+    Dflash2GenerationStats, Dflash2PrefixReuse, Dflash2PromptSnapshot,
+};
 use crate::qwen3_5_mtp::Qwen35MtpGenerator;
 pub use crate::qwen3_5_mtp::{MtpGenerationStats, MtpPrefixReuse, MtpPromptSnapshot};
 #[cfg(any(feature = "specprefill", test))]
@@ -219,6 +221,8 @@ pub struct GenerationOutput {
 pub enum PromptSnapshot {
     Baseline(ModelStateSnapshot),
     Mtp(MtpPromptSnapshot),
+    #[cfg(any(feature = "dflash2", test))]
+    Dflash2(Dflash2PromptSnapshot),
 }
 
 impl PromptSnapshot {
@@ -226,6 +230,8 @@ impl PromptSnapshot {
         match self {
             Self::Baseline(snapshot) => snapshot.token_len(),
             Self::Mtp(snapshot) => snapshot.token_len(),
+            #[cfg(any(feature = "dflash2", test))]
+            Self::Dflash2(snapshot) => snapshot.token_len(),
         }
     }
 }
@@ -1073,26 +1079,67 @@ impl Qwen35Provider {
     }
 
     #[cfg(any(feature = "dflash2", test))]
-    /// Generate with the DFlash2 block-diffusion drafter loaded from
-    /// `draft_dir`, decoding deltas through the provider tokenizer.
-    ///
-    /// The generator is constructed lazily on first use and kept for
-    /// subsequent calls (drafter weights + per-layer KV caches survive across
-    /// calls). Greedy-only: `request.temperature` must be 0 / `top_k` 1.
-    #[tracing::instrument(name = "runtime.generate_dflash2", skip_all, fields(max_tokens), err)]
-    pub fn generate_dflash2_streaming<F: FnMut(&str) -> bool>(
+    pub fn prepare_dflash2_prefix(
         &mut self,
-        request: &GenerationRequest,
+        prompt_ids: &[i32],
         draft_dir: &Path,
-        mut on_delta: F,
-    ) -> Result<(GenerationOutput, Dflash2GenerationStats)> {
+    ) -> Result<Dflash2PromptSnapshot> {
         if self.dflash2_generator.is_none() {
             self.dflash2_generator = Some(
                 crate::qwen3_5_dflash::Qwen35Dflash2Generator::new(&self.model, draft_dir)
                     .map_err(|error| anyhow::anyhow!("failed to load DFlash2 drafter: {error}"))?,
             );
         }
+        self.dflash2_generator
+            .as_mut()
+            .expect("DFlash2 generator was initialized")
+            .capture_prompt_snapshot(&self.model, prompt_ids)
+            .map_err(anyhow::Error::msg)
+            .context("failed to capture DFlash2 prefix")
+    }
+
+    #[cfg(any(feature = "dflash2", test))]
+    /// Generate with the DFlash2 block-diffusion drafter loaded from
+    /// `draft_dir`, decoding deltas through the provider tokenizer.
+    ///
+    /// The generator is constructed lazily on first use and kept for
+    /// subsequent calls. Greedy-only: `request.temperature` must be 0 /
+    /// `top_k` 1.
+    #[tracing::instrument(name = "runtime.generate_dflash2", skip_all, fields(max_tokens), err)]
+    pub fn generate_dflash2_streaming<F: FnMut(&str) -> bool>(
+        &mut self,
+        request: &GenerationRequest,
+        draft_dir: &Path,
+        on_delta: F,
+    ) -> Result<(GenerationOutput, Dflash2GenerationStats)> {
         let (prompt_ids, sampling) = self.prepare_generation(request)?;
+        let (output, stats, _) = self.generate_dflash2_cached_streaming(
+            &prompt_ids,
+            request.max_tokens,
+            &sampling,
+            draft_dir,
+            None,
+            on_delta,
+        )?;
+        Ok((output, stats))
+    }
+
+    #[cfg(any(feature = "dflash2", test))]
+    pub fn generate_dflash2_cached_streaming<F: FnMut(&str) -> bool>(
+        &mut self,
+        prompt_ids: &[i32],
+        max_tokens: usize,
+        sampling: &SamplingConfig,
+        draft_dir: &Path,
+        prefix_reuse: Option<Dflash2PrefixReuse<'_>>,
+        mut on_delta: F,
+    ) -> Result<(GenerationOutput, Dflash2GenerationStats, usize)> {
+        if self.dflash2_generator.is_none() {
+            self.dflash2_generator = Some(
+                crate::qwen3_5_dflash::Qwen35Dflash2Generator::new(&self.model, draft_dir)
+                    .map_err(|error| anyhow::anyhow!("failed to load DFlash2 drafter: {error}"))?,
+            );
+        }
         let generator = self
             .dflash2_generator
             .as_mut()
@@ -1102,9 +1149,10 @@ impl Qwen35Provider {
         let generation = generator
             .generate_streaming(
                 &self.model,
-                &prompt_ids,
-                request.max_tokens,
-                &sampling,
+                prompt_ids,
+                max_tokens,
+                sampling,
+                prefix_reuse,
                 |token_id| match decoder.push(token_id) {
                     Ok(delta) => on_delta(&delta),
                     Err(error) => {
@@ -1124,7 +1172,7 @@ impl Qwen35Provider {
             "dflash2",
             prompt_ids.len(),
             completion_tokens,
-            0,
+            generation.cached_tokens,
             stats.prefill_time,
             stats.decode_time,
         );
@@ -1134,6 +1182,7 @@ impl Qwen35Provider {
                 token_ids: generation.token_ids,
             },
             stats,
+            generation.cached_tokens,
         ))
     }
 
@@ -1448,6 +1497,8 @@ impl Qwen35Provider {
                 let snapshot = match snapshot {
                     PromptSnapshot::Baseline(snapshot) => snapshot,
                     PromptSnapshot::Mtp(snapshot) => snapshot.target_snapshot(),
+                    #[cfg(any(feature = "dflash2", test))]
+                    PromptSnapshot::Dflash2(snapshot) => snapshot.target_snapshot(),
                 };
                 let generation = self.generate_baseline_streaming(
                     prompt_ids,
@@ -1486,6 +1537,10 @@ impl Qwen35Provider {
                 anyhow::bail!("cached benchmark mode must be explicit")
             }
             (Qwen35GenerationMode::Mtp, PromptSnapshot::Baseline(_)) => {
+                anyhow::bail!("cached benchmark mode does not match the snapshot family")
+            }
+            #[cfg(any(feature = "dflash2", test))]
+            (Qwen35GenerationMode::Mtp, PromptSnapshot::Dflash2(_)) => {
                 anyhow::bail!("cached benchmark mode does not match the snapshot family")
             }
         }

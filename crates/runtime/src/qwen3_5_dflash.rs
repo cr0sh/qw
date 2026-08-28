@@ -50,7 +50,8 @@
 
 use std::time::{Duration, Instant};
 
-use mlxcel_core::generate::LanguageModel;
+use mlxcel_core::cache::SequenceId;
+use mlxcel_core::generate::{LanguageModel, ModelStateSnapshot};
 use mlxcel_core::layers::{
     KVCache, QuantizedWeight, RMSNorm, RotatingKVCache, UnifiedEmbedding, UnifiedLinear,
 };
@@ -59,6 +60,10 @@ use mlxcel_core::{MlxArray, UniquePtr, concatenate, multiply_scalar};
 use serde_json::Value;
 
 use crate::qwen3_5::Qwen35Model;
+use crate::portable_snapshot::{
+    PortableArray, PortablePromptSnapshot, array_from_portable, array_to_portable,
+    portable_model_state,
+};
 const DRAFT_QUANT_GROUP_SIZE: i32 = 128;
 const DRAFT_QUANT_BITS: i32 = 4;
 
@@ -1319,6 +1324,92 @@ pub fn load_draft_weights(dir: &std::path::Path) -> Result<(WeightMap, DFlash2Co
 // # 8. Greedy round loop + generator
 // ---------------------------------------------------------------------------
 
+/// Detached target state and target-layer hidden context at an exact prompt
+/// boundary. The hidden rows seed the drafter's bounded sliding context after
+/// the target snapshot is restored.
+pub struct Dflash2PromptSnapshot {
+    target: ModelStateSnapshot,
+    hidden_concat: UniquePtr<MlxArray>,
+    hidden_offset: usize,
+    continuation_logits: UniquePtr<MlxArray>,
+}
+
+impl Dflash2PromptSnapshot {
+    pub fn token_len(&self) -> usize {
+        self.target.token_len()
+    }
+
+    pub fn target_snapshot(&self) -> &ModelStateSnapshot {
+        &self.target
+    }
+
+    pub fn nbytes(&self) -> usize {
+        self.target.nbytes()
+            + mlxcel_core::array_nbytes(&self.hidden_concat)
+            + mlxcel_core::array_nbytes(&self.continuation_logits)
+    }
+    pub fn storage_summary(&self) -> mlxcel_core::generate::SnapshotStorageSummary {
+        let mut summary = self.target.storage_summary();
+        summary.local_bytes += mlxcel_core::array_nbytes(&self.hidden_concat)
+            + mlxcel_core::array_nbytes(&self.continuation_logits);
+        summary
+    }
+
+
+    pub(crate) fn to_portable(&self) -> PortablePromptSnapshot {
+        PortablePromptSnapshot::Dflash2 {
+            target: portable_model_state(&self.target),
+            hidden_concat: array_to_portable(None, &self.hidden_concat),
+            hidden_offset: self.hidden_offset,
+            continuation_logits: array_to_portable(None, &self.continuation_logits),
+        }
+    }
+
+    pub(crate) fn from_portable_parts(
+        target: ModelStateSnapshot,
+        hidden_concat: PortableArray,
+        hidden_offset: usize,
+        continuation_logits: PortableArray,
+    ) -> Result<Self, String> {
+        let hidden_rows = hidden_concat
+            .shape
+            .get(1)
+            .copied()
+            .filter(|&rows| rows > 0)
+            .ok_or_else(|| {
+                "DFlash2 portable hidden context must have layout [1, rows, hidden]".to_string()
+            })? as usize;
+        if hidden_concat.shape.len() != 3
+            || hidden_concat.shape[0] != 1
+            || hidden_offset.checked_add(hidden_rows) != Some(target.token_len())
+        {
+            return Err(
+                "DFlash2 portable hidden context does not match the target boundary".to_string(),
+            );
+        }
+        if continuation_logits.shape.len() != 3
+            || continuation_logits.shape[0] != 1
+            || continuation_logits.shape[1] != 1
+        {
+            return Err(
+                "DFlash2 portable continuation-logits layout must be [1, 1, vocab]".to_string(),
+            );
+        }
+        Ok(Self {
+            target,
+            hidden_concat: array_from_portable(hidden_concat, None)?,
+            hidden_offset,
+            continuation_logits: array_from_portable(continuation_logits, None)?,
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct Dflash2PrefixReuse<'a> {
+    pub snapshot: &'a Dflash2PromptSnapshot,
+    pub cached_tokens: usize,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Dflash2GenerationStats {
     pub accepted_draft_tokens: usize,
@@ -1353,6 +1444,7 @@ impl Dflash2GenerationStats {
 pub(crate) struct Dflash2Generation {
     pub(crate) token_ids: Vec<i32>,
     pub(crate) stats: Dflash2GenerationStats,
+    pub(crate) cached_tokens: usize,
 }
 
 /// DFlash2 generation driver: prefill → speculative draft/verify rounds.
@@ -1391,6 +1483,35 @@ impl Qwen35Dflash2Generator {
             hidden_limit,
         })
     }
+    pub fn capture_prompt_snapshot(
+        &mut self,
+        target: &Qwen35Model,
+        prompt_tokens: &[i32],
+    ) -> Result<Dflash2PromptSnapshot, String> {
+        if prompt_tokens.is_empty() {
+            return Err("DFlash2 snapshots require a non-empty prompt".to_string());
+        }
+        self.caches = self.model.make_cache();
+        let prompt_array = mlxcel_core::from_slice_i32(
+            prompt_tokens,
+            &[1, i32::try_from(prompt_tokens.len()).unwrap_or(i32::MAX)],
+        );
+        let prefill = target.forward_dflash_prefill(
+            &prompt_array,
+            &self.target_layer_ids,
+            self.hidden_limit,
+        )?;
+        let target_state = target
+            .snapshot_sequence_state(SequenceId::from_raw(0), prompt_tokens.len(), None)
+            .ok_or_else(|| "failed to capture DFlash2 target prefix state".to_string())?;
+        Ok(Dflash2PromptSnapshot {
+            target: target_state,
+            hidden_concat: materialize_detached(mlxcel_core::copy(&prefill.hidden_concat)),
+            hidden_offset: prefill.hidden_offset,
+            continuation_logits: materialize_detached(mlxcel_core::copy(&prefill.first_logits)),
+        })
+    }
+
 
     /// Generate greedily with DFlash2 draft verification.
     pub fn generate_streaming<F: FnMut(i32) -> bool>(
@@ -1399,6 +1520,7 @@ impl Qwen35Dflash2Generator {
         prompt_tokens: &[i32],
         max_tokens: usize,
         sampling: &mlxcel_core::generate::SamplingConfig,
+        prefix_reuse: Option<Dflash2PrefixReuse<'_>>,
         mut on_token: F,
     ) -> Result<Dflash2Generation, String> {
         mlxcel_core::generation_policy::seed_rng_if_needed(sampling);
@@ -1410,34 +1532,76 @@ impl Qwen35Dflash2Generator {
             return Ok(Dflash2Generation {
                 token_ids: Vec::new(),
                 stats: Dflash2GenerationStats::default(),
+                cached_tokens: 0,
             });
         }
 
-        // Prefill: capture the target-layer hidden states the drafter attends
-        // to (trimmed to the sliding window) and sample the first token.
+        // Restore an exact target prefix when supplied, then process only the
+        // uncached prompt suffix. Drafter caches are request-local and are
+        // rebuilt so no speculative state survives across Criterion rounds.
         let prefill_start = Instant::now();
-        let prompt_array = mlxcel_core::from_slice_i32(
-            prompt_tokens,
-            &[1, i32::try_from(prompt_tokens.len()).unwrap_or(i32::MAX)],
-        );
-        let prefill = target.forward_dflash_prefill(
-            &prompt_array,
-            &self.target_layer_ids,
-            self.hidden_limit,
-        )?;
-        let mut hidden_concat = prefill.hidden_concat;
-        // The drafter caches start at the same logical position as the
-        // captured target hidden (which may have dropped leading window rows
-        // during prefill).
+        self.caches = self.model.make_cache();
+        let reusable = prefix_reuse.filter(|reuse| {
+            reuse.cached_tokens == reuse.snapshot.token_len()
+                && reuse.cached_tokens <= prompt_tokens.len()
+        });
+        let cached_tokens = reusable.map_or(0, |reuse| reuse.cached_tokens);
+        let (mut hidden_concat, first_logits, hidden_offset) = if let Some(reuse) = reusable {
+            target.restore_sequence_state(SequenceId::from_raw(0), &reuse.snapshot.target)?;
+            let suffix = &prompt_tokens[cached_tokens..];
+            if suffix.is_empty() {
+                (
+                    mlxcel_core::copy(&reuse.snapshot.hidden_concat),
+                    mlxcel_core::copy(&reuse.snapshot.continuation_logits),
+                    reuse.snapshot.hidden_offset,
+                )
+            } else {
+                let suffix_array = mlxcel_core::from_slice_i32(
+                    suffix,
+                    &[1, i32::try_from(suffix.len()).unwrap_or(i32::MAX)],
+                );
+                let suffix_prefill = target.forward_dflash_continuation(
+                    &suffix_array,
+                    &self.target_layer_ids,
+                    self.hidden_limit,
+                )?;
+                let hidden = merge_hidden_context(
+                    &reuse.snapshot.hidden_concat,
+                    &suffix_prefill.hidden_concat,
+                    self.hidden_limit,
+                );
+                let rows = mlxcel_core::array_shape(&hidden)[1] as usize;
+                (
+                    hidden,
+                    suffix_prefill.first_logits,
+                    prompt_tokens.len().saturating_sub(rows),
+                )
+            }
+        } else {
+            let prompt_array = mlxcel_core::from_slice_i32(
+                prompt_tokens,
+                &[1, i32::try_from(prompt_tokens.len()).unwrap_or(i32::MAX)],
+            );
+            let prefill = target.forward_dflash_prefill(
+                &prompt_array,
+                &self.target_layer_ids,
+                self.hidden_limit,
+            )?;
+            (
+                prefill.hidden_concat,
+                prefill.first_logits,
+                prefill.hidden_offset,
+            )
+        };
         for cache in self.caches.iter_mut() {
             match cache {
-                DFlash2KVCache::Full(c) => c.offset = prefill.hidden_offset as i32,
-                DFlash2KVCache::Sliding(c) => c.offset = prefill.hidden_offset as i32,
+                DFlash2KVCache::Full(c) => c.offset = hidden_offset as i32,
+                DFlash2KVCache::Sliding(c) => c.offset = hidden_offset as i32,
             }
         }
         let mut bonus = {
             let (token, _) = mlxcel_core::sampling::sample_token_optimized(
-                &prefill.first_logits,
+                &first_logits,
                 sampling,
                 prompt_tokens,
             );
@@ -1553,9 +1717,37 @@ impl Qwen35Dflash2Generator {
         Ok(Dflash2Generation {
             token_ids: generated,
             stats,
+            cached_tokens,
         })
     }
 }
+fn materialize_detached(array: UniquePtr<MlxArray>) -> UniquePtr<MlxArray> {
+    mlxcel_core::eval(&array);
+    let ptr = array
+        .as_ref()
+        .expect("materialized MLX array must be non-null") as *const MlxArray;
+    unsafe { mlxcel_core::detach_all(&[ptr]) };
+    array
+}
+
+fn merge_hidden_context(
+    prefix: &MlxArray,
+    suffix: &MlxArray,
+    hidden_limit: usize,
+) -> UniquePtr<MlxArray> {
+    let combined = mlxcel_core::concatenate(prefix, suffix, 1);
+    let shape = mlxcel_core::array_shape(&combined);
+    if shape[1] as usize <= hidden_limit {
+        return combined;
+    }
+    let start = shape[1] - i32::try_from(hidden_limit).unwrap_or(i32::MAX);
+    mlxcel_core::slice(
+        &combined,
+        &[0, start, 0],
+        &[shape[0], shape[1], shape[2]],
+    )
+}
+
 
 /// Concatenate a `[1, L, H]` per-target-layer hidden list along `-1`.
 fn concatenate_hiddens(
