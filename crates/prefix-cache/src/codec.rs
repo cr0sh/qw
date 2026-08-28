@@ -145,6 +145,7 @@ pub fn encode_portable(
     let len = match &p {
         PortablePromptSnapshot::Baseline(m) => m.token_len,
         PortablePromptSnapshot::Mtp { target, .. } => target.token_len,
+        PortablePromptSnapshot::Dflash2 { target, .. } => target.token_len,
     };
     if t.is_empty()
         || len != t.len()
@@ -157,7 +158,7 @@ pub fn encode_portable(
         return Err("portable snapshot route and token length must match the cache entry".into());
     }
     validate_resume_metadata(t, res.as_ref())?;
-    let (f, df, off, dense, paged) = flatten(p);
+    let (f, df, off, dense, paged) = flatten(p)?;
     let mut blobs = Vec::new();
     let mut seen = HashSet::new();
     enum BlobBytes {
@@ -411,13 +412,16 @@ pub(crate) fn validate_resume_metadata(
 }
 fn flatten(
     p: PortablePromptSnapshot,
-) -> (
+) -> Result<
+    (
+        String,
+        Option<String>,
+        Option<i32>,
+        Vec<(ArrayRole, PortableArray)>,
+        Vec<(ArrayRole, PortablePagedTensor)>,
+    ),
     String,
-    Option<String>,
-    Option<i32>,
-    Vec<(ArrayRole, PortableArray)>,
-    Vec<(ArrayRole, PortablePagedTensor)>,
-) {
+> {
     fn m(
         mut x: PortableModelState,
         r: ArrayRole,
@@ -437,7 +441,7 @@ fn flatten(
     match p {
         PortablePromptSnapshot::Baseline(x) => {
             let (f, d, p) = m(x, ArrayRole::ModelTensor, ArrayRole::ModelContinuation);
-            (f, None, None, d, p)
+            Ok((f, None, None, d, p))
         }
         PortablePromptSnapshot::Mtp {
             target,
@@ -457,7 +461,10 @@ fn flatten(
             p.append(&mut pp);
             d.push((ArrayRole::LastHidden, last_hidden));
             d.push((ArrayRole::MtpContinuation, continuation_logits));
-            (f, Some(df), Some(draft_offset), d, p)
+            Ok((f, Some(df), Some(draft_offset), d, p))
+        }
+        PortablePromptSnapshot::Dflash2 { .. } => {
+            Err("DFlash2 snapshots are not supported by the prefix cache".into())
         }
     }
 }

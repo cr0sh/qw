@@ -1478,7 +1478,7 @@ impl Qwen35Dflash2Generator {
         Ok(Self {
             model,
             caches,
-            block_size: 5,
+            block_size: 4,
             target_layer_ids: config.target_layer_ids.clone(),
             hidden_limit,
         })
@@ -1623,12 +1623,18 @@ impl Qwen35Dflash2Generator {
             let _ = on_token(bonus);
         }
         let decode_start = Instant::now();
-        let mut draft_block =
-            vec![self.model.config.mask_token_id; self.block_size];
+        // Five-row verification pays off for the 64K target it was tuned on;
+        // its larger draft regresses the shorter decode paths.
+        let block_size = if prompt_tokens.len() >= 64_000 {
+            5
+        } else {
+            self.block_size
+        };
+        let mut draft_block = vec![self.model.config.mask_token_id; block_size];
 
         while generated.len() < max_tokens {
             let remaining = max_tokens - generated.len();
-            let bs = self.block_size.min(remaining + 1);
+            let bs = block_size.min(remaining + 1);
             if bs <= 1 {
                 break;
             }
