@@ -30,8 +30,6 @@ use engine::{
     WorkerEvent, WorkerFailure,
 };
 pub use engine::{Engine, SubmitError};
-#[cfg(feature = "specprefill")]
-pub use engine::SpecPrefillPolicyConfig;
 use protocol::{Endpoint, RequestError};
 
 #[derive(Clone)]

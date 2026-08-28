@@ -3293,16 +3293,8 @@ pub mod sampling;
 // microbenchmark and the server can read the cap-overflow counters.
 pub mod sampling_dispatch;
 
-// Speculative decoding
+// Speculative decoding and shared MTP acceptance logic.
 pub mod speculative;
-
-// Drafter trait + DrafterKind enum + model_type auto-detection. Foundational scaffolding for the Gemma 4 MTP and Qwen 3.5
-// DFlash drafter ports. Concrete drafter impls land.
-// The existing classic `SpeculativeGenerator` above is unchanged — MTP and
-// DFlash are peer code paths, not replacements.
-// TODO: wrap the existing SpeculativeGenerator in a
-// Drafter-trait adapter so the round-loop drivers can dispatch uniformly.
-pub mod drafter;
 
 // Generation-time stream selection and installation wrappers.
 // Public so that the server batch scheduler can install its own generation stream.

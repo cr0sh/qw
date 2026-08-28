@@ -5,9 +5,6 @@ edition = "2024"
 repository = "https://github.com/cr0sh/qw"
 publish = false
 
-[features]
-default = []
-specprefill = ["qw-runtime/specprefill"]
 
 [[bin]]
 name = "qw-server"

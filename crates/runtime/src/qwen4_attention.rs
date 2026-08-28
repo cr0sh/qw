@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Shared dense Qwen3.5 attention, MLP, quantization, and cache primitives.
+//! Shared dense Qwen4 attention, MLP, quantization, and cache primitives.
 
 use crate::gated_delta::GatedDeltaCache;
-use crate::qwen_mrope::{InterleavedMRoPE, apply_multimodal_rotary_pos_emb};
+use crate::qwen_rope::{InterleavedMRoPE, apply_rotary_pos_emb};
 use mlxcel_core::cache::KVCacheMode;
 use mlxcel_core::layers::{FusedQKVLinear, KVCache, QuantizedWeight, RMSNorm, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
@@ -40,7 +40,7 @@ pub struct Quantization {
 }
 
 #[derive(Debug, Clone)]
-pub struct Qwen3NextConfig {
+pub struct Qwen4AttentionConfig {
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
     pub head_dim: usize,
@@ -49,9 +49,14 @@ pub struct Qwen3NextConfig {
     pub partial_rotary_factor: f32,
     pub quantization: Option<Quantization>,
     pub mrope_section: Vec<i32>,
+    pub indexer_n_heads: usize,
+    pub indexer_kv_heads: usize,
+    pub indexer_head_dim: usize,
+    pub indexer_budget: usize,
+    pub indexer_compress_ratio: usize,
 }
 
-impl Qwen3NextConfig {
+impl Qwen4AttentionConfig {
     pub fn quant_params(&self, prefix: &str) -> (i32, i32) {
         let Some(quantization) = &self.quantization else {
             return (64, 4);
@@ -72,13 +77,13 @@ impl Qwen3NextConfig {
 }
 
 // Cache Types.
-/// Mixed cache type for Qwen3Next layers
-pub enum Qwen3NextCache {
+/// Mixed cache type for Qwen4 layers
+pub enum Qwen4LayerCache {
     Attention(Box<KVCache>),
     Linear(GatedDeltaCache),
 }
 
-impl Qwen3NextCache {
+impl Qwen4LayerCache {
     pub fn offset(&self) -> i32 {
         match self {
             Self::Attention(kv) => kv.offset,
@@ -108,8 +113,216 @@ impl Qwen3NextCache {
     }
 }
 
+struct Qwen4QsaIndexer {
+    projection: UnifiedLinear,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
+    n_heads: i32,
+    kv_heads: i32,
+    head_dim: i32,
+    compress_ratio: i32,
+    block_topk: i32,
+    rope_dims: i32,
+    mrope: InterleavedMRoPE,
+}
+
+impl Qwen4QsaIndexer {
+    fn from_weights(
+        weights: &WeightMap,
+        config: &Qwen4AttentionConfig,
+        attention_prefix: &str,
+    ) -> Result<Self, String> {
+        let prefix = format!("{attention_prefix}.indexer");
+        let projection_prefix = format!("{prefix}.index_qk_proj");
+        let (group, bits) = config.quant_params(&projection_prefix);
+        let projection = UnifiedLinear::from_weights(weights, &projection_prefix, group, bits)?;
+        let centered_norm = |name: &str| -> Result<RMSNorm, String> {
+            let weight = weights
+                .get(name)
+                .ok_or_else(|| format!("missing required tensor {name}"))?;
+            let ones = mlxcel_core::ones(
+                &mlxcel_core::array_shape(weight),
+                mlxcel_core::array_dtype(weight),
+            );
+            Ok(RMSNorm::new(
+                mlxcel_core::add(weight, &ones),
+                config.rms_norm_eps,
+            ))
+        };
+        Ok(Self {
+            projection,
+            q_norm: centered_norm(&format!("{prefix}.q_layernorm.weight"))?,
+            k_norm: centered_norm(&format!("{prefix}.k_layernorm.weight"))?,
+            n_heads: config.indexer_n_heads as i32,
+            kv_heads: config.indexer_kv_heads as i32,
+            head_dim: config.indexer_head_dim as i32,
+            compress_ratio: config.indexer_compress_ratio as i32,
+            block_topk: (config.indexer_budget / config.indexer_compress_ratio) as i32,
+            rope_dims: (config.indexer_head_dim as f32 * config.partial_rotary_factor) as i32,
+            mrope: InterleavedMRoPE::new(
+                (config.indexer_head_dim as f32 * config.partial_rotary_factor) as usize,
+                config.rope_theta,
+                config.mrope_section.clone(),
+            ),
+        })
+    }
+
+    fn apply_rope(&self, input: &MlxArray, positions: &[i32], batch: i32) -> UniquePtr<MlxArray> {
+        let mut ids = Vec::with_capacity(3 * batch as usize * positions.len());
+        for _axis in 0..3 {
+            for _row in 0..batch {
+                ids.extend_from_slice(positions);
+            }
+        }
+        let position_ids = mlxcel_core::from_slice_i32(&ids, &[3, batch, positions.len() as i32]);
+        let (cosine, sine) = self.mrope.forward(&position_ids);
+        let dtype = mlxcel_core::array_dtype(input);
+        let cosine = mlxcel_core::astype(&cosine, dtype);
+        let sine = mlxcel_core::astype(&sine, dtype);
+        let shape = mlxcel_core::array_shape(input);
+        let rotary = mlxcel_core::slice(
+            input,
+            &[0, 0, 0, 0],
+            &[shape[0], shape[1], shape[2], self.rope_dims],
+        );
+        let pass = mlxcel_core::slice(
+            input,
+            &[0, 0, 0, self.rope_dims],
+            &[shape[0], shape[1], shape[2], self.head_dim],
+        );
+        let (rotary, _) = apply_rotary_pos_emb(&rotary, &rotary, &cosine, &sine);
+        mlxcel_core::concatenate(&rotary, &pass, -1)
+    }
+
+    fn mask(&self, input: &MlxArray, cache: &mut KVCache) -> Option<UniquePtr<MlxArray>> {
+        let input_shape = mlxcel_core::array_shape(input);
+        let batch = input_shape[0];
+        let sequence = input_shape[1];
+        let past_len = cache.offset;
+        let projected = self.projection.forward(input);
+        let projected = mlxcel_core::reshape(
+            &projected,
+            &[batch, sequence, self.n_heads + self.kv_heads, self.head_dim],
+        );
+        let query = mlxcel_core::slice(
+            &projected,
+            &[0, 0, 0, 0],
+            &[batch, sequence, self.n_heads, self.head_dim],
+        );
+        let raw_keys = mlxcel_core::slice(
+            &projected,
+            &[0, 0, self.n_heads, 0],
+            &[batch, sequence, self.n_heads + self.kv_heads, self.head_dim],
+        );
+        let raw_keys = mlxcel_core::reshape(&raw_keys, &[batch, sequence, self.head_dim]);
+        cache.auxiliary_keys = Some(match cache.auxiliary_keys.take() {
+            Some(previous) => mlxcel_core::concatenate(&previous, &raw_keys, 1),
+            None => raw_keys,
+        });
+        let raw_keys = cache
+            .auxiliary_keys
+            .as_deref()
+            .expect("QSA raw keys were just installed");
+        let key_len = mlxcel_core::array_shape(raw_keys)[1];
+        if key_len != past_len + sequence {
+            return None;
+        }
+        let complete_blocks = key_len / self.compress_ratio;
+        if complete_blocks <= self.block_topk {
+            return None;
+        }
+
+        let query = self.q_norm.forward(&query);
+        let query = mlxcel_core::transpose_axes(&query, &[0, 2, 1, 3]);
+        let query_positions = (past_len..past_len + sequence).collect::<Vec<_>>();
+        let query = self.apply_rope(&query, &query_positions, batch);
+
+        let complete_key_len = complete_blocks * self.compress_ratio;
+        let pooled = mlxcel_core::slice(
+            raw_keys,
+            &[0, 0, 0],
+            &[batch, complete_key_len, self.head_dim],
+        );
+        let pooled = mlxcel_core::reshape(
+            &pooled,
+            &[batch, complete_blocks, self.compress_ratio, self.head_dim],
+        );
+        let pooled = mlxcel_core::mean_axis(
+            &mlxcel_core::astype(&pooled, mlxcel_core::dtype::FLOAT32),
+            2,
+            false,
+        );
+        let pooled = mlxcel_core::astype(&pooled, mlxcel_core::array_dtype(raw_keys));
+        let pooled = self.k_norm.forward(&pooled);
+        let pooled = mlxcel_core::expand_dims(&pooled, 1);
+        let block_positions = (0..complete_blocks)
+            .map(|block| block * self.compress_ratio)
+            .collect::<Vec<_>>();
+        let pooled = self.apply_rope(&pooled, &block_positions, batch);
+
+        let query_f32 = mlxcel_core::astype(&query, mlxcel_core::dtype::FLOAT32);
+        let pooled_f32 = mlxcel_core::astype(&pooled, mlxcel_core::dtype::FLOAT32);
+        let pooled_t = mlxcel_core::transpose_axes(&pooled_f32, &[0, 1, 3, 2]);
+        let scores = mlxcel_core::matmul(&query_f32, &pooled_t);
+        let zero = mlxcel_core::full_f32(&[1], 0.0, mlxcel_core::dtype::FLOAT32);
+        let scores = mlxcel_core::sum_axis(&mlxcel_core::maximum(&scores, &zero), 1, false);
+        let scores = mlxcel_core::multiply_scalar(&scores, 1.0 / (self.head_dim as f32).sqrt());
+
+        let query_ends = mlxcel_core::arange_i32(past_len + 1, past_len + sequence + 1, 1);
+        let query_ends = mlxcel_core::reshape(&query_ends, &[1, sequence, 1]);
+        let ratio = mlxcel_core::from_slice_i32(&[self.compress_ratio], &[1]);
+        let complete_counts = mlxcel_core::floor_divide(&query_ends, &ratio);
+        let block_ids = mlxcel_core::arange_i32(0, complete_blocks, 1);
+        let block_ids = mlxcel_core::reshape(&block_ids, &[1, 1, complete_blocks]);
+        let valid_blocks = mlxcel_core::less(&block_ids, &complete_counts);
+        let negative_infinity =
+            mlxcel_core::full_f32(&[1], f32::NEG_INFINITY, mlxcel_core::dtype::FLOAT32);
+        let scores = mlxcel_core::where_cond(&valid_blocks, &scores, &negative_infinity);
+        let selected = mlxcel_core::argpartition(&scores, -self.block_topk, -1);
+        let selected = mlxcel_core::slice(
+            &selected,
+            &[0, 0, complete_blocks - self.block_topk],
+            &[batch, sequence, complete_blocks],
+        );
+
+        let selected = mlxcel_core::expand_dims(&selected, -1);
+        let selected = mlxcel_core::multiply(&selected, &ratio);
+        let offsets = mlxcel_core::arange_i32(0, self.compress_ratio, 1);
+        let offsets = mlxcel_core::reshape(&offsets, &[1, 1, 1, self.compress_ratio]);
+        let selected = mlxcel_core::add(&selected, &offsets);
+        let selected = mlxcel_core::reshape(
+            &selected,
+            &[batch, sequence, self.block_topk * self.compress_ratio],
+        );
+        let selected_shape = mlxcel_core::array_shape(&selected);
+        let selected_values = mlxcel_core::ones(&selected_shape, mlxcel_core::dtype::BOOL);
+        let selected_mask =
+            mlxcel_core::zeros(&[batch, sequence, key_len + 1], mlxcel_core::dtype::BOOL);
+        let selected_mask =
+            mlxcel_core::put_along_axis(&selected_mask, &selected, &selected_values, -1);
+        let selected_mask =
+            mlxcel_core::slice(&selected_mask, &[0, 0, 0], &[batch, sequence, key_len]);
+
+        let tokens = mlxcel_core::arange_i32(0, key_len, 1);
+        let tokens = mlxcel_core::reshape(&tokens, &[1, 1, key_len]);
+        let tail_starts = mlxcel_core::multiply(&complete_counts, &ratio);
+        let tail = mlxcel_core::logical_and(
+            &mlxcel_core::greater_equal(&tokens, &tail_starts),
+            &mlxcel_core::less(&tokens, &query_ends),
+        );
+        let causal = mlxcel_core::less(&tokens, &query_ends);
+        let topk = mlxcel_core::from_slice_i32(&[self.block_topk], &[1]);
+        let use_sparse = mlxcel_core::greater(&complete_counts, &topk);
+        let sparse = mlxcel_core::logical_or(&selected_mask, &tail);
+        Some(mlxcel_core::expand_dims(
+            &mlxcel_core::where_cond(&use_sparse, &sparse, &causal),
+            1,
+        ))
+    }
+}
+
 // Attention with Gated Output.
-pub(crate) struct Qwen3NextAttention {
+pub(crate) struct Qwen4Attention {
     qkv_proj: FusedQKVLinear,
     o_proj: UnifiedLinear,
     q_norm: RMSNorm,
@@ -121,9 +334,10 @@ pub(crate) struct Qwen3NextAttention {
     rope_dims: i32,
     rope_base: f32,
     mrope: InterleavedMRoPE,
+    indexer: Option<Qwen4QsaIndexer>,
 }
 
-impl Qwen3NextAttention {
+impl Qwen4Attention {
     pub(crate) fn forward_with_position_ids(
         &self,
         x: &MlxArray,
@@ -133,23 +347,6 @@ impl Qwen3NextAttention {
     ) -> UniquePtr<MlxArray> {
         let (output, _) = self.forward_impl(x, cache, mask, position_ids, false);
         self.o_proj.forward(&output)
-    }
-
-    #[cfg(any(feature = "specprefill", test))]
-    /// Draft-lookahead entry point used by SpecPrefill. The captured tensor is
-    /// the normalized, post-RoPE query in `[B, H, L, D]` layout.
-    pub(crate) fn forward_with_query_capture(
-        &self,
-        x: &MlxArray,
-        cache: &mut KVCache,
-        mask: Option<&MlxArray>,
-        position_ids: Option<&MlxArray>,
-    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
-        let (output, queries) = self.forward_impl(x, cache, mask, position_ids, true);
-        (
-            self.o_proj.forward(&output),
-            queries.expect("query capture was requested"),
-        )
     }
 
     /// Verify-only entry point. Multi-token blocks use bottom-right causal
@@ -176,6 +373,11 @@ impl Qwen3NextAttention {
         let shape = mlxcel_core::array_shape(x);
         let b = shape[0];
         let l = shape[1];
+        let qsa_mask = self
+            .indexer
+            .as_ref()
+            .and_then(|indexer| indexer.mask(x, cache));
+        let mask = qsa_mask.as_deref().or(mask);
 
         // Q includes the learned gate plane, followed by K and V.
         let (q_proj_output, keys, values) = self.qkv_proj.forward(x);
@@ -236,7 +438,7 @@ impl Qwen3NextAttention {
                 &[b, self.num_kv_heads, l, self.head_dim],
             );
             let (query_rotary, key_rotary) =
-                apply_multimodal_rotary_pos_emb(&query_rotary, &key_rotary, &cosine, &sine);
+                apply_rotary_pos_emb(&query_rotary, &key_rotary, &cosine, &sine);
             queries = mlxcel_core::concatenate(&query_rotary, &query_pass, -1);
             keys = mlxcel_core::concatenate(&key_rotary, &key_pass, -1);
         } else {
@@ -287,10 +489,28 @@ impl Qwen3NextAttention {
         (gated, captured_query)
     }
 
+    #[cfg(test)]
     pub(crate) fn from_weights(
         weights: &WeightMap,
-        config: &Qwen3NextConfig,
+        config: &Qwen4AttentionConfig,
         prefix: &str,
+    ) -> Result<Self, String> {
+        Self::from_weights_with_norm_mode(weights, config, prefix, false)
+    }
+
+    pub(crate) fn from_weights_centered(
+        weights: &WeightMap,
+        config: &Qwen4AttentionConfig,
+        prefix: &str,
+    ) -> Result<Self, String> {
+        Self::from_weights_with_norm_mode(weights, config, prefix, true)
+    }
+
+    fn from_weights_with_norm_mode(
+        weights: &WeightMap,
+        config: &Qwen4AttentionConfig,
+        prefix: &str,
+        centered_norm: bool,
     ) -> Result<Self, String> {
         let q_prefix = format!("{}.q_proj", prefix);
         let o_prefix = format!("{}.o_proj", prefix);
@@ -308,17 +528,26 @@ impl Qwen3NextAttention {
         )?;
         let o_proj = UnifiedLinear::from_weights(weights, &o_prefix, o_group_size, o_bits)?;
 
-        let q_norm_weight = weights
-            .get(&format!("{}.q_norm.weight", prefix))
-            .map(|w| mlxcel_core::copy(w))
-            .ok_or_else(|| format!("Missing q_norm weight: {}", prefix))?;
-        let k_norm_weight = weights
-            .get(&format!("{}.k_norm.weight", prefix))
-            .map(|w| mlxcel_core::copy(w))
-            .ok_or_else(|| format!("Missing k_norm weight: {}", prefix))?;
+        let norm_weight = |name: &str| {
+            weights
+                .get(name)
+                .map(|weight| {
+                    if centered_norm {
+                        let ones = mlxcel_core::ones(
+                            &mlxcel_core::array_shape(weight),
+                            mlxcel_core::array_dtype(weight),
+                        );
+                        mlxcel_core::add(weight, &ones)
+                    } else {
+                        mlxcel_core::copy(weight)
+                    }
+                })
+                .ok_or_else(|| format!("Missing norm weight: {name}"))
+        };
+        let q_norm_weight = norm_weight(&format!("{}.q_norm.weight", prefix))?;
+        let k_norm_weight = norm_weight(&format!("{}.k_norm.weight", prefix))?;
 
         let head_dim = config.head_dim as i32;
-
         Ok(Self {
             qkv_proj,
             o_proj,
@@ -335,6 +564,11 @@ impl Qwen3NextAttention {
                 config.rope_theta,
                 config.mrope_section.clone(),
             ),
+            indexer: if centered_norm && config.indexer_n_heads > 0 {
+                Some(Qwen4QsaIndexer::from_weights(weights, config, prefix)?)
+            } else {
+                None
+            },
         })
     }
 }
@@ -436,7 +670,7 @@ impl Mlp {
 
     pub(crate) fn from_weights(
         weights: &WeightMap,
-        config: &Qwen3NextConfig,
+        config: &Qwen4AttentionConfig,
         prefix: &str,
     ) -> Result<Self, String> {
         let gate_prefix = format!("{}.gate_proj", prefix);
@@ -478,7 +712,7 @@ mod tests {
         );
     }
 
-    fn unequal_width_attention() -> Qwen3NextAttention {
+    fn unequal_width_attention() -> Qwen4Attention {
         const HIDDEN_SIZE: i32 = 3;
         const NUM_HEADS: i32 = 2;
         const NUM_KV_HEADS: i32 = 1;
@@ -513,9 +747,9 @@ mod tests {
         insert_f32(&mut weights, "self_attn.q_norm.weight", &[HEAD_DIM], 1.0);
         insert_f32(&mut weights, "self_attn.k_norm.weight", &[HEAD_DIM], 1.0);
 
-        Qwen3NextAttention::from_weights(
+        Qwen4Attention::from_weights(
             &weights,
-            &Qwen3NextConfig {
+            &Qwen4AttentionConfig {
                 num_attention_heads: NUM_HEADS as usize,
                 num_key_value_heads: NUM_KV_HEADS as usize,
                 head_dim: HEAD_DIM as usize,
@@ -524,6 +758,11 @@ mod tests {
                 partial_rotary_factor: 1.0,
                 quantization: None,
                 mrope_section: vec![1, 1, 1],
+                indexer_n_heads: 0,
+                indexer_kv_heads: 0,
+                indexer_head_dim: 0,
+                indexer_budget: 0,
+                indexer_compress_ratio: 1,
             },
             "self_attn",
         )

@@ -688,7 +688,7 @@ fn strict_manifest_rejects_unknown_fields_and_namespace_mismatch() {
     );
     let mut baseline_with_draft_family: serde_json::Value =
         serde_json::from_slice(&encoded.manifest).expect("manifest JSON");
-    baseline_with_draft_family["draft_family"] = "qwen3.5-mtp-draft".into();
+    baseline_with_draft_family["draft_family"] = "qwen4-mtp-draft".into();
     assert!(
         codec::parse_manifest(
             NAMESPACE,
@@ -717,14 +717,14 @@ fn mtp_manifest_round_trip_preserves_route_and_offset_validation() {
         bytes,
     };
     let model = || qw_runtime::PortableModelState {
-        family: "qwen3.5-target-v1".to_string(),
+        family: "qwen4-target".to_string(),
         token_len: 1,
         tensors: Vec::new(),
         paged_tensors: Vec::new(),
         continuation_logits: None,
     };
     let draft = qw_runtime::PortableModelState {
-        family: "qwen3.5-mtp-draft".to_string(),
+        family: "qwen4-mtp-draft".to_string(),
         token_len: 0,
         tensors: Vec::new(),
         paged_tensors: Vec::new(),
@@ -753,8 +753,8 @@ fn mtp_manifest_round_trip_preserves_route_and_offset_validation() {
     .expect("encode MTP");
     let manifest: serde_json::Value =
         serde_json::from_slice(&encoded.manifest).expect("manifest JSON");
-    assert_eq!(manifest["family"], "qwen3.5-target-v1");
-    assert_eq!(manifest["draft_family"], "qwen3.5-mtp-draft");
+    assert_eq!(manifest["family"], "qwen4-target");
+    assert_eq!(manifest["draft_family"], "qwen4-mtp-draft");
     let decoded =
         codec::decode(MTP_NAMESPACE, &encoded.manifest, encoded.blobs.clone()).expect("decode MTP");
     assert!(matches!(decoded.snapshot, PromptSnapshot::Mtp(_)));
@@ -765,8 +765,8 @@ fn mtp_manifest_round_trip_preserves_route_and_offset_validation() {
     let qw_runtime::PortablePromptSnapshot::Mtp { target, draft, .. } = restored else {
         panic!("restored baseline snapshot from MTP manifest");
     };
-    assert_eq!(target.family, "qwen3.5-target-v1");
-    assert_eq!(draft.family, "qwen3.5-mtp-draft");
+    assert_eq!(target.family, "qwen4-target");
+    assert_eq!(draft.family, "qwen4-mtp-draft");
 
     for draft_family in [serde_json::Value::Null, "".into()] {
         let mut malformed = manifest.clone();

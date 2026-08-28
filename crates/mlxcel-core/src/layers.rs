@@ -147,23 +147,6 @@ impl QuantizedWeight {
             None => out,
         }
     }
-
-    /// Produce an independent handle that shares the same underlying MLX
-    /// quantized-weight buffers.
-    ///
-    /// Used by speculative drafters that lazy-bind an untied target
-    /// `lm_head` without copying the actual tensor payloads.
-    pub fn clone_shared(&self) -> Self {
-        Self {
-            weight: ffi::copy(&self.weight),
-            scales: ffi::copy(&self.scales),
-            biases: self.biases.as_ref().map(|b| ffi::copy(b)),
-            group_size: self.group_size,
-            bits: self.bits,
-            mode: self.mode.clone(),
-            global_scale: self.global_scale.as_ref().map(|g| ffi::copy(g)),
-        }
-    }
 }
 
 /// Whether native-NVFP4 global-scale fusion is disabled via
@@ -220,21 +203,6 @@ impl Embedding {
     pub fn as_linear(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
         let wt = ffi::transpose(&self.weight);
         ffi::matmul(x, &wt)
-    }
-
-    /// Produce an independent handle that shares the same underlying MLX
-    /// weight buffer.
-    ///
-    /// `ffi::copy` creates a new lazy-array node pointing at the same data
-    /// (no element copy), so this is cheap. Used by speculative drafters
-    /// (DFlash) that lazy-bind the target's embedding table at `bind()`
-    /// time instead of loading their own `embed_tokens.weight`.
-    ///
-    /// Used by: DFlash drafter lazy-bind path (`Drafter::bind`)
-    pub fn clone_shared(&self) -> Self {
-        Self {
-            weight: ffi::copy(&self.weight),
-        }
     }
 }
 
@@ -374,22 +342,6 @@ impl QuantizedEmbedding {
             )
         }
     }
-
-    /// Produce an independent handle that shares the same underlying MLX
-    /// weight / scales / biases buffers (lazy-array share via `ffi::copy`,
-    /// no element copy).
-    ///
-    /// Used by: DFlash drafter lazy-bind path (`Drafter::bind`)
-    pub fn clone_shared(&self) -> Self {
-        Self {
-            weight: ffi::copy(&self.weight),
-            scales: ffi::copy(&self.scales),
-            biases: self.biases.as_ref().map(|b| ffi::copy(b)),
-            group_size: self.group_size,
-            bits: self.bits,
-            mode: self.mode.clone(),
-        }
-    }
 }
 
 /// Unified embedding that auto-detects quantization
@@ -459,26 +411,6 @@ impl UnifiedEmbedding {
         match self {
             Self::Quantized(e) => Some(e),
             Self::Regular(_) => None,
-        }
-    }
-
-    /// Produce an independent [`UnifiedEmbedding`] that shares the same
-    /// underlying MLX buffers (lazy-array share, no element copy).
-    ///
-    /// This is the lazy-bind primitive used by speculative drafters whose
-    /// checkpoint omits `embed_tokens.weight` and instead resolve it from
-    /// the target at `bind()` time — most notably the upstream
-    /// `z-lab/Qwen3.5-4B-DFlash` checkpoint (see
-    /// `crate::drafter::dflash::DFlashDraftModel`). The drafter holds the
-    /// returned handle for the lifetime of the speculative session; it
-    /// stays valid independently of the target because MLX arrays are
-    /// reference-counted.
-    ///
-    /// Used by: DFlash drafter lazy-bind path (`Drafter::bind`)
-    pub fn clone_shared(&self) -> Self {
-        match self {
-            Self::Quantized(e) => Self::Quantized(e.clone_shared()),
-            Self::Regular(e) => Self::Regular(e.clone_shared()),
         }
     }
 
@@ -1111,21 +1043,6 @@ impl Linear {
         match &self.bias {
             Some(b) => ffi::add(&result, b),
             None => result,
-        }
-    }
-
-    /// Produce an independent handle that shares the same underlying MLX
-    /// weight/bias buffers.
-    ///
-    /// Runtime LoRA state is intentionally not carried over: this helper is
-    /// for binding target projection heads into speculative drafters after
-    /// load-time adapter fusion/sanitization has already happened.
-    pub fn clone_shared(&self) -> Self {
-        Self {
-            weight: ffi::copy(&self.weight),
-            bias: self.bias.as_ref().map(|b| ffi::copy(b)),
-            loras: Vec::new(),
-            active_lora: std::cell::Cell::new(None),
         }
     }
 }
@@ -2210,20 +2127,6 @@ impl UnifiedLinear {
         match self {
             Self::Regular(linear) => Some(linear),
             Self::Quantized { .. } => None,
-        }
-    }
-
-    /// Produce an independent handle that shares the same underlying MLX
-    /// buffers.
-    ///
-    /// Used by: DFlash lazy binding for untied target `lm_head` projections.
-    pub fn clone_shared(&self) -> Self {
-        match self {
-            Self::Quantized { weight, bias } => Self::Quantized {
-                weight: weight.clone_shared(),
-                bias: bias.as_ref().map(|b| ffi::copy(b)),
-            },
-            Self::Regular(linear) => Self::Regular(linear.clone_shared()),
         }
     }
 }
@@ -3400,13 +3303,19 @@ impl MoESwitch {
         }
     }
 
-    /// Forward pass with expert indices
-    /// x: [batch, seq_len, hidden_dim]
-    /// indices: [batch, seq_len] - expert index for each token
+    /// Forward pass with expert indices.
+    /// x: [..., hidden_dim]
+    /// indices: [..., top_k]
+    /// output: [..., top_k, hidden_dim]
     pub fn forward(&self, x: &MlxArray, indices: &MlxArray) -> UniquePtr<MlxArray> {
+        // `gather_qmm` follows MLX SwitchGLU's batched-matrix convention:
+        // singleton matrix and routing axes prevent a sequence axis from
+        // broadcasting into the expert-selection axis.
+        let x = ffi::expand_dims(x, -2);
+        let x = ffi::expand_dims(&x, -3);
         let gate = unsafe {
             ffi::gather_qmm(
-                x,
+                &x,
                 &self.gate_proj.weight,
                 &self.gate_proj.scales,
                 self.gate_proj.biases_ptr(),
@@ -3422,7 +3331,7 @@ impl MoESwitch {
 
         let up = unsafe {
             ffi::gather_qmm(
-                x,
+                &x,
                 &self.up_proj.weight,
                 &self.up_proj.scales,
                 self.up_proj.biases_ptr(),
@@ -3438,7 +3347,7 @@ impl MoESwitch {
 
         let activated = ffi::compiled_swiglu_activation(&gate, &up);
 
-        unsafe {
+        let output = unsafe {
             ffi::gather_qmm(
                 &activated,
                 &self.down_proj.weight,
@@ -3452,7 +3361,8 @@ impl MoESwitch {
                 false,
                 &self.down_proj.mode,
             )
-        }
+        };
+        ffi::squeeze_axis(&output, -2)
     }
 }
 
@@ -6791,81 +6701,6 @@ mod tests {
             err.contains("v_proj.scales"),
             "the fused path's own message must survive: {err}"
         );
-    }
-
-    /// `Embedding::clone_shared` produces an independent handle whose
-    /// `forward` result matches the original — the lazy-array share
-    /// (`ffi::copy`) points at the same data, so an embedding lookup
-    /// through the clone is byte-identical to the original. Used by the
-    /// DFlash drafter lazy-bind path.
-    #[test]
-    fn embedding_clone_shared_matches_original_forward() {
-        // [vocab = 4, hidden = 3] embedding table with distinct rows so a
-        // lookup actually exercises the shared buffer.
-        let weight = ffi::from_slice_f32(
-            &[
-                0.0, 1.0, 2.0, // row 0
-                3.0, 4.0, 5.0, // row 1
-                6.0, 7.0, 8.0, // row 2
-                9.0, 10.0, 11.0, // row 3
-            ],
-            &[4, 3],
-        );
-        let embed = Embedding::new(weight);
-        let cloned = embed.clone_shared();
-
-        let ids = ffi::from_slice_i32(&[2, 0], &[1, 2]);
-        let orig_out = embed.forward(&ids);
-        let clone_out = cloned.forward(&ids);
-        ffi::eval(&orig_out);
-        ffi::eval(&clone_out);
-
-        assert_eq!(
-            ffi::array_shape(&orig_out),
-            ffi::array_shape(&clone_out),
-            "clone_shared forward shape must match the original",
-        );
-        // Output is [batch = 1, seq = 2, hidden = 3]: row 2 of the table
-        // at seq position 0, row 0 at seq position 1.
-        let expected: [[f32; 3]; 2] = [[6.0, 7.0, 8.0], [0.0, 1.0, 2.0]];
-        for (s, want_row) in expected.iter().enumerate() {
-            for (h, &want) in want_row.iter().enumerate() {
-                let elem = ffi::slice(
-                    &clone_out,
-                    &[0_i32, s as i32, h as i32],
-                    &[1_i32, s as i32 + 1, h as i32 + 1],
-                );
-                ffi::eval(&elem);
-                let got = ffi::item_f32(&elem);
-                assert!(
-                    (got - want).abs() < 1e-6,
-                    "clone_shared forward element [seq={s}, hidden={h}]: got {got}, want {want}",
-                );
-            }
-        }
-    }
-
-    /// `UnifiedEmbedding::clone_shared` on the `Regular` arm yields a
-    /// `Regular` clone (the variant is preserved) usable as a standalone
-    /// embedding. This is the exact shape the Qwen 3.5 target hands to a
-    /// lazy-bind DFlash drafter.
-    #[test]
-    fn unified_embedding_clone_shared_preserves_regular_variant() {
-        use crate::dtype;
-
-        let weight = ffi::zeros(&[4, 3], dtype::FLOAT32);
-        let unified = UnifiedEmbedding::Regular(Embedding::new(weight));
-        let cloned = unified.clone_shared();
-
-        assert!(
-            !cloned.is_quantized(),
-            "clone_shared of a Regular UnifiedEmbedding must stay Regular",
-        );
-        // The clone is a usable embedding: a lookup returns the right shape.
-        let ids = ffi::from_slice_i32(&[0], &[1, 1]);
-        let out = cloned.forward(&ids);
-        ffi::eval(&out);
-        assert_eq!(ffi::array_shape(&out).as_slice(), &[1, 1, 3]);
     }
 
     /// Verify that `metal4_attention` falls back correctly on all hardware.

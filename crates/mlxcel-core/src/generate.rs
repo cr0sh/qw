@@ -1010,45 +1010,6 @@ pub trait LanguageModel {
         None // default: not supported
     }
 
-    /// Hand out a shared-buffer handle to this model's input embedding
-    /// table for speculative drafters that lazy-bind it.
-    ///
-    /// Unlike [`Self::embed_tokens`] (which applies the embedding to a
-    /// given id tensor), this returns the embedding *module* itself so a
-    /// drafter can use it both as an embedding lookup and as a tied LM
-    /// head (`UnifiedEmbedding::as_linear`). The returned
-    /// [`UnifiedEmbedding`] shares the underlying MLX buffers with the
-    /// target (lazy-array share via `UnifiedEmbedding::clone_shared` — no
-    /// element copy) and stays valid for the lifetime of the speculative
-    /// session.
-    ///
-    /// The default returns `None`; only targets that can pair with a
-    /// lazy-bind drafter override it. Concretely, the upstream
-    /// `z-lab/Qwen3.5-4B-DFlash` checkpoint omits `embed_tokens.weight`
-    /// and the Rust DFlash drafter resolves it here during
-    /// [`crate::drafter::Drafter::bind`].
-    ///
-    /// Used by: DFlash drafter lazy-bind path; Gemma 4 MTP assistant
-    /// binding; Qwen 3.5 target family; Gemma 4 target family
-    fn embed_tokens_module(&self) -> Option<crate::layers::UnifiedEmbedding> {
-        None // default: not supported
-    }
-
-    /// Hand out a shared-buffer handle to this model's output projection
-    /// when the projection is untied from the input embedding table.
-    ///
-    /// Some DFlash checkpoints (for example `z-lab/Qwen3.5-27B-DFlash`)
-    /// omit both `embed_tokens.weight` and `lm_head.weight`; upstream Python
-    /// binds both modules from the target at runtime, falling back to
-    /// `embed_tokens.as_linear` only when the target has no explicit head.
-    /// The default returns `None` so tied-embedding models keep using the
-    /// embedding table path.
-    ///
-    /// Used by: DFlash drafter lazy-bind path for untied Qwen 3.5 targets.
-    fn lm_head_module(&self) -> Option<crate::layers::UnifiedLinear> {
-        None // default: tied or unsupported
-    }
-
     /// Activate request-owned state after generator reset and immediately
     /// before an embedding prefill.
     fn prepare_embedding_prefill(&self) -> Result<(), String> {

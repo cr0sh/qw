@@ -17,7 +17,7 @@
 //! This module provides the core gated delta net primitives used by models
 //! that employ hybrid transformer + linear attention architectures.
 //!
-//! Used by: Qwen3Next, Qwen3.5, KimiLinear
+//! Used by: Qwen4, Qwen4, KimiLinear
 //!
 //! Reference: https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/gated_delta.py
 
@@ -36,10 +36,14 @@ const GATED_DELTA_CHUNK_SIZE: usize = 64;
 /// Cache for GatedDeltaNet (linear attention) layers.
 /// Stores conv1d state and recurrent SSM state.
 ///
-/// Used by: Qwen3Next, Qwen3.5, KimiLinear
+/// Used by: Qwen4, Qwen4, KimiLinear
 pub struct GatedDeltaCache {
     pub conv_state: Option<UniquePtr<MlxArray>>, // [batch, kernel-1, conv_dim]
     pub state_cache: Option<UniquePtr<MlxArray>>, // [batch, num_v_heads, head_v_dim, head_k_dim]
+    /// Qwen4-Exp PLE dilated-convolution tail for the layer carrying PLE.
+    pub ple_conv_state: Option<UniquePtr<MlxArray>>,
+    /// Last `ngram_size - 1` token IDs, retained across decode calls.
+    pub ple_token_history: Vec<i32>,
     pub offset: i32,
 }
 
@@ -48,6 +52,8 @@ impl GatedDeltaCache {
         Self {
             conv_state: None,
             state_cache: None,
+            ple_conv_state: None,
+            ple_token_history: Vec::new(),
             offset: 0,
         }
     }
@@ -55,7 +61,6 @@ impl GatedDeltaCache {
     pub fn advance(&mut self, step: i32) {
         self.offset += step;
     }
-
 }
 
 impl Default for GatedDeltaCache {
@@ -72,7 +77,7 @@ impl Default for GatedDeltaCache {
 /// so the ops-path state accumulation stays in higher precision (the Python
 /// Metal kernel path uses float32 state internally for the same reason).
 ///
-/// Used by: Qwen3Next, Qwen3.5, KimiLinear
+/// Used by: Qwen4, Qwen4, KimiLinear
 pub fn compute_g(a_log: &MlxArray, a: &MlxArray, dt_bias: &MlxArray) -> UniquePtr<MlxArray> {
     mlxcel_core::compiled_gated_delta_gate(a_log, a, dt_bias)
 }
@@ -88,7 +93,7 @@ pub fn compute_g(a_log: &MlxArray, a: &MlxArray, dt_bias: &MlxArray) -> UniquePt
 ///
 /// Returns: (y: [B, H, Dv] in q dtype, new_state: [B, H, Dv, Dk] in float32)
 ///
-/// Used by: Qwen3Next, Qwen3.5, KimiLinear
+/// Used by: Qwen4, Qwen4, KimiLinear
 pub fn gated_delta_step(
     q: &MlxArray,
     k: &MlxArray,
@@ -179,7 +184,7 @@ pub fn gated_delta_step(
 ///
 /// Returns: (y: [B, T, Hv, Dv] in q dtype, state: [B, Hv, Dv, Dk] in float32)
 ///
-/// Used by: Qwen3Next, Qwen3.5, KimiLinear
+/// Used by: Qwen4, Qwen4, KimiLinear
 pub fn gated_delta_ops(
     q: &MlxArray,
     k: &MlxArray,
@@ -407,7 +412,7 @@ pub fn gated_delta_ops(
 /// `Ainv = (I + T)^{-1}` is formed by the finite Neumann series (T is nilpotent).
 /// All decay ratios are kept in the log domain and clamped so no entry overflows.
 ///
-/// Used by: Qwen3Next, Qwen3.5, KimiLinear
+/// Used by: Qwen4, Qwen4, KimiLinear
 #[allow(clippy::too_many_arguments)]
 fn gated_delta_chunked(
     q_ref: &MlxArray,
@@ -603,7 +608,7 @@ fn gated_delta_chunked(
 /// lane, so `Dk` must cover at least one full SIMD group and be exactly
 /// divisible by 32. Its GQA mapping also requires an integral `Hv / Hk`.
 ///
-/// Used by: Qwen3Next, Qwen3.5, KimiLinear
+/// Used by: Qwen4, Qwen4, KimiLinear
 fn supports_metal_gated_delta_kernel(hk: i32, hv: i32, dk: i32, dv: i32) -> bool {
     hk > 0 && hv > 0 && dv > 0 && dk >= 32 && dk % 32 == 0 && hv >= hk && hv % hk == 0
 }
@@ -613,7 +618,7 @@ fn supports_metal_gated_delta_kernel(hk: i32, hv: i32, dk: i32, dv: i32) -> bool
 /// Computes beta = sigmoid(b) and g = exp(-exp(A_log.float32) * softplus(a + dt_bias)),
 /// then runs the ops-based implementation with float32 state accumulation.
 ///
-/// Used by: Qwen3Next, Qwen3.5, KimiLinear
+/// Used by: Qwen4, Qwen4, KimiLinear
 pub fn gated_delta_update(
     (q, k, v): (&MlxArray, &MlxArray, &MlxArray),
     (a, b, a_log, dt_bias): (&MlxArray, &MlxArray, &MlxArray, &MlxArray),
@@ -636,40 +641,46 @@ pub fn gated_delta_update(
 /// attention q/k normalization, avoiding the expanded square/mean/sqrt/divide
 /// graph on every decode step.
 ///
-/// Used by: Qwen3Next, Qwen3.5, KimiLinear
+/// Used by: Qwen4, Qwen4, KimiLinear
 pub fn scaled_fast_rms_norm_no_weight(x: &MlxArray, scale: f32, eps: f32) -> UniquePtr<MlxArray> {
     let normed = mlxcel_core::fast_rms_norm_no_weight(x, eps);
     mlxcel_core::multiply_scalar(&normed, scale)
 }
 
 // RMSNorm with optional gating.
-/// RMSNorm with optional SwiGLU gating (for GatedDeltaNet output).
-/// Gating: silu(gate) * rms_norm(x)
-///
-/// Used by: Qwen3Next, Qwen3.5, KimiLinear
+/// RMSNorm with either SiLU or sigmoid gating for GatedDeltaNet output.
 pub struct RMSNormGated {
     weight: UniquePtr<MlxArray>,
     eps: f32,
+    sigmoid_gate: bool,
 }
 
 impl RMSNormGated {
     pub fn new(weight: UniquePtr<MlxArray>, eps: f32) -> Self {
-        Self { weight, eps }
+        Self {
+            weight,
+            eps,
+            sigmoid_gate: false,
+        }
+    }
+
+    pub fn new_sigmoid(weight: UniquePtr<MlxArray>, eps: f32) -> Self {
+        Self {
+            weight,
+            eps,
+            sigmoid_gate: true,
+        }
     }
 
     pub fn forward(&self, x: &MlxArray, gate: Option<&MlxArray>) -> UniquePtr<MlxArray> {
         let target_dtype = mlxcel_core::array_dtype(x);
-
-        // Reference mlx-lm uses mx.fast.rms_norm here. Keeping this as the
-        // fast kernel avoids expanding the gated delta decode graph with
-        // square/mean/sqrt/divide/multiply per linear-attention layer.
         let scaled = mlxcel_core::fast_rms_norm(x, &self.weight, self.eps);
-
-        // Apply SwiGLU gating: silu(gate) * x
-        // Python mlx-lm promotes the gated path to float32 before restoring the
-        // hidden-state dtype so Qwen3Next/Qwen3.5 keep the expected precision.
-        if let Some(g) = gate {
-            precise_swiglu_gate(&scaled, g, target_dtype)
+        if let Some(gate) = gate {
+            if self.sigmoid_gate {
+                precise_sigmoid_gate(&scaled, gate, target_dtype)
+            } else {
+                precise_swiglu_gate(&scaled, gate, target_dtype)
+            }
         } else {
             restore_dtype(scaled, target_dtype)
         }
@@ -692,3 +703,10 @@ fn precise_swiglu_gate(x: &MlxArray, gate: &MlxArray, target_dtype: i32) -> Uniq
     restore_dtype(product, target_dtype)
 }
 
+fn precise_sigmoid_gate(x: &MlxArray, gate: &MlxArray, target_dtype: i32) -> UniquePtr<MlxArray> {
+    let gate_f32 = mlxcel_core::astype(gate, dtype::FLOAT32);
+    let gate_sigmoid = mlxcel_core::sigmoid(&gate_f32);
+    let x_f32 = mlxcel_core::astype(x, dtype::FLOAT32);
+    let product = mlxcel_core::multiply(&gate_sigmoid, &x_f32);
+    restore_dtype(product, target_dtype)
+}

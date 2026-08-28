@@ -1,8 +1,6 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-#[cfg(feature = "specprefill")]
-use crate::SpecPrefillPolicyConfig;
 use crate::{Engine, router};
 use anyhow::{Context, Result, ensure};
 use clap_derive::{Args as DeriveArgs, ValueEnum};
@@ -125,22 +123,6 @@ pub struct ServerArgs {
     #[arg(long = "mtp-k", default_value_t = 3)]
     mtp_k: usize,
 
-    #[cfg(feature = "specprefill")]
-    /// Current-turn token threshold above which SpecPrefill activates.
-    #[arg(long, default_value_t = 8_000)]
-    specprefill_min_turn_tokens: usize,
-    #[cfg(feature = "specprefill")]
-    /// Fraction of score-ranked prompt chunks retained by SpecPrefill.
-    #[arg(long, default_value_t = 0.25)]
-    specprefill_keep_rate: f32,
-    #[cfg(feature = "specprefill")]
-    /// Tokens force-kept at the start of the SpecPrefill-eligible suffix.
-    #[arg(long, default_value_t = 256)]
-    specprefill_keep_first_tokens: usize,
-    #[cfg(feature = "specprefill")]
-    /// Tokens force-kept at the end of the SpecPrefill-eligible suffix.
-    #[arg(long, default_value_t = 256)]
-    specprefill_keep_last_tokens: usize,
     /// Disable the default 8-bit TurboQuant KV cache.
     #[arg(long)]
     no_kv_quantization: bool,
@@ -163,17 +145,7 @@ impl ServerArgs {
         if self.no_kv_quantization {
             KVCacheMode::Fp16
         } else {
-            KVCacheMode::Turbo4
-        }
-    }
-
-    #[cfg(feature = "specprefill")]
-    fn specprefill_policy(&self) -> SpecPrefillPolicyConfig {
-        SpecPrefillPolicyConfig {
-            min_turn_tokens: self.specprefill_min_turn_tokens,
-            keep_rate: self.specprefill_keep_rate,
-            keep_first_tokens: self.specprefill_keep_first_tokens,
-            keep_last_tokens: self.specprefill_keep_last_tokens,
+            KVCacheMode::Turbo8
         }
     }
 }
@@ -188,8 +160,6 @@ fn validate_cli(cli: &ServerArgs) -> Result<()> {
         "--prefix-cache-filesystem-bytes must be greater than zero"
     );
     ensure!(cli.mtp_k >= 2, "--mtp-k must be at least 2");
-    #[cfg(feature = "specprefill")]
-    cli.specprefill_policy().validate()?;
     Ok(())
 }
 
@@ -200,8 +170,7 @@ fn default_prefix_cache_directory() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".cache/qw/checkpoint"))
 }
 
-const DEFAULT_PERSISTENT_LOG_FILTER: &str =
-    "debug,qw_server=trace,qw_runtime=trace,qw_prefix_cache=trace,qw_cli=trace,tokenizers=info";
+const DEFAULT_PERSISTENT_LOG_FILTER: &str = "debug,qw_server=trace,qw_runtime=trace,qw_prefix_cache=trace,mlxcel_core=trace,qw_cli=trace,tokenizers=info";
 
 fn resolve_persistent_log_filter(
     cli_filter: Option<&str>,
@@ -301,8 +270,6 @@ pub async fn serve(cli: ServerArgs) -> Result<()> {
     info!(phase = "server.starting", bind = %bind);
 
     let kv_cache_mode = cli.kv_cache_mode();
-    #[cfg(feature = "specprefill")]
-    let specprefill_policy = cli.specprefill_policy();
     let model = resolve_model_path(cli.model.as_deref())?;
     let prefix_cache_directory = resolve_prefix_cache_directory(cli.prefix_cache_directory)?;
     let engine = Engine::start_qwen(
@@ -315,8 +282,6 @@ pub async fn serve(cli: ServerArgs) -> Result<()> {
         },
         cli.mtp_k,
         kv_cache_mode,
-        #[cfg(feature = "specprefill")]
-        specprefill_policy,
     )?;
     let listener = tokio::net::TcpListener::bind(bind)
         .await
@@ -339,7 +304,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
     use tracing_subscriber::{EnvFilter, Layer as _, layer::SubscriberExt as _};
     #[derive(Debug, Parser)]
-    #[command(name = "qw-server", about = "OpenAI-compatible Qwen3.8 Flash Next server")]
+    #[command(
+        name = "qw-server",
+        about = "OpenAI-compatible Qwen3.8 Flash Next server"
+    )]
     struct TestCli {
         #[command(flatten)]
         args: ServerArgs,
@@ -377,7 +345,7 @@ mod tests {
                 stream = tracing::field::Empty,
             );
             let _entered = span.enter();
-            span.record("model", "Qwen3.8-27B");
+            span.record("model", "Qwen3.8-Flash-Next-REAP-288");
             span.record("stream", true);
             tracing::info!(request_id = 42, "persisted event");
         });
@@ -387,7 +355,7 @@ mod tests {
         assert!(!output.contains("field_error"), "{output}");
         let parsed: serde_json::Value = serde_json::from_str(output.trim_end()).unwrap();
         assert_eq!(parsed["spans"][0]["name"], "server.request");
-        assert_eq!(parsed["spans"][0]["model"], "Qwen3.8-27B");
+        assert_eq!(parsed["spans"][0]["model"], "Qwen3.8-Flash-Next-REAP-288");
         assert_eq!(parsed["spans"][0]["stream"], true);
         assert_eq!(parsed["fields"]["message"], "persisted event");
         assert_eq!(parsed["fields"]["request_id"], 42);
@@ -462,8 +430,9 @@ mod tests {
 
     #[test]
     fn persistent_log_filter_defaults_and_preserves_precedence() {
-        let default_output =
-            capture_persistent_log_filter_events(resolve_persistent_log_filter(None, None).unwrap());
+        let default_output = capture_persistent_log_filter_events(
+            resolve_persistent_log_filter(None, None).unwrap(),
+        );
         for message in [
             "qw_server trace",
             "qw_runtime trace",
@@ -552,10 +521,10 @@ mod tests {
     }
 
     #[test]
-    fn turbo4_kv_quantization_is_default_with_explicit_opt_out() {
+    fn turbo8_kv_quantization_is_default_with_explicit_opt_out() {
         let default =
             TestCli::try_parse_from(["qw-server", "--model", "/tmp/checkpoint"]).expect("CLI");
-        assert_eq!(default.args.kv_cache_mode(), KVCacheMode::Turbo4);
+        assert_eq!(default.args.kv_cache_mode(), KVCacheMode::Turbo8);
 
         let unquantized = TestCli::try_parse_from([
             "qw-server",
@@ -703,69 +672,6 @@ mod tests {
             negative.to_string().contains("invalid byte size '-1'"),
             "{negative}"
         );
-    }
-
-    #[cfg(not(feature = "specprefill"))]
-    #[test]
-    fn cli_omits_specprefill_controls_without_feature() {
-        let help = TestCli::command().render_long_help().to_string();
-        assert!(!help.contains("--specprefill-"), "{help}");
-    }
-
-    #[cfg(feature = "specprefill")]
-    #[test]
-    fn cli_configures_specprefill_policy() {
-        let defaults =
-            TestCli::try_parse_from(["qw-server", "--model", "/tmp/checkpoint"]).expect("CLI");
-        let policy = defaults.args.specprefill_policy();
-        assert_eq!(policy.min_turn_tokens, 8_000);
-        assert_eq!(policy.keep_rate, 0.25);
-        assert_eq!(policy.keep_first_tokens, 256);
-        assert_eq!(policy.keep_last_tokens, 256);
-        validate_cli(&defaults.args).expect("default SpecPrefill policy");
-
-        let custom = TestCli::try_parse_from([
-            "qw-server",
-            "--model",
-            "/tmp/checkpoint",
-            "--specprefill-min-turn-tokens",
-            "12000",
-            "--specprefill-keep-rate",
-            "0.4",
-            "--specprefill-keep-first-tokens",
-            "0",
-            "--specprefill-keep-last-tokens",
-            "64",
-        ])
-        .expect("custom SpecPrefill CLI");
-        let policy = custom.args.specprefill_policy();
-        assert_eq!(policy.min_turn_tokens, 12_000);
-        assert_eq!(policy.keep_rate, 0.4);
-        assert_eq!(policy.keep_first_tokens, 0);
-        assert_eq!(policy.keep_last_tokens, 64);
-        validate_cli(&custom.args).expect("custom SpecPrefill policy");
-
-        let invalid_threshold =
-            TestCli::try_parse_from(["qw-server", "--specprefill-min-turn-tokens", "0"])
-                .expect("threshold reaches startup validation");
-        assert!(validate_cli(&invalid_threshold.args).is_err());
-
-        for rate in ["0", "1.1", "NaN"] {
-            let invalid_rate =
-                TestCli::try_parse_from(["qw-server", "--specprefill-keep-rate", rate])
-                    .expect("keep rate reaches startup validation");
-            assert!(validate_cli(&invalid_rate.args).is_err(), "rate={rate}");
-        }
-
-        let help = TestCli::command().render_long_help().to_string();
-        for option in [
-            "--specprefill-min-turn-tokens",
-            "--specprefill-keep-rate",
-            "--specprefill-keep-first-tokens",
-            "--specprefill-keep-last-tokens",
-        ] {
-            assert!(help.contains(option), "{help}");
-        }
     }
 
     #[test]

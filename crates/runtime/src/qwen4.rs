@@ -12,23 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Dense Qwen3.5 hybrid text model.
+//! Dense Qwen4 hybrid text model.
 //!
-//! Reference: https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/qwen3_5.py
+//! Reference: https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/qwen4.py
 
 use crate::gated_delta::{
     GatedDeltaCache, RMSNormGated, gated_delta_update, scaled_fast_rms_norm_no_weight,
 };
 use crate::model_owned::ModelOwnedSequenceState;
-use crate::qwen_mrope_state::MRopeState;
-use crate::qwen_vl_position::decode_rope_positions;
-use crate::qwen3_5_mtp::Qwen35MtpDraftModel;
-use crate::qwen3_next::{Mlp, Quantization, Qwen3NextAttention, Qwen3NextCache, Qwen3NextConfig};
-use crate::qwen3_vl_vision::{Qwen3VLVisionConfig, Qwen3VLVisionEncoder};
+use crate::ngram_offload::{NGramTable, NGramTableSpec};
+use crate::qwen_position::decode_rope_positions;
+use crate::qwen_rope_state::RopeState;
+use crate::qwen4_attention::{
+    Mlp, Quantization, Qwen4Attention, Qwen4AttentionConfig, Qwen4LayerCache,
+};
+use crate::qwen4_mtp::Qwen4MtpDraftModel;
 use anyhow::{Context, Result, ensure};
 use mlxcel_core::cache::{KVCacheMode, SequenceId, Turbo4SnapshotTensors};
 use mlxcel_core::generate::{LanguageModel, ModelStateSnapshot};
-use mlxcel_core::layers::{KVCache, QuantizedWeight, RMSNorm, UnifiedEmbedding, UnifiedLinear};
+use mlxcel_core::layers::{KVCache, MoESwitch, QuantizedWeight, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::utils::silu;
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr, concatenate};
@@ -36,17 +38,16 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const MTP_DRAFT_PREFIX: i32 = 65_536;
 const MTP_DRAFT_PADDED: i32 = 65_568;
-const DFLASH_VERIFY_PREFIX: i32 = 80_896;
-const DFLASH_VERIFY_PADDED: i32 = 80_928;
+const MTP_VERIFY_PREFIX: i32 = 80_896;
+const MTP_VERIFY_PADDED: i32 = 80_928;
 const DRAFT_CONTROL_START: i32 = 248_044;
 const DRAFT_CONTROL_END: i32 = 248_070;
 const TURBO4_PACKED_MTP_THRESHOLD_TOKENS: i32 = 2_048;
-#[cfg(any(feature = "specprefill", test))]
-const SPECPREFILL_TARGET_CHUNK_TOKENS: usize = 512;
 
 fn compact_rows(array: &MlxArray, prefix_len: i32, padded_len: i32) -> UniquePtr<MlxArray> {
     let columns = mlxcel_core::array_shape(array)[1];
@@ -90,12 +91,18 @@ fn compact_head(
 
 // Configuration.
 #[derive(Debug, Clone, Deserialize)]
-pub struct Qwen35Config {
+pub struct Qwen4Config {
     pub model_type: String,
     pub hidden_size: usize,
     pub num_hidden_layers: usize,
     #[serde(default)]
-    pub intermediate_size: usize,
+    pub moe_intermediate_size: usize,
+    #[serde(default)]
+    pub shared_expert_intermediate_size: usize,
+    #[serde(default)]
+    pub num_experts: usize,
+    #[serde(default)]
+    pub num_experts_per_tok: usize,
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
     #[serde(default)]
@@ -119,6 +126,34 @@ pub struct Qwen35Config {
 
     #[serde(default = "default_full_attention_interval")]
     pub full_attention_interval: usize,
+    #[serde(default)]
+    pub layer_types: Vec<String>,
+    #[serde(default = "default_hc_count")]
+    pub hc_count: usize,
+    #[serde(default = "default_hc_lowrank")]
+    pub hc_lowrank: usize,
+    #[serde(default)]
+    pub ple_layer_ids: Vec<usize>,
+    #[serde(default)]
+    pub ple_embed_dim: usize,
+    #[serde(default = "default_ple_conv_kernel_size")]
+    pub ple_conv_kernel_size: usize,
+    #[serde(default = "default_ngram_size")]
+    pub ngram_size: usize,
+    #[serde(default = "default_heads_per_ngram")]
+    pub heads_per_ngram: usize,
+    #[serde(default = "default_ngram_vocab_size_base")]
+    pub ngram_vocab_size_base: usize,
+    #[serde(default = "default_ngram_divisor")]
+    pub make_ngram_vocab_size_divisible_by: usize,
+    #[serde(default = "default_split_ngram_parts")]
+    pub split_ngram_parts: usize,
+    #[serde(default = "default_seed")]
+    pub seed: u64,
+    #[serde(default)]
+    pub eos_token_id: Option<i32>,
+    #[serde(default = "default_output_gate_type")]
+    pub output_gate_type: String,
     #[serde(default = "default_rms_norm_eps")]
     pub rms_norm_eps: f32,
     #[serde(default)]
@@ -128,18 +163,6 @@ pub struct Qwen35Config {
     pub max_position_embeddings: usize,
     #[serde(default, alias = "quantization_config")]
     pub quantization: Option<Quantization>,
-    #[serde(default)]
-    pub mtp_num_hidden_layers: Option<usize>,
-    #[serde(default)]
-    pub mtp_use_dedicated_embeddings: Option<bool>,
-    #[serde(default)]
-    pub vision_config: Option<Qwen3VLVisionConfig>,
-    #[serde(default)]
-    pub image_token_id: Option<i32>,
-    #[serde(default)]
-    pub video_token_id: Option<i32>,
-    #[serde(default)]
-    pub vision_start_token_id: Option<i32>,
 }
 
 fn default_rms_norm_eps() -> f32 {
@@ -163,8 +186,38 @@ fn default_linear_value_head_dim() -> usize {
 fn default_linear_conv_kernel_dim() -> usize {
     4
 }
+fn default_hc_count() -> usize {
+    1
+}
+fn default_hc_lowrank() -> usize {
+    320
+}
+fn default_ple_conv_kernel_size() -> usize {
+    4
+}
+fn default_ngram_size() -> usize {
+    3
+}
+fn default_heads_per_ngram() -> usize {
+    8
+}
+fn default_ngram_vocab_size_base() -> usize {
+    20_000_000
+}
+fn default_ngram_divisor() -> usize {
+    128
+}
+fn default_split_ngram_parts() -> usize {
+    128
+}
+fn default_seed() -> u64 {
+    1234
+}
+fn default_output_gate_type() -> String {
+    "silu".to_owned()
+}
 
-impl Qwen35Config {
+impl Qwen4Config {
     pub fn quant_params(&self, prefix: &str) -> (i32, i32) {
         let Some(quantization) = &self.quantization else {
             return (64, 4);
@@ -218,12 +271,15 @@ impl Qwen35Config {
     }
 
     pub fn is_linear_layer(&self, layer_idx: usize) -> bool {
-        !(layer_idx + 1).is_multiple_of(self.full_attention_interval)
+        self.layer_types.get(layer_idx).map_or_else(
+            || !(layer_idx + 1).is_multiple_of(self.full_attention_interval),
+            |kind| kind == "linear_attention",
+        )
     }
 
-    /// Convert to Qwen3NextConfig for reusing shared components
-    pub fn to_qwen3next_config(&self) -> Qwen3NextConfig {
-        Qwen3NextConfig {
+    /// Convert to Qwen4AttentionConfig for reusing shared components
+    pub fn to_qwen4_attention_config(&self) -> Qwen4AttentionConfig {
+        Qwen4AttentionConfig {
             num_attention_heads: self.num_attention_heads,
             num_key_value_heads: self.num_key_value_heads,
             head_dim: self.head_dim_resolved(),
@@ -232,34 +288,12 @@ impl Qwen35Config {
             partial_rotary_factor: self.partial_rotary_factor(),
             quantization: self.quantization.clone(),
             mrope_section: self.mrope_section(),
+            indexer_n_heads: 4,
+            indexer_kv_heads: 1,
+            indexer_head_dim: 128,
+            indexer_budget: 2_048,
+            indexer_compress_ratio: 4,
         }
-    }
-
-    fn validate_mtp_metadata(&self, config_path: &Path) -> Result<()> {
-        match (
-            self.mtp_num_hidden_layers,
-            self.mtp_use_dedicated_embeddings,
-        ) {
-            (None, None) => Ok(()),
-            (Some(1), Some(false)) => Ok(()),
-            (Some(layers), Some(false)) => anyhow::bail!(
-                "text_config.mtp_num_hidden_layers in {} must be exactly 1, got {layers}",
-                config_path.display()
-            ),
-            (_, Some(true)) => anyhow::bail!(
-                "text_config.mtp_use_dedicated_embeddings in {} must be false",
-                config_path.display()
-            ),
-            _ => anyhow::bail!(
-                "incomplete MTP metadata in {}; text_config.mtp_num_hidden_layers and \
-                 text_config.mtp_use_dedicated_embeddings must be declared together",
-                config_path.display()
-            ),
-        }
-    }
-
-    pub(crate) fn has_mtp_metadata(&self) -> bool {
-        self.mtp_num_hidden_layers == Some(1) && self.mtp_use_dedicated_embeddings == Some(false)
     }
 }
 
@@ -273,47 +307,25 @@ pub(crate) struct GdnRollbackSnapshot {
     b: UniquePtr<MlxArray>,
     init_state: Option<UniquePtr<MlxArray>>,
     conv_input: UniquePtr<MlxArray>,
+    ple_inputs: Option<UniquePtr<MlxArray>>,
+    ple_input_ids: Option<UniquePtr<MlxArray>>,
+    ple_conv_state: Option<UniquePtr<MlxArray>>,
+    ple_token_history: Option<Vec<i32>>,
 }
 
-pub(crate) struct Qwen35MtpPrefill {
+pub(crate) struct Qwen4MtpPrefill {
     pub(crate) hidden: UniquePtr<MlxArray>,
     pub(crate) first_logits: UniquePtr<MlxArray>,
 }
 
-pub(crate) struct Qwen35MtpVerifyOutput {
+pub(crate) struct Qwen4MtpVerifyOutput {
     pub(crate) hidden: UniquePtr<MlxArray>,
     pub(crate) logits: UniquePtr<MlxArray>,
     pub(crate) gdn_states: Vec<GdnRollbackSnapshot>,
-}
-
-#[cfg(any(feature = "dflash2", test))]
-/// DFlash2 verify output: the post-layer hidden state at each
-/// `target_layer_ids[i]` (copied before the final norm), the final logits,
-/// and the GDN rollback snapshots. Mirrors the SGLang DFLASH verify forward,
-/// which captures the target's hidden states at the draft's configured layer
-/// ids for the next draft round's context.
-pub(crate) struct Qwen35DflashVerifyOutput {
-    pub(crate) hidden_by_layer: Vec<UniquePtr<MlxArray>>,
-    pub(crate) logits: UniquePtr<MlxArray>,
-    pub(crate) gdn_states: Vec<GdnRollbackSnapshot>,
-}
-
-#[cfg(any(feature = "dflash2", test))]
-/// DFlash2 prefill output: `hidden_concat` is the per-layer captured hidden
-/// states concatenated along the hidden axis `[1, P', K * hidden]`; the
-/// drafter consumes it as its context buffer. `first_logits` is the last
-/// position's logits (the first sampled token). `hidden_offset` is the number
-/// of leading rows dropped once the captured rows exceeded the drafter's
-/// sliding-window limit (0 when nothing was dropped); the drafter cache
-/// offsets are aligned to it.
-pub(crate) struct Qwen35DflashPrefill {
-    pub(crate) hidden_concat: UniquePtr<MlxArray>,
-    pub(crate) first_logits: UniquePtr<MlxArray>,
-    pub(crate) hidden_offset: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Qwen35RollbackPlan {
+pub(crate) struct Qwen4RollbackPlan {
     pub(crate) accepted_block_len: i32,
     pub(crate) trim: i32,
     pub(crate) final_offset: i32,
@@ -323,18 +335,18 @@ pub(crate) fn rollback_plan(
     verify_offset: i32,
     accepted: usize,
     block_size: usize,
-) -> Qwen35RollbackPlan {
+) -> Qwen4RollbackPlan {
     let accepted_block_len = i32::try_from(accepted.saturating_add(1)).unwrap_or(i32::MAX);
     let block_size = i32::try_from(block_size).unwrap_or(i32::MAX);
     let trim = (block_size - accepted_block_len).max(0);
-    Qwen35RollbackPlan {
+    Qwen4RollbackPlan {
         accepted_block_len,
         trim,
         final_offset: verify_offset - trim,
     }
 }
 
-enum Qwen35GatedAuxProjections {
+enum Qwen4GatedAuxProjections {
     Separate {
         z: UnifiedLinear,
         b: UnifiedLinear,
@@ -349,7 +361,7 @@ fn fuse_gated_aux_projections(
     z: UnifiedLinear,
     b: UnifiedLinear,
     a: UnifiedLinear,
-) -> Qwen35GatedAuxProjections {
+) -> Qwen4GatedAuxProjections {
     let can_drop_linear_biases = prefixes
         .iter()
         .all(|prefix| !weights.contains_key(&format!("{prefix}.bias")));
@@ -395,15 +407,15 @@ fn fuse_gated_aux_projections(
     })();
 
     fused.map_or(
-        Qwen35GatedAuxProjections::Separate { z, b, a },
-        Qwen35GatedAuxProjections::Fused,
+        Qwen4GatedAuxProjections::Separate { z, b, a },
+        Qwen4GatedAuxProjections::Fused,
     )
 }
 
-// GatedDeltaNet - Qwen3.5 variant with separately stored projections.
+// GatedDeltaNet - Qwen4 variant with separately stored projections.
 /// Fuses compatible z, beta, and decay projections at load time.
 #[allow(dead_code)]
-pub(crate) struct Qwen35GatedDeltaNet {
+pub(crate) struct Qwen4GatedDeltaNet {
     hidden_size: usize,
     num_v_heads: usize,
     num_k_heads: usize,
@@ -416,14 +428,14 @@ pub(crate) struct Qwen35GatedDeltaNet {
 
     conv1d_weight: UniquePtr<MlxArray>,
     in_proj_qkv: UnifiedLinear,
-    aux_projections: Qwen35GatedAuxProjections,
+    aux_projections: Qwen4GatedAuxProjections,
     dt_bias: UniquePtr<MlxArray>,
     a_log: UniquePtr<MlxArray>,
     norm: RMSNormGated,
     out_proj: UnifiedLinear,
 }
 
-impl Qwen35GatedDeltaNet {
+impl Qwen4GatedDeltaNet {
     pub(crate) fn forward(
         &self,
         inputs: &MlxArray,
@@ -461,10 +473,10 @@ impl Qwen35GatedDeltaNet {
 
         let qkv = self.in_proj_qkv.forward(inputs);
         let (z, b_proj, a) = match &self.aux_projections {
-            Qwen35GatedAuxProjections::Separate { z, b, a } => {
+            Qwen4GatedAuxProjections::Separate { z, b, a } => {
                 (z.forward(inputs), b.forward(inputs), a.forward(inputs))
             }
-            Qwen35GatedAuxProjections::Fused(projection) => {
+            Qwen4GatedAuxProjections::Fused(projection) => {
                 let projected = projection.forward(inputs);
                 let z_end = self.value_dim as i32;
                 let b_end = z_end + self.num_v_heads as i32;
@@ -598,7 +610,7 @@ impl Qwen35GatedDeltaNet {
             })
         });
 
-        // Apply RMS norm with scaling (same as Qwen3Next). Reference mlx-lm
+        // Apply RMS norm with scaling (same as Qwen4). Reference mlx-lm
         // keeps this on mx.fast.rms_norm rather than expanding it into
         // primitive ops.
         let inv_scale = (self.head_k_dim as f32).powf(-0.5);
@@ -616,6 +628,10 @@ impl Qwen35GatedDeltaNet {
                 b: mlxcel_core::share(&b_proj),
                 init_state: state.as_ref().map(|value| mlxcel_core::share(value)),
                 conv_input: mlxcel_core::share(&conv_input),
+                ple_inputs: None,
+                ple_input_ids: None,
+                ple_conv_state: None,
+                ple_token_history: None,
             });
         }
 
@@ -640,7 +656,7 @@ impl Qwen35GatedDeltaNet {
 
     fn from_weights(
         weights: &WeightMap,
-        config: &Qwen35Config,
+        config: &Qwen4Config,
         prefix: &str,
     ) -> Result<Self, String> {
         let hidden_size = config.hidden_size;
@@ -675,7 +691,7 @@ impl Qwen35GatedDeltaNet {
             })
             .ok_or_else(|| format!("Missing conv1d weight: {}", prefix))?;
 
-        // Qwen3.5 uses separate projections instead of combined projections.
+        // Qwen4 uses separate projections instead of combined projections.
         let in_proj_qkv =
             UnifiedLinear::from_weights(weights, &qkv_prefix, qkv_group_size, qkv_bits)?;
         let in_proj_z = UnifiedLinear::from_weights(weights, &z_prefix, z_group_size, z_bits)?;
@@ -706,6 +722,11 @@ impl Qwen35GatedDeltaNet {
 
         let out_proj = UnifiedLinear::from_weights(weights, &out_prefix, out_group_size, out_bits)?;
 
+        let norm = if config.output_gate_type == "sigmoid" {
+            RMSNormGated::new_sigmoid(norm_weight, config.rms_norm_eps)
+        } else {
+            RMSNormGated::new(norm_weight, config.rms_norm_eps)
+        };
         Ok(Self {
             hidden_size,
             num_v_heads,
@@ -721,148 +742,808 @@ impl Qwen35GatedDeltaNet {
             aux_projections,
             dt_bias,
             a_log,
-            norm: RMSNormGated::new(norm_weight, config.rms_norm_eps),
+            norm,
             out_proj,
         })
     }
 }
 
-// Decoder Layer.
-/// Attention variant for Qwen3.5
-pub(crate) enum Qwen35AttentionVariant {
-    FullAttention(Qwen3NextAttention),
-    Linear(Qwen35GatedDeltaNet),
+pub(crate) struct Qwen4RmsNorm {
+    adjusted_weight: UniquePtr<MlxArray>,
+    eps: f32,
+    group_size: Option<usize>,
 }
 
-pub(crate) struct Qwen35DecoderLayer {
+impl Qwen4RmsNorm {
+    pub(crate) fn from_weights(
+        weights: &WeightMap,
+        name: &str,
+        eps: f32,
+        group_size: Option<usize>,
+    ) -> Result<Self, String> {
+        let weight = weights
+            .get(name)
+            .ok_or_else(|| format!("missing required tensor {name}"))?;
+        let shape = mlxcel_core::array_shape(weight);
+        if let Some(group_size) = group_size {
+            let width = *shape
+                .last()
+                .ok_or_else(|| format!("invalid scalar Qwen4 RMSNorm tensor {name}"))?
+                as usize;
+            if !width.is_multiple_of(group_size) {
+                return Err(format!(
+                    "Qwen4 RMSNorm tensor {name} width {width} is not divisible by {group_size}"
+                ));
+            }
+        }
+        let ones = mlxcel_core::ones(&shape, mlxcel_core::array_dtype(weight));
+        Ok(Self {
+            adjusted_weight: mlxcel_core::add(weight, &ones),
+            eps,
+            group_size,
+        })
+    }
+
+    pub(crate) fn forward(&self, input: &MlxArray) -> UniquePtr<MlxArray> {
+        let Some(group_size) = self.group_size else {
+            return mlxcel_core::fast_rms_norm(input, &self.adjusted_weight, self.eps);
+        };
+        let shape = mlxcel_core::array_shape(input);
+        let width = *shape.last().expect("Qwen4 RMSNorm input has an axis") as usize;
+        let groups = width / group_size;
+        let mut grouped_shape = shape.clone();
+        grouped_shape.pop();
+        grouped_shape.push(groups as i32);
+        grouped_shape.push(group_size as i32);
+        let grouped = mlxcel_core::reshape(input, &grouped_shape);
+        let input_dtype = mlxcel_core::array_dtype(input);
+        let grouped_f32 = mlxcel_core::astype(&grouped, mlxcel_core::dtype::FLOAT32);
+        let squared = mlxcel_core::square(&grouped_f32);
+        let mean = mlxcel_core::mean_axis(&squared, -1, true);
+        let epsilon = mlxcel_core::full_f32(&[1], self.eps, mlxcel_core::dtype::FLOAT32);
+        let inverse = mlxcel_core::rsqrt(&mlxcel_core::add(&mean, &epsilon));
+        let normalized = mlxcel_core::multiply(&grouped_f32, &inverse);
+        let adjusted =
+            mlxcel_core::reshape(&self.adjusted_weight, &[groups as i32, group_size as i32]);
+        let adjusted = mlxcel_core::astype(&adjusted, mlxcel_core::dtype::FLOAT32);
+        let output = mlxcel_core::multiply(&normalized, &adjusted);
+        let output = mlxcel_core::reshape(&output, &shape);
+        if input_dtype == mlxcel_core::dtype::FLOAT32 {
+            output
+        } else {
+            mlxcel_core::astype(&output, input_dtype)
+        }
+    }
+}
+
+pub(crate) struct Qwen4HyperConnection {
+    hc_count: usize,
+    hidden_size: usize,
+    norm: Qwen4RmsNorm,
+    input_mix_weight_down: UnifiedLinear,
+    input_mix_weight_up: UnifiedLinear,
+    block_inject_weight: Option<UnifiedLinear>,
+}
+
+impl Qwen4HyperConnection {
+    fn from_weights(
+        weights: &WeightMap,
+        config: &Qwen4Config,
+        prefix: &str,
+        with_injection: bool,
+    ) -> Result<Self, String> {
+        let norm = Qwen4RmsNorm::from_weights(
+            weights,
+            &format!("{prefix}.hc_norm.weight"),
+            config.rms_norm_eps,
+            Some(config.hidden_size),
+        )?;
+        let down_prefix = format!("{prefix}.input_mix_weight_down");
+        let up_prefix = format!("{prefix}.input_mix_weight_up");
+        let (down_group, down_bits) = config.quant_params(&down_prefix);
+        let (up_group, up_bits) = config.quant_params(&up_prefix);
+        let input_mix_weight_down =
+            UnifiedLinear::from_weights(weights, &down_prefix, down_group, down_bits)?;
+        let input_mix_weight_up =
+            UnifiedLinear::from_weights(weights, &up_prefix, up_group, up_bits)?;
+        let block_inject_weight = if with_injection {
+            let block_prefix = format!("{prefix}.block_inject_weight");
+            let (group, bits) = config.quant_params(&block_prefix);
+            Some(UnifiedLinear::from_weights(
+                weights,
+                &block_prefix,
+                group,
+                bits,
+            )?)
+        } else {
+            None
+        };
+        Ok(Self {
+            hc_count: config.hc_count,
+            hidden_size: config.hidden_size,
+            norm,
+            input_mix_weight_down,
+            input_mix_weight_up,
+            block_inject_weight,
+        })
+    }
+
+    fn mix_from_normed(&self, normed: &MlxArray, hyper_input_shape: &[i32]) -> UniquePtr<MlxArray> {
+        let down = self.input_mix_weight_down.forward(normed);
+        let down = mlxcel_core::multiply_scalar(&down, 1.0 / self.hc_count as f32);
+        let mix = mlxcel_core::sigmoid(&self.input_mix_weight_up.forward(&silu(&down)));
+        let streams = mlxcel_core::reshape(
+            normed,
+            &[
+                hyper_input_shape[0],
+                hyper_input_shape[1],
+                self.hc_count as i32,
+                self.hidden_size as i32,
+            ],
+        );
+        let mix = mlxcel_core::reshape(
+            &mix,
+            &[
+                hyper_input_shape[0],
+                hyper_input_shape[1],
+                self.hc_count as i32,
+                self.hidden_size as i32,
+            ],
+        );
+        mlxcel_core::mean_axis(&mlxcel_core::multiply(&mix, &streams), -2, false)
+    }
+
+    fn mix(&self, hyper_input: &MlxArray) -> UniquePtr<MlxArray> {
+        let normed = self.norm.forward(hyper_input);
+        self.mix_from_normed(&normed, &mlxcel_core::array_shape(hyper_input))
+    }
+
+    fn forward(
+        &self,
+        hyper_input: &MlxArray,
+    ) -> (
+        UniquePtr<MlxArray>,
+        UniquePtr<MlxArray>,
+        UniquePtr<MlxArray>,
+    ) {
+        let normed = self.norm.forward(hyper_input);
+        let mixed = self.mix_from_normed(&normed, &mlxcel_core::array_shape(hyper_input));
+        let inject = self
+            .block_inject_weight
+            .as_ref()
+            .expect("decoder hyper-connection carries injection weights")
+            .forward(&normed);
+        let inject = mlxcel_core::multiply_scalar(
+            &mlxcel_core::sigmoid(&mlxcel_core::multiply_scalar(
+                &inject,
+                1.0 / self.hc_count as f32,
+            )),
+            2.0,
+        );
+        (mixed, mlxcel_core::copy(hyper_input), inject)
+    }
+
+    fn inject(
+        &self,
+        branch: &MlxArray,
+        hyper_input: &MlxArray,
+        weights: &MlxArray,
+    ) -> UniquePtr<MlxArray> {
+        let branch = mlxcel_core::expand_dims(branch, -2);
+        let weights = mlxcel_core::expand_dims(weights, -1);
+        let injection = mlxcel_core::multiply(&branch, &weights);
+        let shape = mlxcel_core::array_shape(hyper_input);
+        mlxcel_core::add(
+            hyper_input,
+            &mlxcel_core::reshape(&injection, &[shape[0], shape[1], shape[2]]),
+        )
+    }
+}
+
+pub(crate) struct Qwen4FinalMixer(Qwen4HyperConnection);
+
+impl Qwen4FinalMixer {
+    pub(crate) fn from_weights(
+        weights: &WeightMap,
+        config: &Qwen4Config,
+        prefix: &str,
+    ) -> Result<Self, String> {
+        Ok(Self(Qwen4HyperConnection::from_weights(
+            weights, config, prefix, false,
+        )?))
+    }
+
+    pub(crate) fn forward(&self, hyper_input: &MlxArray) -> UniquePtr<MlxArray> {
+        self.0.mix(hyper_input)
+    }
+}
+
+enum Qwen4ExpertSwitch {
+    Quantized(MoESwitch),
+    Regular {
+        gate_proj: UniquePtr<MlxArray>,
+        up_proj: UniquePtr<MlxArray>,
+        down_proj: UniquePtr<MlxArray>,
+    },
+}
+
+impl Qwen4ExpertSwitch {
+    fn forward(&self, input: &MlxArray, indices: &MlxArray) -> UniquePtr<MlxArray> {
+        if let Self::Quantized(switch) = self {
+            return switch.forward(input, indices);
+        }
+        let Self::Regular {
+            gate_proj,
+            up_proj,
+            down_proj,
+        } = self
+        else {
+            unreachable!()
+        };
+        let input = mlxcel_core::expand_dims(input, -2);
+        let input = mlxcel_core::expand_dims(&input, -3);
+        let project = |input: &MlxArray, weight: &MlxArray| unsafe {
+            mlxcel_core::gather_mm(input, weight, std::ptr::null(), indices as *const _, false)
+        };
+        let gate = project(&input, gate_proj);
+        let up = project(&input, up_proj);
+        let activated = mlxcel_core::compiled_swiglu_activation(&gate, &up);
+        mlxcel_core::squeeze_axis(&project(&activated, down_proj), -2)
+    }
+}
+
+pub(crate) struct Qwen4SparseMoe {
+    gate: UnifiedLinear,
+    switch_mlp: Qwen4ExpertSwitch,
+    shared_expert: Mlp,
+    shared_expert_gate: UnifiedLinear,
+    num_experts: usize,
+    top_k: usize,
+}
+
+impl Qwen4SparseMoe {
+    fn from_weights(
+        weights: &WeightMap,
+        config: &Qwen4Config,
+        qn_config: &Qwen4AttentionConfig,
+        prefix: &str,
+    ) -> Result<Self, String> {
+        let gate_prefix = format!("{prefix}.gate");
+        let (gate_group, gate_bits) = config.quant_params(&gate_prefix);
+        let gate = UnifiedLinear::from_weights(weights, &gate_prefix, gate_group, gate_bits)?;
+        let switch_prefix = format!("{prefix}.switch_mlp");
+        let switch_mlp = if weights.contains_key(&format!("{switch_prefix}.gate_proj.scales")) {
+            let load_expert = |name: &str| {
+                let prefix = format!("{switch_prefix}.{name}");
+                let (group_size, bits) = config.quant_params(&prefix);
+                match UnifiedLinear::from_weights(weights, &prefix, group_size, bits)? {
+                    UnifiedLinear::Quantized { weight, .. } => Ok(weight),
+                    UnifiedLinear::Regular(_) => Err(format!(
+                        "Qwen4 expert {prefix} has incomplete quantization tensors"
+                    )),
+                }
+            };
+            Qwen4ExpertSwitch::Quantized(MoESwitch::new(
+                load_expert("gate_proj")?,
+                load_expert("up_proj")?,
+                load_expert("down_proj")?,
+                config.num_experts as i32,
+            ))
+        } else {
+            let load_expert = |name: &str| {
+                let tensor_name = format!("{switch_prefix}.{name}.weight");
+                weights
+                    .get(&tensor_name)
+                    .map(|weight| mlxcel_core::swap_axes(weight, -1, -2))
+                    .ok_or_else(|| format!("missing required tensor {tensor_name}"))
+            };
+            Qwen4ExpertSwitch::Regular {
+                gate_proj: load_expert("gate_proj")?,
+                up_proj: load_expert("up_proj")?,
+                down_proj: load_expert("down_proj")?,
+            }
+        };
+        let shared_expert =
+            Mlp::from_weights(weights, qn_config, &format!("{prefix}.shared_expert"))?;
+        let shared_gate_prefix = format!("{prefix}.shared_expert_gate");
+        let (shared_group, shared_bits) = config.quant_params(&shared_gate_prefix);
+        let shared_expert_gate =
+            UnifiedLinear::from_weights(weights, &shared_gate_prefix, shared_group, shared_bits)?;
+        Ok(Self {
+            gate,
+            switch_mlp,
+            shared_expert,
+            shared_expert_gate,
+            num_experts: config.num_experts,
+            top_k: config.num_experts_per_tok,
+        })
+    }
+
+    fn forward(&self, input: &MlxArray) -> UniquePtr<MlxArray> {
+        let gates = mlxcel_core::softmax_precise(&self.gate.forward(input), -1);
+        let partitioned = mlxcel_core::argpartition(&gates, -(self.top_k as i32), -1);
+        let shape = mlxcel_core::array_shape(&partitioned);
+        let indices = mlxcel_core::slice(
+            &partitioned,
+            &[0, 0, (self.num_experts - self.top_k) as i32],
+            &[shape[0], shape[1], self.num_experts as i32],
+        );
+        let scores = mlxcel_core::take_along_axis(&gates, &indices, -1);
+        let score_sum = mlxcel_core::sum_axis(&scores, -1, true);
+        let scores = mlxcel_core::divide(&scores, &score_sum);
+        let experts = self.switch_mlp.forward(input, &indices);
+        let routed = mlxcel_core::sum_axis(
+            &mlxcel_core::multiply(&experts, &mlxcel_core::expand_dims(&scores, -1)),
+            -2,
+            false,
+        );
+        let shared = self.shared_expert.forward(input);
+        let shared_gate = mlxcel_core::sigmoid(&self.shared_expert_gate.forward(input));
+        mlxcel_core::add(&routed, &mlxcel_core::multiply(&shared, &shared_gate))
+    }
+}
+
+struct Qwen4Ple {
+    table: Arc<NGramTable>,
+    key_proj: UnifiedLinear,
+    value_proj: UnifiedLinear,
+    norm_key: Qwen4RmsNorm,
+    norm_query: Qwen4RmsNorm,
+    norm_conv: Qwen4RmsNorm,
+    conv1d_weight: UniquePtr<MlxArray>,
+    hidden_size: usize,
+    hc_count: usize,
+    ngram_size: usize,
+    heads_per_ngram: usize,
+    head_sizes: Vec<u64>,
+    head_offsets: Vec<u64>,
+    multipliers: Vec<u64>,
+    eos_token_id: i32,
+    conv_state_len: usize,
+}
+
+impl Qwen4Ple {
+    fn from_weights(
+        weights: &WeightMap,
+        config: &Qwen4Config,
+        prefix: &str,
+        table: Arc<NGramTable>,
+    ) -> Result<Self, String> {
+        let linear = |suffix: &str| {
+            let name = format!("{prefix}.{suffix}");
+            let (group, bits) = config.quant_params(&name);
+            UnifiedLinear::from_weights(weights, &name, group, bits)
+        };
+        let conv_name = format!("{prefix}.conv1d.weight");
+        let conv = weights
+            .get(&conv_name)
+            .ok_or_else(|| format!("missing required tensor {conv_name}"))?;
+        let conv_shape = mlxcel_core::array_shape(conv);
+        let conv1d_weight = if conv_shape.last().copied() != Some(1) {
+            mlxcel_core::swap_axes(conv, -1, -2)
+        } else {
+            mlxcel_core::copy(conv)
+        };
+        let ngram_heads = (config.ngram_size - 1) * config.heads_per_ngram;
+        let mut head_sizes = Vec::with_capacity(ngram_heads);
+        let mut head_offsets = Vec::with_capacity(ngram_heads);
+        let mut offset = 0u64;
+        for head in 0..ngram_heads {
+            let size = nth_prime_after(config.ngram_vocab_size_base as u64 - 1, head + 1);
+            head_sizes.push(size);
+            head_offsets.push(offset);
+            offset += size;
+        }
+        let max_long = i64::MAX as u64;
+        let half_bound = (max_long / config.vocab_size as u64 / 2).max(1);
+        let multipliers = (0..config.ngram_size)
+            .map(|index| {
+                let value = config
+                    .seed
+                    .wrapping_add(SPLITMIX_GAMMA.wrapping_mul(index as u64 + 1));
+                2 * (splitmix64(value) % half_bound) + 1
+            })
+            .collect();
+        Ok(Self {
+            table,
+            key_proj: linear("key_proj")?,
+            value_proj: linear("value_proj")?,
+            norm_key: Qwen4RmsNorm::from_weights(
+                weights,
+                &format!("{prefix}.norm_key.weight"),
+                config.rms_norm_eps,
+                Some(config.hidden_size),
+            )?,
+            norm_query: Qwen4RmsNorm::from_weights(
+                weights,
+                &format!("{prefix}.norm_query.weight"),
+                config.rms_norm_eps,
+                Some(config.hidden_size),
+            )?,
+            norm_conv: Qwen4RmsNorm::from_weights(
+                weights,
+                &format!("{prefix}.norm_conv.weight"),
+                config.rms_norm_eps,
+                Some(config.hidden_size),
+            )?,
+            conv1d_weight,
+            hidden_size: config.hidden_size,
+            hc_count: config.hc_count,
+            ngram_size: config.ngram_size,
+            heads_per_ngram: config.heads_per_ngram,
+            head_sizes,
+            head_offsets,
+            multipliers,
+            eos_token_id: config.eos_token_id.unwrap_or(248_044),
+            conv_state_len: (config.ple_conv_kernel_size - 1) * config.ngram_size,
+        })
+    }
+
+    fn forward(
+        &self,
+        hidden_states: &MlxArray,
+        input_ids: &MlxArray,
+        cache: &mut GatedDeltaCache,
+    ) -> Result<UniquePtr<MlxArray>, String> {
+        let input_shape = mlxcel_core::array_shape(input_ids);
+        let batch = input_shape[0] as usize;
+        let sequence = input_shape[1] as usize;
+        let bytes = mlxcel_core::array_to_raw_bytes(input_ids);
+        let tokens = bytes
+            .chunks_exact(4)
+            .map(|chunk| i32::from_ne_bytes(chunk.try_into().expect("four-byte token")))
+            .collect::<Vec<_>>();
+        if tokens.len() != batch * sequence {
+            return Err("Qwen4 PLE input token shape does not match host data".to_owned());
+        }
+        let context_len = self.ngram_size - 1;
+        if cache.ple_token_history.len() != batch * context_len {
+            cache.ple_token_history = vec![self.eos_token_id; batch * context_len];
+        }
+        let mut indices = Vec::with_capacity(batch * sequence * self.head_sizes.len());
+        let mut next_history = Vec::with_capacity(batch * context_len);
+        for row in 0..batch {
+            let mut history =
+                cache.ple_token_history[row * context_len..(row + 1) * context_len].to_vec();
+            for &token in &tokens[row * sequence..(row + 1) * sequence] {
+                let mut shifted = Vec::with_capacity(self.ngram_size);
+                shifted.push(token);
+                for distance in 1..self.ngram_size {
+                    let candidate = history[context_len - distance];
+                    let crosses_eos = history[context_len - distance..]
+                        .iter()
+                        .skip(1)
+                        .any(|&value| value == self.eos_token_id);
+                    shifted.push(if crosses_eos {
+                        self.eos_token_id
+                    } else {
+                        candidate
+                    });
+                }
+                for ngram in 2..=self.ngram_size {
+                    let mut mixed = (shifted[0] as u64).wrapping_mul(self.multipliers[0]);
+                    for position in 1..ngram {
+                        mixed ^=
+                            (shifted[position] as u64).wrapping_mul(self.multipliers[position]);
+                    }
+                    let first_head = (ngram - 2) * self.heads_per_ngram;
+                    for head in first_head..first_head + self.heads_per_ngram {
+                        indices.push(self.head_offsets[head] + mixed % self.head_sizes[head]);
+                    }
+                }
+                history.rotate_left(1);
+                history[context_len - 1] = token;
+            }
+            next_history.extend_from_slice(&history);
+        }
+        cache.ple_token_history = next_history;
+        let indices = indices
+            .into_iter()
+            .map(|value| value as usize)
+            .collect::<Vec<_>>();
+        let embeddings = self
+            .table
+            .gather(&indices)
+            .map_err(|error| error.to_string())?;
+        let embeddings = mlxcel_core::from_slice_f32(
+            &embeddings,
+            &[
+                batch as i32,
+                sequence as i32,
+                self.head_sizes.len() as i32,
+                self.table.embedding_dim() as i32,
+            ],
+        );
+        let embeddings = mlxcel_core::reshape(
+            &embeddings,
+            &[
+                batch as i32,
+                sequence as i32,
+                (self.head_sizes.len() * self.table.embedding_dim()) as i32,
+            ],
+        );
+        let embeddings = mlxcel_core::astype(&embeddings, mlxcel_core::array_dtype(hidden_states));
+
+        let keys = self.norm_key.forward(&self.key_proj.forward(&embeddings));
+        let values = self.value_proj.forward(&embeddings);
+        let queries = self.norm_query.forward(hidden_states);
+        let keys = mlxcel_core::reshape(
+            &keys,
+            &[
+                batch as i32,
+                sequence as i32,
+                self.hc_count as i32,
+                self.hidden_size as i32,
+            ],
+        );
+        let queries = mlxcel_core::reshape(
+            &queries,
+            &[
+                batch as i32,
+                sequence as i32,
+                self.hc_count as i32,
+                self.hidden_size as i32,
+            ],
+        );
+        let gate = mlxcel_core::sum_axis(&mlxcel_core::multiply(&keys, &queries), -1, true);
+        let gate = mlxcel_core::multiply_scalar(&gate, 1.0 / (self.hidden_size as f32).sqrt());
+        let magnitude = mlxcel_core::abs(&gate);
+        let epsilon = mlxcel_core::full_f32(&[1], 1e-6, mlxcel_core::array_dtype(&gate));
+        let gate = mlxcel_core::multiply(
+            &mlxcel_core::sign(&gate),
+            &mlxcel_core::sqrt(&mlxcel_core::maximum(&magnitude, &epsilon)),
+        );
+        let gated = mlxcel_core::multiply(
+            &mlxcel_core::sigmoid(&gate),
+            &mlxcel_core::expand_dims(&values, -2),
+        );
+        let gated = mlxcel_core::reshape(
+            &gated,
+            &[
+                batch as i32,
+                sequence as i32,
+                (self.hc_count * self.hidden_size) as i32,
+            ],
+        );
+        let normed = self.norm_conv.forward(&gated);
+        let state = cache
+            .ple_conv_state
+            .as_ref()
+            .filter(|state| mlxcel_core::array_shape(state)[0] == batch as i32)
+            .map(|state| mlxcel_core::copy(state))
+            .unwrap_or_else(|| {
+                mlxcel_core::zeros(
+                    &[
+                        batch as i32,
+                        self.conv_state_len as i32,
+                        (self.hc_count * self.hidden_size) as i32,
+                    ],
+                    mlxcel_core::array_dtype(hidden_states),
+                )
+            });
+        let conv_input = mlxcel_core::concatenate(&state, &normed, 1);
+        let conv_len = mlxcel_core::array_shape(&conv_input)[1];
+        cache.ple_conv_state = Some(mlxcel_core::contiguous(
+            &mlxcel_core::slice(
+                &conv_input,
+                &[0, conv_len - self.conv_state_len as i32, 0],
+                &[
+                    batch as i32,
+                    conv_len,
+                    (self.hc_count * self.hidden_size) as i32,
+                ],
+            ),
+            false,
+        ));
+        let conv = mlxcel_core::conv1d(
+            &conv_input,
+            &self.conv1d_weight,
+            1,
+            0,
+            self.ngram_size as i32,
+            (self.hc_count * self.hidden_size) as i32,
+        );
+        Ok(mlxcel_core::add(&gated, &silu(&conv)))
+    }
+}
+
+const SPLITMIX_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
+const SPLITMIX_M1: u64 = 0xBF58_476D_1CE4_E5B9;
+const SPLITMIX_M2: u64 = 0x94D0_49BB_1331_11EB;
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(SPLITMIX_GAMMA);
+    value = (value ^ (value >> 30)).wrapping_mul(SPLITMIX_M1);
+    value = (value ^ (value >> 27)).wrapping_mul(SPLITMIX_M2);
+    value ^ (value >> 31)
+}
+
+fn nth_prime_after(start: u64, count: usize) -> u64 {
+    let mut prime = start;
+    for _ in 0..count {
+        prime += 1;
+        while !is_prime(prime) {
+            prime += 1;
+        }
+    }
+    prime
+}
+
+fn is_prime(value: u64) -> bool {
+    if value < 2 {
+        return false;
+    }
+    if value.is_multiple_of(2) {
+        return value == 2;
+    }
+    let mut divisor = 3;
+    while divisor * divisor <= value {
+        if value.is_multiple_of(divisor) {
+            return false;
+        }
+        divisor += 2;
+    }
+    true
+}
+
+// Decoder layer.
+pub(crate) enum Qwen4AttentionVariant {
+    FullAttention(Qwen4Attention),
+    Linear(Qwen4GatedDeltaNet),
+}
+
+pub(crate) struct Qwen4DecoderLayer {
     pub(crate) is_linear: bool,
-    pub(crate) attention: Qwen35AttentionVariant,
-    pub(crate) mlp: Mlp,
-    pub(crate) input_layernorm: RMSNorm,
-    pub(crate) post_attention_layernorm: RMSNorm,
+    pub(crate) attention: Qwen4AttentionVariant,
+    pub(crate) mlp: Qwen4SparseMoe,
+    ple: Option<Qwen4Ple>,
+    attn_hyper_connection: Qwen4HyperConnection,
+    mlp_hyper_connection: Qwen4HyperConnection,
 }
 
-impl Qwen35DecoderLayer {
+impl Qwen4DecoderLayer {
     fn forward(
         &self,
         x: &MlxArray,
+        input_ids: &MlxArray,
         mask: Option<&MlxArray>,
-        cache: &mut Qwen3NextCache,
+        cache: &mut Qwen4LayerCache,
         position_ids: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        let normed = self.input_layernorm.forward(x);
-
-        let residual = match (&self.attention, cache) {
-            (Qwen35AttentionVariant::Linear(attention), Qwen3NextCache::Linear(cache)) => {
-                attention.forward(&normed, mask, Some(cache))
+        let hidden =
+            if let (Some(ple), Qwen4LayerCache::Linear(linear_cache)) = (&self.ple, &mut *cache) {
+                mlxcel_core::add(
+                    x,
+                    &ple.forward(x, input_ids, linear_cache)
+                        .expect("validated Qwen4 PLE lookup must succeed"),
+                )
+            } else {
+                mlxcel_core::copy(x)
+            };
+        let (mixed, hyper_input, injection_weights) = self.attn_hyper_connection.forward(&hidden);
+        let branch = match (&self.attention, &mut *cache) {
+            (Qwen4AttentionVariant::Linear(attention), Qwen4LayerCache::Linear(cache)) => {
+                attention.forward(&mixed, mask, Some(cache))
             }
-            (Qwen35AttentionVariant::Linear(attention), _) => {
-                attention.forward(&normed, mask, None)
-            }
+            (Qwen4AttentionVariant::Linear(attention), _) => attention.forward(&mixed, mask, None),
             (
-                Qwen35AttentionVariant::FullAttention(attention),
-                Qwen3NextCache::Attention(cache),
-            ) => attention.forward_with_position_ids(&normed, cache, mask, position_ids),
-            (Qwen35AttentionVariant::FullAttention(attention), _) => {
+                Qwen4AttentionVariant::FullAttention(attention),
+                Qwen4LayerCache::Attention(cache),
+            ) => attention.forward_with_position_ids(&mixed, cache, mask, position_ids),
+            (Qwen4AttentionVariant::FullAttention(attention), _) => {
                 let mut temporary = KVCache::new();
-                attention.forward_with_position_ids(&normed, &mut temporary, mask, position_ids)
+                attention.forward_with_position_ids(&mixed, &mut temporary, mask, position_ids)
             }
         };
-        let hidden = mlxcel_core::add(x, &residual);
-        let mlp = self
-            .mlp
-            .forward(&self.post_attention_layernorm.forward(&hidden));
-        mlxcel_core::add(&hidden, &mlp)
-    }
-
-    #[cfg(any(feature = "specprefill", test))]
-    fn forward_with_query_capture(
-        &self,
-        x: &MlxArray,
-        cache: &mut Qwen3NextCache,
-    ) -> (UniquePtr<MlxArray>, Option<UniquePtr<MlxArray>>) {
-        let normed = self.input_layernorm.forward(x);
-        let (residual, query) = match (&self.attention, cache) {
-            (Qwen35AttentionVariant::Linear(attention), Qwen3NextCache::Linear(cache)) => {
-                (attention.forward(&normed, None, Some(cache)), None)
-            }
-            (
-                Qwen35AttentionVariant::FullAttention(attention),
-                Qwen3NextCache::Attention(cache),
-            ) => {
-                let (output, query) =
-                    attention.forward_with_query_capture(&normed, cache, None, None);
-                (output, Some(query))
-            }
-            _ => unreachable!("Qwen3.5 layer/cache topology must match"),
-        };
-        let hidden = mlxcel_core::add(x, &residual);
-        let mlp = self
-            .mlp
-            .forward(&self.post_attention_layernorm.forward(&hidden));
-        (mlxcel_core::add(&hidden, &mlp), query)
+        let hidden = self
+            .attn_hyper_connection
+            .inject(&branch, &hyper_input, &injection_weights);
+        let (mixed, hyper_input, injection_weights) = self.mlp_hyper_connection.forward(&hidden);
+        let branch = self.mlp.forward(&mixed);
+        self.mlp_hyper_connection
+            .inject(&branch, &hyper_input, &injection_weights)
     }
 
     fn forward_with_capture(
         &self,
         layer_idx: usize,
         x: &MlxArray,
+        input_ids: &MlxArray,
         mask: Option<&MlxArray>,
-        cache: &mut Qwen3NextCache,
+        cache: &mut Qwen4LayerCache,
         position_ids: Option<&MlxArray>,
         snapshots: &mut Vec<GdnRollbackSnapshot>,
     ) -> UniquePtr<MlxArray> {
-        let normed = self.input_layernorm.forward(x);
-        let residual = match (&self.attention, cache) {
-            (Qwen35AttentionVariant::Linear(attn), Qwen3NextCache::Linear(cache)) => {
-                attn.forward_with_capture(layer_idx, &normed, mask, Some(cache), snapshots)
+        let ple_rollback = match (&self.ple, &*cache) {
+            (Some(_), Qwen4LayerCache::Linear(linear_cache)) => Some((
+                mlxcel_core::share(x),
+                mlxcel_core::share(input_ids),
+                linear_cache
+                    .ple_conv_state
+                    .as_ref()
+                    .map(|state| mlxcel_core::share(state)),
+                linear_cache.ple_token_history.clone(),
+            )),
+            _ => None,
+        };
+        let hidden =
+            if let (Some(ple), Qwen4LayerCache::Linear(linear_cache)) = (&self.ple, &mut *cache) {
+                mlxcel_core::add(
+                    x,
+                    &ple.forward(x, input_ids, linear_cache)
+                        .expect("validated Qwen4 PLE lookup must succeed"),
+                )
+            } else {
+                mlxcel_core::copy(x)
+            };
+        let (mixed, hyper_input, injection_weights) = self.attn_hyper_connection.forward(&hidden);
+        let branch = match (&self.attention, &mut *cache) {
+            (Qwen4AttentionVariant::Linear(attn), Qwen4LayerCache::Linear(cache)) => {
+                attn.forward_with_capture(layer_idx, &mixed, mask, Some(cache), snapshots)
             }
-            (Qwen35AttentionVariant::Linear(attn), _) => {
-                attn.forward_with_capture(layer_idx, &normed, mask, None, snapshots)
+            (Qwen4AttentionVariant::Linear(attn), _) => {
+                attn.forward_with_capture(layer_idx, &mixed, mask, None, snapshots)
             }
-            (Qwen35AttentionVariant::FullAttention(attn), Qwen3NextCache::Attention(cache)) => {
-                attn.forward_verify(&normed, cache, mask, position_ids)
+            (Qwen4AttentionVariant::FullAttention(attn), Qwen4LayerCache::Attention(cache)) => {
+                attn.forward_verify(&mixed, cache, mask, position_ids)
             }
-            (Qwen35AttentionVariant::FullAttention(attn), _) => {
+            (Qwen4AttentionVariant::FullAttention(attn), _) => {
                 let mut temporary = KVCache::new();
-                attn.forward_verify(&normed, &mut temporary, mask, position_ids)
+                attn.forward_verify(&mixed, &mut temporary, mask, position_ids)
             }
         };
-        let hidden = mlxcel_core::add(x, &residual);
-        let mlp = self
-            .mlp
-            .forward(&self.post_attention_layernorm.forward(&hidden));
-        mlxcel_core::add(&hidden, &mlp)
+        if let Some((inputs, input_ids, conv_state, token_history)) = ple_rollback {
+            let snapshot = snapshots
+                .last_mut()
+                .filter(|snapshot| snapshot.layer_idx == layer_idx)
+                .expect("PLE must be attached to a captured linear-attention layer");
+            snapshot.ple_inputs = Some(inputs);
+            snapshot.ple_input_ids = Some(input_ids);
+            snapshot.ple_conv_state = conv_state;
+            snapshot.ple_token_history = Some(token_history);
+        }
+        let hidden = self
+            .attn_hyper_connection
+            .inject(&branch, &hyper_input, &injection_weights);
+        let (mixed, hyper_input, injection_weights) = self.mlp_hyper_connection.forward(&hidden);
+        let branch = self.mlp.forward(&mixed);
+        self.mlp_hyper_connection
+            .inject(&branch, &hyper_input, &injection_weights)
     }
 
     pub(crate) fn forward_full_attention(
         &self,
         x: &MlxArray,
+        input_ids: &MlxArray,
         mask: Option<&MlxArray>,
         cache: &mut KVCache,
         position_ids: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        let normed = self.input_layernorm.forward(x);
-        let residual = match &self.attention {
-            Qwen35AttentionVariant::FullAttention(attention) => {
-                attention.forward_with_position_ids(&normed, cache, mask, position_ids)
+        let (mixed, hyper_input, injection_weights) = self.attn_hyper_connection.forward(x);
+        let branch = match &self.attention {
+            Qwen4AttentionVariant::FullAttention(attention) => {
+                attention.forward_with_position_ids(&mixed, cache, mask, position_ids)
             }
-            Qwen35AttentionVariant::Linear(_) => {
-                unreachable!("the bundled MTP layer must use full attention")
+            Qwen4AttentionVariant::Linear(_) => {
+                unreachable!("the MTP layer must use full attention")
             }
         };
-        let hidden = mlxcel_core::add(x, &residual);
-        let mlp = self
-            .mlp
-            .forward(&self.post_attention_layernorm.forward(&hidden));
-        mlxcel_core::add(&hidden, &mlp)
+        let hidden = self
+            .attn_hyper_connection
+            .inject(&branch, &hyper_input, &injection_weights);
+        let (mixed, hyper_input, injection_weights) = self.mlp_hyper_connection.forward(&hidden);
+        let branch = self.mlp.forward(&mixed);
+        let _ = input_ids;
+        self.mlp_hyper_connection
+            .inject(&branch, &hyper_input, &injection_weights)
     }
 
     fn from_weights(
         weights: &WeightMap,
-        config: &Qwen35Config,
-        qn_config: &Qwen3NextConfig,
+        config: &Qwen4Config,
+        qn_config: &Qwen4AttentionConfig,
         layer_idx: usize,
+        ngram_table: Option<Arc<NGramTable>>,
     ) -> Result<Self, String> {
         Self::from_weights_at_prefix(
             weights,
@@ -870,56 +1551,70 @@ impl Qwen35DecoderLayer {
             qn_config,
             &format!("model.layers.{layer_idx}"),
             config.is_linear_layer(layer_idx),
+            ngram_table,
+            config.ple_layer_ids.contains(&(layer_idx + 1)),
         )
     }
 
     pub(crate) fn from_weights_at_prefix(
         weights: &WeightMap,
-        config: &Qwen35Config,
-        qn_config: &Qwen3NextConfig,
+        config: &Qwen4Config,
+        qn_config: &Qwen4AttentionConfig,
         prefix: &str,
         is_linear: bool,
+        ngram_table: Option<Arc<NGramTable>>,
+        has_ple: bool,
     ) -> Result<Self, String> {
         let attention = if is_linear {
-            Qwen35AttentionVariant::Linear(Qwen35GatedDeltaNet::from_weights(
+            Qwen4AttentionVariant::Linear(Qwen4GatedDeltaNet::from_weights(
                 weights,
                 config,
-                &format!("{}.linear_attn", prefix),
+                &format!("{prefix}.linear_attn"),
             )?)
         } else {
-            Qwen35AttentionVariant::FullAttention(Qwen3NextAttention::from_weights(
+            Qwen4AttentionVariant::FullAttention(Qwen4Attention::from_weights_centered(
                 weights,
                 qn_config,
-                &format!("{}.self_attn", prefix),
+                &format!("{prefix}.self_attn"),
             )?)
         };
-
-        let mlp = Mlp::from_weights(weights, qn_config, &format!("{}.mlp", prefix))?;
-
-        let input_norm_weight = weights
-            .get(&format!("{}.input_layernorm.weight", prefix))
-            .map(|w| mlxcel_core::copy(w))
-            .ok_or_else(|| format!("Missing input_layernorm: {}", prefix))?;
-
-        let post_norm_weight = weights
-            .get(&format!("{}.post_attention_layernorm.weight", prefix))
-            .map(|w| mlxcel_core::copy(w))
-            .ok_or_else(|| format!("Missing post_attention_layernorm: {}", prefix))?;
-
+        let ple = if has_ple {
+            Some(Qwen4Ple::from_weights(
+                weights,
+                config,
+                &format!("{prefix}.ple"),
+                ngram_table.ok_or_else(|| "Qwen4 PLE requires an SSD n-gram table".to_owned())?,
+            )?)
+        } else {
+            None
+        };
         Ok(Self {
             is_linear,
             attention,
-            mlp,
-            input_layernorm: RMSNorm::new(input_norm_weight, config.rms_norm_eps),
-            post_attention_layernorm: RMSNorm::new(post_norm_weight, config.rms_norm_eps),
+            mlp: Qwen4SparseMoe::from_weights(
+                weights,
+                config,
+                qn_config,
+                &format!("{prefix}.mlp"),
+            )?,
+            ple,
+            attn_hyper_connection: Qwen4HyperConnection::from_weights(
+                weights,
+                config,
+                &format!("{prefix}.attn_hyper_connection"),
+                true,
+            )?,
+            mlp_hyper_connection: Qwen4HyperConnection::from_weights(
+                weights,
+                config,
+                &format!("{prefix}.mlp_hyper_connection"),
+                true,
+            )?,
         })
     }
 }
 
-// Qwen3.5 Model.
-fn mtp_target_cache_mode(_has_mtp: bool, requested: KVCacheMode) -> KVCacheMode {
-    requested
-}
+// Qwen4 Model.
 
 fn initial_attention_cache_mode(configured: KVCacheMode) -> KVCacheMode {
     if configured == KVCacheMode::Turbo4 {
@@ -929,15 +1624,15 @@ fn initial_attention_cache_mode(configured: KVCacheMode) -> KVCacheMode {
     }
 }
 
-fn new_initial_attention_cache(configured: KVCacheMode) -> Qwen3NextCache {
-    Qwen3NextCache::Attention(Box::new(KVCache::new_with_mode(
+fn new_initial_attention_cache(configured: KVCacheMode) -> Qwen4LayerCache {
+    Qwen4LayerCache::Attention(Box::new(KVCache::new_with_mode(
         initial_attention_cache_mode(configured),
     )))
 }
 
-fn demote_populated_attention_caches(caches: &mut [Qwen3NextCache]) {
+fn demote_populated_attention_caches(caches: &mut [Qwen4LayerCache]) {
     for cache in caches {
-        if let Qwen3NextCache::Attention(cache) = cache
+        if let Qwen4LayerCache::Attention(cache) = cache
             && cache.mode == KVCacheMode::Fp16
             && cache.offset > 0
         {
@@ -947,9 +1642,13 @@ fn demote_populated_attention_caches(caches: &mut [Qwen3NextCache]) {
     }
 }
 
-fn finish_initial_attention_prefill(caches: &mut [Qwen3NextCache], configured: KVCacheMode) {
+fn finish_initial_attention_prefill(caches: &mut [Qwen4LayerCache], configured: KVCacheMode) {
     if configured == KVCacheMode::Turbo4
-        && caches.iter().map(Qwen3NextCache::offset).max().unwrap_or(0)
+        && caches
+            .iter()
+            .map(Qwen4LayerCache::offset)
+            .max()
+            .unwrap_or(0)
             > TURBO4_PACKED_MTP_THRESHOLD_TOKENS
     {
         demote_populated_attention_caches(caches);
@@ -957,7 +1656,7 @@ fn finish_initial_attention_prefill(caches: &mut [Qwen3NextCache], configured: K
 }
 
 fn prepare_attention_forward(
-    caches: &mut [Qwen3NextCache],
+    caches: &mut [Qwen4LayerCache],
     configured: KVCacheMode,
     input_len: i32,
     initial_prefill_complete: bool,
@@ -967,7 +1666,7 @@ fn prepare_attention_forward(
     }
     let projected = caches
         .iter()
-        .map(Qwen3NextCache::offset)
+        .map(Qwen4LayerCache::offset)
         .max()
         .unwrap_or(0)
         .saturating_add(input_len);
@@ -976,30 +1675,29 @@ fn prepare_attention_forward(
     }
 }
 
-pub struct Qwen35Model {
+pub struct Qwen4Model {
     pub(crate) embed_tokens: UnifiedEmbedding,
-    pub(crate) layers: Vec<Qwen35DecoderLayer>,
-    pub(crate) norm: RMSNorm,
+    pub(crate) layers: Vec<Qwen4DecoderLayer>,
+    pub(crate) norm: Qwen4FinalMixer,
     pub(crate) lm_head: Option<UnifiedLinear>,
     compact_draft_head: Option<UnifiedLinear>,
-    compact_dflash_verify_head: Option<UnifiedLinear>,
-    pub(crate) config: Qwen35Config,
-    mtp: Option<Qwen35MtpDraftModel>,
+    compact_mtp_verify_head: Option<UnifiedLinear>,
+    pub(crate) config: Qwen4Config,
+    mtp: Option<Qwen4MtpDraftModel>,
     kv_cache_mode: KVCacheMode,
-    vision: Option<Qwen3VLVisionEncoder>,
     /// Model-owned heterogeneous cache state used by one synchronous sequence.
-    sequence_state: ModelOwnedSequenceState<Qwen3NextCache>,
-    /// MRoPE position state retained for the Qwen3.5 text path.
-    mrope_state: MRopeState,
+    sequence_state: ModelOwnedSequenceState<Qwen4LayerCache>,
+    /// Rotary-position state retained for the active text sequence.
+    rope_state: RopeState,
     initial_prefill_complete: AtomicBool,
 }
 
-impl Qwen35Model {
+impl Qwen4Model {
     fn forward_backbone_with_inputs(
         &self,
         input_ids: &MlxArray,
         input_embeddings: Option<&MlxArray>,
-        caches: &mut [Qwen3NextCache],
+        caches: &mut [Qwen4LayerCache],
         position_ids: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
         prepare_attention_forward(
@@ -1008,12 +1706,13 @@ impl Qwen35Model {
             mlxcel_core::array_shape(input_ids)[1],
             self.initial_prefill_complete.load(Ordering::Relaxed),
         );
-        let mut hidden = input_embeddings
+        let embedded = input_embeddings
             .map(mlxcel_core::copy)
             .unwrap_or_else(|| self.embed_tokens.forward(input_ids));
+        let mut hidden = mlxcel_core::tile(&embedded, &[1, 1, self.config.hc_count as i32]);
 
         for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
-            hidden = layer.forward(&hidden, None, cache, position_ids);
+            hidden = layer.forward(&hidden, input_ids, None, cache, position_ids);
         }
         hidden
     }
@@ -1036,12 +1735,8 @@ impl Qwen35Model {
         self.project_compact_logits(hidden, &self.compact_draft_head, MTP_DRAFT_PREFIX)
     }
 
-    pub(crate) fn project_dflash_verify_logits(&self, hidden: &MlxArray) -> UniquePtr<MlxArray> {
-        self.project_compact_logits(
-            hidden,
-            &self.compact_dflash_verify_head,
-            DFLASH_VERIFY_PREFIX,
-        )
+    pub(crate) fn project_mtp_verify_logits(&self, hidden: &MlxArray) -> UniquePtr<MlxArray> {
+        self.project_compact_logits(hidden, &self.compact_mtp_verify_head, MTP_VERIFY_PREFIX)
     }
 
     fn project_compact_logits(
@@ -1072,11 +1767,6 @@ impl Qwen35Model {
         self.compact_draft_head.is_some()
     }
 
-    #[cfg(any(feature = "dflash2", test))]
-    pub(crate) fn has_compact_dflash_verify_head(&self) -> bool {
-        self.compact_dflash_verify_head.is_some()
-    }
-
     pub(crate) fn map_draft_token(token: i32) -> i32 {
         if token < MTP_DRAFT_PREFIX {
             token
@@ -1085,20 +1775,20 @@ impl Qwen35Model {
         }
     }
 
-    pub(crate) fn map_dflash_verify_token(token: i32) -> i32 {
-        if token < DFLASH_VERIFY_PREFIX {
+    pub(crate) fn map_mtp_verify_token(token: i32) -> i32 {
+        if token < MTP_VERIFY_PREFIX {
             token
         } else {
-            token + DRAFT_CONTROL_START - DFLASH_VERIFY_PREFIX
+            token + DRAFT_CONTROL_START - MTP_VERIFY_PREFIX
         }
     }
 
-    fn make_internal_caches(&self) -> Vec<Qwen3NextCache> {
+    fn make_internal_caches(&self) -> Vec<Qwen4LayerCache> {
         self.layers
             .iter()
             .map(|layer| {
                 if layer.is_linear {
-                    Qwen3NextCache::Linear(GatedDeltaCache::new())
+                    Qwen4LayerCache::Linear(GatedDeltaCache::new())
                 } else {
                     new_initial_attention_cache(self.kv_cache_mode)
                 }
@@ -1121,48 +1811,15 @@ impl Qwen35Model {
         self.config.vocab_size
     }
 
-    pub(crate) fn has_vision(&self) -> bool {
-        self.vision.is_some()
-    }
-
-    pub(crate) fn vision_config(&self) -> Option<&Qwen3VLVisionConfig> {
-        self.config.vision_config.as_ref()
-    }
-
-    pub(crate) fn multimodal_token_ids(&self) -> Option<(i32, i32, i32)> {
-        Some((
-            self.config.image_token_id?,
-            self.config.video_token_id?,
-            self.config.vision_start_token_id?,
-        ))
-    }
-
-    pub(crate) fn encode_vision(
-        &self,
-        pixel_values: &MlxArray,
-        grids: &[(i32, i32, i32)],
-    ) -> Result<UniquePtr<MlxArray>> {
-        let vision = self
-            .vision
-            .as_ref()
-            .context("model does not support image inputs")?;
-        let output = vision.forward_with_grid(pixel_values, grids);
-        ensure!(
-            output.deepstack_features.is_empty(),
-            "Qwen3.5 DeepStack vision features are not supported"
-        );
-        Ok(output.hidden_states)
-    }
-
-    pub(crate) fn prepare_mrope(&self, position_ids: &MlxArray, rope_delta: i32) {
-        self.mrope_state.prepare(position_ids, rope_delta);
-    }
-
     pub(crate) fn clear_prepared_mrope(&self) {
-        self.mrope_state.clear_prepared();
+        self.rope_state.clear_prepared();
     }
 
-    pub(crate) fn mtp(&self) -> Option<&Qwen35MtpDraftModel> {
+    pub(crate) fn attach_mtp(&mut self, mtp: Qwen4MtpDraftModel) {
+        self.mtp = Some(mtp);
+    }
+
+    pub(crate) fn mtp(&self) -> Option<&Qwen4MtpDraftModel> {
         self.mtp.as_ref()
     }
 
@@ -1173,7 +1830,7 @@ impl Qwen35Model {
         position_ids: Option<&MlxArray>,
         rope_delta: Option<i32>,
         mut consume_chunk: F,
-    ) -> std::result::Result<Qwen35MtpPrefill, String>
+    ) -> std::result::Result<Qwen4MtpPrefill, String>
     where
         F: FnMut(i32, i32, &MlxArray),
     {
@@ -1184,8 +1841,8 @@ impl Qwen35Model {
             return Err("MTP prefill requires at least one token".to_string());
         }
         if let (Some(position_ids), Some(rope_delta)) = (position_ids, rope_delta) {
-            self.mrope_state.prepare(position_ids, rope_delta);
-            self.mrope_state.activate_prepared()?;
+            self.rope_state.prepare(position_ids, rope_delta);
+            self.rope_state.activate_prepared()?;
         }
         let configured = mlxcel_core::generate::prefill_chunk_len();
         let chunk_len =
@@ -1242,12 +1899,12 @@ impl Qwen35Model {
 
         let offset = self
             .sequence_state
-            .with_internal(|caches| caches.first().map(Qwen3NextCache::offset).unwrap_or(0));
-        self.mrope_state.set_position(offset);
+            .with_internal(|caches| caches.first().map(Qwen4LayerCache::offset).unwrap_or(0));
+        self.rope_state.set_position(offset);
         if position_ids.is_some() {
-            self.mrope_state.finish_prefill();
+            self.rope_state.finish_prefill();
         }
-        Ok(Qwen35MtpPrefill {
+        Ok(Qwen4MtpPrefill {
             hidden: final_chunk.expect("MTP prefill requires a non-empty prompt"),
             first_logits: final_logits.expect("MTP prefill requires a non-empty prompt"),
         })
@@ -1257,7 +1914,7 @@ impl Qwen35Model {
         &self,
         input_ids: &MlxArray,
         mut consume_chunk: F,
-    ) -> std::result::Result<Qwen35MtpPrefill, String>
+    ) -> std::result::Result<Qwen4MtpPrefill, String>
     where
         F: FnMut(&MlxArray, &MlxArray),
     {
@@ -1293,15 +1950,15 @@ impl Qwen35Model {
         let first_logits = self.project_logits(&self.norm.forward(&last_hidden));
         let offset = self
             .sequence_state
-            .with_internal(|caches| caches.first().map(Qwen3NextCache::offset).unwrap_or(0));
-        self.mrope_state.set_position(offset);
-        Ok(Qwen35MtpPrefill {
+            .with_internal(|caches| caches.first().map(Qwen4LayerCache::offset).unwrap_or(0));
+        self.rope_state.set_position(offset);
+        Ok(Qwen4MtpPrefill {
             hidden,
             first_logits,
         })
     }
 
-    pub(crate) fn forward_mtp_verify(&self, input_ids: &MlxArray) -> Qwen35MtpVerifyOutput {
+    pub(crate) fn forward_mtp_verify(&self, input_ids: &MlxArray) -> Qwen4MtpVerifyOutput {
         self.forward_mtp_verify_with_compact(input_ids, false)
     }
 
@@ -1309,13 +1966,14 @@ impl Qwen35Model {
         &self,
         input_ids: &MlxArray,
         compact_logits: bool,
-    ) -> Qwen35MtpVerifyOutput {
-        let rope_delta = self.mrope_state.rope_delta();
+    ) -> Qwen4MtpVerifyOutput {
+        let rope_delta = self.rope_state.rope_delta();
         let (output, offset) = self.sequence_state.with_internal(|caches| {
-            let mut hidden = self.embed_tokens.forward(input_ids);
+            let embedded = self.embed_tokens.forward(input_ids);
+            let mut hidden = mlxcel_core::tile(&embedded, &[1, 1, self.config.hc_count as i32]);
             let shape = mlxcel_core::array_shape(&hidden);
             let seq_len = shape[1];
-            let cache_offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
+            let cache_offset = caches.first().map(Qwen4LayerCache::offset).unwrap_or(0);
             prepare_attention_forward(
                 caches,
                 self.kv_cache_mode,
@@ -1330,6 +1988,7 @@ impl Qwen35Model {
                 hidden = layer.forward_with_capture(
                     layer_idx,
                     &hidden,
+                    input_ids,
                     None,
                     cache,
                     position_ids.as_deref(),
@@ -1338,13 +1997,13 @@ impl Qwen35Model {
             }
             let normalized = self.norm.forward(&hidden);
             let logits = if compact_logits {
-                self.project_dflash_verify_logits(&normalized)
+                self.project_mtp_verify_logits(&normalized)
             } else {
                 self.project_logits(&normalized)
             };
-            let offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
+            let offset = caches.first().map(Qwen4LayerCache::offset).unwrap_or(0);
             (
-                Qwen35MtpVerifyOutput {
+                Qwen4MtpVerifyOutput {
                     hidden,
                     logits,
                     gdn_states,
@@ -1352,207 +2011,8 @@ impl Qwen35Model {
                 offset,
             )
         });
-        self.mrope_state.set_position(offset);
+        self.rope_state.set_position(offset);
         output
-    }
-
-    #[cfg(any(feature = "dflash2", test))]
-    /// DFlash2 target verify: run the backbone over `input_ids` exactly like
-    /// `forward_mtp_verify` but additionally retain the post-layer hidden
-    /// handle at each `target_layer_ids[i]`. `target_layer_ids` is a small
-    /// sorted slice (5 ids for the Qwen3.8-27B-DFlash2 checkpoint); a linear
-    /// scan per layer is fine. The captured hiddens feed the next draft
-    /// round's context buffer (SGLang `DFLASH` captures the same features).
-    pub(crate) fn forward_dflash_verify(
-        &self,
-        input_ids: &MlxArray,
-        target_layer_ids: &[usize],
-        compact_logits: bool,
-    ) -> Qwen35DflashVerifyOutput {
-        let rope_delta = self.mrope_state.rope_delta();
-        let (output, offset) = self.sequence_state.with_internal(|caches| {
-            let mut hidden = self.embed_tokens.forward(input_ids);
-            let shape = mlxcel_core::array_shape(&hidden);
-            let seq_len = shape[1];
-            let cache_offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
-            prepare_attention_forward(
-                caches,
-                self.kv_cache_mode,
-                seq_len,
-                self.initial_prefill_complete.load(Ordering::Relaxed),
-            );
-            let position_ids =
-                rope_delta.map(|delta| decode_rope_positions(cache_offset, seq_len, delta));
-            let mut hidden_by_layer = Vec::with_capacity(target_layer_ids.len());
-            let mut gdn_states = Vec::new();
-            for (layer_idx, (layer, cache)) in self.layers.iter().zip(caches.iter_mut()).enumerate()
-            {
-                hidden = layer.forward_with_capture(
-                    layer_idx,
-                    &hidden,
-                    None,
-                    cache,
-                    position_ids.as_deref(),
-                    &mut gdn_states,
-                );
-                if target_layer_ids.contains(&layer_idx) {
-                    hidden_by_layer.push(mlxcel_core::share(&hidden));
-                }
-            }
-            let normalized = self.norm.forward(&hidden);
-            let logits = if compact_logits {
-                self.project_dflash_verify_logits(&normalized)
-            } else {
-                self.project_logits(&normalized)
-            };
-            let offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
-            (
-                Qwen35DflashVerifyOutput {
-                    hidden_by_layer,
-                    logits,
-                    gdn_states,
-                },
-                offset,
-            )
-        });
-        self.mrope_state.set_position(offset);
-        output
-    }
-
-    #[cfg(any(feature = "dflash2", test))]
-    /// DFlash2 prefill: chunked backbone forward that also captures the
-    /// post-layer hidden state at each `target_layer_ids[i]`, keeping only the
-    /// last `hidden_limit` rows per layer (dropping leading rows once over the
-    /// limit, as the drafter's sliding window bounds the context the draft
-    /// layers can attend to). After all chunks, `hidden_concat` is the
-    /// per-layer hiddens concatenated along `-1`; `hidden_offset` is the number
-    /// of dropped leading rows.
-    pub(crate) fn forward_dflash_prefill(
-        &self,
-        input_ids: &MlxArray,
-        target_layer_ids: &[usize],
-        hidden_limit: usize,
-    ) -> std::result::Result<Qwen35DflashPrefill, String> {
-        self.forward_dflash_prefill_impl(input_ids, target_layer_ids, hidden_limit, true)
-    }
-
-    #[cfg(any(feature = "dflash2", test))]
-    pub(crate) fn forward_dflash_continuation(
-        &self,
-        input_ids: &MlxArray,
-        target_layer_ids: &[usize],
-        hidden_limit: usize,
-    ) -> std::result::Result<Qwen35DflashPrefill, String> {
-        self.forward_dflash_prefill_impl(input_ids, target_layer_ids, hidden_limit, false)
-    }
-
-    #[cfg(any(feature = "dflash2", test))]
-    fn forward_dflash_prefill_impl(
-        &self,
-        input_ids: &MlxArray,
-        target_layer_ids: &[usize],
-        hidden_limit: usize,
-        reset: bool,
-    ) -> std::result::Result<Qwen35DflashPrefill, String> {
-        if reset {
-            self.reset_runtime_state();
-        }
-        let shape = mlxcel_core::array_shape(input_ids);
-        let prompt_len = shape[1];
-        if prompt_len == 0 {
-            return Err("DFlash2 prefill requires at least one token".to_owned());
-        }
-        let configured = mlxcel_core::generate::prefill_chunk_len();
-        let chunk_len =
-            mlxcel_core::generate::effective_prefill_chunk(configured, true, prompt_len as usize)
-                .unwrap_or(prompt_len as usize) as i32;
-
-        // One captured hidden buffer per target layer, kept under `hidden_limit`
-        // rows.
-        let mut layer_hiddens: Vec<Option<UniquePtr<MlxArray>>> =
-            (0..target_layer_ids.len()).map(|_| None).collect();
-        let rope_delta = self.mrope_state.rope_delta();
-        let mut first_logits = None;
-        let mut start = 0;
-        while start < prompt_len {
-            let end = (start + chunk_len).min(prompt_len);
-            let ids = mlxcel_core::slice(input_ids, &[0, start], &[shape[0], end]);
-            let final_hidden = self.sequence_state.with_internal(|caches| {
-                let cache_offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
-                let seq_len = end - start;
-                let position_ids =
-                    rope_delta.map(|delta| decode_rope_positions(cache_offset, seq_len, delta));
-                let mut h = self.embed_tokens.forward(&ids);
-                for (layer_idx, (layer, cache)) in
-                    self.layers.iter().zip(caches.iter_mut()).enumerate()
-                {
-                    h = layer.forward(&h, None, cache, position_ids.as_deref());
-                    if let Some(capture_idx) = target_layer_ids.iter().position(|&t| t == layer_idx)
-                    {
-                        // Accumulate this layer's hidden rows (all positions of
-                        // this chunk row-wise).
-                        let h_rows = mlxcel_core::copy(&h);
-                        let current = layer_hiddens[capture_idx].take();
-                        let mut combined = match current {
-                            Some(prior) => mlxcel_core::concatenate(&prior, &h_rows, 1),
-                            None => h_rows,
-                        };
-                        // Keep at most `hidden_limit` rows; drop leading ones.
-                        let combined_shape = mlxcel_core::array_shape(&combined);
-                        let rows = combined_shape[1];
-                        if rows as usize > hidden_limit {
-                            let drop = rows as usize - hidden_limit;
-                            combined = mlxcel_core::slice(
-                                &combined,
-                                &[0, drop as i32, 0],
-                                &[combined_shape[0], rows, combined_shape[2]],
-                            );
-                        }
-                        layer_hiddens[capture_idx] = Some(combined);
-                    }
-                }
-                h
-            });
-            if end == prompt_len {
-                // Last chunk: final-row logits (the first sampled token).
-                let hidden_shape = mlxcel_core::array_shape(&final_hidden);
-                let last = hidden_shape[1] - 1;
-                let last_hidden = mlxcel_core::slice(
-                    &final_hidden,
-                    &[0, last, 0],
-                    &[hidden_shape[0], last + 1, hidden_shape[2]],
-                );
-                first_logits = Some(self.project_logits(&self.norm.forward(&last_hidden)));
-            }
-            start = end;
-        }
-        if reset {
-            self.finish_initial_prefill();
-        }
-
-        // Concatenate the per-layer captures along the hidden axis.
-        let mut hidden_concat: Option<UniquePtr<MlxArray>> = None;
-        for slot in layer_hiddens {
-            let h = slot.expect("DFlash2 prefill captured every target layer");
-            hidden_concat = Some(match hidden_concat {
-                Some(acc) => mlxcel_core::concatenate(&acc, &h, -1),
-                None => h,
-            });
-        }
-        let hidden_concat =
-            hidden_concat.expect("DFlash2 prefill captures at least one target layer");
-        let hidden_rows = mlxcel_core::array_shape(&hidden_concat)[1] as usize;
-        let hidden_offset = prompt_len as usize - hidden_rows;
-
-        let offset = self
-            .sequence_state
-            .with_internal(|caches| caches.first().map(Qwen3NextCache::offset).unwrap_or(0));
-        self.mrope_state.set_position(offset);
-        Ok(Qwen35DflashPrefill {
-            hidden_concat,
-            first_logits: first_logits.expect("non-empty prefill produces first_logits"),
-            hidden_offset,
-        })
     }
 
     pub(crate) fn rollback_mtp_verify(
@@ -1561,23 +2021,23 @@ impl Qwen35Model {
         accepted: usize,
         block_size: usize,
         materialize: bool,
-    ) -> Qwen35RollbackPlan {
+    ) -> Qwen4RollbackPlan {
         let plan = self.sequence_state.with_internal(|caches| {
-            let verify_offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
+            let verify_offset = caches.first().map(Qwen4LayerCache::offset).unwrap_or(0);
             let plan = rollback_plan(verify_offset, accepted, block_size);
             for cache in caches.iter_mut() {
-                if let Qwen3NextCache::Attention(cache) = cache
+                if let Qwen4LayerCache::Attention(cache) = cache
                     && plan.trim > 0
                 {
                     cache.trim(plan.trim);
                 }
             }
-
             for snapshot in gdn_states {
-                let Some(Qwen3NextCache::Linear(cache)) = caches.get_mut(snapshot.layer_idx) else {
+                let Some(Qwen4LayerCache::Linear(cache)) = caches.get_mut(snapshot.layer_idx)
+                else {
                     continue;
                 };
-                let Qwen35AttentionVariant::Linear(layer) =
+                let Qwen4AttentionVariant::Linear(layer) =
                     &self.layers[snapshot.layer_idx].attention
                 else {
                     continue;
@@ -1631,8 +2091,7 @@ impl Qwen35Model {
                     None,
                 );
                 cache.state_cache = Some(replayed_state);
-
-                let start = plan.accepted_block_len;
+                let start = replay_len;
                 let end = start + layer.conv_kernel_size as i32 - 1;
                 let conv_state = mlxcel_core::slice(
                     &snapshot.conv_input,
@@ -1641,6 +2100,33 @@ impl Qwen35Model {
                 );
                 cache.conv_state = Some(mlxcel_core::contiguous(&conv_state, false));
                 cache.offset = plan.final_offset;
+                if let Some(token_history) = &snapshot.ple_token_history {
+                    cache.ple_conv_state = snapshot
+                        .ple_conv_state
+                        .as_ref()
+                        .map(|state| mlxcel_core::share(state));
+                    cache.ple_token_history = token_history.clone();
+                    let inputs = snapshot
+                        .ple_inputs
+                        .as_ref()
+                        .expect("PLE rollback must retain layer inputs");
+                    let input_ids = snapshot
+                        .ple_input_ids
+                        .as_ref()
+                        .expect("PLE rollback must retain token IDs");
+                    let hidden_size = mlxcel_core::array_shape(inputs)[2];
+                    let inputs =
+                        mlxcel_core::slice(inputs, &[0, 0, 0], &[batch, replay_len, hidden_size]);
+                    let replay_ids = mlxcel_core::slice(input_ids, &[0, 0], &[batch, replay_len]);
+                    let ple = self.layers[snapshot.layer_idx]
+                        .ple
+                        .as_ref()
+                        .expect("PLE rollback snapshot must retain its layer");
+                    let output = ple
+                        .forward(&inputs, &replay_ids, cache)
+                        .expect("captured PLE replay must remain valid");
+                    mlxcel_core::eval(&output);
+                }
             }
             if materialize {
                 for cache in caches.iter_mut() {
@@ -1649,7 +2135,7 @@ impl Qwen35Model {
             }
             plan
         });
-        self.mrope_state.set_position(plan.final_offset);
+        self.rope_state.set_position(plan.final_offset);
         plan
     }
 
@@ -1662,7 +2148,7 @@ impl Qwen35Model {
         });
     }
 
-    fn parse_config(model_dir: &Path) -> Result<Qwen35Config> {
+    fn parse_config(model_dir: &Path) -> Result<Qwen4Config> {
         let config_path = model_dir.join("config.json");
         let config_text = std::fs::read_to_string(&config_path)
             .with_context(|| format!("failed to read {}", config_path.display()))?;
@@ -1676,159 +2162,80 @@ impl Qwen35Model {
             .and_then(Value::as_str)
             .with_context(|| format!("{} is missing string model_type", config_path.display()))?;
         ensure!(
-            model_type == "qwen3_5",
-            "unsupported architecture {model_type:?} in {}; expected \"qwen3_5\"",
+            model_type == "qwen4_exp",
+            "unsupported architecture {model_type:?} in {}; expected \"qwen4_exp\"",
             config_path.display()
         );
-
         let mut text_config = root_object
             .get("text_config")
             .cloned()
-            .unwrap_or_else(|| root.clone());
+            .with_context(|| format!("{} is missing text_config", config_path.display()))?;
         let text_object = text_config.as_object_mut().with_context(|| {
             format!(
                 "text_config in {} must contain a JSON object",
                 config_path.display()
             )
         })?;
-
-        for object in [Some(root_object), Some(&*text_object)] {
-            let object = object.expect("config object");
-            if let Some(value) = object.get("num_experts") {
-                let experts = value.as_i64().with_context(|| {
-                    format!(
-                        "num_experts in {} must be an integer",
-                        config_path.display()
-                    )
-                })?;
-                ensure!(
-                    experts == 0,
-                    "MoE checkpoints are not supported: num_experts={experts} in {}",
-                    config_path.display()
-                );
-            }
-            if let Some(kind) = object.get("model_type").and_then(Value::as_str) {
-                ensure!(
-                    !kind.ends_with("_moe"),
-                    "MoE architecture {kind:?} is not supported in {}",
-                    config_path.display()
-                );
-            }
-        }
-
-        if let Some(quantization) = root_object
+        let quantization = root_object
             .get("quantization")
             .or_else(|| root_object.get("quantization_config"))
-        {
-            validate_quantization(quantization, &config_path)?;
-            text_object.insert("quantization".to_string(), quantization.clone());
-        } else if let Some(quantization) = text_object
-            .get("quantization")
-            .or_else(|| text_object.get("quantization_config"))
-        {
-            validate_quantization(quantization, &config_path)?;
-        }
-
-        for key in [
-            "vision_config",
-            "image_token_id",
-            "video_token_id",
-            "vision_start_token_id",
-            "rope_parameters",
-        ] {
-            if let Some(value) = root_object.get(key) {
-                text_object.insert(key.to_string(), value.clone());
-            }
-        }
-
-        let mut config: Qwen35Config = serde_json::from_value(text_config).with_context(|| {
+            .with_context(|| {
+                format!("{} is missing quantization metadata", config_path.display())
+            })?;
+        validate_quantization(quantization, &config_path)?;
+        text_object.insert("quantization".to_owned(), quantization.clone());
+        let config: Qwen4Config = serde_json::from_value(text_config).with_context(|| {
             format!(
-                "failed to parse dense text config in {}",
+                "failed to parse Qwen4 text config in {}",
                 config_path.display()
             )
         })?;
         ensure!(
-            config.model_type == "qwen3_5" || config.model_type == "qwen3_5_text",
-            "unsupported dense text architecture {:?} in {}",
+            config.model_type == "qwen4_exp_text",
+            "unsupported text architecture {:?} in {}",
             config.model_type,
             config_path.display()
         );
         ensure!(
-            config.hidden_size > 0
-                && config.intermediate_size > 0
-                && config.vocab_size > 0
-                && config.num_attention_heads > 0
-                && config.num_key_value_heads > 0,
-            "dense text dimensions must be greater than zero in {}",
+            config.hidden_size == 2_560
+                && config.num_hidden_layers == 48
+                && config.num_attention_heads == 24
+                && config.num_key_value_heads == 2
+                && config.head_dim_resolved() == 256
+                && config.linear_num_key_heads == 16
+                && config.linear_num_value_heads == 48
+                && config.linear_key_head_dim == 128
+                && config.linear_value_head_dim == 128
+                && config.vocab_size == 248_320,
+            "checkpoint {} does not match the fixed Qwen3.8 Flash Next text backbone",
             config_path.display()
         );
         ensure!(
-            config.full_attention_interval > 0,
-            "full_attention_interval must be greater than zero in {}",
+            config.num_experts == 288
+                && config.num_experts_per_tok == 10
+                && config.moe_intermediate_size == 640
+                && config.shared_expert_intermediate_size == 640,
+            "checkpoint {} does not match the REAP-288 expert layout",
             config_path.display()
         );
         ensure!(
-            config.num_hidden_layers > 0,
-            "num_hidden_layers must be greater than zero in {}",
+            config.hc_count == 4
+                && config.hc_lowrank == 320
+                && config.layer_types.len() == config.num_hidden_layers
+                && config.ple_layer_ids == [2]
+                && config.ple_embed_dim == 2_560
+                && config.ngram_size == 3
+                && config.heads_per_ngram == 8
+                && config.make_ngram_vocab_size_divisible_by == 128
+                && config.split_ngram_parts == 128,
+            "checkpoint {} does not match the fixed Qwen4 hyper-connection/PLE layout",
             config_path.display()
         );
-        config.validate_mtp_metadata(&config_path)?;
-        let root_quantization = config.quantization.clone();
-        if let Some(vision) = config.vision_config.as_mut()
-            && let Some(quantization) = vision
-                .quantization_config
-                .as_ref()
-                .or(root_quantization.as_ref())
-        {
-            ensure!(
-                quantization.mode == "affine",
-                "unsupported vision quantization mode {:?} in {}",
-                quantization.mode,
-                config_path.display()
-            );
-            vision.quant_group_size = quantization.group_size;
-            vision.quant_bits = quantization.bits;
-        }
-        if let Some(vision) = config.vision_config.as_ref() {
-            ensure!(
-                vision.deepstack_visual_indexes.is_empty(),
-                "Qwen3.5-VL checkpoints with DeepStack visual indexes are not supported"
-            );
-            ensure!(
-                vision.out_hidden_size == config.hidden_size,
-                "vision output width must match the text hidden size in {}",
-                config_path.display()
-            );
-            ensure!(
-                config.image_token_id.is_some()
-                    && config.video_token_id.is_some()
-                    && config.vision_start_token_id.is_some(),
-                "Qwen3.5-VL config in {} is missing multimodal token identifiers",
-                config_path.display()
-            );
-            if let Some(raw_sections) = config
-                .rope_parameters
-                .as_ref()
-                .and_then(|parameters| parameters.get("mrope_section"))
-            {
-                ensure!(
-                    raw_sections.as_array().is_some_and(|values| {
-                        values.len() == 3 && values.iter().all(|value| value.as_i64().is_some())
-                    }),
-                    "rope_parameters.mrope_section must contain three integers in {}",
-                    config_path.display()
-                );
-            }
-            let sections = config.mrope_section();
-            let rotary_half =
-                ((config.head_dim_resolved() as f32 * config.partial_rotary_factor()) as i32) / 2;
-            ensure!(
-                sections.iter().all(|&section| section > 0)
-                    && sections.iter().sum::<i32>() == rotary_half,
-                "rope_parameters.mrope_section is incompatible with the rotary dimension in {}",
-                config_path.display()
-            );
-        }
+        ensure!(
+            config.output_gate_type == "sigmoid" && config.eos_token_id.is_some(),
+            "checkpoint {} has incompatible Qwen4 gating or EOS metadata",
+            config_path.display()
+        );
         Ok(config)
     }
 
@@ -1883,308 +2290,65 @@ impl Qwen35Model {
         );
         let config = Self::parse_config(model_dir)?;
         Self::validate_shard_index(model_dir)?;
+        let ngram_prefix = "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards";
+        let (ngram_group_size, ngram_bits) =
+            config.quant_params("model.layers.1.ple.ple_embedding.ngram_embedding.shards.0");
+        ensure!(
+            ngram_group_size == 32 && ngram_bits == 4,
+            "Qwen4 SSD n-gram table requires affine 4-bit/group-32 rows"
+        );
+        let ngram_heads = (config.ngram_size - 1) * config.heads_per_ngram;
+        let table = Arc::new(NGramTable::prepare(
+            model_dir,
+            &NGramTableSpec {
+                tensor_prefix: ngram_prefix.to_owned(),
+                shard_count: config.split_ngram_parts,
+                embedding_dim: config.ple_embed_dim / ngram_heads,
+                group_size: ngram_group_size as usize,
+            },
+        )?);
 
         let weights = mlxcel_core::weights::load_weights_from_dir_filtered(model_dir, |name| {
-            name.starts_with("language_model.")
+            (name.starts_with("language_model.")
                 || name.starts_with("model.language_model.")
-                || name.starts_with("model.visual.")
-                || name.starts_with("visual.")
-                || name.starts_with("vision_tower.")
-                || name.starts_with("lm_head.")
+                || name.starts_with("lm_head."))
+                && !name.contains(".ngram_embedding.shards.")
         })
         .map_err(anyhow::Error::msg)
         .with_context(|| {
             format!(
-                "failed to load checkpoint shards from {}",
+                "failed to load Qwen4 checkpoint shards from {}",
                 model_dir.display()
             )
         })?;
         ensure!(
             !weights.is_empty(),
-            "checkpoint {} contains no Qwen3.5 model tensors",
+            "checkpoint {} contains no Qwen4 language-model tensors",
             model_dir.display()
         );
         let weights = sanitize_language_model_weights(weights, &config, model_dir)?;
-        let target_cache_mode = mtp_target_cache_mode(weights.mtp.is_some(), kv_cache_mode);
         tracing::info!(
             requested_cache_mode = ?kv_cache_mode,
-            effective_target_cache_mode = ?target_cache_mode,
-            "selected Qwen3.5 target cache policy"
+            ngram_rows = table.rows(),
+            "selected Qwen4 target cache and SSD n-gram policy"
         );
-        let mut model = Self::from_weights(&weights.target, &config, target_cache_mode)
+        Self::from_weights(&weights.target, &config, kv_cache_mode, Some(table))
             .map_err(anyhow::Error::msg)
             .with_context(|| {
                 format!(
-                    "failed to construct dense model from checkpoint {}",
-                    model_dir.display()
-                )
-            })?;
-        if let Some(mtp_weights) = weights.mtp.as_ref() {
-            model.mtp = Some(
-                Qwen35MtpDraftModel::from_weights(mtp_weights, &config)
-                    .map_err(anyhow::Error::msg)
-                    .with_context(|| {
-                        format!(
-                            "failed to construct bundled MTP head from checkpoint {}",
-                            model_dir.display()
-                        )
-                    })?,
-            );
-        }
-        if let Some(mut vision_config) = config.vision_config.clone() {
-            if vision_config.quantization_config.is_none() {
-                let (group_size, bits) = config.quant_params("model.visual");
-                vision_config.quant_group_size = group_size;
-                vision_config.quant_bits = bits;
-            }
-            model.vision = Some(
-                Qwen3VLVisionEncoder::from_weights(&weights.vision, &vision_config, "vision_tower")
-                    .map_err(anyhow::Error::msg)
-                    .with_context(|| {
-                        format!(
-                            "failed to construct Qwen3.5 vision encoder from checkpoint {}",
-                            model_dir.display()
-                        )
-                    })?,
-            );
-        }
-        Ok(model)
-    }
-
-    #[cfg(any(feature = "specprefill", test))]
-    pub(crate) fn load_specprefill_draft(model_dir: &Path) -> Result<Self> {
-        use crate::specprefill::SPECPREFILL_DRAFT_MODEL_IDENTIFIER;
-
-        ensure!(
-            model_dir.is_dir(),
-            "SpecPrefill draft model directory does not exist or is not a directory: {}",
-            model_dir.display()
-        );
-        // `parse_config` has already required the checkpoint root
-        // `model_type == "qwen3_5"`; the returned config is the nested text
-        // architecture, whose pinned identifier is `qwen3_5_text`.
-        let mut config = Self::parse_config(model_dir)?;
-        let quantization = config.quantization.as_ref();
-        ensure!(
-            config.model_type == "qwen3_5_text"
-                && config.num_hidden_layers == 24
-                && config.full_attention_interval == 4
-                && config.hidden_size == 1_024
-                && config.num_attention_heads == 8
-                && config.num_key_value_heads == 2
-                && config.vocab_size == 248_320
-                && config.max_position_embeddings == 262_144
-                && quantization
-                    .is_some_and(|q| { q.mode == "affine" && q.bits == 8 && q.group_size == 64 }),
-            "checkpoint {} does not match pinned SpecPrefill draft architecture {}",
-            model_dir.display(),
-            SPECPREFILL_DRAFT_MODEL_IDENTIFIER
-        );
-        // The pinned checkpoint is a VLM distribution, but SpecPrefill uses
-        // only its text scorer. Make the draft-only sanitized contract
-        // explicitly language-only; ordinary target loading retains the
-        // complete vision and bundled-MTP validation above.
-        config.vision_config = None;
-        config.image_token_id = None;
-        config.video_token_id = None;
-        config.vision_start_token_id = None;
-        config.mtp_num_hidden_layers = None;
-        config.mtp_use_dedicated_embeddings = None;
-        Self::validate_shard_index(model_dir)?;
-        let weights = mlxcel_core::weights::load_weights_from_dir_filtered(model_dir, |name| {
-            name.starts_with("language_model.")
-                || name.starts_with("model.language_model.")
-                || name.starts_with("lm_head.")
-        })
-        .map_err(anyhow::Error::msg)
-        .with_context(|| {
-            format!(
-                "failed to load SpecPrefill draft checkpoint shards from {}",
-                model_dir.display()
-            )
-        })?;
-        ensure!(
-            !weights.is_empty(),
-            "checkpoint {} contains no Qwen3.5 language-model tensors",
-            model_dir.display()
-        );
-        let weights = sanitize_language_model_weights(weights, &config, model_dir)?;
-        Self::from_weights(&weights.target, &config, KVCacheMode::Fp16)
-            .map_err(anyhow::Error::msg)
-            .with_context(|| {
-                format!(
-                    "failed to construct SpecPrefill draft model {} from {}",
-                    SPECPREFILL_DRAFT_MODEL_IDENTIFIER,
+                    "failed to construct Qwen4 model from checkpoint {}",
                     model_dir.display()
                 )
             })
     }
 
-    #[cfg(any(feature = "specprefill", test))]
-    pub(crate) fn specprefill_draft_prefill(
-        &self,
-        prompt_ids: &[i32],
-    ) -> Result<UniquePtr<MlxArray>> {
-        ensure!(
-            !prompt_ids.is_empty(),
-            "SpecPrefill draft prompt must not be empty"
-        );
-        self.reset_runtime_state();
-        let configured = mlxcel_core::generate::prefill_chunk_len();
-        let chunk_len =
-            mlxcel_core::generate::effective_prefill_chunk(configured, true, prompt_ids.len())
-                .unwrap_or(prompt_ids.len());
-        let mut final_logits = None;
-        for (chunk_index, chunk) in prompt_ids.chunks(chunk_len).enumerate() {
-            let input = mlxcel_core::from_slice_i32(chunk, &[1, chunk.len() as i32]);
-            let hidden = self.sequence_state.with_internal(|caches| {
-                self.forward_backbone_with_inputs(&input, None, caches, None)
-            });
-            if (chunk_index + 1) * chunk_len >= prompt_ids.len() {
-                let shape = mlxcel_core::array_shape(&hidden);
-                let last = shape[1] - 1;
-                let last_hidden =
-                    mlxcel_core::slice(&hidden, &[0, last, 0], &[shape[0], last + 1, shape[2]]);
-                final_logits = Some(self.project_logits(&self.norm.forward(&last_hidden)));
-            }
-        }
-        Ok(final_logits.expect("non-empty draft prompt produces logits"))
-    }
-
-    #[cfg(any(feature = "specprefill", test))]
-    pub(crate) fn specprefill_draft_lookahead(
-        &self,
-        token_id: i32,
-    ) -> (UniquePtr<MlxArray>, Vec<UniquePtr<MlxArray>>) {
-        let input = mlxcel_core::from_slice_i32(&[token_id], &[1, 1]);
-        self.sequence_state.with_internal(|caches| {
-            let mut hidden = self.embed_tokens.forward(&input);
-            let mut queries =
-                Vec::with_capacity(self.layers.len() / self.config.full_attention_interval);
-            for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
-                let (next, query) = layer.forward_with_query_capture(&hidden, cache);
-                hidden = next;
-                if let Some(query) = query {
-                    queries.push(query);
-                }
-            }
-            (self.project_logits(&self.norm.forward(&hidden)), queries)
-        })
-    }
-
-    #[cfg(any(feature = "specprefill", test))]
-    pub(crate) fn specprefill_draft_prompt_keys(
-        &self,
-        prompt_len: usize,
-    ) -> Vec<UniquePtr<MlxArray>> {
-        let prompt_len = i32::try_from(prompt_len).unwrap_or(i32::MAX);
-        self.sequence_state.with_internal(|caches| {
-            caches
-                .iter()
-                .filter_map(|cache| match cache {
-                    Qwen3NextCache::Attention(cache) => {
-                        let keys = cache.keys.as_deref()?;
-                        let shape = mlxcel_core::array_shape(keys);
-                        Some(mlxcel_core::slice(
-                            keys,
-                            &[0, 0, 0, 0],
-                            &[shape[0], shape[1], prompt_len, shape[3]],
-                        ))
-                    }
-                    Qwen3NextCache::Linear(_) => None,
-                })
-                .collect()
-        })
-    }
-
-    #[cfg(any(feature = "specprefill", test))]
-    pub(crate) fn specprefill_sparse_prefill(
-        &self,
-        prompt_ids: &[i32],
-        prefix_reuse: Option<mlxcel_core::generate::PrefixReuse<'_>>,
-        dense_prefix_end: usize,
-        selected_indices: &[usize],
-    ) -> std::result::Result<(UniquePtr<MlxArray>, usize), String> {
-        self.reset_runtime_state();
-        let mut cached_tokens = 0;
-        if let Some(reuse) = prefix_reuse
-            && reuse.cached_tokens > 0
-            && reuse.cached_tokens <= prompt_ids.len()
-            && reuse.snapshot.token_len() == reuse.cached_tokens
-            && (reuse.cached_tokens < prompt_ids.len()
-                || reuse.snapshot.continuation_logits().is_some())
-        {
-            self.restore_sequence_state(SequenceId::from_raw(0), reuse.snapshot)?;
-            cached_tokens = reuse.cached_tokens;
-        }
-
-        if cached_tokens < dense_prefix_end {
-            let dense = &prompt_ids[cached_tokens..dense_prefix_end];
-            let input = mlxcel_core::from_slice_i32(dense, &[1, dense.len() as i32]);
-            self.sequence_state.with_internal(|caches| {
-                self.forward_backbone_with_inputs(&input, None, caches, None)
-            });
-        }
-
-        if selected_indices.is_empty() {
-            return Err("SpecPrefill selected no target tokens".to_string());
-        }
-        let mut final_hidden = None;
-        for indices in selected_indices.chunks(SPECPREFILL_TARGET_CHUNK_TOKENS) {
-            let sparse_ids = indices
-                .iter()
-                .map(|&index| prompt_ids[index])
-                .collect::<Vec<_>>();
-            let one_axis_positions = indices
-                .iter()
-                .map(|&index| i32::try_from(index).unwrap_or(i32::MAX))
-                .collect::<Vec<_>>();
-            let positions = one_axis_positions
-                .iter()
-                .chain(&one_axis_positions)
-                .chain(&one_axis_positions)
-                .copied()
-                .collect::<Vec<_>>();
-            let input = mlxcel_core::from_slice_i32(&sparse_ids, &[1, sparse_ids.len() as i32]);
-            let position_ids =
-                mlxcel_core::from_slice_i32(&positions, &[3, 1, sparse_ids.len() as i32]);
-            final_hidden = Some(self.sequence_state.with_internal(|caches| {
-                self.forward_backbone_with_inputs(&input, None, caches, Some(&position_ids))
-            }));
-        }
-        let hidden = final_hidden.expect("non-empty SpecPrefill selection produces hidden states");
-        let shape = mlxcel_core::array_shape(&hidden);
-        let last = shape[1] - 1;
-        let last_hidden =
-            mlxcel_core::slice(&hidden, &[0, last, 0], &[shape[0], last + 1, shape[2]]);
-        self.finish_initial_prefill();
-        Ok((
-            self.project_logits(&self.norm.forward(&last_hidden)),
-            cached_tokens,
-        ))
-    }
-
-    #[cfg(any(feature = "specprefill", test))]
-    pub(crate) fn specprefill_decode(
-        &self,
-        token_id: i32,
-        logical_position: usize,
-    ) -> UniquePtr<MlxArray> {
-        let input = mlxcel_core::from_slice_i32(&[token_id], &[1, 1]);
-        let position = i32::try_from(logical_position).unwrap_or(i32::MAX);
-        let position_ids = mlxcel_core::from_slice_i32(&[position, position, position], &[3, 1, 1]);
-        let hidden = self.sequence_state.with_internal(|caches| {
-            self.forward_backbone_with_inputs(&input, None, caches, Some(&position_ids))
-        });
-        self.project_logits(&self.norm.forward(&hidden))
-    }
-
     pub(crate) fn from_weights(
         weights: &WeightMap,
-        config: &Qwen35Config,
+        config: &Qwen4Config,
         kv_cache_mode: KVCacheMode,
+        ngram_table: Option<Arc<NGramTable>>,
     ) -> std::result::Result<Self, String> {
-        let qn_config = config.to_qwen3next_config();
+        let qn_config = config.to_qwen4_attention_config();
         let (embed_group_size, embed_bits) = config.quant_params("model.embed_tokens");
         let embed_tokens = UnifiedEmbedding::from_weights(
             weights,
@@ -2195,15 +2359,15 @@ impl Qwen35Model {
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for layer_idx in 0..config.num_hidden_layers {
-            layers.push(Qwen35DecoderLayer::from_weights(
-                weights, config, &qn_config, layer_idx,
+            layers.push(Qwen4DecoderLayer::from_weights(
+                weights,
+                config,
+                &qn_config,
+                layer_idx,
+                ngram_table.clone(),
             )?);
         }
-
-        let norm_weight = weights
-            .get("model.norm.weight")
-            .map(|weight| mlxcel_core::copy(weight))
-            .ok_or_else(|| "missing required tensor model.norm.weight".to_string())?;
+        let norm = Qwen4FinalMixer::from_weights(weights, config, "model.hyper_connection_mixer")?;
         let lm_head = if config.tie_word_embeddings {
             None
         } else {
@@ -2215,19 +2379,19 @@ impl Qwen35Model {
         let compact_draft_head = lm_head.as_ref().and_then(|head| {
             compact_head(head, config.vocab_size, MTP_DRAFT_PREFIX, MTP_DRAFT_PADDED)
         });
-        let compact_dflash_verify_head = lm_head.as_ref().and_then(|head| {
+        let compact_mtp_verify_head = lm_head.as_ref().and_then(|head| {
             compact_head(
                 head,
                 config.vocab_size,
-                DFLASH_VERIFY_PREFIX,
-                DFLASH_VERIFY_PADDED,
+                MTP_VERIFY_PREFIX,
+                MTP_VERIFY_PADDED,
             )
         });
         let internal_caches = layers
             .iter()
             .map(|layer| {
                 if layer.is_linear {
-                    Qwen3NextCache::Linear(GatedDeltaCache::new())
+                    Qwen4LayerCache::Linear(GatedDeltaCache::new())
                 } else {
                     new_initial_attention_cache(kv_cache_mode)
                 }
@@ -2237,17 +2401,16 @@ impl Qwen35Model {
         Ok(Self {
             embed_tokens,
             layers,
-            norm: RMSNorm::new(norm_weight, config.rms_norm_eps),
+            norm,
             lm_head,
             initial_prefill_complete: AtomicBool::new(false),
             compact_draft_head,
-            compact_dflash_verify_head,
+            compact_mtp_verify_head,
             config: config.clone(),
             kv_cache_mode,
             mtp: None,
-            vision: None,
             sequence_state: ModelOwnedSequenceState::new(internal_caches),
-            mrope_state: MRopeState::new(),
+            rope_state: RopeState::new(),
         })
     }
 }
@@ -2334,40 +2497,18 @@ fn is_raw_conv1d_layout(shape: &[i32]) -> bool {
     shape.len() >= 3 && shape[shape.len() - 1] != 1
 }
 
-pub(crate) fn sanitize_weights(mut weights: WeightMap, config: &Qwen35Config) -> WeightMap {
-    let raw_conv1d = weights.iter().any(|(name, value)| {
-        name.contains("conv1d.weight") && is_raw_conv1d_layout(&mlxcel_core::array_shape(value))
-    });
-
-    weights.retain(|name, _| !name.starts_with("mtp.") && !name.contains(".mtp."));
+pub(crate) fn sanitize_weights(mut weights: WeightMap, config: &Qwen4Config) -> WeightMap {
     if config.tie_word_embeddings {
         weights.remove("lm_head.weight");
     }
-
-    let norm_suffixes = [
-        ".input_layernorm.weight",
-        ".post_attention_layernorm.weight",
-        "model.norm.weight",
-        ".q_norm.weight",
-        ".k_norm.weight",
-    ];
-    let keys: Vec<String> = weights.keys().cloned().collect();
+    let keys = weights.keys().cloned().collect::<Vec<_>>();
     for key in keys {
         if key.contains("conv1d.weight") {
             let value = weights
                 .get(&key)
                 .expect("key collected from the same weight map");
             if is_raw_conv1d_layout(&mlxcel_core::array_shape(value)) {
-                weights.insert(key.clone(), mlxcel_core::swap_axes(value, -1, -2));
-            }
-        }
-        if raw_conv1d && norm_suffixes.iter().any(|suffix| key.ends_with(suffix)) {
-            let value = weights
-                .get(&key)
-                .expect("key collected from the same weight map");
-            if mlxcel_core::array_shape(value).len() == 1 {
-                let one = mlxcel_core::full_f32(&[1], 1.0, mlxcel_core::array_dtype(value));
-                weights.insert(key, mlxcel_core::add(value, &one));
+                weights.insert(key, mlxcel_core::swap_axes(value, -1, -2));
             }
         }
     }
@@ -2376,166 +2517,39 @@ pub(crate) fn sanitize_weights(mut weights: WeightMap, config: &Qwen35Config) ->
 
 struct SanitizedLanguageWeights {
     target: WeightMap,
-    vision: WeightMap,
-    mtp: Option<WeightMap>,
 }
 
 fn sanitize_language_model_weights(
     weights: WeightMap,
-    config: &Qwen35Config,
-    checkpoint_path: &Path,
+    config: &Qwen4Config,
+    _checkpoint_path: &Path,
 ) -> Result<SanitizedLanguageWeights> {
     let mut target = WeightMap::new();
-    let mut vision = WeightMap::new();
-    let mut mtp = WeightMap::new();
     for (name, value) in weights {
         let normalized = if let Some(rest) = name.strip_prefix("model.language_model.") {
             format!("model.{rest}")
         } else if let Some(rest) = name.strip_prefix("language_model.") {
-            rest.to_string()
+            rest.to_owned()
         } else {
             name
         };
-        if let Some(rest) = normalized
-            .strip_prefix("model.visual.")
-            .or_else(|| normalized.strip_prefix("visual."))
-            .or_else(|| normalized.strip_prefix("vision_tower."))
-        {
-            vision.insert(format!("vision_tower.{rest}"), value);
-        } else if let Some(rest) = normalized.strip_prefix("model.mtp.") {
-            mtp.insert(format!("mtp.{rest}"), value);
-        } else if normalized.starts_with("mtp.") {
-            mtp.insert(normalized, value);
-        } else {
-            target.insert(normalized, value);
-        }
+        target.insert(normalized, value);
     }
-    ensure!(
-        config.vision_config.is_some() || vision.is_empty(),
-        "checkpoint {} contains vision tensors but config.json has no vision_config",
-        checkpoint_path.display()
-    );
-    ensure!(
-        config.vision_config.is_none() || !vision.is_empty(),
-        "checkpoint {} declares vision_config but contains no vision tensors",
-        checkpoint_path.display()
-    );
-
-    let declared = config.has_mtp_metadata();
-    ensure!(
-        declared || mtp.is_empty(),
-        "checkpoint {} contains language_model.mtp.* tensors but text_config does not declare \
-         mtp_num_hidden_layers and mtp_use_dedicated_embeddings",
-        checkpoint_path.display()
-    );
-    ensure!(
-        !declared || !mtp.is_empty(),
-        "checkpoint {} declares a bundled MTP head but contains no language_model.mtp.* tensors",
-        checkpoint_path.display()
-    );
-
-    let raw_layout = target.iter().any(|(name, value)| {
-        name.contains("conv1d.weight") && is_raw_conv1d_layout(&mlxcel_core::array_shape(value))
-    });
-    let mtp = if declared {
-        validate_mtp_weights(&mtp, checkpoint_path)?;
-        Some(sanitize_mtp_weights(mtp, raw_layout))
-    } else {
-        None
-    };
     Ok(SanitizedLanguageWeights {
         target: sanitize_weights(target, config),
-        vision,
-        mtp,
     })
 }
 
-fn validate_mtp_weights(weights: &WeightMap, checkpoint_path: &Path) -> Result<()> {
-    const REQUIRED: &[&str] = &[
-        "mtp.fc.weight",
-        "mtp.pre_fc_norm_embedding.weight",
-        "mtp.pre_fc_norm_hidden.weight",
-        "mtp.layers.0.input_layernorm.weight",
-        "mtp.layers.0.post_attention_layernorm.weight",
-        "mtp.layers.0.self_attn.q_proj.weight",
-        "mtp.layers.0.self_attn.k_proj.weight",
-        "mtp.layers.0.self_attn.v_proj.weight",
-        "mtp.layers.0.self_attn.o_proj.weight",
-        "mtp.layers.0.self_attn.q_norm.weight",
-        "mtp.layers.0.self_attn.k_norm.weight",
-        "mtp.layers.0.mlp.gate_proj.weight",
-        "mtp.layers.0.mlp.up_proj.weight",
-        "mtp.layers.0.mlp.down_proj.weight",
-        "mtp.norm.weight",
-    ];
-    for name in REQUIRED {
-        ensure!(
-            weights.contains_key(*name),
-            "checkpoint {} is missing required tensor language_model.{name}",
-            checkpoint_path.display()
-        );
-    }
-    if let Some(name) = weights
-        .keys()
-        .find(|name| name.starts_with("mtp.embed_tokens."))
-    {
-        anyhow::bail!(
-            "checkpoint {} contains dedicated MTP embedding tensor language_model.{name} \
-             while text_config.mtp_use_dedicated_embeddings is false",
-            checkpoint_path.display()
-        );
-    }
-    if let Some(name) = weights
-        .keys()
-        .find(|name| name.starts_with("mtp.layers.") && !name.starts_with("mtp.layers.0."))
-    {
-        anyhow::bail!(
-            "checkpoint {} contains unsupported extra MTP layer tensor language_model.{name}",
-            checkpoint_path.display()
-        );
-    }
-    Ok(())
-}
-
-fn sanitize_mtp_weights(mut weights: WeightMap, raw_layout: bool) -> WeightMap {
-    if !raw_layout {
-        return weights;
-    }
-    const NORM_SUFFIXES: &[&str] = &[
-        ".input_layernorm.weight",
-        ".post_attention_layernorm.weight",
-        ".q_norm.weight",
-        ".k_norm.weight",
-        "mtp.norm.weight",
-        "mtp.pre_fc_norm_embedding.weight",
-        "mtp.pre_fc_norm_hidden.weight",
-    ];
-    let names: Vec<String> = weights.keys().cloned().collect();
-    for name in names {
-        if !NORM_SUFFIXES.iter().any(|suffix| name.ends_with(suffix)) {
-            continue;
-        }
-        let value = weights
-            .get(&name)
-            .expect("name collected from the same MTP weight map");
-        if mlxcel_core::array_shape(value).len() == 1 {
-            let one = mlxcel_core::full_f32(&[1], 1.0, mlxcel_core::array_dtype(value));
-            weights.insert(name, mlxcel_core::add(value, &one));
-        }
-    }
-    weights
-}
-
-const QWEN35_SNAPSHOT_FAMILY: &str = "qwen3.5-target-v1";
-const QWEN35_TURBO4_SNAPSHOT_SUFFIXES: [&str; 5] =
+const QWEN4_SNAPSHOT_FAMILY: &str = "qwen4-target";
+const QWEN4_TURBO4_SNAPSHOT_SUFFIXES: [&str; 5] =
     ["k_packed", "k_rescale", "v_packed", "v_norms", "v_rescale"];
 
 fn snapshot_i32(snapshot: &ModelStateSnapshot, name: &str) -> std::result::Result<i32, String> {
     let value = snapshot
         .tensor(name)
-        .ok_or_else(|| format!("Qwen3.5 snapshot is missing {name}"))?;
+        .ok_or_else(|| format!("Qwen4 snapshot is missing {name}"))?;
     if mlxcel_core::array_size(value) != 1 {
-        return Err(format!("Qwen3.5 snapshot field {name} must be scalar"));
+        return Err(format!("Qwen4 snapshot field {name} must be scalar"));
     }
     Ok(mlxcel_core::item_i32(&mlxcel_core::reshape(value, &[])))
 }
@@ -2571,10 +2585,7 @@ fn push_turbo4_attention_snapshot(
 ) -> bool {
     // A donated snapshot and the live continuation must use identical cache
     // storage; packing only the snapshot can eventually change greedy output.
-    if cache.mode == KVCacheMode::Fp16
-        && cache.offset > 0
-        && !cache.demote_fp16_to_turbo4()
-    {
+    if cache.mode == KVCacheMode::Fp16 && cache.offset > 0 && !cache.demote_fp16_to_turbo4() {
         return false;
     }
     let Some(tensors) = cache.turbo4_snapshot_tensors() else {
@@ -2585,7 +2596,7 @@ fn push_turbo4_attention_snapshot(
 
 fn validate_snapshot_tensor_names(
     snapshot: &ModelStateSnapshot,
-    layers: &[Qwen35DecoderLayer],
+    layers: &[Qwen4DecoderLayer],
     kv_cache_mode: KVCacheMode,
 ) -> std::result::Result<(), String> {
     let mut expected = BTreeSet::from([
@@ -2601,16 +2612,27 @@ fn validate_snapshot_tensor_names(
     for (index, layer) in layers.iter().enumerate() {
         expected.insert(format!("layer.{index}.kind"));
         expected.insert(format!("layer.{index}.offset"));
+        if !layer.is_linear {
+            expected.insert(format!("layer.{index}.auxiliary_keys"));
+        }
         if layer.is_linear {
             expected.insert(format!("layer.{index}.conv_state"));
             expected.insert(format!("layer.{index}.state_cache"));
+            if layer.ple.is_some() {
+                expected.insert(format!("layer.{index}.ple_conv_state"));
+                expected.insert(format!("layer.{index}.ple_token_history"));
+            }
         } else if kv_cache_mode == KVCacheMode::Turbo4 {
-            for suffix in QWEN35_TURBO4_SNAPSHOT_SUFFIXES {
+            for suffix in QWEN4_TURBO4_SNAPSHOT_SUFFIXES {
                 expected.insert(format!("layer.{index}.{suffix}"));
             }
         } else {
             expected.insert(format!("layer.{index}.keys"));
             expected.insert(format!("layer.{index}.values"));
+            if matches!(kv_cache_mode, KVCacheMode::Int8 | KVCacheMode::Turbo8) {
+                expected.insert(format!("layer.{index}.key_scales"));
+                expected.insert(format!("layer.{index}.val_scales"));
+            }
         }
     }
     if actual_dense.len() + actual_paged.len()
@@ -2619,12 +2641,12 @@ fn validate_snapshot_tensor_names(
             .union(&actual_paged)
             .any(|name| !expected.contains(name))
     {
-        return Err("Qwen3.5 snapshot tensor layout does not match the loaded model".to_string());
+        return Err("Qwen4 snapshot tensor layout does not match the loaded model".to_string());
     }
     for (index, layer) in layers.iter().enumerate() {
         if !layer.is_linear {
             let names: &[&str] = if kv_cache_mode == KVCacheMode::Turbo4 {
-                &QWEN35_TURBO4_SNAPSHOT_SUFFIXES
+                &QWEN4_TURBO4_SNAPSHOT_SUFFIXES
             } else {
                 &["keys", "values"]
             };
@@ -2632,7 +2654,7 @@ fn validate_snapshot_tensor_names(
                 !actual_paged.contains(&format!("layer.{index}.{suffix}"))
                     && !actual_dense.contains(&format!("layer.{index}.{suffix}"))
             }) {
-                return Err("Qwen3.5 snapshot is missing paged attention state".to_string());
+                return Err("Qwen4 snapshot is missing paged attention state".to_string());
             }
         }
     }
@@ -2640,7 +2662,7 @@ fn validate_snapshot_tensor_names(
 }
 
 // LanguageModel trait implementation.
-impl LanguageModel for Qwen35Model {
+impl LanguageModel for Qwen4Model {
     fn forward(
         &self,
         input: &MlxArray,
@@ -2648,18 +2670,18 @@ impl LanguageModel for Qwen35Model {
         _mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
         let sequence_length = mlxcel_core::array_shape(input)[1];
-        let rope_delta = self.mrope_state.rope_delta();
+        let rope_delta = self.rope_state.rope_delta();
         let (logits, offset) = self.sequence_state.with_internal(|caches| {
-            let cache_offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
+            let cache_offset = caches.first().map(Qwen4LayerCache::offset).unwrap_or(0);
             let position_ids =
                 rope_delta.map(|delta| decode_rope_positions(cache_offset, sequence_length, delta));
             let hidden =
                 self.forward_backbone_with_inputs(input, None, caches, position_ids.as_deref());
             let logits = self.project_logits(&self.norm.forward(&hidden));
-            let offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
+            let offset = caches.first().map(Qwen4LayerCache::offset).unwrap_or(0);
             (logits, offset)
         });
-        self.mrope_state.set_position(offset);
+        self.rope_state.set_position(offset);
         logits
     }
 
@@ -2671,9 +2693,9 @@ impl LanguageModel for Qwen35Model {
         last_pos: usize,
     ) -> UniquePtr<MlxArray> {
         let sequence_length = mlxcel_core::array_shape(input_ids)[1];
-        let rope_delta = self.mrope_state.rope_delta();
+        let rope_delta = self.rope_state.rope_delta();
         let (logits, offset) = self.sequence_state.with_internal(|caches| {
-            let cache_offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
+            let cache_offset = caches.first().map(Qwen4LayerCache::offset).unwrap_or(0);
             let position_ids =
                 rope_delta.map(|delta| decode_rope_positions(cache_offset, sequence_length, delta));
             let hidden =
@@ -2690,10 +2712,10 @@ impl LanguageModel for Qwen35Model {
                 &[shape[0], position + 1, shape[2]],
             );
             let logits = self.project_logits(&self.norm.forward(&hidden));
-            let offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
+            let offset = caches.first().map(Qwen4LayerCache::offset).unwrap_or(0);
             (logits, offset)
         });
-        self.mrope_state.set_position(offset);
+        self.rope_state.set_position(offset);
         logits
     }
 
@@ -2705,14 +2727,14 @@ impl LanguageModel for Qwen35Model {
         _mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
         let (logits, offset) = self.sequence_state.with_internal(|caches| {
-            let hidden = self.mrope_state.with_position_ids(|position_ids| {
+            let hidden = self.rope_state.with_position_ids(|position_ids| {
                 self.forward_backbone_with_inputs(input_ids, input_embeddings, caches, position_ids)
             });
             let logits = self.project_logits(&self.norm.forward(&hidden));
-            let offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
+            let offset = caches.first().map(Qwen4LayerCache::offset).unwrap_or(0);
             (logits, offset)
         });
-        self.mrope_state.set_position(offset);
+        self.rope_state.set_position(offset);
         logits
     }
 
@@ -2721,19 +2743,16 @@ impl LanguageModel for Qwen35Model {
     }
 
     fn output_suppressed_token_ids(&self) -> Vec<i32> {
-        [self.config.image_token_id, self.config.video_token_id]
-            .into_iter()
-            .flatten()
-            .collect()
+        Vec::new()
     }
 
     fn prepare_embedding_prefill(&self) -> std::result::Result<(), String> {
-        self.mrope_state.activate_prepared()
+        self.rope_state.activate_prepared()
     }
 
     fn after_prefill(&self) {
         self.finish_initial_prefill();
-        self.mrope_state.finish_prefill();
+        self.rope_state.finish_prefill();
     }
 
     fn make_caches(&self) -> Vec<KVCache> {
@@ -2753,7 +2772,7 @@ impl LanguageModel for Qwen35Model {
             .store(false, Ordering::Relaxed);
         self.sequence_state
             .replace_internal(self.make_internal_caches());
-        self.mrope_state.clear();
+        self.rope_state.clear();
         if let Some(mtp) = &self.mtp {
             mtp.reset();
         }
@@ -2770,19 +2789,19 @@ impl LanguageModel for Qwen35Model {
         previous: Option<&ModelStateSnapshot>,
     ) -> Option<ModelStateSnapshot> {
         let token_len_i32 = i32::try_from(token_len).ok()?;
-        let mut snapshot = ModelStateSnapshot::new(QWEN35_SNAPSHOT_FAMILY, token_len);
+        let mut snapshot = ModelStateSnapshot::new(QWEN4_SNAPSHOT_FAMILY, token_len);
         push_snapshot_i32(
             &mut snapshot,
             "meta.layer_count",
             i32::try_from(self.layers.len()).ok()?,
         );
-        push_snapshot_i32(&mut snapshot, "mrope.position", self.mrope_state.position());
+        push_snapshot_i32(&mut snapshot, "mrope.position", self.rope_state.position());
         push_snapshot_i32(
             &mut snapshot,
             "mrope.rope_delta",
-            self.mrope_state.rope_delta().unwrap_or(i32::MIN),
+            self.rope_state.rope_delta().unwrap_or(i32::MIN),
         );
-        self.mrope_state.with_position_ids(|position_ids| {
+        self.rope_state.with_position_ids(|position_ids| {
             if let Some(position_ids) = position_ids {
                 snapshot.push_tensor("mrope.position_ids", position_ids);
             }
@@ -2807,7 +2826,21 @@ impl LanguageModel for Qwen35Model {
                     cache.offset(),
                 );
                 match cache {
-                    Qwen3NextCache::Attention(cache) => {
+                    Qwen4LayerCache::Attention(cache) => {
+                        let Some(auxiliary_keys) = cache.auxiliary_keys.as_deref() else {
+                            return false;
+                        };
+                        if snapshot
+                            .push_paged_tensor(
+                                previous,
+                                format!("layer.{index}.auxiliary_keys"),
+                                auxiliary_keys,
+                                1,
+                            )
+                            .is_err()
+                        {
+                            return false;
+                        }
                         if self.kv_cache_mode == KVCacheMode::Turbo4 {
                             if !push_turbo4_attention_snapshot(
                                 &mut snapshot,
@@ -2840,9 +2873,34 @@ impl LanguageModel for Qwen35Model {
                             {
                                 return false;
                             }
+                            if matches!(self.kv_cache_mode, KVCacheMode::Int8 | KVCacheMode::Turbo8)
+                            {
+                                let Some(tensors) = cache.int8_snapshot_tensors() else {
+                                    return false;
+                                };
+                                if snapshot
+                                    .push_paged_tensor(
+                                        previous,
+                                        format!("layer.{index}.key_scales"),
+                                        tensors.key_scales,
+                                        2,
+                                    )
+                                    .is_err()
+                                    || snapshot
+                                        .push_paged_tensor(
+                                            previous,
+                                            format!("layer.{index}.val_scales"),
+                                            tensors.val_scales,
+                                            2,
+                                        )
+                                        .is_err()
+                                {
+                                    return false;
+                                }
+                            }
                         }
                     }
-                    Qwen3NextCache::Linear(cache) => {
+                    Qwen4LayerCache::Linear(cache) => {
                         let (Some(conv_state), Some(state_cache)) =
                             (cache.conv_state.as_deref(), cache.state_cache.as_deref())
                         else {
@@ -2850,6 +2908,24 @@ impl LanguageModel for Qwen35Model {
                         };
                         snapshot.push_tensor(format!("layer.{index}.conv_state"), conv_state);
                         snapshot.push_tensor(format!("layer.{index}.state_cache"), state_cache);
+                        if layer.ple.is_some() {
+                            let Some(ple_conv_state) = cache.ple_conv_state.as_deref() else {
+                                return false;
+                            };
+                            if cache.ple_token_history.is_empty() {
+                                return false;
+                            }
+                            snapshot.push_tensor(
+                                format!("layer.{index}.ple_conv_state"),
+                                ple_conv_state,
+                            );
+                            let history = mlxcel_core::from_slice_i32(
+                                &cache.ple_token_history,
+                                &[cache.ple_token_history.len() as i32],
+                            );
+                            snapshot
+                                .push_tensor(format!("layer.{index}.ple_token_history"), &history);
+                        }
                     }
                 }
             }
@@ -2863,18 +2939,18 @@ impl LanguageModel for Qwen35Model {
         _seq_id: SequenceId,
         snapshot: &ModelStateSnapshot,
     ) -> std::result::Result<(), String> {
-        if snapshot.family() != QWEN35_SNAPSHOT_FAMILY {
+        if snapshot.family() != QWEN4_SNAPSHOT_FAMILY {
             return Err(format!(
-                "Qwen3.5 snapshot family mismatch: expected {QWEN35_SNAPSHOT_FAMILY}, got {}",
+                "Qwen4 snapshot family mismatch: expected {QWEN4_SNAPSHOT_FAMILY}, got {}",
                 snapshot.family()
             ));
         }
         let token_len = i32::try_from(snapshot.token_len())
-            .map_err(|_| "Qwen3.5 snapshot token length exceeds i32".to_string())?;
+            .map_err(|_| "Qwen4 snapshot token length exceeds i32".to_string())?;
         if snapshot_i32(snapshot, "meta.layer_count")?
             != i32::try_from(self.layers.len()).unwrap_or(i32::MAX)
         {
-            return Err("Qwen3.5 snapshot layer count does not match the loaded model".to_string());
+            return Err("Qwen4 snapshot layer count does not match the loaded model".to_string());
         }
         validate_snapshot_tensor_names(snapshot, &self.layers, self.kv_cache_mode)?;
 
@@ -2883,33 +2959,60 @@ impl LanguageModel for Qwen35Model {
             let expected_kind = if layer.is_linear { 1 } else { 0 };
             if snapshot_i32(snapshot, &format!("layer.{index}.kind"))? != expected_kind {
                 return Err(format!(
-                    "Qwen3.5 snapshot layer {index} cache variant mismatch"
+                    "Qwen4 snapshot layer {index} cache variant mismatch"
                 ));
             }
             if snapshot_i32(snapshot, &format!("layer.{index}.offset"))? != token_len {
-                return Err(format!("Qwen3.5 snapshot layer {index} offset mismatch"));
+                return Err(format!("Qwen4 snapshot layer {index} offset mismatch"));
             }
             if layer.is_linear {
                 let conv_state = snapshot
                     .tensor(&format!("layer.{index}.conv_state"))
-                    .ok_or_else(|| {
-                        format!("Qwen3.5 snapshot is missing layer {index} conv state")
-                    })?;
+                    .ok_or_else(|| format!("Qwen4 snapshot is missing layer {index} conv state"))?;
                 let state_cache = snapshot
                     .tensor(&format!("layer.{index}.state_cache"))
                     .ok_or_else(|| {
-                        format!("Qwen3.5 snapshot is missing layer {index} recurrent state")
+                        format!("Qwen4 snapshot is missing layer {index} recurrent state")
                     })?;
                 if mlxcel_core::array_shape(conv_state).len() != 3
                     || mlxcel_core::array_shape(state_cache).len() != 4
                 {
                     return Err(format!(
-                        "Qwen3.5 snapshot layer {index} linear cache layout mismatch"
+                        "Qwen4 snapshot layer {index} linear cache layout mismatch"
                     ));
                 }
-                restored.push(Qwen3NextCache::Linear(GatedDeltaCache {
+                let (ple_conv_state, ple_token_history) = if layer.ple.is_some() {
+                    let conv = snapshot
+                        .tensor(&format!("layer.{index}.ple_conv_state"))
+                        .ok_or_else(|| {
+                            format!("Qwen4 snapshot is missing layer {index} PLE convolution state")
+                        })?;
+                    let history = snapshot
+                        .tensor(&format!("layer.{index}.ple_token_history"))
+                        .ok_or_else(|| {
+                            format!("Qwen4 snapshot is missing layer {index} PLE token history")
+                        })?;
+                    if mlxcel_core::array_shape(conv).len() != 3
+                        || mlxcel_core::array_shape(history).len() != 1
+                    {
+                        return Err(format!(
+                            "Qwen4 snapshot layer {index} PLE cache layout mismatch"
+                        ));
+                    }
+                    let bytes = mlxcel_core::array_to_raw_bytes(history);
+                    let history = bytes
+                        .chunks_exact(4)
+                        .map(|chunk| i32::from_ne_bytes(chunk.try_into().expect("four-byte token")))
+                        .collect();
+                    (Some(mlxcel_core::copy(conv)), history)
+                } else {
+                    (None, Vec::new())
+                };
+                restored.push(Qwen4LayerCache::Linear(GatedDeltaCache {
                     conv_state: Some(mlxcel_core::copy(conv_state)),
                     state_cache: Some(mlxcel_core::copy(state_cache)),
+                    ple_conv_state,
+                    ple_token_history,
                     offset: token_len,
                 }));
             } else if self.kv_cache_mode == KVCacheMode::Turbo4 {
@@ -2922,9 +3025,7 @@ impl LanguageModel for Qwen35Model {
                                 .tensor(&format!("layer.{index}.{suffix}"))
                                 .map(mlxcel_core::copy)
                         })
-                        .ok_or_else(|| {
-                            format!("Qwen3.5 snapshot is missing layer {index} {suffix}")
-                        })
+                        .ok_or_else(|| format!("Qwen4 snapshot is missing layer {index} {suffix}"))
                 };
                 let mut cache = KVCache::new_with_mode(KVCacheMode::Turbo4);
                 cache.restore_turbo4_snapshot(
@@ -2935,7 +3036,20 @@ impl LanguageModel for Qwen35Model {
                     tensor("v_norms")?,
                     tensor("v_rescale")?,
                 )?;
-                restored.push(Qwen3NextCache::Attention(Box::new(cache)));
+                cache.auxiliary_keys = Some(
+                    snapshot
+                        .paged_tensor(&format!("layer.{index}.auxiliary_keys"))
+                        .and_then(|paged| paged.materialize())
+                        .or_else(|| {
+                            snapshot
+                                .tensor(&format!("layer.{index}.auxiliary_keys"))
+                                .map(mlxcel_core::copy)
+                        })
+                        .ok_or_else(|| {
+                            format!("Qwen4 snapshot is missing layer {index} QSA keys")
+                        })?,
+                );
+                restored.push(Qwen4LayerCache::Attention(Box::new(cache)));
             } else {
                 let keys = snapshot
                     .paged_tensor(&format!("layer.{index}.keys"))
@@ -2945,7 +3059,7 @@ impl LanguageModel for Qwen35Model {
                             .tensor(&format!("layer.{index}.keys"))
                             .map(mlxcel_core::copy)
                     })
-                    .ok_or_else(|| format!("Qwen3.5 snapshot is missing layer {index} keys"))?;
+                    .ok_or_else(|| format!("Qwen4 snapshot is missing layer {index} keys"))?;
                 let values = snapshot
                     .paged_tensor(&format!("layer.{index}.values"))
                     .and_then(|p| p.materialize())
@@ -2954,7 +3068,7 @@ impl LanguageModel for Qwen35Model {
                             .tensor(&format!("layer.{index}.values"))
                             .map(mlxcel_core::copy)
                     })
-                    .ok_or_else(|| format!("Qwen3.5 snapshot is missing layer {index} values"))?;
+                    .ok_or_else(|| format!("Qwen4 snapshot is missing layer {index} values"))?;
                 let key_shape = mlxcel_core::array_shape(keys.as_ref().expect("materialized keys"));
                 let value_shape =
                     mlxcel_core::array_shape(values.as_ref().expect("materialized values"));
@@ -2964,36 +3078,70 @@ impl LanguageModel for Qwen35Model {
                     || key_shape[2] < token_len
                 {
                     return Err(format!(
-                        "Qwen3.5 snapshot layer {index} attention cache layout mismatch"
+                        "Qwen4 snapshot layer {index} attention cache layout mismatch"
                     ));
                 }
                 let mut cache = KVCache::new_with_mode(self.kv_cache_mode);
-                cache.keys = Some(mlxcel_core::copy(keys.as_ref().expect("materialized keys")));
-                cache.values = Some(mlxcel_core::copy(
-                    values.as_ref().expect("materialized values"),
-                ));
-                cache.offset = token_len;
-                restored.push(Qwen3NextCache::Attention(Box::new(cache)));
+                if matches!(self.kv_cache_mode, KVCacheMode::Int8 | KVCacheMode::Turbo8) {
+                    let tensor = |suffix: &str| {
+                        snapshot
+                            .paged_tensor(&format!("layer.{index}.{suffix}"))
+                            .and_then(|paged| paged.materialize())
+                            .or_else(|| {
+                                snapshot
+                                    .tensor(&format!("layer.{index}.{suffix}"))
+                                    .map(mlxcel_core::copy)
+                            })
+                            .ok_or_else(|| {
+                                format!("Qwen4 snapshot is missing layer {index} {suffix}")
+                            })
+                    };
+                    cache.restore_int8_snapshot(
+                        token_len,
+                        keys,
+                        values,
+                        tensor("key_scales")?,
+                        tensor("val_scales")?,
+                    )?;
+                } else {
+                    cache.keys = Some(keys);
+                    cache.values = Some(values);
+                    cache.offset = token_len;
+                }
+                cache.auxiliary_keys = Some(
+                    snapshot
+                        .paged_tensor(&format!("layer.{index}.auxiliary_keys"))
+                        .and_then(|paged| paged.materialize())
+                        .or_else(|| {
+                            snapshot
+                                .tensor(&format!("layer.{index}.auxiliary_keys"))
+                                .map(mlxcel_core::copy)
+                        })
+                        .ok_or_else(|| {
+                            format!("Qwen4 snapshot is missing layer {index} QSA keys")
+                        })?,
+                );
+                restored.push(Qwen4LayerCache::Attention(Box::new(cache)));
             }
         }
 
         let position = snapshot_i32(snapshot, "mrope.position")?;
         if position != token_len {
-            return Err("Qwen3.5 snapshot MRoPE position does not match token length".to_string());
+            return Err("Qwen4 snapshot MRoPE position does not match token length".to_string());
         }
         let rope_delta = match snapshot_i32(snapshot, "mrope.rope_delta")? {
             i32::MIN => None,
             value => Some(value),
         };
         self.sequence_state.replace_internal(restored);
-        self.mrope_state
+        self.rope_state
             .restore(position, snapshot.tensor("mrope.position_ids"), rope_delta);
         self.initial_prefill_complete.store(true, Ordering::Relaxed);
         Ok(())
     }
 
     fn snapshot_truncatable_to(&self, snapshot: &ModelStateSnapshot, target_len: usize) -> bool {
-        snapshot.family() == QWEN35_SNAPSHOT_FAMILY && target_len == snapshot.token_len()
+        snapshot.family() == QWEN4_SNAPSHOT_FAMILY && target_len == snapshot.token_len()
     }
 
     fn restore_sequence_state_truncated(
@@ -3004,7 +3152,7 @@ impl LanguageModel for Qwen35Model {
     ) -> std::result::Result<(), String> {
         if !self.snapshot_truncatable_to(snapshot, target_len) {
             return Err(
-                "Qwen3.5 recurrent snapshots cannot be truncated to an earlier token".to_string(),
+                "Qwen4 recurrent snapshots cannot be truncated to an earlier token".to_string(),
             );
         }
         self.restore_sequence_state(seq_id, snapshot)
@@ -3019,9 +3167,9 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn dense_config(quantization: Option<Value>) -> Qwen35Config {
+    fn dense_config(quantization: Option<Value>) -> Qwen4Config {
         let mut value = serde_json::json!({
-            "model_type": "qwen3_5_text",
+            "model_type": "qwen4_exp_text",
             "hidden_size": 16,
             "num_hidden_layers": 8,
             "intermediate_size": 32,
@@ -3040,29 +3188,6 @@ mod tests {
         serde_json::from_value(value).expect("minimal dense config")
     }
 
-    fn mtp_config() -> Qwen35Config {
-        let mut config = dense_config(None);
-        config.mtp_num_hidden_layers = Some(1);
-        config.mtp_use_dedicated_embeddings = Some(false);
-        config
-    }
-
-    #[test]
-    fn bundled_mtp_preserves_requested_target_cache() {
-        assert_eq!(
-            mtp_target_cache_mode(true, KVCacheMode::Turbo4),
-            KVCacheMode::Turbo4
-        );
-        assert_eq!(
-            mtp_target_cache_mode(false, KVCacheMode::Turbo4),
-            KVCacheMode::Turbo4
-        );
-        assert_eq!(
-            mtp_target_cache_mode(true, KVCacheMode::Int8),
-            KVCacheMode::Int8
-        );
-    }
-
     fn test_attention_tensor(tokens: i32, scale: f32) -> UniquePtr<MlxArray> {
         let values = (0..tokens as usize * 64)
             .map(|index| ((index % 64) as f32 + 1.0) * scale)
@@ -3073,10 +3198,10 @@ mod tests {
         )
     }
 
-    fn attention_cache(caches: &[Qwen3NextCache]) -> &KVCache {
+    fn attention_cache(caches: &[Qwen4LayerCache]) -> &KVCache {
         match &caches[0] {
-            Qwen3NextCache::Attention(cache) => cache,
-            Qwen3NextCache::Linear(_) => panic!("expected attention cache"),
+            Qwen4LayerCache::Attention(cache) => cache,
+            Qwen4LayerCache::Linear(_) => panic!("expected attention cache"),
         }
     }
 
@@ -3098,16 +3223,16 @@ mod tests {
     fn short_populated_turbo4_prefill_stays_fp16() {
         let mut caches = vec![
             new_initial_attention_cache(KVCacheMode::Turbo4),
-            Qwen3NextCache::Linear(GatedDeltaCache::new()),
+            Qwen4LayerCache::Linear(GatedDeltaCache::new()),
         ];
         match &mut caches[0] {
-            Qwen3NextCache::Attention(cache) => {
+            Qwen4LayerCache::Attention(cache) => {
                 cache.update(
                     test_attention_tensor(2, 0.01),
                     test_attention_tensor(2, 0.02),
                 );
             }
-            Qwen3NextCache::Linear(_) => panic!("expected attention cache"),
+            Qwen4LayerCache::Linear(_) => panic!("expected attention cache"),
         }
 
         finish_initial_attention_prefill(&mut caches, KVCacheMode::Turbo4);
@@ -3122,25 +3247,25 @@ mod tests {
     fn short_fp16_resident_turbo4_snapshot_demotes_live_cache() {
         let mut caches = vec![new_initial_attention_cache(KVCacheMode::Turbo4)];
         match &mut caches[0] {
-            Qwen3NextCache::Attention(cache) => {
+            Qwen4LayerCache::Attention(cache) => {
                 cache.update(
                     test_attention_tensor(2, 0.01),
                     test_attention_tensor(2, 0.02),
                 );
             }
-            Qwen3NextCache::Linear(_) => panic!("expected attention cache"),
+            Qwen4LayerCache::Linear(_) => panic!("expected attention cache"),
         }
         finish_initial_attention_prefill(&mut caches, KVCacheMode::Turbo4);
         let live = match &mut caches[0] {
-            Qwen3NextCache::Attention(cache) => cache.as_mut(),
-            Qwen3NextCache::Linear(_) => panic!("expected attention cache"),
+            Qwen4LayerCache::Attention(cache) => cache.as_mut(),
+            Qwen4LayerCache::Linear(_) => panic!("expected attention cache"),
         };
 
         let mut snapshot = ModelStateSnapshot::new("test", 2);
 
         assert!(push_turbo4_attention_snapshot(&mut snapshot, None, 0, live));
 
-        let expected = QWEN35_TURBO4_SNAPSHOT_SUFFIXES
+        let expected = QWEN4_TURBO4_SNAPSHOT_SUFFIXES
             .iter()
             .map(|suffix| format!("layer.0.{suffix}"))
             .collect::<BTreeSet<_>>();
@@ -3190,13 +3315,13 @@ mod tests {
         let tokens = TURBO4_PACKED_MTP_THRESHOLD_TOKENS + 1;
         let mut caches = vec![new_initial_attention_cache(KVCacheMode::Turbo4)];
         match &mut caches[0] {
-            Qwen3NextCache::Attention(cache) => {
+            Qwen4LayerCache::Attention(cache) => {
                 cache.update(
                     test_attention_tensor(tokens, 0.01),
                     test_attention_tensor(tokens, 0.02),
                 );
             }
-            Qwen3NextCache::Linear(_) => panic!("expected attention cache"),
+            Qwen4LayerCache::Linear(_) => panic!("expected attention cache"),
         }
 
         finish_initial_attention_prefill(&mut caches, KVCacheMode::Turbo4);
@@ -3211,13 +3336,13 @@ mod tests {
     fn threshold_crossing_demotes_once_before_target_forward() {
         let mut caches = vec![new_initial_attention_cache(KVCacheMode::Turbo4)];
         match &mut caches[0] {
-            Qwen3NextCache::Attention(cache) => {
+            Qwen4LayerCache::Attention(cache) => {
                 cache.update(
                     test_attention_tensor(2, 0.01),
                     test_attention_tensor(2, 0.02),
                 );
             }
-            Qwen3NextCache::Linear(_) => panic!("expected attention cache"),
+            Qwen4LayerCache::Linear(_) => panic!("expected attention cache"),
         }
         finish_initial_attention_prefill(&mut caches, KVCacheMode::Turbo4);
 
@@ -3279,7 +3404,7 @@ mod tests {
             .turbo4_snapshot_tensors()
             .expect("restored packed cache")
             .k_packed as *const MlxArray;
-        let mut caches = vec![Qwen3NextCache::Attention(Box::new(restored))];
+        let mut caches = vec![Qwen4LayerCache::Attention(Box::new(restored))];
 
         finish_initial_attention_prefill(&mut caches, KVCacheMode::Turbo4);
 
@@ -3300,13 +3425,13 @@ mod tests {
     fn requested_fp16_attention_cache_stays_fp16_after_prefill() {
         let mut caches = vec![new_initial_attention_cache(KVCacheMode::Fp16)];
         match &mut caches[0] {
-            Qwen3NextCache::Attention(cache) => {
+            Qwen4LayerCache::Attention(cache) => {
                 cache.update(
                     test_attention_tensor(2, 0.05),
                     test_attention_tensor(2, 0.06),
                 );
             }
-            Qwen3NextCache::Linear(_) => panic!("expected attention cache"),
+            Qwen4LayerCache::Linear(_) => panic!("expected attention cache"),
         }
 
         finish_initial_attention_prefill(&mut caches, KVCacheMode::Fp16);
@@ -3321,34 +3446,9 @@ mod tests {
     #[test]
     fn turbo4_snapshot_uses_k_rescale_sidecar() {
         assert_eq!(
-            QWEN35_TURBO4_SNAPSHOT_SUFFIXES,
+            QWEN4_TURBO4_SNAPSHOT_SUFFIXES,
             ["k_packed", "k_rescale", "v_packed", "v_norms", "v_rescale"]
         );
-    }
-
-    fn insert_required_mtp_weights(weights: &mut WeightMap) {
-        for name in [
-            "mtp.fc.weight",
-            "mtp.pre_fc_norm_embedding.weight",
-            "mtp.pre_fc_norm_hidden.weight",
-            "mtp.layers.0.input_layernorm.weight",
-            "mtp.layers.0.post_attention_layernorm.weight",
-            "mtp.layers.0.self_attn.q_proj.weight",
-            "mtp.layers.0.self_attn.k_proj.weight",
-            "mtp.layers.0.self_attn.v_proj.weight",
-            "mtp.layers.0.self_attn.o_proj.weight",
-            "mtp.layers.0.self_attn.q_norm.weight",
-            "mtp.layers.0.self_attn.k_norm.weight",
-            "mtp.layers.0.mlp.gate_proj.weight",
-            "mtp.layers.0.mlp.up_proj.weight",
-            "mtp.layers.0.mlp.down_proj.weight",
-            "mtp.norm.weight",
-        ] {
-            weights.insert(
-                format!("language_model.{name}"),
-                mlxcel_core::from_slice_f32(&[0.0; 4], &[4]),
-            );
-        }
     }
 
     struct TestDir(std::path::PathBuf);
@@ -3373,39 +3473,20 @@ mod tests {
     }
 
     #[test]
-    fn outer_qwen35_text_config_and_mixed_quantization_are_accepted() {
-        let fixture = TestDir::new("outer-config");
-        std::fs::write(
-            fixture.0.join("config.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "model_type": "qwen3_5",
-                "text_config": {
-                    "model_type": "qwen3_5_text",
-                    "hidden_size": 16,
-                    "num_hidden_layers": 8,
-                    "intermediate_size": 32,
-                    "num_attention_heads": 4,
-                    "num_key_value_heads": 2,
-                    "head_dim": 4,
-                    "full_attention_interval": 4,
-                    "vocab_size": 100
+    fn mixed_quantization_overrides_are_selected() {
+        let mut config = dense_config(None);
+        config.quantization = Some(Quantization {
+            group_size: 64,
+            bits: 4,
+            mode: "affine".to_owned(),
+            overrides: std::collections::HashMap::from([(
+                "model.layers.0.linear_attn.in_proj_qkv".to_owned(),
+                crate::qwen4_attention::TensorQuantization {
+                    group_size: 64,
+                    bits: 5,
                 },
-                "quantization": {
-                    "group_size": 64,
-                    "bits": 4,
-                    "mode": "affine",
-                    "language_model.model.layers.0.linear_attn.in_proj_qkv": {
-                        "group_size": 64,
-                        "bits": 5,
-                        "mode": "affine"
-                    }
-                }
-            }))
-            .expect("serialize config"),
-        )
-        .expect("write config");
-
-        let config = Qwen35Model::parse_config(&fixture.0).expect("parse dense outer config");
+            )]),
+        });
         assert_eq!(
             config.quant_params("model.layers.0.linear_attn.in_proj_qkv"),
             (64, 5)
@@ -3417,34 +3498,18 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_architecture_and_moe_are_rejected() {
-        for (name, config, expected) in [
-            (
-                "unsupported",
-                serde_json::json!({"model_type": "llama"}),
-                "unsupported architecture",
-            ),
-            (
-                "moe",
-                serde_json::json!({
-                    "model_type": "qwen3_5",
-                    "num_experts": 8,
-                    "text_config": {"model_type": "qwen3_5_text"}
-                }),
-                "MoE checkpoints are not supported",
-            ),
-        ] {
-            let fixture = TestDir::new(name);
-            std::fs::write(
-                fixture.0.join("config.json"),
-                serde_json::to_vec(&config).expect("serialize config"),
-            )
-            .expect("write config");
-            let error = Qwen35Model::parse_config(&fixture.0)
-                .expect_err("invalid architecture must fail")
-                .to_string();
-            assert!(error.contains(expected), "{error}");
-        }
+    fn unsupported_architecture_is_rejected() {
+        let fixture = TestDir::new("unsupported");
+        std::fs::write(
+            fixture.0.join("config.json"),
+            serde_json::to_vec(&serde_json::json!({"model_type": "llama"}))
+                .expect("serialize config"),
+        )
+        .expect("write config");
+        let error = Qwen4Model::parse_config(&fixture.0)
+            .expect_err("invalid architecture must fail")
+            .to_string();
+        assert!(error.contains("unsupported architecture"), "{error}");
     }
 
     #[test]
@@ -3456,7 +3521,7 @@ mod tests {
         )
         .expect("write index");
 
-        let error = Qwen35Model::validate_shard_index(&fixture.0)
+        let error = Qwen4Model::validate_shard_index(&fixture.0)
             .expect_err("missing shard must fail")
             .to_string();
         assert!(error.contains("missing.safetensors"), "{error}");
@@ -3473,124 +3538,7 @@ mod tests {
     }
 
     #[test]
-    fn mtp_metadata_accepts_absent_and_valid_and_rejects_incompatible_forms() {
-        let path = Path::new("/checkpoint/config.json");
-        dense_config(None)
-            .validate_mtp_metadata(path)
-            .expect("absent MTP metadata is valid");
-        mtp_config()
-            .validate_mtp_metadata(path)
-            .expect("one shared-embedding MTP layer is valid");
-
-        for (layers, dedicated, expected) in [
-            (Some(1), None, "incomplete MTP metadata"),
-            (Some(2), Some(false), "must be exactly 1"),
-            (Some(1), Some(true), "must be false"),
-        ] {
-            let mut config = dense_config(None);
-            config.mtp_num_hidden_layers = layers;
-            config.mtp_use_dedicated_embeddings = dedicated;
-            let error = config
-                .validate_mtp_metadata(path)
-                .expect_err("incompatible MTP metadata must fail")
-                .to_string();
-            assert!(error.contains(expected), "{error}");
-        }
-    }
-
-    #[test]
-    fn declared_mtp_requires_the_complete_exact_tensor_set() {
-        let config = mtp_config();
-        let error =
-            sanitize_language_model_weights(WeightMap::new(), &config, Path::new("/checkpoint"))
-                .err()
-                .expect("declared MTP without tensors must fail")
-                .to_string();
-        assert!(error.contains("/checkpoint"), "{error}");
-        assert!(
-            error.contains("contains no language_model.mtp.* tensors"),
-            "{error}"
-        );
-
-        let mut incomplete = WeightMap::new();
-        incomplete.insert(
-            "language_model.mtp.fc.weight".to_string(),
-            mlxcel_core::from_slice_f32(&[0.0; 4], &[4]),
-        );
-        let error = sanitize_language_model_weights(incomplete, &config, Path::new("/checkpoint"))
-            .err()
-            .expect("incomplete MTP tensors must fail")
-            .to_string();
-        assert!(
-            error.contains("language_model.mtp.pre_fc_norm_embedding.weight"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn sanitizer_splits_mtp_and_converts_its_norms_only_for_raw_layout() {
-        let config = mtp_config();
-        let mut weights = WeightMap::new();
-        weights.insert(
-            "language_model.model.layers.0.linear_attn.conv1d.weight".to_string(),
-            mlxcel_core::from_slice_f32(&[0.0; 12], &[4, 1, 3]),
-        );
-
-        let mut undeclared = WeightMap::new();
-        undeclared.insert(
-            "language_model.mtp.fc.weight".to_string(),
-            mlxcel_core::from_slice_f32(&[0.0; 4], &[4]),
-        );
-        let error = sanitize_language_model_weights(
-            undeclared,
-            &dense_config(None),
-            Path::new("/undeclared"),
-        )
-        .err()
-        .expect("MTP tensors without metadata must fail")
-        .to_string();
-        assert!(error.contains("/undeclared"), "{error}");
-        assert!(error.contains("does not declare"), "{error}");
-        weights.insert(
-            "language_model.model.layers.0.linear_attn.in_proj_qkv.scales".to_string(),
-            mlxcel_core::from_slice_f32(&[1.0], &[1]),
-        );
-        insert_required_mtp_weights(&mut weights);
-
-        let sanitized = sanitize_language_model_weights(weights, &config, Path::new("/checkpoint"))
-            .expect("valid bundled MTP weights");
-        let mtp = sanitized.mtp.expect("retained MTP partition");
-        assert!(mtp.contains_key("mtp.fc.weight"));
-        let expected = mlxcel_core::from_slice_f32(&[1.0; 4], &[4]);
-        let shifted = mlxcel_core::allclose(
-            mtp.get("mtp.pre_fc_norm_hidden.weight")
-                .expect("MTP hidden norm"),
-            &expected,
-            0.0,
-            0.0,
-        );
-        mlxcel_core::eval(&shifted);
-        assert!(mlxcel_core::item_bool(&shifted));
-
-        let mut converted = WeightMap::new();
-        converted.insert(
-            "mtp.norm.weight".to_string(),
-            mlxcel_core::from_slice_f32(&[0.0; 4], &[4]),
-        );
-        let converted = sanitize_mtp_weights(converted, false);
-        let expected_zero = mlxcel_core::from_slice_f32(&[0.0; 4], &[4]);
-        let unchanged = mlxcel_core::allclose(
-            converted.get("mtp.norm.weight").expect("MTP final norm"),
-            &expected_zero,
-            0.0,
-            0.0,
-        );
-        mlxcel_core::eval(&unchanged);
-        assert!(mlxcel_core::item_bool(&unchanged));
-    }
-
-    #[test]
-    fn raw_conv1d_is_transposed_and_norms_are_shifted_once() {
+    fn raw_conv1d_is_transposed_without_mutating_norms() {
         let config = dense_config(None);
         let mut weights = WeightMap::new();
         weights.insert(
@@ -3611,7 +3559,7 @@ mod tests {
             ),
             vec![4, 3, 1]
         );
-        let expected = mlxcel_core::from_slice_f32(&[1.0; 4], &[4]);
+        let expected = mlxcel_core::from_slice_f32(&[0.0; 4], &[4]);
         let close = mlxcel_core::allclose(
             sanitized
                 .get("model.layers.0.input_layernorm.weight")
@@ -3637,43 +3585,13 @@ mod tests {
     }
 
     #[test]
-    fn sanitizer_partitions_visual_weights_without_dropping_text_weights() {
-        let mut config = dense_config(None);
-        config.vision_config = Some(
-            serde_json::from_value(serde_json::json!({
-                "hidden_size": 8,
-                "out_hidden_size": 16,
-                "deepstack_visual_indexes": []
-            }))
-            .expect("vision config"),
-        );
-        let mut weights = WeightMap::new();
-        weights.insert(
-            "model.visual.patch_embed.proj.weight".to_string(),
-            mlxcel_core::from_slice_f32(&[1.0], &[1]),
-        );
-        weights.insert(
-            "model.language_model.embed_tokens.weight".to_string(),
-            mlxcel_core::from_slice_f32(&[2.0], &[1]),
-        );
-        let sanitized = sanitize_language_model_weights(weights, &config, Path::new("/checkpoint"))
-            .expect("partition weights");
-        assert!(
-            sanitized
-                .vision
-                .contains_key("vision_tower.patch_embed.proj.weight")
-        );
-        assert!(sanitized.target.contains_key("model.embed_tokens.weight"));
-    }
-
-    #[test]
-    #[ignore = "requires the real dense Qwen3.5 checkpoint at QW_MODEL_PATH or the default model cache path"]
+    #[ignore = "requires the real dense Qwen4 checkpoint at QW_MODEL_PATH or the default model cache path"]
     fn restored_turbo4_target_snapshot_matches_uninterrupted_next_token_and_text() {
         let model_dir = crate::resolve_model_path(None)
             .expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
         let tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
             .expect("load tokenizer");
-        let model = Qwen35Model::load(&model_dir, KVCacheMode::Turbo4).expect("load Qwen3.5 model");
+        let model = Qwen4Model::load(&model_dir, KVCacheMode::Turbo4).expect("load Qwen4 model");
         let prompt = tokenizer
             .encode("Snapshot restore invariant", true)
             .expect("encode prompt");

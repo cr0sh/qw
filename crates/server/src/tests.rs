@@ -452,8 +452,6 @@ async fn real_responses_sse_latency_stays_bounded_across_cold_fork_and_continuat
         },
         3,
         KVCacheMode::Turbo4,
-        #[cfg(feature = "specprefill")]
-        SpecPrefillPolicyConfig::default(),
     )
     .expect("start real Qwen engine");
     let app = router(engine);
@@ -2130,319 +2128,48 @@ fn tiny_png_data_uri() -> &'static str {
 }
 
 #[tokio::test]
-async fn chat_and_responses_preserve_mixed_image_order_buffered_and_streamed() {
+async fn image_inputs_are_rejected_by_both_openai_endpoints() {
     let app = router(Engine::start_fake(Some(MODEL), 8));
-    let chat = json!({
-        "model": MODEL,
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type":"text","text":"before"},
-                {"type":"image_url","image_url":{"url":tiny_png_data_uri()}},
-                {"type":"text","text":"after"}
-            ]
-        }]
-    });
-    let (status, _, body) = post(app.clone(), "/v1/chat/completions", chat.clone()).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let value: Value = serde_json::from_str(&body).expect("chat response");
-    assert_eq!(
-        value["choices"][0]["message"]["content"],
-        "echo:before[image:png]after"
-    );
-
-    let image_only = json!({
-        "model": MODEL,
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type":"image_url","image_url":{"url":tiny_png_data_uri()}}
-            ]
-        }]
-    });
-    let (status, _, body) = post(app.clone(), "/v1/chat/completions", image_only).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let value: Value = serde_json::from_str(&body).expect("image-only response");
-    assert_eq!(
-        value["choices"][0]["message"]["content"],
-        "echo:[image:png]"
-    );
-
-    let responses = json!({
-        "model": MODEL,
-        "input": [{
-            "role": "user",
-            "content": [
-                {"type":"input_text","text":"before"},
-                {"type":"input_image","image_url":tiny_png_data_uri()},
-                {"type":"input_text","text":"after"}
-            ]
-        }]
-    });
-    let (status, _, body) = post(app.clone(), "/v1/responses", responses.clone()).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let value: Value = serde_json::from_str(&body).expect("responses response");
-    assert_eq!(
-        value["output"][0]["content"][0]["text"],
-        "echo:before[image:png]after"
-    );
-
-    let mut chat_stream = chat;
-    chat_stream["stream"] = json!(true);
-    chat_stream["stream_options"] = json!({"include_usage":true});
-    let (status, _, body) = post(app.clone(), "/v1/chat/completions", chat_stream).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let (frames, done) = parse_sse(&body);
-    assert!(done);
-    let content = frames
-        .iter()
-        .filter_map(|frame| frame.data["choices"][0]["delta"]["content"].as_str())
-        .collect::<String>();
-    assert_eq!(content, "echo:before[image:png]after", "{body}");
-    assert!(frames.iter().any(|frame| !frame.data["usage"].is_null()));
-
-    let mut responses_stream = responses;
-    responses_stream["stream"] = json!(true);
-    let (status, _, body) = post(app, "/v1/responses", responses_stream).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let (frames, done) = parse_sse(&body);
-    assert!(!done);
-    let text = frames
-        .iter()
-        .filter(|frame| frame.event.as_deref() == Some("response.output_text.delta"))
-        .filter_map(|frame| frame.data["delta"].as_str())
-        .collect::<String>();
-    assert_eq!(text, "echo:before[image:png]after", "{body}");
-    assert!(
-        frames.windows(2).all(|pair| {
-            pair[1].data["sequence_number"].as_u64()
-                == pair[0].data["sequence_number"]
-                    .as_u64()
-                    .map(|value| value + 1)
-        }),
-        "{body}"
-    );
-}
-
-#[tokio::test]
-async fn image_validation_reports_exact_openai_parameter_paths() {
-    let app = router(Engine::start_fake(Some(MODEL), 8));
-    let (status, _, body) = post(
-        app.clone(),
-        "/v1/chat/completions",
-        json!({"model":MODEL,"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":tiny_png_data_uri(),"detail":"high"}}]}]}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let chat_cases = [
+    let cases = [
         (
-            json!({"model":MODEL,"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"https://example.com/a.png"}}]}]}),
-            "messages[0].content[0].image_url.url",
+            "/v1/chat/completions",
+            json!({
+                "model": MODEL,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type":"text","text":"before"},
+                        {"type":"image_url","image_url":{"url":tiny_png_data_uri()}}
+                    ]
+                }]
+            }),
+            "messages[0].content[1].image_url.url",
         ),
         (
-            json!({"model":MODEL,"messages":[{"role":"system","content":[{"type":"image_url","image_url":{"url":tiny_png_data_uri()}}]},{"role":"user","content":"x"}]}),
-            "messages[0].content[0].image_url",
-        ),
-        (
-            json!({"model":MODEL,"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":tiny_png_data_uri(),"extra":1}}]}]}),
-            "messages[0].content[0].image_url.extra",
-        ),
-        (
-            json!({"model":MODEL,"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,%%%%"}}]}]}),
-            "messages[0].content[0].image_url.url",
-        ),
-    ];
-    for (request, expected_param) in chat_cases {
-        let (status, _, body) = post(app.clone(), "/v1/chat/completions", request).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        let error: Value = serde_json::from_str(&body).expect("error response");
-        assert_eq!(error["error"]["param"], expected_param, "{body}");
-    }
-
-    let response_cases = [
-        (
-            json!({"model":MODEL,"input":[{"role":"user","content":[{"type":"input_image","image_url":"file:///tmp/a.png"}]}]}),
-            "input[0].content[0].image_url",
-        ),
-        (
-            json!({"model":MODEL,"input":[{"role":"user","content":[{"type":"input_image","file_id":"file_1"}]}]}),
-            "input[0].content[0].file_id",
-        ),
-        (
-            json!({"model":MODEL,"input":[{"role":"assistant","content":[{"type":"input_image","image_url":tiny_png_data_uri()}]}]}),
+            "/v1/responses",
+            json!({
+                "model": MODEL,
+                "input": [{
+                    "role": "user",
+                    "content": [
+                        {"type":"input_image","image_url":tiny_png_data_uri()}
+                    ]
+                }]
+            }),
             "input[0].content[0].image_url",
         ),
     ];
-    for (request, expected_param) in response_cases {
-        let (status, _, body) = post(app.clone(), "/v1/responses", request).await;
+
+    for (endpoint, request, expected_param) in cases {
+        let (status, _, body) = post(app.clone(), endpoint, request).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         let error: Value = serde_json::from_str(&body).expect("error response");
         assert_eq!(error["error"]["param"], expected_param, "{body}");
+        assert_eq!(
+            error["error"]["message"], "model does not support image inputs",
+            "{body}"
+        );
     }
-
-    let parts = (0..=protocol::MAX_IMAGES_PER_REQUEST)
-        .map(|_| json!({"type":"image_url","image_url":{"url":tiny_png_data_uri()}}))
-        .collect::<Vec<_>>();
-    let request = json!({"model":MODEL,"messages":[{"role":"user","content":parts}]});
-    let (status, _, body) = post(app, "/v1/chat/completions", request).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    let error: Value = serde_json::from_str(&body).expect("error response");
-    assert_eq!(
-        error["error"]["param"],
-        format!(
-            "messages[0].content[{}].image_url.url",
-            protocol::MAX_IMAGES_PER_REQUEST
-        )
-    );
-}
-
-#[tokio::test]
-async fn image_requests_never_use_or_populate_the_text_prefix_cache() {
-    let app = router(Engine::start_fake(Some(MODEL), 8));
-    let image_request = json!({
-        "model": MODEL,
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type":"text","text":"same"},
-                {"type":"image_url","image_url":{"url":tiny_png_data_uri()}}
-            ]
-        }]
-    });
-    for _ in 0..2 {
-        let (status, _, body) =
-            post(app.clone(), "/v1/chat/completions", image_request.clone()).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        let value: Value = serde_json::from_str(&body).expect("image response");
-        assert_eq!(value["usage"]["prompt_tokens_details"]["cached_tokens"], 0);
-    }
-    let _ = post(app.clone(), "/v1/chat/completions", chat_request("same")).await;
-    let (status, _, body) = post(app, "/v1/chat/completions", chat_request("same-more")).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let value: Value = serde_json::from_str(&body).expect("text response");
-    assert!(
-        value["usage"]["prompt_tokens_details"]["cached_tokens"]
-            .as_u64()
-            .is_some_and(|tokens| tokens > 0)
-    );
-}
-
-#[tokio::test]
-async fn image_messages_survive_chat_and_responses_tool_replay() {
-    let app = router(Engine::start_fake(Some(MODEL), 8));
-    let chat_user = json!({
-        "role":"user",
-        "content":[
-            {"type":"text","text":"call-tool"},
-            {"type":"image_url","image_url":{"url":tiny_png_data_uri()}}
-        ]
-    });
-    let mut first_chat = chat_tool_request("unused");
-    first_chat["messages"] = json!([chat_user.clone()]);
-    let (status, _, body) = post(app.clone(), "/v1/chat/completions", first_chat).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let first: Value = serde_json::from_str(&body).expect("first chat response");
-    let message = first["choices"][0]["message"].clone();
-    let calls = message["tool_calls"].as_array().expect("chat tool calls");
-    let mut replay = chat_tool_request("unused");
-    replay["messages"] = json!([
-        chat_user,
-        message,
-        {"role":"tool","tool_call_id":calls[0]["id"],"content":"sunny"},
-        {"role":"tool","tool_call_id":calls[1]["id"],"content":"noon"}
-    ]);
-    let (status, _, body) = post(app.clone(), "/v1/chat/completions", replay).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(body.contains("sunny") && body.contains("noon"), "{body}");
-
-    let responses_user = json!({
-        "role":"user",
-        "content":[
-            {"type":"input_text","text":"call-tool"},
-            {"type":"input_image","image_url":tiny_png_data_uri()}
-        ]
-    });
-    let mut first_responses = responses_tool_request("unused");
-    first_responses["input"] = json!([responses_user.clone()]);
-    let (status, _, body) = post(app.clone(), "/v1/responses", first_responses).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let first: Value = serde_json::from_str(&body).expect("first Responses response");
-    let calls = first["output"].as_array().expect("Responses tool calls");
-    let mut replay = responses_tool_request("unused");
-    replay["input"] = json!([
-        responses_user,
-        responses_replay_call(&calls[0]),
-        responses_replay_call(&calls[1]),
-        {"type":"function_call_output","call_id":calls[0]["call_id"],"output":"sunny"},
-        {"type":"function_call_output","call_id":calls[1]["call_id"],"output":"noon"}
-    ]);
-    let (status, _, body) = post(app, "/v1/responses", replay).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert!(body.contains("sunny") && body.contains("noon"), "{body}");
-}
-
-#[tokio::test]
-async fn image_requests_keep_structured_output_and_tool_choice_none_contracts() {
-    let app = router(Engine::start_fake(Some(MODEL), 8));
-    let chat = json!({
-        "model": MODEL,
-        "messages": [{"role":"user","content":[
-            {"type":"image_url","image_url":{"url":tiny_png_data_uri()}}
-        ]}],
-        "response_format": {"type":"json_object"}
-    });
-    let (status, _, body) = post(app.clone(), "/v1/chat/completions", chat).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let value: Value = serde_json::from_str(&body).expect("structured chat response");
-    assert_eq!(value["choices"][0]["message"]["content"], "{\"answer\":1}");
-    assert_eq!(value["choices"][0]["finish_reason"], "stop");
-
-    let responses = json!({
-        "model": MODEL,
-        "input": [{"role":"user","content":[
-            {"type":"input_image","image_url":tiny_png_data_uri()}
-        ]}],
-        "text": {"format":{"type":"json_schema","name":"answer","strict":true,
-            "schema":{"type":"object","properties":{"answer":{"type":"integer"}},"required":["answer"],"additionalProperties":false}}}
-    });
-    let (status, _, body) = post(app.clone(), "/v1/responses", responses).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let value: Value = serde_json::from_str(&body).expect("structured Responses response");
-    assert_eq!(value["output"][0]["content"][0]["text"], "{\"answer\":1}");
-
-    let chat_with_tools = json!({
-        "model": MODEL,
-        "messages": [{"role":"user","content":[
-            {"type":"text","text":"call-tool"},
-            {"type":"image_url","image_url":{"url":tiny_png_data_uri()}}
-        ]}],
-        "tools": chat_tools(),
-        "tool_choice": "none"
-    });
-    let (status, _, body) = post(app.clone(), "/v1/chat/completions", chat_with_tools).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let value: Value = serde_json::from_str(&body).expect("tool-free chat response");
-    assert_eq!(
-        value["choices"][0]["message"]["content"],
-        "echo:call-tool[image:png]"
-    );
-    assert!(value["choices"][0]["message"].get("tool_calls").is_none());
-
-    let responses_with_tools = json!({
-        "model": MODEL,
-        "input": [{"role":"user","content":[
-            {"type":"input_text","text":"call-tool"},
-            {"type":"input_image","image_url":tiny_png_data_uri()}
-        ]}],
-        "tools": responses_tools(),
-        "tool_choice": "none"
-    });
-    let (status, _, body) = post(app, "/v1/responses", responses_with_tools).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    let value: Value = serde_json::from_str(&body).expect("tool-free Responses response");
-    let output = value["output"].as_array().expect("Responses output");
-    assert_eq!(output[0]["content"][0]["text"], "echo:call-tool[image:png]");
-    assert!(output.iter().all(|item| item["type"] != "function_call"));
 }
 
 #[tokio::test]
