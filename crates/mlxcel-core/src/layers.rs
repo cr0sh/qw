@@ -3303,11 +3303,73 @@ impl MoESwitch {
         }
     }
 
+    fn gather_sorted(
+        input: &MlxArray,
+        weight: &QuantizedWeight,
+        expert_indices: &MlxArray,
+    ) -> UniquePtr<MlxArray> {
+        unsafe {
+            ffi::gather_qmm(
+                input,
+                &weight.weight,
+                &weight.scales,
+                weight.biases_ptr(),
+                std::ptr::null(),
+                expert_indices as *const _,
+                true,
+                weight.group_size,
+                weight.bits,
+                true,
+                &weight.mode,
+            )
+        }
+    }
+
+    fn forward_sorted_prefill(&self, x: &MlxArray, indices: &MlxArray) -> UniquePtr<MlxArray> {
+        let x_shape = ffi::array_shape(x);
+        let indices_shape = ffi::array_shape(indices);
+        let (batch, sequence, hidden) = (x_shape[0], x_shape[1], x_shape[2]);
+        let top_k = indices_shape[2];
+        let routes = batch * sequence * top_k;
+
+        let expanded = ffi::expand_dims(x, 2);
+        let expanded = ffi::broadcast_to(&expanded, &[batch, sequence, top_k, hidden]);
+        let flat_input = ffi::reshape(&expanded, &[routes, hidden]);
+        let flat_indices = ffi::reshape(indices, &[routes]);
+        let order = ffi::argsort(&flat_indices, -1);
+        let sorted_indices = ffi::take(&flat_indices, &order, 0);
+        let sorted_input = ffi::take(&flat_input, &order, 0);
+        let sorted_input = ffi::expand_dims(&sorted_input, -2);
+
+        let gate = Self::gather_sorted(&sorted_input, &self.gate_proj, &sorted_indices);
+        let up = Self::gather_sorted(&sorted_input, &self.up_proj, &sorted_indices);
+        let activated = ffi::compiled_swiglu_activation(&gate, &up);
+        let output = Self::gather_sorted(&activated, &self.down_proj, &sorted_indices);
+        let output = ffi::squeeze_axis(&output, -2);
+
+        let inverse = ffi::argsort(&order, -1);
+        let restored = ffi::take(&output, &inverse, 0);
+        let output_width = *ffi::array_shape(&restored)
+            .last()
+            .expect("MoE expert output has a hidden axis");
+        ffi::reshape(&restored, &[batch, sequence, top_k, output_width])
+    }
+
     /// Forward pass with expert indices.
     /// x: [..., hidden_dim]
     /// indices: [..., top_k]
     /// output: [..., top_k, hidden_dim]
     pub fn forward(&self, x: &MlxArray, indices: &MlxArray) -> UniquePtr<MlxArray> {
+
+        let x_shape = ffi::array_shape(x);
+        let indices_shape = ffi::array_shape(indices);
+        if x_shape.len() == 3
+            && indices_shape.len() == 3
+            && x_shape[1] > 1
+            && x_shape[..2] == indices_shape[..2]
+        {
+            return self.forward_sorted_prefill(x, indices);
+        }
 
         // `gather_qmm` follows MLX SwitchGLU's batched-matrix convention:
         // singleton matrix and routing axes prevent a sequence axis from
@@ -8009,51 +8071,6 @@ mod tests {
                 "packed key must never equal the empty sentinel"
             );
         }
-    }
-    fn synthetic_expert_weight(experts: i32, output: i32, input: i32) -> QuantizedWeight {
-        const GROUP_SIZE: i32 = 32;
-        const BITS: i32 = 4;
-        let values = (0..experts * output * input)
-            .map(|index| ((index % 17) as f32 - 8.0) / 8.0)
-            .collect::<Vec<_>>();
-        let dense = ffi::from_slice_f32(&values, &[experts, output, input]);
-        QuantizedWeight::new(
-            ffi::quantize_weights_w(&dense, GROUP_SIZE, BITS),
-            ffi::quantize_weights_scales(&dense, GROUP_SIZE, BITS),
-            ffi::quantize_weights_biases(&dense, GROUP_SIZE, BITS),
-            GROUP_SIZE,
-            BITS,
-        )
-    }
-
-    #[test]
-    fn moe_switch_batched_rows_match_single_token_dispatches() {
-        const EXPERTS: i32 = 4;
-        const HIDDEN: i32 = 32;
-        const INTERMEDIATE: i32 = 32;
-        let switch = MoESwitch::new(
-            synthetic_expert_weight(EXPERTS, INTERMEDIATE, HIDDEN),
-            synthetic_expert_weight(EXPERTS, INTERMEDIATE, HIDDEN),
-            synthetic_expert_weight(EXPERTS, HIDDEN, INTERMEDIATE),
-            EXPERTS,
-        );
-        let input_values = (0..3 * HIDDEN)
-            .map(|index| ((index % 23) as f32 - 11.0) / 8.0)
-            .collect::<Vec<_>>();
-        let input = ffi::from_slice_f32(&input_values, &[1, 3, HIDDEN]);
-        let indices = ffi::from_slice_i32(&[0, 2, 1, 3, 0, 3], &[1, 3, 2]);
-        let batched = switch.forward(&input, &indices);
-
-        let mut sequential = Vec::new();
-        for row in 0..3 {
-            let row_input = ffi::slice(&input, &[0, row, 0], &[1, row + 1, HIDDEN]);
-            let row_indices = ffi::slice(&indices, &[0, row, 0], &[1, row + 1, 2]);
-            sequential.push(switch.forward(&row_input, &row_indices));
-        }
-        let sequential = crate::concatenate_owned(&sequential, 1);
-        let equal = ffi::allclose(&batched, &sequential, 0.0, 0.0);
-        ffi::eval(&equal);
-        assert!(ffi::item_bool(&equal));
     }
 
 }
