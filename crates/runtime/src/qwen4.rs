@@ -42,6 +42,8 @@ use std::sync::Arc;
 
 const MTP_DRAFT_PREFIX: i32 = 65_536;
 const MTP_DRAFT_PADDED: i32 = 65_568;
+const MTP_VERIFY_PREFIX: i32 = 80_896;
+const MTP_VERIFY_PADDED: i32 = 80_928;
 const DRAFT_CONTROL_START: i32 = 248_044;
 const DRAFT_CONTROL_END: i32 = 248_070;
 
@@ -1608,6 +1610,7 @@ pub struct Qwen4Model {
     pub(crate) norm: Qwen4FinalMixer,
     pub(crate) lm_head: Option<UnifiedLinear>,
     compact_draft_head: Option<UnifiedLinear>,
+    compact_mtp_verify_head: Option<UnifiedLinear>,
     pub(crate) config: Qwen4Config,
     mtp: Option<Qwen4MtpDraftModel>,
     /// Model-owned heterogeneous cache state used by one synchronous sequence.
@@ -1662,6 +1665,9 @@ impl Qwen4Model {
         self.project_compact_logits(hidden, &self.compact_draft_head, MTP_DRAFT_PREFIX)
     }
 
+    pub(crate) fn project_mtp_verify_logits(&self, hidden: &MlxArray) -> UniquePtr<MlxArray> {
+        self.project_compact_logits(hidden, &self.compact_mtp_verify_head, MTP_VERIFY_PREFIX)
+    }
 
     fn project_compact_logits(
         &self,
@@ -1699,6 +1705,13 @@ impl Qwen4Model {
         }
     }
 
+    pub(crate) fn map_mtp_verify_token(token: i32) -> i32 {
+        if token < MTP_VERIFY_PREFIX {
+            token
+        } else {
+            token + DRAFT_CONTROL_START - MTP_VERIFY_PREFIX
+        }
+    }
 
     fn make_internal_caches(&self) -> Vec<Qwen4LayerCache> {
         self.layers
@@ -1867,6 +1880,14 @@ impl Qwen4Model {
     }
 
     pub(crate) fn forward_mtp_verify(&self, input_ids: &MlxArray) -> Qwen4MtpVerifyOutput {
+        self.forward_mtp_verify_with_compact(input_ids, false)
+    }
+
+    pub(crate) fn forward_mtp_verify_with_compact(
+        &self,
+        input_ids: &MlxArray,
+        compact_logits: bool,
+    ) -> Qwen4MtpVerifyOutput {
         let rope_delta = self.rope_state.rope_delta();
         let (output, offset) = self.sequence_state.with_internal(|caches| {
             let embedded = self.embed_tokens.forward(input_ids);
@@ -1890,7 +1911,11 @@ impl Qwen4Model {
                 );
             }
             let normalized = self.norm.forward(&hidden);
-            let logits = self.project_logits(&normalized);
+            let logits = if compact_logits {
+                self.project_mtp_verify_logits(&normalized)
+            } else {
+                self.project_logits(&normalized)
+            };
             let offset = caches.first().map(Qwen4LayerCache::offset).unwrap_or(0);
             (
                 Qwen4MtpVerifyOutput {
@@ -2317,7 +2342,14 @@ impl Qwen4Model {
         let compact_draft_head = lm_head.as_ref().and_then(|head| {
             compact_head(head, config.vocab_size, MTP_DRAFT_PREFIX, MTP_DRAFT_PADDED)
         });
-
+        let compact_mtp_verify_head = lm_head.as_ref().and_then(|head| {
+            compact_head(
+                head,
+                config.vocab_size,
+                MTP_VERIFY_PREFIX,
+                MTP_VERIFY_PADDED,
+            )
+        });
         let internal_caches = layers
             .iter()
             .map(|layer| {
@@ -2335,6 +2367,7 @@ impl Qwen4Model {
             norm,
             lm_head,
             compact_draft_head,
+            compact_mtp_verify_head,
             config: config.clone(),
             mtp: None,
             sequence_state: ModelOwnedSequenceState::new(internal_caches),
