@@ -1911,6 +1911,26 @@ impl Qwen4Model {
                 );
             }
             let normalized = self.norm.forward(&hidden);
+            let verifier_head = if compact_logits {
+                self.compact_mtp_verify_head.as_ref()
+            } else {
+                self.lm_head.as_ref()
+            };
+            let promote_verifier_logits = verifier_head
+                .and_then(UnifiedLinear::as_quantized_weight)
+                .is_some_and(|weight| {
+                    weight.mode == "affine"
+                        && mlxcel_core::array_dtype(&weight.scales)
+                            == mlxcel_core::dtype::BFLOAT16
+                });
+            // For affine QMM, FP16 rows plus BF16 scales promote the verifier
+            // logits to FP32. Cast only after RMSNorm so earlier residual
+            // intermediates retain BF16's wider exponent range.
+            let normalized = if promote_verifier_logits {
+                mlxcel_core::astype(&normalized, mlxcel_core::dtype::FLOAT16)
+            } else {
+                normalized
+            };
             let logits = if compact_logits {
                 self.project_mtp_verify_logits(&normalized)
             } else {
