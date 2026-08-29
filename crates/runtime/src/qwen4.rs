@@ -1074,6 +1074,25 @@ struct Qwen4Ple {
     conv_state_len: usize,
 }
 
+fn append_ple_conv_state(
+    state: &MlxArray,
+    normed: &MlxArray,
+    state_len: i32,
+) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+    let input = mlxcel_core::concatenate(state, normed, 1);
+    let input_shape = mlxcel_core::array_shape(&input);
+    let input_len = input_shape[1];
+    let tail = mlxcel_core::contiguous(
+        &mlxcel_core::slice(
+            &input,
+            &[0, input_len - state_len, 0],
+            &[input_shape[0], input_len, input_shape[2]],
+        ),
+        false,
+    );
+    (input, tail)
+}
+
 impl Qwen4Ple {
     fn from_weights(
         weights: &WeightMap,
@@ -1293,20 +1312,9 @@ impl Qwen4Ple {
                     mlxcel_core::array_dtype(hidden_states),
                 )
             });
-        let conv_input = mlxcel_core::concatenate(&state, &normed, 1);
-        let conv_len = mlxcel_core::array_shape(&conv_input)[1];
-        cache.ple_conv_state = Some(mlxcel_core::contiguous(
-            &mlxcel_core::slice(
-                &conv_input,
-                &[0, conv_len - self.conv_state_len as i32, 0],
-                &[
-                    batch as i32,
-                    conv_len,
-                    (self.hc_count * self.hidden_size) as i32,
-                ],
-            ),
-            false,
-        ));
+        let (conv_input, next_state) =
+            append_ple_conv_state(&state, &normed, self.conv_state_len as i32);
+        cache.ple_conv_state = Some(next_state);
         let conv = mlxcel_core::conv1d(
             &conv_input,
             &self.conv1d_weight,
@@ -3194,6 +3202,43 @@ mod tests {
             mlxcel_core::eval(&equal);
             assert!(mlxcel_core::item_bool(&equal));
         }
+    }
+
+    #[test]
+    fn batched_ple_tail_matches_sequential_dispatches_at_materialization_boundary() {
+        const STATE_LEN: i32 = 6;
+        const SEQUENCE: i32 = 4;
+        let initial = mlxcel_core::from_slice_f32(
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            &[1, STATE_LEN, 1],
+        );
+        let rows =
+            mlxcel_core::from_slice_f32(&[7.0, 8.0, 9.0, 10.0], &[1, SEQUENCE, 1]);
+
+        let (_, batched_tail) = append_ple_conv_state(&initial, &rows, STATE_LEN);
+        let mut batched_cache = Qwen4LayerCache::Linear(GatedDeltaCache {
+            ple_conv_state: Some(batched_tail),
+            ..GatedDeltaCache::new()
+        });
+        batched_cache.materialize_state();
+        mlxcel_core::clear_memory_cache();
+
+        let mut sequential = initial;
+        for row in 0..SEQUENCE {
+            let next = mlxcel_core::slice(&rows, &[0, row, 0], &[1, row + 1, 1]);
+            let (_, tail) = append_ple_conv_state(&sequential, &next, STATE_LEN);
+            sequential = tail;
+        }
+        let Qwen4LayerCache::Linear(cache) = batched_cache else {
+            unreachable!("test constructed a linear cache")
+        };
+        let batched = cache
+            .ple_conv_state
+            .as_deref()
+            .expect("materialized PLE tail");
+        let equal = mlxcel_core::allclose(batched, &sequential, 0.0, 0.0);
+        mlxcel_core::eval(&equal);
+        assert!(mlxcel_core::item_bool(&equal));
     }
 
     #[test]
