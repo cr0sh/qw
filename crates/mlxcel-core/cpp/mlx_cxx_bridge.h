@@ -1757,6 +1757,12 @@ std::unique_ptr<MlxArray> qsa_sparse_prefill_attention(
     float scale
 );
 
+// Sort every QSA selected-index row chronologically in one Metal threadgroup.
+std::unique_ptr<MlxArray> qsa_sort_selected_indices(
+    const MlxArray& indices
+);
+
+
 // BitLinear ternary matmul (BitNet b1.58): multiply on 2-bit-packed ternary
 // weights [out_features/4, in_features] uint8 scaled by weight_scale[0].
 std::unique_ptr<MlxArray> bitlinear_matmul(

@@ -1813,6 +1813,11 @@ mod ffi {
             scale: f32,
         ) -> UniquePtr<MlxArray>;
 
+        /// Sort every QSA selected-index row chronologically in one Metal
+        /// threadgroup, avoiding the generic sort's intermediate dispatches.
+        fn qsa_sort_selected_indices(indices: &MlxArray) -> UniquePtr<MlxArray>;
+
+
         /// BitLinear ternary matmul (BitNet b1.58). `packed_weights` is
         /// [out_features/4, in_features] uint8 (2-bit ternary, 4 rows/byte),
         /// scaled by `weight_scale[0]` (inverted unless linear_class is
