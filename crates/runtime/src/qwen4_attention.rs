@@ -373,15 +373,21 @@ impl Qwen4QsaIndexer {
             let invalid_rank = mlxcel_core::from_slice_i32(&[i32::MIN], &[1]);
             mlxcel_core::where_cond(&valid_blocks, &ranked, &invalid_rank)
         };
-        let selected = mlxcel_core::argpartition(&ranked, -self.block_topk, -1);
-        let selected = mlxcel_core::slice(
-            &selected,
-            &[0, 0, complete_blocks - self.block_topk],
-            &[batch, sequence, complete_blocks],
-        );
-        // `argpartition` leaves the selected suffix unordered. Sparse
-        // attention must reduce tokens in chronological order so repeated
-        // snapshot restores use the same BF16 accumulation path.
+        // When every query has at least top-k valid blocks, the rank key's
+        // remainder is the unique block id. Early prefill rows can contain the
+        // i32::MIN invalid sentinel, whose remainder is not an index, so retain
+        // the index-producing argpartition fallback for that case.
+        let selected = if past_len / self.compress_ratio > self.block_topk {
+            let selected = mlxcel_core::topk(&ranked, self.block_topk, -1);
+            mlxcel_core::remainder(&selected, &rank_stride)
+        } else {
+            let selected = mlxcel_core::argpartition(&ranked, -self.block_topk, -1);
+            mlxcel_core::slice(
+                &selected,
+                &[0, 0, complete_blocks - self.block_topk],
+                &[batch, sequence, complete_blocks],
+            )
+        };
         let selected = mlxcel_core::sort(&selected, -1);
         let selected = mlxcel_core::expand_dims(&selected, -1);
         let selected = mlxcel_core::multiply(&selected, &ratio);
