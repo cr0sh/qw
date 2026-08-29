@@ -40,6 +40,8 @@ pub struct LongConversationFixture {
     pub prompt_ids: Vec<i32>,
     pub prefix_tokens: usize,
     pub snapshot: PromptSnapshot,
+    pub baseline_token_ids: Vec<i32>,
+    pub mtp_token_ids: Vec<i32>,
 }
 
 pub fn request(max_tokens: usize) -> GenerationRequest {
@@ -74,6 +76,10 @@ pub fn prepare_decode_fixture(provider: &mut Qwen4Provider) -> DecodeFixture {
             true
         })
         .expect("warm MTP decode");
+    assert_eq!(
+        baseline.token_ids, mtp.token_ids,
+        "greedy MTP must match baseline"
+    );
     assert!(
         stats.is_some_and(|stats| stats.proposed_draft_tokens > 0),
         "MTP warmup must propose draft tokens"
@@ -183,7 +189,7 @@ pub fn prepare_long_conversation_fixture(
         prefix_tokens,
         "64k QSA snapshot must retain the complete prefix"
     );
-    let (_baseline, stats) = provider
+    let (baseline, stats) = provider
         .benchmark_cached_streaming_in_mode(
             &prompt_ids,
             DECODE_MAX_TOKENS,
@@ -197,7 +203,22 @@ pub fn prepare_long_conversation_fixture(
         )
         .expect("warm cached 64k baseline");
     assert!(stats.is_none());
-    let (_mtp_warm, stats) = provider
+    let (baseline_repeat, stats) = provider
+        .benchmark_cached_streaming_in_mode(
+            &prompt_ids,
+            DECODE_MAX_TOKENS,
+            &sampling,
+            &snapshot,
+            Qwen4GenerationMode::Baseline,
+            |_| true,
+        )
+        .expect("repeat warm cached long-context baseline");
+    assert!(stats.is_none());
+    assert_eq!(
+        baseline_repeat.token_ids, baseline.token_ids,
+        "repeated baseline snapshot restore changed greedy output"
+    );
+    let (mtp_warm, stats) = provider
         .benchmark_cached_streaming_in_mode(
             &prompt_ids,
             DECODE_MAX_TOKENS,
@@ -211,9 +232,15 @@ pub fn prepare_long_conversation_fixture(
         )
         .expect("warm cached 64k MTP");
     assert!(stats.is_some());
+    assert_eq!(
+        mtp_warm.token_ids, baseline.token_ids,
+        "greedy MTP output diverged from baseline"
+    );
     LongConversationFixture {
         prompt_ids,
         prefix_tokens,
         snapshot,
+        baseline_token_ids: baseline.token_ids,
+        mtp_token_ids: mtp_warm.token_ids,
     }
 }

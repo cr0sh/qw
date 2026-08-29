@@ -102,9 +102,17 @@ fn benchmark_64k_cached_decode(criterion: &mut Criterion) {
     group.sample_size(10);
     group.throughput(Throughput::Elements(DECODE_MAX_TOKENS as u64));
 
-    for (name, mode) in [
-        ("cached_64k_baseline", Qwen4GenerationMode::Baseline),
-        ("cached_64k_mtp", Qwen4GenerationMode::Mtp),
+    for (name, mode, expected) in [
+        (
+            "cached_64k_baseline",
+            Qwen4GenerationMode::Baseline,
+            fixture.baseline_token_ids.as_slice(),
+        ),
+        (
+            "cached_64k_mtp",
+            Qwen4GenerationMode::Mtp,
+            fixture.mtp_token_ids.as_slice(),
+        ),
     ] {
         group.bench_function(name, |bencher| {
             bencher.iter_custom(|iterations| {
@@ -125,6 +133,7 @@ fn benchmark_64k_cached_decode(criterion: &mut Criterion) {
                         .unwrap_or_else(|error| panic!("benchmark {name}: {error:#}"));
                     assert_eq!(output.cached_tokens, fixture.prefix_tokens);
                     assert_eq!(output.token_ids.len(), DECODE_MAX_TOKENS);
+                    assert_eq!(output.token_ids, expected, "deterministic output changed");
                     assert_eq!(stats.is_some(), mode == Qwen4GenerationMode::Mtp);
                     decode_time += output.decode_time;
                     black_box(output);
@@ -157,7 +166,7 @@ fn benchmark_64k_cached_decode(criterion: &mut Criterion) {
                     .unwrap_or_else(|error| panic!("benchmark cached 64k prefill: {error:#}"));
                 assert_eq!(output.cached_tokens, fixture.prefix_tokens);
                 assert_eq!(output.prompt_tokens, fixture.prompt_ids.len());
-                assert_eq!(output.token_ids.len(), 1);
+                assert_eq!(output.token_ids, fixture.baseline_token_ids[..1]);
                 assert!(stats.is_none());
                 prefill_time += output.prefill_time;
                 black_box(output);

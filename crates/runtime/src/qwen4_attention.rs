@@ -129,27 +129,6 @@ enum Qwen4QsaPlan {
     Mask(UniquePtr<MlxArray>),
     DecodeIndices(UniquePtr<MlxArray>),
     VerifyIndices(Vec<UniquePtr<MlxArray>>),
-    PrefillIndices {
-        indices: UniquePtr<MlxArray>,
-        mask: UniquePtr<MlxArray>,
-    },
-}
-fn sparse_prefill_attention(
-    full_keys: &MlxArray,
-    full_values: &MlxArray,
-    queries: &MlxArray,
-    indices: &MlxArray,
-    valid: &MlxArray,
-    scale: f32,
-) -> UniquePtr<MlxArray> {
-    mlxcel_core::qsa_sparse_prefill_attention(
-        queries,
-        full_keys,
-        full_values,
-        indices,
-        valid,
-        scale,
-    )
 }
 
 impl Qwen4QsaIndexer {
@@ -332,15 +311,33 @@ impl Qwen4QsaIndexer {
         let block_ids = mlxcel_core::arange_i32(0, complete_blocks, 1);
         let block_ids = mlxcel_core::reshape(&block_ids, &[1, 1, complete_blocks]);
         let valid_blocks = mlxcel_core::less(&block_ids, &complete_counts);
-        let negative_infinity =
-            mlxcel_core::full_f32(&[1], f32::NEG_INFINITY, mlxcel_core::dtype::FLOAT32);
-        let scores = mlxcel_core::where_cond(&valid_blocks, &scores, &negative_infinity);
-        let selected = mlxcel_core::argpartition(&scores, -self.block_topk, -1);
+        // Quantize the relevance score before selection. Long-context QSA
+        // matmuls can vary by a few low bits across Metal schedules; without
+        // a stable key, those differences change the top-k boundary and then
+        // cascade through subsequent recurrent layers. Integer ranking keeps
+        // the score bin and recent-first block-ID tie break exact.
+        let half = mlxcel_core::full_f32(&[1], 0.5, mlxcel_core::dtype::FLOAT32);
+        let quantized = mlxcel_core::astype(
+            &mlxcel_core::floor(&mlxcel_core::add(
+                &mlxcel_core::multiply_scalar(&scores, 256.0),
+                &half,
+            )),
+            mlxcel_core::dtype::INT32,
+        );
+        let rank_stride = mlxcel_core::from_slice_i32(&[complete_blocks + 1], &[1]);
+        let ranked = mlxcel_core::add(&mlxcel_core::multiply(&quantized, &rank_stride), &block_ids);
+        let invalid_rank = mlxcel_core::from_slice_i32(&[i32::MIN], &[1]);
+        let ranked = mlxcel_core::where_cond(&valid_blocks, &ranked, &invalid_rank);
+        let selected = mlxcel_core::argpartition(&ranked, -self.block_topk, -1);
         let selected = mlxcel_core::slice(
             &selected,
             &[0, 0, complete_blocks - self.block_topk],
             &[batch, sequence, complete_blocks],
         );
+        // `argpartition` leaves the selected suffix unordered. Sparse
+        // attention must reduce tokens in chronological order so repeated
+        // snapshot restores use the same BF16 accumulation path.
+        let selected = mlxcel_core::sort(&selected, -1);
         let selected = mlxcel_core::expand_dims(&selected, -1);
         let selected = mlxcel_core::multiply(&selected, &ratio);
         let offsets = mlxcel_core::arange_i32(0, self.compress_ratio, 1);
@@ -391,30 +388,6 @@ impl Qwen4QsaIndexer {
                 rows.push(row_selected);
             }
             return Some(Qwen4QsaPlan::VerifyIndices(rows));
-        }
-        if batch == 1
-            && sequence >= 64
-            && past_len / self.compress_ratio > self.block_topk
-            && matches!(
-                cache.mode,
-                KVCacheMode::Fp16 | KVCacheMode::Fp8 | KVCacheMode::Int8
-            )
-        {
-            let tail_starts = mlxcel_core::multiply(&complete_counts, &ratio);
-            let offsets = mlxcel_core::arange_i32(0, self.compress_ratio, 1);
-            let offsets = mlxcel_core::reshape(&offsets, &[1, 1, self.compress_ratio]);
-            let tail_indices = mlxcel_core::add(&tail_starts, &offsets);
-            let tail_valid = mlxcel_core::less(&tail_indices, &query_ends);
-            let last_visible =
-                mlxcel_core::subtract(&query_ends, &mlxcel_core::from_slice_i32(&[1], &[1]));
-            let tail_indices = mlxcel_core::where_cond(&tail_valid, &tail_indices, &last_visible);
-            let indices = mlxcel_core::concatenate(&selected, &tail_indices, -1);
-            let selected_valid = mlxcel_core::ones(
-                &mlxcel_core::array_shape(&selected),
-                mlxcel_core::dtype::BOOL,
-            );
-            let mask = mlxcel_core::concatenate(&selected_valid, &tail_valid, -1);
-            return Some(Qwen4QsaPlan::PrefillIndices { indices, mask });
         }
 
         let selected_shape = mlxcel_core::array_shape(&selected);
@@ -512,13 +485,6 @@ impl Qwen4Attention {
         };
         let qsa_verify = match &qsa_plan {
             Some(Qwen4QsaPlan::VerifyIndices(rows)) => Some(rows.as_slice()),
-            _ => None,
-        };
-        let qsa_prefill = match (mask.is_none(), &qsa_plan) {
-            (true, Some(Qwen4QsaPlan::PrefillIndices { indices, mask })) => Some((
-                indices.as_ref().expect("QSA prefill indices are non-null"),
-                mask.as_ref().expect("QSA prefill mask is non-null"),
-            )),
             _ => None,
         };
         let mask = qsa_mask.or(mask);
@@ -623,9 +589,6 @@ impl Qwen4Attention {
                 });
             }
             mlxcel_core::concatenate_owned(&outputs, 2)
-        } else if let Some((indices, valid)) = qsa_prefill {
-            let (cache_k, cache_v) = cache.update_and_fetch(keys, values);
-            sparse_prefill_attention(&cache_k, &cache_v, &queries, indices, valid, self.scale)
         } else if let Some(indices) = qsa_indices {
             let (cache_k, cache_v) = cache.update_and_fetch_selected(keys, values, indices);
             unsafe {
@@ -973,7 +936,9 @@ mod tests {
         );
         let indices = mlxcel_core::from_slice_i32(&[0, 2, 4, 1, 3, 4], &[1, 2, 3]);
         let valid = mlxcel_core::ones(&[1, 2, 3], mlxcel_core::dtype::BOOL);
-        let actual = sparse_prefill_attention(&keys, &values, &queries, &indices, &valid, 0.5);
+        let actual = mlxcel_core::qsa_sparse_prefill_attention(
+            &queries, &keys, &values, &indices, &valid, 0.5,
+        );
         let expected = mlxcel_core::from_slice_f32(
             &[
                 2.0,
