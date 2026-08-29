@@ -1002,6 +1002,18 @@ fn should_extend_greedy_draft(
         && accepted.saturating_add(1) >= proposed
 }
 
+fn reference_correction_for_greedy_verify(
+    greedy: bool,
+    logits: &MlxArray,
+    emitted_rows: usize,
+) -> Option<mlxcel_core::generate::IllConditionedGreedyDecision> {
+    greedy
+        .then(|| {
+            mlxcel_core::generate::first_bf16_ill_conditioned_greedy_row(logits, emitted_rows)
+        })
+        .flatten()
+}
+
 fn logits_at(logits: &MlxArray, position: usize) -> UniquePtr<MlxArray> {
     let shape = mlxcel_core::array_shape(logits);
     mlxcel_core::slice(
@@ -2344,14 +2356,11 @@ impl Qwen4MtpGenerator {
                 };
                 mtp_stats.walk_time += phase_start.elapsed();
                 let mut reference_fallback = false;
-                if proposal_probs.is_none()
-                    && model.approximate_prefill_used()
-                    && let Some(decision) =
-                        mlxcel_core::generate::first_bf16_ill_conditioned_greedy_row(
-                            &verify.logits,
-                            walk.new_tokens.len(),
-                        )
-                {
+                if let Some(decision) = reference_correction_for_greedy_verify(
+                    proposal_probs.is_none(),
+                    &verify.logits,
+                    walk.new_tokens.len(),
+                ) {
                     debug!(
                         phase = "mtp.reference_fallback",
                         verify_row = decision.row,
@@ -2972,6 +2981,32 @@ mod tests {
             .flat_map(|row| row.iter().copied())
             .collect::<Vec<_>>();
         mlxcel_core::from_slice_f32(&values, &[1, rows.len() as i32, vocab as i32])
+    }
+
+    #[test]
+    fn fresh_dense_false_acceptance_requests_reference_correction() {
+        let logits = logits_rows(&[
+            &[10.0, 0.0, -1.0],
+            &[0.0, 20.75, 20.625],
+            &[9.0, 0.0, -1.0],
+        ]);
+        let walk = greedy_walk(
+            &[0, 1],
+            &logits,
+            false,
+            &SamplingConfig::default(),
+            &[],
+            3,
+        );
+        assert_eq!(walk.accepted, 2, "batched row falsely accepts the second draft");
+
+        let decision = reference_correction_for_greedy_verify(true, &logits, walk.new_tokens.len())
+            .expect("fresh dense verification must correct an ill-conditioned greedy row");
+        assert_eq!(decision.row, 1);
+        assert_eq!(decision.margin, 0.125);
+        assert!(
+            reference_correction_for_greedy_verify(false, &logits, walk.new_tokens.len()).is_none()
+        );
     }
 
     fn probs(values: &[f32]) -> UniquePtr<MlxArray> {
