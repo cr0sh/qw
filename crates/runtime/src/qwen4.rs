@@ -24,7 +24,7 @@ use crate::ngram_offload::{NGramTable, NGramTableSpec};
 use crate::qwen_position::decode_rope_positions;
 use crate::qwen_rope_state::RopeState;
 use crate::qwen4_attention::{
-    Mlp, Quantization, Qwen4Attention, Qwen4AttentionConfig, Qwen4LayerCache,
+    Mlp, Quantization, Qwen4Attention, Qwen4AttentionConfig, Qwen4LayerCache, Qwen4PrefillPolicy,
 };
 use crate::qwen4_mtp::Qwen4MtpDraftModel;
 use anyhow::{Context, Result, ensure};
@@ -329,12 +329,12 @@ pub(crate) struct Qwen4RollbackPlan {
     pub(crate) final_offset: i32,
 }
 
-pub(crate) fn rollback_plan(
+fn rollback_plan_for_retained_inputs(
     verify_offset: i32,
-    accepted: usize,
+    retained_inputs: usize,
     block_size: usize,
 ) -> Qwen4RollbackPlan {
-    let accepted_block_len = i32::try_from(accepted.saturating_add(1)).unwrap_or(i32::MAX);
+    let accepted_block_len = i32::try_from(retained_inputs).unwrap_or(i32::MAX);
     let block_size = i32::try_from(block_size).unwrap_or(i32::MAX);
     let trim = (block_size - accepted_block_len).max(0);
     Qwen4RollbackPlan {
@@ -342,6 +342,15 @@ pub(crate) fn rollback_plan(
         trim,
         final_offset: verify_offset - trim,
     }
+}
+
+#[cfg(test)]
+pub(crate) fn rollback_plan(
+    verify_offset: i32,
+    accepted: usize,
+    block_size: usize,
+) -> Qwen4RollbackPlan {
+    rollback_plan_for_retained_inputs(verify_offset, accepted.saturating_add(1), block_size)
 }
 
 enum Qwen4GatedAuxProjections {
@@ -1501,6 +1510,7 @@ impl Qwen4DecoderLayer {
         qn_config: &Qwen4AttentionConfig,
         layer_idx: usize,
         ngram_table: Option<Arc<NGramTable>>,
+        prefill_policy: Arc<Qwen4PrefillPolicy>,
     ) -> Result<Self, String> {
         Self::from_weights_at_prefix(
             weights,
@@ -1510,6 +1520,7 @@ impl Qwen4DecoderLayer {
             config.is_linear_layer(layer_idx),
             ngram_table,
             config.ple_layer_ids.contains(&(layer_idx + 1)),
+            prefill_policy,
         )
     }
 
@@ -1521,6 +1532,7 @@ impl Qwen4DecoderLayer {
         is_linear: bool,
         ngram_table: Option<Arc<NGramTable>>,
         has_ple: bool,
+        prefill_policy: Arc<Qwen4PrefillPolicy>,
     ) -> Result<Self, String> {
         let attention = if is_linear {
             Qwen4AttentionVariant::Linear(Qwen4GatedDeltaNet::from_weights(
@@ -1533,6 +1545,7 @@ impl Qwen4DecoderLayer {
                 weights,
                 qn_config,
                 &format!("{prefix}.self_attn"),
+                prefill_policy,
             )?)
         };
         let ple = if has_ple {
@@ -1590,9 +1603,18 @@ pub struct Qwen4Model {
     sequence_state: ModelOwnedSequenceState<Qwen4LayerCache>,
     /// Rotary-position state retained for the active text sequence.
     rope_state: RopeState,
+    prefill_policy: Arc<Qwen4PrefillPolicy>,
 }
 
 impl Qwen4Model {
+    pub(crate) fn approximate_prefill_used(&self) -> bool {
+        self.prefill_policy.approximate_used()
+    }
+
+    pub(crate) fn set_reference_prefill(&self, enabled: bool) {
+        self.prefill_policy.set_force_reference(enabled);
+    }
+
     fn forward_backbone_with_inputs(
         &self,
         input_ids: &MlxArray,
@@ -1894,16 +1916,17 @@ impl Qwen4Model {
         output
     }
 
-    pub(crate) fn rollback_mtp_verify(
+    fn rollback_mtp_verify_to_retained_inputs(
         &self,
         gdn_states: &[GdnRollbackSnapshot],
-        accepted: usize,
+        retained_inputs: usize,
         block_size: usize,
         materialize: bool,
     ) -> Qwen4RollbackPlan {
         let plan = self.sequence_state.with_internal(|caches| {
             let verify_offset = caches.first().map(Qwen4LayerCache::offset).unwrap_or(0);
-            let plan = rollback_plan(verify_offset, accepted, block_size);
+            let plan =
+                rollback_plan_for_retained_inputs(verify_offset, retained_inputs, block_size);
             for cache in caches.iter_mut() {
                 if let Qwen4LayerCache::Attention(cache) = cache
                     && plan.trim > 0
@@ -1922,54 +1945,62 @@ impl Qwen4Model {
                     continue;
                 };
                 let replay_len = plan.accepted_block_len;
+                cache.state_cache = if replay_len == 0 {
+                    snapshot
+                        .init_state
+                        .as_ref()
+                        .map(|state| mlxcel_core::share(state))
+                } else {
+                    let batch = snapshot.batch;
+                    let q = mlxcel_core::slice(
+                        &snapshot.q,
+                        &[0, 0, 0, 0],
+                        &[
+                            batch,
+                            replay_len,
+                            layer.num_k_heads as i32,
+                            layer.head_k_dim as i32,
+                        ],
+                    );
+                    let k = mlxcel_core::slice(
+                        &snapshot.k,
+                        &[0, 0, 0, 0],
+                        &[
+                            batch,
+                            replay_len,
+                            layer.num_k_heads as i32,
+                            layer.head_k_dim as i32,
+                        ],
+                    );
+                    let v = mlxcel_core::slice(
+                        &snapshot.v,
+                        &[0, 0, 0, 0],
+                        &[
+                            batch,
+                            replay_len,
+                            layer.num_v_heads as i32,
+                            layer.head_v_dim as i32,
+                        ],
+                    );
+                    let a = mlxcel_core::slice(
+                        &snapshot.a,
+                        &[0, 0, 0],
+                        &[batch, replay_len, layer.num_v_heads as i32],
+                    );
+                    let b = mlxcel_core::slice(
+                        &snapshot.b,
+                        &[0, 0, 0],
+                        &[batch, replay_len, layer.num_v_heads as i32],
+                    );
+                    let (_, replayed_state) = gated_delta_update(
+                        (&q, &k, &v),
+                        (&a, &b, &layer.a_log, &layer.dt_bias),
+                        snapshot.init_state.as_deref(),
+                        None,
+                    );
+                    Some(replayed_state)
+                };
                 let batch = snapshot.batch;
-                let q = mlxcel_core::slice(
-                    &snapshot.q,
-                    &[0, 0, 0, 0],
-                    &[
-                        batch,
-                        replay_len,
-                        layer.num_k_heads as i32,
-                        layer.head_k_dim as i32,
-                    ],
-                );
-                let k = mlxcel_core::slice(
-                    &snapshot.k,
-                    &[0, 0, 0, 0],
-                    &[
-                        batch,
-                        replay_len,
-                        layer.num_k_heads as i32,
-                        layer.head_k_dim as i32,
-                    ],
-                );
-                let v = mlxcel_core::slice(
-                    &snapshot.v,
-                    &[0, 0, 0, 0],
-                    &[
-                        batch,
-                        replay_len,
-                        layer.num_v_heads as i32,
-                        layer.head_v_dim as i32,
-                    ],
-                );
-                let a = mlxcel_core::slice(
-                    &snapshot.a,
-                    &[0, 0, 0],
-                    &[batch, replay_len, layer.num_v_heads as i32],
-                );
-                let b = mlxcel_core::slice(
-                    &snapshot.b,
-                    &[0, 0, 0],
-                    &[batch, replay_len, layer.num_v_heads as i32],
-                );
-                let (_, replayed_state) = gated_delta_update(
-                    (&q, &k, &v),
-                    (&a, &b, &layer.a_log, &layer.dt_bias),
-                    snapshot.init_state.as_deref(),
-                    None,
-                );
-                cache.state_cache = Some(replayed_state);
                 let start = replay_len;
                 let end = start + layer.conv_kernel_size as i32 - 1;
                 let conv_state = mlxcel_core::slice(
@@ -1985,26 +2016,32 @@ impl Qwen4Model {
                         .as_ref()
                         .map(|state| mlxcel_core::share(state));
                     cache.ple_token_history = token_history.clone();
-                    let inputs = snapshot
-                        .ple_inputs
-                        .as_ref()
-                        .expect("PLE rollback must retain layer inputs");
-                    let input_ids = snapshot
-                        .ple_input_ids
-                        .as_ref()
-                        .expect("PLE rollback must retain token IDs");
-                    let hidden_size = mlxcel_core::array_shape(inputs)[2];
-                    let inputs =
-                        mlxcel_core::slice(inputs, &[0, 0, 0], &[batch, replay_len, hidden_size]);
-                    let replay_ids = mlxcel_core::slice(input_ids, &[0, 0], &[batch, replay_len]);
-                    let ple = self.layers[snapshot.layer_idx]
-                        .ple
-                        .as_ref()
-                        .expect("PLE rollback snapshot must retain its layer");
-                    let output = ple
-                        .forward(&inputs, &replay_ids, cache)
-                        .expect("captured PLE replay must remain valid");
-                    mlxcel_core::eval(&output);
+                    if replay_len > 0 {
+                        let inputs = snapshot
+                            .ple_inputs
+                            .as_ref()
+                            .expect("PLE rollback must retain layer inputs");
+                        let input_ids = snapshot
+                            .ple_input_ids
+                            .as_ref()
+                            .expect("PLE rollback must retain token IDs");
+                        let hidden_size = mlxcel_core::array_shape(inputs)[2];
+                        let inputs = mlxcel_core::slice(
+                            inputs,
+                            &[0, 0, 0],
+                            &[batch, replay_len, hidden_size],
+                        );
+                        let replay_ids =
+                            mlxcel_core::slice(input_ids, &[0, 0], &[batch, replay_len]);
+                        let ple = self.layers[snapshot.layer_idx]
+                            .ple
+                            .as_ref()
+                            .expect("PLE rollback snapshot must retain its layer");
+                        let output = ple
+                            .forward(&inputs, &replay_ids, cache)
+                            .expect("captured PLE replay must remain valid");
+                        mlxcel_core::eval(&output);
+                    }
                 }
             }
             if materialize {
@@ -2016,6 +2053,30 @@ impl Qwen4Model {
         });
         self.rope_state.set_position(plan.final_offset);
         plan
+    }
+
+    pub(crate) fn rollback_mtp_verify(
+        &self,
+        gdn_states: &[GdnRollbackSnapshot],
+        accepted: usize,
+        block_size: usize,
+        materialize: bool,
+    ) -> Qwen4RollbackPlan {
+        self.rollback_mtp_verify_to_retained_inputs(
+            gdn_states,
+            accepted.saturating_add(1),
+            block_size,
+            materialize,
+        )
+    }
+
+    pub(crate) fn rollback_mtp_verify_to_prefix(
+        &self,
+        gdn_states: &[GdnRollbackSnapshot],
+        block_size: usize,
+        materialize: bool,
+    ) -> Qwen4RollbackPlan {
+        self.rollback_mtp_verify_to_retained_inputs(gdn_states, 0, block_size, materialize)
     }
 
     /// Sever persistent target state from the completed MTP round.
@@ -2235,6 +2296,7 @@ impl Qwen4Model {
             return Err("Qwen3.8 Flash Next supports only the FP8 KV cache".to_string());
         }
         let qn_config = config.to_qwen4_attention_config();
+        let prefill_policy = Arc::new(Qwen4PrefillPolicy::default());
         let (embed_group_size, embed_bits) = config.quant_params("model.embed_tokens");
         let embed_tokens = UnifiedEmbedding::from_weights(
             weights,
@@ -2251,6 +2313,7 @@ impl Qwen4Model {
                 &qn_config,
                 layer_idx,
                 ngram_table.clone(),
+                prefill_policy.clone(),
             )?);
         }
         let norm = Qwen4FinalMixer::from_weights(weights, config, "model.hyper_connection_mixer")?;
@@ -2295,6 +2358,7 @@ impl Qwen4Model {
             mtp: None,
             sequence_state: ModelOwnedSequenceState::new(internal_caches),
             rope_state: RopeState::new(),
+            prefill_policy,
         })
     }
 }
@@ -2608,9 +2672,18 @@ impl LanguageModel for Qwen4Model {
         self.sequence_state
             .replace_internal(self.make_internal_caches());
         self.rope_state.clear();
+        self.prefill_policy.reset();
         if let Some(mtp) = &self.mtp {
             mtp.reset();
         }
+    }
+
+    fn approximate_prefill_used(&self) -> bool {
+        self.approximate_prefill_used()
+    }
+
+    fn set_reference_prefill(&self, enabled: bool) {
+        self.set_reference_prefill(enabled);
     }
 
     fn supports_snapshot_reuse(&self) -> bool {
@@ -3080,5 +3153,18 @@ mod tests {
         );
         mlxcel_core::eval(&close);
         assert!(mlxcel_core::item_bool(&close));
+    }
+
+    #[test]
+    fn rollback_plan_can_restore_the_pre_verify_prefix() {
+        let plan = rollback_plan_for_retained_inputs(64_004, 0, 4);
+        assert_eq!(
+            plan,
+            Qwen4RollbackPlan {
+                accepted_block_len: 0,
+                trim: 4,
+                final_offset: 64_000,
+            }
+        );
     }
 }

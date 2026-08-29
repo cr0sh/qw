@@ -668,6 +668,7 @@ impl Qwen4Provider {
             mtp_target_forward_calls = generated.stats.target_forward_calls,
             mtp_speculative_rounds = generated.stats.speculative_rounds,
             mtp_full_state_materializations = generated.stats.full_state_materializations,
+            mtp_reference_fallbacks = generated.stats.reference_fallbacks,
             mtp_cache_snapshot_count = generated.stats.cache_snapshot_count,
             mtp_cache_clear_seconds = generated.stats.cache_clear_time.as_secs_f64(),
         );

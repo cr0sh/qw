@@ -20,6 +20,7 @@
 
 use std::cell::RefCell;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::portable_snapshot::{
@@ -45,6 +46,7 @@ use tracing::debug;
 
 use crate::qwen_position::decode_rope_positions;
 use crate::qwen4::{Qwen4Config, Qwen4DecoderLayer, Qwen4FinalMixer, Qwen4Model, Qwen4RmsNorm};
+use crate::qwen4_attention::Qwen4PrefillPolicy;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MtpGenerationStats {
@@ -64,6 +66,9 @@ pub struct MtpGenerationStats {
     pub speculative_rounds: usize,
     pub full_state_materializations: usize,
     pub cache_snapshot_count: usize,
+    /// Greedy rounds replayed through single-token target verification because
+    /// the fast multi-token decision was within one BF16 ULP.
+    pub reference_fallbacks: usize,
 }
 
 impl MtpGenerationStats {
@@ -374,7 +379,14 @@ impl Qwen4MtpDraftModel {
         let fc_hidden =
             UnifiedLinear::from_weights(&weights, "fc_hidden", hidden_group, hidden_bits)?;
         let layer = Qwen4DecoderLayer::from_weights_at_prefix(
-            &weights, &config, &qn_config, "layers.0", false, None, false,
+            &weights,
+            &config,
+            &qn_config,
+            "layers.0",
+            false,
+            None,
+            false,
+            Arc::new(Qwen4PrefillPolicy::default()),
         )?;
         let final_mixer =
             Qwen4FinalMixer::from_weights(&weights, &config, "hyper_connection_mixer")?;
@@ -2304,13 +2316,14 @@ impl Qwen4MtpGenerator {
                     && sampling.xtc_probability == 0.0
                     && remaining > block_size;
                 let phase_start = Instant::now();
-                let verify = model.forward_mtp_verify_with_compact(&verify_input, compact_verify);
+                let mut verify =
+                    model.forward_mtp_verify_with_compact(&verify_input, compact_verify);
                 mlxcel_core::eval(&verify.logits);
                 mtp_stats.target_verify_time += phase_start.elapsed();
                 mtp_stats.target_forward_calls += 1;
                 mtp_stats.speculative_rounds += 1;
                 let phase_start = Instant::now();
-                let walk = if let Some(proposals) = proposal_probs.as_deref() {
+                let mut walk = if let Some(proposals) = proposal_probs.as_deref() {
                     stochastic_walk(
                         proposals,
                         &verify.logits,
@@ -2330,6 +2343,46 @@ impl Qwen4MtpGenerator {
                     )
                 };
                 mtp_stats.walk_time += phase_start.elapsed();
+                let mut reference_fallback = false;
+                if proposal_probs.is_none()
+                    && model.approximate_prefill_used()
+                    && let Some(decision) =
+                        mlxcel_core::generate::first_bf16_ill_conditioned_greedy_row(
+                            &verify.logits,
+                            walk.new_tokens.len(),
+                        )
+                {
+                    debug!(
+                        phase = "mtp.reference_fallback",
+                        verify_row = decision.row,
+                        logit_margin = decision.margin,
+                        bf16_ulp = decision.bf16_ulp,
+                    );
+                    model.rollback_mtp_verify_to_prefix(
+                        &verify.gdn_states,
+                        verify_tokens.len(),
+                        false,
+                    );
+                    let reference_input = mlxcel_core::from_slice_i32(&[bonus], &[1, 1]);
+                    let phase_start = Instant::now();
+                    verify =
+                        model.forward_mtp_verify_with_compact(&reference_input, compact_verify);
+                    mlxcel_core::eval(&verify.logits);
+                    mtp_stats.target_verify_time += phase_start.elapsed();
+                    mtp_stats.target_forward_calls += 1;
+                    let phase_start = Instant::now();
+                    walk = greedy_walk(
+                        &[],
+                        &verify.logits,
+                        compact_verify,
+                        &sampling,
+                        &history,
+                        remaining,
+                    );
+                    mtp_stats.walk_time += phase_start.elapsed();
+                    mtp_stats.reference_fallbacks += 1;
+                    reference_fallback = true;
+                }
                 let phase_start = Instant::now();
                 mtp_stats.record_round(walk.accepted, draft_tokens.len());
                 extend_greedy_draft = should_extend_greedy_draft(
@@ -2353,7 +2406,7 @@ impl Qwen4MtpGenerator {
                 }
 
                 let rollback_accepted = target_cache_accepted_count(emitted_in_round);
-                if rollback_accepted < draft_tokens.len() {
+                if !reference_fallback && rollback_accepted < draft_tokens.len() {
                     model.rollback_mtp_verify(
                         &verify.gdn_states,
                         rollback_accepted,
