@@ -8011,7 +8011,7 @@ mod tests {
         }
     }
     fn synthetic_expert_weight(experts: i32, output: i32, input: i32) -> QuantizedWeight {
-        const GROUP_SIZE: i32 = 4;
+        const GROUP_SIZE: i32 = 32;
         const BITS: i32 = 4;
         let values = (0..experts * output * input)
             .map(|index| ((index % 17) as f32 - 8.0) / 8.0)
@@ -8029,22 +8029,18 @@ mod tests {
     #[test]
     fn moe_switch_batched_rows_match_single_token_dispatches() {
         const EXPERTS: i32 = 4;
-        const HIDDEN: i32 = 8;
-        const INTERMEDIATE: i32 = 8;
+        const HIDDEN: i32 = 32;
+        const INTERMEDIATE: i32 = 32;
         let switch = MoESwitch::new(
             synthetic_expert_weight(EXPERTS, INTERMEDIATE, HIDDEN),
             synthetic_expert_weight(EXPERTS, INTERMEDIATE, HIDDEN),
             synthetic_expert_weight(EXPERTS, HIDDEN, INTERMEDIATE),
             EXPERTS,
         );
-        let input = ffi::from_slice_f32(
-            &[
-                0.5, -0.25, 0.75, 0.125, -0.5, 0.375, 0.625, -0.125,
-                -0.75, 0.5, 0.25, -0.375, 0.875, -0.625, 0.125, 0.75,
-                0.25, 0.625, -0.5, 0.875, -0.125, 0.375, -0.75, 0.5,
-            ],
-            &[1, 3, HIDDEN],
-        );
+        let input_values = (0..3 * HIDDEN)
+            .map(|index| ((index % 23) as f32 - 11.0) / 8.0)
+            .collect::<Vec<_>>();
+        let input = ffi::from_slice_f32(&input_values, &[1, 3, HIDDEN]);
         let indices = ffi::from_slice_i32(&[0, 2, 1, 3, 0, 3], &[1, 3, 2]);
         let batched = switch.forward(&input, &indices);
 
