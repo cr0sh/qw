@@ -710,3 +710,112 @@ fn precise_sigmoid_gate(x: &MlxArray, gate: &MlxArray, target_dtype: i32) -> Uni
     let product = mlxcel_core::multiply(&gate_sigmoid, &x_f32);
     restore_dtype(product, target_dtype)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_close(actual: &MlxArray, expected: &MlxArray) {
+        let close = mlxcel_core::allclose(actual, expected, 1e-5, 1e-5);
+        mlxcel_core::eval(&close);
+        assert!(mlxcel_core::item_bool(&close));
+    }
+
+    fn metal_batch_matches_sequential(vectorized_gate: bool, masked: bool) {
+        if !mlxcel_core::gated_delta_kernel_available() {
+            return;
+        }
+
+        const T: i32 = 5;
+        const DK: i32 = 32;
+        const DV: i32 = 4;
+        let q_values = (0..T * DK)
+            .map(|index| ((index * 7 % 29) as f32 - 14.0) / 32.0)
+            .collect::<Vec<_>>();
+        let k_values = (0..T * DK)
+            .map(|index| ((index * 11 % 31) as f32 - 15.0) / 40.0)
+            .collect::<Vec<_>>();
+        let v_values = (0..T * DV)
+            .map(|index| ((index * 5 % 17) as f32 - 8.0) / 12.0)
+            .collect::<Vec<_>>();
+        let gate_len = if vectorized_gate { T * DK } else { T };
+        let g_values = (0..gate_len)
+            .map(|index| 0.91 + (index % 7) as f32 * 0.01)
+            .collect::<Vec<_>>();
+        let beta_values = (0..T)
+            .map(|index| 0.35 + index as f32 * 0.07)
+            .collect::<Vec<_>>();
+        let state_values = (0..DV * DK)
+            .map(|index| ((index * 13 % 37) as f32 - 18.0) / 50.0)
+            .collect::<Vec<_>>();
+
+        let activation = |values: &[f32], shape: &[i32]| {
+            mlxcel_core::astype(
+                &mlxcel_core::from_slice_f32(values, shape),
+                dtype::BFLOAT16,
+            )
+        };
+        let q = activation(&q_values, &[1, T, 1, DK]);
+        let k = activation(&k_values, &[1, T, 1, DK]);
+        let v = activation(&v_values, &[1, T, 1, DV]);
+        let g_shape = if vectorized_gate {
+            [1, T, 1, DK]
+        } else {
+            [1, T, 1, 1]
+        };
+        let g = activation(&g_values, &g_shape[..if vectorized_gate { 4 } else { 3 }]);
+        let beta = activation(&beta_values, &[1, T, 1]);
+        let initial_state = mlxcel_core::from_slice_f32(&state_values, &[1, 1, DV, DK]);
+        let mask = masked.then(|| mlxcel_core::ones(&[1, T], dtype::BOOL));
+
+        let (batched_output, batched_state) =
+            gated_delta_ops(&q, &k, &v, &g, &beta, Some(&initial_state), mask.as_deref());
+
+        let mut state = mlxcel_core::share(&initial_state);
+        let mut outputs = Vec::with_capacity(T as usize);
+        for position in 0..T {
+            let q_row =
+                mlxcel_core::slice(&q, &[0, position, 0, 0], &[1, position + 1, 1, DK]);
+            let k_row =
+                mlxcel_core::slice(&k, &[0, position, 0, 0], &[1, position + 1, 1, DK]);
+            let v_row =
+                mlxcel_core::slice(&v, &[0, position, 0, 0], &[1, position + 1, 1, DV]);
+            let g_row = if vectorized_gate {
+                mlxcel_core::slice(&g, &[0, position, 0, 0], &[1, position + 1, 1, DK])
+            } else {
+                mlxcel_core::slice(&g, &[0, position, 0], &[1, position + 1, 1])
+            };
+            let beta_row =
+                mlxcel_core::slice(&beta, &[0, position, 0], &[1, position + 1, 1]);
+            let mask_row = mask
+                .as_deref()
+                .map(|value| mlxcel_core::slice(value, &[0, position], &[1, position + 1]));
+            let (output, next_state) = gated_delta_ops(
+                &q_row,
+                &k_row,
+                &v_row,
+                &g_row,
+                &beta_row,
+                Some(&state),
+                mask_row.as_deref(),
+            );
+            outputs.push(output);
+            state = next_state;
+        }
+        let sequential_output = mlxcel_core::concatenate_owned(&outputs, 1);
+
+        assert_eq!(mlxcel_core::array_dtype(&batched_state), dtype::FLOAT32);
+        assert_eq!(mlxcel_core::array_dtype(&state), dtype::FLOAT32);
+        assert_close(&batched_output, &sequential_output);
+        assert_close(&batched_state, &state);
+    }
+
+    #[test]
+    fn metal_gated_delta_batch_matches_sequential_dispatches() {
+        for vectorized_gate in [false, true] {
+            for masked in [false, true] {
+                metal_batch_matches_sequential(vectorized_gate, masked);
+            }
+        }
+    }
+}

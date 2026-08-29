@@ -854,7 +854,7 @@ namespace {
         }
         for (int i = 0; i < n_per_t; ++i) {
             auto s_idx = 32 * i + dk_idx;
-            o_state[s_idx] = static_cast<InT>(state[i]);
+            o_state[s_idx] = state[i];
         }
     )";
 
@@ -922,7 +922,7 @@ namespace {
         }
         for (int i = 0; i < n_per_t; ++i) {
             auto s_idx = n_per_t * dk_idx + i;
-            o_state[s_idx] = static_cast<InT>(state[i]);
+            o_state[s_idx] = state[i];
         }
     )";
 
@@ -988,7 +988,7 @@ namespace {
         }
         for (int i = 0; i < n_per_t; ++i) {
             auto s_idx = n_per_t * dk_idx + i;
-            o_state[s_idx] = static_cast<InT>(state[i]);
+            o_state[s_idx] = state[i];
         }
     )";
 
@@ -1056,7 +1056,7 @@ namespace {
         }
         for (int i = 0; i < n_per_t; ++i) {
             auto s_idx = n_per_t * dk_idx + i;
-            o_state[s_idx] = static_cast<InT>(state[i]);
+            o_state[s_idx] = state[i];
         }
     )";
 
@@ -1167,9 +1167,10 @@ void metal_gated_delta_forward(
 
     auto input_type = q.inner.dtype();
 
-    // Cast inputs to input_type if needed (state may be float32 from Rust side)
-    auto state_cast = (state.inner.dtype() != input_type)
-        ? mlx::core::astype(state.inner, input_type) : state.inner;
+    // Preserve the float32 recurrent state across dispatches. Casting it to the
+    // activation dtype makes T=N differ from N successive T=1 calls because
+    // only the latter quantizes the state at every dispatch boundary.
+    const auto& state_input = state.inner;
     auto g_cast = (g.inner.dtype() != input_type)
         ? mlx::core::astype(g.inner, input_type) : g.inner;
     auto beta_cast = (beta.inner.dtype() != input_type)
@@ -1191,25 +1192,25 @@ void metal_gated_delta_forward(
 
     if (vectorized && has_mask) {
         input_names = {"q", "k", "v", "g", "beta", "state_in", "T", "mask"};
-        inputs = {q.inner, k.inner, v.inner, g_cast, beta_cast, state_cast, T_arr, mask->inner};
+        inputs = {q.inner, k.inner, v.inner, g_cast, beta_cast, state_input, T_arr, mask->inner};
         holder = &get_gd_kernel_vec_mask();
         kernel_name = "gated_delta_step_vec_mask";
         kernel_source = GATED_DELTA_METAL_SOURCE_VEC_MASK;
     } else if (vectorized) {
         input_names = {"q", "k", "v", "g", "beta", "state_in", "T"};
-        inputs = {q.inner, k.inner, v.inner, g_cast, beta_cast, state_cast, T_arr};
+        inputs = {q.inner, k.inner, v.inner, g_cast, beta_cast, state_input, T_arr};
         holder = &get_gd_kernel_vec();
         kernel_name = "gated_delta_step_vec";
         kernel_source = GATED_DELTA_METAL_SOURCE_VEC;
     } else if (has_mask) {
         input_names = {"q", "k", "v", "g", "beta", "state_in", "T", "mask"};
-        inputs = {q.inner, k.inner, v.inner, g_cast, beta_cast, state_cast, T_arr, mask->inner};
+        inputs = {q.inner, k.inner, v.inner, g_cast, beta_cast, state_input, T_arr, mask->inner};
         holder = &get_gd_kernel_mask();
         kernel_name = "gated_delta_step_mask";
         kernel_source = GATED_DELTA_METAL_SOURCE_MASK;
     } else {
         input_names = {"q", "k", "v", "g", "beta", "state_in", "T"};
-        inputs = {q.inner, k.inner, v.inner, g_cast, beta_cast, state_cast, T_arr};
+        inputs = {q.inner, k.inner, v.inner, g_cast, beta_cast, state_input, T_arr};
         holder = &get_gd_kernel();
         kernel_name = "gated_delta_step";
         kernel_source = GATED_DELTA_METAL_SOURCE;
@@ -1226,12 +1227,13 @@ void metal_gated_delta_forward(
         {"Hv", Hv},
     };
 
-    // Output shapes and dtypes (matching Python: both in input_type)
+    // Activations follow the input dtype; recurrent state stays float32, matching
+    // the ops fallback and preserving the state equation across call boundaries.
     std::vector<Shape> output_shapes = {
         Shape{B, T_val, Hv, Dv},   // y
         state.inner.shape(),        // state_out (same shape as state_in)
     };
-    std::vector<Dtype> output_dtypes = {input_type, input_type};
+    std::vector<Dtype> output_dtypes = {input_type, mlx::core::float32};
 
     // Four SIMD groups maximize occupancy with coalesced Dk accesses.
     auto results = kernel(
