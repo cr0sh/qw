@@ -546,7 +546,7 @@ namespace {
             float output = 0.0f;
             for (uint selection = 0; selection < selected; ++selection) {
                 uint selection_offset = selection_base + selection;
-                if (selection + 4u < selected || valid[selection_offset]) {
+                if (selection < always_valid || valid[selection_offset]) {
                     uint token = (uint)indices[selection_offset];
                     uint value_offset =
                         (((batch_index * kv_heads + kv_head) * key_length
@@ -587,6 +587,7 @@ std::unique_ptr<MlxArray> qsa_sparse_prefill_attention(
     const MlxArray& values,
     const MlxArray& indices,
     const MlxArray& valid,
+    int32_t always_valid,
     float scale
 ) {
     using namespace mlx::core;
@@ -610,6 +611,7 @@ std::unique_ptr<MlxArray> qsa_sparse_prefill_attention(
         {"key_length", key_length},
         {"head_dim", head_dim},
         {"selected", selected},
+        {"always_valid", always_valid},
     };
     std::vector<array> inputs = {
         queries.inner, keys.inner, values.inner, indices.inner, valid.inner,

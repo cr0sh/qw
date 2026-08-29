@@ -1754,6 +1754,7 @@ std::unique_ptr<MlxArray> qsa_sparse_prefill_attention(
     const MlxArray& values,
     const MlxArray& indices,
     const MlxArray& valid,
+    int32_t always_valid,
     float scale
 );
 

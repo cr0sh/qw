@@ -161,6 +161,7 @@ enum Qwen4QsaPlan {
     PrefillIndices {
         indices: UniquePtr<MlxArray>,
         valid: UniquePtr<MlxArray>,
+        always_valid: i32,
     },
 }
 
@@ -444,13 +445,18 @@ impl Qwen4QsaIndexer {
             let last_visible =
                 mlxcel_core::subtract(&query_ends, &mlxcel_core::from_slice_i32(&[1], &[1]));
             let tail_indices = mlxcel_core::where_cond(&tail_valid, &tail_indices, &last_visible);
+            let always_valid = mlxcel_core::array_shape(&selected)[2];
             let indices = mlxcel_core::concatenate(&selected, &tail_indices, -1);
             let selected_valid = mlxcel_core::ones(
                 &mlxcel_core::array_shape(&selected),
                 mlxcel_core::dtype::BOOL,
             );
             let valid = mlxcel_core::concatenate(&selected_valid, &tail_valid, -1);
-            return Some(Qwen4QsaPlan::PrefillIndices { indices, valid });
+            return Some(Qwen4QsaPlan::PrefillIndices {
+                indices,
+                valid,
+                always_valid,
+            });
         }
 
         let selected_shape = mlxcel_core::array_shape(&selected);
@@ -551,9 +557,17 @@ impl Qwen4Attention {
             _ => None,
         };
         let qsa_prefill = match (mask.is_none(), &qsa_plan) {
-            (true, Some(Qwen4QsaPlan::PrefillIndices { indices, valid })) => Some((
+            (
+                true,
+                Some(Qwen4QsaPlan::PrefillIndices {
+                    indices,
+                    valid,
+                    always_valid,
+                }),
+            ) => Some((
                 indices.as_ref().expect("QSA prefill indices are non-null"),
                 valid.as_ref().expect("QSA prefill validity is non-null"),
+                *always_valid,
             )),
             _ => None,
         };
@@ -659,10 +673,16 @@ impl Qwen4Attention {
                 });
             }
             mlxcel_core::concatenate_owned(&outputs, 2)
-        } else if let Some((indices, valid)) = qsa_prefill {
+        } else if let Some((indices, valid, always_valid)) = qsa_prefill {
             let (cache_k, cache_v) = cache.update_and_fetch(keys, values);
             mlxcel_core::qsa_sparse_prefill_attention(
-                &queries, &cache_k, &cache_v, indices, valid, self.scale,
+                &queries,
+                &cache_k,
+                &cache_v,
+                indices,
+                valid,
+                always_valid,
+                self.scale,
             )
         } else if let Some(indices) = qsa_indices {
             let (cache_k, cache_v) = cache.update_and_fetch_selected(keys, values, indices);
@@ -1023,9 +1043,12 @@ mod tests {
             &[1, 1, 5, 4],
         );
         let indices = mlxcel_core::from_slice_i32(&[0, 2, 4, 1, 3, 4], &[1, 2, 3]);
-        let valid = mlxcel_core::ones(&[1, 2, 3], mlxcel_core::dtype::BOOL);
+        let valid = mlxcel_core::astype(
+            &mlxcel_core::from_slice_i32(&[1, 0, 1, 1, 0, 1], &[1, 2, 3]),
+            mlxcel_core::dtype::BOOL,
+        );
         let actual = mlxcel_core::qsa_sparse_prefill_attention(
-            &queries, &keys, &values, &indices, &valid, 0.5,
+            &queries, &keys, &values, &indices, &valid, 1, 0.5,
         );
         let expected = mlxcel_core::from_slice_f32(
             &[
@@ -1033,18 +1056,18 @@ mod tests {
                 2.0,
                 2.0,
                 2.0,
-                8.0 / 3.0,
-                8.0 / 3.0,
-                8.0 / 3.0,
-                8.0 / 3.0,
+                2.5,
+                2.5,
+                2.5,
+                2.5,
                 2.0,
                 2.0,
                 2.0,
                 2.0,
-                8.0 / 3.0,
-                8.0 / 3.0,
-                8.0 / 3.0,
-                8.0 / 3.0,
+                2.5,
+                2.5,
+                2.5,
+                2.5,
             ],
             &[1, 2, 2, 4],
         );

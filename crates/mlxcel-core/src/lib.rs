@@ -1810,6 +1810,7 @@ mod ffi {
             values: &MlxArray,
             indices: &MlxArray,
             valid: &MlxArray,
+            always_valid: i32,
             scale: f32,
         ) -> UniquePtr<MlxArray>;
 
