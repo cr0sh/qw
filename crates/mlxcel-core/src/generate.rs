@@ -36,6 +36,7 @@ use crate::loop_detection::{LoopDetectionConfig, detect_repetition_loop};
 use crate::sampling::{
     SamplerState, TokenBiasMap, sample_token_optimized, sample_token_optimized_with_state,
 };
+use crate::speculative::stochastic_accept::sampler_is_greedy;
 use crate::streams::{install_thread_local_default_stream, new_thread_local_generation_stream};
 use crate::utils::{align_to_na_tile, create_padded_prefill_mask};
 use cxx::UniquePtr;
@@ -625,6 +626,59 @@ pub struct PrefixReuse<'a> {
     pub snapshot: &'a ModelStateSnapshot,
     pub cached_tokens: usize,
 }
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IllConditionedGreedyDecision {
+    pub row: usize,
+    pub margin: f32,
+    pub bf16_ulp: f32,
+}
+
+fn bf16_ulp(value: f32) -> f32 {
+    if value == 0.0 {
+        return f32::from_bits(1 << 16);
+    }
+    let biased_exponent = ((value.to_bits() >> 23) & 0xff) as i32;
+    if biased_exponent == 0 {
+        f32::from_bits(1 << 16)
+    } else {
+        2.0_f32.powi(biased_exponent - 127 - 7)
+    }
+}
+
+pub fn first_bf16_ill_conditioned_greedy_row(
+    logits: &MlxArray,
+    emitted_rows: usize,
+) -> Option<IllConditionedGreedyDecision> {
+    let shape = ffi::array_shape(logits);
+    let rows = emitted_rows.min(shape[1] as usize);
+    if rows == 0 {
+        return None;
+    }
+    let considered_logits = ffi::slice(logits, &[0, 0, 0], &[shape[0], rows as i32, shape[2]]);
+    let negated = ffi::negative(&considered_logits);
+    let partition = ffi::argpartition(&negated, 1, -1);
+    let top_indices = ffi::slice(&partition, &[0, 0, 0], &[shape[0], rows as i32, 2]);
+    let top_values = ffi::astype(
+        &ffi::take_along_axis(&considered_logits, &top_indices, -1),
+        crate::dtype::FLOAT32,
+    );
+    let bytes = ffi::array_to_raw_bytes(&top_values);
+    bytes
+        .chunks_exact(8)
+        .take(rows)
+        .enumerate()
+        .find_map(|(row, pair)| {
+            let left = f32::from_ne_bytes(pair[..4].try_into().expect("four-byte logit"));
+            let right = f32::from_ne_bytes(pair[4..].try_into().expect("four-byte logit"));
+            let margin = (left - right).abs();
+            let ulp = bf16_ulp(left.abs().max(right.abs()));
+            (margin <= ulp).then_some(IllConditionedGreedyDecision {
+                row,
+                margin,
+                bf16_ulp: ulp,
+            })
+        })
+}
 
 /// Returns true when the current hardware is M5+ with a Neural Accelerator
 /// and tile-aligned prefill should be applied.
@@ -1038,6 +1092,14 @@ pub trait LanguageModel {
     /// generate_with_stats, generate_streaming_with_embeddings,
     /// generate_with_stats_and_embeddings, evaluate_loglikelihoods}`.
     fn reset_runtime_state(&self) {}
+    /// Whether the most recent prefill used a numerically approximate fast
+    /// path whose greedy boundary can require reference replay.
+    fn approximate_prefill_used(&self) -> bool {
+        false
+    }
+
+    /// Select the numerically stable prefill implementation for a replay.
+    fn set_reference_prefill(&self, _enabled: bool) {}
 
     /// Release any model-owned sequence state associated with the provided
     /// external cache slice before the scheduler drops that cache set.
@@ -1752,6 +1814,62 @@ impl CxxGenerator {
         Ok(logits)
     }
 
+    fn replay_reference_prefill_decision<M: LanguageModel>(
+        &mut self,
+        model: &M,
+        prompt_tokens: &[i32],
+        prefix_reuse: Option<&PrefixReuse<'_>>,
+    ) -> Result<(UniquePtr<MlxArray>, Option<ModelStateSnapshot>), String> {
+        let generated_tokens = self.generated_tokens.clone();
+        self.reset_with_model(model);
+        let sequence_id = SequenceId::from_raw(0);
+        let mut cached_tokens = 0;
+        if let Some(reuse) = prefix_reuse
+            && reuse.cached_tokens > 0
+            && reuse.cached_tokens < prompt_tokens.len()
+            && reuse.snapshot.token_len() == reuse.cached_tokens
+        {
+            model.restore_sequence_state(sequence_id, reuse.snapshot)?;
+            cached_tokens = reuse.cached_tokens;
+        }
+        let prefill_tokens = &prompt_tokens[cached_tokens..];
+        model.set_reference_prefill(true);
+        let prefill_chunk = effective_prefill_chunk(
+            prefill_chunk_len(),
+            model.supports_chunked_prefill(),
+            prefill_tokens.len(),
+        );
+        let mut logits = if let Some(chunk) = prefill_chunk {
+            chunked_prefill_last_logits(model, &mut self.caches, prefill_tokens, chunk)
+        } else {
+            let input = ffi::from_slice_i32(prefill_tokens, &[1, prefill_tokens.len() as i32]);
+            model.forward_last_logits(
+                &input,
+                &mut self.caches,
+                None,
+                prefill_tokens.len().saturating_sub(1),
+            )
+        };
+        ffi::eval(&logits);
+        model.set_reference_prefill(false);
+        let mut prompt_snapshot =
+            model.snapshot_sequence_state(sequence_id, prompt_tokens.len(), None);
+        if let Some(snapshot) = prompt_snapshot.as_mut() {
+            snapshot.set_continuation_logits(
+                logits
+                    .as_ref()
+                    .expect("reference prefill logits must not be null"),
+            );
+        }
+        for &token_id in &generated_tokens {
+            let input = ffi::from_slice_i32(&[token_id], &[1, 1]);
+            logits = model.forward_last_logits(&input, &mut self.caches, None, 0);
+            ffi::eval(&logits);
+        }
+        self.generated_tokens = generated_tokens;
+        Ok((logits, prompt_snapshot))
+    }
+
     /// Baseline single-sequence generation with optional exact-prefix reuse and
     /// an engine-neutral token constraint.
     ///
@@ -1804,7 +1922,7 @@ impl CxxGenerator {
         let requested_cached_tokens = prefix_reuse.as_ref().map_or(0, |reuse| reuse.cached_tokens);
         let mut cached_tokens = 0;
         let mut cached_logits = None;
-        if let Some(reuse) = prefix_reuse
+        if let Some(reuse) = prefix_reuse.as_ref()
             && reuse.cached_tokens > 0
             && reuse.cached_tokens <= prompt_tokens.len()
             && reuse.snapshot.token_len() == reuse.cached_tokens
@@ -1894,6 +2012,39 @@ impl CxxGenerator {
         let mut aligned_token_len = prompt_tokens.len();
 
         while self.generated_tokens.len() < max_tokens {
+            if constraint.is_none()
+                && model.approximate_prefill_used()
+                && sampler_is_greedy(sampling)
+            {
+                if let Some(decision) = first_bf16_ill_conditioned_greedy_row(
+                    logits.as_ref().expect("generation logits must not be null"),
+                    1,
+                ) {
+                    let (reference_logits, reference_snapshot) = self
+                        .replay_reference_prefill_decision(
+                            model,
+                            prompt_tokens,
+                            prefix_reuse.as_ref(),
+                        )?;
+                    logits = reference_logits;
+                    if let Some(snapshot) = reference_snapshot {
+                        if let Some(existing) = prompt_snapshots
+                            .iter_mut()
+                            .find(|existing| existing.token_len() == prompt_tokens.len())
+                        {
+                            *existing = snapshot;
+                        } else {
+                            prompt_snapshots.push(snapshot);
+                        }
+                    }
+                    tracing::debug!(
+                        phase = "generation.reference_fallback",
+                        generated_tokens = self.generated_tokens.len(),
+                        margin = decision.margin,
+                        bf16_ulp = decision.bf16_ulp,
+                    );
+                }
+            }
             let constrained_logits;
             let logits_for_sample = if let Some(active) = constraint.as_deref_mut() {
                 match active.compute_mask(
@@ -3391,6 +3542,18 @@ pub fn run_benchmark<M: LanguageModel>(
 mod tests {
     use super::*;
     use crate::layers::KVCache;
+    #[test]
+    fn one_bf16_ulp_marks_a_greedy_decision_ill_conditioned() {
+        assert_eq!(bf16_ulp(20.0), 0.125);
+        let logits = ffi::from_slice_f32(&[20.75, 20.625], &[1, 1, 2]);
+        let decision = first_bf16_ill_conditioned_greedy_row(&logits, 1)
+            .expect("one BF16 ULP must use reference decision");
+        assert_eq!(decision.margin, 0.125);
+        assert_eq!(decision.bf16_ulp, 0.125);
+
+        let stable = ffi::from_slice_f32(&[20.75, 20.5], &[1, 1, 2]);
+        assert!(first_bf16_ill_conditioned_greedy_row(&stable, 1).is_none());
+    }
 
     /// Minimal model stub for testing forward_batched default implementation.
     /// Produces logits that are just the input token ID broadcast to a small

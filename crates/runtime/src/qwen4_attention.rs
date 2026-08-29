@@ -22,6 +22,10 @@ use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr, concatenate};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 // Configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -113,6 +117,30 @@ impl Qwen4LayerCache {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct Qwen4PrefillPolicy {
+    force_reference: AtomicBool,
+    approximate_used: AtomicBool,
+}
+
+impl Qwen4PrefillPolicy {
+    pub(crate) fn set_force_reference(&self, enabled: bool) {
+        self.force_reference.store(enabled, Ordering::Relaxed);
+        if enabled {
+            self.approximate_used.store(false, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn approximate_used(&self) -> bool {
+        self.approximate_used.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn reset(&self) {
+        self.force_reference.store(false, Ordering::Relaxed);
+        self.approximate_used.store(false, Ordering::Relaxed);
+    }
+}
+
 struct Qwen4QsaIndexer {
     projection: UnifiedLinear,
     q_norm: RMSNorm,
@@ -124,11 +152,16 @@ struct Qwen4QsaIndexer {
     block_topk: i32,
     rope_dims: i32,
     mrope: InterleavedMRoPE,
+    prefill_policy: Arc<Qwen4PrefillPolicy>,
 }
 enum Qwen4QsaPlan {
     Mask(UniquePtr<MlxArray>),
     DecodeIndices(UniquePtr<MlxArray>),
     VerifyIndices(Vec<UniquePtr<MlxArray>>),
+    PrefillIndices {
+        indices: UniquePtr<MlxArray>,
+        valid: UniquePtr<MlxArray>,
+    },
 }
 
 impl Qwen4QsaIndexer {
@@ -136,6 +169,7 @@ impl Qwen4QsaIndexer {
         weights: &WeightMap,
         config: &Qwen4AttentionConfig,
         attention_prefix: &str,
+        prefill_policy: Arc<Qwen4PrefillPolicy>,
     ) -> Result<Self, String> {
         let prefix = format!("{attention_prefix}.indexer");
         let projection_prefix = format!("{prefix}.index_qk_proj");
@@ -164,6 +198,7 @@ impl Qwen4QsaIndexer {
             compress_ratio: config.indexer_compress_ratio as i32,
             block_topk: (config.indexer_budget / config.indexer_compress_ratio) as i32,
             rope_dims: (config.indexer_head_dim as f32 * config.partial_rotary_factor) as i32,
+            prefill_policy,
             mrope: InterleavedMRoPE::new(
                 (config.indexer_head_dim as f32 * config.partial_rotary_factor) as usize,
                 config.rope_theta,
@@ -389,6 +424,34 @@ impl Qwen4QsaIndexer {
             }
             return Some(Qwen4QsaPlan::VerifyIndices(rows));
         }
+        if batch == 1
+            && sequence >= 64
+            && !self.prefill_policy.force_reference.load(Ordering::Relaxed)
+            && past_len / self.compress_ratio > self.block_topk
+            && matches!(
+                cache.mode,
+                KVCacheMode::Fp16 | KVCacheMode::Fp8 | KVCacheMode::Int8
+            )
+        {
+            self.prefill_policy
+                .approximate_used
+                .store(true, Ordering::Relaxed);
+            let tail_starts = mlxcel_core::multiply(&complete_counts, &ratio);
+            let offsets = mlxcel_core::arange_i32(0, self.compress_ratio, 1);
+            let offsets = mlxcel_core::reshape(&offsets, &[1, 1, self.compress_ratio]);
+            let tail_indices = mlxcel_core::add(&tail_starts, &offsets);
+            let tail_valid = mlxcel_core::less(&tail_indices, &query_ends);
+            let last_visible =
+                mlxcel_core::subtract(&query_ends, &mlxcel_core::from_slice_i32(&[1], &[1]));
+            let tail_indices = mlxcel_core::where_cond(&tail_valid, &tail_indices, &last_visible);
+            let indices = mlxcel_core::concatenate(&selected, &tail_indices, -1);
+            let selected_valid = mlxcel_core::ones(
+                &mlxcel_core::array_shape(&selected),
+                mlxcel_core::dtype::BOOL,
+            );
+            let valid = mlxcel_core::concatenate(&selected_valid, &tail_valid, -1);
+            return Some(Qwen4QsaPlan::PrefillIndices { indices, valid });
+        }
 
         let selected_shape = mlxcel_core::array_shape(&selected);
         let selected_values = mlxcel_core::ones(&selected_shape, mlxcel_core::dtype::BOOL);
@@ -485,6 +548,13 @@ impl Qwen4Attention {
         };
         let qsa_verify = match &qsa_plan {
             Some(Qwen4QsaPlan::VerifyIndices(rows)) => Some(rows.as_slice()),
+            _ => None,
+        };
+        let qsa_prefill = match (mask.is_none(), &qsa_plan) {
+            (true, Some(Qwen4QsaPlan::PrefillIndices { indices, valid })) => Some((
+                indices.as_ref().expect("QSA prefill indices are non-null"),
+                valid.as_ref().expect("QSA prefill validity is non-null"),
+            )),
             _ => None,
         };
         let mask = qsa_mask.or(mask);
@@ -589,6 +659,11 @@ impl Qwen4Attention {
                 });
             }
             mlxcel_core::concatenate_owned(&outputs, 2)
+        } else if let Some((indices, valid)) = qsa_prefill {
+            let (cache_k, cache_v) = cache.update_and_fetch(keys, values);
+            mlxcel_core::qsa_sparse_prefill_attention(
+                &queries, &cache_k, &cache_v, indices, valid, self.scale,
+            )
         } else if let Some(indices) = qsa_indices {
             let (cache_k, cache_v) = cache.update_and_fetch_selected(keys, values, indices);
             unsafe {
@@ -632,15 +707,22 @@ impl Qwen4Attention {
         config: &Qwen4AttentionConfig,
         prefix: &str,
     ) -> Result<Self, String> {
-        Self::from_weights_with_norm_mode(weights, config, prefix, false)
+        Self::from_weights_with_norm_mode(
+            weights,
+            config,
+            prefix,
+            false,
+            Arc::new(Qwen4PrefillPolicy::default()),
+        )
     }
 
     pub(crate) fn from_weights_centered(
         weights: &WeightMap,
         config: &Qwen4AttentionConfig,
         prefix: &str,
+        prefill_policy: Arc<Qwen4PrefillPolicy>,
     ) -> Result<Self, String> {
-        Self::from_weights_with_norm_mode(weights, config, prefix, true)
+        Self::from_weights_with_norm_mode(weights, config, prefix, true, prefill_policy)
     }
 
     fn from_weights_with_norm_mode(
@@ -648,6 +730,7 @@ impl Qwen4Attention {
         config: &Qwen4AttentionConfig,
         prefix: &str,
         centered_norm: bool,
+        prefill_policy: Arc<Qwen4PrefillPolicy>,
     ) -> Result<Self, String> {
         let q_prefix = format!("{}.q_proj", prefix);
         let o_prefix = format!("{}.o_proj", prefix);
@@ -702,7 +785,12 @@ impl Qwen4Attention {
                 config.mrope_section.clone(),
             ),
             indexer: if centered_norm && config.indexer_n_heads > 0 {
-                Some(Qwen4QsaIndexer::from_weights(weights, config, prefix)?)
+                Some(Qwen4QsaIndexer::from_weights(
+                    weights,
+                    config,
+                    prefix,
+                    prefill_policy,
+                )?)
             } else {
                 None
             },
