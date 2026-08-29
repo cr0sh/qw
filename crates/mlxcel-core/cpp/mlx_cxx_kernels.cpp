@@ -544,7 +544,17 @@ namespace {
 
         for (uint dim = thread_index; dim < head_dim; dim += 256u) {
             float output = 0.0f;
-            for (uint selection = 0; selection < selected; ++selection) {
+            uint always_valid = selected - checked_tail;
+            for (uint selection = 0; selection < always_valid; ++selection) {
+                uint selection_offset = selection_base + selection;
+                uint token = (uint)indices[selection_offset];
+                uint value_offset =
+                    (((batch_index * kv_heads + kv_head) * key_length
+                      + token) * head_dim) + dim;
+                output += logits[selection] * (float)values[value_offset];
+            }
+            for (uint selection = always_valid; selection < selected;
+                 ++selection) {
                 uint selection_offset = selection_base + selection;
                 if (valid[selection_offset]) {
                     uint token = (uint)indices[selection_offset];
@@ -580,93 +590,6 @@ namespace {
     }
 }
 
-namespace {
-    static const char* QSA_SORT_SELECTED_METAL_SOURCE = R"(
-        uint thread_index = thread_position_in_threadgroup.x;
-        uint row = thread_position_in_grid.y;
-        uint row_base = row * selected;
-        threadgroup int values[selected];
-
-        for (uint index = thread_index; index < selected; index += 256u) {
-            values[index] = indices[row_base + index];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // One threadgroup owns the complete selected row. Bitonic stages stay
-        // in threadgroup memory instead of round-tripping through global
-        // memory across the generic sort's dispatches.
-        for (uint width = 2u; width <= selected; width <<= 1u) {
-            for (uint stride = width >> 1u; stride > 0u; stride >>= 1u) {
-                for (uint index = thread_index; index < selected;
-                     index += 256u) {
-                    uint partner = index ^ stride;
-                    if (partner > index) {
-                        int left = values[index];
-                        int right = values[partner];
-                        bool ascending = (index & width) == 0u;
-                        if ((ascending && left > right)
-                            || (!ascending && left < right)) {
-                            values[index] = right;
-                            values[partner] = left;
-                        }
-                    }
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-            }
-        }
-
-        for (uint index = thread_index; index < selected; index += 256u) {
-            outputs[row_base + index] = values[index];
-        }
-    )";
-
-    struct QsaSortSelectedKernelHolder {
-        std::optional<mlx::core::fast::CustomKernelFunction> kernel;
-        mlx::core::fast::CustomKernelFunction& get() {
-            if (!kernel) {
-                kernel = mlx::core::fast::metal_kernel(
-                    "qsa_sort_selected_indices",
-                    {"indices"},
-                    {"outputs"},
-                    QSA_SORT_SELECTED_METAL_SOURCE);
-            }
-            return *kernel;
-        }
-    };
-
-    static QsaSortSelectedKernelHolder& get_qsa_sort_selected_kernel() {
-        static QsaSortSelectedKernelHolder holder;
-        return holder;
-    }
-}
-
-std::unique_ptr<MlxArray> qsa_sort_selected_indices(
-    const MlxArray& indices
-) {
-    using namespace mlx::core;
-    auto shape = indices.inner.shape();
-    int rows = 1;
-    for (size_t axis = 0; axis + 1 < shape.size(); ++axis) {
-        rows *= shape[axis];
-    }
-    int selected = shape.back();
-    std::vector<std::pair<std::string, fast::TemplateArg>> ta = {
-        {"selected", selected},
-    };
-    std::vector<array> inputs = {indices.inner};
-    auto results = get_qsa_sort_selected_kernel().get()(
-        inputs,
-        {shape},
-        {indices.inner.dtype()},
-        std::make_tuple(256, rows, 1),
-        std::make_tuple(256, 1, 1),
-        ta,
-        std::nullopt,
-        false,
-        {});
-    return std::make_unique<MlxArray>(std::move(results[0]));
-}
-
 
 std::unique_ptr<MlxArray> qsa_sparse_prefill_attention(
     const MlxArray& queries,
@@ -686,6 +609,7 @@ std::unique_ptr<MlxArray> qsa_sparse_prefill_attention(
     int kv_heads = key_shape[1];
     int key_length = key_shape[2];
     int selected = indices.inner.shape()[2];
+    int checked_tail = selected < 4 ? selected : 4;
     auto T = queries.inner.dtype();
     auto scale_value = full({1}, scale, float32);
 
@@ -697,6 +621,7 @@ std::unique_ptr<MlxArray> qsa_sparse_prefill_attention(
         {"key_length", key_length},
         {"head_dim", head_dim},
         {"selected", selected},
+        {"checked_tail", checked_tail},
     };
     std::vector<array> inputs = {
         queries.inner, keys.inner, values.inner, indices.inner, valid.inner,

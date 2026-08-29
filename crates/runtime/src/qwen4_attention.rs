@@ -372,11 +372,7 @@ impl Qwen4QsaIndexer {
         // `argpartition` leaves the selected suffix unordered. Sparse
         // attention must reduce tokens in chronological order so repeated
         // snapshot restores use the same BF16 accumulation path.
-        let selected = if batch == 1 && sequence >= 64 {
-            mlxcel_core::qsa_sort_selected_indices(&selected)
-        } else {
-            mlxcel_core::sort(&selected, -1)
-        };
+        let selected = mlxcel_core::sort(&selected, -1);
         let selected = mlxcel_core::expand_dims(&selected, -1);
         let selected = mlxcel_core::multiply(&selected, &ratio);
         let offsets = mlxcel_core::arange_i32(0, self.compress_ratio, 1);
