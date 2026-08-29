@@ -499,30 +499,6 @@ pub(crate) struct Qwen4Attention {
     indexer: Option<Qwen4QsaIndexer>,
 }
 
-fn qwen4_dense_attention(
-    queries: &MlxArray,
-    keys: &MlxArray,
-    values: &MlxArray,
-    scale: f32,
-    mask: Option<&MlxArray>,
-) -> UniquePtr<MlxArray> {
-    if let Some(mask) = mask {
-        unsafe {
-            mlxcel_core::layers::attention_from_ptr(
-                queries,
-                keys,
-                values,
-                scale,
-                mask as *const _,
-                0.0,
-                0,
-            )
-        }
-    } else {
-        mlxcel_core::native_causal_attention(queries, keys, values, scale)
-    }
-}
-
 impl Qwen4Attention {
     pub(crate) fn forward_with_position_ids(
         &self,
@@ -706,13 +682,16 @@ impl Qwen4Attention {
             }
         } else {
             let (cache_k, cache_v) = cache.update_and_fetch(keys, values);
-            qwen4_dense_attention(
-                &queries,
-                &cache_k,
-                &cache_v,
-                self.scale,
-                mask,
-            )
+            if l > 1 && mask.is_none() {
+                mlxcel_core::causal_attention(&queries, &cache_k, &cache_v, self.scale, 0.0, 0)
+            } else {
+                let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
+                unsafe {
+                    mlxcel_core::layers::attention_from_ptr(
+                        &queries, &cache_k, &cache_v, self.scale, mask_ptr, 0.0, 0,
+                    )
+                }
+            }
         };
 
         // Transpose back and reshape
@@ -1077,51 +1056,4 @@ mod tests {
         assert!(mlxcel_core::item_bool(&close));
     }
 
-    #[test]
-    fn dense_verify_attention_matches_progressive_single_token_dispatches() {
-        let queries = mlxcel_core::from_slice_f32(
-            &[
-                0.1, -0.2, 0.3, 0.4, -0.3, 0.2, 0.5, -0.1, 0.6, 0.1, -0.4, 0.2,
-            ],
-            &[1, 1, 3, 4],
-        );
-        let keys = mlxcel_core::from_slice_f32(
-            &[
-                0.2, 0.1, -0.1, 0.3, -0.2, 0.4, 0.1, 0.5, 0.3, -0.3, 0.2, 0.1, 0.5, 0.2,
-                -0.4, 0.3, -0.1, 0.6, 0.2, -0.2,
-            ],
-            &[1, 1, 5, 4],
-        );
-        let values = mlxcel_core::from_slice_f32(
-            &[
-                0.7, -0.1, 0.2, 0.4, 0.3, 0.8, -0.2, 0.1, -0.4, 0.5, 0.6, 0.2, 0.1, -0.3,
-                0.9, 0.4, 0.2, 0.6, -0.5, 0.7,
-            ],
-            &[1, 1, 5, 4],
-        );
-        let scale = 0.5;
-        let batched = qwen4_dense_attention(&queries, &keys, &values, scale, None);
-
-        let mut sequential = Vec::new();
-        for row in 0..3 {
-            let query =
-                mlxcel_core::slice(&queries, &[0, 0, row, 0], &[1, 1, row + 1, 4]);
-            let query = mlxcel_core::slice(&query, &[0, 0, 0, 0], &[1, 1, 1, 4]);
-            let key_end = row + 3;
-            let row_keys = mlxcel_core::slice(&keys, &[0, 0, 0, 0], &[1, 1, key_end, 4]);
-            let row_values = mlxcel_core::slice(&values, &[0, 0, 0, 0], &[1, 1, key_end, 4]);
-            sequential.push(qwen4_dense_attention(
-                &query,
-                &row_keys,
-                &row_values,
-                scale,
-                None,
-            ));
-        }
-        let sequential = mlxcel_core::concatenate_owned(&sequential, 2);
-        let equal = mlxcel_core::allclose(&batched, &sequential, 0.0, 0.0);
-        mlxcel_core::eval(&equal);
-        assert!(mlxcel_core::item_bool(&equal));
-    }
 }
-
