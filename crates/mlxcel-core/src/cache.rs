@@ -2504,9 +2504,9 @@ impl KVCache {
                 ));
             }
         }
-        // Block means depend on the tail length. Rebuild them lazily from the
-        // trimmed raw auxiliary keys on the next QSA plan.
-        self.auxiliary_block_keys = None;
+        // QSA block keys summarize only complete, fixed-position groups.
+        // Rewinding a partial speculative tail cannot change those groups;
+        // the next QSA plan slices any now-out-of-range complete blocks.
         if live_len_after == 0 {
             self.keys = None;
             self.values = None;
@@ -7486,7 +7486,7 @@ mod tests {
         assert!(cache.is_empty());
     }
     #[test]
-    fn kv_cache_trim_rewinds_qsa_auxiliary_state() {
+    fn kv_cache_trim_preserves_complete_qsa_blocks() {
         let mut cache = KVCache::new_with_mode(KVCacheMode::Fp8);
         cache.update(
             ffi::from_slice_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 4, 1]),
@@ -7503,7 +7503,15 @@ mod tests {
             ffi::array_shape(cache.auxiliary_keys.as_deref().expect("trimmed QSA keys")),
             vec![1, 2, 2]
         );
-        assert!(cache.auxiliary_block_keys.is_none());
+        assert_eq!(
+            ffi::array_shape(
+                cache
+                    .auxiliary_block_keys
+                    .as_deref()
+                    .expect("complete QSA block keys survive tail trim"),
+            ),
+            vec![1, 1, 1, 2]
+        );
     }
 
     /// #678 repro at the cache layer: every suspect prefill shape (single-pass
