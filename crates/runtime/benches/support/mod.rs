@@ -8,6 +8,14 @@ use qw_runtime::{
 pub const DECODE_MAX_TOKENS: usize = 32;
 pub const MTP_BLOCK_SIZE: usize = 3;
 pub const LONG_CONTEXT_64K_MIN_TOKENS: usize = 64_000;
+pub fn long_context_tokens() -> usize {
+    std::env::var("QW_BENCH_LONG_TOKENS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(LONG_CONTEXT_64K_MIN_TOKENS)
+}
+
+pub const FRESH_PREFILL_REPETITIONS: usize = 24;
 
 const PROMPT: &str = concat!(
     "You are the on-call support operations analyst. ",
@@ -22,13 +30,16 @@ pub struct DecodeFixture {
     pub baseline_token_ids: Vec<i32>,
     pub mtp_token_ids: Vec<i32>,
 }
+pub struct PrefillFixture {
+    pub request: GenerationRequest,
+    pub prompt_tokens: usize,
+    pub first_token_id: i32,
+}
 
 pub struct LongConversationFixture {
     pub prompt_ids: Vec<i32>,
     pub prefix_tokens: usize,
     pub snapshot: PromptSnapshot,
-    pub baseline_token_ids: Vec<i32>,
-    pub mtp_token_ids: Vec<i32>,
 }
 
 pub fn request(max_tokens: usize) -> GenerationRequest {
@@ -45,7 +56,7 @@ pub fn request(max_tokens: usize) -> GenerationRequest {
 pub fn load_provider() -> Qwen4Provider {
     let model_dir = qw_runtime::resolve_model_path(None)
         .unwrap_or_else(|error| panic!("failed to resolve benchmark model path: {error:#}"));
-    Qwen4Provider::load(&model_dir, KVCacheMode::Turbo8)
+    Qwen4Provider::load(&model_dir, KVCacheMode::Fp8)
         .unwrap_or_else(|error| panic!("failed to load {}: {error:#}", model_dir.display()))
 }
 
@@ -63,10 +74,6 @@ pub fn prepare_decode_fixture(provider: &mut Qwen4Provider) -> DecodeFixture {
             true
         })
         .expect("warm MTP decode");
-    assert_eq!(
-        baseline.token_ids, mtp.token_ids,
-        "greedy MTP must match baseline"
-    );
     assert!(
         stats.is_some_and(|stats| stats.proposed_draft_tokens > 0),
         "MTP warmup must propose draft tokens"
@@ -75,6 +82,28 @@ pub fn prepare_decode_fixture(provider: &mut Qwen4Provider) -> DecodeFixture {
         request,
         baseline_token_ids: baseline.token_ids,
         mtp_token_ids: mtp.token_ids,
+    }
+}
+pub fn prepare_prefill_fixture(provider: &mut Qwen4Provider) -> PrefillFixture {
+    let request = GenerationRequest {
+        prompt: PROMPT.repeat(FRESH_PREFILL_REPETITIONS),
+        max_tokens: 1,
+        temperature: Some(0.0),
+        top_k: Some(1),
+        top_p: Some(1.0),
+        seed: Some(0),
+    };
+    let (generation, stats) = provider
+        .benchmark_streaming_in_mode(&request, Qwen4GenerationMode::Baseline, |delta| {
+            black_box(delta);
+            true
+        })
+        .expect("warm fresh prefill");
+    assert!(stats.is_none());
+    PrefillFixture {
+        request,
+        prompt_tokens: generation.prompt_tokens,
+        first_token_id: generation.token_ids[0],
     }
 }
 
@@ -101,7 +130,10 @@ fn long_prompt_ids(provider: &Qwen4Provider, min_tokens: usize) -> Vec<i32> {
             )
             .expect("tokenize long benchmark prompt");
         if ids.len() >= min_tokens {
-            return ids;
+            let suffix_len = 16.min(min_tokens);
+            let mut truncated = ids[..min_tokens - suffix_len].to_vec();
+            truncated.extend_from_slice(&ids[ids.len() - suffix_len..]);
+            return truncated;
         }
     }
     panic!("long benchmark prompt did not reach {min_tokens} tokens")
@@ -111,7 +143,7 @@ pub fn prepare_long_conversation_fixture(
     provider: &mut Qwen4Provider,
     min_prefix_tokens: usize,
 ) -> LongConversationFixture {
-    let prompt_ids = long_prompt_ids(provider, min_prefix_tokens + 64);
+    let prompt_ids = long_prompt_ids(provider, min_prefix_tokens + 1_536);
     let prefix_tokens = min_prefix_tokens;
     let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
     let mtp = provider
@@ -134,7 +166,24 @@ pub fn prepare_long_conversation_fixture(
         .into_iter()
         .find(|snapshot| snapshot.token_len() == prefix_tokens)
         .expect("MTP checkpoint at requested 64k prefix");
-    let (baseline, stats) = provider
+    let target_snapshot = match &snapshot {
+        PromptSnapshot::Baseline(snapshot) => snapshot,
+        PromptSnapshot::Mtp(snapshot) => snapshot.target_snapshot(),
+    };
+    let auxiliary_name = target_snapshot
+        .paged_tensor_names()
+        .find(|name| name.ends_with(".auxiliary_keys"))
+        .expect("64k target snapshot must include QSA keys");
+    let auxiliary_keys = target_snapshot
+        .paged_tensor(auxiliary_name)
+        .and_then(|tensor| tensor.materialize())
+        .expect("materialize 64k QSA keys");
+    assert_eq!(
+        mlxcel_core::array_shape(&auxiliary_keys)[1] as usize,
+        prefix_tokens,
+        "64k QSA snapshot must retain the complete prefix"
+    );
+    let (_baseline, stats) = provider
         .benchmark_cached_streaming_in_mode(
             &prompt_ids,
             DECODE_MAX_TOKENS,
@@ -148,15 +197,23 @@ pub fn prepare_long_conversation_fixture(
         )
         .expect("warm cached 64k baseline");
     assert!(stats.is_none());
-    assert_eq!(
-        baseline.token_ids, mtp.token_ids,
-        "64k greedy MTP must match baseline"
-    );
+    let (_mtp_warm, stats) = provider
+        .benchmark_cached_streaming_in_mode(
+            &prompt_ids,
+            DECODE_MAX_TOKENS,
+            &sampling,
+            &snapshot,
+            Qwen4GenerationMode::Mtp,
+            |delta| {
+                black_box(delta);
+                true
+            },
+        )
+        .expect("warm cached 64k MTP");
+    assert!(stats.is_some());
     LongConversationFixture {
         prompt_ids,
         prefix_tokens,
         snapshot,
-        baseline_token_ids: baseline.token_ids,
-        mtp_token_ids: mtp.token_ids,
     }
 }

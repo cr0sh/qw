@@ -10,6 +10,11 @@ use mlxcel_core::generate::{
 };
 use serde::Deserialize;
 use tokenizers::Tokenizer;
+use tokenizers::decoders::DecoderWrapper;
+use tokenizers::models::ModelWrapper;
+use tokenizers::normalizers::NormalizerWrapper;
+use tokenizers::pre_tokenizers::PreTokenizerWrapper;
+use tokenizers::processors::PostProcessorWrapper;
 use tracing::debug;
 
 use crate::chat_template::ChatTemplateProcessor;
@@ -104,9 +109,18 @@ pub struct BaselineGeneration {
     /// Wall time spent sampling and forwarding generated tokens.
     pub decode_time: Duration,
 }
+type QwenDecodeStream<'a> = tokenizers::DecodeStream<
+    'a,
+    ModelWrapper,
+    NormalizerWrapper,
+    PreTokenizerWrapper,
+    PostProcessorWrapper,
+    DecoderWrapper,
+>;
 
 struct IncrementalTextDecoder<'a> {
     tokenizer: &'a Tokenizer,
+    stream: QwenDecodeStream<'a>,
     token_ids: Vec<u32>,
     emitted: String,
 }
@@ -114,6 +128,7 @@ struct IncrementalTextDecoder<'a> {
 impl<'a> IncrementalTextDecoder<'a> {
     fn new(tokenizer: &'a Tokenizer) -> Self {
         Self {
+            stream: tokenizer.decode_stream(false),
             tokenizer,
             token_ids: Vec::new(),
             emitted: String::new(),
@@ -121,14 +136,16 @@ impl<'a> IncrementalTextDecoder<'a> {
     }
 
     fn push(&mut self, token_id: i32) -> Result<String> {
-        self.token_ids
-            .push(u32::try_from(token_id).context("generated a negative token identifier")?);
-        let decoded = self
-            .tokenizer
-            .decode(&self.token_ids, false)
+        let token_id = u32::try_from(token_id).context("generated a negative token identifier")?;
+        self.token_ids.push(token_id);
+        let delta = self
+            .stream
+            .step(token_id)
             .map_err(anyhow::Error::msg)
-            .context("failed to incrementally decode generated tokens")?;
-        self.advance(decoded, false)
+            .context("failed to incrementally decode generated token")?
+            .unwrap_or_default();
+        self.emitted.push_str(&delta);
+        Ok(delta)
     }
 
     fn finish(&mut self) -> Result<String> {
@@ -746,7 +763,7 @@ impl Qwen4Provider {
         request: &GenerationRequest,
         mode: Qwen4GenerationMode,
         on_delta: F,
-    ) -> Result<(GenerationOutput, Duration, Option<MtpGenerationStats>)> {
+    ) -> Result<(BaselineGeneration, Option<MtpGenerationStats>)> {
         let (prompt_ids, sampling) = self.prepare_generation(request)?;
         if !self.resolve_generation_mode(mode)? {
             let generation = self.generate_baseline_streaming(
@@ -758,14 +775,7 @@ impl Qwen4Provider {
                 &[],
                 on_delta,
             )?;
-            return Ok((
-                GenerationOutput {
-                    text: generation.text,
-                    token_ids: generation.token_ids,
-                },
-                generation.decode_time,
-                None,
-            ));
+            return Ok((generation, None));
         }
         let (generation, stats) = self.generate_mtp_streaming_for_prompt(
             &prompt_ids,
@@ -777,14 +787,7 @@ impl Qwen4Provider {
             None,
             on_delta,
         )?;
-        Ok((
-            GenerationOutput {
-                text: generation.text,
-                token_ids: generation.token_ids,
-            },
-            generation.decode_time,
-            Some(stats),
-        ))
+        Ok((generation, Some(stats)))
     }
 
     /// Controlled cached-context benchmark route. The snapshot is reusable:
@@ -905,12 +908,49 @@ impl Qwen4Provider {
     }
 }
 
+fn metal_wired_limit(system_memory: u64, max_recommended_working_set: u64) -> Result<u64> {
+    ensure!(
+        system_memory > 0,
+        "failed to determine physical system memory for the Metal wired-memory limit"
+    );
+    ensure!(
+        max_recommended_working_set > 0,
+        "Metal did not report a maximum recommended working-set size"
+    );
+    let eighty_five_percent = ((u128::from(system_memory) * 85) / 100) as u64;
+    Ok(eighty_five_percent.min(max_recommended_working_set))
+}
+
 fn initialize_runtime() -> Result<()> {
     static INITIALIZED: LazyLock<std::result::Result<(), String>> = LazyLock::new(|| {
+        // MLX's 256 MiB default command-buffer cap lets this model accumulate
+        // enough decode work to delay submission. Fifteen MiB measured best on
+        // the supported Apple-Silicon path. Respect an explicit operator override.
+        if std::env::var_os("MLX_MAX_MB_PER_BUFFER").is_none() {
+            // SAFETY: this one-time initializer runs before the first MLX
+            // backend query or model worker is created.
+            unsafe {
+                std::env::set_var("MLX_MAX_MB_PER_BUFFER", "15");
+            }
+        }
         if !mlxcel_core::metal_is_available() {
             return Err("the MLX Metal backend is unavailable on this host".to_string());
         }
         mlxcel_core::set_default_device(true);
+        let system_memory = mlxcel_core::hardware::system_memory_bytes();
+        // Upstream `set_wired_limit` rejects values above Metal's recommended
+        // maximum, so enforce both ceilings: 85% of physical unified memory
+        // and `recommendedMaxWorkingSetSize`.
+        let max_recommended_working_set = mlxcel_core::get_wired_limit() as u64;
+        let wired_limit = metal_wired_limit(system_memory, max_recommended_working_set)
+            .map_err(|error| error.to_string())?;
+        mlxcel_core::set_wired_limit(wired_limit as usize);
+        tracing::info!(
+            wired_limit,
+            system_memory,
+            max_recommended_working_set,
+            "configured Metal wired-memory ceiling"
+        );
         const MLX_MEMORY_LIMIT: u64 = 45 * 1024 * 1024 * 1024;
         const MLX_CACHE_LIMIT: u64 = 512 * 1024 * 1024;
         mlxcel_core::memory::set_memory_limit(MLX_MEMORY_LIMIT);
@@ -990,6 +1030,18 @@ mod tests {
     }
 
     #[test]
+    fn metal_wired_limit_is_eighty_five_percent_or_device_max() {
+        let gib = 1024_u64.pow(3);
+        assert_eq!(
+            metal_wired_limit(128 * gib, 120 * gib).unwrap(),
+            108 * gib + 4 * gib / 5
+        );
+        assert_eq!(metal_wired_limit(128 * gib, 96 * gib).unwrap(), 96 * gib);
+        assert!(metal_wired_limit(0, 96 * gib).is_err());
+        assert!(metal_wired_limit(128 * gib, 0).is_err());
+    }
+
+    #[test]
     fn generation_defaults_match_checkpoint_contract() {
         let fixture = TestDir::new("generation-defaults");
         let fallback = load_generation_defaults(&fixture.0).expect("fallback defaults");
@@ -1031,7 +1083,7 @@ mod tests {
         std::fs::write(fixture.0.join("tokenizer_config.json"), b"{}")
             .expect("write tokenizer config");
 
-        let error = match Qwen4Provider::load_target_only(&fixture.0, KVCacheMode::Fp16) {
+        let error = match Qwen4Provider::load_target_only(&fixture.0, KVCacheMode::Fp8) {
             Ok(_) => panic!("provider load must reject an absent chat template"),
             Err(error) => error.to_string(),
         };
@@ -1076,7 +1128,7 @@ mod tests {
         let model_dir = crate::resolve_model_path(None)
             .expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
         let mut provider =
-            Qwen4Provider::load(&model_dir, KVCacheMode::Fp16).expect("load real Qwen checkpoint");
+            Qwen4Provider::load(&model_dir, KVCacheMode::Fp8).expect("load real Qwen checkpoint");
         let request = GenerationRequest {
             prompt: "Continue counting upward from one, writing each integer on its own line without stopping."
                 .to_string(),
@@ -1111,7 +1163,7 @@ mod tests {
     fn real_model_mtp_prefix_reuse_matches_cold_and_reduces_ttft() {
         let model_dir = crate::resolve_model_path(None)
             .expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
-        let mut provider = Qwen4Provider::load(&model_dir, KVCacheMode::Turbo4)
+        let mut provider = Qwen4Provider::load(&model_dir, KVCacheMode::Fp8)
             .expect("load real bundled-MTP checkpoint");
         let base = provider
             .tokenizer
@@ -1254,7 +1306,7 @@ mod tests {
     fn real_model_mtp_prefix_reuse_covers_reasoning_and_plain_history() {
         let model_dir = crate::resolve_model_path(None)
             .expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
-        let mut provider = Qwen4Provider::load(&model_dir, KVCacheMode::Turbo4)
+        let mut provider = Qwen4Provider::load(&model_dir, KVCacheMode::Fp8)
             .expect("load real bundled-MTP checkpoint");
         let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
         let user = |content: &str| ChatMessage {
@@ -1375,7 +1427,7 @@ mod tests {
     fn real_model_mtp_max_output_has_bounded_terminal_tail() {
         let model_dir = crate::resolve_model_path(None)
             .expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
-        let mut provider = Qwen4Provider::load(&model_dir, KVCacheMode::Turbo4)
+        let mut provider = Qwen4Provider::load(&model_dir, KVCacheMode::Fp8)
             .expect("load real bundled-MTP checkpoint");
         let prompt = provider
             .tokenizer
@@ -1432,7 +1484,7 @@ mod tests {
         let model_dir = crate::resolve_model_path(None)
             .expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
         let mut provider =
-            Qwen4Provider::load(&model_dir, KVCacheMode::Turbo4).expect("load real MTP checkpoint");
+            Qwen4Provider::load(&model_dir, KVCacheMode::Fp8).expect("load real MTP checkpoint");
         let prompt = provider
             .tokenizer
             .encode(
@@ -1571,7 +1623,7 @@ mod tests {
     fn real_model_cancelled_mtp_snapshot_portable_resume_matches_uninterrupted_greedy() {
         let model_dir = crate::resolve_model_path(None)
             .expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
-        let mut provider = Qwen4Provider::load(&model_dir, KVCacheMode::Turbo4)
+        let mut provider = Qwen4Provider::load(&model_dir, KVCacheMode::Fp8)
             .expect("load real bundled-MTP checkpoint");
         let messages = vec![
             ChatMessage {

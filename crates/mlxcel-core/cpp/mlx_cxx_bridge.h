@@ -161,6 +161,10 @@ std::unique_ptr<MlxArray> from_bytes_nocopy(rust::Slice<const uint8_t> data, rus
 // Create half-precision array from raw bytes
 std::unique_ptr<MlxArray> from_bytes_f16(rust::Slice<const uint8_t> data, rust::Slice<const int32_t> shape, bool bfloat16);
 
+// Raw E4M3 FP8 conversion. MLX represents FP8 storage as uint8 arrays.
+std::unique_ptr<MlxArray> to_fp8(const MlxArray& a);
+std::unique_ptr<MlxArray> from_fp8(const MlxArray& a);
+
 // Array property accessors.
 rust::Vec<int32_t> array_shape(const MlxArray& arr);
 int32_t array_dtype(const MlxArray& arr);
@@ -463,6 +467,11 @@ std::unique_ptr<MlxArray> compiled_relu_squared(const MlxArray& x);
 
 // Compiled silu: x * sigmoid(x) — single fused kernel
 std::unique_ptr<MlxArray> compiled_silu(const MlxArray& x);
+// Compiled silu(x * scale), retaining the scaled value inside one graph.
+std::unique_ptr<MlxArray> compiled_scaled_silu(
+    const MlxArray& x,
+    float scale
+);
 
 // Compiled gelu: x * 0.5 * (1 + erf(x / sqrt(2))) — single fused kernel
 // Used by: StarCoder2 and other precise GELU-based models
@@ -633,6 +642,26 @@ std::unique_ptr<MlxArray> compiled_gelu_approx_mlp_forward_global_scale(
 // fall back to separate `gather_qmm` calls when `sorted_indices` is
 // true (prefill). Used by: Gemma 4 26B-a4b SwitchGeGLU experts.
 std::unique_ptr<MlxArray> compiled_switch_qgeglu_forward(
+    const MlxArray& x,
+    const MlxArray& gate_w,
+    const MlxArray& gate_s,
+    const MlxArray* gate_b,
+    const MlxArray& up_w,
+    const MlxArray& up_s,
+    const MlxArray* up_b,
+    const MlxArray& down_w,
+    const MlxArray& down_s,
+    const MlxArray* down_b,
+    const MlxArray& rhs_indices,
+    int32_t group_size,
+    int32_t bits,
+    rust::Str mode
+);
+
+// Compiled SwiGLU Switch MLP forward for quantized MoE experts.
+// The affine 4-bit/group-64 decode path uses one compile window without
+// concatenating or duplicating expert weights.
+std::unique_ptr<MlxArray> compiled_switch_qswiglu_forward(
     const MlxArray& x,
     const MlxArray& gate_w,
     const MlxArray& gate_s,
@@ -982,6 +1011,27 @@ std::unique_ptr<MlxArray> fast_rms_norm(
     const MlxArray& weight,
     float eps
 );
+// Compiled grouped RMS norm. Each last-axis group has independent statistics
+// and its own corresponding weight slice.
+std::unique_ptr<MlxArray> compiled_group_rms_norm(
+    const MlxArray& x,
+    const MlxArray& weight,
+    int32_t group_size,
+    float eps
+);
+// Compiled Qwen hyper-connection reductions and branch injection.
+std::unique_ptr<MlxArray> compiled_hyper_mix(
+    const MlxArray& normed,
+    const MlxArray& mix_logits,
+    int32_t stream_count
+);
+std::unique_ptr<MlxArray> compiled_hyper_inject(
+    const MlxArray& branch,
+    const MlxArray& hyper_input,
+    const MlxArray& injection_logits,
+    int32_t stream_count
+);
+
 
 // Fast RMS norm without a learnable scale
 std::unique_ptr<MlxArray> fast_rms_norm_no_weight(
@@ -1690,6 +1740,21 @@ std::unique_ptr<MlxArray> fused_xielu(
     float alpha_n,
     float beta,
     float eps
+);
+
+
+
+
+// Block-sparse grouped-query attention for QSA prefill. The selection is
+// independent per query row, so the kernel reads selected K/V rows directly
+// instead of materializing [query, selected, head_dim] gathers.
+std::unique_ptr<MlxArray> qsa_sparse_prefill_attention(
+    const MlxArray& queries,
+    const MlxArray& keys,
+    const MlxArray& values,
+    const MlxArray& indices,
+    const MlxArray& valid,
+    float scale
 );
 
 // BitLinear ternary matmul (BitNet b1.58): multiply on 2-bit-packed ternary

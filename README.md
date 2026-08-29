@@ -20,8 +20,8 @@ QW aims to be explicitly "focused", to achieve these goals below:
   metrics to optimize.
 - Minimal: No fancy features, fixed model, fixed environment.
   - No fancy features: GUI, MCP integration, and vision inputs are outside this
-    project's current scope. 8-bit TurboQuant KV-cache quantization and the
-    checkpoint's native MTP head are enabled by default.
+    project's current scope. E4M3 FP8 KV-cache storage and the checkpoint's
+    native MTP head are enabled by default.
   - Fixed model: Qwen3.8 Flash Next REAP-288 only. No generalization across
     different model structures.
     - QW serves [sh0wie/Qwen3.8-Flash-Next-REAP-288-MLX-4bit](https://huggingface.co/sh0wie/Qwen3.8-Flash-Next-REAP-288-MLX-4bit) as the default model.

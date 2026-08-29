@@ -4,7 +4,7 @@ use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
-use memmap2::{Advice, Mmap, MmapOptions};
+use memmap2::{Advice, Mmap, MmapOptions, UncheckedAdvice};
 use safetensors::SafeTensors;
 use serde::Deserialize;
 
@@ -150,9 +150,10 @@ impl NGramTable {
         self.embedding_dim
     }
 
-    pub(crate) fn gather(&self, indices: &[usize]) -> Result<Vec<f32>> {
-        let mut output = vec![0.0f32; indices.len() * self.embedding_dim];
-        for (output_row, &index) in output.chunks_exact_mut(self.embedding_dim).zip(indices) {
+    pub(crate) fn gather_bf16(&self, indices: &[usize]) -> Result<Vec<u8>> {
+        let mut output = vec![0u8; indices.len() * self.embedding_dim * 2];
+        let mut discard_pages = Vec::with_capacity(indices.len());
+        for (output_row, &index) in output.chunks_exact_mut(self.embedding_dim * 2).zip(indices) {
             let shard_index = self.shard_ends.partition_point(|&end| end <= index);
             ensure!(
                 shard_index < self.shards.len(),
@@ -174,14 +175,7 @@ impl NGramTable {
             let scales = &self.map[scales_start..biases_start];
             let biases = &self.map[biases_start..biases_start + self.parameter_bytes];
 
-            for (dimension, value) in output_row.iter_mut().enumerate() {
-                let byte = packed[dimension / 2];
-                let quantized = if dimension.is_multiple_of(2) {
-                    byte & 0x0f
-                } else {
-                    byte >> 4
-                };
-                let group = dimension / self.group_size;
+            for group in 0..self.embedding_dim / self.group_size {
                 let scale = bf16_to_f32(u16::from_le_bytes([
                     scales[group * 2],
                     scales[group * 2 + 1],
@@ -190,8 +184,57 @@ impl NGramTable {
                     biases[group * 2],
                     biases[group * 2 + 1],
                 ]));
-                *value = scale.mul_add(quantized as f32, bias);
+                let start = group * self.group_size;
+                let end = start + self.group_size;
+                for dimension in start..end {
+                    let byte = packed[dimension / 2];
+                    let quantized = if dimension.is_multiple_of(2) {
+                        byte & 0x0f
+                    } else {
+                        byte >> 4
+                    };
+                    let value = scale.mul_add(quantized as f32, bias);
+                    output_row[dimension * 2..dimension * 2 + 2]
+                        .copy_from_slice(&f32_to_bf16(value).to_le_bytes());
+                }
             }
+            let page_start = row_start / DATA_ALIGNMENT * DATA_ALIGNMENT;
+            let page_end = align_up(row_start + self.row_bytes, DATA_ALIGNMENT).min(self.map.len());
+            discard_pages.push((page_start, page_end));
+        }
+
+        // The table is a clean, separate file mapping. Release pages after the
+        // selected rows have been copied so they remain pageable SSD data and
+        // never accumulate alongside Metal-resident model buffers.
+        discard_pages.sort_unstable();
+        let mut current: Option<(usize, usize)> = None;
+        for (start, end) in discard_pages {
+            match current {
+                Some((range_start, range_end)) if start <= range_end => {
+                    current = Some((range_start, range_end.max(end)));
+                }
+                Some((range_start, range_end)) => {
+                    // SAFETY: every row borrow ended before this loop. This is
+                    // a clean shared file mapping, so future reads repopulate
+                    // the original bytes from the n-gram table.
+                    let _ = unsafe {
+                        self.map.unchecked_advise_range(
+                            UncheckedAdvice::DontNeed,
+                            range_start,
+                            range_end - range_start,
+                        )
+                    };
+                    current = Some((start, end));
+                }
+                None => current = Some((start, end)),
+            }
+        }
+        if let Some((start, end)) = current {
+            // SAFETY: no mapping borrow survives the copy loop; see above.
+            let _ = unsafe {
+                self.map
+                    .unchecked_advise_range(UncheckedAdvice::DontNeed, start, end - start)
+            };
         }
         Ok(output)
     }
@@ -385,6 +428,11 @@ fn bf16_to_f32(value: u16) -> f32 {
     f32::from_bits((value as u32) << 16)
 }
 
+fn f32_to_bf16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    ((bits + 0x7fff + ((bits >> 16) & 1)) >> 16) as u16
+}
+
 fn align_up(value: usize, alignment: usize) -> usize {
     value.div_ceil(alignment) * alignment
 }
@@ -399,6 +447,13 @@ mod tests {
 
     fn f32_to_bf16(value: f32) -> [u8; 2] {
         ((value.to_bits() >> 16) as u16).to_le_bytes()
+    }
+
+    fn decode_bf16(bytes: &[u8]) -> Vec<f32> {
+        bytes
+            .chunks_exact(2)
+            .map(|chunk| bf16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])))
+            .collect()
     }
 
     fn write_fixture(path: &Path) {
@@ -446,7 +501,7 @@ mod tests {
         assert_eq!(table.rows(), 2);
         assert_eq!(table.embedding_dim(), 8);
         assert_eq!(
-            table.gather(&[1, 0]).unwrap(),
+            decode_bf16(&table.gather_bf16(&[1, 0]).unwrap()),
             vec![
                 10.0, 12.0, 14.0, 16.0, 1.0, 1.5, 2.0, 2.5, 10.0, 11.0, 12.0, 13.0, 1.0, 1.5, 2.0,
                 2.5
@@ -470,7 +525,7 @@ mod tests {
         let table = NGramTable::open(&path, &spec).unwrap();
         assert!(
             table
-                .gather(&[2])
+                .gather_bf16(&[2])
                 .unwrap_err()
                 .to_string()
                 .contains("outside 2 rows")

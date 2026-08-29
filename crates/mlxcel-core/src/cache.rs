@@ -176,10 +176,10 @@ pub enum KVCacheMode {
     /// Per-token INT8 absmax quantization. Reduces KV cache memory by ~50%
     /// at the cost of small quantization error per token.
     Int8,
-    /// Symmetric 8-bit TurboQuant. K and V are independently randomized with
-    /// sign-flip Walsh-Hadamard rotations, then stored with per-token INT8
-    /// scales. This is the default high-fidelity long-context cache.
-    Turbo8,
+    /// Raw E4M3 FP8 storage. MLX represents each FP8 element as a UINT8 byte;
+    /// reads decode directly to BF16 without per-token scales or TurboQuant
+    /// rotations.
+    Fp8,
     /// Asymmetric Fp16-K + Turbo4-V. K side stays in FP16; V side uses 4-bit
     /// PolarQuant with Walsh–Hadamard rotation for ~26% net KV memory savings
     /// at long context..
@@ -214,8 +214,8 @@ impl std::str::FromStr for KVCacheMode {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
             "fp16" | "float16" => Ok(Self::Fp16),
+            "fp8" | "e4m3" => Ok(Self::Fp8),
             "int8" | "i8" => Ok(Self::Int8),
-            "turbo8" | "turboquant8" | "tq8" => Ok(Self::Turbo8),
             // Both spellings are accepted: the canonical user-facing string
             // ("fp16+turbo4") makes the asymmetric K/V split explicit, while
             // "turbo4-asym" is a shorter alias for scripts and tests.
@@ -238,7 +238,8 @@ impl std::str::FromStr for KVCacheMode {
             "turbo4-delegated" | "fp16+turbo4-delegated" => Ok(Self::Turbo4Delegated),
             other => Err(format!(
                 "unknown kv-cache-mode \"{other}\"; expected one of \
-                 \"fp16\", \"int8\", \"fp16+turbo4\" (alias \"turbo4-asym\"), \
+                 \"fp16\", \"fp8\", \"int8\", \
+                 \"fp16+turbo4\" (alias \"turbo4-asym\"), \
                  \"turbo4\" (alias \"turbo4-sym\"), \
                  \"turbo4-delegated\" (alias \"fp16+turbo4-delegated\"), \
                  \"fp16+turbo3\" (aliases \"turbo3-asym\" / \"turbo3\")"
@@ -251,8 +252,8 @@ impl std::fmt::Display for KVCacheMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Fp16 => f.write_str("fp16"),
+            Self::Fp8 => f.write_str("fp8"),
             Self::Int8 => f.write_str("int8"),
-            Self::Turbo8 => f.write_str("turbo8"),
             Self::Turbo4Asym => f.write_str("fp16+turbo4"),
             Self::Turbo4 => f.write_str("turbo4"),
             Self::Turbo4Delegated => f.write_str("turbo4-delegated"),
@@ -363,6 +364,9 @@ pub struct KVCache {
     /// Optional model-specific raw keys used by sparse-attention indexers.
     /// Shape: `[batch, sequence, index_head_dim]`.
     pub auxiliary_keys: Option<UniquePtr<MlxArray>>,
+    /// Optional model-specific normalized and position-encoded block keys.
+    /// Shape: `[batch, index_heads, blocks, index_head_dim]`.
+    pub auxiliary_block_keys: Option<UniquePtr<MlxArray>>,
     /// Monotonically increasing absolute write position. Used as the RoPE
     /// position for new K/Q tokens and as the upper bound of the live window.
     /// Once a token has been written at position `p`, this value never
@@ -481,12 +485,17 @@ pub struct Turbo4SnapshotTensors<'a> {
     pub v_norms: &'a MlxArray,
     pub v_rescale: &'a MlxArray,
 }
-/// Borrowed tensors required to preserve an Int8 or Turbo8 cache.
+/// Borrowed tensors required to preserve an Int8 cache.
 pub struct Int8SnapshotTensors<'a> {
     pub keys: &'a MlxArray,
     pub values: &'a MlxArray,
     pub key_scales: &'a MlxArray,
     pub val_scales: &'a MlxArray,
+}
+/// Borrowed raw E4M3 tensors required to preserve an FP8 cache.
+pub struct Fp8SnapshotTensors<'a> {
+    pub keys: &'a MlxArray,
+    pub values: &'a MlxArray,
 }
 
 /// Shared handle that makes one [`KVCache`] write/read through a pooled paged
@@ -529,6 +538,7 @@ impl KVCache {
             keys: None,
             values: None,
             auxiliary_keys: None,
+            auxiliary_block_keys: None,
             offset: 0,
             live_start: 0,
             step: 256,
@@ -579,6 +589,7 @@ impl KVCache {
             keys: None,
             values: None,
             auxiliary_keys: None,
+            auxiliary_block_keys: None,
             offset: 0,
             live_start: 0,
             step: 256,
@@ -619,14 +630,18 @@ impl KVCache {
     }
 
     pub fn int8_snapshot_tensors(&self) -> Option<Int8SnapshotTensors<'_>> {
-        matches!(self.mode, KVCacheMode::Int8 | KVCacheMode::Turbo8).then_some(
-            Int8SnapshotTensors {
-                keys: self.keys.as_deref()?,
-                values: self.values.as_deref()?,
-                key_scales: self.key_scales.as_deref()?,
-                val_scales: self.val_scales.as_deref()?,
-            },
-        )
+        (self.mode == KVCacheMode::Int8).then_some(Int8SnapshotTensors {
+            keys: self.keys.as_deref()?,
+            values: self.values.as_deref()?,
+            key_scales: self.key_scales.as_deref()?,
+            val_scales: self.val_scales.as_deref()?,
+        })
+    }
+    pub fn fp8_snapshot_tensors(&self) -> Option<Fp8SnapshotTensors<'_>> {
+        (self.mode == KVCacheMode::Fp8).then_some(Fp8SnapshotTensors {
+            keys: self.keys.as_deref()?,
+            values: self.values.as_deref()?,
+        })
     }
 
     /// Restore symmetric Turbo4 packed storage without dequantizing and
@@ -677,7 +692,7 @@ impl KVCache {
         Ok(())
     }
 
-    /// Restore an Int8 or Turbo8 cache and its per-token scale sidecars.
+    /// Restore an Int8 cache and its per-token scale sidecars.
     pub fn restore_int8_snapshot(
         &mut self,
         offset: i32,
@@ -686,8 +701,8 @@ impl KVCache {
         key_scales: UniquePtr<MlxArray>,
         val_scales: UniquePtr<MlxArray>,
     ) -> Result<(), String> {
-        if !matches!(self.mode, KVCacheMode::Int8 | KVCacheMode::Turbo8) {
-            return Err("8-bit snapshot requires an Int8 or Turbo8 cache".to_owned());
+        if self.mode != KVCacheMode::Int8 {
+            return Err("8-bit snapshot requires an Int8 cache".to_owned());
         }
         if offset <= 0 {
             return Err(format!(
@@ -708,15 +723,46 @@ impl KVCache {
                 ));
             }
         }
-        let head_dim = ffi::array_shape(keys.as_ref().expect("validated keys"))[3] as u32;
         self.keys = Some(keys);
         self.values = Some(values);
         self.key_scales = Some(key_scales);
         self.val_scales = Some(val_scales);
         self.offset = offset;
         self.live_start = 0;
-        self.turbo_params = (self.mode == KVCacheMode::Turbo8)
-            .then(|| turbo::TurboQuantParams::new(head_dim, self.turbo_seed));
+        self.turbo_params = None;
+        Ok(())
+    }
+    /// Restore raw E4M3 FP8 storage without decoding and re-encoding the prefix.
+    pub fn restore_fp8_snapshot(
+        &mut self,
+        offset: i32,
+        keys: UniquePtr<MlxArray>,
+        values: UniquePtr<MlxArray>,
+    ) -> Result<(), String> {
+        if self.mode != KVCacheMode::Fp8 {
+            return Err("FP8 snapshot requires an FP8 cache".to_owned());
+        }
+        if offset <= 0 {
+            return Err(format!(
+                "FP8 snapshot offset must be positive, got {offset}"
+            ));
+        }
+        for (name, tensor) in [("keys", keys.as_ref()), ("values", values.as_ref())] {
+            let tensor = tensor.ok_or_else(|| format!("FP8 snapshot {name} is null"))?;
+            let shape = ffi::array_shape(tensor);
+            if shape.len() != 4 || shape[2] < offset {
+                return Err(format!(
+                    "FP8 snapshot {name} must be rank 4 with at least {offset} tokens, got {shape:?}"
+                ));
+            }
+            if ffi::array_dtype(tensor) != dtype::UINT8 {
+                return Err(format!("FP8 snapshot {name} must use UINT8 storage"));
+            }
+        }
+        self.keys = Some(keys);
+        self.values = Some(values);
+        self.offset = offset;
+        self.live_start = 0;
         Ok(())
     }
 
@@ -1028,7 +1074,8 @@ impl KVCache {
             return;
         }
         match self.mode {
-            KVCacheMode::Int8 | KVCacheMode::Turbo8 => self.update_int8(new_keys, new_values),
+            KVCacheMode::Int8 => self.update_int8(new_keys, new_values),
+            KVCacheMode::Fp8 => self.update_fp8(new_keys, new_values),
             KVCacheMode::Turbo4Asym => self.update_turbo4_asym(new_keys, new_values),
             KVCacheMode::Turbo4 => self.update_turbo4_sym(new_keys, new_values),
             KVCacheMode::Turbo4Delegated => self.update_turbo4_delegated(new_keys, new_values),
@@ -1127,6 +1174,71 @@ impl KVCache {
             &[v_shape[0], v_shape[1], live_len, v_shape[3]],
         ));
     }
+    /// E4M3 FP8 update path. The cache owns raw UINT8 bytes; no scale
+    /// sidecars or TurboQuant rotations are involved.
+    fn update_fp8(&mut self, new_keys: UniquePtr<MlxArray>, new_values: UniquePtr<MlxArray>) {
+        let new_keys = ffi::to_fp8(&new_keys);
+        let new_values = ffi::to_fp8(&new_values);
+        let key_shape = ffi::array_shape(&new_keys);
+        let new_seq_len = key_shape[2];
+        let prev = self.buffer_idx();
+
+        if prev == 0 && self.keys.is_none() && direct_prefill_cache_store_enabled() {
+            self.keys = Some(ffi::contiguous(&new_keys, false));
+            self.values = Some(ffi::contiguous(&new_values, false));
+            self.offset += new_seq_len;
+            return;
+        }
+
+        if self.keys.is_none() || (prev + new_seq_len) > self.buffer_seq_len() {
+            let b = key_shape[0];
+            let n_kv_heads = key_shape[1];
+            let k_head_dim = key_shape[3];
+            let val_shape = ffi::array_shape(&new_values);
+            let v_head_dim = val_shape[3];
+            let n_steps = (self.step + new_seq_len - 1) / self.step;
+            let buf_size = n_steps * self.step;
+            let new_k = ffi::zeros(&[b, n_kv_heads, buf_size, k_head_dim], dtype::UINT8);
+            let new_v = ffi::zeros(&[b, n_kv_heads, buf_size, v_head_dim], dtype::UINT8);
+
+            if self.keys.is_some() {
+                if prev % self.step != 0 {
+                    self.keys = Some(ffi::slice(
+                        self.keys.as_ref().unwrap(),
+                        &[0, 0, 0, 0],
+                        &[b, n_kv_heads, prev, k_head_dim],
+                    ));
+                    self.values = Some(ffi::slice(
+                        self.values.as_ref().unwrap(),
+                        &[0, 0, 0, 0],
+                        &[b, n_kv_heads, prev, v_head_dim],
+                    ));
+                }
+                self.keys = Some(concatenate(self.keys.as_ref().unwrap(), &new_k, 2));
+                self.values = Some(concatenate(self.values.as_ref().unwrap(), &new_v, 2));
+            } else {
+                self.keys = Some(new_k);
+                self.values = Some(new_v);
+            }
+        }
+
+        self.offset += new_seq_len;
+        let live_len = self.buffer_idx();
+        let k_shape = ffi::array_shape(self.keys.as_ref().unwrap());
+        let v_shape = ffi::array_shape(self.values.as_ref().unwrap());
+        self.keys = Some(ffi::slice_update(
+            self.keys.as_ref().unwrap(),
+            &new_keys,
+            &[0, 0, prev, 0],
+            &[k_shape[0], k_shape[1], live_len, k_shape[3]],
+        ));
+        self.values = Some(ffi::slice_update(
+            self.values.as_ref().unwrap(),
+            &new_values,
+            &[0, 0, prev, 0],
+            &[v_shape[0], v_shape[1], live_len, v_shape[3]],
+        ));
+    }
 
     /// INT8 update path — quantizes incoming K/V tokens and accumulates into
     /// INT8 key/value buffers alongside FP16 per-token scale buffers.
@@ -1135,33 +1247,8 @@ impl KVCache {
     /// - `keys`/`values`: `[B, H, capacity, D]` INT8
     /// - `key_scales`/`val_scales`: `[B, H, capacity, 1]` FP16
     fn update_int8(&mut self, new_keys: UniquePtr<MlxArray>, new_values: UniquePtr<MlxArray>) {
-        // Turbo8 first whitens each vector with independent K/V rotations;
-        // ordinary Int8 preserves the historical unrotated path.
-        let (new_keys_f16, new_values_f16) = if self.mode == KVCacheMode::Turbo8 {
-            let head_dim = ffi::array_shape(&new_keys)[3] as u32;
-            if self.turbo_params.is_none() {
-                self.turbo_params = Some(turbo::TurboQuantParams::new(head_dim, self.turbo_seed));
-            }
-            let params = self
-                .turbo_params
-                .as_ref()
-                .expect("Turbo8 parameters were just initialized");
-            (
-                ffi::astype(
-                    &turbo::quant::turbo4_k_rotate(&new_keys, params),
-                    dtype::FLOAT16,
-                ),
-                ffi::astype(
-                    &turbo::quant::turbo4_v_rotate(&new_values, params),
-                    dtype::FLOAT16,
-                ),
-            )
-        } else {
-            (
-                ffi::astype(&new_keys, dtype::FLOAT16),
-                ffi::astype(&new_values, dtype::FLOAT16),
-            )
-        };
+        let new_keys_f16 = ffi::astype(&new_keys, dtype::FLOAT16);
+        let new_values_f16 = ffi::astype(&new_values, dtype::FLOAT16);
 
         let (k_int8, k_scale) = quantize_per_token(&new_keys_f16);
         let (v_int8, v_scale) = quantize_per_token(&new_values_f16);
@@ -2407,10 +2494,24 @@ impl KVCache {
         // refuses to advance it for them, so the Turbo branches below that
         // still use `self.offset` continue to be correct.
         let live_len_after = self.offset - self.live_start;
+        if live_len_after > 0 {
+            if let Some(auxiliary_keys) = self.auxiliary_keys.as_ref() {
+                let shape = ffi::array_shape(auxiliary_keys);
+                self.auxiliary_keys = Some(ffi::slice(
+                    auxiliary_keys,
+                    &[0, 0, 0],
+                    &[shape[0], live_len_after, shape[2]],
+                ));
+            }
+        }
+        // Block means depend on the tail length. Rebuild them lazily from the
+        // trimmed raw auxiliary keys on the next QSA plan.
+        self.auxiliary_block_keys = None;
         if live_len_after == 0 {
             self.keys = None;
             self.values = None;
             self.auxiliary_keys = None;
+            self.auxiliary_block_keys = None;
             self.key_scales = None;
             self.val_scales = None;
             self.v_packed = None;
@@ -2514,7 +2615,7 @@ impl KVCache {
                 ));
             }
             // Trim INT8 scale sidecars.
-            if matches!(self.mode, KVCacheMode::Int8 | KVCacheMode::Turbo8) {
+            if self.mode == KVCacheMode::Int8 {
                 if let Some(ref ks) = self.key_scales {
                     let ks_shape = ffi::array_shape(ks);
                     self.key_scales = Some(ffi::slice(
@@ -2708,14 +2809,11 @@ impl KVCache {
             return 0;
         }
 
-        // Only Fp16 and Int8 are supported; Turbo modes carry rotation
-        // state in their sidecars that is not safe to truncate from the
-        // head. `live_start` must remain `0` for those modes so the Turbo
-        // fetch paths that still slice `[0..self.offset]` continue to be
-        // correct.
+        // Dense Fp16, FP8, and Int8 storage can be truncated safely. Turbo
+        // modes carry sidecars whose fetch paths require `live_start == 0`.
         if !matches!(
             self.mode,
-            KVCacheMode::Fp16 | KVCacheMode::Int8 | KVCacheMode::Turbo8
+            KVCacheMode::Fp16 | KVCacheMode::Fp8 | KVCacheMode::Int8
         ) {
             return 0;
         }
@@ -2732,6 +2830,7 @@ impl KVCache {
             self.keys = None;
             self.values = None;
             self.auxiliary_keys = None;
+            self.auxiliary_block_keys = None;
             self.key_scales = None;
             self.val_scales = None;
             return n;
@@ -2755,7 +2854,7 @@ impl KVCache {
                 .values
                 .as_ref()
                 .map(|v| Self::slice_keep_sink(v, keep, n, live_len));
-            if matches!(self.mode, KVCacheMode::Int8 | KVCacheMode::Turbo8) {
+            if self.mode == KVCacheMode::Int8 {
                 self.key_scales = self
                     .key_scales
                     .as_ref()
@@ -2787,7 +2886,7 @@ impl KVCache {
                 ));
             }
             // Slice INT8 scale sidecars in lockstep.
-            if matches!(self.mode, KVCacheMode::Int8 | KVCacheMode::Turbo8) {
+            if self.mode == KVCacheMode::Int8 {
                 if let Some(ref ks) = self.key_scales {
                     let ks_shape = ffi::array_shape(ks);
                     self.key_scales = Some(ffi::slice(
@@ -2825,6 +2924,7 @@ impl KVCache {
                 ))
             };
         }
+        self.auxiliary_block_keys = None;
         // CRITICAL: do NOT modify `self.offset`. Advance `live_start` only.
         // See the top-level doc comment for the RoPE rationale.
         self.live_start += n;
@@ -2882,7 +2982,25 @@ impl KVCache {
         // `self.offset`-based slicing.
         let live_len = self.buffer_idx();
         match self.mode {
-            KVCacheMode::Int8 | KVCacheMode::Turbo8 => {
+            KVCacheMode::Fp8 => {
+                let keys = self.keys.as_ref().expect("FP8 cache must retain keys");
+                let values = self.values.as_ref().expect("FP8 cache must retain values");
+                let ks = ffi::array_shape(keys);
+                let vs = ffi::array_shape(values);
+                (
+                    ffi::from_fp8(&ffi::slice(
+                        keys,
+                        &[0, 0, 0, 0],
+                        &[ks[0], ks[1], live_len, ks[3]],
+                    )),
+                    ffi::from_fp8(&ffi::slice(
+                        values,
+                        &[0, 0, 0, 0],
+                        &[vs[0], vs[1], live_len, vs[3]],
+                    )),
+                )
+            }
+            KVCacheMode::Int8 => {
                 // Dequantize the filled portion of the INT8 buffers
                 let k_int8 = self.keys.as_ref().unwrap();
                 let v_int8 = self.values.as_ref().unwrap();
@@ -2899,20 +3017,10 @@ impl KVCache {
                 let ks_slice = ffi::slice(k_scales, &[0, 0, 0, 0], &[kss[0], kss[1], live_len, 1]);
                 let vs_slice = ffi::slice(v_scales, &[0, 0, 0, 0], &[vss[0], vss[1], live_len, 1]);
 
-                let keys = dequantize(&k_slice, &ks_slice);
-                let values = dequantize(&v_slice, &vs_slice);
-                if self.mode == KVCacheMode::Turbo8 {
-                    let params = self
-                        .turbo_params
-                        .as_ref()
-                        .expect("Turbo8 parameters must be initialized");
-                    (
-                        turbo::quant::turbo4_k_inverse_rotate(&keys, params),
-                        turbo::quant::turbo4_v_inverse_rotate(&values, params),
-                    )
-                } else {
-                    (keys, values)
-                }
+                (
+                    dequantize(&k_slice, &ks_slice),
+                    dequantize(&v_slice, &vs_slice),
+                )
             }
             KVCacheMode::Turbo4Asym => {
                 let k = self.keys.as_ref().unwrap();
@@ -2995,6 +3103,93 @@ impl KVCache {
                 )
             }
         }
+    }
+    /// Update the cache and fetch only the selected token positions.
+    ///
+    /// FP8 gathers raw bytes before decoding; Int8 gathers vectors and scales
+    /// before dequantization. Sparse attention therefore never materializes
+    /// the full context in FP16.
+    pub fn update_and_fetch_selected(
+        &mut self,
+        new_keys: UniquePtr<MlxArray>,
+        new_values: UniquePtr<MlxArray>,
+        indices: &MlxArray,
+    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        if matches!(
+            self.mode,
+            KVCacheMode::Fp16 | KVCacheMode::Fp8 | KVCacheMode::Int8
+        ) && self.paged_backing.is_none()
+        {
+            self.update(new_keys, new_values);
+            return self.fetch_selected(indices);
+        }
+        let (keys, values) = self.update_and_fetch(new_keys, new_values);
+        (ffi::take(&keys, indices, 2), ffi::take(&values, indices, 2))
+    }
+    /// Gather one shared token set from an already-updated cache.
+    pub fn fetch_selected(&self, indices: &MlxArray) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        if self.mode == KVCacheMode::Fp8 {
+            let keys = ffi::take(
+                self.keys.as_deref().expect("FP8 cache must retain keys"),
+                indices,
+                2,
+            );
+            let values = ffi::take(
+                self.values
+                    .as_deref()
+                    .expect("FP8 cache must retain values"),
+                indices,
+                2,
+            );
+            return (ffi::from_fp8(&keys), ffi::from_fp8(&values));
+        }
+        if self.mode == KVCacheMode::Int8 {
+            let keys = ffi::take(
+                self.keys.as_deref().expect("8-bit cache must retain keys"),
+                indices,
+                2,
+            );
+            let values = ffi::take(
+                self.values
+                    .as_deref()
+                    .expect("8-bit cache must retain values"),
+                indices,
+                2,
+            );
+            let key_scales = ffi::take(
+                self.key_scales
+                    .as_deref()
+                    .expect("8-bit cache must retain key scales"),
+                indices,
+                2,
+            );
+            let value_scales = ffi::take(
+                self.val_scales
+                    .as_deref()
+                    .expect("8-bit cache must retain value scales"),
+                indices,
+                2,
+            );
+            return (
+                dequantize(&keys, &key_scales),
+                dequantize(&values, &value_scales),
+            );
+        }
+        assert_eq!(self.mode, KVCacheMode::Fp16);
+        (
+            ffi::take(
+                self.keys.as_deref().expect("FP16 cache must retain keys"),
+                indices,
+                2,
+            ),
+            ffi::take(
+                self.values
+                    .as_deref()
+                    .expect("FP16 cache must retain values"),
+                indices,
+                2,
+            ),
+        )
     }
 
     /// Transparent pool-backed `update_and_fetch` for single-stream
@@ -3274,6 +3469,9 @@ impl KVCache {
         if let Some(keys) = self.auxiliary_keys.as_ref() {
             ffi::eval(keys);
         }
+        if let Some(keys) = self.auxiliary_block_keys.as_ref() {
+            ffi::eval(keys);
+        }
         if let Some(v) = self.values.as_ref() {
             ffi::eval(v);
         }
@@ -3312,6 +3510,7 @@ impl KVCache {
             self.keys.as_deref(),
             self.values.as_deref(),
             self.auxiliary_keys.as_deref(),
+            self.auxiliary_block_keys.as_deref(),
             self.key_scales.as_deref(),
             self.val_scales.as_deref(),
             self.v_packed.as_deref(),
@@ -4357,7 +4556,7 @@ impl RotatingKVCache {
     ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
         match self.mode {
             KVCacheMode::Fp16 => self.update_and_fetch_fp16(new_keys, new_values),
-            KVCacheMode::Int8 | KVCacheMode::Turbo8 => {
+            KVCacheMode::Fp8 | KVCacheMode::Int8 => {
                 // INT8 support for RotatingKVCache is not part of B9 / issue
                 // Fall back to FP16 storage so the path is correct, even
                 // if mis-configured. A future sub-issue can wire INT8 in.
@@ -7286,6 +7485,26 @@ mod tests {
         assert_eq!(cache.seq_len(), 0);
         assert!(cache.is_empty());
     }
+    #[test]
+    fn kv_cache_trim_rewinds_qsa_auxiliary_state() {
+        let mut cache = KVCache::new_with_mode(KVCacheMode::Fp8);
+        cache.update(
+            ffi::from_slice_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 4, 1]),
+            ffi::from_slice_f32(&[5.0, 6.0, 7.0, 8.0], &[1, 1, 4, 1]),
+        );
+        cache.auxiliary_keys = Some(ffi::from_slice_f32(
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            &[1, 4, 2],
+        ));
+        cache.auxiliary_block_keys = Some(ffi::from_slice_f32(&[1.0, 2.0], &[1, 1, 1, 2]));
+
+        assert_eq!(cache.trim(2), 2);
+        assert_eq!(
+            ffi::array_shape(cache.auxiliary_keys.as_deref().expect("trimmed QSA keys")),
+            vec![1, 2, 2]
+        );
+        assert!(cache.auxiliary_block_keys.is_none());
+    }
 
     /// #678 repro at the cache layer: every suspect prefill shape (single-pass
     /// over-window, chunked at the window size, chunked with an oversized
@@ -7637,7 +7856,7 @@ mod tests {
     }
 
     #[test]
-    fn turbo8_roundtrip_rotates_and_recovers_kv_vectors() {
+    fn fp8_roundtrip_and_selected_fetch_preserve_e4m3_values() {
         fn read_f32(array: &MlxArray) -> Vec<f32> {
             let array = ffi::astype(array, dtype::FLOAT32);
             ffi::eval(&array);
@@ -7647,24 +7866,35 @@ mod tests {
                 .collect()
         }
 
-        let keys = [0.30_f32, -1.20, 2.50, -0.80, 4.10, -3.30, 0.05, 1.90];
-        let values = [-5.60_f32, 0.90, 3.10, -2.20, 0.15, -0.45, 0.60, -0.30];
-        let mut cache = KVCache::new_with_mode_and_seed(KVCacheMode::Turbo8, 73);
-        let (restored_keys, restored_values) = cache.update_and_fetch(
-            ffi::from_slice_f32(&keys, &[1, 1, 2, 4]),
-            ffi::from_slice_f32(&values, &[1, 1, 2, 4]),
-        );
+        let keys = [
+            0.30_f32, -1.20, 2.50, -0.80, 4.10, -3.30, 0.05, 1.90, 0.25, 0.50, -0.75, 1.00,
+        ];
+        let values = [
+            -5.60_f32, 0.90, 3.10, -2.20, 0.15, -0.45, 0.60, -0.30, 1.25, -1.50, 1.75, -2.00,
+        ];
+        let make = |values: &[f32]| ffi::from_slice_f32(values, &[1, 1, 3, 4]);
+
+        let mut full = KVCache::new_with_mode(KVCacheMode::Fp8);
+        let (restored_keys, restored_values) = full.update_and_fetch(make(&keys), make(&values));
         assert_eq!(
-            ffi::array_dtype(cache.keys.as_deref().expect("stored Turbo8 keys")),
-            dtype::INT8
+            ffi::array_dtype(full.keys.as_deref().expect("stored FP8 keys")),
+            dtype::UINT8
         );
-        assert!(cache.turbo_params.is_some());
         for (expected, actual) in keys.iter().zip(read_f32(&restored_keys)) {
-            assert!((expected - actual).abs() < 0.08, "{expected} != {actual}");
+            assert!((expected - actual).abs() < 0.3, "{expected} != {actual}");
         }
         for (expected, actual) in values.iter().zip(read_f32(&restored_values)) {
-            assert!((expected - actual).abs() < 0.08, "{expected} != {actual}");
+            assert!((expected - actual).abs() < 0.3, "{expected} != {actual}");
         }
+
+        let indices = ffi::from_slice_i32(&[2, 0], &[2]);
+        let expected_keys = ffi::take(&restored_keys, &indices, 2);
+        let expected_values = ffi::take(&restored_values, &indices, 2);
+        let mut sparse = KVCache::new_with_mode(KVCacheMode::Fp8);
+        let (selected_keys, selected_values) =
+            sparse.update_and_fetch_selected(make(&keys), make(&values), &indices);
+        assert_eq!(read_f32(&selected_keys), read_f32(&expected_keys));
+        assert_eq!(read_f32(&selected_values), read_f32(&expected_values));
     }
 
     /// INT8 + `--max-kv-size` front-trim interaction on the single-stream

@@ -109,6 +109,20 @@ static HARDWARE_CAPABILITIES: OnceLock<HardwareCapabilities> = OnceLock::new();
 pub fn get_hardware() -> &'static HardwareCapabilities {
     HARDWARE_CAPABILITIES.get_or_init(detect_hardware)
 }
+/// Total physical system memory in bytes.
+///
+/// Metal uses unified system memory, so allocator residency limits must be
+/// derived from `hw.memsize`, not from a model-name capacity table.
+pub fn system_memory_bytes() -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        platform::sysctl_u64("hw.memsize").unwrap_or(0)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        0
+    }
+}
 
 /// True only on M5-class Apple Silicon whose Neural Accelerator is driven by
 /// the running macOS (Metal GPU Family 4).

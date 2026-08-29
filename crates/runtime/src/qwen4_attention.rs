@@ -125,6 +125,32 @@ struct Qwen4QsaIndexer {
     rope_dims: i32,
     mrope: InterleavedMRoPE,
 }
+enum Qwen4QsaPlan {
+    Mask(UniquePtr<MlxArray>),
+    DecodeIndices(UniquePtr<MlxArray>),
+    VerifyIndices(Vec<UniquePtr<MlxArray>>),
+    PrefillIndices {
+        indices: UniquePtr<MlxArray>,
+        mask: UniquePtr<MlxArray>,
+    },
+}
+fn sparse_prefill_attention(
+    full_keys: &MlxArray,
+    full_values: &MlxArray,
+    queries: &MlxArray,
+    indices: &MlxArray,
+    valid: &MlxArray,
+    scale: f32,
+) -> UniquePtr<MlxArray> {
+    mlxcel_core::qsa_sparse_prefill_attention(
+        queries,
+        full_keys,
+        full_values,
+        indices,
+        valid,
+        scale,
+    )
+}
 
 impl Qwen4QsaIndexer {
     fn from_weights(
@@ -194,7 +220,7 @@ impl Qwen4QsaIndexer {
         mlxcel_core::concatenate(&rotary, &pass, -1)
     }
 
-    fn mask(&self, input: &MlxArray, cache: &mut KVCache) -> Option<UniquePtr<MlxArray>> {
+    fn plan(&self, input: &MlxArray, cache: &mut KVCache) -> Option<Qwen4QsaPlan> {
         let input_shape = mlxcel_core::array_shape(input);
         let batch = input_shape[0];
         let sequence = input_shape[1];
@@ -225,6 +251,7 @@ impl Qwen4QsaIndexer {
             .expect("QSA raw keys were just installed");
         let key_len = mlxcel_core::array_shape(raw_keys)[1];
         if key_len != past_len + sequence {
+            cache.auxiliary_block_keys = None;
             return None;
         }
         let complete_blocks = key_len / self.compress_ratio;
@@ -238,27 +265,57 @@ impl Qwen4QsaIndexer {
         let query = self.apply_rope(&query, &query_positions, batch);
 
         let complete_key_len = complete_blocks * self.compress_ratio;
-        let pooled = mlxcel_core::slice(
-            raw_keys,
-            &[0, 0, 0],
-            &[batch, complete_key_len, self.head_dim],
-        );
-        let pooled = mlxcel_core::reshape(
-            &pooled,
-            &[batch, complete_blocks, self.compress_ratio, self.head_dim],
-        );
-        let pooled = mlxcel_core::mean_axis(
-            &mlxcel_core::astype(&pooled, mlxcel_core::dtype::FLOAT32),
-            2,
-            false,
-        );
-        let pooled = mlxcel_core::astype(&pooled, mlxcel_core::array_dtype(raw_keys));
-        let pooled = self.k_norm.forward(&pooled);
-        let pooled = mlxcel_core::expand_dims(&pooled, 1);
-        let block_positions = (0..complete_blocks)
-            .map(|block| block * self.compress_ratio)
-            .collect::<Vec<_>>();
-        let pooled = self.apply_rope(&pooled, &block_positions, batch);
+        let cached_blocks = match cache.auxiliary_block_keys.as_deref() {
+            Some(keys) => {
+                let shape = mlxcel_core::array_shape(keys);
+                if shape[0] != batch || shape[1] != 1 || shape[3] != self.head_dim {
+                    cache.auxiliary_block_keys = None;
+                    0
+                } else if shape[2] > complete_blocks {
+                    cache.auxiliary_block_keys = Some(mlxcel_core::slice(
+                        keys,
+                        &[0, 0, 0, 0],
+                        &[batch, 1, complete_blocks, self.head_dim],
+                    ));
+                    complete_blocks
+                } else {
+                    shape[2]
+                }
+            }
+            None => 0,
+        };
+        if cached_blocks < complete_blocks {
+            let new_block_count = complete_blocks - cached_blocks;
+            let pooled = mlxcel_core::slice(
+                raw_keys,
+                &[0, cached_blocks * self.compress_ratio, 0],
+                &[batch, complete_key_len, self.head_dim],
+            );
+            let pooled = mlxcel_core::reshape(
+                &pooled,
+                &[batch, new_block_count, self.compress_ratio, self.head_dim],
+            );
+            let pooled = mlxcel_core::mean_axis(
+                &mlxcel_core::astype(&pooled, mlxcel_core::dtype::FLOAT32),
+                2,
+                false,
+            );
+            let pooled = mlxcel_core::astype(&pooled, mlxcel_core::array_dtype(raw_keys));
+            let pooled = self.k_norm.forward(&pooled);
+            let pooled = mlxcel_core::expand_dims(&pooled, 1);
+            let block_positions = (cached_blocks..complete_blocks)
+                .map(|block| block * self.compress_ratio)
+                .collect::<Vec<_>>();
+            let pooled = self.apply_rope(&pooled, &block_positions, batch);
+            cache.auxiliary_block_keys = Some(match cache.auxiliary_block_keys.take() {
+                Some(previous) => mlxcel_core::concatenate(&previous, &pooled, 2),
+                None => pooled,
+            });
+        }
+        let pooled = cache
+            .auxiliary_block_keys
+            .as_deref()
+            .expect("QSA block keys were just installed");
 
         let query_f32 = mlxcel_core::astype(&query, mlxcel_core::dtype::FLOAT32);
         let pooled_f32 = mlxcel_core::astype(&pooled, mlxcel_core::dtype::FLOAT32);
@@ -284,7 +341,6 @@ impl Qwen4QsaIndexer {
             &[0, 0, complete_blocks - self.block_topk],
             &[batch, sequence, complete_blocks],
         );
-
         let selected = mlxcel_core::expand_dims(&selected, -1);
         let selected = mlxcel_core::multiply(&selected, &ratio);
         let offsets = mlxcel_core::arange_i32(0, self.compress_ratio, 1);
@@ -294,6 +350,73 @@ impl Qwen4QsaIndexer {
             &selected,
             &[batch, sequence, self.block_topk * self.compress_ratio],
         );
+        if batch == 1 && sequence == 1 {
+            let selected = if complete_key_len < key_len {
+                let tail = mlxcel_core::arange_i32(complete_key_len, key_len, 1);
+                let tail = mlxcel_core::reshape(&tail, &[1, 1, key_len - complete_key_len]);
+                mlxcel_core::concatenate(&selected, &tail, -1)
+            } else {
+                selected
+            };
+            return Some(Qwen4QsaPlan::DecodeIndices(mlxcel_core::reshape(
+                &selected,
+                &[-1],
+            )));
+        }
+        if batch == 1
+            && sequence > 1
+            && sequence < 64
+            && past_len / self.compress_ratio > self.block_topk
+            && matches!(
+                cache.mode,
+                KVCacheMode::Fp16 | KVCacheMode::Fp8 | KVCacheMode::Int8
+            )
+        {
+            let mut rows = Vec::with_capacity(sequence as usize);
+            for row in 0..sequence {
+                let row_selected = mlxcel_core::slice(
+                    &selected,
+                    &[0, row, 0],
+                    &[1, row + 1, self.block_topk * self.compress_ratio],
+                );
+                let row_selected = mlxcel_core::reshape(&row_selected, &[-1]);
+                let query_end = past_len + row + 1;
+                let complete_end = (query_end / self.compress_ratio) * self.compress_ratio;
+                let row_selected = if complete_end < query_end {
+                    let tail = mlxcel_core::arange_i32(complete_end, query_end, 1);
+                    mlxcel_core::concatenate(&row_selected, &tail, 0)
+                } else {
+                    row_selected
+                };
+                rows.push(row_selected);
+            }
+            return Some(Qwen4QsaPlan::VerifyIndices(rows));
+        }
+        if batch == 1
+            && sequence >= 64
+            && past_len / self.compress_ratio > self.block_topk
+            && matches!(
+                cache.mode,
+                KVCacheMode::Fp16 | KVCacheMode::Fp8 | KVCacheMode::Int8
+            )
+        {
+            let tail_starts = mlxcel_core::multiply(&complete_counts, &ratio);
+            let offsets = mlxcel_core::arange_i32(0, self.compress_ratio, 1);
+            let offsets = mlxcel_core::reshape(&offsets, &[1, 1, self.compress_ratio]);
+            let tail_indices = mlxcel_core::add(&tail_starts, &offsets);
+            let tail_valid = mlxcel_core::less(&tail_indices, &query_ends);
+            let last_visible =
+                mlxcel_core::subtract(&query_ends, &mlxcel_core::from_slice_i32(&[1], &[1]));
+            let tail_indices = mlxcel_core::where_cond(&tail_valid, &tail_indices, &last_visible);
+            let indices = mlxcel_core::concatenate(&selected, &tail_indices, -1);
+            let selected_valid = mlxcel_core::ones(
+                &mlxcel_core::array_shape(&selected),
+                mlxcel_core::dtype::BOOL,
+            );
+            let mask = mlxcel_core::concatenate(&selected_valid, &tail_valid, -1);
+            return Some(Qwen4QsaPlan::PrefillIndices { indices, mask });
+        }
+
         let selected_shape = mlxcel_core::array_shape(&selected);
         let selected_values = mlxcel_core::ones(&selected_shape, mlxcel_core::dtype::BOOL);
         let selected_mask =
@@ -314,10 +437,10 @@ impl Qwen4QsaIndexer {
         let topk = mlxcel_core::from_slice_i32(&[self.block_topk], &[1]);
         let use_sparse = mlxcel_core::greater(&complete_counts, &topk);
         let sparse = mlxcel_core::logical_or(&selected_mask, &tail);
-        Some(mlxcel_core::expand_dims(
+        Some(Qwen4QsaPlan::Mask(mlxcel_core::expand_dims(
             &mlxcel_core::where_cond(&use_sparse, &sparse, &causal),
             1,
-        ))
+        )))
     }
 }
 
@@ -373,11 +496,32 @@ impl Qwen4Attention {
         let shape = mlxcel_core::array_shape(x);
         let b = shape[0];
         let l = shape[1];
-        let qsa_mask = self
+        let qsa_plan = self
             .indexer
             .as_ref()
-            .and_then(|indexer| indexer.mask(x, cache));
-        let mask = qsa_mask.as_deref().or(mask);
+            .and_then(|indexer| indexer.plan(x, cache));
+        let qsa_mask = match &qsa_plan {
+            Some(Qwen4QsaPlan::Mask(mask)) => Some(mask.as_ref().expect("QSA mask is non-null")),
+            _ => None,
+        };
+        let qsa_indices = match (mask.is_none(), &qsa_plan) {
+            (true, Some(Qwen4QsaPlan::DecodeIndices(indices))) => {
+                Some(indices.as_ref().expect("QSA indices are non-null"))
+            }
+            _ => None,
+        };
+        let qsa_verify = match &qsa_plan {
+            Some(Qwen4QsaPlan::VerifyIndices(rows)) => Some(rows.as_slice()),
+            _ => None,
+        };
+        let qsa_prefill = match (mask.is_none(), &qsa_plan) {
+            (true, Some(Qwen4QsaPlan::PrefillIndices { indices, mask })) => Some((
+                indices.as_ref().expect("QSA prefill indices are non-null"),
+                mask.as_ref().expect("QSA prefill mask is non-null"),
+            )),
+            _ => None,
+        };
+        let mask = qsa_mask.or(mask);
 
         // Q includes the learned gate plane, followed by K and V.
         let (q_proj_output, keys, values) = self.qkv_proj.forward(x);
@@ -456,14 +600,44 @@ impl Qwen4Attention {
 
         let captured_query = capture_query.then(|| mlxcel_core::share(&queries));
 
-        // Symmetric Turbo4 reads packed K/V directly only for the specialized
-        // long-context MTP verify envelope. Other multi-token calls retain
-        // bottom-right causal metadata and use the exact dequant-SDPA fallback.
-        let attn_out = if cache.mode == KVCacheMode::Turbo4 {
-            if l > 1 && mask.is_none() {
-                cache.update_and_turbo4_causal_attention(&queries, keys, values, self.scale)
-            } else {
-                cache.update_and_turbo4_attention(&queries, keys, values, self.scale, mask)
+        let attn_out = if let Some(rows) = qsa_verify {
+            cache.update(keys, values);
+            let mut outputs = Vec::with_capacity(rows.len());
+            for (row, indices) in rows.iter().enumerate() {
+                let query = mlxcel_core::slice(
+                    &queries,
+                    &[0, 0, row as i32, 0],
+                    &[b, self.num_heads, row as i32 + 1, self.head_dim],
+                );
+                let (cache_k, cache_v) = cache.fetch_selected(indices);
+                outputs.push(unsafe {
+                    mlxcel_core::layers::attention_from_ptr(
+                        &query,
+                        &cache_k,
+                        &cache_v,
+                        self.scale,
+                        std::ptr::null(),
+                        0.0,
+                        0,
+                    )
+                });
+            }
+            mlxcel_core::concatenate_owned(&outputs, 2)
+        } else if let Some((indices, valid)) = qsa_prefill {
+            let (cache_k, cache_v) = cache.update_and_fetch(keys, values);
+            sparse_prefill_attention(&cache_k, &cache_v, &queries, indices, valid, self.scale)
+        } else if let Some(indices) = qsa_indices {
+            let (cache_k, cache_v) = cache.update_and_fetch_selected(keys, values, indices);
+            unsafe {
+                mlxcel_core::layers::attention_from_ptr(
+                    &queries,
+                    &cache_k,
+                    &cache_v,
+                    self.scale,
+                    std::ptr::null(),
+                    0.0,
+                    0,
+                )
             }
         } else {
             let (cache_k, cache_v) = cache.update_and_fetch(keys, values);
@@ -781,5 +955,48 @@ mod tests {
         let mut verify_cache = KVCache::new();
         let verify = attention.forward_verify(&input, &mut verify_cache, None, None);
         assert_eq!(mlxcel_core::array_shape(&verify), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn sparse_prefill_streams_selected_values_without_gathering() {
+        if !mlxcel_core::metal_is_available() {
+            return;
+        }
+        let queries = mlxcel_core::zeros(&[1, 2, 2, 4], mlxcel_core::dtype::FLOAT32);
+        let keys = mlxcel_core::zeros(&[1, 1, 5, 4], mlxcel_core::dtype::FLOAT32);
+        let values = mlxcel_core::from_slice_f32(
+            &[
+                0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0, 3.0, 3.0, 3.0, 3.0,
+                4.0, 4.0, 4.0, 4.0,
+            ],
+            &[1, 1, 5, 4],
+        );
+        let indices = mlxcel_core::from_slice_i32(&[0, 2, 4, 1, 3, 4], &[1, 2, 3]);
+        let valid = mlxcel_core::ones(&[1, 2, 3], mlxcel_core::dtype::BOOL);
+        let actual = sparse_prefill_attention(&keys, &values, &queries, &indices, &valid, 0.5);
+        let expected = mlxcel_core::from_slice_f32(
+            &[
+                2.0,
+                2.0,
+                2.0,
+                2.0,
+                8.0 / 3.0,
+                8.0 / 3.0,
+                8.0 / 3.0,
+                8.0 / 3.0,
+                2.0,
+                2.0,
+                2.0,
+                2.0,
+                8.0 / 3.0,
+                8.0 / 3.0,
+                8.0 / 3.0,
+                8.0 / 3.0,
+            ],
+            &[1, 2, 2, 4],
+        );
+        let close = mlxcel_core::allclose(&actual, &expected, 1e-5, 1e-5);
+        mlxcel_core::eval(&close);
+        assert!(mlxcel_core::item_bool(&close));
     }
 }

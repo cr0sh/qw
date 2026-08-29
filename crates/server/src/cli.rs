@@ -123,10 +123,6 @@ pub struct ServerArgs {
     #[arg(long = "mtp-k", default_value_t = 3)]
     mtp_k: usize,
 
-    /// Disable the default 8-bit TurboQuant KV cache.
-    #[arg(long)]
-    no_kv_quantization: bool,
-
     /// Disable the daily trace log file under `~/.cache/qw/log/`.
     #[arg(long)]
     no_file_logging: bool,
@@ -142,11 +138,7 @@ pub struct ServerArgs {
 
 impl ServerArgs {
     fn kv_cache_mode(&self) -> KVCacheMode {
-        if self.no_kv_quantization {
-            KVCacheMode::Fp16
-        } else {
-            KVCacheMode::Turbo8
-        }
+        KVCacheMode::Fp8
     }
 }
 
@@ -521,23 +513,14 @@ mod tests {
     }
 
     #[test]
-    fn turbo8_kv_quantization_is_default_with_explicit_opt_out() {
+    fn fp8_kv_cache_is_the_only_server_path() {
         let default =
             TestCli::try_parse_from(["qw-server", "--model", "/tmp/checkpoint"]).expect("CLI");
-        assert_eq!(default.args.kv_cache_mode(), KVCacheMode::Turbo8);
-
-        let unquantized = TestCli::try_parse_from([
-            "qw-server",
-            "--model",
-            "/tmp/checkpoint",
-            "--no-kv-quantization",
-        ])
-        .expect("CLI");
-        assert_eq!(unquantized.args.kv_cache_mode(), KVCacheMode::Fp16);
+        assert_eq!(default.args.kv_cache_mode(), KVCacheMode::Fp8);
 
         let help = TestCli::command().render_long_help().to_string();
-        assert!(help.contains("--no-kv-quantization"), "{help}");
-        assert!(help.contains("default 8-bit TurboQuant KV cache"), "{help}");
+        assert!(!help.contains("--no-kv-quantization"), "{help}");
+        assert!(!help.contains("TurboQuant"), "{help}");
     }
 
     #[test]

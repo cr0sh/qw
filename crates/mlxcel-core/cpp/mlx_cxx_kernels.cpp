@@ -454,6 +454,173 @@ std::unique_ptr<MlxArray> fused_xielu(
     return std::make_unique<MlxArray>(reshape(results[0], xs));
 }
 
+// QSA prefill has a different K/V selection for every query row. Expressing
+// that through take_along_axis materializes a multi-gigabyte
+// [batch, kv_head, query, selected, head_dim] tensor and makes prefill
+// gather-bound. One simdgroup handles one (batch, query, query-head) row here:
+// it reads the selected cache rows directly, keeps only the scalar logits in
+// threadgroup memory, then streams the selected values into the output.
+namespace {
+    static const char* QSA_SPARSE_PREFILL_METAL_SOURCE = R"(
+        uint thread_index = thread_position_in_threadgroup.x;
+        uint lane = thread_index & 31u;
+        uint simdgroup = thread_index >> 5u;
+        uint query_index = thread_position_in_grid.y;
+        uint batch_head = thread_position_in_grid.z;
+        uint batch_index = batch_head / query_heads;
+        uint query_head = batch_head - batch_index * query_heads;
+        uint kv_head = query_head / (query_heads / kv_heads);
+        uint selection_base =
+            (batch_index * query_length + query_index) * selected;
+        uint query_base =
+            ((batch_index * query_heads + query_head) * query_length
+             + query_index) * head_dim;
+
+        threadgroup float logits[selected];
+        threadgroup float reduction[256];
+
+        // Eight simdgroups cooperatively produce the selected-token logits.
+        for (uint selection = simdgroup; selection < selected; selection += 8u) {
+            uint selection_offset = selection_base + selection;
+            uint token = (uint)indices[selection_offset];
+            uint key_base =
+                ((batch_index * kv_heads + kv_head) * key_length + token)
+                * head_dim;
+            float dot = 0.0f;
+            for (uint dim = lane; dim < head_dim; dim += 32u) {
+                dot += (float)queries[query_base + dim]
+                     * (float)keys[key_base + dim];
+            }
+            dot = simd_sum(dot);
+            if (lane == 0u) {
+                logits[selection] = valid[selection_offset]
+                    ? dot * scale_value[0]
+                    : -INFINITY;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float local_max = -INFINITY;
+        for (uint selection = thread_index; selection < selected;
+             selection += 256u) {
+            local_max = max(local_max, logits[selection]);
+        }
+        reduction[thread_index] = local_max;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+            if (thread_index < stride) {
+                reduction[thread_index] =
+                    max(reduction[thread_index],
+                        reduction[thread_index + stride]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        float row_max = reduction[0];
+
+        float local_sum = 0.0f;
+        for (uint selection = thread_index; selection < selected;
+             selection += 256u) {
+            local_sum += exp(logits[selection] - row_max);
+        }
+        reduction[thread_index] = local_sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+            if (thread_index < stride) {
+                reduction[thread_index] += reduction[thread_index + stride];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        float inverse_sum = 1.0f / reduction[0];
+
+        for (uint dim = thread_index; dim < head_dim; dim += 256u) {
+            float output = 0.0f;
+            for (uint selection = 0; selection < selected; ++selection) {
+                uint selection_offset = selection_base + selection;
+                if (valid[selection_offset]) {
+                    uint token = (uint)indices[selection_offset];
+                    uint value_offset =
+                        (((batch_index * kv_heads + kv_head) * key_length
+                          + token) * head_dim) + dim;
+                    float probability =
+                        exp(logits[selection] - row_max) * inverse_sum;
+                    output += probability * (float)values[value_offset];
+                }
+            }
+            outputs[query_base + dim] = (T)output;
+        }
+    )";
+
+    struct QsaSparsePrefillKernelHolder {
+        std::optional<mlx::core::fast::CustomKernelFunction> kernel;
+        mlx::core::fast::CustomKernelFunction& get() {
+            if (!kernel) {
+                kernel = mlx::core::fast::metal_kernel(
+                    "qsa_sparse_prefill_attention",
+                    {"queries", "keys", "values", "indices", "valid",
+                     "scale_value"},
+                    {"outputs"},
+                    QSA_SPARSE_PREFILL_METAL_SOURCE);
+            }
+            return *kernel;
+        }
+    };
+
+    static QsaSparsePrefillKernelHolder& get_qsa_sparse_prefill_kernel() {
+        static QsaSparsePrefillKernelHolder holder;
+        return holder;
+    }
+}
+
+std::unique_ptr<MlxArray> qsa_sparse_prefill_attention(
+    const MlxArray& queries,
+    const MlxArray& keys,
+    const MlxArray& values,
+    const MlxArray& indices,
+    const MlxArray& valid,
+    float scale
+) {
+    using namespace mlx::core;
+    auto query_shape = queries.inner.shape();
+    auto key_shape = keys.inner.shape();
+    int batch = query_shape[0];
+    int query_heads = query_shape[1];
+    int query_length = query_shape[2];
+    int head_dim = query_shape[3];
+    int kv_heads = key_shape[1];
+    int key_length = key_shape[2];
+    int selected = indices.inner.shape()[2];
+    auto T = queries.inner.dtype();
+    auto scale_value = full({1}, scale, float32);
+
+    std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>> ta = {
+        {"T", T},
+        {"query_heads", query_heads},
+        {"kv_heads", kv_heads},
+        {"query_length", query_length},
+        {"key_length", key_length},
+        {"head_dim", head_dim},
+        {"selected", selected},
+    };
+    std::vector<array> inputs = {
+        queries.inner, keys.inner, values.inner, indices.inner, valid.inner,
+        scale_value,
+    };
+    auto results = get_qsa_sparse_prefill_kernel().get()(
+        inputs,
+        {Shape{batch, query_heads, query_length, head_dim}},
+        {T},
+        std::make_tuple(256, query_length, batch * query_heads),
+        std::make_tuple(256, 1, 1),
+        ta,
+        std::nullopt,
+        false,
+        {});
+    return std::make_unique<MlxArray>(std::move(results[0]));
+}
+
+
+
+
 // SSM (Mamba2) fused Metal kernel for single-token decode.
 // Port of Python mlx-lm ssm.py make_ssm_kernel() + ssm_update_kernel()
 namespace {

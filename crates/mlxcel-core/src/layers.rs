@@ -3302,64 +3302,94 @@ impl MoESwitch {
             num_experts,
         }
     }
+    fn gather_sorted(
+        input: &MlxArray,
+        weight: &QuantizedWeight,
+        expert_indices: &MlxArray,
+    ) -> UniquePtr<MlxArray> {
+        unsafe {
+            ffi::gather_qmm(
+                input,
+                &weight.weight,
+                &weight.scales,
+                weight.biases_ptr(),
+                std::ptr::null(),
+                expert_indices as *const _,
+                true,
+                weight.group_size,
+                weight.bits,
+                true,
+                &weight.mode,
+            )
+        }
+    }
+
+    fn forward_sorted_prefill(&self, x: &MlxArray, indices: &MlxArray) -> UniquePtr<MlxArray> {
+        let x_shape = ffi::array_shape(x);
+        let indices_shape = ffi::array_shape(indices);
+        let (batch, sequence, hidden) = (x_shape[0], x_shape[1], x_shape[2]);
+        let top_k = indices_shape[2];
+        let routes = batch * sequence * top_k;
+
+        let expanded = ffi::expand_dims(x, 2);
+        let expanded = ffi::broadcast_to(&expanded, &[batch, sequence, top_k, hidden]);
+        let flat_input = ffi::reshape(&expanded, &[routes, hidden]);
+        let flat_indices = ffi::reshape(indices, &[routes]);
+        let order = ffi::argsort(&flat_indices, -1);
+        let sorted_indices = ffi::take(&flat_indices, &order, 0);
+        let sorted_input = ffi::take(&flat_input, &order, 0);
+        let sorted_input = ffi::expand_dims(&sorted_input, -2);
+
+        let gate = Self::gather_sorted(&sorted_input, &self.gate_proj, &sorted_indices);
+        let up = Self::gather_sorted(&sorted_input, &self.up_proj, &sorted_indices);
+        let activated = ffi::compiled_swiglu_activation(&gate, &up);
+        let output = Self::gather_sorted(&activated, &self.down_proj, &sorted_indices);
+        let output = ffi::squeeze_axis(&output, -2);
+
+        let inverse = ffi::argsort(&order, -1);
+        let restored = ffi::take(&output, &inverse, 0);
+        let output_width = *ffi::array_shape(&restored)
+            .last()
+            .expect("MoE expert output has a hidden axis");
+        ffi::reshape(&restored, &[batch, sequence, top_k, output_width])
+    }
 
     /// Forward pass with expert indices.
     /// x: [..., hidden_dim]
     /// indices: [..., top_k]
     /// output: [..., top_k, hidden_dim]
     pub fn forward(&self, x: &MlxArray, indices: &MlxArray) -> UniquePtr<MlxArray> {
+        let x_shape = ffi::array_shape(x);
+        let indices_shape = ffi::array_shape(indices);
+        if x_shape.len() == 3
+            && indices_shape.len() == 3
+            && x_shape[1] > 1
+            && x_shape[..2] == indices_shape[..2]
+        {
+            return self.forward_sorted_prefill(x, indices);
+        }
+
         // `gather_qmm` follows MLX SwitchGLU's batched-matrix convention:
         // singleton matrix and routing axes prevent a sequence axis from
         // broadcasting into the expert-selection axis.
         let x = ffi::expand_dims(x, -2);
         let x = ffi::expand_dims(&x, -3);
-        let gate = unsafe {
-            ffi::gather_qmm(
+        let output = unsafe {
+            ffi::compiled_switch_qswiglu_forward(
                 &x,
                 &self.gate_proj.weight,
                 &self.gate_proj.scales,
                 self.gate_proj.biases_ptr(),
-                std::ptr::null(),    // lhs_indices
-                indices as *const _, // rhs_indices
-                true,                // transpose
-                self.gate_proj.group_size,
-                self.gate_proj.bits,
-                false, // sorted_indices
-                &self.gate_proj.mode,
-            )
-        };
-
-        let up = unsafe {
-            ffi::gather_qmm(
-                &x,
                 &self.up_proj.weight,
                 &self.up_proj.scales,
                 self.up_proj.biases_ptr(),
-                std::ptr::null(),
-                indices as *const _,
-                true,
-                self.up_proj.group_size,
-                self.up_proj.bits,
-                false,
-                &self.up_proj.mode,
-            )
-        };
-
-        let activated = ffi::compiled_swiglu_activation(&gate, &up);
-
-        let output = unsafe {
-            ffi::gather_qmm(
-                &activated,
                 &self.down_proj.weight,
                 &self.down_proj.scales,
                 self.down_proj.biases_ptr(),
-                std::ptr::null(),
-                indices as *const _,
-                true,
-                self.down_proj.group_size,
-                self.down_proj.bits,
-                false,
-                &self.down_proj.mode,
+                indices,
+                self.gate_proj.group_size,
+                self.gate_proj.bits,
+                &self.gate_proj.mode,
             )
         };
         ffi::squeeze_axis(&output, -2)

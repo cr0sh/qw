@@ -387,7 +387,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Generate(args) => {
             let model = qw_runtime::resolve_model_path(args.model.as_deref())?;
             eprintln!("Loading model from {}", model.display());
-            let mut provider = Qwen4Provider::load(&model, KVCacheMode::Turbo8)?;
+            let mut provider = Qwen4Provider::load(&model, KVCacheMode::Fp8)?;
             let stdout = std::io::stdout();
             let mut stdout = stdout.lock();
             let mut io_error = None;
@@ -598,7 +598,6 @@ mod tests {
             "{serve_help}"
         );
         assert!(serve_help.contains("--mtp-k"), "{serve_help}");
-        assert!(serve_help.contains("--no-kv-quantization"), "{serve_help}");
         assert!(serve_help.contains("--output-format"), "{serve_help}");
     }
 }
