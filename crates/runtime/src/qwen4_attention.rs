@@ -625,6 +625,8 @@ impl Qwen4Attention {
             }
             mlxcel_core::concatenate_owned(&outputs, 2)
         } else if let Some((indices, valid)) = qsa_prefill {
+            mlxcel_core::eval(indices);
+            mlxcel_core::eval(valid);
             let (cache_k, cache_v) = cache.update_and_fetch(keys, values);
             mlxcel_core::qsa_sparse_prefill_attention(
                 &queries,
