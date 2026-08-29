@@ -958,6 +958,17 @@ pub(crate) struct Qwen4SparseMoe {
     top_k: usize,
 }
 
+fn canonicalize_expert_selection(
+    indices: &MlxArray,
+    scores: &MlxArray,
+) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+    let order = mlxcel_core::argsort(indices, -1);
+    (
+        mlxcel_core::take_along_axis(indices, &order, -1),
+        mlxcel_core::take_along_axis(scores, &order, -1),
+    )
+}
+
 impl Qwen4SparseMoe {
     fn from_weights(
         weights: &WeightMap,
@@ -1028,15 +1039,10 @@ impl Qwen4SparseMoe {
         let scores = mlxcel_core::take_along_axis(&gates, &indices, -1);
         let score_sum = mlxcel_core::sum_axis(&scores, -1, true);
         let scores = mlxcel_core::divide(&scores, &score_sum);
-        let (indices, scores) = if shape[1] == 1 {
-            let order = mlxcel_core::argsort(&indices, -1);
-            (
-                mlxcel_core::take_along_axis(&indices, &order, -1),
-                mlxcel_core::take_along_axis(&scores, &order, -1),
-            )
-        } else {
-            (indices, scores)
-        };
+        // Canonicalize every row, not only one-token decode. Batched MTP
+        // verification must gather and reduce experts in the same order as N
+        // sequential one-token forwards.
+        let (indices, scores) = canonicalize_expert_selection(&indices, &scores);
         let experts = self.switch_mlp.forward(input, &indices);
         let routed = mlxcel_core::sum_axis(
             &mlxcel_core::multiply(&experts, &mlxcel_core::expand_dims(&scores, -1)),
@@ -3153,6 +3159,41 @@ mod tests {
         );
         mlxcel_core::eval(&close);
         assert!(mlxcel_core::item_bool(&close));
+    }
+
+    #[test]
+    fn batched_expert_selection_matches_sequential_row_order() {
+        let indices = mlxcel_core::from_slice_i32(&[7, 2, 5, 3, 4, 1], &[1, 2, 3]);
+        let scores = mlxcel_core::from_slice_f32(&[0.7, 0.2, 0.5, 0.3, 0.4, 0.1], &[1, 2, 3]);
+        let (batch_indices, batch_scores) =
+            canonicalize_expert_selection(&indices, &scores);
+
+        let mut sequential_indices = Vec::new();
+        let mut sequential_scores = Vec::new();
+        for row in 0..2 {
+            let row_indices = mlxcel_core::slice(&indices, &[0, row, 0], &[1, row + 1, 3]);
+            let row_scores = mlxcel_core::slice(&scores, &[0, row, 0], &[1, row + 1, 3]);
+            let (row_indices, row_scores) =
+                canonicalize_expert_selection(&row_indices, &row_scores);
+            sequential_indices.push(row_indices);
+            sequential_scores.push(row_scores);
+        }
+        let sequential_indices = mlxcel_core::concatenate_owned(&sequential_indices, 1);
+        let sequential_scores = mlxcel_core::concatenate_owned(&sequential_scores, 1);
+
+        let expected_indices =
+            mlxcel_core::from_slice_i32(&[2, 5, 7, 1, 3, 4], &[1, 2, 3]);
+        let expected_scores =
+            mlxcel_core::from_slice_f32(&[0.2, 0.5, 0.7, 0.1, 0.3, 0.4], &[1, 2, 3]);
+        for equal in [
+            mlxcel_core::allclose(&batch_indices, &sequential_indices, 0.0, 0.0),
+            mlxcel_core::allclose(&batch_scores, &sequential_scores, 0.0, 0.0),
+            mlxcel_core::allclose(&batch_indices, &expected_indices, 0.0, 0.0),
+            mlxcel_core::allclose(&batch_scores, &expected_scores, 0.0, 0.0),
+        ] {
+            mlxcel_core::eval(&equal);
+            assert!(mlxcel_core::item_bool(&equal));
+        }
     }
 
     #[test]
