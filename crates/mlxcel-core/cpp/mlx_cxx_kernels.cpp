@@ -532,6 +532,16 @@ namespace {
         }
         float inverse_sum = 1.0f / reduction[0];
 
+        // Normalize once per selected token. Reusing the probabilities from
+        // threadgroup memory avoids recomputing the same exponential for every
+        // output dimension.
+        for (uint selection = thread_index; selection < selected;
+             selection += 256u) {
+            logits[selection] =
+                exp(logits[selection] - row_max) * inverse_sum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
         for (uint dim = thread_index; dim < head_dim; dim += 256u) {
             float output = 0.0f;
             for (uint selection = 0; selection < selected; ++selection) {
@@ -541,9 +551,8 @@ namespace {
                     uint value_offset =
                         (((batch_index * kv_heads + kv_head) * key_length
                           + token) * head_dim) + dim;
-                    float probability =
-                        exp(logits[selection] - row_max) * inverse_sum;
-                    output += probability * (float)values[value_offset];
+                    output += logits[selection]
+                            * (float)values[value_offset];
                 }
             }
             outputs[query_base + dim] = (T)output;
