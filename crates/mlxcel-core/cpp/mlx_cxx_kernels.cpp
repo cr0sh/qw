@@ -544,19 +544,9 @@ namespace {
 
         for (uint dim = thread_index; dim < head_dim; dim += 256u) {
             float output = 0.0f;
-            uint always_valid = selected - checked_tail;
-            for (uint selection = 0; selection < always_valid; ++selection) {
+            for (uint selection = 0; selection < selected; ++selection) {
                 uint selection_offset = selection_base + selection;
-                uint token = (uint)indices[selection_offset];
-                uint value_offset =
-                    (((batch_index * kv_heads + kv_head) * key_length
-                      + token) * head_dim) + dim;
-                output += logits[selection] * (float)values[value_offset];
-            }
-            for (uint selection = always_valid; selection < selected;
-                 ++selection) {
-                uint selection_offset = selection_base + selection;
-                if (valid[selection_offset]) {
+                if (selection + 4u < selected || valid[selection_offset]) {
                     uint token = (uint)indices[selection_offset];
                     uint value_offset =
                         (((batch_index * kv_heads + kv_head) * key_length
@@ -609,7 +599,6 @@ std::unique_ptr<MlxArray> qsa_sparse_prefill_attention(
     int kv_heads = key_shape[1];
     int key_length = key_shape[2];
     int selected = indices.inner.shape()[2];
-    int checked_tail = selected < 4 ? selected : 4;
     auto T = queries.inner.dtype();
     auto scale_value = full({1}, scale, float32);
 
@@ -621,7 +610,6 @@ std::unique_ptr<MlxArray> qsa_sparse_prefill_attention(
         {"key_length", key_length},
         {"head_dim", head_dim},
         {"selected", selected},
-        {"checked_tail", checked_tail},
     };
     std::vector<array> inputs = {
         queries.inner, keys.inner, values.inner, indices.inner, valid.inner,
