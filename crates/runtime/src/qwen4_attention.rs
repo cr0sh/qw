@@ -100,15 +100,18 @@ impl Qwen4LayerCache {
         match self {
             Self::Attention(cache) => cache.materialize_state(),
             Self::Linear(cache) => {
-                let arrays: Vec<*const MlxArray> =
-                    [cache.conv_state.as_deref(), cache.state_cache.as_deref()]
-                        .into_iter()
-                        .flatten()
-                        .map(|array| {
-                            mlxcel_core::eval(array);
-                            array as *const MlxArray
-                        })
-                        .collect();
+                let arrays: Vec<*const MlxArray> = [
+                    cache.conv_state.as_deref(),
+                    cache.state_cache.as_deref(),
+                    cache.ple_conv_state.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .map(|array| {
+                    mlxcel_core::eval(array);
+                    array as *const MlxArray
+                })
+                .collect();
                 if !arrays.is_empty() {
                     unsafe { mlxcel_core::detach_all(&arrays) };
                 }
@@ -1052,4 +1055,5 @@ mod tests {
         mlxcel_core::eval(&close);
         assert!(mlxcel_core::item_bool(&close));
     }
+
 }
