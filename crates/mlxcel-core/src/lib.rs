@@ -3293,18 +3293,6 @@ pub fn causal_attention(
     ffi::ffi_fast_scaled_dot_product_attention_causal(q, k, v, scale)
 }
 
-/// MLX's native causal SDPA without the single-query decode detour.
-///
-/// Use when batched and one-row calls must share one reduction implementation.
-pub fn native_causal_attention(
-    q: &MlxArray,
-    k: &MlxArray,
-    v: &MlxArray,
-    scale: f32,
-) -> UniquePtr<MlxArray> {
-    ffi::ffi_fast_scaled_dot_product_attention_causal(q, k, v, scale)
-}
-
 /// Causal SDPA wrapper with transparent M5 Neural Accelerator routing.
 ///
 /// This is the zero-softcap, full-window shorthand used by existing model code.
