@@ -9,7 +9,7 @@ use std::thread;
 use clap::Parser as _;
 use clap_derive::{Args, Parser, Subcommand};
 use qw_runtime::{
-    DEFAULT_MODEL_IDENTIFIER, GenerationRequest, KVCacheMode, Qwen35Provider, model_cache_path,
+    DEFAULT_MODEL_IDENTIFIER, GenerationRequest, KVCacheMode, Qwen4Provider, model_cache_path,
     resolve_model_path, validate_identifier,
 };
 use qw_server::serve;
@@ -17,7 +17,7 @@ use qw_server::serve;
 #[derive(Debug, Parser)]
 #[command(
     name = "qw",
-    about = "Local dense Qwen3.5 inference",
+    about = "Local Qwen3.8 Flash Next REAP inference",
     disable_help_subcommand = true
 )]
 struct Cli {
@@ -39,7 +39,7 @@ enum Command {
 
 #[derive(Debug, Args)]
 struct DownloadArgs {
-    /// Hugging Face model identifier, such as Qwen/Qwen3.5-0.8B; defaults to the resolver model.
+    /// Hugging Face model identifier; defaults to the fixed Qwen3.8 Flash Next REAP model.
     identifier: Option<String>,
 }
 
@@ -387,7 +387,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Command::Generate(args) => {
             let model = qw_runtime::resolve_model_path(args.model.as_deref())?;
             eprintln!("Loading model from {}", model.display());
-            let mut provider = Qwen35Provider::load(&model, KVCacheMode::Fp16)?;
+            let mut provider = Qwen4Provider::load(&model, KVCacheMode::Fp8)?;
             let stdout = std::io::stdout();
             let mut stdout = stdout.lock();
             let mut io_error = None;
@@ -482,15 +482,15 @@ mod tests {
 
     #[test]
     fn download_accepts_explicit_identifier_override() {
-        let cli = Cli::try_parse_from(["qw", "download", "Qwen/Qwen3.5-0.8B"])
+        let cli = Cli::try_parse_from(["qw", "download", "Qwen/Qwen4-0.8B"])
             .expect("parse download command");
         let Command::Download(args) = cli.command else {
             panic!("expected download command");
         };
-        assert_eq!(args.identifier.as_deref(), Some("Qwen/Qwen3.5-0.8B"));
+        assert_eq!(args.identifier.as_deref(), Some("Qwen/Qwen4-0.8B"));
         assert_eq!(
             resolve_download_identifier(args.identifier.as_deref()),
-            "Qwen/Qwen3.5-0.8B"
+            "Qwen/Qwen4-0.8B"
         );
     }
     #[test]
@@ -577,41 +577,6 @@ mod tests {
         assert_eq!(request.seed, Some(42));
     }
 
-    #[cfg(feature = "specprefill")]
-    #[test]
-    fn serve_accepts_server_options() {
-        let cli = Cli::try_parse_from([
-            "qw",
-            "serve",
-            "--model",
-            "/tmp/model",
-            "--model-id",
-            "served-model",
-            "--bind",
-            "127.0.0.1:9000",
-            "--prefix-cache-memory-bytes",
-            "4096",
-            "--prefix-cache-directory",
-            "/tmp/prefixes",
-            "--prefix-cache-filesystem-bytes",
-            "8192",
-            "--mtp-k",
-            "5",
-            "--specprefill-min-turn-tokens",
-            "12000",
-            "--specprefill-keep-rate",
-            "0.4",
-            "--specprefill-keep-first-tokens",
-            "0",
-            "--specprefill-keep-last-tokens",
-            "64",
-            "--no-kv-quantization",
-            "--output-format",
-            "json",
-        ])
-        .expect("parse serve command");
-        assert!(matches!(cli.command, Command::Serve(_)));
-    }
     #[test]
     fn help_documents_stats_and_serve_commands_and_server_options() {
         let help = Cli::command().render_long_help().to_string();
@@ -633,29 +598,6 @@ mod tests {
             "{serve_help}"
         );
         assert!(serve_help.contains("--mtp-k"), "{serve_help}");
-        #[cfg(feature = "specprefill")]
-        assert!(
-            serve_help.contains("--specprefill-min-turn-tokens"),
-            "{serve_help}"
-        );
-        #[cfg(feature = "specprefill")]
-        assert!(
-            serve_help.contains("--specprefill-keep-rate"),
-            "{serve_help}"
-        );
-        #[cfg(feature = "specprefill")]
-        assert!(
-            serve_help.contains("--specprefill-keep-first-tokens"),
-            "{serve_help}"
-        );
-        #[cfg(feature = "specprefill")]
-        assert!(
-            serve_help.contains("--specprefill-keep-last-tokens"),
-            "{serve_help}"
-        );
-        #[cfg(not(feature = "specprefill"))]
-        assert!(!serve_help.contains("--specprefill-"), "{serve_help}");
-        assert!(serve_help.contains("--no-kv-quantization"), "{serve_help}");
         assert!(serve_help.contains("--output-format"), "{serve_help}");
     }
 }

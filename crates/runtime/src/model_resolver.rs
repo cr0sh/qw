@@ -5,10 +5,9 @@ use anyhow::{Result, bail};
 /// Fixed default identifier for checkpoints that `qw generate`, `qw serve`,
 /// and the runtime benchmarks use when neither `--model` nor `QW_MODEL_PATH`
 /// is given. Users override the *path* to a checkpoint, never this identifier.
-pub const DEFAULT_MODEL_IDENTIFIER: &str = "Jundot/Qwen3.8-27B-oQ4e-fp16-mtp";
-#[cfg(any(feature = "specprefill", test))]
-pub const DEFAULT_SPECPREFILL_DRAFT_MODEL_IDENTIFIER: &str =
-    "mlx-community/Qwen3.5-0.8B-MLX-8bit";
+pub const DEFAULT_MODEL_IDENTIFIER: &str = "sh0wie/Qwen3.8-Flash-Next-REAP-288-MLX-4bit";
+pub const DEFAULT_MTP_DRAFT_MODEL_IDENTIFIER: &str =
+    "sh0wie/Qwen3.8-Flash-Next-MTP-Drafter-MLX-bf16";
 
 /// Split a Hugging Face model identifier into the namespace and model
 /// components that form the cache subdirectory. Rejects identifiers that could
@@ -70,49 +69,32 @@ pub fn resolve_model_path(cli_override: Option<&Path>) -> Result<PathBuf> {
     resolve_model_dir(cli_override, env_override.as_deref(), home.as_deref())
 }
 
-#[cfg(any(feature = "specprefill", test))]
-fn resolve_specprefill_draft_dir(
-    cli_override: Option<&Path>,
-    env_override: Option<&Path>,
-    home: Option<&Path>,
-) -> Result<PathBuf> {
-    if let Some(path) = cli_override {
-        return Ok(path.to_path_buf());
-    }
-    if let Some(path) = env_override {
-        return Ok(path.to_path_buf());
-    }
-    let Some(home) = home else {
-        bail!("HOME is not set");
-    };
-    model_cache_path(home, DEFAULT_SPECPREFILL_DRAFT_MODEL_IDENTIFIER)
-}
-
-#[cfg(any(feature = "specprefill", test))]
-pub fn resolve_specprefill_draft_path(cli_override: Option<&Path>) -> Result<PathBuf> {
-    let env_override = std::env::var_os("QW_SPECPREFILL_DRAFT_MODEL_PATH")
+/// Resolve the standalone native MTP companion, honoring
+/// `QW_MTP_MODEL_PATH` before its fixed cache location.
+pub fn resolve_mtp_model_path() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("QW_MTP_MODEL_PATH")
         .filter(|value| !value.is_empty())
-        .map(PathBuf::from);
+        .map(PathBuf::from)
+    {
+        return Ok(path);
+    }
     let home = std::env::var_os("HOME")
         .filter(|value| !value.is_empty())
-        .map(PathBuf::from);
-    resolve_specprefill_draft_dir(cli_override, env_override.as_deref(), home.as_deref())
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("HOME is not set"))?;
+    model_cache_path(&home, DEFAULT_MTP_DRAFT_MODEL_IDENTIFIER)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        DEFAULT_MODEL_IDENTIFIER, DEFAULT_SPECPREFILL_DRAFT_MODEL_IDENTIFIER, model_cache_path,
-        resolve_model_dir, resolve_specprefill_draft_dir,
-    };
+    use super::{DEFAULT_MODEL_IDENTIFIER, model_cache_path, resolve_model_dir};
     use std::path::Path;
 
     #[test]
     fn model_cache_path_preserves_namespace() {
         assert_eq!(
-            model_cache_path(Path::new("/home/user"), "Qwen/Qwen3.5-0.8B")
-                .expect("valid identifier"),
-            Path::new("/home/user/.cache/qw/models/Qwen/Qwen3.5-0.8B")
+            model_cache_path(Path::new("/home/user"), "Qwen/Qwen4-0.8B").expect("valid identifier"),
+            Path::new("/home/user/.cache/qw/models/Qwen/Qwen4-0.8B")
         );
     }
 
@@ -139,8 +121,12 @@ mod tests {
     #[test]
     fn resolve_model_dir_precedence() {
         assert_eq!(
-            resolve_model_dir(Some(Path::new("/cli")), Some(Path::new("/env")), Some(Path::new("/home")))
-                .expect("cli override"),
+            resolve_model_dir(
+                Some(Path::new("/cli")),
+                Some(Path::new("/env")),
+                Some(Path::new("/home"))
+            )
+            .expect("cli override"),
             Path::new("/cli")
         );
         assert_eq!(
@@ -149,15 +135,17 @@ mod tests {
             Path::new("/env")
         );
         assert_eq!(
-            resolve_model_dir(None, None, Some(Path::new("/home")))
-                .expect("default cache"),
-            Path::new("/home/.cache/qw/models/Jundot/Qwen3.8-27B-oQ4e-fp16-mtp")
+            resolve_model_dir(None, None, Some(Path::new("/home"))).expect("default cache"),
+            Path::new("/home/.cache/qw/models/sh0wie/Qwen3.8-Flash-Next-REAP-288-MLX-4bit",)
         );
     }
 
     #[test]
     fn resolve_model_dir_requires_home_only_when_unoverridden() {
-        assert!(resolve_model_dir(None, None, None).is_err(), "HOME required without overrides");
+        assert!(
+            resolve_model_dir(None, None, None).is_err(),
+            "HOME required without overrides"
+        );
         assert_eq!(
             resolve_model_dir(Some(Path::new("/cli")), None, None)
                 .expect("cli override needs no HOME"),
@@ -170,38 +158,7 @@ mod tests {
         assert_eq!(
             model_cache_path(Path::new("/home/user"), DEFAULT_MODEL_IDENTIFIER)
                 .expect("default identifier is valid"),
-            Path::new("/home/user/.cache/qw/models/Jundot/Qwen3.8-27B-oQ4e-fp16-mtp")
-        );
-    }
-
-    #[test]
-    fn specprefill_draft_default_path_and_precedence() {
-        assert_eq!(
-            resolve_specprefill_draft_dir(
-                Some(Path::new("/cli-draft")),
-                Some(Path::new("/env-draft")),
-                Some(Path::new("/home")),
-            )
-            .expect("explicit override"),
-            Path::new("/cli-draft")
-        );
-        assert_eq!(
-            resolve_specprefill_draft_dir(
-                None,
-                Some(Path::new("/env-draft")),
-                Some(Path::new("/home")),
-            )
-            .expect("environment override"),
-            Path::new("/env-draft")
-        );
-        assert_eq!(
-            resolve_specprefill_draft_dir(None, None, Some(Path::new("/home")))
-                .expect("default draft cache"),
-            model_cache_path(
-                Path::new("/home"),
-                DEFAULT_SPECPREFILL_DRAFT_MODEL_IDENTIFIER,
-            )
-            .expect("valid pinned identifier")
+            Path::new("/home/user/.cache/qw/models/sh0wie/Qwen3.8-Flash-Next-REAP-288-MLX-4bit",)
         );
     }
 }

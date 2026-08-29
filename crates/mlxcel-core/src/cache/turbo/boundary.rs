@@ -156,7 +156,7 @@ pub fn is_boundary_layer(layer_idx: usize, n_layers: usize, boundary: i32) -> bo
 ///   few extra bytes per token in those 4 layers but recovers strictly
 ///   more quality, and the boundary-layer count is tiny relative to
 ///   the model depth.
-/// - `Fp16` and `Int8` modes are passed through unchanged: there is
+/// - `Fp16`, `Fp8`, and `Int8` modes are passed through unchanged: there is
 ///   nothing for the boundary policy to upgrade to.
 ///
 /// Used by: [`resolve_layer_mode`] — kept as a separate helper so the
@@ -171,7 +171,7 @@ pub fn boundary_mode_for(nominal: KVCacheMode) -> KVCacheMode {
         | KVCacheMode::Turbo3Asym => KVCacheMode::Fp16,
         // Non-turbo modes have no boundary upgrade path — return the
         // nominal mode unchanged.
-        KVCacheMode::Fp16 | KVCacheMode::Int8 => nominal,
+        KVCacheMode::Fp16 | KVCacheMode::Fp8 | KVCacheMode::Int8 => nominal,
     }
 }
 

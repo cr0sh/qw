@@ -5,9 +5,7 @@ use mlxcel_core::generate::{ModelStateSnapshot, SnapshotPage};
 use mlxcel_core::{MlxArray, UniquePtr};
 
 use crate::provider::PromptSnapshot;
-use crate::qwen3_5_mtp::MtpPromptSnapshot;
-#[cfg(any(feature = "dflash2", test))]
-use crate::qwen3_5_dflash::Dflash2PromptSnapshot;
+use crate::qwen4_mtp::MtpPromptSnapshot;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortablePage {
@@ -50,13 +48,6 @@ pub enum PortablePromptSnapshot {
         draft: PortableModelState,
         draft_offset: i32,
         last_hidden: PortableArray,
-        continuation_logits: PortableArray,
-    },
-    #[cfg(any(feature = "dflash2", test))]
-    Dflash2 {
-        target: PortableModelState,
-        hidden_concat: PortableArray,
-        hidden_offset: usize,
         continuation_logits: PortableArray,
     },
 }
@@ -239,8 +230,6 @@ impl PromptSnapshot {
         match self {
             Self::Baseline(snapshot) => snapshot.nbytes(),
             Self::Mtp(snapshot) => snapshot.nbytes(),
-            #[cfg(any(feature = "dflash2", test))]
-            Self::Dflash2(snapshot) => snapshot.nbytes(),
         }
     }
 
@@ -250,8 +239,6 @@ impl PromptSnapshot {
                 PortablePromptSnapshot::Baseline(model_to_portable(snapshot))
             }
             Self::Mtp(snapshot) => snapshot.to_portable(),
-            #[cfg(any(feature = "dflash2", test))]
-            Self::Dflash2(snapshot) => snapshot.to_portable(),
         })
     }
 
@@ -259,8 +246,6 @@ impl PromptSnapshot {
         match self {
             Self::Baseline(snapshot) => snapshot.storage_summary(),
             Self::Mtp(snapshot) => snapshot.storage_summary(),
-            #[cfg(any(feature = "dflash2", test))]
-            Self::Dflash2(snapshot) => snapshot.storage_summary(),
         }
     }
 
@@ -283,19 +268,6 @@ impl PromptSnapshot {
                 continuation_logits,
             )
             .map(Self::Mtp),
-            #[cfg(any(feature = "dflash2", test))]
-            PortablePromptSnapshot::Dflash2 {
-                target,
-                hidden_concat,
-                hidden_offset,
-                continuation_logits,
-            } => Dflash2PromptSnapshot::from_portable_parts(
-                model_from_portable(target, false, false)?,
-                hidden_concat,
-                hidden_offset,
-                continuation_logits,
-            )
-            .map(Self::Dflash2),
         }
     }
 }

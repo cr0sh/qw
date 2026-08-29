@@ -768,6 +768,25 @@ pub fn turbo4_v_inverse_rotate(x: &MlxArray, params: &TurboQuantParams) -> Uniqu
     ffi::astype(&out_f32, dtype::FLOAT16)
 }
 
+/// Apply the inverse K-side TurboQuant rotation.
+pub fn turbo4_k_inverse_rotate(x: &MlxArray, params: &TurboQuantParams) -> UniquePtr<MlxArray> {
+    let shape = ffi::array_shape(x);
+    let d = *shape
+        .last()
+        .expect("turbo4_k_inverse_rotate: input must be at least 1-D") as usize;
+    assert_eq!(
+        d, params.head_dim as usize,
+        "turbo4_k_inverse_rotate: last dim ({d}) must match TurboQuantParams head_dim ({})",
+        params.head_dim
+    );
+    let signs1_arr = ffi::from_slice_f32(&params.k_signs1, &[1, 1, 1, d as i32]);
+    let signs2_arr = ffi::from_slice_f32(&params.k_signs2, &[1, 1, 1, d as i32]);
+    let x_f32 = ffi::astype(x, dtype::FLOAT32);
+    let pre_h = ffi::multiply(&x_f32, &signs2_arr);
+    let post_h = wht(&pre_h);
+    ffi::astype(&ffi::multiply(&post_h, &signs1_arr), dtype::FLOAT16)
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------

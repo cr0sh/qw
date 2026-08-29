@@ -1,8 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::Duration;
-#[cfg(any(feature = "specprefill", test))]
-use std::time::Instant;
 
 use anyhow::{Context, Result, ensure};
 use mlxcel_core::cache::KVCacheMode;
@@ -10,19 +8,13 @@ use mlxcel_core::generate::{
     ControlledGeneration, CxxGenerator, GenerationStopReason, LanguageModel, ModelStateSnapshot,
     PrefixReuse, SamplingConfig, TokenConstraint,
 };
-#[cfg(any(feature = "specprefill", test))]
-use mlxcel_core::generation_policy::{
-    initial_token_history, merged_eos_token_ids, seed_rng_if_needed,
-};
-#[cfg(any(feature = "specprefill", test))]
-use mlxcel_core::loop_detection::detect_repetition_loop;
-#[cfg(any(feature = "specprefill", test))]
-use mlxcel_core::sampling::{
-    SamplerState, sample_token_optimized, sample_token_optimized_with_state,
-};
-use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use tokenizers::Tokenizer;
+use tokenizers::decoders::DecoderWrapper;
+use tokenizers::models::ModelWrapper;
+use tokenizers::normalizers::NormalizerWrapper;
+use tokenizers::pre_tokenizers::PreTokenizerWrapper;
+use tokenizers::processors::PostProcessorWrapper;
 use tracing::debug;
 
 use crate::chat_template::ChatTemplateProcessor;
@@ -31,22 +23,9 @@ pub use crate::chat_template::{
     ChatMessage, ChatMessageContent, ChatPromptCacheBreakpoint, ChatTool, ChatToolCall,
     ChatToolCallFunction, ChatToolFunction,
 };
-use crate::qwen_vl::insert_qwen_vl_image_tokens;
-use crate::qwen_vl_merge::merge_llava;
-use crate::qwen_vl_position::compute_rope_index;
-use crate::qwen_vl_processor::{PreparedImage, QwenVLProcessor};
-use crate::qwen3_5::Qwen35Model;
-#[cfg(any(feature = "dflash2", test))]
-pub use crate::qwen3_5_dflash::{
-    Dflash2GenerationStats, Dflash2PrefixReuse, Dflash2PromptSnapshot,
-};
-use crate::qwen3_5_mtp::Qwen35MtpGenerator;
-pub use crate::qwen3_5_mtp::{MtpGenerationStats, MtpPrefixReuse, MtpPromptSnapshot};
-#[cfg(any(feature = "specprefill", test))]
-use crate::specprefill::{
-    PrefillMode, SpecPrefillConfig, SpecPrefillStats, dense_prefix_end, score_tokens,
-    select_target_indices, should_activate,
-};
+use crate::qwen4::Qwen4Model;
+pub use crate::qwen4_mtp::{MtpGenerationStats, MtpPrefixReuse, MtpPromptSnapshot};
+use crate::qwen4_mtp::{Qwen4MtpDraftModel, Qwen4MtpGenerator};
 
 const DEFAULT_MTP_BLOCK_SIZE: usize = 3;
 
@@ -85,122 +64,6 @@ fn log_generation_metrics(
         tokens_per_second = tokens_per_second(completion_tokens, decode_time),
     );
 }
-#[cfg(any(feature = "specprefill", test))]
-struct SparseGeneration {
-    token_ids: Vec<i32>,
-    stop_reason: GenerationStopReason,
-    cached_tokens: usize,
-    prefill_time: Duration,
-    decode_time: Duration,
-    stats: SpecPrefillStats,
-}
-
-#[cfg(any(feature = "specprefill", test))]
-#[allow(clippy::too_many_arguments)]
-fn generate_specprefill_tokens<F: FnMut(i32) -> bool>(
-    model: &Qwen35Model,
-    draft: &Qwen35Model,
-    prompt_ids: &[i32],
-    max_tokens: usize,
-    sampling: &SamplingConfig,
-    prefix_reuse: Option<PrefixReuse<'_>>,
-    config: SpecPrefillConfig,
-    mut on_token: F,
-) -> Result<SparseGeneration> {
-    let requested_cached_tokens = prefix_reuse.as_ref().map_or(0, |reuse| reuse.cached_tokens);
-    let structurally_reusable = prefix_reuse.as_ref().is_some_and(|reuse| {
-        reuse.cached_tokens > 0
-            && reuse.cached_tokens <= prompt_ids.len()
-            && reuse.snapshot.token_len() == reuse.cached_tokens
-            && (reuse.cached_tokens < prompt_ids.len()
-                || reuse.snapshot.continuation_logits().is_some())
-    });
-    let admitted_cached_tokens = structurally_reusable
-        .then_some(requested_cached_tokens)
-        .unwrap_or(0);
-    let dense_end = dense_prefix_end(admitted_cached_tokens, config);
-    let eligible = &prompt_ids[dense_end..];
-
-    let scoring_start = Instant::now();
-    let importance = score_tokens(draft, eligible)?;
-    let draft_scoring_time = scoring_start.elapsed();
-    let selected = select_target_indices(&importance, dense_end, prompt_ids.len(), config);
-
-    let target_start = Instant::now();
-    let (mut logits, cached_tokens) = model
-        .specprefill_sparse_prefill(prompt_ids, prefix_reuse, dense_end, &selected)
-        .map_err(anyhow::Error::msg)
-        .context("sparse target prefill failed")?;
-    mlxcel_core::eval(&logits);
-    let target_prefill_time = target_start.elapsed();
-
-    let mut effective_sampling = sampling.clone();
-    effective_sampling
-        .token_bias
-        .suppress_tokens(&model.output_suppressed_token_ids());
-    seed_rng_if_needed(&effective_sampling);
-    let eos_tokens =
-        merged_eos_token_ids(model.eos_token_ids(), &effective_sampling.stop_token_ids);
-    let needs_history = effective_sampling.needs_token_history();
-    let mut token_history = initial_token_history(prompt_ids, needs_history);
-    let mut sampler_state: Option<SamplerState> = None;
-    let mut generated = Vec::with_capacity(max_tokens);
-    let mut stop_reason = GenerationStopReason::MaxTokens;
-    let decode_start = Instant::now();
-
-    while generated.len() < max_tokens {
-        let (token, _) = if needs_history {
-            sample_token_optimized_with_state(
-                &logits,
-                &effective_sampling,
-                &token_history,
-                &mut sampler_state,
-            )
-        } else {
-            sample_token_optimized(&logits, &effective_sampling, &token_history)
-        };
-        mlxcel_core::eval(&token);
-        let token_id = mlxcel_core::item_i32(&token);
-        if eos_tokens.contains(&token_id) {
-            stop_reason = GenerationStopReason::Eos;
-            break;
-        }
-        generated.push(token_id);
-        if needs_history {
-            token_history.push(token_id);
-        }
-        if !on_token(token_id) {
-            stop_reason = GenerationStopReason::CallbackCancelled;
-            break;
-        }
-        if detect_repetition_loop(&generated, &effective_sampling.loop_detection) {
-            stop_reason = GenerationStopReason::RepetitionLoop;
-            break;
-        }
-        if generated.len() == max_tokens {
-            break;
-        }
-        logits = model.specprefill_decode(token_id, prompt_ids.len() + generated.len() - 1);
-    }
-    let decode_time = decode_start.elapsed();
-    let stats = SpecPrefillStats {
-        draft_tokens: eligible.len(),
-        eligible_target_tokens: eligible.len(),
-        selected_target_tokens: selected.len(),
-        protected_target_tokens: dense_end.saturating_sub(cached_tokens),
-        cached_target_tokens: cached_tokens,
-        draft_scoring_time,
-        target_prefill_time,
-    };
-    Ok(SparseGeneration {
-        token_ids: generated,
-        stop_reason,
-        cached_tokens,
-        prefill_time: target_prefill_time,
-        decode_time,
-        stats,
-    })
-}
 
 #[derive(Debug, Clone)]
 pub struct GenerationRequest {
@@ -221,8 +84,6 @@ pub struct GenerationOutput {
 pub enum PromptSnapshot {
     Baseline(ModelStateSnapshot),
     Mtp(MtpPromptSnapshot),
-    #[cfg(any(feature = "dflash2", test))]
-    Dflash2(Dflash2PromptSnapshot),
 }
 
 impl PromptSnapshot {
@@ -230,8 +91,6 @@ impl PromptSnapshot {
         match self {
             Self::Baseline(snapshot) => snapshot.token_len(),
             Self::Mtp(snapshot) => snapshot.token_len(),
-            #[cfg(any(feature = "dflash2", test))]
-            Self::Dflash2(snapshot) => snapshot.token_len(),
         }
     }
 }
@@ -249,24 +108,19 @@ pub struct BaselineGeneration {
     pub prefill_time: Duration,
     /// Wall time spent sampling and forwarding generated tokens.
     pub decode_time: Duration,
-    #[cfg(any(feature = "specprefill", test))]
-    pub specprefill_stats: Option<SpecPrefillStats>,
 }
-
-pub struct PreparedMultimodalPrefill {
-    pub prompt_ids: Vec<i32>,
-    input_embeddings: UniquePtr<MlxArray>,
-    position_ids: UniquePtr<MlxArray>,
-    rope_delta: i32,
-}
-
-enum MtpPrompt<'a> {
-    Text { prompt_ids: &'a [i32] },
-    Multimodal(PreparedMultimodalPrefill),
-}
+type QwenDecodeStream<'a> = tokenizers::DecodeStream<
+    'a,
+    ModelWrapper,
+    NormalizerWrapper,
+    PreTokenizerWrapper,
+    PostProcessorWrapper,
+    DecoderWrapper,
+>;
 
 struct IncrementalTextDecoder<'a> {
     tokenizer: &'a Tokenizer,
+    stream: QwenDecodeStream<'a>,
     token_ids: Vec<u32>,
     emitted: String,
 }
@@ -274,6 +128,7 @@ struct IncrementalTextDecoder<'a> {
 impl<'a> IncrementalTextDecoder<'a> {
     fn new(tokenizer: &'a Tokenizer) -> Self {
         Self {
+            stream: tokenizer.decode_stream(false),
             tokenizer,
             token_ids: Vec::new(),
             emitted: String::new(),
@@ -281,14 +136,16 @@ impl<'a> IncrementalTextDecoder<'a> {
     }
 
     fn push(&mut self, token_id: i32) -> Result<String> {
-        self.token_ids
-            .push(u32::try_from(token_id).context("generated a negative token identifier")?);
-        let decoded = self
-            .tokenizer
-            .decode(&self.token_ids, false)
+        let token_id = u32::try_from(token_id).context("generated a negative token identifier")?;
+        self.token_ids.push(token_id);
+        let delta = self
+            .stream
+            .step(token_id)
             .map_err(anyhow::Error::msg)
-            .context("failed to incrementally decode generated tokens")?;
-        self.advance(decoded, false)
+            .context("failed to incrementally decode generated token")?
+            .unwrap_or_default();
+        self.emitted.push_str(&delta);
+        Ok(delta)
     }
 
     fn finish(&mut self) -> Result<String> {
@@ -325,24 +182,19 @@ fn advance_decoded_text(emitted: &mut String, decoded: &str, final_chunk: bool) 
 
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Qwen35GenerationMode {
+pub enum Qwen4GenerationMode {
     Automatic,
     Baseline,
     Mtp,
 }
 
-pub struct Qwen35Provider {
-    model: Qwen35Model,
+pub struct Qwen4Provider {
+    model: Qwen4Model,
     tokenizer: Tokenizer,
-    #[cfg(any(feature = "specprefill", test))]
-    specprefill_draft: Option<Qwen35Model>,
     chat_template: ChatTemplateProcessor,
     defaults: GenerationDefaults,
     generator: CxxGenerator,
-    mtp_generator: Option<Qwen35MtpGenerator>,
-    #[cfg(any(feature = "dflash2", test))]
-    dflash2_generator: Option<crate::qwen3_5_dflash::Qwen35Dflash2Generator>,
-    vision_processor: Option<QwenVLProcessor>,
+    mtp_generator: Option<Qwen4MtpGenerator>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -371,21 +223,8 @@ struct GenerationDefaults {
     top_p: f32,
 }
 
-impl Qwen35Provider {
+impl Qwen4Provider {
     pub fn load(model_dir: impl AsRef<Path>, kv_cache_mode: KVCacheMode) -> Result<Self> {
-        #[cfg(feature = "specprefill")]
-        {
-            let draft_model_dir = crate::resolve_specprefill_draft_path(None)?;
-            return Self::load_with_specprefill_draft(model_dir, &draft_model_dir, kv_cache_mode)
-                .with_context(|| {
-                    format!(
-                        "failed to load required SpecPrefill draft at {}; rerun `qw download {}`",
-                        draft_model_dir.display(),
-                        crate::DEFAULT_MODEL_IDENTIFIER
-                    )
-                });
-        }
-        #[cfg(not(feature = "specprefill"))]
         Self::load_target_only(model_dir.as_ref(), kv_cache_mode)
     }
 
@@ -408,19 +247,24 @@ impl Qwen35Provider {
             .with_context(|| format!("failed to load tokenizer {}", tokenizer_path.display()))?;
         let chat_template = ChatTemplateProcessor::from_model_path(model_dir)?;
         let defaults = load_generation_defaults(model_dir)?;
-        let model = Qwen35Model::load(model_dir, kv_cache_mode)?;
-        if model.has_vision() {
-            ensure!(
-                chat_template.supports_image_content(),
-                "unsupported Qwen3.5-VL chat template: expected image/vision marker behavior"
-            );
-        }
-        let vision_processor = model
-            .vision_config()
-            .map(|vision| load_vision_processor(model_dir, vision))
-            .transpose()?;
+        let mut model = Qwen4Model::load(model_dir, kv_cache_mode)?;
+        let mtp_model_dir = crate::resolve_mtp_model_path()?;
+        ensure!(
+            mtp_model_dir.is_dir(),
+            "MTP companion model directory does not exist: {}",
+            mtp_model_dir.display()
+        );
+        let mtp = Qwen4MtpDraftModel::load(&mtp_model_dir, &model.config)
+            .map_err(anyhow::Error::msg)
+            .with_context(|| {
+                format!(
+                    "failed to load Qwen4 MTP companion from {}",
+                    mtp_model_dir.display()
+                )
+            })?;
+        model.attach_mtp(mtp);
         let generator = CxxGenerator::new_with_kv_mode(model.num_layers(), kv_cache_mode);
-        let mtp_generator = model.has_mtp().then(Qwen35MtpGenerator::new);
+        let mtp_generator = model.has_mtp().then(Qwen4MtpGenerator::new);
 
         Ok(Self {
             model,
@@ -428,43 +272,8 @@ impl Qwen35Provider {
             chat_template,
             defaults,
             generator,
-            #[cfg(any(feature = "specprefill", test))]
-            specprefill_draft: None,
             mtp_generator,
-            #[cfg(any(feature = "dflash2", test))]
-            dflash2_generator: None,
-            vision_processor,
         })
-    }
-
-    #[cfg(any(feature = "specprefill", test))]
-    pub fn load_with_specprefill_draft(
-        model_dir: impl AsRef<Path>,
-        draft_model_dir: impl AsRef<Path>,
-        kv_cache_mode: KVCacheMode,
-    ) -> Result<Self> {
-        let mut provider = Self::load_target_only(model_dir.as_ref(), kv_cache_mode)?;
-        let draft_model_dir = draft_model_dir.as_ref();
-        let draft_tokenizer_path = draft_model_dir.join("tokenizer.json");
-        ensure!(
-            draft_tokenizer_path.is_file(),
-            "missing SpecPrefill draft tokenizer {}",
-            draft_tokenizer_path.display()
-        );
-        let draft_tokenizer = Tokenizer::from_file(&draft_tokenizer_path)
-            .map_err(anyhow::Error::msg)
-            .with_context(|| {
-                format!(
-                    "failed to load SpecPrefill draft tokenizer {}",
-                    draft_tokenizer_path.display()
-                )
-            })?;
-        ensure!(
-            provider.tokenizer.get_vocab(true) == draft_tokenizer.get_vocab(true),
-            "target and SpecPrefill draft tokenizer vocabularies are incompatible"
-        );
-        provider.specprefill_draft = Some(Qwen35Model::load_specprefill_draft(draft_model_dir)?);
-        Ok(provider)
     }
 
     pub fn tokenizer(&self) -> &Tokenizer {
@@ -482,10 +291,6 @@ impl Qwen35Provider {
 
     pub fn eos_token_id(&self) -> u32 {
         self.defaults.stop_token_ids[0] as u32
-    }
-
-    pub fn supports_image_inputs(&self) -> bool {
-        self.vision_processor.is_some() && self.model.has_vision()
     }
 
     pub fn has_mtp(&self) -> bool {
@@ -509,6 +314,12 @@ impl Qwen35Provider {
         reasoning_effort: Option<&str>,
         enable_thinking: bool,
     ) -> Result<String> {
+        ensure!(
+            messages
+                .iter()
+                .all(|message| message.image_urls().next().is_none()),
+            "Qwen4 supports text input only"
+        );
         self.chat_template
             .render_messages(messages, tools, reasoning_effort, enable_thinking, true)
     }
@@ -587,117 +398,8 @@ impl Qwen35Provider {
         Ok(token_ids)
     }
 
-    #[tracing::instrument(
-        name = "runtime.prepare_image",
-        skip(self, rgb),
-        fields(width, height, input_bytes = rgb.len()),
-        err
-    )]
-    pub fn prepare_image(&self, width: u32, height: u32, rgb: Vec<u8>) -> Result<PreparedImage> {
-        self.vision_processor
-            .as_ref()
-            .context("model does not support image inputs")?
-            .prepare_rgb_bytes(width, height, rgb)
-    }
-
-    #[tracing::instrument(
-        name = "runtime.prepare_multimodal_prefill",
-        skip_all,
-        fields(
-            message_count = messages.len(),
-            tool_count = tools.len(),
-            image_count = images.len(),
-            enable_thinking,
-        ),
-        err
-    )]
-    pub fn prepare_multimodal_prefill(
-        &self,
-        messages: &[ChatMessage],
-        tools: &[ChatTool],
-        reasoning_effort: Option<&str>,
-        enable_thinking: bool,
-        images: &[PreparedImage],
-    ) -> Result<PreparedMultimodalPrefill> {
-        ensure!(
-            !images.is_empty(),
-            "image prefill requires at least one image"
-        );
-        ensure!(
-            self.supports_image_inputs(),
-            "model does not support image inputs"
-        );
-        let declared_images = messages.iter().flat_map(ChatMessage::image_urls).count();
-        ensure!(
-            declared_images == images.len(),
-            "prepared image count does not match rendered image count"
-        );
-        let vision_config = self
-            .model
-            .vision_config()
-            .context("model does not support image inputs")?;
-        let (image_token_id, video_token_id, vision_start_token_id) = self
-            .model
-            .multimodal_token_ids()
-            .context("model does not support image inputs")?;
-        let grids = images
-            .iter()
-            .map(|image| image.grid_thw)
-            .collect::<Vec<_>>();
-        let mut prompt_ids =
-            self.tokenize_messages(messages, tools, reasoning_effort, enable_thinking)?;
-        let expansion = insert_qwen_vl_image_tokens(
-            &mut prompt_ids,
-            &grids,
-            vision_config.spatial_merge_size,
-            vision_start_token_id,
-            image_token_id,
-        )?;
-        let input_ids = mlxcel_core::from_slice_i32(&prompt_ids, &[1, prompt_ids.len() as i32]);
-        let text_embeddings = self
-            .model
-            .embed_tokens(&input_ids)
-            .context("Qwen3.5 input embeddings are unavailable")?;
-        let mut pixel_values = images[0].to_mlx();
-        for image in &images[1..] {
-            pixel_values = mlxcel_core::concatenate(&pixel_values, &image.to_mlx(), 0);
-        }
-        let pixel_values =
-            mlxcel_core::astype(&pixel_values, mlxcel_core::array_dtype(&text_embeddings));
-        let vision_features = self.model.encode_vision(&pixel_values, &grids)?;
-        ensure!(
-            mlxcel_core::array_shape(&vision_features)[0] as usize == expansion.total_image_tokens,
-            "vision encoder output count does not match expanded image token count"
-        );
-        let input_embeddings = merge_llava(
-            image_token_id,
-            &vision_features,
-            &text_embeddings,
-            &input_ids,
-        )?;
-        let positions = compute_rope_index(
-            &prompt_ids,
-            &grids,
-            vision_config.spatial_merge_size,
-            image_token_id,
-            video_token_id,
-        )?;
-        let position_ids = positions.to_mlx();
-        debug!(
-            phase = "multimodal_prefill.complete",
-            prompt_tokens = prompt_ids.len(),
-            image_tokens = expansion.total_image_tokens,
-        );
-        Ok(PreparedMultimodalPrefill {
-            prompt_ids,
-            input_embeddings,
-            position_ids,
-            rope_delta: positions.rope_delta,
-        })
-    }
-
-    pub fn supports_qwen35_tool_calls(&self) -> bool {
-        self.chat_template.supports_qwen35_tool_calls()
+    pub fn supports_qwen4_tool_calls(&self) -> bool {
+        self.chat_template.supports_qwen4_tool_calls()
     }
 
     pub fn baseline_sampling(
@@ -736,101 +438,8 @@ impl Qwen35Provider {
         prefix_reuse: Option<PrefixReuse<'_>>,
         constraint: Option<&mut dyn TokenConstraint>,
         checkpoint_token_lengths: &[usize],
-        #[cfg(any(feature = "specprefill", test))] prefill_mode: PrefillMode,
         mut on_delta: F,
     ) -> Result<BaselineGeneration> {
-        #[cfg(any(feature = "specprefill", test))]
-        if let PrefillMode::SpecPrefill(config) = prefill_mode {
-            config.validate(prompt_ids.len())?;
-            ensure!(
-                constraint.is_none(),
-                "SpecPrefill does not support token constraints"
-            );
-            ensure!(
-                !prompt_ids.is_empty(),
-                "prompt token sequence must not be empty"
-            );
-            ensure!(max_tokens > 0, "max_tokens must be greater than zero");
-            let draft = self.specprefill_draft.as_ref().context(
-                "SpecPrefill capability is unavailable because no draft model is loaded",
-            )?;
-            let requested_cached = prefix_reuse.as_ref().map_or(0, |reuse| reuse.cached_tokens);
-            let reusable = prefix_reuse.as_ref().is_some_and(|reuse| {
-                reuse.cached_tokens > 0
-                    && reuse.cached_tokens <= prompt_ids.len()
-                    && reuse.snapshot.token_len() == reuse.cached_tokens
-                    && (reuse.cached_tokens < prompt_ids.len()
-                        || reuse.snapshot.continuation_logits().is_some())
-            });
-            let dense_end =
-                dense_prefix_end(reusable.then_some(requested_cached).unwrap_or(0), config);
-            if should_activate(prompt_ids.len() - dense_end, config) {
-                let mut decoder = IncrementalTextDecoder::new(&self.tokenizer);
-                let mut decode_error = None;
-                let mut callback_active = true;
-                let sparse = generate_specprefill_tokens(
-                    &self.model,
-                    draft,
-                    prompt_ids,
-                    max_tokens,
-                    sampling,
-                    prefix_reuse,
-                    config,
-                    |token_id| match decoder.push(token_id) {
-                        Ok(delta) => {
-                            if delta.is_empty() {
-                                true
-                            } else {
-                                callback_active = on_delta(&delta);
-                                callback_active
-                            }
-                        }
-                        Err(error) => {
-                            decode_error = Some(error);
-                            false
-                        }
-                    },
-                )?;
-                if let Some(error) = decode_error {
-                    return Err(error);
-                }
-                let final_delta = decoder.finish()?;
-                if callback_active && !final_delta.is_empty() {
-                    let _ = on_delta(&final_delta);
-                }
-                let completion_tokens = sparse.token_ids.len();
-                debug!(
-                    route = "specprefill",
-                    draft_scoring_ms = sparse.stats.draft_scoring_time.as_secs_f64() * 1_000.0,
-                    target_prefill_ms = sparse.stats.target_prefill_time.as_secs_f64() * 1_000.0,
-                    selected_tokens = sparse.stats.selected_target_tokens,
-                    eligible_tokens = sparse.stats.eligible_target_tokens,
-                    "completed sparse prefill generation"
-                );
-                log_generation_metrics(
-                    "specprefill",
-                    prompt_ids.len(),
-                    completion_tokens,
-                    sparse.cached_tokens,
-                    sparse.prefill_time,
-                    sparse.decode_time,
-                );
-                return Ok(BaselineGeneration {
-                    text: decoder.emitted,
-                    token_ids: sparse.token_ids,
-                    prompt_tokens: prompt_ids.len(),
-                    completion_tokens,
-                    cached_tokens: sparse.cached_tokens,
-                    finish_outcome: sparse.stop_reason,
-                    prompt_snapshots: Vec::new(),
-                    final_snapshot: None,
-                    prefill_time: sparse.prefill_time,
-                    decode_time: sparse.decode_time,
-                    #[cfg(any(feature = "specprefill", test))]
-                    specprefill_stats: Some(sparse.stats),
-                });
-            }
-        }
         self.model.clear_prepared_mrope();
         let buffer_output = constraint.is_some();
         let mut decoder = IncrementalTextDecoder::new(&self.tokenizer);
@@ -921,114 +530,6 @@ impl Qwen35Provider {
             final_snapshot: controlled.final_snapshot.map(PromptSnapshot::Baseline),
             prefill_time,
             decode_time,
-            #[cfg(any(feature = "specprefill", test))]
-            specprefill_stats: None,
-        })
-    }
-
-    #[tracing::instrument(
-        name = "runtime.generate_multimodal",
-        skip_all,
-        fields(
-            prompt_tokens = prefill.prompt_ids.len(),
-            max_tokens,
-            constrained = constraint.is_some(),
-        ),
-        err
-    )]
-    #[allow(clippy::too_many_arguments)]
-    pub fn generate_multimodal_streaming<F: FnMut(&str) -> bool>(
-        &mut self,
-        prefill: PreparedMultimodalPrefill,
-        max_tokens: usize,
-        sampling: &SamplingConfig,
-        constraint: Option<&mut dyn TokenConstraint>,
-        mut on_delta: F,
-    ) -> Result<BaselineGeneration> {
-        self.model
-            .prepare_mrope(&prefill.position_ids, prefill.rope_delta);
-        let buffer_output = constraint.is_some();
-        let mut callback_active = true;
-        let mut decoder = IncrementalTextDecoder::new(&self.tokenizer);
-        let mut decode_error = None;
-        let controlled = self
-            .generator
-            .generate_streaming_controlled_with_embeddings(
-                &self.model,
-                &prefill.prompt_ids,
-                Some(&prefill.input_embeddings),
-                None,
-                None,
-                max_tokens,
-                sampling,
-                constraint,
-                |token_id| {
-                    if buffer_output {
-                        callback_active = on_delta("");
-                        return callback_active;
-                    }
-                    match decoder.push(token_id) {
-                        Ok(delta) => {
-                            callback_active = on_delta(&delta);
-                            callback_active
-                        }
-                        Err(error) => {
-                            decode_error = Some(error);
-                            false
-                        }
-                    }
-                },
-            )
-            .map_err(anyhow::Error::msg)
-            .context("multimodal generation failed")?;
-        if let Some(error) = decode_error {
-            return Err(error);
-        }
-        if buffer_output {
-            for &token_id in &controlled.token_ids {
-                let _ = decoder.push(token_id)?;
-            }
-            let _ = decoder.finish()?;
-            if callback_active && !decoder.emitted.is_empty() {
-                let _ = on_delta(&decoder.emitted);
-            }
-        } else {
-            let final_delta = decoder.finish()?;
-            if callback_active && !final_delta.is_empty() {
-                let _ = on_delta(&final_delta);
-            }
-        }
-        let completion_tokens = controlled.token_ids.len();
-        let prefill_time = controlled.prefill_time;
-        let decode_time = controlled.decode_time;
-        log_generation_metrics(
-            "multimodal",
-            prefill.prompt_ids.len(),
-            completion_tokens,
-            0,
-            prefill_time,
-            decode_time,
-        );
-        debug!(
-            phase = "model.complete",
-            prompt_tokens = prefill.prompt_ids.len(),
-            completion_tokens,
-            cached_tokens = 0,
-            stop_reason = ?controlled.stop_reason,
-        );
-        Ok(BaselineGeneration {
-            text: decoder.emitted,
-            token_ids: controlled.token_ids,
-            prompt_tokens: prefill.prompt_ids.len(),
-            completion_tokens,
-            cached_tokens: 0,
-            finish_outcome: controlled.stop_reason,
-            prompt_snapshots: Vec::new(),
-            final_snapshot: None,
-            prefill_time,
-            decode_time,
-            #[cfg(any(feature = "specprefill", test))]
-            specprefill_stats: None,
         })
     }
 
@@ -1044,7 +545,7 @@ impl Qwen35Provider {
         on_delta: F,
     ) -> Result<BaselineGeneration> {
         self.generate_mtp_streaming_for_prompt(
-            MtpPrompt::Text { prompt_ids },
+            prompt_ids,
             max_tokens,
             sampling,
             block_size,
@@ -1056,136 +557,6 @@ impl Qwen35Provider {
         .map(|(generation, _)| generation)
     }
 
-    pub fn generate_mtp_multimodal_streaming<F: FnMut(&str) -> bool>(
-        &mut self,
-        prefill: PreparedMultimodalPrefill,
-        max_tokens: usize,
-        sampling: &SamplingConfig,
-        block_size: usize,
-        constraint: Option<&mut dyn TokenConstraint>,
-        on_delta: F,
-    ) -> Result<BaselineGeneration> {
-        self.generate_mtp_streaming_for_prompt(
-            MtpPrompt::Multimodal(prefill),
-            max_tokens,
-            sampling,
-            block_size,
-            None,
-            &[],
-            constraint,
-            on_delta,
-        )
-        .map(|(generation, _)| generation)
-    }
-
-    #[cfg(any(feature = "dflash2", test))]
-    pub fn prepare_dflash2_prefix(
-        &mut self,
-        prompt_ids: &[i32],
-        draft_dir: &Path,
-    ) -> Result<Dflash2PromptSnapshot> {
-        if self.dflash2_generator.is_none() {
-            self.dflash2_generator = Some(
-                crate::qwen3_5_dflash::Qwen35Dflash2Generator::new(&self.model, draft_dir)
-                    .map_err(|error| anyhow::anyhow!("failed to load DFlash2 drafter: {error}"))?,
-            );
-        }
-        self.dflash2_generator
-            .as_mut()
-            .expect("DFlash2 generator was initialized")
-            .capture_prompt_snapshot(&self.model, prompt_ids)
-            .map_err(anyhow::Error::msg)
-            .context("failed to capture DFlash2 prefix")
-    }
-
-    #[cfg(any(feature = "dflash2", test))]
-    /// Generate with the DFlash2 block-diffusion drafter loaded from
-    /// `draft_dir`, decoding deltas through the provider tokenizer.
-    ///
-    /// The generator is constructed lazily on first use and kept for
-    /// subsequent calls. Greedy-only: `request.temperature` must be 0 /
-    /// `top_k` 1.
-    #[tracing::instrument(name = "runtime.generate_dflash2", skip_all, fields(max_tokens), err)]
-    pub fn generate_dflash2_streaming<F: FnMut(&str) -> bool>(
-        &mut self,
-        request: &GenerationRequest,
-        draft_dir: &Path,
-        on_delta: F,
-    ) -> Result<(GenerationOutput, Dflash2GenerationStats)> {
-        let (prompt_ids, sampling) = self.prepare_generation(request)?;
-        let (output, stats, _) = self.generate_dflash2_cached_streaming(
-            &prompt_ids,
-            request.max_tokens,
-            &sampling,
-            draft_dir,
-            None,
-            on_delta,
-        )?;
-        Ok((output, stats))
-    }
-
-    #[cfg(any(feature = "dflash2", test))]
-    pub fn generate_dflash2_cached_streaming<F: FnMut(&str) -> bool>(
-        &mut self,
-        prompt_ids: &[i32],
-        max_tokens: usize,
-        sampling: &SamplingConfig,
-        draft_dir: &Path,
-        prefix_reuse: Option<Dflash2PrefixReuse<'_>>,
-        mut on_delta: F,
-    ) -> Result<(GenerationOutput, Dflash2GenerationStats, usize)> {
-        if self.dflash2_generator.is_none() {
-            self.dflash2_generator = Some(
-                crate::qwen3_5_dflash::Qwen35Dflash2Generator::new(&self.model, draft_dir)
-                    .map_err(|error| anyhow::anyhow!("failed to load DFlash2 drafter: {error}"))?,
-            );
-        }
-        let generator = self
-            .dflash2_generator
-            .as_mut()
-            .expect("DFlash2 generator was initialized");
-        let mut decoder = IncrementalTextDecoder::new(&self.tokenizer);
-        let mut decode_error = None;
-        let generation = generator
-            .generate_streaming(
-                &self.model,
-                prompt_ids,
-                max_tokens,
-                sampling,
-                prefix_reuse,
-                |token_id| match decoder.push(token_id) {
-                    Ok(delta) => on_delta(&delta),
-                    Err(error) => {
-                        decode_error = Some(error);
-                        false
-                    }
-                },
-            )
-            .map_err(anyhow::Error::msg)
-            .context("DFlash2 generation failed")?;
-        if let Some(error) = decode_error {
-            return Err(error);
-        }
-        let completion_tokens = generation.token_ids.len();
-        let stats = generation.stats;
-        log_generation_metrics(
-            "dflash2",
-            prompt_ids.len(),
-            completion_tokens,
-            generation.cached_tokens,
-            stats.prefill_time,
-            stats.decode_time,
-        );
-        Ok((
-            GenerationOutput {
-                text: decoder.emitted,
-                token_ids: generation.token_ids,
-            },
-            stats,
-            generation.cached_tokens,
-        ))
-    }
-
     #[tracing::instrument(
         name = "runtime.generate_mtp",
         skip_all,
@@ -1195,7 +566,7 @@ impl Qwen35Provider {
 
     fn generate_mtp_streaming_for_prompt<F: FnMut(&str) -> bool>(
         &mut self,
-        prompt: MtpPrompt<'_>,
+        prompt_ids: &[i32],
         max_tokens: usize,
         sampling: &SamplingConfig,
         block_size: usize,
@@ -1207,13 +578,10 @@ impl Qwen35Provider {
         ensure!(block_size >= 2, "MTP block size must be at least 2");
         ensure!(
             self.mtp_generator.is_some(),
-            "the loaded checkpoint does not contain a bundled Qwen 3.5 MTP head"
+            "the loaded checkpoint does not contain a bundled Qwen4 MTP head"
         );
         let buffer_output = constraint.is_some();
-        let prompt_tokens = match &prompt {
-            MtpPrompt::Text { prompt_ids } => prompt_ids.len(),
-            MtpPrompt::Multimodal(prefill) => prefill.prompt_ids.len(),
-        };
+        let prompt_tokens = prompt_ids.len();
         let mut decoder = IncrementalTextDecoder::new(&self.tokenizer);
         let mut decode_error = None;
         let mut callback_active = true;
@@ -1221,8 +589,8 @@ impl Qwen35Provider {
             .mtp_generator
             .as_mut()
             .expect("MTP capability was validated");
-        let generated = match prompt {
-            MtpPrompt::Text { prompt_ids } => generator.generate_streaming(
+        let generated = generator
+            .generate_streaming(
                 &self.model,
                 prompt_ids,
                 max_tokens,
@@ -1251,41 +619,9 @@ impl Qwen35Provider {
                         }
                     }
                 },
-            ),
-            MtpPrompt::Multimodal(prefill) => generator.generate_streaming_with_embeddings(
-                &self.model,
-                &prefill.prompt_ids,
-                &prefill.input_embeddings,
-                &prefill.position_ids,
-                prefill.rope_delta,
-                max_tokens,
-                sampling,
-                block_size,
-                constraint,
-                |token_id| {
-                    if buffer_output {
-                        callback_active = on_delta("");
-                        return callback_active;
-                    }
-                    match decoder.push(token_id) {
-                        Ok(delta) => {
-                            if delta.is_empty() {
-                                true
-                            } else {
-                                callback_active = on_delta(&delta);
-                                callback_active
-                            }
-                        }
-                        Err(error) => {
-                            decode_error = Some(error);
-                            false
-                        }
-                    }
-                },
-            ),
-        }
-        .map_err(anyhow::Error::msg)
-        .context("MTP generation failed")?;
+            )
+            .map_err(anyhow::Error::msg)
+            .context("MTP generation failed")?;
         if let Some(error) = decode_error {
             return Err(error);
         }
@@ -1332,6 +668,7 @@ impl Qwen35Provider {
             mtp_target_forward_calls = generated.stats.target_forward_calls,
             mtp_speculative_rounds = generated.stats.speculative_rounds,
             mtp_full_state_materializations = generated.stats.full_state_materializations,
+            mtp_reference_fallbacks = generated.stats.reference_fallbacks,
             mtp_cache_snapshot_count = generated.stats.cache_snapshot_count,
             mtp_cache_clear_seconds = generated.stats.cache_clear_time.as_secs_f64(),
         );
@@ -1351,8 +688,6 @@ impl Qwen35Provider {
                 final_snapshot: generated.final_snapshot.map(PromptSnapshot::Mtp),
                 prefill_time,
                 decode_time,
-                #[cfg(any(feature = "specprefill", test))]
-                specprefill_stats: None,
             },
             generated.stats,
         ))
@@ -1363,7 +698,7 @@ impl Qwen35Provider {
         request: &GenerationRequest,
         on_delta: F,
     ) -> Result<GenerationOutput> {
-        self.generate_streaming_in_mode(request, Qwen35GenerationMode::Automatic, on_delta)
+        self.generate_streaming_in_mode(request, Qwen4GenerationMode::Automatic, on_delta)
             .map(|(output, _)| output)
     }
 
@@ -1377,12 +712,12 @@ impl Qwen35Provider {
     pub fn generate_streaming_in_mode<F: FnMut(&str) -> bool>(
         &mut self,
         request: &GenerationRequest,
-        mode: Qwen35GenerationMode,
+        mode: Qwen4GenerationMode,
         on_delta: F,
     ) -> Result<(GenerationOutput, Option<MtpGenerationStats>)> {
         let (prompt_ids, sampling) = self.prepare_generation(request)?;
         let use_mtp = self.resolve_generation_mode(mode)?
-            && !(mode == Qwen35GenerationMode::Automatic && request.max_tokens == 1);
+            && !(mode == Qwen4GenerationMode::Automatic && request.max_tokens == 1);
         if !use_mtp {
             let generation = self.generate_baseline_streaming(
                 &prompt_ids,
@@ -1391,8 +726,6 @@ impl Qwen35Provider {
                 None,
                 None,
                 &[],
-                #[cfg(any(feature = "specprefill", test))]
-                PrefillMode::Dense,
                 on_delta,
             )?;
             return Ok((
@@ -1405,9 +738,7 @@ impl Qwen35Provider {
         }
 
         let (generation, stats) = self.generate_mtp_streaming_for_prompt(
-            MtpPrompt::Text {
-                prompt_ids: &prompt_ids,
-            },
+            &prompt_ids,
             request.max_tokens,
             &sampling,
             DEFAULT_MTP_BLOCK_SIZE,
@@ -1431,9 +762,9 @@ impl Qwen35Provider {
     pub fn benchmark_streaming_in_mode<F: FnMut(&str) -> bool>(
         &mut self,
         request: &GenerationRequest,
-        mode: Qwen35GenerationMode,
+        mode: Qwen4GenerationMode,
         on_delta: F,
-    ) -> Result<(GenerationOutput, Duration, Option<MtpGenerationStats>)> {
+    ) -> Result<(BaselineGeneration, Option<MtpGenerationStats>)> {
         let (prompt_ids, sampling) = self.prepare_generation(request)?;
         if !self.resolve_generation_mode(mode)? {
             let generation = self.generate_baseline_streaming(
@@ -1443,23 +774,12 @@ impl Qwen35Provider {
                 None,
                 None,
                 &[],
-                #[cfg(any(feature = "specprefill", test))]
-                PrefillMode::Dense,
                 on_delta,
             )?;
-            return Ok((
-                GenerationOutput {
-                    text: generation.text,
-                    token_ids: generation.token_ids,
-                },
-                generation.decode_time,
-                None,
-            ));
+            return Ok((generation, None));
         }
         let (generation, stats) = self.generate_mtp_streaming_for_prompt(
-            MtpPrompt::Text {
-                prompt_ids: &prompt_ids,
-            },
+            &prompt_ids,
             request.max_tokens,
             &sampling,
             DEFAULT_MTP_BLOCK_SIZE,
@@ -1468,14 +788,7 @@ impl Qwen35Provider {
             None,
             on_delta,
         )?;
-        Ok((
-            GenerationOutput {
-                text: generation.text,
-                token_ids: generation.token_ids,
-            },
-            generation.decode_time,
-            Some(stats),
-        ))
+        Ok((generation, Some(stats)))
     }
 
     /// Controlled cached-context benchmark route. The snapshot is reusable:
@@ -1489,16 +802,14 @@ impl Qwen35Provider {
         max_tokens: usize,
         sampling: &SamplingConfig,
         snapshot: &PromptSnapshot,
-        mode: Qwen35GenerationMode,
+        mode: Qwen4GenerationMode,
         on_delta: F,
     ) -> Result<(BaselineGeneration, Option<MtpGenerationStats>)> {
         match (mode, snapshot) {
-            (Qwen35GenerationMode::Baseline, snapshot) => {
+            (Qwen4GenerationMode::Baseline, snapshot) => {
                 let snapshot = match snapshot {
                     PromptSnapshot::Baseline(snapshot) => snapshot,
                     PromptSnapshot::Mtp(snapshot) => snapshot.target_snapshot(),
-                    #[cfg(any(feature = "dflash2", test))]
-                    PromptSnapshot::Dflash2(snapshot) => snapshot.target_snapshot(),
                 };
                 let generation = self.generate_baseline_streaming(
                     prompt_ids,
@@ -1510,15 +821,13 @@ impl Qwen35Provider {
                     }),
                     None,
                     &[],
-                    #[cfg(any(feature = "specprefill", test))]
-                    PrefillMode::Dense,
                     on_delta,
                 )?;
                 Ok((generation, None))
             }
-            (Qwen35GenerationMode::Mtp, PromptSnapshot::Mtp(snapshot)) => {
+            (Qwen4GenerationMode::Mtp, PromptSnapshot::Mtp(snapshot)) => {
                 let (generation, stats) = self.generate_mtp_streaming_for_prompt(
-                    MtpPrompt::Text { prompt_ids },
+                    prompt_ids,
                     max_tokens,
                     sampling,
                     DEFAULT_MTP_BLOCK_SIZE,
@@ -1533,27 +842,23 @@ impl Qwen35Provider {
                 )?;
                 Ok((generation, Some(stats)))
             }
-            (Qwen35GenerationMode::Automatic, _) => {
+            (Qwen4GenerationMode::Automatic, _) => {
                 anyhow::bail!("cached benchmark mode must be explicit")
             }
-            (Qwen35GenerationMode::Mtp, PromptSnapshot::Baseline(_)) => {
-                anyhow::bail!("cached benchmark mode does not match the snapshot family")
-            }
-            #[cfg(any(feature = "dflash2", test))]
-            (Qwen35GenerationMode::Mtp, PromptSnapshot::Dflash2(_)) => {
+            (Qwen4GenerationMode::Mtp, PromptSnapshot::Baseline(_)) => {
                 anyhow::bail!("cached benchmark mode does not match the snapshot family")
             }
         }
     }
 
-    fn resolve_generation_mode(&self, mode: Qwen35GenerationMode) -> Result<bool> {
+    fn resolve_generation_mode(&self, mode: Qwen4GenerationMode) -> Result<bool> {
         match mode {
-            Qwen35GenerationMode::Automatic => Ok(self.mtp_generator.is_some()),
-            Qwen35GenerationMode::Baseline => Ok(false),
-            Qwen35GenerationMode::Mtp => {
+            Qwen4GenerationMode::Automatic => Ok(self.mtp_generator.is_some()),
+            Qwen4GenerationMode::Baseline => Ok(false),
+            Qwen4GenerationMode::Mtp => {
                 ensure!(
                     self.mtp_generator.is_some(),
-                    "the loaded checkpoint does not contain a bundled Qwen 3.5 MTP head"
+                    "the loaded checkpoint does not contain a bundled Qwen4 MTP head"
                 );
                 Ok(true)
             }
@@ -1604,52 +909,56 @@ impl Qwen35Provider {
     }
 }
 
+fn metal_wired_limit(system_memory: u64, max_recommended_working_set: u64) -> Result<u64> {
+    ensure!(
+        system_memory > 0,
+        "failed to determine physical system memory for the Metal wired-memory limit"
+    );
+    ensure!(
+        max_recommended_working_set > 0,
+        "Metal did not report a maximum recommended working-set size"
+    );
+    let eighty_five_percent = ((u128::from(system_memory) * 85) / 100) as u64;
+    Ok(eighty_five_percent.min(max_recommended_working_set))
+}
+
 fn initialize_runtime() -> Result<()> {
     static INITIALIZED: LazyLock<std::result::Result<(), String>> = LazyLock::new(|| {
+        // MLX's 256 MiB default command-buffer cap lets this model accumulate
+        // enough decode work to delay submission. Fifteen MiB measured best on
+        // the supported Apple-Silicon path. Respect an explicit operator override.
+        if std::env::var_os("MLX_MAX_MB_PER_BUFFER").is_none() {
+            // SAFETY: this one-time initializer runs before the first MLX
+            // backend query or model worker is created.
+            unsafe {
+                std::env::set_var("MLX_MAX_MB_PER_BUFFER", "15");
+            }
+        }
         if !mlxcel_core::metal_is_available() {
             return Err("the MLX Metal backend is unavailable on this host".to_string());
         }
         mlxcel_core::set_default_device(true);
+        let system_memory = mlxcel_core::hardware::system_memory_bytes();
+        // Upstream `set_wired_limit` rejects values above Metal's recommended
+        // maximum, so enforce both ceilings: 85% of physical unified memory
+        // and `recommendedMaxWorkingSetSize`.
+        let max_recommended_working_set = mlxcel_core::get_wired_limit() as u64;
+        let wired_limit = metal_wired_limit(system_memory, max_recommended_working_set)
+            .map_err(|error| error.to_string())?;
+        mlxcel_core::set_wired_limit(wired_limit as usize);
+        tracing::info!(
+            wired_limit,
+            system_memory,
+            max_recommended_working_set,
+            "configured Metal wired-memory ceiling"
+        );
+        const MLX_MEMORY_LIMIT: u64 = 45 * 1024 * 1024 * 1024;
+        const MLX_CACHE_LIMIT: u64 = 512 * 1024 * 1024;
+        mlxcel_core::memory::set_memory_limit(MLX_MEMORY_LIMIT);
+        mlxcel_core::memory::set_cache_limit(MLX_CACHE_LIMIT);
         Ok(())
     });
     (*INITIALIZED).clone().map_err(anyhow::Error::msg)
-}
-
-fn load_vision_processor(
-    model_dir: &Path,
-    config: &crate::qwen3_vl_vision::Qwen3VLVisionConfig,
-) -> Result<QwenVLProcessor> {
-    let factor = config.patch_size * config.spatial_merge_size;
-    let default_min = 4 * factor * factor;
-    let default_max = 16_384 * factor * factor;
-    let path = model_dir.join("preprocessor_config.json");
-    let value = match std::fs::read_to_string(&path) {
-        Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
-            .with_context(|| format!("failed to parse {}", path.display()))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            serde_json::Value::Object(Default::default())
-        }
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to read {}", path.display()));
-        }
-    };
-    let min_pixels = value
-        .get("min_pixels")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|value| usize::try_from(value).ok())
-        .unwrap_or(default_min);
-    let max_pixels = value
-        .get("max_pixels")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|value| usize::try_from(value).ok())
-        .unwrap_or(default_max);
-    QwenVLProcessor::new(
-        config.patch_size,
-        config.temporal_patch_size,
-        config.spatial_merge_size,
-        min_pixels,
-        max_pixels,
-    )
 }
 
 fn load_generation_defaults(model_dir: &Path) -> Result<GenerationDefaults> {
@@ -1722,6 +1031,18 @@ mod tests {
     }
 
     #[test]
+    fn metal_wired_limit_is_eighty_five_percent_or_device_max() {
+        let gib = 1024_u64.pow(3);
+        assert_eq!(
+            metal_wired_limit(128 * gib, 120 * gib).unwrap(),
+            108 * gib + 4 * gib / 5
+        );
+        assert_eq!(metal_wired_limit(128 * gib, 96 * gib).unwrap(), 96 * gib);
+        assert!(metal_wired_limit(0, 96 * gib).is_err());
+        assert!(metal_wired_limit(128 * gib, 0).is_err());
+    }
+
+    #[test]
     fn generation_defaults_match_checkpoint_contract() {
         let fixture = TestDir::new("generation-defaults");
         let fallback = load_generation_defaults(&fixture.0).expect("fallback defaults");
@@ -1763,7 +1084,7 @@ mod tests {
         std::fs::write(fixture.0.join("tokenizer_config.json"), b"{}")
             .expect("write tokenizer config");
 
-        let error = match Qwen35Provider::load_target_only(&fixture.0, KVCacheMode::Fp16) {
+        let error = match Qwen4Provider::load_target_only(&fixture.0, KVCacheMode::Fp8) {
             Ok(_) => panic!("provider load must reject an absent chat template"),
             Err(error) => error.to_string(),
         };
@@ -1808,7 +1129,7 @@ mod tests {
         let model_dir = crate::resolve_model_path(None)
             .expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
         let mut provider =
-            Qwen35Provider::load(&model_dir, KVCacheMode::Fp16).expect("load real Qwen checkpoint");
+            Qwen4Provider::load(&model_dir, KVCacheMode::Fp8).expect("load real Qwen checkpoint");
         let request = GenerationRequest {
             prompt: "Continue counting upward from one, writing each integer on its own line without stopping."
                 .to_string(),
@@ -1820,95 +1141,30 @@ mod tests {
         };
         let mut baseline_deltas = String::new();
         let (baseline, _) = provider
-            .generate_streaming_in_mode(&request, Qwen35GenerationMode::Baseline, |delta| {
+            .generate_streaming_in_mode(&request, Qwen4GenerationMode::Baseline, |delta| {
                 baseline_deltas.push_str(delta);
                 true
             })
             .expect("baseline greedy generation");
         let mut mtp_deltas = String::new();
-        let (mtp, _) = provider
-            .generate_streaming_in_mode(&request, Qwen35GenerationMode::Mtp, |delta| {
+        let (mtp, mtp_stats) = provider
+            .generate_streaming_in_mode(&request, Qwen4GenerationMode::Mtp, |delta| {
                 mtp_deltas.push_str(delta);
                 true
             })
             .expect("MTP greedy generation");
-        assert_eq!(baseline.token_ids, mtp.token_ids);
+        assert_eq!(baseline.token_ids, mtp.token_ids, "{mtp_stats:?}");
         assert_eq!(baseline.text, mtp.text);
         assert_eq!(baseline_deltas, baseline.text);
         assert_eq!(mtp_deltas, mtp.text);
     }
 
     #[test]
-    #[ignore = "requires real target and SpecPrefill draft checkpoints at their configured or default cache paths"]
-    fn real_model_dense_specprefill_dense_has_no_position_state_leakage() {
-        let model_dir = crate::resolve_model_path(None).expect("resolve target checkpoint");
-        let draft_dir =
-            crate::resolve_specprefill_draft_path(None).expect("resolve SpecPrefill draft checkpoint");
-        let mut provider =
-            Qwen35Provider::load_with_specprefill_draft(model_dir, draft_dir, KVCacheMode::Fp16)
-                .expect("load target and SpecPrefill draft");
-        let prompt = provider
-            .tokenizer
-            .encode(
-                "Operational record: all systems nominal; preserve this context. ".repeat(1024),
-                true,
-            )
-            .expect("encode long prompt")
-            .get_ids()
-            .iter()
-            .map(|&id| id as i32)
-            .collect::<Vec<_>>();
-        let sampling = SamplingConfig::greedy();
-        let dense_before = provider
-            .generate_baseline_streaming(
-                &prompt,
-                8,
-                &sampling,
-                None,
-                None,
-                &[],
-                PrefillMode::Dense,
-                |_| true,
-            )
-            .expect("first dense generation");
-        let sparse = provider
-            .generate_baseline_streaming(
-                &prompt,
-                8,
-                &sampling,
-                None,
-                None,
-                &[],
-                PrefillMode::SpecPrefill(SpecPrefillConfig {
-                    min_tokens: 512,
-                    keep_rate: 0.30,
-                    protected_prefix_tokens: 0,
-                    ..Default::default()
-                }),
-                |_| true,
-            )
-            .expect("sparse generation");
-        assert!(sparse.specprefill_stats.is_some());
-        let dense_after = provider
-            .generate_baseline_streaming(
-                &prompt,
-                8,
-                &sampling,
-                None,
-                None,
-                &[],
-                PrefillMode::Dense,
-                |_| true,
-            )
-            .expect("second dense generation");
-        assert_eq!(dense_before.token_ids, dense_after.token_ids);
-    }
-    #[test]
     #[ignore = "requires the real bundled-MTP checkpoint at QW_MODEL_PATH or the default model cache path"]
     fn real_model_mtp_prefix_reuse_matches_cold_and_reduces_ttft() {
         let model_dir = crate::resolve_model_path(None)
             .expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
-        let mut provider = Qwen35Provider::load(&model_dir, KVCacheMode::Turbo4)
+        let mut provider = Qwen4Provider::load(&model_dir, KVCacheMode::Fp8)
             .expect("load real bundled-MTP checkpoint");
         let base = provider
             .tokenizer
@@ -1994,16 +1250,7 @@ mod tests {
             .expect("warm MTP generation");
 
         let baseline_cold = provider
-            .generate_baseline_streaming(
-                &full_ids,
-                32,
-                &sampling,
-                None,
-                None,
-                &[],
-                PrefillMode::Dense,
-                |_| true,
-            )
+            .generate_baseline_streaming(&full_ids, 32, &sampling, None, None, &[], |_| true)
             .expect("cold baseline generation");
         let mtp_snapshot = PromptSnapshot::Mtp(snapshot);
         let (baseline_warm, baseline_stats) = provider
@@ -2012,7 +1259,7 @@ mod tests {
                 32,
                 &sampling,
                 &mtp_snapshot,
-                Qwen35GenerationMode::Baseline,
+                Qwen4GenerationMode::Baseline,
                 |_| true,
             )
             .expect("baseline generation from MTP target snapshot");
@@ -2060,7 +1307,7 @@ mod tests {
     fn real_model_mtp_prefix_reuse_covers_reasoning_and_plain_history() {
         let model_dir = crate::resolve_model_path(None)
             .expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
-        let mut provider = Qwen35Provider::load(&model_dir, KVCacheMode::Turbo4)
+        let mut provider = Qwen4Provider::load(&model_dir, KVCacheMode::Fp8)
             .expect("load real bundled-MTP checkpoint");
         let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
         let user = |content: &str| ChatMessage {
@@ -2181,7 +1428,7 @@ mod tests {
     fn real_model_mtp_max_output_has_bounded_terminal_tail() {
         let model_dir = crate::resolve_model_path(None)
             .expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
-        let mut provider = Qwen35Provider::load(&model_dir, KVCacheMode::Turbo4)
+        let mut provider = Qwen4Provider::load(&model_dir, KVCacheMode::Fp8)
             .expect("load real bundled-MTP checkpoint");
         let prompt = provider
             .tokenizer
@@ -2237,8 +1484,8 @@ mod tests {
     fn real_model_mtp_eos_has_bounded_terminal_tail_and_resumable_snapshot() {
         let model_dir = crate::resolve_model_path(None)
             .expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
-        let mut provider = Qwen35Provider::load(&model_dir, KVCacheMode::Turbo4)
-            .expect("load real MTP checkpoint");
+        let mut provider =
+            Qwen4Provider::load(&model_dir, KVCacheMode::Fp8).expect("load real MTP checkpoint");
         let prompt = provider
             .tokenizer
             .encode(
@@ -2377,7 +1624,7 @@ mod tests {
     fn real_model_cancelled_mtp_snapshot_portable_resume_matches_uninterrupted_greedy() {
         let model_dir = crate::resolve_model_path(None)
             .expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
-        let mut provider = Qwen35Provider::load(&model_dir, KVCacheMode::Turbo4)
+        let mut provider = Qwen4Provider::load(&model_dir, KVCacheMode::Fp8)
             .expect("load real bundled-MTP checkpoint");
         let messages = vec![
             ChatMessage {

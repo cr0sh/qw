@@ -139,6 +139,11 @@ mod ffi {
 
         /// Create half-precision array from raw bytes
         fn from_bytes_f16(data: &[u8], shape: &[i32], bfloat16: bool) -> UniquePtr<MlxArray>;
+        /// Encode floating-point values as raw E4M3 FP8 bytes.
+        fn to_fp8(a: &MlxArray) -> UniquePtr<MlxArray>;
+
+        /// Decode raw E4M3 FP8 bytes to BF16.
+        fn from_fp8(a: &MlxArray) -> UniquePtr<MlxArray>;
 
         // Array property accessors.
         /// Get the shape of an array
@@ -629,6 +634,8 @@ mod ffi {
 
         /// Compiled silu: x * sigmoid(x) — single fused kernel
         fn compiled_silu(x: &MlxArray) -> UniquePtr<MlxArray>;
+        /// Compiled `silu(x * scale)`.
+        fn compiled_scaled_silu(x: &MlxArray, scale: f32) -> UniquePtr<MlxArray>;
 
         /// Compiled gelu: x * 0.5 * (1 + erf(x / sqrt(2))) — single fused kernel
         /// Used by: StarCoder2 and other precise GELU-based models
@@ -762,6 +769,24 @@ mod ffi {
         /// `sorted_indices == true` (prefill).
         /// Used by: Gemma 4 26B-a4b SwitchGeGLU experts (decode)
         unsafe fn compiled_switch_qgeglu_forward(
+            x: &MlxArray,
+            gate_w: &MlxArray,
+            gate_s: &MlxArray,
+            gate_b: *const MlxArray,
+            up_w: &MlxArray,
+            up_s: &MlxArray,
+            up_b: *const MlxArray,
+            down_w: &MlxArray,
+            down_s: &MlxArray,
+            down_b: *const MlxArray,
+            rhs_indices: &MlxArray,
+            group_size: i32,
+            bits: i32,
+            mode: &str,
+        ) -> UniquePtr<MlxArray>;
+
+        /// Compiled SwiGLU Switch MLP for the decode no-sort path.
+        unsafe fn compiled_switch_qswiglu_forward(
             x: &MlxArray,
             gate_w: &MlxArray,
             gate_s: &MlxArray,
@@ -1238,6 +1263,26 @@ mod ffi {
 
         /// Fast RMS norm using MLX fast kernel
         fn fast_rms_norm(x: &MlxArray, weight: &MlxArray, eps: f32) -> UniquePtr<MlxArray>;
+        /// Compiled grouped RMS norm with independent last-axis group statistics.
+        fn compiled_group_rms_norm(
+            x: &MlxArray,
+            weight: &MlxArray,
+            group_size: i32,
+            eps: f32,
+        ) -> UniquePtr<MlxArray>;
+        /// Compiled weighted stream reduction for Qwen hyper-connections.
+        fn compiled_hyper_mix(
+            normed: &MlxArray,
+            mix_logits: &MlxArray,
+            stream_count: i32,
+        ) -> UniquePtr<MlxArray>;
+        /// Compiled Qwen hyper-connection branch injection.
+        fn compiled_hyper_inject(
+            branch: &MlxArray,
+            hyper_input: &MlxArray,
+            injection_logits: &MlxArray,
+            stream_count: i32,
+        ) -> UniquePtr<MlxArray>;
 
         /// Fast RMS norm without a learnable scale
         fn fast_rms_norm_no_weight(x: &MlxArray, eps: f32) -> UniquePtr<MlxArray>;
@@ -1755,6 +1800,17 @@ mod ffi {
             alpha_n: f32,
             beta: f32,
             eps: f32,
+        ) -> UniquePtr<MlxArray>;
+
+        /// QSA block-sparse grouped-query attention without materializing
+        /// per-query selected K/V tensors.
+        fn qsa_sparse_prefill_attention(
+            queries: &MlxArray,
+            keys: &MlxArray,
+            values: &MlxArray,
+            indices: &MlxArray,
+            valid: &MlxArray,
+            scale: f32,
         ) -> UniquePtr<MlxArray>;
 
         /// BitLinear ternary matmul (BitNet b1.58). `packed_weights` is
@@ -2908,7 +2964,9 @@ pub use ffi::*;
 
 // Re-export cxx::UniquePtr for consumers of this crate
 pub use cxx::UniquePtr;
-pub use ops::{concatenate, divide_scalar, multiply_scalar, stack, stack_owned, wht};
+pub use ops::{
+    concatenate, concatenate_owned, divide_scalar, multiply_scalar, stack, stack_owned, wht,
+};
 
 // Re-export sampling primitives needed by generation-loop wiring (B8) and server layers.
 pub use sampling::TokenBiasMap;
@@ -3293,16 +3351,8 @@ pub mod sampling;
 // microbenchmark and the server can read the cap-overflow counters.
 pub mod sampling_dispatch;
 
-// Speculative decoding
+// Speculative decoding and shared MTP acceptance logic.
 pub mod speculative;
-
-// Drafter trait + DrafterKind enum + model_type auto-detection. Foundational scaffolding for the Gemma 4 MTP and Qwen 3.5
-// DFlash drafter ports. Concrete drafter impls land.
-// The existing classic `SpeculativeGenerator` above is unchanged — MTP and
-// DFlash are peer code paths, not replacements.
-// TODO: wrap the existing SpeculativeGenerator in a
-// Drafter-trait adapter so the round-loop drivers can dispatch uniformly.
-pub mod drafter;
 
 // Generation-time stream selection and installation wrappers.
 // Public so that the server batch scheduler can install its own generation stream.

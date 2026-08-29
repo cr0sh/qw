@@ -5,14 +5,9 @@ edition = "2024"
 repository = "https://github.com/cr0sh/qw"
 publish = false
 
-[features]
-default = []
-dflash2 = []
-specprefill = []
 
 [dependencies]
 anyhow.workspace = true
-image.workspace = true
 memmap2.workspace = true
 minijinja.workspace = true
 mlxcel-core.workspace = true
@@ -25,9 +20,6 @@ tracing.workspace = true
 [dev-dependencies]
 criterion.workspace = true
 
-[[example]]
-name = "specprefill_experiment"
-required-features = ["specprefill"]
 
 [[bench]]
 name = "single_user_throughput"

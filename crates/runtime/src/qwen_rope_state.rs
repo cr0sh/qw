@@ -12,26 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Single-sequence MRoPE position state retained by the dense text model.
+//! Single-sequence rotary-position state.
 
 use std::cell::{Cell, RefCell};
 
 use mlxcel_core::{MlxArray, UniquePtr};
 
-/// MRoPE state for a single sequence.
-///
-/// `position_ids` is `[3, 1, prefill_len]` and is populated only by the
-/// vision-language prefill path (when image/video tokens are present).
-/// `rope_deltas` is the scalar that decode steps add to `cache_offset`
-/// to recover the absolute MRoPE position; it is non-zero when the row
-/// went through a multimodal prefill, and zero (or absent) for text-only
-/// rows.
-pub(crate) struct MRopeEntry {
+/// Optional explicit rotary positions for prefill and the scalar decode offset.
+pub(crate) struct RopeEntry {
     pub position_ids: Option<UniquePtr<MlxArray>>,
     pub rope_deltas: Option<i32>,
 }
 
-impl MRopeEntry {
+impl RopeEntry {
     pub(crate) fn empty() -> Self {
         Self {
             position_ids: None,
@@ -40,18 +33,17 @@ impl MRopeEntry {
     }
 }
 
-/// Single-sequence fallback state. Dense text generation leaves this empty,
-/// but retaining it preserves the position-state path used by Qwen3.5.
-pub(crate) struct MRopeState {
-    fallback: RefCell<MRopeEntry>,
-    pending: RefCell<Option<MRopeEntry>>,
+/// Position state for one active Qwen4 sequence.
+pub(crate) struct RopeState {
+    fallback: RefCell<RopeEntry>,
+    pending: RefCell<Option<RopeEntry>>,
     position: Cell<i32>,
 }
 
-impl MRopeState {
+impl RopeState {
     pub(crate) fn new() -> Self {
         Self {
-            fallback: RefCell::new(MRopeEntry::empty()),
+            fallback: RefCell::new(RopeEntry::empty()),
             pending: RefCell::new(None),
             position: Cell::new(0),
         }
@@ -65,7 +57,7 @@ impl MRopeState {
     }
 
     pub(crate) fn prepare(&self, position_ids: &MlxArray, rope_delta: i32) {
-        *self.pending.borrow_mut() = Some(MRopeEntry {
+        *self.pending.borrow_mut() = Some(RopeEntry {
             position_ids: Some(mlxcel_core::copy(position_ids)),
             rope_deltas: Some(rope_delta),
         });
@@ -102,10 +94,7 @@ impl MRopeState {
         self.fallback.borrow().rope_deltas
     }
 
-    pub(crate) fn with_position_ids<R>(
-        &self,
-        f: impl FnOnce(Option<&MlxArray>) -> R,
-    ) -> R {
+    pub(crate) fn with_position_ids<R>(&self, f: impl FnOnce(Option<&MlxArray>) -> R) -> R {
         let entry = self.fallback.borrow();
         f(entry.position_ids.as_deref())
     }
@@ -124,9 +113,8 @@ impl MRopeState {
     }
 }
 
-impl Default for MRopeState {
+impl Default for RopeState {
     fn default() -> Self {
         Self::new()
     }
 }
-

@@ -19,12 +19,14 @@ QW aims to be explicitly "focused", to achieve these goals below:
   configuration. Decode TPS and TTFT (time to first token) are the top priority
   metrics to optimize.
 - Minimal: No fancy features, fixed model, fixed environment.
-  - No fancy features: GUI, MCP integration, etc. are outside this project's
-    scope. 4-bit TurboQuant cache quantization and MTP with depth `$k=3$` are
-    enabled by default.
-  - Fixed model: Qwen3.8 27B (dense model) only. No generalization across
+  - No fancy features: GUI, MCP integration, and vision inputs are outside this
+    project's current scope. E4M3 FP8 KV-cache storage and the checkpoint's
+    native MTP head are enabled by default.
+  - Fixed model: Qwen3.8 Flash Next REAP-288 only. No generalization across
     different model structures.
-    - QW serves [Jundot/Qwen3.8-27B-oQ4e-fp16-mtp](https://huggingface.co/Jundot/Qwen3.8-27B-oQ4e-fp16-mtp) as the default model.
+    - QW serves [sh0wie/Qwen3.8-Flash-Next-REAP-288-MLX-4bit](https://huggingface.co/sh0wie/Qwen3.8-Flash-Next-REAP-288-MLX-4bit) as the default model.
+    - The 51B-parameter n-gram embedding table remains in a separate pageable
+      SSD-backed mapping; it is never materialized as an MLX/Metal tensor.
     - If a better model with similar requirements is released, this project
       may migrate to the new model, but it will never support more than one
       model at a time.
@@ -49,7 +51,7 @@ Or, compile from the source. Prerequisites:
 cargo install --locked --git https://github.com/cr0sh/qw [--tag TAG] qw-cli
 ```
 
-Download the model from Hugging Face(model ID unset means the default preferred model `Jundot/Qwen3.8-27B-oQ4e-fp16-mtp`):
+Download the model from Hugging Face (an unset model ID selects `sh0wie/Qwen3.8-Flash-Next-REAP-288-MLX-4bit`):
 
 ```bash
 qw download
@@ -72,34 +74,36 @@ For a more detailed manual, use `--help` — or just ask your LLM.
 
 ## Performance
 
-QW aims to be fast enough for daily use. Below is the benchmark table from
-tag v0.1.0. You can reproduce it with `cargo bench`. The benchmark was run on
-a Mac Studio with an Apple M4 Max chip, 64 GB of memory, and a 40-core GPU.
+QW targets the following minimum throughput on an M4 Max with 64 GB of unified
+memory. Benchmarks must stay below 50 GB total resident memory.
 
-   |  | fresh | 10k | 64k |
-   |---|------:|-----:|-----:|
-   | **prefill** | 254.27 | 221.07 | 97.08 |
-   | **decode (baseline)** | 27.20 | 21.65 | 12.80 |
-   | **decode (MTP)** | 58.20 | 53.38 | 35.66 |
+   |  | fresh | 64k |
+   |---|------:|-----:|
+   | **prefill** | 400 | 300 |
+   | **decode (baseline)** | 20 | 15 |
+   | **decode (MTP)** | 34 | 25.5 |
 
-All values are tokens/s; `10k`/`64k` are prefilled prompt lengths in tokens.
+All values are tokens/s. The MTP rows encode the required minimum 1.7x decode
+speedup over the corresponding baseline.
 
 QW stores prefix caches under `~/.cache/qw/checkpoint`. Disk usage is capped at
 16 GB by default; the hard ceiling is twice the configured limit.
 
-An attempt to achieve better TPS/TTFT numbers for hardcore use produced
-unsatisfying results, so these options are feature-gated and disabled by
-default. See `crates/runtime/Cargo.toml`.
+The n-gram embedding table is served row-by-row from its pageable SSD mapping.
+Only selected rows enter a small staging buffer; the mapping must remain
+outside pinned Metal memory.
 
 ## Project Policy
 
 Any configuration other than the default is considered experimental and out
 of scope for testing by the maintainer. The default is:
 
-- Model checkpoint (`Jundot/Qwen3.8-27B-oQ4e-fp16-mtp` on HuggingFace) and its
-  quantization method
-- MTP with depth $k=3$
-- KV cache is 4-bit quantized with TurboQuant
+- Model checkpoint (`sh0wie/Qwen3.8-Flash-Next-REAP-288-MLX-4bit` on
+  Hugging Face) and its 4-bit affine weight quantization
+- The checkpoint's native MTP head
+- KV cache is 8-bit quantized with TurboQuant
+- N-gram embeddings remain SSD-backed and total resident memory stays below
+  50 GB
 - The above configuration is tested on an M4 Max 40-core GPU with 64 GB of
   unified memory
 

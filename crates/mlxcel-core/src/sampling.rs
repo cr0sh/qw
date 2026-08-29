@@ -231,14 +231,8 @@ pub fn apply_token_bias(logits: &MlxArray, bias: &TokenBiasMap) -> UniquePtr<Mlx
     *sparse_shape.last_mut().unwrap() = tokens.len() as i32;
     let mut update_shape = shape;
     *update_shape.last_mut().unwrap() = tokens.len() as i32;
-    let indices = ffi::broadcast_to(
-        &ffi::from_slice_i32(&tokens, &sparse_shape),
-        &update_shape,
-    );
-    let values = ffi::broadcast_to(
-        &ffi::from_slice_f32(&biases, &sparse_shape),
-        &update_shape,
-    );
+    let indices = ffi::broadcast_to(&ffi::from_slice_i32(&tokens, &sparse_shape), &update_shape);
+    let values = ffi::broadcast_to(&ffi::from_slice_f32(&biases, &sparse_shape), &update_shape);
     let selected = ffi::take_along_axis(logits, &indices, -1);
     let updated = ffi::add(&selected, &values);
     ffi::put_along_axis(logits, &indices, &updated, -1)

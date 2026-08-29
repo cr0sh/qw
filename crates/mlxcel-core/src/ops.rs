@@ -29,6 +29,17 @@ pub fn concatenate(a: &ffi::MlxArray, b: &ffi::MlxArray, axis: i32) -> UniquePtr
     let ptrs: [*const ffi::MlxArray; 2] = [a as *const ffi::MlxArray, b as *const ffi::MlxArray];
     unsafe { ffi::concatenate(&ptrs, axis) }
 }
+/// Concatenate owned arrays along an existing axis in one graph node.
+pub fn concatenate_owned(
+    arrays: &[UniquePtr<ffi::MlxArray>],
+    axis: i32,
+) -> UniquePtr<ffi::MlxArray> {
+    let ptrs: Vec<*const ffi::MlxArray> = arrays
+        .iter()
+        .map(|array| array.as_ref().expect("concatenate input is non-null") as *const _)
+        .collect();
+    unsafe { ffi::concatenate(&ptrs, axis) }
+}
 
 /// Stack arrays along a new axis from raw MLX pointers.
 ///

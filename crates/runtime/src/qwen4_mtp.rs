@@ -12,13 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Built-in Qwen 3.5 multi-token-prediction drafter and greedy round loop.
+//! Built-in Qwen4 multi-token-prediction drafter and greedy round loop.
 //!
-//! Architecture and reconciliation follow the Apache-2.0 `mlx-vlm` Qwen 3.5
+//! Architecture and reconciliation follow the Apache-2.0 `mlx-vlm` Qwen4
 //! MTP drafter; target verification and rollback follow the checked-in
-//! Apache-2.0 `mlxcel` Qwen 3.5 implementation.
+//! Apache-2.0 `mlxcel` Qwen4 implementation.
 
 use std::cell::RefCell;
+use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::portable_snapshot::{
@@ -30,7 +32,7 @@ use mlxcel_core::generate::{
     SamplingConfig, TokenConstraint, mask_logits_to_allowed,
 };
 use mlxcel_core::generation_policy::{merged_eos_token_ids, seed_rng_if_needed};
-use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedLinear};
+use mlxcel_core::layers::{KVCache, UnifiedLinear};
 use mlxcel_core::sampling::{
     effective_token_distribution, sample_token_optimized, sample_token_with_distribution,
 };
@@ -39,12 +41,12 @@ use mlxcel_core::speculative::mtp::walk::WalkResult;
 use mlxcel_core::speculative::stochastic_accept::{
     DraftVerdict, sampler_is_greedy, verify_draft_token,
 };
-use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use tracing::debug;
 
-use crate::qwen_vl_position::decode_rope_positions;
-use crate::qwen3_5::{Qwen35Config, Qwen35DecoderLayer, Qwen35Model};
+use crate::qwen_position::decode_rope_positions;
+use crate::qwen4::{Qwen4Config, Qwen4DecoderLayer, Qwen4FinalMixer, Qwen4Model, Qwen4RmsNorm};
+use crate::qwen4_attention::Qwen4PrefillPolicy;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MtpGenerationStats {
@@ -64,6 +66,9 @@ pub struct MtpGenerationStats {
     pub speculative_rounds: usize,
     pub full_state_materializations: usize,
     pub cache_snapshot_count: usize,
+    /// Greedy rounds replayed through single-token target verification because
+    /// the fast multi-token decision was within one BF16 ULP.
+    pub reference_fallbacks: usize,
 }
 
 impl MtpGenerationStats {
@@ -170,7 +175,7 @@ impl MtpPromptSnapshot {
             && draft.continuation_logits.is_none();
         if draft_offset != expected_offset
             || draft.token_len != expected_offset as usize
-            || draft.family != "qwen3.5-mtp-draft"
+            || draft.family != "qwen4-mtp-draft"
             || (expected_offset == 0 && !empty_draft)
         {
             return Err("MTP portable target and drafter offsets do not match".to_string());
@@ -234,14 +239,14 @@ struct MtpProposal {
     proposal_probs: UniquePtr<MlxArray>,
 }
 
-struct Qwen35MtpDraftState {
+struct Qwen4MtpDraftState {
     cache: KVCache,
     seed_hidden: Option<UniquePtr<MlxArray>>,
     rope_delta: Option<i32>,
     round_appended: usize,
 }
 
-impl Qwen35MtpDraftState {
+impl Qwen4MtpDraftState {
     fn new() -> Self {
         Self {
             cache: KVCache::new(),
@@ -252,95 +257,181 @@ impl Qwen35MtpDraftState {
     }
 }
 
-fn shifted_embedding_range(
-    input_embeddings: &MlxArray,
-    start: i32,
-    end: i32,
-    bonus_embedding: Option<&MlxArray>,
-) -> UniquePtr<MlxArray> {
-    let shape = mlxcel_core::array_shape(input_embeddings);
-    let stop = if bonus_embedding.is_some() {
-        shape[1]
-    } else {
-        end + 1
-    };
-    let tail = (start + 1 < stop).then(|| {
-        mlxcel_core::slice(
-            input_embeddings,
-            &[0, start + 1, 0],
-            &[shape[0], stop, shape[2]],
-        )
-    });
-    match (tail, bonus_embedding) {
-        (Some(tail), Some(bonus)) => mlxcel_core::concatenate(&tail, bonus, 1),
-        (Some(tail), None) => tail,
-        (None, Some(bonus)) => mlxcel_core::copy(bonus),
-        (None, None) => panic!("shifted embedding range must not be empty"),
+fn quantize_drafter_weights(weights: &mut mlxcel_core::weights::WeightMap) {
+    const GROUP_SIZE: i32 = 64;
+    const BITS: i32 = 4;
+    let names = weights
+        .iter()
+        .filter_map(|(name, weight)| {
+            let shape = mlxcel_core::array_shape(weight);
+            (name.ends_with(".weight")
+                && !name.contains("norm")
+                && !name.contains("conv1d")
+                && shape.len() >= 2
+                && shape.last().is_some_and(|width| width % GROUP_SIZE == 0))
+            .then(|| name.clone())
+        })
+        .collect::<Vec<_>>();
+    for name in names {
+        let dense = weights
+            .remove(&name)
+            .expect("collected MTP weight must remain present");
+        let quantized = mlxcel_core::quantize_weights(&dense, GROUP_SIZE, BITS);
+        let weight = mlxcel_core::quantized_weights_w(&quantized);
+        let scales = mlxcel_core::quantized_weights_scales(&quantized);
+        let biases = mlxcel_core::quantized_weights_biases(&quantized);
+        mlxcel_core::eval(&weight);
+        mlxcel_core::eval(&scales);
+        mlxcel_core::eval(&biases);
+        let prefix = name
+            .strip_suffix(".weight")
+            .expect("quantized MTP tensor name must end in .weight")
+            .to_owned();
+        weights.insert(name, weight);
+        weights.insert(format!("{prefix}.scales"), scales);
+        weights.insert(format!("{prefix}.biases"), biases);
     }
+    mlxcel_core::clear_memory_cache();
 }
 
-/// The single bundled Qwen 3.5 MTP layer. Embeddings and the output projection
-/// remain owned by and shared with the target model.
-pub(crate) struct Qwen35MtpDraftModel {
-    pre_fc_norm_embedding: RMSNorm,
-    pre_fc_norm_hidden: RMSNorm,
-    fc: UnifiedLinear,
-    layer: Qwen35DecoderLayer,
-    norm: RMSNorm,
-    state: RefCell<Qwen35MtpDraftState>,
+/// The standalone Qwen4 native MTP layer. Embeddings and the output
+/// projection remain owned by and shared with the target model.
+pub(crate) struct Qwen4MtpDraftModel {
+    pre_fc_norm_embedding: Qwen4RmsNorm,
+    pre_fc_norm_hidden: Qwen4RmsNorm,
+    fc_embedding: UnifiedLinear,
+    fc_hidden: UnifiedLinear,
+    layer: Qwen4DecoderLayer,
+    final_mixer: Qwen4FinalMixer,
+    state: RefCell<Qwen4MtpDraftState>,
 }
 
-impl Qwen35MtpDraftModel {
-    pub(crate) fn from_weights(weights: &WeightMap, config: &Qwen35Config) -> Result<Self, String> {
-        let embedding_norm = weights
-            .get("mtp.pre_fc_norm_embedding.weight")
-            .map(|weight| mlxcel_core::copy(weight))
-            .ok_or_else(|| {
-                "missing required tensor mtp.pre_fc_norm_embedding.weight".to_string()
-            })?;
-        let hidden_norm = weights
-            .get("mtp.pre_fc_norm_hidden.weight")
-            .map(|weight| mlxcel_core::copy(weight))
-            .ok_or_else(|| "missing required tensor mtp.pre_fc_norm_hidden.weight".to_string())?;
-        let norm = weights
-            .get("mtp.norm.weight")
-            .map(|weight| mlxcel_core::copy(weight))
-            .ok_or_else(|| "missing required tensor mtp.norm.weight".to_string())?;
-        let (fc_group_size, fc_bits) = config.quant_params("mtp.fc");
-        let fc = UnifiedLinear::from_weights(weights, "mtp.fc", fc_group_size, fc_bits)?;
-        let layer = Qwen35DecoderLayer::from_weights_at_prefix(
-            weights,
-            config,
-            &config.to_qwen3next_config(),
-            "mtp.layers.0",
-            false,
+impl Qwen4MtpDraftModel {
+    pub(crate) fn load(model_dir: &Path, target_config: &Qwen4Config) -> Result<Self, String> {
+        let config_path = model_dir.join("config.json");
+        let raw_config = std::fs::read_to_string(&config_path)
+            .map_err(|error| format!("failed to read {}: {error}", config_path.display()))?;
+        let checkpoint: serde_json::Value = serde_json::from_str(&raw_config)
+            .map_err(|error| format!("failed to parse {}: {error}", config_path.display()))?;
+        if checkpoint
+            .get("model_type")
+            .and_then(serde_json::Value::as_str)
+            != Some("qwen4_exp_mtp")
+        {
+            return Err(format!(
+                "{} is not a qwen4_exp_mtp checkpoint",
+                config_path.display()
+            ));
+        }
+        let text = checkpoint
+            .get("text_config")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| format!("{} has no text_config object", config_path.display()))?;
+        let read_usize = |name: &str| {
+            text.get(name)
+                .and_then(serde_json::Value::as_u64)
+                .map(|value| value as usize)
+                .ok_or_else(|| {
+                    format!(
+                        "{} has no integer text_config.{name}",
+                        config_path.display()
+                    )
+                })
+        };
+        let hidden_size = read_usize("hidden_size")?;
+        let hc_count = read_usize("hc_count")?;
+        let num_experts = read_usize("num_experts")?;
+        if hidden_size != target_config.hidden_size || hc_count != target_config.hc_count {
+            return Err(
+                "Qwen4 target and MTP hidden width or stream count do not match".to_owned(),
+            );
+        }
+
+        let mut weights = mlxcel_core::weights::load_weights_from_dir(model_dir)?;
+        quantize_drafter_weights(&mut weights);
+        let mut config = target_config.clone();
+        config.model_type = "qwen4_exp_mtp".to_owned();
+        config.num_hidden_layers = 1;
+        config.num_experts = num_experts;
+        config.layer_types = vec!["full_attention".to_owned()];
+        config.full_attention_interval = 1;
+        config.ple_layer_ids.clear();
+        config.quantization = None;
+        let qn_config = config.to_qwen4_attention_config();
+
+        let pre_fc_norm_embedding = Qwen4RmsNorm::from_weights(
+            &weights,
+            "pre_fc_norm_embedding.weight",
+            config.rms_norm_eps,
+            None,
         )?;
+        // The released head uses one global RMS across all four streams.
+        let pre_fc_norm_hidden = Qwen4RmsNorm::from_weights(
+            &weights,
+            "pre_fc_norm_hidden.weight",
+            config.rms_norm_eps,
+            None,
+        )?;
+        let (embedding_group, embedding_bits) = config.quant_params("fc_embedding");
+        let fc_embedding =
+            UnifiedLinear::from_weights(&weights, "fc_embedding", embedding_group, embedding_bits)?;
+        let (hidden_group, hidden_bits) = config.quant_params("fc_hidden");
+        let fc_hidden =
+            UnifiedLinear::from_weights(&weights, "fc_hidden", hidden_group, hidden_bits)?;
+        let layer = Qwen4DecoderLayer::from_weights_at_prefix(
+            &weights,
+            &config,
+            &qn_config,
+            "layers.0",
+            false,
+            None,
+            false,
+            Arc::new(Qwen4PrefillPolicy::default()),
+        )?;
+        let final_mixer =
+            Qwen4FinalMixer::from_weights(&weights, &config, "hyper_connection_mixer")?;
 
         Ok(Self {
-            pre_fc_norm_embedding: RMSNorm::new(embedding_norm, config.rms_norm_eps),
-            pre_fc_norm_hidden: RMSNorm::new(hidden_norm, config.rms_norm_eps),
-            fc,
+            pre_fc_norm_embedding,
+            pre_fc_norm_hidden,
+            fc_embedding,
+            fc_hidden,
             layer,
-            norm: RMSNorm::new(norm, config.rms_norm_eps),
-            state: RefCell::new(Qwen35MtpDraftState::new()),
+            final_mixer,
+            state: RefCell::new(Qwen4MtpDraftState::new()),
         })
     }
 
     pub(crate) fn reset(&self) {
-        *self.state.borrow_mut() = Qwen35MtpDraftState::new();
+        *self.state.borrow_mut() = Qwen4MtpDraftState::new();
     }
 
     fn forward_embeddings(
         &self,
         token_embeddings: &MlxArray,
         target_hidden: &MlxArray,
-        state: &mut Qwen35MtpDraftState,
+        state: &mut Qwen4MtpDraftState,
         position_ids: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        let embedding = self.pre_fc_norm_embedding.forward(token_embeddings);
+        let embedding = self
+            .fc_embedding
+            .forward(&self.pre_fc_norm_embedding.forward(token_embeddings));
+        let hidden_shape = mlxcel_core::array_shape(target_hidden);
+        let embedding_shape = mlxcel_core::array_shape(token_embeddings);
         let hidden = self.pre_fc_norm_hidden.forward(target_hidden);
-        let concatenated = mlxcel_core::concatenate(&embedding, &hidden, -1);
-        let mut output = self.fc.forward(&concatenated);
+        let hidden = mlxcel_core::reshape(
+            &hidden,
+            &[
+                hidden_shape[0],
+                hidden_shape[1],
+                hidden_shape[2] / embedding_shape[2],
+                embedding_shape[2],
+            ],
+        );
+        let hidden = self.fc_hidden.forward(&hidden);
+        let embedding = mlxcel_core::expand_dims(&embedding, -2);
+        let fused = mlxcel_core::add(&embedding, &hidden);
+        let mut output = mlxcel_core::reshape(&fused, &hidden_shape);
         let steps = mlxcel_core::array_shape(&output)[1];
         let cache_offset = state.cache.offset;
         let decode_positions = if position_ids.is_none() {
@@ -352,19 +443,34 @@ impl Qwen35MtpDraftModel {
         };
         output = self.layer.forward_full_attention(
             &output,
+            token_embeddings,
             None,
             &mut state.cache,
             position_ids.or(decode_positions.as_deref()),
         );
-        self.norm.forward(&output)
+        output
+    }
+
+    fn project_logits(
+        &self,
+        target: &Qwen4Model,
+        hyper_hidden: &MlxArray,
+        compact: bool,
+    ) -> UniquePtr<MlxArray> {
+        let mixed = self.final_mixer.forward(hyper_hidden);
+        if compact {
+            target.project_draft_logits(&mixed)
+        } else {
+            target.project_logits(&mixed)
+        }
     }
 
     fn forward_tokens(
         &self,
-        target: &Qwen35Model,
+        target: &Qwen4Model,
         tokens: &MlxArray,
         target_hidden: &MlxArray,
-        state: &mut Qwen35MtpDraftState,
+        state: &mut Qwen4MtpDraftState,
     ) -> UniquePtr<MlxArray> {
         let token_embeddings = target.embed_tokens.forward(tokens);
         self.forward_embeddings(&token_embeddings, target_hidden, state, None)
@@ -372,16 +478,16 @@ impl Qwen35MtpDraftModel {
 
     fn set_seed_from_hidden(
         &self,
-        _target: &Qwen35Model,
+        _target: &Qwen4Model,
         hidden: &MlxArray,
-        state: &mut Qwen35MtpDraftState,
+        state: &mut Qwen4MtpDraftState,
     ) {
         state.seed_hidden = Some(materialize_detached(mlxcel_core::copy(hidden)));
     }
 
     fn prefill_target_chunk(
         &self,
-        target: &Qwen35Model,
+        target: &Qwen4Model,
         shifted_embeddings: &MlxArray,
         target_hidden: &MlxArray,
         position_ids: Option<&MlxArray>,
@@ -406,10 +512,10 @@ impl Qwen35MtpDraftModel {
 
     fn draft_seed_hidden(
         &self,
-        target: &Qwen35Model,
+        target: &Qwen4Model,
         last_bonus: i32,
         target_hidden: &MlxArray,
-        state: &mut Qwen35MtpDraftState,
+        state: &mut Qwen4MtpDraftState,
     ) -> UniquePtr<MlxArray> {
         state.seed_hidden.take().unwrap_or_else(|| {
             let bonus = mlxcel_core::from_slice_i32(&[last_bonus], &[1, 1]);
@@ -422,7 +528,7 @@ impl Qwen35MtpDraftModel {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn draft_block_greedy(
         &self,
-        target: &Qwen35Model,
+        target: &Qwen4Model,
         last_bonus: i32,
         target_hidden: &MlxArray,
         proposal_count: usize,
@@ -436,7 +542,7 @@ impl Qwen35MtpDraftModel {
         let mut tokens = Vec::with_capacity(proposal_count);
         let mut history = (!compact).then(|| committed_history.to_vec());
         let mut hidden = self.draft_seed_hidden(target, last_bonus, target_hidden, &mut state);
-        let mut logits = target.project_draft_logits(&hidden);
+        let mut logits = self.project_logits(target, &hidden, compact);
         while tokens.len() < proposal_count {
             let token_array = if compact && sampler_is_greedy(sampling) {
                 mlxcel_core::argmax_last_axis(&logits)
@@ -453,7 +559,7 @@ impl Qwen35MtpDraftModel {
             mlxcel_core::eval(&token_array);
             let sampled = mlxcel_core::item_i32(&token_array);
             let token = if compact {
-                Qwen35Model::map_draft_token(sampled)
+                Qwen4Model::map_draft_token(sampled)
             } else {
                 sampled
             };
@@ -467,7 +573,7 @@ impl Qwen35MtpDraftModel {
             let token_array = mlxcel_core::from_slice_i32(&[token], &[1, 1]);
             hidden = self.forward_tokens(target, &token_array, &hidden, &mut state);
             state.round_appended += 1;
-            logits = target.project_draft_logits(&hidden);
+            logits = self.project_logits(target, &hidden, compact);
         }
         tokens
     }
@@ -475,7 +581,7 @@ impl Qwen35MtpDraftModel {
     #[allow(clippy::too_many_arguments)]
     fn draft_block_stochastic(
         &self,
-        target: &Qwen35Model,
+        target: &Qwen4Model,
         last_bonus: i32,
         target_hidden: &MlxArray,
         proposal_count: usize,
@@ -488,7 +594,7 @@ impl Qwen35MtpDraftModel {
         let mut proposals = Vec::with_capacity(proposal_count);
         let mut history = committed_history.to_vec();
         let mut hidden = self.draft_seed_hidden(target, last_bonus, target_hidden, &mut state);
-        let mut logits = target.project_logits(&hidden);
+        let mut logits = self.project_logits(target, &hidden, false);
 
         while proposals.len() < proposal_count {
             let (token_array, proposal_probs) =
@@ -506,7 +612,7 @@ impl Qwen35MtpDraftModel {
             let token_array = mlxcel_core::from_slice_i32(&[token], &[1, 1]);
             hidden = self.forward_tokens(target, &token_array, &hidden, &mut state);
             state.round_appended += 1;
-            logits = target.project_logits(&hidden);
+            logits = self.project_logits(target, &hidden, false);
         }
         proposals
     }
@@ -514,7 +620,7 @@ impl Qwen35MtpDraftModel {
     #[allow(clippy::too_many_arguments)]
     fn draft_block_greedy_constrained(
         &self,
-        target: &Qwen35Model,
+        target: &Qwen4Model,
         last_bonus: i32,
         target_hidden: &MlxArray,
         proposal_count: usize,
@@ -531,7 +637,7 @@ impl Qwen35MtpDraftModel {
         let mut history = Vec::with_capacity(prompt_tokens.len() + output.len() + proposal_count);
         rebuild_history(prompt_tokens, &output, &mut history);
         let mut hidden = self.draft_seed_hidden(target, last_bonus, target_hidden, &mut state);
-        let mut logits = target.project_logits(&hidden);
+        let mut logits = self.project_logits(target, &hidden, false);
 
         while tokens.len() < proposal_count {
             let step = constraint_step(&logits, constraint, &history)?;
@@ -558,7 +664,7 @@ impl Qwen35MtpDraftModel {
             let token_array = mlxcel_core::from_slice_i32(&[token], &[1, 1]);
             hidden = self.forward_tokens(target, &token_array, &hidden, &mut state);
             state.round_appended += 1;
-            logits = target.project_logits(&hidden);
+            logits = self.project_logits(target, &hidden, false);
         }
         Ok(tokens)
     }
@@ -566,7 +672,7 @@ impl Qwen35MtpDraftModel {
     #[allow(clippy::too_many_arguments)]
     fn draft_block_stochastic_constrained(
         &self,
-        target: &Qwen35Model,
+        target: &Qwen4Model,
         last_bonus: i32,
         target_hidden: &MlxArray,
         proposal_count: usize,
@@ -583,7 +689,7 @@ impl Qwen35MtpDraftModel {
         let mut history = Vec::with_capacity(prompt_tokens.len() + output.len() + proposal_count);
         rebuild_history(prompt_tokens, &output, &mut history);
         let mut hidden = self.draft_seed_hidden(target, last_bonus, target_hidden, &mut state);
-        let mut logits = target.project_logits(&hidden);
+        let mut logits = self.project_logits(target, &hidden, false);
 
         while proposals.len() < proposal_count {
             let step = constraint_step(&logits, constraint, &history)?;
@@ -614,14 +720,14 @@ impl Qwen35MtpDraftModel {
             let token_array = mlxcel_core::from_slice_i32(&[token], &[1, 1]);
             hidden = self.forward_tokens(target, &token_array, &hidden, &mut state);
             state.round_appended += 1;
-            logits = target.project_logits(&hidden);
+            logits = self.project_logits(target, &hidden, false);
         }
         Ok(proposals)
     }
 
     pub(crate) fn accept_verified_tokens(
         &self,
-        target: &Qwen35Model,
+        target: &Qwen4Model,
         verify_hidden: &MlxArray,
         draft_tokens: &[i32],
         accepted: usize,
@@ -690,7 +796,7 @@ impl Qwen35MtpDraftModel {
         if state.cache.offset != expected_offset {
             return None;
         }
-        let mut draft = ModelStateSnapshot::new("qwen3.5-mtp-draft", expected_offset as usize);
+        let mut draft = ModelStateSnapshot::new("qwen4-mtp-draft", expected_offset as usize);
         if let (Some(keys), Some(values)) =
             (state.cache.keys.as_deref(), state.cache.values.as_deref())
         {
@@ -737,7 +843,7 @@ impl Qwen35MtpDraftModel {
         if snapshot.target.token_len() != token_len
             || snapshot.draft_offset != expected_offset
             || snapshot.draft.token_len() != expected_offset as usize
-            || snapshot.draft.family() != "qwen3.5-mtp-draft"
+            || snapshot.draft.family() != "qwen4-mtp-draft"
         {
             return Err(
                 "MTP snapshot target/drafter offsets do not match the cached prefix".to_string(),
@@ -761,7 +867,7 @@ impl Qwen35MtpDraftModel {
             cache.values = values.materialize();
         }
         cache.offset = expected_offset;
-        *self.state.borrow_mut() = Qwen35MtpDraftState {
+        *self.state.borrow_mut() = Qwen4MtpDraftState {
             cache,
             seed_hidden: None,
             rope_delta: None,
@@ -856,7 +962,7 @@ fn log_mtp_memory(phase: &'static str, tokens: usize) {
     );
 }
 
-fn finish_mtp_request(model: &Qwen35Model) {
+fn finish_mtp_request(model: &Qwen4Model) {
     if let Some(drafter) = model.mtp() {
         drafter.materialize_state();
     }
@@ -995,7 +1101,7 @@ pub(crate) fn greedy_walk(
             );
             let token = mlxcel_core::item_i32(&token);
             target_tokens.push(if compact_logits {
-                Qwen35Model::map_dflash_verify_token(token)
+                Qwen4Model::map_mtp_verify_token(token)
             } else {
                 token
             });
@@ -1008,7 +1114,7 @@ pub(crate) fn greedy_walk(
             mlxcel_core::eval(&token);
             let token = mlxcel_core::item_i32(&token);
             target_tokens.push(if compact_logits {
-                Qwen35Model::map_dflash_verify_token(token)
+                Qwen4Model::map_mtp_verify_token(token)
             } else {
                 token
             });
@@ -1018,59 +1124,6 @@ pub(crate) fn greedy_walk(
         }
     }
     speculative_walk(draft_tokens, &target_tokens, max_new_tokens)
-}
-
-/// Greedy verification with proposals retained on-device until the target
-/// posterior has been evaluated.
-#[cfg(any(feature = "dflash2", test))]
-pub(crate) fn greedy_walk_device_proposals(
-    draft_tokens: &MlxArray,
-    verify_logits: &MlxArray,
-    compact_logits: bool,
-    sampling: &SamplingConfig,
-    committed_history: &[i32],
-    max_new_tokens: usize,
-) -> (WalkResult, Vec<i32>) {
-    let materialize_ids = |array: &MlxArray| {
-        mlxcel_core::eval(array);
-        mlxcel_core::array_evaluated_bytes(array)
-            .chunks_exact(4)
-            .map(|bytes| i32::from_ne_bytes(bytes.try_into().expect("i32 token bytes")))
-            .collect::<Vec<_>>()
-    };
-    let history_independent = sampling.repetition_penalty == 1.0
-        && sampling.dry_multiplier == 0.0
-        && sampling.frequency_penalty == 0.0
-        && sampling.presence_penalty == 0.0
-        && sampling.xtc_probability == 0.0;
-    if !history_independent {
-        let draft_tokens = materialize_ids(draft_tokens);
-        let walk = greedy_walk(
-            &draft_tokens,
-            verify_logits,
-            compact_logits,
-            sampling,
-            committed_history,
-            max_new_tokens,
-        );
-        return (walk, draft_tokens);
-    }
-
-    let biased_logits =
-        mlxcel_core::sampling::apply_token_bias(verify_logits, &sampling.token_bias);
-    let targets = mlxcel_core::argmax_last_axis(&biased_logits);
-    mlxcel_core::async_eval(&targets);
-    let draft_tokens = materialize_ids(draft_tokens);
-    let mut target_tokens = materialize_ids(&targets);
-    if compact_logits {
-        target_tokens
-            .iter_mut()
-            .for_each(|token| *token = Qwen35Model::map_dflash_verify_token(*token));
-    }
-    (
-        speculative_walk(&draft_tokens, &target_tokens, max_new_tokens),
-        draft_tokens,
-    )
 }
 
 fn stochastic_walk(
@@ -1528,15 +1581,7 @@ pub(crate) fn emit_walk_tokens<F: FnMut(i32) -> bool>(
 
 #[derive(Clone, Copy)]
 enum MtpPrefill<'a> {
-    Text {
-        prompt: &'a MlxArray,
-    },
-    Multimodal {
-        prompt: &'a MlxArray,
-        input_embeddings: &'a MlxArray,
-        position_ids: &'a MlxArray,
-        rope_delta: i32,
-    },
+    Text { prompt: &'a MlxArray },
 }
 
 struct ActiveMtpState {
@@ -1546,12 +1591,12 @@ struct ActiveMtpState {
 
 fn prompt_for_prefill(prefill: MtpPrefill<'_>) -> &MlxArray {
     match prefill {
-        MtpPrefill::Text { prompt } | MtpPrefill::Multimodal { prompt, .. } => prompt,
+        MtpPrefill::Text { prompt } => prompt,
     }
 }
 
 fn shifted_embeddings_for_range(
-    model: &Qwen35Model,
+    model: &Qwen4Model,
     prefill: MtpPrefill<'_>,
     start: i32,
     end: i32,
@@ -1576,50 +1621,17 @@ fn shifted_embeddings_for_range(
             };
             model.embed_tokens.forward(&shifted_ids)
         }
-        MtpPrefill::Multimodal {
-            input_embeddings, ..
-        } => {
-            let bonus_embedding = bonus.map(|bonus| {
-                let bonus = mlxcel_core::from_slice_i32(&[bonus], &[1, 1]);
-                model.embed_tokens.forward(&bonus)
-            });
-            shifted_embedding_range(input_embeddings, start, end, bonus_embedding.as_deref())
-        }
     }
 }
 
-fn position_ids_for_range(
-    prefill: MtpPrefill<'_>,
-    start: i32,
-    end: i32,
-) -> Option<UniquePtr<MlxArray>> {
-    let MtpPrefill::Multimodal { position_ids, .. } = prefill else {
-        return None;
-    };
-    let shape = mlxcel_core::array_shape(position_ids);
-    Some(mlxcel_core::slice(
-        position_ids,
-        &[0, 0, start],
-        &[shape[0], shape[1], end],
-    ))
-}
-
 fn prefill_for_input(
-    model: &Qwen35Model,
-    drafter: &Qwen35MtpDraftModel,
+    model: &Qwen4Model,
+    drafter: &Qwen4MtpDraftModel,
     prefill_input: MtpPrefill<'_>,
-) -> Result<crate::qwen3_5::Qwen35MtpPrefill, String> {
+) -> Result<crate::qwen4::Qwen4MtpPrefill, String> {
     drafter.reset();
     let prompt = prompt_for_prefill(prefill_input);
-    let (embeddings, positions, rope_delta) = match prefill_input {
-        MtpPrefill::Text { .. } => (None, None, None),
-        MtpPrefill::Multimodal {
-            input_embeddings,
-            position_ids,
-            rope_delta,
-            ..
-        } => (Some(input_embeddings), Some(position_ids), Some(rope_delta)),
-    };
+    let (embeddings, positions, rope_delta) = (None, None, None);
     let prefill = model.forward_mtp_prefill_chunks(
         prompt,
         embeddings,
@@ -1627,7 +1639,7 @@ fn prefill_for_input(
         rope_delta,
         |start, end, hidden| {
             let shifted = shifted_embeddings_for_range(model, prefill_input, start, end, None);
-            let chunk_positions = position_ids_for_range(prefill_input, start, end);
+            let chunk_positions: Option<UniquePtr<MlxArray>> = None;
             drafter.prefill_target_chunk(
                 model,
                 &shifted,
@@ -1655,7 +1667,7 @@ fn prefill_for_input(
             &[0, 0, 0],
             &[final_shape[0], final_len - 1, final_shape[2]],
         );
-        let positions = position_ids_for_range(prefill_input, start, prompt_len - 1);
+        let positions: Option<UniquePtr<MlxArray>> = None;
         drafter.prefill_target_chunk(
             model,
             &shifted,
@@ -1671,11 +1683,11 @@ fn prefill_for_input(
 }
 
 fn prefill_text_with_reuse(
-    model: &Qwen35Model,
-    drafter: &Qwen35MtpDraftModel,
+    model: &Qwen4Model,
+    drafter: &Qwen4MtpDraftModel,
     prompt_tokens: &[i32],
     reuse: Option<MtpPrefixReuse<'_>>,
-) -> Result<(crate::qwen3_5::Qwen35MtpPrefill, usize), String> {
+) -> Result<(crate::qwen4::Qwen4MtpPrefill, usize), String> {
     let Some(reuse) = reuse else {
         debug!(
             phase = "prefill.started",
@@ -1715,7 +1727,7 @@ fn prefill_text_with_reuse(
             prefill_tokens = 0,
         );
         return Ok((
-            crate::qwen3_5::Qwen35MtpPrefill {
+            crate::qwen4::Qwen4MtpPrefill {
                 hidden: mlxcel_core::copy(&reuse.snapshot.last_hidden),
                 first_logits: mlxcel_core::copy(&reuse.snapshot.continuation_logits),
             },
@@ -1732,7 +1744,7 @@ fn prefill_text_with_reuse(
             prefill_tokens = 0,
         );
         return Ok((
-            crate::qwen3_5::Qwen35MtpPrefill {
+            crate::qwen4::Qwen4MtpPrefill {
                 hidden: mlxcel_core::copy(&reuse.snapshot.last_hidden),
                 first_logits: mlxcel_core::copy(&reuse.snapshot.continuation_logits),
             },
@@ -1777,10 +1789,10 @@ fn prefill_text_with_reuse(
 }
 
 fn capture_mtp_prompt_snapshot(
-    model: &Qwen35Model,
-    drafter: &Qwen35MtpDraftModel,
+    model: &Qwen4Model,
+    drafter: &Qwen4MtpDraftModel,
     token_len: usize,
-    prefill: &crate::qwen3_5::Qwen35MtpPrefill,
+    prefill: &crate::qwen4::Qwen4MtpPrefill,
     previous: Option<&MtpPromptSnapshot>,
 ) -> Option<MtpPromptSnapshot> {
     let target = model.snapshot_sequence_state(
@@ -1804,19 +1816,12 @@ fn capture_mtp_prompt_snapshot(
     )
 }
 fn prefill_text_with_checkpoints(
-    model: &Qwen35Model,
-    drafter: &Qwen35MtpDraftModel,
+    model: &Qwen4Model,
+    drafter: &Qwen4MtpDraftModel,
     prompt_tokens: &[i32],
     reuse: Option<MtpPrefixReuse<'_>>,
     checkpoint_token_lengths: &[usize],
-) -> Result<
-    (
-        crate::qwen3_5::Qwen35MtpPrefill,
-        usize,
-        Vec<MtpPromptSnapshot>,
-    ),
-    String,
-> {
+) -> Result<(crate::qwen4::Qwen4MtpPrefill, usize, Vec<MtpPromptSnapshot>), String> {
     let cached_tokens = reuse.map_or(0, |value| value.cached_tokens);
     let mut source_reuse = reuse;
     let mut latest_checkpoint = None;
@@ -1871,10 +1876,10 @@ fn prefill_text_with_checkpoints(
 }
 
 fn finish_drafter_prefill(
-    model: &Qwen35Model,
-    drafter: &Qwen35MtpDraftModel,
+    model: &Qwen4Model,
+    drafter: &Qwen4MtpDraftModel,
     prefill_input: MtpPrefill<'_>,
-    prefill: crate::qwen3_5::Qwen35MtpPrefill,
+    prefill: crate::qwen4::Qwen4MtpPrefill,
     first_token: i32,
 ) -> UniquePtr<MlxArray> {
     let prompt_len = mlxcel_core::array_shape(prompt_for_prefill(prefill_input))[1];
@@ -1887,11 +1892,8 @@ fn finish_drafter_prefill(
     ));
     let bonus = mlxcel_core::from_slice_i32(&[first_token], &[1, 1]);
     let bonus_embedding = model.embed_tokens.forward(&bonus);
-    let positions = position_ids_for_range(prefill_input, prompt_len - 1, prompt_len);
-    let rope_delta = match prefill_input {
-        MtpPrefill::Text { .. } => None,
-        MtpPrefill::Multimodal { rope_delta, .. } => Some(rope_delta),
-    };
+    let positions: Option<UniquePtr<MlxArray>> = None;
+    let rope_delta = None;
     drafter.prefill_target_chunk(
         model,
         &bonus_embedding,
@@ -1908,8 +1910,8 @@ fn finish_drafter_prefill(
     last_hidden
 }
 fn rebuild_mtp_state(
-    model: &Qwen35Model,
-    drafter: &Qwen35MtpDraftModel,
+    model: &Qwen4Model,
+    drafter: &Qwen4MtpDraftModel,
     prefill_input: MtpPrefill<'_>,
     output: &[i32],
 ) -> Result<ActiveMtpState, String> {
@@ -1959,8 +1961,8 @@ fn aligned_terminal_verify_row(emitted_in_round: usize) -> Result<i32, String> {
 }
 
 fn capture_mtp_snapshot_from_verify(
-    model: &Qwen35Model,
-    drafter: &Qwen35MtpDraftModel,
+    model: &Qwen4Model,
+    drafter: &Qwen4MtpDraftModel,
     prompt_tokens: usize,
     generated_tokens: usize,
     verify_hidden: &MlxArray,
@@ -2006,8 +2008,8 @@ fn capture_mtp_snapshot_from_verify(
 }
 
 fn capture_mtp_final_snapshot(
-    model: &Qwen35Model,
-    drafter: &Qwen35MtpDraftModel,
+    model: &Qwen4Model,
+    drafter: &Qwen4MtpDraftModel,
     prompt_tokens: &[i32],
     prefill_input: MtpPrefill<'_>,
     prefix_reuse: Option<MtpPrefixReuse<'_>>,
@@ -2107,16 +2109,16 @@ fn capture_mtp_final_snapshot(
     Ok(snapshot)
 }
 
-pub(crate) struct Qwen35MtpGenerator;
+pub(crate) struct Qwen4MtpGenerator;
 
-impl Qwen35MtpGenerator {
+impl Qwen4MtpGenerator {
     pub(crate) fn new() -> Self {
         Self
     }
 
     pub(crate) fn generate_streaming<F: FnMut(i32) -> bool>(
         &mut self,
-        model: &Qwen35Model,
+        model: &Qwen4Model,
         prompt_tokens: &[i32],
         max_tokens: usize,
         sampling: &SamplingConfig,
@@ -2146,48 +2148,9 @@ impl Qwen35MtpGenerator {
         result
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn generate_streaming_with_embeddings<F: FnMut(i32) -> bool>(
-        &mut self,
-        model: &Qwen35Model,
-        prompt_tokens: &[i32],
-        input_embeddings: &MlxArray,
-        position_ids: &MlxArray,
-        rope_delta: i32,
-        max_tokens: usize,
-        sampling: &SamplingConfig,
-        block_size: usize,
-        constraint: Option<&mut dyn TokenConstraint>,
-        on_token: F,
-    ) -> Result<MtpGeneration, String> {
-        let prompt = mlxcel_core::from_slice_i32(
-            prompt_tokens,
-            &[1, i32::try_from(prompt_tokens.len()).unwrap_or(i32::MAX)],
-        );
-        let result = self.generate_streaming_for_prefill(
-            model,
-            prompt_tokens,
-            MtpPrefill::Multimodal {
-                prompt: &prompt,
-                input_embeddings,
-                position_ids,
-                rope_delta,
-            },
-            max_tokens,
-            sampling,
-            block_size,
-            None,
-            &[],
-            constraint,
-            on_token,
-        );
-        finish_mtp_request(model);
-        result
-    }
-
     fn generate_streaming_for_prefill<F: FnMut(i32) -> bool>(
         &mut self,
-        model: &Qwen35Model,
+        model: &Qwen4Model,
         prompt_tokens: &[i32],
         prefill_input: MtpPrefill<'_>,
         max_tokens: usize,
@@ -2228,7 +2191,7 @@ impl Qwen35MtpGenerator {
         }
         let drafter = model
             .mtp()
-            .expect("Qwen35MtpGenerator requires a bundled MTP head");
+            .expect("Qwen4MtpGenerator requires a bundled MTP head");
         let final_prefix_reuse = prefix_reuse;
         let continuation_token = final_prefix_reuse.and_then(|reuse| reuse.continuation_token);
         let mut sampling = sampling.clone();
@@ -2249,17 +2212,13 @@ impl Qwen35MtpGenerator {
         }
 
         let prefill_start = Instant::now();
-        let (prefill, cached_tokens, prompt_snapshots) = match prefill_input {
-            MtpPrefill::Text { .. } => prefill_text_with_checkpoints(
-                model,
-                drafter,
-                prompt_tokens,
-                prefix_reuse,
-                checkpoint_token_lengths,
-            ),
-            MtpPrefill::Multimodal { .. } => prefill_for_input(model, drafter, prefill_input)
-                .map(|prefill| (prefill, 0, Vec::new())),
-        }
+        let (prefill, cached_tokens, prompt_snapshots) = prefill_text_with_checkpoints(
+            model,
+            drafter,
+            prompt_tokens,
+            prefix_reuse,
+            checkpoint_token_lengths,
+        )
         .expect("MTP prefill requires valid synchronized chunks");
         let first_token = if let Some(token) = continuation_token {
             token
@@ -2357,13 +2316,14 @@ impl Qwen35MtpGenerator {
                     && sampling.xtc_probability == 0.0
                     && remaining > block_size;
                 let phase_start = Instant::now();
-                let verify = model.forward_mtp_verify_with_compact(&verify_input, compact_verify);
+                let mut verify =
+                    model.forward_mtp_verify_with_compact(&verify_input, compact_verify);
                 mlxcel_core::eval(&verify.logits);
                 mtp_stats.target_verify_time += phase_start.elapsed();
                 mtp_stats.target_forward_calls += 1;
                 mtp_stats.speculative_rounds += 1;
                 let phase_start = Instant::now();
-                let walk = if let Some(proposals) = proposal_probs.as_deref() {
+                let mut walk = if let Some(proposals) = proposal_probs.as_deref() {
                     stochastic_walk(
                         proposals,
                         &verify.logits,
@@ -2383,6 +2343,46 @@ impl Qwen35MtpGenerator {
                     )
                 };
                 mtp_stats.walk_time += phase_start.elapsed();
+                let mut reference_fallback = false;
+                if proposal_probs.is_none()
+                    && model.approximate_prefill_used()
+                    && let Some(decision) =
+                        mlxcel_core::generate::first_bf16_ill_conditioned_greedy_row(
+                            &verify.logits,
+                            walk.new_tokens.len(),
+                        )
+                {
+                    debug!(
+                        phase = "mtp.reference_fallback",
+                        verify_row = decision.row,
+                        logit_margin = decision.margin,
+                        bf16_ulp = decision.bf16_ulp,
+                    );
+                    model.rollback_mtp_verify_to_prefix(
+                        &verify.gdn_states,
+                        verify_tokens.len(),
+                        false,
+                    );
+                    let reference_input = mlxcel_core::from_slice_i32(&[bonus], &[1, 1]);
+                    let phase_start = Instant::now();
+                    verify =
+                        model.forward_mtp_verify_with_compact(&reference_input, compact_verify);
+                    mlxcel_core::eval(&verify.logits);
+                    mtp_stats.target_verify_time += phase_start.elapsed();
+                    mtp_stats.target_forward_calls += 1;
+                    let phase_start = Instant::now();
+                    walk = greedy_walk(
+                        &[],
+                        &verify.logits,
+                        compact_verify,
+                        &sampling,
+                        &history,
+                        remaining,
+                    );
+                    mtp_stats.walk_time += phase_start.elapsed();
+                    mtp_stats.reference_fallbacks += 1;
+                    reference_fallback = true;
+                }
                 let phase_start = Instant::now();
                 mtp_stats.record_round(walk.accepted, draft_tokens.len());
                 extend_greedy_draft = should_extend_greedy_draft(
@@ -2406,7 +2406,7 @@ impl Qwen35MtpGenerator {
                 }
 
                 let rollback_accepted = target_cache_accepted_count(emitted_in_round);
-                if rollback_accepted < draft_tokens.len() {
+                if !reference_fallback && rollback_accepted < draft_tokens.len() {
                     model.rollback_mtp_verify(
                         &verify.gdn_states,
                         rollback_accepted,
@@ -2503,7 +2503,7 @@ impl Qwen35MtpGenerator {
     #[allow(clippy::too_many_arguments)]
     fn generate_streaming_constrained_for_prefill<F: FnMut(i32) -> bool>(
         &mut self,
-        model: &Qwen35Model,
+        model: &Qwen4Model,
         prompt_tokens: &[i32],
         prefill_input: MtpPrefill<'_>,
         max_tokens: usize,
@@ -2516,7 +2516,7 @@ impl Qwen35MtpGenerator {
     ) -> Result<MtpGeneration, String> {
         let drafter = model
             .mtp()
-            .expect("Qwen35MtpGenerator requires a bundled MTP head");
+            .expect("Qwen4MtpGenerator requires a bundled MTP head");
         let mut sampling = sampling.clone();
         sampling
             .token_bias
@@ -2545,19 +2545,13 @@ impl Qwen35MtpGenerator {
 
         loop {
             let (prefill, reused, checkpoints) = if generated.is_empty() {
-                match prefill_input {
-                    MtpPrefill::Text { .. } => prefill_text_with_checkpoints(
-                        model,
-                        drafter,
-                        prompt_tokens,
-                        prefix_reuse.take(),
-                        checkpoint_token_lengths,
-                    ),
-                    MtpPrefill::Multimodal { .. } => {
-                        prefill_for_input(model, drafter, prefill_input)
-                            .map(|prefill| (prefill, 0, Vec::new()))
-                    }
-                }
+                prefill_text_with_checkpoints(
+                    model,
+                    drafter,
+                    prompt_tokens,
+                    prefix_reuse.take(),
+                    checkpoint_token_lengths,
+                )
             } else {
                 prefill_for_input(model, drafter, prefill_input)
                     .map(|prefill| (prefill, 0, Vec::new()))
@@ -2866,9 +2860,9 @@ impl Qwen35MtpGenerator {
 mod tests {
     use super::*;
     use crate::gated_delta::GatedDeltaCache;
-    use crate::qwen_mrope_state::MRopeState;
-    use crate::qwen3_5::rollback_plan;
-    use crate::qwen3_next::Qwen3NextCache;
+    use crate::qwen_rope_state::RopeState;
+    use crate::qwen4::rollback_plan;
+    use crate::qwen4_attention::Qwen4LayerCache;
 
     #[test]
     fn mtp_prompt_snapshot_arrays_remain_owned_after_sources_drop() {
@@ -2876,7 +2870,7 @@ mod tests {
         let values = mlxcel_core::from_slice_f32(&[3.0, 4.0], &[1, 1, 1, 2]);
         let hidden = mlxcel_core::from_slice_f32(&[5.0, 6.0], &[1, 1, 2]);
         let logits = mlxcel_core::from_slice_f32(&[7.0, 8.0], &[1, 1, 2]);
-        let mut draft = ModelStateSnapshot::new("qwen3.5-mtp-draft", 1);
+        let mut draft = ModelStateSnapshot::new("qwen4-mtp-draft", 1);
         draft
             .push_paged_tensor(None, "draft_keys", &keys, 2)
             .expect("draft keys");
@@ -2921,7 +2915,7 @@ mod tests {
         let values = mlxcel_core::astype(&keys, mlxcel_core::dtype::FLOAT16);
         let hidden = mlxcel_core::from_slice_f32(&[3.0, 4.0], &[1, 1, 2]);
         let logits = mlxcel_core::from_slice_f32(&[5.0, 6.0], &[1, 1, 2]);
-        let mut draft = ModelStateSnapshot::new("qwen3.5-mtp-draft", 1);
+        let mut draft = ModelStateSnapshot::new("qwen4-mtp-draft", 1);
         draft
             .push_paged_tensor(None, "draft_keys", &values, 2)
             .expect("draft keys");
@@ -3439,8 +3433,8 @@ mod tests {
             let mut linear = GatedDeltaCache::new();
             linear.offset = plan.final_offset;
             let caches = [
-                Qwen3NextCache::Attention(Box::new(attention)),
-                Qwen3NextCache::Linear(linear),
+                Qwen4LayerCache::Attention(Box::new(attention)),
+                Qwen4LayerCache::Linear(linear),
             ];
             assert_eq!(caches[0].offset(), plan.final_offset);
             assert_eq!(caches[1].offset(), plan.final_offset);
@@ -3452,7 +3446,7 @@ mod tests {
             draft.offset += (accepted - kept + 1) as i32;
             assert_eq!(draft.offset, plan.final_offset);
 
-            let mrope = MRopeState::new();
+            let mrope = RopeState::new();
             mrope.restore(plan.final_offset, None, Some(-3));
             assert_eq!(mrope.position(), plan.final_offset);
             assert_eq!(mrope.rope_delta(), Some(-3));
@@ -3619,27 +3613,8 @@ mod tests {
     }
 
     #[test]
-    fn multimodal_shift_preserves_chunk_alignment_and_bonus_tail() {
-        let embeddings = mlxcel_core::from_slice_f32(&[1.0, 20.0, 2.0, 30.0, 3.0, 4.0], &[1, 6, 1]);
-        let bonus = mlxcel_core::from_slice_f32(&[99.0], &[1, 1, 1]);
-        let first = shifted_embedding_range(&embeddings, 0, 2, None);
-        let second = shifted_embedding_range(&embeddings, 2, 4, None);
-        let final_chunk = shifted_embedding_range(&embeddings, 4, 6, Some(&bonus));
-        assert_eq!(array_f32(&first), [20.0, 2.0]);
-        assert_eq!(array_f32(&second), [30.0, 3.0]);
-        assert_eq!(array_f32(&final_chunk), [4.0, 99.0]);
-
-        let synchronized = mlxcel_core::concatenate(
-            &mlxcel_core::concatenate(&first, &second, 1),
-            &final_chunk,
-            1,
-        );
-        assert_eq!(array_f32(&synchronized), [20.0, 2.0, 30.0, 3.0, 4.0, 99.0]);
-    }
-
-    #[test]
     fn signed_rope_delta_is_retained_for_draft_decode_positions() {
-        let mut state = Qwen35MtpDraftState::new();
+        let mut state = Qwen4MtpDraftState::new();
         state.cache.offset = 8;
         state.rope_delta = Some(-3);
         let positions =

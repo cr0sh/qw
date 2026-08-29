@@ -387,17 +387,10 @@ impl ChatTemplateProcessor {
             .context("failed to render chat messages")
     }
 
-    pub(crate) fn supports_qwen35_tool_calls(&self) -> bool {
+    pub(crate) fn supports_qwen4_tool_calls(&self) -> bool {
         self.template.contains("<tool_call>")
             && self.template.contains("<function=")
             && self.template.contains("<parameter=")
-    }
-
-    pub(crate) fn supports_image_content(&self) -> bool {
-        self.template.contains("image_url")
-            || (self.template.contains("content")
-                && (self.template.contains("\"image\"") || self.template.contains("'image'"))
-                && (self.template.contains("vision_start") || self.template.contains("image_pad")))
     }
 }
 

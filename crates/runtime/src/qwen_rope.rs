@@ -41,10 +41,8 @@ impl InterleavedMRoPE {
             &mlxcel_core::reshape(&positions, &[3, batch, 1, sequence]),
             mlxcel_core::dtype::FLOAT32,
         );
-        let frequencies = mlxcel_core::transpose_axes(
-            &mlxcel_core::matmul(&inverse, &positions),
-            &[0, 1, 3, 2],
-        );
+        let frequencies =
+            mlxcel_core::transpose_axes(&mlxcel_core::matmul(&inverse, &positions), &[0, 1, 3, 2]);
         let frequencies = self.interleave(&frequencies);
         let embedding = mlxcel_core::concatenate(&frequencies, &frequencies, -1);
         (mlxcel_core::cos(&embedding), mlxcel_core::sin(&embedding))
@@ -63,18 +61,12 @@ impl InterleavedMRoPE {
                 column += 3;
             }
         }
-        let indices = mlxcel_core::from_slice_i32(
-            &dimensions,
-            &[1, 1, 1, half_dim],
-        );
-        mlxcel_core::squeeze_axis(
-            &mlxcel_core::take_along_axis(frequencies, &indices, 0),
-            0,
-        )
+        let indices = mlxcel_core::from_slice_i32(&dimensions, &[1, 1, 1, half_dim]);
+        mlxcel_core::squeeze_axis(&mlxcel_core::take_along_axis(frequencies, &indices, 0), 0)
     }
 }
 
-pub(crate) fn apply_multimodal_rotary_pos_emb(
+pub(crate) fn apply_rotary_pos_emb(
     queries: &MlxArray,
     keys: &MlxArray,
     cosine: &MlxArray,

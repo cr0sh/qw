@@ -296,6 +296,14 @@ std::unique_ptr<MlxArray> from_bytes_f16(rust::Slice<const uint8_t> data, rust::
     return std::make_unique<MlxArray>(array(float_data.data(), mlx_shape));
 }
 
+std::unique_ptr<MlxArray> to_fp8(const MlxArray& a) {
+    return std::make_unique<MlxArray>(mlx::core::to_fp8(a.inner));
+}
+
+std::unique_ptr<MlxArray> from_fp8(const MlxArray& a) {
+    return std::make_unique<MlxArray>(mlx::core::from_fp8(a.inner, mlx::core::bfloat16));
+}
+
 // Array property accessors.
 rust::Vec<int32_t> array_shape(const MlxArray& arr) {
     rust::Vec<int32_t> result;
@@ -1222,6 +1230,22 @@ namespace {
 
 std::unique_ptr<MlxArray> compiled_silu(const MlxArray& x) {
     static auto compiled_fn = get_compiled_silu();
+    auto result = compiled_fn({x.inner});
+    return std::make_unique<MlxArray>(std::move(result[0]));
+}
+
+std::unique_ptr<MlxArray> compiled_scaled_silu(
+    const MlxArray& x,
+    float scale
+) {
+    static auto compiled_fn = mlx::core::compile(
+        [scale](const std::vector<array>& inputs) -> std::vector<array> {
+            auto scaled = mlx::core::multiply(
+                inputs[0], mlx::core::array(scale, inputs[0].dtype()));
+            return {mlx::core::multiply(
+                scaled, mlx::core::sigmoid(scaled))};
+        },
+        true);
     auto result = compiled_fn({x.inner});
     return std::make_unique<MlxArray>(std::move(result[0]));
 }
@@ -2330,6 +2354,90 @@ std::unique_ptr<MlxArray> compiled_switch_qgeglu_forward(
     return std::make_unique<MlxArray>(std::move(down));
 }
 
+namespace {
+    static std::function<std::vector<array>(const std::vector<array>&)>
+    get_compiled_switch_qswiglu() {
+        auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
+            const auto& x = inputs[0];
+            const auto& gate_w = inputs[1];
+            const auto& gate_s = inputs[2];
+            const auto& gate_b = inputs[3];
+            const auto& up_w = inputs[4];
+            const auto& up_s = inputs[5];
+            const auto& up_b = inputs[6];
+            const auto& down_w = inputs[7];
+            const auto& down_s = inputs[8];
+            const auto& down_b = inputs[9];
+            const auto& rhs_indices = inputs[10];
+
+            auto gate = mlx::core::gather_qmm(
+                x, gate_w, gate_s, std::optional<array>(gate_b),
+                std::nullopt, std::optional<array>(rhs_indices),
+                true, 64, 4, "affine", false);
+            auto up = mlx::core::gather_qmm(
+                x, up_w, up_s, std::optional<array>(up_b),
+                std::nullopt, std::optional<array>(rhs_indices),
+                true, 64, 4, "affine", false);
+            auto activated = mlx::core::multiply(
+                mlx::core::multiply(gate, mlx::core::sigmoid(gate)), up);
+            auto down = mlx::core::gather_qmm(
+                activated, down_w, down_s, std::optional<array>(down_b),
+                std::nullopt, std::optional<array>(rhs_indices),
+                true, 64, 4, "affine", false);
+            return {down};
+        };
+        return mlx::core::compile(fn, false);
+    }
+}
+
+std::unique_ptr<MlxArray> compiled_switch_qswiglu_forward(
+    const MlxArray& x,
+    const MlxArray& gate_w,
+    const MlxArray& gate_s,
+    const MlxArray* gate_b,
+    const MlxArray& up_w,
+    const MlxArray& up_s,
+    const MlxArray* up_b,
+    const MlxArray& down_w,
+    const MlxArray& down_s,
+    const MlxArray* down_b,
+    const MlxArray& rhs_indices,
+    int32_t group_size,
+    int32_t bits,
+    rust::Str mode
+) {
+    std::string mode_str(mode.data(), mode.size());
+    if (mode_str == "affine" && group_size == 64 && bits == 4
+        && gate_b && up_b && down_b) {
+        static auto compiled_fn = get_compiled_switch_qswiglu();
+        auto result = compiled_fn({
+            x.inner,
+            gate_w.inner, gate_s.inner, gate_b->inner,
+            up_w.inner, up_s.inner, up_b->inner,
+            down_w.inner, down_s.inner, down_b->inner,
+            rhs_indices.inner
+        });
+        return std::make_unique<MlxArray>(std::move(result[0]));
+    }
+
+    std::optional<array> gb_opt = gate_b ? std::optional(gate_b->inner) : std::nullopt;
+    std::optional<array> ub_opt = up_b ? std::optional(up_b->inner) : std::nullopt;
+    std::optional<array> db_opt = down_b ? std::optional(down_b->inner) : std::nullopt;
+    std::optional<array> rhs_opt = std::optional(rhs_indices.inner);
+    auto gate = mlx::core::gather_qmm(
+        x.inner, gate_w.inner, gate_s.inner, gb_opt,
+        std::nullopt, rhs_opt, true, group_size, bits, mode_str, false);
+    auto up = mlx::core::gather_qmm(
+        x.inner, up_w.inner, up_s.inner, ub_opt,
+        std::nullopt, rhs_opt, true, group_size, bits, mode_str, false);
+    auto activated = mlx::core::multiply(
+        mlx::core::multiply(gate, mlx::core::sigmoid(gate)), up);
+    auto down = mlx::core::gather_qmm(
+        activated, down_w.inner, down_s.inner, db_opt,
+        std::nullopt, rhs_opt, true, group_size, bits, mode_str, false);
+    return std::make_unique<MlxArray>(std::move(down));
+}
+
 // SwiGLU MLP forward for non-quantized (FP16/BF16) weights:
 //   down_proj(silu(gate_proj(x)) * up_proj(x))
 //
@@ -3410,6 +3518,98 @@ std::unique_ptr<MlxArray> fast_rms_norm(
         x.inner, weight.inner, eps
     ));
 }
+namespace {
+std::function<std::vector<array>(const std::vector<array>&)>
+make_compiled_group_rms_norm(int group_size, float eps) {
+    auto fn = [group_size, eps](const std::vector<array>& inputs) -> std::vector<array> {
+        auto input_dtype = inputs[0].dtype();
+        auto grouped = mlx::core::unflatten(inputs[0], -1, {-1, group_size});
+        auto grouped_f32 = mlx::core::astype(grouped, mlx::core::float32);
+        auto mean = mlx::core::mean(mlx::core::square(grouped_f32), -1, true);
+        auto inverse = mlx::core::rsqrt(
+            mlx::core::add(mean, mlx::core::array(eps, mlx::core::float32)));
+        auto adjusted = mlx::core::unflatten(inputs[1], -1, {-1, group_size});
+        adjusted = mlx::core::astype(adjusted, mlx::core::float32);
+        auto output = mlx::core::multiply(
+            mlx::core::multiply(grouped_f32, inverse), adjusted);
+        return {mlx::core::astype(
+            mlx::core::flatten(output, -2, -1), input_dtype)};
+    };
+    return mlx::core::compile(fn, true);
+}
+}  // namespace
+
+std::unique_ptr<MlxArray> compiled_group_rms_norm(
+    const MlxArray& x,
+    const MlxArray& weight,
+    int32_t group_size,
+    float eps
+) {
+    static auto fn = make_compiled_group_rms_norm(group_size, eps);
+    return std::make_unique<MlxArray>(std::move(fn({x.inner, weight.inner})[0]));
+}
+
+namespace {
+std::function<std::vector<array>(const std::vector<array>&)>
+make_compiled_hyper_mix(int stream_count) {
+    auto fn = [stream_count](const std::vector<array>& inputs)
+        -> std::vector<array> {
+        auto streams =
+            mlx::core::unflatten(inputs[0], -1, {stream_count, -1});
+        auto weights = mlx::core::sigmoid(
+            mlx::core::unflatten(inputs[1], -1, {stream_count, -1}));
+        return {mlx::core::mean(
+            mlx::core::multiply(streams, weights), -2, false)};
+    };
+    return mlx::core::compile(fn, true);
+}
+
+std::function<std::vector<array>(const std::vector<array>&)>
+make_compiled_hyper_inject(int stream_count) {
+    auto fn = [stream_count](const std::vector<array>& inputs)
+        -> std::vector<array> {
+        auto hyper =
+            mlx::core::unflatten(inputs[1], -1, {stream_count, -1});
+        auto branch = mlx::core::expand_dims(inputs[0], -2);
+        auto weights = mlx::core::expand_dims(
+            mlx::core::multiply(
+                mlx::core::sigmoid(mlx::core::multiply(
+                    inputs[2],
+                    mlx::core::array(1.0f / stream_count,
+                                     inputs[2].dtype()))),
+                mlx::core::array(2.0f, inputs[2].dtype())),
+            -1);
+        auto output = mlx::core::add(
+            hyper, mlx::core::multiply(branch, weights));
+        return {mlx::core::flatten(output, -2, -1)};
+    };
+    return mlx::core::compile(fn, true);
+}
+
+}  // namespace
+
+std::unique_ptr<MlxArray> compiled_hyper_mix(
+    const MlxArray& normed,
+    const MlxArray& mix_logits,
+    int32_t stream_count
+) {
+    static auto fn = make_compiled_hyper_mix(stream_count);
+    return std::make_unique<MlxArray>(
+        std::move(fn({normed.inner, mix_logits.inner})[0]));
+}
+
+std::unique_ptr<MlxArray> compiled_hyper_inject(
+    const MlxArray& branch,
+    const MlxArray& hyper_input,
+    const MlxArray& injection_logits,
+    int32_t stream_count
+) {
+    static auto fn = make_compiled_hyper_inject(stream_count);
+    return std::make_unique<MlxArray>(std::move(
+        fn({branch.inner, hyper_input.inner, injection_logits.inner})[0]));
+}
+
+
 
 std::unique_ptr<MlxArray> fast_rms_norm_no_weight(
     const MlxArray& x,

@@ -145,7 +145,6 @@ pub fn encode_portable(
     let len = match &p {
         PortablePromptSnapshot::Baseline(m) => m.token_len,
         PortablePromptSnapshot::Mtp { target, .. } => target.token_len,
-        PortablePromptSnapshot::Dflash2 { target, .. } => target.token_len,
     };
     if t.is_empty()
         || len != t.len()
@@ -462,9 +461,6 @@ fn flatten(
             d.push((ArrayRole::LastHidden, last_hidden));
             d.push((ArrayRole::MtpContinuation, continuation_logits));
             Ok((f, Some(df), Some(draft_offset), d, p))
-        }
-        PortablePromptSnapshot::Dflash2 { .. } => {
-            Err("DFlash2 snapshots are not supported by the prefix cache".into())
         }
     }
 }
