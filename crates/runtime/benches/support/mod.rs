@@ -55,6 +55,12 @@ impl BenchmarkMemoryReport {
                     process.lifetime_peak_physical_footprint_bytes,
             })
         });
+        let recommended_working_set = mlxcel_core::get_wired_limit() as u64;
+        let configured_wired_limit = (((u128::from(
+            mlxcel_core::hardware::system_memory_bytes(),
+        ) * 85)
+            / 100) as u64)
+            .min(recommended_working_set);
         let record = serde_json::json!({
             "schema": "qw_bench_memory",
             "phase": "post_fixture",
@@ -69,7 +75,8 @@ impl BenchmarkMemoryReport {
                 "peak_bytes": mlx.peak_bytes,
                 "cache_bytes": mlx.cache_bytes,
                 "limit_bytes": mlx.limit_bytes,
-                "wired_limit_bytes": mlxcel_core::get_wired_limit(),
+                "recommended_max_working_set_bytes": recommended_working_set,
+                "configured_wired_limit_bytes": configured_wired_limit,
             },
             "process": process,
         });
