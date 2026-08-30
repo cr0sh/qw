@@ -242,6 +242,7 @@ impl Qwen4QsaIndexer {
         let batch = input_shape[0];
         let sequence = input_shape[1];
         let past_len = cache.offset;
+        cache.set_auxiliary_block_size(self.compress_ratio);
         let projected = self.projection.forward(input);
         let projected = mlxcel_core::reshape(
             &projected,
@@ -951,6 +952,151 @@ mod tests {
             name.to_string(),
             mlxcel_core::from_slice_f32(&vec![value; len], shape),
         );
+    }
+
+    fn qsa_rollback_indexer() -> Qwen4QsaIndexer {
+        const HEAD_DIM: i32 = 2;
+        let mut weights = WeightMap::new();
+        weights.insert(
+            "self_attn.indexer.index_qk_proj.weight".to_string(),
+            mlxcel_core::from_slice_f32(
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0],
+                &[4, HEAD_DIM],
+            ),
+        );
+        insert_f32(
+            &mut weights,
+            "self_attn.indexer.q_layernorm.weight",
+            &[HEAD_DIM],
+            0.0,
+        );
+        insert_f32(
+            &mut weights,
+            "self_attn.indexer.k_layernorm.weight",
+            &[HEAD_DIM],
+            0.0,
+        );
+        Qwen4QsaIndexer::from_weights(
+            &weights,
+            &Qwen4AttentionConfig {
+                num_attention_heads: 1,
+                num_key_value_heads: 1,
+                head_dim: HEAD_DIM as usize,
+                rms_norm_eps: 1e-6,
+                rope_theta: 10_000.0,
+                partial_rotary_factor: 1.0,
+                quantization: None,
+                mrope_section: vec![1, 0, 0],
+                indexer_n_heads: 1,
+                indexer_kv_heads: 1,
+                indexer_head_dim: HEAD_DIM as usize,
+                indexer_budget: 4,
+                indexer_compress_ratio: 4,
+            },
+            "self_attn",
+            Arc::new(Qwen4PrefillPolicy::default()),
+        )
+        .expect("synthetic QSA indexer")
+    }
+
+    fn qsa_token_rows(tokens: &[i32]) -> UniquePtr<MlxArray> {
+        let rows = tokens
+            .iter()
+            .flat_map(|&token| [token as f32, ((token * 7) % 19 - 9) as f32])
+            .collect::<Vec<_>>();
+        mlxcel_core::from_slice_f32(&rows, &[1, tokens.len() as i32, 2])
+    }
+
+    fn append_qsa_rows(indexer: &Qwen4QsaIndexer, cache: &mut KVCache, tokens: &[i32]) {
+        let _ = indexer.plan(&qsa_token_rows(tokens), cache);
+        cache.offset += tokens.len() as i32;
+    }
+
+    fn assert_qsa_blocks_equal(actual: &KVCache, expected: &KVCache) {
+        let actual = actual
+            .auxiliary_block_keys
+            .as_deref()
+            .expect("actual QSA summaries");
+        let expected = expected
+            .auxiliary_block_keys
+            .as_deref()
+            .expect("expected QSA summaries");
+        let equal = mlxcel_core::allclose(actual, expected, 0.0, 0.0);
+        mlxcel_core::eval(&equal);
+        assert!(mlxcel_core::item_bool(&equal));
+    }
+
+    fn exercise_qsa_rollback_reappend(materialize_before_rollback: bool) {
+        let indexer = qsa_rollback_indexer();
+        let mut cache = KVCache::new();
+        append_qsa_rows(&indexer, &mut cache, &[1, 2, 3, 4, 5, 6, 7, 8]);
+        append_qsa_rows(&indexer, &mut cache, &[9, 10, 11, 12]);
+        if materialize_before_rollback {
+            cache.materialize_state();
+        }
+
+        assert_eq!(cache.trim(3), 3);
+        if !materialize_before_rollback {
+            cache.materialize_state();
+        }
+        assert_eq!(
+            mlxcel_core::array_shape(
+                cache
+                    .auxiliary_block_keys
+                    .as_deref()
+                    .expect("immutable prefix summaries"),
+            )[2],
+            2,
+        );
+
+        append_qsa_rows(&indexer, &mut cache, &[90, 91, 92]);
+        let first_rebuild = mlxcel_core::copy(
+            cache
+                .auxiliary_block_keys
+                .as_deref()
+                .expect("first rebuilt summaries"),
+        );
+        mlxcel_core::eval(&first_rebuild);
+        let mut first_reference = KVCache::new();
+        append_qsa_rows(
+            &indexer,
+            &mut first_reference,
+            &[1, 2, 3, 4, 5, 6, 7, 8],
+        );
+        append_qsa_rows(&indexer, &mut first_reference, &[9, 90, 91, 92]);
+        assert_qsa_blocks_equal(&cache, &first_reference);
+
+        assert_eq!(cache.trim(3), 3);
+        append_qsa_rows(&indexer, &mut cache, &[190, 191, 192]);
+        let mut second_reference = KVCache::new();
+        append_qsa_rows(
+            &indexer,
+            &mut second_reference,
+            &[1, 2, 3, 4, 5, 6, 7, 8],
+        );
+        append_qsa_rows(&indexer, &mut second_reference, &[9, 190, 191, 192]);
+        assert_qsa_blocks_equal(&cache, &second_reference);
+
+        let changed = mlxcel_core::allclose(
+            &first_rebuild,
+            cache
+                .auxiliary_block_keys
+                .as_deref()
+                .expect("second rebuilt summaries"),
+            0.0,
+            0.0,
+        );
+        mlxcel_core::eval(&changed);
+        assert!(
+            !mlxcel_core::item_bool(&changed),
+            "replacement token content must rebuild the rolled-back block",
+        );
+    }
+
+    #[test]
+    fn qsa_rollback_rebuilds_replaced_blocks_before_and_after_materialization() {
+        exercise_qsa_rollback_reappend(true);
+        exercise_qsa_rollback_reappend(false);
     }
 
     fn unequal_width_attention() -> Qwen4Attention {

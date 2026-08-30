@@ -367,6 +367,12 @@ pub struct KVCache {
     /// Optional model-specific normalized and position-encoded block keys.
     /// Shape: `[batch, index_heads, blocks, index_head_dim]`.
     pub auxiliary_block_keys: Option<UniquePtr<MlxArray>>,
+    /// Token width represented by each entry in `auxiliary_block_keys`.
+    ///
+    /// Sparse-attention indexers install this before building block summaries
+    /// so tail rollback can discard summaries that intersect the rewound
+    /// region before replacement tokens are appended.
+    auxiliary_block_size: Option<i32>,
     /// Monotonically increasing absolute write position. Used as the RoPE
     /// position for new K/Q tokens and as the upper bound of the live window.
     /// Once a token has been written at position `p`, this value never
@@ -539,6 +545,7 @@ impl KVCache {
             values: None,
             auxiliary_keys: None,
             auxiliary_block_keys: None,
+            auxiliary_block_size: None,
             offset: 0,
             live_start: 0,
             step: 256,
@@ -590,6 +597,7 @@ impl KVCache {
             values: None,
             auxiliary_keys: None,
             auxiliary_block_keys: None,
+            auxiliary_block_size: None,
             offset: 0,
             live_start: 0,
             step: 256,
@@ -610,6 +618,47 @@ impl KVCache {
             delegated_fp16_fast_path: turbo::delegated_fp16_fast_path_enabled(),
             delegated_fp16_sidecar_policy: turbo::delegated_fp16_sidecar_policy(),
             paged_backing: None,
+        }
+    }
+
+    /// Register the token width used by sparse-attention block summaries.
+    ///
+    /// Changing widths invalidates summaries built under the previous layout.
+    pub fn set_auxiliary_block_size(&mut self, block_size: i32) {
+        if block_size <= 0 {
+            self.auxiliary_block_keys = None;
+            self.auxiliary_block_size = None;
+            return;
+        }
+        if self
+            .auxiliary_block_size
+            .is_some_and(|previous| previous != block_size)
+        {
+            self.auxiliary_block_keys = None;
+        }
+        self.auxiliary_block_size = Some(block_size);
+    }
+
+    fn retain_auxiliary_blocks_through(&mut self, token_len: i32) {
+        let Some(block_size) = self.auxiliary_block_size else {
+            // Without layout metadata no existing summary is provably outside
+            // the rewound suffix.
+            self.auxiliary_block_keys = None;
+            return;
+        };
+        let retained_blocks = token_len / block_size;
+        let Some(keys) = self.auxiliary_block_keys.as_ref() else {
+            return;
+        };
+        let shape = ffi::array_shape(keys);
+        if retained_blocks <= 0 {
+            self.auxiliary_block_keys = None;
+        } else if shape[2] > retained_blocks {
+            self.auxiliary_block_keys = Some(ffi::slice(
+                keys,
+                &[0, 0, 0, 0],
+                &[shape[0], shape[1], retained_blocks, shape[3]],
+            ));
         }
     }
     /// Quantize V once on each FP16 write while retaining FP16 cache storage.
@@ -2504,9 +2553,11 @@ impl KVCache {
                 ));
             }
         }
-        // QSA block keys summarize only complete, fixed-position groups.
-        // Rewinding a partial speculative tail cannot change those groups;
-        // the next QSA plan slices any now-out-of-range complete blocks.
+        // Drop every summary whose block crosses the rollback boundary now.
+        // Waiting for the next QSA plan is unsafe: replacement tokens can
+        // restore the old block count before the planner gets a chance to
+        // notice that the retained tail summary contains rejected tokens.
+        self.retain_auxiliary_blocks_through(live_len_after);
         if live_len_after == 0 {
             self.keys = None;
             self.values = None;
@@ -7486,32 +7537,61 @@ mod tests {
         assert!(cache.is_empty());
     }
     #[test]
-    fn kv_cache_trim_preserves_complete_qsa_blocks() {
-        let mut cache = KVCache::new_with_mode(KVCacheMode::Fp8);
-        cache.update(
-            ffi::from_slice_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 4, 1]),
-            ffi::from_slice_f32(&[5.0, 6.0, 7.0, 8.0], &[1, 1, 4, 1]),
-        );
-        cache.auxiliary_keys = Some(ffi::from_slice_f32(
-            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-            &[1, 4, 2],
-        ));
-        cache.auxiliary_block_keys = Some(ffi::from_slice_f32(&[1.0, 2.0], &[1, 1, 1, 2]));
+    fn kv_cache_trim_keeps_only_blocks_before_every_mtp_rollback_boundary() {
+        const RATIO: i32 = 4;
+        const VERIFY_LEN: i32 = 4;
 
-        assert_eq!(cache.trim(2), 2);
-        assert_eq!(
-            ffi::array_shape(cache.auxiliary_keys.as_deref().expect("trimmed QSA keys")),
-            vec![1, 2, 2]
-        );
-        assert_eq!(
-            ffi::array_shape(
-                cache
-                    .auxiliary_block_keys
-                    .as_deref()
-                    .expect("complete QSA block keys survive tail trim"),
-            ),
-            vec![1, 1, 1, 2]
-        );
+        for alignment in 0..RATIO {
+            for accepted in 0..VERIFY_LEN {
+                let prefix_len = 8 + alignment;
+                let verify_offset = prefix_len + VERIFY_LEN;
+                let retained_inputs = accepted + 1;
+                let trim = VERIFY_LEN - retained_inputs;
+                let final_len = verify_offset - trim;
+                let complete_before = verify_offset / RATIO;
+                let complete_after = final_len / RATIO;
+                let values = (0..verify_offset).map(|value| value as f32).collect::<Vec<_>>();
+                let summaries = (0..complete_before)
+                    .map(|block| block as f32)
+                    .collect::<Vec<_>>();
+
+                let mut cache = KVCache::new();
+                cache.update(
+                    ffi::from_slice_f32(&values, &[1, 1, verify_offset, 1]),
+                    ffi::from_slice_f32(&values, &[1, 1, verify_offset, 1]),
+                );
+                cache.auxiliary_keys =
+                    Some(ffi::from_slice_f32(&values, &[1, verify_offset, 1]));
+                cache.auxiliary_block_keys = Some(ffi::from_slice_f32(
+                    &summaries,
+                    &[1, 1, complete_before, 1],
+                ));
+                cache.set_auxiliary_block_size(RATIO);
+
+                assert_eq!(cache.trim(trim), trim);
+                assert_eq!(cache.offset, final_len);
+                assert_eq!(
+                    cache
+                        .auxiliary_block_keys
+                        .as_deref()
+                        .map(|keys| ffi::array_shape(keys)[2])
+                        .unwrap_or(0),
+                    complete_after,
+                    "alignment={alignment}, accepted={accepted}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kv_cache_trim_discards_unbounded_auxiliary_summaries() {
+        let mut cache = KVCache::new();
+        cache.offset = 8;
+        cache.auxiliary_block_keys =
+            Some(ffi::from_slice_f32(&[1.0, 2.0], &[1, 1, 2, 1]));
+
+        assert_eq!(cache.trim(1), 1);
+        assert!(cache.auxiliary_block_keys.is_none());
     }
 
     /// #678 repro at the cache layer: every suspect prefill shape (single-pass
