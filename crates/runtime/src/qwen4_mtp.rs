@@ -403,7 +403,19 @@ impl Qwen4MtpDraftModel {
     }
 
     pub(crate) fn reset(&self) {
-        *self.state.borrow_mut() = Qwen4MtpDraftState::new();
+        let horizon = self.state.borrow().cache.auxiliary_rollback_horizon();
+        let mut state = Qwen4MtpDraftState::new();
+        state
+            .cache
+            .set_auxiliary_rollback_horizon(horizon)
+            .expect("fresh MTP draft cache accepts configured QSA horizon");
+        *self.state.borrow_mut() = state;
+    }
+    fn set_qsa_rollback_horizon(&self, horizon: i32) -> Result<(), String> {
+        self.state
+            .borrow_mut()
+            .cache
+            .set_auxiliary_rollback_horizon(horizon)
     }
 
     fn reserve_prefill_capacity(&self, total_tokens: i32) {
@@ -824,6 +836,30 @@ impl Qwen4MtpDraftModel {
         } else if expected_offset > 0 {
             return None;
         }
+        if let Some(auxiliary_keys) = state.cache.auxiliary_keys.as_deref() {
+            let (tail_start, tail_end) = state.cache.auxiliary_raw_tail_range();
+            let metadata = mlxcel_core::from_slice_i32(
+                &[
+                    tail_start,
+                    tail_end,
+                    state.cache.auxiliary_rollback_horizon(),
+                    state.cache.auxiliary_block_size().unwrap_or(0),
+                ],
+                &[4],
+            );
+            draft.push_tensor("draft_auxiliary_metadata", &metadata);
+            draft.push_tensor("draft_auxiliary_keys", auxiliary_keys);
+            if let Some(block_keys) = state.cache.auxiliary_block_keys_view() {
+                draft
+                    .push_paged_tensor(
+                        previous.map(|snapshot| &snapshot.draft),
+                        "draft_auxiliary_block_keys",
+                        &block_keys,
+                        2,
+                    )
+                    .ok()?;
+            }
+        }
         let detached = |array: &MlxArray| materialize_detached(mlxcel_core::copy(array));
         Some(MtpPromptSnapshot {
             target,
@@ -859,6 +895,7 @@ impl Qwen4MtpDraftModel {
         if keys.is_some() != values.is_some() || (expected_offset > 0 && keys.is_none()) {
             return Err("MTP snapshot drafter KV layout is incomplete".to_string());
         }
+        let desired_horizon = self.state.borrow().cache.auxiliary_rollback_horizon();
         let mut cache = KVCache::new();
         if let (Some(keys), Some(values)) = (keys, values) {
             if keys.token_axis() != 2
@@ -872,6 +909,39 @@ impl Qwen4MtpDraftModel {
             cache.values = values.materialize();
         }
         cache.offset = expected_offset;
+        let auxiliary_keys = snapshot.draft.tensor("draft_auxiliary_keys");
+        let auxiliary_metadata = snapshot.draft.tensor("draft_auxiliary_metadata");
+        if auxiliary_keys.is_some() != auxiliary_metadata.is_some() {
+            return Err("MTP snapshot drafter QSA layout is incomplete".to_string());
+        }
+        if let (Some(auxiliary_keys), Some(metadata)) = (auxiliary_keys, auxiliary_metadata) {
+            if mlxcel_core::array_shape(metadata) != [4] {
+                return Err("MTP snapshot drafter QSA metadata is invalid".to_string());
+            }
+            let bytes = mlxcel_core::array_to_raw_bytes(metadata);
+            let values = bytes
+                .chunks_exact(4)
+                .map(|chunk| i32::from_ne_bytes(chunk.try_into().expect("four-byte QSA field")))
+                .collect::<Vec<_>>();
+            let block_keys = snapshot
+                .draft
+                .paged_tensor("draft_auxiliary_block_keys")
+                .and_then(|paged| paged.materialize())
+                .or_else(|| {
+                    snapshot
+                        .draft
+                        .tensor("draft_auxiliary_block_keys")
+                        .map(mlxcel_core::copy)
+                });
+            cache.restore_auxiliary_block_keys(values[3], block_keys);
+            cache.restore_auxiliary_keys(
+                values[0],
+                values[1],
+                values[2],
+                mlxcel_core::copy(auxiliary_keys),
+            )?;
+        }
+        cache.set_auxiliary_rollback_horizon(desired_horizon)?;
         *self.state.borrow_mut() = Qwen4MtpDraftState {
             cache,
             seed_hidden: None,
@@ -2207,7 +2277,15 @@ impl Qwen4MtpGenerator {
         assert!(block_size >= 2, "MTP block size must be at least 2");
         let qsa_horizon = i32::try_from(mtp_qsa_rollback_horizon(block_size, prompt_tokens.len()))
             .map_err(|_| "MTP verify block size exceeds the QSA horizon range".to_string())?;
+        // MTP owns a fresh target sequence. Clear any baseline request state
+        // before increasing the rewind horizon; prefix reuse restores its
+        // snapshot after this request-level initialization.
+        model.reset_runtime_state();
         model.set_qsa_rollback_horizon(qsa_horizon)?;
+        model
+            .mtp()
+            .expect("Qwen4MtpGenerator requires a bundled MTP head")
+            .set_qsa_rollback_horizon(qsa_horizon)?;
         if checkpoint_token_lengths
             .iter()
             .any(|&length| length == 0 || length > prompt_tokens.len())
