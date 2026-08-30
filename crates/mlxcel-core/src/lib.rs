@@ -539,7 +539,7 @@ mod ffi {
         /// Equal comparison
         fn equal(a: &MlxArray, b: &MlxArray) -> UniquePtr<MlxArray>;
 
-        /// Seed the global MLX random number generator
+        /// Seed this thread's default MLX random-key sequence.
         fn random_seed(seed: u64);
 
         /// Random categorical sampling

@@ -22,6 +22,8 @@ use crate::ffi;
 use crate::generate::{LanguageModel, SamplingConfig};
 use crate::layers::KVCache;
 
+/// Seeds MLX's thread-local default key sequence. Independent generator
+/// workers therefore do not mutate shared RNG state.
 /// Used by: CxxGenerator, SpeculativeGenerator, BatchScheduler
 pub fn seed_rng_if_needed(sampling: &SamplingConfig) {
     if let Some(seed) = sampling.seed {
