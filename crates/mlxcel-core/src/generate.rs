@@ -81,6 +81,11 @@ impl ModelStateTensor {
             .as_ref()
             .expect("model-state snapshot tensor must not be null")
     }
+
+    /// Move the captured tensor out without copying it.
+    fn into_array(self) -> UniquePtr<MlxArray> {
+        self.array
+    }
     /// Byte footprint of this captured tensor.
     pub fn nbytes(&self) -> usize {
         ffi::array_nbytes(self.array())
@@ -532,6 +537,12 @@ impl ModelStateSnapshot {
             .map(ModelStateTensor::array)
     }
 
+    /// Remove and return one named dense tensor without copying it.
+    pub fn take_tensor(&mut self, name: &str) -> Option<UniquePtr<MlxArray>> {
+        let index = self.tensors.iter().position(|tensor| tensor.name() == name)?;
+        Some(self.tensors.remove(index).into_array())
+    }
+
     /// Attach the prefill logits that predict the first token after this prefix.
     ///
     /// This is kept outside the model-defined tensor namespace so model restore
@@ -688,6 +699,11 @@ pub struct ControlledGeneration {
 pub struct PrefixReuse<'a> {
     pub snapshot: &'a ModelStateSnapshot,
     pub cached_tokens: usize,
+}
+
+enum ControlledPrefixReuse<'a> {
+    Borrowed(PrefixReuse<'a>),
+    Owned(ModelStateSnapshot),
 }
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct IllConditionedGreedyDecision {
@@ -983,6 +999,7 @@ fn prefill_with_checkpoints<M: LanguageModel + ?Sized>(
     configured_prefill_chunk: usize,
     checkpoint_token_lengths: &[usize],
     sequence_id: SequenceId,
+    previous: Option<&ModelStateSnapshot>,
 ) -> (UniquePtr<MlxArray>, Vec<ModelStateSnapshot>) {
     model.reserve_prefill_capacity(caches, prompt_tokens.len());
     let configured_prefill_chunk =
@@ -1031,9 +1048,11 @@ fn prefill_with_checkpoints<M: LanguageModel + ?Sized>(
             logits
         };
         if checkpoint_token_lengths.binary_search(&range_end).is_ok()
-            && let Some(mut snapshot) =
-                model.snapshot_sequence_state(sequence_id, range_end, snapshots.last())
-        {
+            && let Some(mut snapshot) = model.snapshot_sequence_state(
+                sequence_id,
+                range_end,
+                snapshots.last().or(previous),
+            ) {
             snapshot.set_continuation_logits(
                 piece_logits
                     .as_ref()
@@ -2100,6 +2119,55 @@ impl CxxGenerator {
         prefix_reuse: Option<PrefixReuse<'_>>,
         max_tokens: usize,
         sampling: &SamplingConfig,
+        constraint: Option<&mut dyn TokenConstraint>,
+        checkpoint_token_lengths: &[usize],
+        on_token: F,
+    ) -> Result<ControlledGeneration, String> {
+        self.generate_streaming_controlled_impl(
+            model,
+            prompt_tokens,
+            prefix_reuse.map(ControlledPrefixReuse::Borrowed),
+            max_tokens,
+            sampling,
+            constraint,
+            checkpoint_token_lengths,
+            on_token,
+        )
+    }
+
+    /// Baseline generation that consumes a one-shot exact-prefix snapshot.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_streaming_controlled_owned<M: LanguageModel, F: FnMut(i32) -> bool>(
+        &mut self,
+        model: &M,
+        prompt_tokens: &[i32],
+        snapshot: ModelStateSnapshot,
+        max_tokens: usize,
+        sampling: &SamplingConfig,
+        constraint: Option<&mut dyn TokenConstraint>,
+        checkpoint_token_lengths: &[usize],
+        on_token: F,
+    ) -> Result<ControlledGeneration, String> {
+        self.generate_streaming_controlled_impl(
+            model,
+            prompt_tokens,
+            Some(ControlledPrefixReuse::Owned(snapshot)),
+            max_tokens,
+            sampling,
+            constraint,
+            checkpoint_token_lengths,
+            on_token,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn generate_streaming_controlled_impl<M: LanguageModel, F: FnMut(i32) -> bool>(
+        &mut self,
+        model: &M,
+        prompt_tokens: &[i32],
+        mut prefix_reuse: Option<ControlledPrefixReuse<'_>>,
+        max_tokens: usize,
+        sampling: &SamplingConfig,
         mut constraint: Option<&mut dyn TokenConstraint>,
         checkpoint_token_lengths: &[usize],
         mut on_token: F,
@@ -2134,21 +2202,61 @@ impl CxxGenerator {
         let eos_tokens = merged_eos_token_ids(model.eos_token_ids(), &sampling.stop_token_ids);
         let sequence_id = SequenceId::from_raw(0);
 
-        let requested_cached_tokens = prefix_reuse.as_ref().map_or(0, |reuse| reuse.cached_tokens);
+        let requested_cached_tokens = prefix_reuse.as_ref().map_or(0, |reuse| match reuse {
+            ControlledPrefixReuse::Borrowed(reuse) => reuse.cached_tokens,
+            ControlledPrefixReuse::Owned(snapshot) => snapshot.token_len(),
+        });
+        let can_restore = prefix_reuse.as_ref().is_some_and(|reuse| {
+            let (snapshot, cached_tokens) = match reuse {
+                ControlledPrefixReuse::Borrowed(reuse) => {
+                    (reuse.snapshot, reuse.cached_tokens)
+                }
+                ControlledPrefixReuse::Owned(snapshot) => (snapshot, snapshot.token_len()),
+            };
+            cached_tokens > 0
+                && cached_tokens <= prompt_tokens.len()
+                && snapshot.token_len() == cached_tokens
+                && (cached_tokens < prompt_tokens.len()
+                    || snapshot.continuation_logits().is_some())
+        });
         let mut cached_tokens = 0;
         let mut cached_logits = None;
-        if let Some(reuse) = prefix_reuse.as_ref()
-            && reuse.cached_tokens > 0
-            && reuse.cached_tokens <= prompt_tokens.len()
-            && reuse.snapshot.token_len() == reuse.cached_tokens
-            && (reuse.cached_tokens < prompt_tokens.len()
-                || reuse.snapshot.continuation_logits().is_some())
-        {
-            model.restore_sequence_state(sequence_id, reuse.snapshot)?;
-            cached_tokens = reuse.cached_tokens;
-            if cached_tokens == prompt_tokens.len() {
-                cached_logits = reuse.snapshot.continuation_logits().map(ffi::copy);
+        let mut borrowed_prefix_reuse = None;
+        if can_restore {
+            match prefix_reuse.take().expect("validated prefix reuse") {
+                ControlledPrefixReuse::Borrowed(reuse) => {
+                    model.restore_sequence_state(sequence_id, reuse.snapshot)?;
+                    cached_tokens = reuse.cached_tokens;
+                    if cached_tokens == prompt_tokens.len() {
+                        cached_logits = reuse.snapshot.continuation_logits().map(ffi::copy);
+                    }
+                    borrowed_prefix_reuse = Some(reuse);
+                }
+                ControlledPrefixReuse::Owned(snapshot) => {
+                    cached_tokens = snapshot.token_len();
+                    match model.restore_sequence_state_owned(sequence_id, snapshot) {
+                        Ok(logits) => {
+                            if cached_tokens == prompt_tokens.len() {
+                                if logits.is_some() {
+                                    cached_logits = logits;
+                                } else {
+                                    self.reset_with_model(model);
+                                    cached_tokens = 0;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            self.reset_with_model(model);
+                            return Err(error);
+                        }
+                    }
+                }
             }
+        } else if matches!(
+            prefix_reuse.as_ref(),
+            Some(ControlledPrefixReuse::Owned(_))
+        ) {
+            drop(prefix_reuse.take());
         }
         let prefill_tokens = &prompt_tokens[cached_tokens..];
         tracing::debug!(
@@ -2184,6 +2292,9 @@ impl CxxGenerator {
                 prefill_chunk_len(),
                 &effective_checkpoint_lengths,
                 sequence_id,
+                borrowed_prefix_reuse
+                    .as_ref()
+                    .map(|reuse| reuse.snapshot),
             )
         } else {
             let configured_prefill_chunk =
@@ -2223,7 +2334,11 @@ impl CxxGenerator {
             if let Some(mut snapshot) = model.snapshot_sequence_state(
                 sequence_id,
                 prompt_tokens.len(),
-                prompt_snapshots.last(),
+                prompt_snapshots.last().or_else(|| {
+                    borrowed_prefix_reuse
+                        .as_ref()
+                        .map(|reuse| reuse.snapshot)
+                }),
             ) {
                 snapshot.set_continuation_logits(
                     logits.as_ref().expect("generation logits must not be null"),
@@ -2269,7 +2384,7 @@ impl CxxGenerator {
                         .replay_reference_prefill_decision(
                             model,
                             prompt_tokens,
-                            prefix_reuse.as_ref(),
+                            borrowed_prefix_reuse.as_ref(),
                         )?;
                     logits = reference_logits;
                     if let Some(snapshot) = reference_snapshot {
@@ -2433,7 +2548,11 @@ impl CxxGenerator {
                 model.snapshot_sequence_state(
                     sequence_id,
                     aligned_token_len,
-                    prompt_snapshots.last(),
+                    prompt_snapshots.last().or_else(|| {
+                        borrowed_prefix_reuse
+                            .as_ref()
+                            .map(|reuse| reuse.snapshot)
+                    }),
                 )
             })
             .flatten()
@@ -4450,6 +4569,7 @@ mod tests {
             2,
             &[8, 11],
             SequenceId::from_raw(7),
+            None,
         );
         assert_eq!(
             model.chunk_size_calls.borrow().as_slice(),
@@ -4503,6 +4623,7 @@ mod tests {
             2,
             &[],
             SequenceId::from_raw(8),
+            None,
         );
 
         assert!(snapshots.is_empty());
@@ -4529,6 +4650,7 @@ mod tests {
                 configured_chunk,
                 &[5, 10],
                 SequenceId::from_raw(9),
+                None,
             );
 
             assert_eq!(
@@ -5577,6 +5699,21 @@ mod tests {
     }
 
     #[test]
+    fn dense_snapshot_tensor_is_moved_without_copying() {
+        let array = ffi::from_slice_f32(&[1.0, 2.0], &[1, 2]);
+        let mut snapshot = ModelStateSnapshot::new("test", 1);
+        snapshot.push_tensor("seed", &array);
+        let source = snapshot.tensor("seed").expect("dense snapshot seed") as *const MlxArray;
+
+        let moved = snapshot.take_tensor("seed").expect("move dense seed");
+        assert_eq!(
+            moved.as_ref().expect("moved seed must not be null") as *const MlxArray,
+            source,
+        );
+        assert_eq!(snapshot.tensor_count(), 0);
+    }
+
+    #[test]
     fn continuation_logits_are_moved_out_without_copying() {
         let logits = ffi::from_slice_f32(&[0.25, 0.75], &[1, 1, 2]);
         let mut snapshot = ModelStateSnapshot::new("test", 1);
@@ -5612,6 +5749,197 @@ mod tests {
             moved.as_ref().expect("moved logits must not be null") as *const MlxArray,
             source
         );
+    }
+
+    struct OwnedGenerationStub {
+        owned_logits_moved: std::cell::Cell<bool>,
+        return_owned_logits: bool,
+    }
+
+    impl LanguageModel for OwnedGenerationStub {
+        fn forward(
+            &self,
+            input_ids: &MlxArray,
+            caches: &mut [KVCache],
+            mask: Option<&MlxArray>,
+        ) -> UniquePtr<MlxArray> {
+            StubModel.forward(input_ids, caches, mask)
+        }
+
+        fn make_caches(&self) -> Vec<KVCache> {
+            vec![KVCache::new()]
+        }
+
+        fn num_layers(&self) -> usize {
+            1
+        }
+
+        fn eos_token_ids(&self) -> Vec<i32> {
+            vec![99]
+        }
+
+        fn supports_snapshot_reuse(&self) -> bool {
+            true
+        }
+
+        fn snapshot_sequence_state(
+            &self,
+            _seq_id: SequenceId,
+            token_len: usize,
+            previous: Option<&ModelStateSnapshot>,
+        ) -> Option<ModelStateSnapshot> {
+            let state = ffi::from_slice_f32(&vec![1.0; token_len], &[1, token_len as i32, 1]);
+            let mut snapshot = ModelStateSnapshot::new("owned-generation-stub", token_len);
+            snapshot
+                .push_paged_tensor(previous, "state", &state, 1)
+                .expect("capture stub pages");
+            Some(snapshot)
+        }
+
+        fn restore_sequence_state(
+            &self,
+            _seq_id: SequenceId,
+            snapshot: &ModelStateSnapshot,
+        ) -> Result<(), String> {
+            if snapshot.family() != "owned-generation-stub" {
+                return Err("unexpected owned-generation stub family".to_string());
+            }
+            Ok(())
+        }
+
+        fn restore_sequence_state_owned(
+            &self,
+            _seq_id: SequenceId,
+            mut snapshot: ModelStateSnapshot,
+        ) -> Result<Option<UniquePtr<MlxArray>>, String> {
+            self.restore_sequence_state(SequenceId::from_raw(0), &snapshot)?;
+            let logits_source = snapshot
+                .continuation_logits()
+                .expect("owned stub continuation logits")
+                as *const MlxArray;
+            let _state = snapshot
+                .take_paged_tensor("state")
+                .expect("owned stub state")
+                .into_materialized()
+                .expect("owned stub materialized state");
+            let logits = snapshot
+                .take_continuation_logits()
+                .expect("owned stub moved continuation logits");
+            self.owned_logits_moved.set(
+                logits
+                    .as_ref()
+                    .expect("owned stub logits must not be null")
+                    as *const MlxArray
+                    == logits_source,
+            );
+            Ok(self.return_owned_logits.then_some(logits))
+        }
+    }
+
+    fn owned_generation_snapshot() -> ModelStateSnapshot {
+        let state = ffi::from_slice_f32(
+            &vec![1.0; SNAPSHOT_PAGE_TOKENS],
+            &[1, SNAPSHOT_PAGE_TOKENS as i32, 1],
+        );
+        let logits = ffi::from_slice_f32(&[0.0, 10.0, 0.0, 0.0], &[1, 1, 4]);
+        let mut snapshot =
+            ModelStateSnapshot::new("owned-generation-stub", SNAPSHOT_PAGE_TOKENS);
+        snapshot
+            .push_paged_tensor(None, "state", &state, 1)
+            .expect("capture owned generation source");
+        snapshot.set_continuation_logits(&logits);
+        snapshot
+    }
+
+    #[test]
+    fn owned_generation_matches_borrowed_without_reusing_consumed_parent() {
+        let borrowed_model = OwnedGenerationStub {
+            owned_logits_moved: std::cell::Cell::new(false),
+            return_owned_logits: true,
+        };
+        let borrowed_source = owned_generation_snapshot();
+        let borrowed_page = borrowed_source
+            .paged_tensor("state")
+            .expect("borrowed source state")
+            .pages()[0]
+            .identity();
+        let borrowed = CxxGenerator::new(1)
+            .generate_streaming_controlled(
+                &borrowed_model,
+                &vec![1; SNAPSHOT_PAGE_TOKENS],
+                Some(PrefixReuse {
+                    snapshot: &borrowed_source,
+                    cached_tokens: SNAPSHOT_PAGE_TOKENS,
+                }),
+                1,
+                &SamplingConfig::greedy(),
+                None,
+                &[],
+                |_| true,
+            )
+            .expect("borrowed controlled generation");
+        let borrowed_final_page = borrowed
+            .final_snapshot
+            .as_ref()
+            .expect("borrowed final snapshot")
+            .paged_tensor("state")
+            .expect("borrowed final state")
+            .pages()[0]
+            .identity();
+        assert_eq!(borrowed_final_page, borrowed_page);
+
+        let owned_model = OwnedGenerationStub {
+            owned_logits_moved: std::cell::Cell::new(false),
+            return_owned_logits: true,
+        };
+        let owned_source = owned_generation_snapshot();
+        let consumed_page = owned_source
+            .paged_tensor("state")
+            .expect("owned source state")
+            .pages()[0]
+            .identity();
+        let owned = CxxGenerator::new(1)
+            .generate_streaming_controlled_owned(
+                &owned_model,
+                &vec![1; SNAPSHOT_PAGE_TOKENS],
+                owned_source,
+                1,
+                &SamplingConfig::greedy(),
+                None,
+                &[],
+                |_| true,
+            )
+            .expect("owned controlled generation");
+        let owned_final_page = owned
+            .final_snapshot
+            .as_ref()
+            .expect("owned final snapshot")
+            .paged_tensor("state")
+            .expect("owned final state")
+            .pages()[0]
+            .identity();
+        assert_eq!(owned.token_ids, borrowed.token_ids);
+        assert!(owned_model.owned_logits_moved.get());
+        assert_ne!(owned_final_page, consumed_page);
+
+        let no_logits_model = OwnedGenerationStub {
+            owned_logits_moved: std::cell::Cell::new(false),
+            return_owned_logits: false,
+        };
+        let replayed = CxxGenerator::new(1)
+            .generate_streaming_controlled_owned(
+                &no_logits_model,
+                &vec![1; SNAPSHOT_PAGE_TOKENS],
+                owned_generation_snapshot(),
+                1,
+                &SamplingConfig::greedy(),
+                None,
+                &[],
+                |_| true,
+            )
+            .expect("owned generation cold replay without restored logits");
+        assert_eq!(replayed.cached_tokens, 0);
+        assert_eq!(replayed.token_ids, borrowed.token_ids);
     }
 
     #[test]

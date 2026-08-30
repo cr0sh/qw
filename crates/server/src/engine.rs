@@ -1282,6 +1282,13 @@ impl QwenWorker {
             if !resume.token_ids.starts_with(&prompt_ids)
                 || resume.metadata.prompt_token_count != prompt_ids.len()
                 || resume.metadata.generated_token_ids.len() >= resume.metadata.original_max_tokens
+                || !matches!(
+                    (route, &resume.snapshot),
+                    (
+                        QwenGenerationRoute::BaselineText,
+                        PromptSnapshot::Baseline(_)
+                    ) | (QwenGenerationRoute::MtpText, PromptSnapshot::Mtp(_))
+                )
             {
                 send_failure(
                     &job,
@@ -1318,10 +1325,13 @@ impl QwenWorker {
         if job.cancelled.load(Ordering::Acquire) {
             return;
         }
-
+        let (resume_snapshot, prior_metadata) = match resume_entry {
+            Some(resume) => (Some(resume.snapshot), Some(resume.metadata)),
+            None => (None, None),
+        };
         let mtp_k = self.mtp_k;
         let (provider, cache) = (&mut self.provider, &mut self.prefix_cache);
-        if resume_entry.is_none()
+        if resume_snapshot.is_none()
             && let Some(lookup_cache_route) = lookup_cache_route
         {
             checkpoint_token_lengths = cache.checkpoint_lengths(
@@ -1330,50 +1340,13 @@ impl QwenWorker {
                 lookup_cache_route,
             );
         }
-        let hit = if resume_entry.is_none() {
+        let hit = if resume_snapshot.is_none() {
             lookup_cache_route.and_then(|route| cache.lookup(&generation_prompt_ids, route))
         } else {
             None
         };
-        let (prefix_reuse, mtp_prefix_reuse) = match (route, resume_entry.as_ref(), hit) {
-            (QwenGenerationRoute::BaselineText, Some(resume), _) => match &resume.snapshot {
-                PromptSnapshot::Baseline(snapshot) => (
-                    Some(PrefixReuse {
-                        snapshot,
-                        cached_tokens: snapshot.token_len(),
-                    }),
-                    None,
-                ),
-                PromptSnapshot::Mtp(_) => {
-                    send_failure(
-                        &job,
-                        FailureKind::ResumeNotFound,
-                        "response continuation checkpoint was not found".to_string(),
-                        Some("resume_response_id".to_string()),
-                    );
-                    return;
-                }
-            },
-            (QwenGenerationRoute::MtpText, Some(resume), _) => match &resume.snapshot {
-                PromptSnapshot::Mtp(snapshot) => (
-                    None,
-                    Some(MtpPrefixReuse {
-                        snapshot,
-                        cached_tokens: snapshot.token_len(),
-                        continuation_token: resume.metadata.generated_token_ids.last().copied(),
-                    }),
-                ),
-                PromptSnapshot::Baseline(_) => {
-                    send_failure(
-                        &job,
-                        FailureKind::ResumeNotFound,
-                        "response continuation checkpoint was not found".to_string(),
-                        Some("resume_response_id".to_string()),
-                    );
-                    return;
-                }
-            },
-            (QwenGenerationRoute::BaselineText, None, Some(hit)) => match hit.snapshot {
+        let (prefix_reuse, mtp_prefix_reuse) = match (route, hit) {
+            (QwenGenerationRoute::BaselineText, Some(hit)) => match hit.snapshot {
                 PromptSnapshot::Baseline(snapshot) => (
                     Some(PrefixReuse {
                         snapshot,
@@ -1389,7 +1362,7 @@ impl QwenWorker {
                     None,
                 ),
             },
-            (QwenGenerationRoute::MtpText, None, Some(hit)) => match hit.snapshot {
+            (QwenGenerationRoute::MtpText, Some(hit)) => match hit.snapshot {
                 PromptSnapshot::Mtp(snapshot) => (
                     None,
                     Some(MtpPrefixReuse {
@@ -1402,7 +1375,7 @@ impl QwenWorker {
             },
             _ => (None, None),
         };
-        let cache_source = if resume_entry.is_some() {
+        let cache_source = if resume_snapshot.is_some() {
             "response_resume"
         } else if lookup_cache_route.is_none() {
             "disabled"
@@ -1426,15 +1399,21 @@ impl QwenWorker {
             seed = ?job.request.seed,
             route = ?route,
         );
+        let reused_tokens = resume_snapshot.as_ref().map_or_else(
+            || {
+                prefix_reuse.as_ref().map_or_else(
+                    || mtp_prefix_reuse.as_ref().map_or(0, |reuse| reuse.cached_tokens),
+                    |reuse| reuse.cached_tokens,
+                )
+            },
+            PromptSnapshot::token_len,
+        );
         trace!(
             event = "cache.decision",
             response_id = %job.admission.response_id,
             route = ?route,
             source = cache_source,
-            reused_tokens = prefix_reuse.as_ref().map_or_else(
-                || mtp_prefix_reuse.as_ref().map_or(0, |reuse| reuse.cached_tokens),
-                |reuse| reuse.cached_tokens,
-            ),
+            reused_tokens,
             prompt_tokens = generation_prompt_ids.len(),
             lookup_duration_ms = cache_lookup_started.elapsed().as_secs_f64() * 1_000.0,
         );
@@ -1442,17 +1421,14 @@ impl QwenWorker {
             phase = "model_generation.started",
             route = ?route,
             mtp_k,
-            prefix_cached_tokens = prefix_reuse.as_ref().map_or_else(
-                || mtp_prefix_reuse.as_ref().map_or(0, |reuse| reuse.cached_tokens),
-                |reuse| reuse.cached_tokens,
-            ),
+            prefix_cached_tokens = reused_tokens,
         );
         let mut output = StreamOutputTracker::new(enable_thinking, tool_enabled);
-        if let Some(resume) = &resume_entry {
+        if let Some(metadata) = &prior_metadata {
             let replay = match output.prime_and_replay(
-                &resume.metadata.raw_text,
-                &resume.metadata.emitted_reasoning_text,
-                &resume.metadata.emitted_content_text,
+                &metadata.raw_text,
+                &metadata.emitted_reasoning_text,
+                &metadata.emitted_content_text,
             ) {
                 Ok(replay) => replay,
                 Err(error) => {
@@ -1485,8 +1461,38 @@ impl QwenWorker {
             }
             true
         };
-        let generated = match route {
-            QwenGenerationRoute::MtpText => provider.generate_mtp_streaming(
+        let generated = match (route, resume_snapshot) {
+            (QwenGenerationRoute::MtpText, Some(PromptSnapshot::Mtp(snapshot))) => provider
+                .generate_mtp_streaming_owned_response(
+                    &generation_prompt_ids,
+                    max_tokens,
+                    &sampling,
+                    mtp_k,
+                    snapshot,
+                    prior_metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.generated_token_ids.last().copied()),
+                    &checkpoint_token_lengths,
+                    constraint
+                        .as_mut()
+                        .map(|value| value as &mut dyn mlxcel_core::generate::TokenConstraint),
+                    &mut emit_delta,
+                ),
+            (
+                QwenGenerationRoute::BaselineText,
+                Some(PromptSnapshot::Baseline(snapshot)),
+            ) => provider.generate_baseline_streaming_owned_response(
+                &generation_prompt_ids,
+                max_tokens,
+                &sampling,
+                snapshot,
+                constraint
+                    .as_mut()
+                    .map(|value| value as &mut dyn mlxcel_core::generate::TokenConstraint),
+                &checkpoint_token_lengths,
+                &mut emit_delta,
+            ),
+            (QwenGenerationRoute::MtpText, None) => provider.generate_mtp_streaming(
                 &generation_prompt_ids,
                 max_tokens,
                 &sampling,
@@ -1498,7 +1504,7 @@ impl QwenWorker {
                     .map(|value| value as &mut dyn mlxcel_core::generate::TokenConstraint),
                 &mut emit_delta,
             ),
-            QwenGenerationRoute::BaselineText => provider.generate_baseline_streaming(
+            (QwenGenerationRoute::BaselineText, None) => provider.generate_baseline_streaming(
                 &generation_prompt_ids,
                 max_tokens,
                 &sampling,
@@ -1509,6 +1515,7 @@ impl QwenWorker {
                 &checkpoint_token_lengths,
                 &mut emit_delta,
             ),
+            _ => unreachable!("response resume route was validated before generation"),
         };
         let mut generated = match generated {
             Ok(generated) => generated,
@@ -1541,7 +1548,6 @@ impl QwenWorker {
             cached_tokens = generated.cached_tokens,
             stop_reason = ?generated.finish_outcome,
         );
-        let prior_metadata = resume_entry.as_ref().map(|resume| resume.metadata.clone());
         let mut combined_token_ids = prior_metadata
             .as_ref()
             .map(|metadata| metadata.generated_token_ids.clone())
