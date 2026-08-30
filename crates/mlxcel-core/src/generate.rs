@@ -854,9 +854,12 @@ fn chunked_prefill_last_logits<M: LanguageModel + ?Sized>(
     caches: &mut [KVCache],
     prompt_tokens: &[i32],
     chunk: usize,
+    processed_before: usize,
+    total_tokens: usize,
 ) -> UniquePtr<MlxArray> {
     debug_assert!(chunk > 0 && !prompt_tokens.is_empty());
     let mut logits: Option<UniquePtr<MlxArray>> = None;
+    let mut processed_tokens = processed_before;
     for piece in prompt_tokens.chunks(chunk) {
         let input = ffi::from_slice_i32(piece, &[1, piece.len() as i32]);
         let piece_logits =
@@ -864,13 +867,29 @@ fn chunked_prefill_last_logits<M: LanguageModel + ?Sized>(
         // Evaluate now so this chunk's transients are released before the
         // next chunk's graph is built; the result is only [1, 1, vocab].
         ffi::eval(&piece_logits);
+        processed_tokens += piece.len();
+        crate::memory::trace_snapshot(
+            "baseline.prefill.chunk_complete",
+            processed_tokens,
+            total_tokens,
+        );
         // Return freed buffers to the OS between chunks. Every chunk sees a
         // different key length, so its transients (scores, masks, logits)
         // land in differently-sized allocations; without this the CUDA
         // async-malloc pool accumulates each shape's high-water mark across
         // the whole prompt (measured ~84 GB system peak for a 32k gemma-4-31b
         // chunked prefill whose live set is ~30 GB, issue #672).
+        crate::memory::trace_snapshot(
+            "baseline.prefill.cache_clear.before",
+            processed_tokens,
+            total_tokens,
+        );
         ffi::clear_memory_cache();
+        crate::memory::trace_snapshot(
+            "baseline.prefill.cache_clear.after",
+            processed_tokens,
+            total_tokens,
+        );
         logits = Some(piece_logits);
     }
     logits.expect("chunked_prefill_last_logits requires a non-empty prompt")
@@ -903,12 +922,24 @@ fn prefill_with_checkpoints<M: LanguageModel + ?Sized>(
             model.supports_chunked_prefill(),
             piece.len(),
         ) {
-            chunked_prefill_last_logits(model, caches, piece, chunk)
+            chunked_prefill_last_logits(
+                model,
+                caches,
+                piece,
+                chunk,
+                range_start,
+                prompt_tokens.len(),
+            )
         } else {
             let input = ffi::from_slice_i32(piece, &[1, piece.len() as i32]);
             let logits =
                 model.forward_last_logits(&input, caches, None, piece.len().saturating_sub(1));
             ffi::eval(&logits);
+            crate::memory::trace_snapshot(
+                "baseline.prefill.chunk_complete",
+                range_end,
+                prompt_tokens.len(),
+            );
             logits
         };
         if checkpoint_token_lengths.binary_search(&range_end).is_ok()
@@ -1840,7 +1871,14 @@ impl CxxGenerator {
             prefill_tokens.len(),
         );
         let mut logits = if let Some(chunk) = prefill_chunk {
-            chunked_prefill_last_logits(model, &mut self.caches, prefill_tokens, chunk)
+            chunked_prefill_last_logits(
+                model,
+                &mut self.caches,
+                prefill_tokens,
+                chunk,
+                cached_tokens,
+                prompt_tokens.len(),
+            )
         } else {
             let input = ffi::from_slice_i32(prefill_tokens, &[1, prefill_tokens.len() as i32]);
             model.forward_last_logits(
@@ -1944,6 +1982,11 @@ impl CxxGenerator {
             prefill_start = cached_tokens,
             prefill_tokens = prefill_tokens.len(),
         );
+        crate::memory::trace_snapshot(
+            "baseline.prefill.started",
+            cached_tokens,
+            prompt_tokens.len(),
+        );
         let retain_prompt_snapshot = (!checkpoint_token_lengths.is_empty() || constraint.is_some())
             && model.supports_snapshot_reuse();
         let prefill_start = Instant::now();
@@ -1972,7 +2015,14 @@ impl CxxGenerator {
                 prefill_tokens.len(),
             );
             let logits = if let Some(chunk) = prefill_chunk {
-                chunked_prefill_last_logits(model, &mut self.caches, prefill_tokens, chunk)
+                chunked_prefill_last_logits(
+                    model,
+                    &mut self.caches,
+                    prefill_tokens,
+                    chunk,
+                    cached_tokens,
+                    prompt_tokens.len(),
+                )
             } else {
                 let input = ffi::from_slice_i32(prefill_tokens, &[1, prefill_tokens.len() as i32]);
                 model.forward_last_logits(
@@ -2001,8 +2051,23 @@ impl CxxGenerator {
                 prompt_snapshots.push(snapshot);
             }
         }
+        crate::memory::trace_snapshot(
+            "baseline.prefill.final_complete",
+            prompt_tokens.len(),
+            prompt_tokens.len(),
+        );
         let prefill_time = prefill_start.elapsed();
+        crate::memory::trace_snapshot(
+            "baseline.prefill.cache_clear.before",
+            prompt_tokens.len(),
+            prompt_tokens.len(),
+        );
         ffi::clear_memory_cache();
+        crate::memory::trace_snapshot(
+            "baseline.prefill.cache_clear.after",
+            prompt_tokens.len(),
+            prompt_tokens.len(),
+        );
         let decode_start = Instant::now();
 
         let needs_history = sampling.needs_token_history() || constraint.is_some();
@@ -2276,6 +2341,11 @@ impl CxxGenerator {
 
         let prefill_start = Instant::now();
         let prefill_tokens = &prompt_tokens[cached_tokens..];
+        crate::memory::trace_snapshot(
+            "baseline.prefill.started",
+            cached_tokens,
+            prompt_tokens.len(),
+        );
         let mut logits = if let Some(logits) = cached_logits {
             logits
         } else if input_embeddings.is_some() || mask.is_some() {
@@ -2290,7 +2360,14 @@ impl CxxGenerator {
                 prefill_tokens.len(),
             );
             if let Some(chunk) = prefill_chunk {
-                chunked_prefill_last_logits(model, &mut self.caches, prefill_tokens, chunk)
+                chunked_prefill_last_logits(
+                    model,
+                    &mut self.caches,
+                    prefill_tokens,
+                    chunk,
+                    cached_tokens,
+                    prompt_tokens.len(),
+                )
             } else {
                 let input = ffi::from_slice_i32(prefill_tokens, &[1, prefill_tokens.len() as i32]);
                 model.forward_last_logits(
@@ -2314,7 +2391,22 @@ impl CxxGenerator {
                 logits.as_ref().expect("generation logits must not be null"),
             );
         }
+        crate::memory::trace_snapshot(
+            "baseline.prefill.final_complete",
+            prompt_tokens.len(),
+            prompt_tokens.len(),
+        );
+        crate::memory::trace_snapshot(
+            "baseline.prefill.cache_clear.before",
+            prompt_tokens.len(),
+            prompt_tokens.len(),
+        );
         ffi::clear_memory_cache();
+        crate::memory::trace_snapshot(
+            "baseline.prefill.cache_clear.after",
+            prompt_tokens.len(),
+            prompt_tokens.len(),
+        );
         let prefill_time = prefill_start.elapsed();
         let decode_start = Instant::now();
 
@@ -2527,7 +2619,14 @@ impl CxxGenerator {
         );
         let logits = if let Some(chunk) = prefill_chunk {
             // Cache-level chunked prefill (MLXCEL_PREFILL_CHUNK, default 2048).
-            chunked_prefill_last_logits(model, &mut self.caches, prompt_tokens, chunk)
+            chunked_prefill_last_logits(
+                model,
+                &mut self.caches,
+                prompt_tokens,
+                chunk,
+                0,
+                prompt_tokens.len(),
+            )
         } else if should_align_prefill() && model.supports_padded_prefill() {
             let padded_len = align_to_na_tile(actual_len);
             let (padded_tokens, mask_opt) = pad_tokens_for_prefill(
@@ -3223,7 +3322,14 @@ impl CxxGenerator {
         );
         let logits = if let Some(chunk) = prefill_chunk {
             // Cache-level chunked prefill (MLXCEL_PREFILL_CHUNK, default 2048).
-            chunked_prefill_last_logits(model, &mut self.caches, prompt_tokens, chunk)
+            chunked_prefill_last_logits(
+                model,
+                &mut self.caches,
+                prompt_tokens,
+                chunk,
+                0,
+                prompt_tokens.len(),
+            )
         } else if should_align_prefill() && model.supports_padded_prefill() {
             let padded_len = align_to_na_tile(actual_len);
             let (padded_tokens, mask_opt) = pad_tokens_for_prefill(
@@ -3826,7 +3932,14 @@ mod tests {
                 seen: std::cell::RefCell::new(Vec::new()),
             };
             let mut caches = chunked.make_caches();
-            let chunked_logits = chunked_prefill_last_logits(&chunked, &mut caches, &prompt, chunk);
+            let chunked_logits = chunked_prefill_last_logits(
+                &chunked,
+                &mut caches,
+                &prompt,
+                chunk,
+                0,
+                prompt.len(),
+            );
             assert_eq!(
                 ffi::array_shape(&chunked_logits).as_slice(),
                 &[1, 1, 4],
