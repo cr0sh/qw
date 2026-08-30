@@ -1093,8 +1093,17 @@ fn acquire_resource_lock() -> Result<File> {
         .create(true)
         .open(&path)
         .with_context(|| format!("failed to open resource lock {}", path.display()))?;
-    file.lock()
-        .with_context(|| format!("failed to acquire resource lock {}", path.display()))?;
+    loop {
+        match file.lock() {
+            Ok(()) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to acquire resource lock {}", path.display())
+                });
+            }
+        }
+    }
     Ok(file)
 }
 
