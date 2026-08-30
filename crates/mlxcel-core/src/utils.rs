@@ -76,6 +76,40 @@ pub fn slice_axis(x: &MlxArray, axis: i32, start: i32, end: i32) -> UniquePtr<Ml
     ffi::slice(x, &starts, &stops)
 }
 
+/// Retain zeroed storage after an array while exposing only its original
+/// leading logical slice.
+///
+/// Some tiled device kernels issue loads for the whole final tile even when
+/// their logical bounds mask the values. Extending the selected axis gives
+/// those loads initialized backing storage without changing the array's logical
+/// shape, dtype, or leading values.
+pub fn zero_guarded_axis(
+    x: &MlxArray,
+    axis: i32,
+    guard_elements: i32,
+) -> UniquePtr<MlxArray> {
+    let shape = ffi::array_shape(x);
+    let ndim = shape.len();
+    let axis = if axis < 0 { ndim as i32 + axis } else { axis };
+    assert!((0..ndim as i32).contains(&axis), "guard axis out of range");
+    assert!(guard_elements > 0, "guard must contain at least one element");
+    let axis = axis as usize;
+
+    let mut guard_shape = shape.clone();
+    guard_shape[axis] = guard_elements;
+    let guard = ffi::zeros(&guard_shape, ffi::array_dtype(x));
+    let parts = [
+        x as *const MlxArray,
+        guard.as_ref().expect("zero guard allocation") as *const MlxArray,
+    ];
+    // SAFETY: both pointers remain live for the duration of concatenate.
+    let padded = unsafe { ffi::concatenate(&parts, axis as i32) };
+    // Materialize the backing allocation here instead of copying the source
+    // tensor on its first inference use.
+    ffi::eval(&padded);
+    ffi::slice(&padded, &vec![0; ndim], &shape)
+}
+
 // Attention Mask Utilities.
 /// Create a causal attention mask.
 ///
