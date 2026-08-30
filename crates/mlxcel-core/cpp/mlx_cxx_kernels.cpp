@@ -12,6 +12,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <mutex>
 
 namespace mlx_cxx {
 
@@ -60,16 +61,15 @@ namespace {
 
     struct BitlinearKernelHolder {
         std::optional<mlx::core::fast::CustomKernelFunction> kernel;
-        bool initialized = false;
+        std::once_flag initialize_once;
         mlx::core::fast::CustomKernelFunction& get() {
-            if (!initialized) {
+            std::call_once(initialize_once, [this] {
                 kernel = mlx::core::fast::metal_kernel(
                     "bitlinear_matmul",
                     {"x", "packed_weights", "weight_scale"},
                     {"out"},
                     BITLINEAR_METAL_SOURCE);
-                initialized = true;
-            }
+            });
             return *kernel;
         }
     };
@@ -125,16 +125,15 @@ namespace {
 
     struct BitlinearKernelHolderCuda {
         std::optional<mlx::core::fast::CustomKernelFunction> kernel;
-        bool initialized = false;
+        std::once_flag initialize_once;
         mlx::core::fast::CustomKernelFunction& get() {
-            if (!initialized) {
+            std::call_once(initialize_once, [this] {
                 kernel = mlx::core::fast::cuda_kernel(
                     "bitlinear_matmul_cu",
                     {"x", "packed_weights", "weight_scale"},
                     {"out"},
                     BITLINEAR_CUDA_SOURCE);
-                initialized = true;
-            }
+            });
             return *kernel;
         }
     };
@@ -216,14 +215,15 @@ namespace {
 
     struct Turbo4PackKernelHolder {
         std::optional<mlx::core::fast::CustomKernelFunction> kernel;
+        std::once_flag initialize_once;
         mlx::core::fast::CustomKernelFunction& get() {
-            if (!kernel) {
+            std::call_once(initialize_once, [this] {
                 kernel = mlx::core::fast::metal_kernel(
                     "turbo4_pack_centroids",
                     {"rotated", "norms", "boundaries", "centroids"},
                     {"packed", "packed_norms", "rescale"},
                     TURBO4_PACK_METAL_SOURCE);
-            }
+            });
             return *kernel;
         }
     };
@@ -368,17 +368,16 @@ namespace {
 
     struct XieluKernelHolder {
         std::optional<mlx::core::fast::CustomKernelFunction> kernel;
-        bool initialized = false;
+        std::once_flag initialize_once;
         mlx::core::fast::CustomKernelFunction& get() {
-            if (!initialized) {
+            std::call_once(initialize_once, [this] {
                 kernel = mlx::core::fast::metal_kernel(
                     "xielu_fused",
                     {"x", "alpha_p", "alpha_n", "beta", "eps"},
                     {"out"},
                     XIELU_METAL_SOURCE,
                     XIELU_METAL_HEADER);
-                initialized = true;
-            }
+            });
             return *kernel;
         }
     };
@@ -605,8 +604,9 @@ namespace {
         const char* name;
         bool ensure_row_contiguous;
         std::optional<mlx::core::fast::CustomKernelFunction> kernel;
+        std::once_flag initialize_once;
         mlx::core::fast::CustomKernelFunction& get() {
-            if (!kernel) {
+            std::call_once(initialize_once, [this] {
                 kernel = mlx::core::fast::metal_kernel(
                     name,
                     {"queries", "keys", "values", "indices", "valid",
@@ -615,7 +615,7 @@ namespace {
                     QSA_SPARSE_PREFILL_METAL_SOURCE,
                     "",
                     ensure_row_contiguous);
-            }
+            });
             return *kernel;
         }
     };
@@ -780,18 +780,17 @@ namespace {
 
     struct SsmKernelHolder {
         std::optional<mlx::core::fast::CustomKernelFunction> kernel;
-        bool initialized = false;
+        std::once_flag initialize_once;
 
         mlx::core::fast::CustomKernelFunction& get() {
-            if (!initialized) {
+            std::call_once(initialize_once, [this] {
                 kernel = mlx::core::fast::metal_kernel(
                     "ssm_kernel",
                     {"X", "A_log", "B", "C", "D", "dt", "state_in"},
                     {"out", "state_out"},
                     SSM_METAL_SOURCE
                 );
-                initialized = true;
-            }
+            });
             return *kernel;
         }
     };
@@ -856,18 +855,17 @@ namespace {
 
     struct SsmKernelHolderCuda {
         std::optional<mlx::core::fast::CustomKernelFunction> kernel;
-        bool initialized = false;
+        std::once_flag initialize_once;
 
         mlx::core::fast::CustomKernelFunction& get() {
-            if (!initialized) {
+            std::call_once(initialize_once, [this] {
                 kernel = mlx::core::fast::cuda_kernel(
                     "ssm_kernel_cu",
                     {"X", "A_log", "B", "C", "D", "dt", "state_in"},
                     {"out", "state_out"},
                     SSM_CUDA_SOURCE
                 );
-                initialized = true;
-            }
+            });
             return *kernel;
         }
     };
@@ -1179,19 +1177,18 @@ namespace {
     // Kernel holder structs (lazy init, one per variant)
     struct GatedDeltaKernelHolder {
         std::optional<mlx::core::fast::CustomKernelFunction> kernel;
-        bool initialized = false;
+        std::once_flag initialize_once;
 
         mlx::core::fast::CustomKernelFunction& get(const char* name,
                                                     const std::vector<std::string>& inputs,
                                                     const char* source) {
-            if (!initialized) {
+            std::call_once(initialize_once, [this, name, &inputs, source] {
                 kernel = mlx::core::fast::metal_kernel(
                     name, inputs,
                     {"y", "state_out"},
                     source
                 );
-                initialized = true;
-            }
+            });
             return *kernel;
         }
     };
@@ -1902,9 +1899,9 @@ namespace {
 
     struct MoeGateUpKernelHolder {
         std::optional<mlx::core::fast::CustomKernelFunction> kernel;
-        bool initialized = false;
+        std::once_flag initialize_once;
         mlx::core::fast::CustomKernelFunction& get() {
-            if (!initialized) {
+            std::call_once(initialize_once, [this] {
                 kernel = mlx::core::fast::metal_kernel(
                     "moe_gateup_kernel",
                     {"x", "indices", "gate_w", "gate_s", "gate_b",
@@ -1912,8 +1909,7 @@ namespace {
                     {"act_g"},
                     MOE_GATEUP_METAL_SOURCE
                 );
-                initialized = true;
-            }
+            });
             return *kernel;
         }
     };
@@ -1924,17 +1920,16 @@ namespace {
 
     struct MoeDownKernelHolder {
         std::optional<mlx::core::fast::CustomKernelFunction> kernel;
-        bool initialized = false;
+        std::once_flag initialize_once;
         mlx::core::fast::CustomKernelFunction& get() {
-            if (!initialized) {
+            std::call_once(initialize_once, [this] {
                 kernel = mlx::core::fast::metal_kernel(
                     "moe_down_kernel",
                     {"indices", "down_w", "down_s", "down_b", "act_g", "scores"},
                     {"out"},
                     MOE_DOWN_METAL_SOURCE
                 );
-                initialized = true;
-            }
+            });
             return *kernel;
         }
     };
@@ -2071,9 +2066,9 @@ namespace {
 
     struct MoeGateUpKernelHolderCuda {
         std::optional<mlx::core::fast::CustomKernelFunction> kernel;
-        bool initialized = false;
+        std::once_flag initialize_once;
         mlx::core::fast::CustomKernelFunction& get() {
-            if (!initialized) {
+            std::call_once(initialize_once, [this] {
                 kernel = mlx::core::fast::cuda_kernel(
                     "moe_gateup_kernel_cu",
                     {"x", "indices", "gate_w", "gate_s", "gate_b",
@@ -2081,8 +2076,7 @@ namespace {
                     {"act_g"},
                     MOE_GATEUP_CUDA_SOURCE
                 );
-                initialized = true;
-            }
+            });
             return *kernel;
         }
     };
@@ -2093,17 +2087,16 @@ namespace {
 
     struct MoeDownKernelHolderCuda {
         std::optional<mlx::core::fast::CustomKernelFunction> kernel;
-        bool initialized = false;
+        std::once_flag initialize_once;
         mlx::core::fast::CustomKernelFunction& get() {
-            if (!initialized) {
+            std::call_once(initialize_once, [this] {
                 kernel = mlx::core::fast::cuda_kernel(
                     "moe_down_kernel_cu",
                     {"indices", "down_w", "down_s", "down_b", "act_g", "scores"},
                     {"out"},
                     MOE_DOWN_CUDA_SOURCE
                 );
-                initialized = true;
-            }
+            });
             return *kernel;
         }
     };
@@ -2155,17 +2148,16 @@ namespace {
 
     struct MoeFc1Relu2KernelHolder {
         std::optional<mlx::core::fast::CustomKernelFunction> kernel;
-        bool initialized = false;
+        std::once_flag initialize_once;
         mlx::core::fast::CustomKernelFunction& get() {
-            if (!initialized) {
+            std::call_once(initialize_once, [this] {
                 kernel = mlx::core::fast::metal_kernel(
                     "moe_fc1_relu2_kernel",
                     {"x", "indices", "fc1_w", "fc1_s", "fc1_b"},
                     {"act_g"},
                     MOE_FC1_RELU2_METAL_SOURCE
                 );
-                initialized = true;
-            }
+            });
             return *kernel;
         }
     };
