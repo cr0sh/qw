@@ -29,7 +29,9 @@ use crate::qwen4_attention::{
 use crate::qwen4_mtp::Qwen4MtpDraftModel;
 use anyhow::{Context, Result, ensure};
 use mlxcel_core::cache::{KVCacheMode, SequenceId};
-use mlxcel_core::generate::{LanguageModel, ModelStateSnapshot};
+use mlxcel_core::generate::{
+    LanguageModel, ModelStateSnapshot, SnapshotPagedTensor,
+};
 use mlxcel_core::layers::{KVCache, MoESwitch, QuantizedWeight, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::utils::silu;
 use mlxcel_core::weights::WeightMap;
@@ -2935,6 +2937,585 @@ fn validate_snapshot_tensor_names(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct Qwen4OwnedSnapshotLayerLayout {
+    is_linear: bool,
+    has_ple: bool,
+}
+
+enum Qwen4OwnedSnapshotLayerMetadata {
+    Linear {
+        ple_token_history: Vec<i32>,
+    },
+    Attention {
+        tail_start: i32,
+        tail_end: i32,
+        horizon: i32,
+        block_size: i32,
+        block_count: usize,
+    },
+}
+
+struct Qwen4OwnedSnapshotValidation {
+    token_len: i32,
+    position: i32,
+    rope_delta: Option<i32>,
+    layers: Vec<Qwen4OwnedSnapshotLayerMetadata>,
+}
+
+fn owned_snapshot_dimension(value: usize, name: &str) -> std::result::Result<i32, String> {
+    i32::try_from(value).map_err(|_| format!("Qwen4 snapshot {name} exceeds i32"))
+}
+
+fn owned_snapshot_dense_tensor<'a>(
+    snapshot: &'a ModelStateSnapshot,
+    name: &str,
+    expected_shape: &[i32],
+    expected_dtype: i32,
+) -> std::result::Result<&'a MlxArray, String> {
+    let array = snapshot
+        .tensor(name)
+        .ok_or_else(|| format!("Qwen4 snapshot is missing {name}"))?;
+    let shape = mlxcel_core::array_shape(array);
+    let dtype = mlxcel_core::array_dtype(array);
+    if shape != expected_shape || dtype != expected_dtype {
+        return Err(format!(
+            "Qwen4 snapshot field {name} layout mismatch: expected shape {expected_shape:?} dtype {expected_dtype}, got shape {shape:?} dtype {dtype}"
+        ));
+    }
+    Ok(array)
+}
+
+fn owned_snapshot_float_tensor<'a>(
+    snapshot: &'a ModelStateSnapshot,
+    name: &str,
+    expected_shape: &[i32],
+) -> std::result::Result<(&'a MlxArray, i32), String> {
+    let array = snapshot
+        .tensor(name)
+        .ok_or_else(|| format!("Qwen4 snapshot is missing {name}"))?;
+    let shape = mlxcel_core::array_shape(array);
+    let dtype = mlxcel_core::array_dtype(array);
+    if shape != expected_shape
+        || ![
+            mlxcel_core::dtype::FLOAT16,
+            mlxcel_core::dtype::FLOAT32,
+            mlxcel_core::dtype::BFLOAT16,
+        ]
+        .contains(&dtype)
+    {
+        return Err(format!(
+            "Qwen4 snapshot field {name} layout mismatch: expected floating shape {expected_shape:?}, got shape {shape:?} dtype {dtype}"
+        ));
+    }
+    Ok((array, dtype))
+}
+
+fn owned_snapshot_i32(
+    snapshot: &ModelStateSnapshot,
+    name: &str,
+) -> std::result::Result<i32, String> {
+    let value =
+        owned_snapshot_dense_tensor(snapshot, name, &[1], mlxcel_core::dtype::INT32)?;
+    Ok(mlxcel_core::item_i32(&mlxcel_core::reshape(value, &[])))
+}
+
+fn validate_owned_snapshot_pages(
+    tensor: &SnapshotPagedTensor,
+    name: &str,
+    expected_axis: usize,
+    expected_len: usize,
+    expected_shape: &[i32],
+    expected_dtype: i32,
+) -> std::result::Result<(), String> {
+    if tensor.token_axis() != expected_axis
+        || tensor.token_len() != expected_len
+        || expected_shape.get(expected_axis).copied() != Some(expected_len as i32)
+    {
+        return Err(format!(
+            "Qwen4 snapshot paged tensor {name} coordinates mismatch"
+        ));
+    }
+    let mut cursor = 0usize;
+    for page in tensor.pages() {
+        let range = page.token_range();
+        let shape = page.shape();
+        if range.start != cursor
+            || range.end <= range.start
+            || range.end > expected_len
+            || shape.len() != expected_shape.len()
+            || shape.get(expected_axis).copied()
+                != Some((range.end - range.start) as i32)
+            || shape
+                .iter()
+                .zip(expected_shape)
+                .enumerate()
+                .any(|(axis, (&actual, &expected))| {
+                    axis != expected_axis && actual != expected
+                })
+            || page.dtype() != expected_dtype
+        {
+            return Err(format!(
+                "Qwen4 snapshot paged tensor {name} page layout mismatch at {range:?}"
+            ));
+        }
+        cursor = range.end;
+    }
+    if cursor != expected_len {
+        return Err(format!(
+            "Qwen4 snapshot paged tensor {name} does not cover 0..{expected_len}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_qwen4_owned_snapshot(
+    snapshot: &ModelStateSnapshot,
+    config: &Qwen4Config,
+    layouts: &[Qwen4OwnedSnapshotLayerLayout],
+    desired_qsa_horizon: i32,
+) -> std::result::Result<Qwen4OwnedSnapshotValidation, String> {
+    if snapshot.family() != QWEN4_SNAPSHOT_FAMILY {
+        return Err(format!(
+            "Qwen4 snapshot family mismatch: expected {QWEN4_SNAPSHOT_FAMILY}, got {}",
+            snapshot.family()
+        ));
+    }
+    let token_len = i32::try_from(snapshot.token_len())
+        .map_err(|_| "Qwen4 snapshot token length exceeds i32".to_string())?;
+    if token_len <= 0 {
+        return Err("Qwen4 owned snapshot token length must be positive".to_string());
+    }
+    if desired_qsa_horizon < 0 {
+        return Err(format!(
+            "QSA rollback horizon must be non-negative, got {desired_qsa_horizon}"
+        ));
+    }
+    if owned_snapshot_i32(snapshot, "meta.layer_count")?
+        != i32::try_from(layouts.len()).unwrap_or(i32::MAX)
+    {
+        return Err("Qwen4 snapshot layer count does not match the loaded model".to_string());
+    }
+
+    let position = owned_snapshot_i32(snapshot, "mrope.position")?;
+    if position != token_len {
+        return Err("Qwen4 snapshot MRoPE position does not match token length".to_string());
+    }
+    let rope_delta = match owned_snapshot_i32(snapshot, "mrope.rope_delta")? {
+        i32::MIN => None,
+        value => Some(value),
+    };
+
+    let mut expected_dense = BTreeSet::from([
+        "meta.layer_count".to_string(),
+        "mrope.position".to_string(),
+        "mrope.rope_delta".to_string(),
+    ]);
+    if let Some(position_ids) = snapshot.tensor("mrope.position_ids") {
+        let shape = mlxcel_core::array_shape(position_ids);
+        let valid_shape = shape == [1, token_len] || shape == [3, 1, token_len];
+        if !valid_shape || mlxcel_core::array_dtype(position_ids) != mlxcel_core::dtype::INT32 {
+            return Err(format!(
+                "Qwen4 snapshot MRoPE position IDs layout mismatch: shape={shape:?}, dtype={}",
+                mlxcel_core::array_dtype(position_ids)
+            ));
+        }
+        expected_dense.insert("mrope.position_ids".to_string());
+    }
+    let mut expected_paged = BTreeSet::new();
+
+    let key_heads = config
+        .linear_num_key_heads
+        .checked_mul(config.linear_key_head_dim)
+        .ok_or_else(|| "Qwen4 linear key cache geometry overflowed".to_string())?;
+    let value_heads = config
+        .linear_num_value_heads
+        .checked_mul(config.linear_value_head_dim)
+        .ok_or_else(|| "Qwen4 linear value cache geometry overflowed".to_string())?;
+    let conv_dim = key_heads
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(value_heads))
+        .ok_or_else(|| "Qwen4 linear convolution cache geometry overflowed".to_string())?;
+    let conv_state_len = config
+        .linear_conv_kernel_dim
+        .checked_sub(1)
+        .ok_or_else(|| "Qwen4 linear convolution kernel must be positive".to_string())?;
+    let linear_conv_shape = [
+        1,
+        owned_snapshot_dimension(conv_state_len, "linear convolution state length")?,
+        owned_snapshot_dimension(conv_dim, "linear convolution width")?,
+    ];
+    let linear_state_shape = [
+        1,
+        owned_snapshot_dimension(config.linear_num_value_heads, "linear value heads")?,
+        owned_snapshot_dimension(config.linear_value_head_dim, "linear value head dimension")?,
+        owned_snapshot_dimension(config.linear_key_head_dim, "linear key head dimension")?,
+    ];
+    let ple_state_len = config
+        .ple_conv_kernel_size
+        .checked_sub(1)
+        .and_then(|value| value.checked_mul(config.ngram_size))
+        .ok_or_else(|| "Qwen4 PLE convolution cache geometry overflowed".to_string())?;
+    let ple_width = config
+        .hc_count
+        .checked_mul(config.hidden_size)
+        .ok_or_else(|| "Qwen4 PLE cache width overflowed".to_string())?;
+    let ple_conv_shape = [
+        1,
+        owned_snapshot_dimension(ple_state_len, "PLE convolution state length")?,
+        owned_snapshot_dimension(ple_width, "PLE convolution width")?,
+    ];
+    let ple_history_len = config
+        .ngram_size
+        .checked_sub(1)
+        .ok_or_else(|| "Qwen4 PLE n-gram size must be positive".to_string())?;
+    let ple_history_shape = [owned_snapshot_dimension(ple_history_len, "PLE token history")?];
+    let attention_config = config.to_qwen4_attention_config();
+    let kv_shape = [
+        1,
+        owned_snapshot_dimension(
+            attention_config.num_key_value_heads,
+            "attention key/value heads",
+        )?,
+        token_len,
+        owned_snapshot_dimension(attention_config.head_dim, "attention head dimension")?,
+    ];
+    let qsa_head_dim =
+        owned_snapshot_dimension(attention_config.indexer_head_dim, "QSA head dimension")?;
+    let expected_block_size = owned_snapshot_dimension(
+        attention_config.indexer_compress_ratio,
+        "QSA compression ratio",
+    )?;
+
+    let mut layer_metadata = Vec::with_capacity(layouts.len());
+    for (index, layout) in layouts.iter().enumerate() {
+        let kind_name = format!("layer.{index}.kind");
+        let offset_name = format!("layer.{index}.offset");
+        expected_dense.insert(kind_name.clone());
+        expected_dense.insert(offset_name.clone());
+        let expected_kind = if layout.is_linear { 1 } else { 0 };
+        if owned_snapshot_i32(snapshot, &kind_name)? != expected_kind {
+            return Err(format!(
+                "Qwen4 snapshot layer {index} cache variant mismatch"
+            ));
+        }
+        if owned_snapshot_i32(snapshot, &offset_name)? != token_len {
+            return Err(format!("Qwen4 snapshot layer {index} offset mismatch"));
+        }
+
+        if layout.is_linear {
+            let conv_name = format!("layer.{index}.conv_state");
+            let state_name = format!("layer.{index}.state_cache");
+            expected_dense.insert(conv_name.clone());
+            expected_dense.insert(state_name.clone());
+            let (_, conv_dtype) =
+                owned_snapshot_float_tensor(snapshot, &conv_name, &linear_conv_shape)?;
+            owned_snapshot_dense_tensor(
+                snapshot,
+                &state_name,
+                &linear_state_shape,
+                mlxcel_core::dtype::FLOAT32,
+            )?;
+            let ple_token_history = if layout.has_ple {
+                let ple_conv_name = format!("layer.{index}.ple_conv_state");
+                let ple_history_name = format!("layer.{index}.ple_token_history");
+                expected_dense.insert(ple_conv_name.clone());
+                expected_dense.insert(ple_history_name.clone());
+                let (_, ple_dtype) =
+                    owned_snapshot_float_tensor(snapshot, &ple_conv_name, &ple_conv_shape)?;
+                if ple_dtype != conv_dtype {
+                    return Err(format!(
+                        "Qwen4 snapshot layer {index} PLE cache dtype mismatch"
+                    ));
+                }
+                let history = owned_snapshot_dense_tensor(
+                    snapshot,
+                    &ple_history_name,
+                    &ple_history_shape,
+                    mlxcel_core::dtype::INT32,
+                )?;
+                mlxcel_core::array_to_raw_bytes(history)
+                    .chunks_exact(4)
+                    .map(|chunk| {
+                        i32::from_ne_bytes(chunk.try_into().expect("four-byte PLE token"))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            layer_metadata.push(Qwen4OwnedSnapshotLayerMetadata::Linear {
+                ple_token_history,
+            });
+        } else {
+            let auxiliary_name = format!("layer.{index}.auxiliary_keys");
+            let tail_start_name = format!("layer.{index}.auxiliary_tail_start");
+            let tail_end_name = format!("layer.{index}.auxiliary_tail_end");
+            let horizon_name = format!("layer.{index}.auxiliary_rollback_horizon");
+            let block_size_name = format!("layer.{index}.auxiliary_block_size");
+            expected_dense.extend([
+                auxiliary_name.clone(),
+                tail_start_name.clone(),
+                tail_end_name.clone(),
+                horizon_name.clone(),
+                block_size_name.clone(),
+            ]);
+            let keys_name = format!("layer.{index}.keys");
+            let values_name = format!("layer.{index}.values");
+            expected_paged.extend([keys_name, values_name]);
+
+            let tail_start = owned_snapshot_i32(snapshot, &tail_start_name)?;
+            let tail_end = owned_snapshot_i32(snapshot, &tail_end_name)?;
+            let horizon = owned_snapshot_i32(snapshot, &horizon_name)?;
+            let block_size = owned_snapshot_i32(snapshot, &block_size_name)?;
+            if tail_end != token_len || horizon < 0 || block_size != expected_block_size {
+                return Err(format!(
+                    "Qwen4 snapshot layer {index} QSA metadata mismatch"
+                ));
+            }
+            if tail_start < 0 || tail_start > tail_end || tail_start % block_size != 0 {
+                return Err(format!(
+                    "Qwen4 snapshot layer {index} QSA tail coordinates mismatch"
+                ));
+            }
+            let desired_tail_start = token_len.saturating_sub(desired_qsa_horizon).max(0)
+                / block_size
+                * block_size;
+            if desired_qsa_horizon > horizon && tail_start > desired_tail_start {
+                return Err(format!(
+                    "Qwen4 snapshot layer {index} QSA tail cannot satisfy rollback horizon {desired_qsa_horizon}"
+                ));
+            }
+            let tail_shape = [1, tail_end - tail_start, qsa_head_dim];
+            let (_, auxiliary_dtype) =
+                owned_snapshot_float_tensor(snapshot, &auxiliary_name, &tail_shape)?;
+            let block_count = usize::try_from(token_len / block_size)
+                .expect("positive QSA coordinates fit usize");
+            if block_count > 0 {
+                let block_name = format!("layer.{index}.auxiliary_block_keys");
+                expected_paged.insert(block_name.clone());
+                let block_shape = [
+                    1,
+                    1,
+                    owned_snapshot_dimension(block_count, "QSA block count")?,
+                    qsa_head_dim,
+                ];
+                let block_tensor = snapshot
+                    .paged_tensor(&block_name)
+                    .ok_or_else(|| format!("Qwen4 snapshot is missing {block_name}"))?;
+                validate_owned_snapshot_pages(
+                    block_tensor,
+                    &block_name,
+                    2,
+                    block_count,
+                    &block_shape,
+                    auxiliary_dtype,
+                )?;
+            }
+            layer_metadata.push(Qwen4OwnedSnapshotLayerMetadata::Attention {
+                tail_start,
+                tail_end,
+                horizon,
+                block_size,
+                block_count,
+            });
+        }
+    }
+
+    let dense_names = snapshot.tensor_names().collect::<Vec<_>>();
+    let paged_names = snapshot.paged_tensor_names().collect::<Vec<_>>();
+    let actual_dense = dense_names.iter().copied().collect::<BTreeSet<_>>();
+    let actual_paged = paged_names.iter().copied().collect::<BTreeSet<_>>();
+    if actual_dense.len() != snapshot.tensor_count()
+        || actual_paged.len() != snapshot.paged_tensor_count()
+        || actual_dense.iter().any(|name| actual_paged.contains(name))
+        || actual_dense
+            != expected_dense
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>()
+        || actual_paged
+            != expected_paged
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>()
+    {
+        return Err("Qwen4 snapshot tensor layout does not match the loaded model".to_string());
+    }
+
+    for (index, metadata) in layer_metadata.iter().enumerate() {
+        if let Qwen4OwnedSnapshotLayerMetadata::Attention {
+            block_count,
+            ..
+        } = metadata
+        {
+            for suffix in ["keys", "values"] {
+                let name = format!("layer.{index}.{suffix}");
+                validate_owned_snapshot_pages(
+                    snapshot
+                        .paged_tensor(&name)
+                        .expect("validated paged tensor name"),
+                    &name,
+                    2,
+                    snapshot.token_len(),
+                    &kv_shape,
+                    mlxcel_core::dtype::UINT8,
+                )?;
+            }
+            if *block_count == 0
+                && snapshot
+                    .paged_tensor(&format!("layer.{index}.auxiliary_block_keys"))
+                    .is_some()
+            {
+                return Err(format!(
+                    "Qwen4 snapshot layer {index} has unexpected empty QSA blocks"
+                ));
+            }
+        }
+    }
+
+    if let Some(logits) = snapshot.continuation_logits() {
+        let shape = mlxcel_core::array_shape(logits);
+        let dtype = mlxcel_core::array_dtype(logits);
+        let expected_vocab =
+            owned_snapshot_dimension(config.vocab_size, "continuation vocabulary")?;
+        if shape != [1, 1, expected_vocab]
+            || ![
+                mlxcel_core::dtype::FLOAT16,
+                mlxcel_core::dtype::FLOAT32,
+                mlxcel_core::dtype::BFLOAT16,
+            ]
+            .contains(&dtype)
+        {
+            return Err(format!(
+                "Qwen4 snapshot continuation logits layout mismatch: shape={shape:?}, dtype={dtype}"
+            ));
+        }
+    }
+
+    Ok(Qwen4OwnedSnapshotValidation {
+        token_len,
+        position,
+        rope_delta,
+        layers: layer_metadata,
+    })
+}
+
+fn take_owned_snapshot_tensor(
+    snapshot: &mut ModelStateSnapshot,
+    name: &str,
+) -> std::result::Result<UniquePtr<MlxArray>, String> {
+    snapshot
+        .take_paged_tensor(name)
+        .ok_or_else(|| format!("Qwen4 snapshot is missing {name}"))?
+        .into_materialized()
+        .ok_or_else(|| format!("Qwen4 snapshot paged tensor {name} is empty"))
+}
+
+fn restore_qwen4_snapshot_owned(
+    sequence_state: &ModelOwnedSequenceState<Qwen4LayerCache>,
+    rope_state: &RopeState,
+    mut snapshot: ModelStateSnapshot,
+    config: &Qwen4Config,
+    layouts: &[Qwen4OwnedSnapshotLayerLayout],
+    desired_qsa_horizon: i32,
+) -> std::result::Result<Option<UniquePtr<MlxArray>>, String> {
+    let validation =
+        validate_qwen4_owned_snapshot(&snapshot, config, layouts, desired_qsa_horizon)?;
+    let mut restored = Vec::with_capacity(layouts.len());
+    for (index, (layout, metadata)) in layouts
+        .iter()
+        .zip(validation.layers.into_iter())
+        .enumerate()
+    {
+        match (layout, metadata) {
+            (
+                Qwen4OwnedSnapshotLayerLayout {
+                    is_linear: true, ..
+                },
+                Qwen4OwnedSnapshotLayerMetadata::Linear { ple_token_history },
+            ) => {
+                let conv_state = snapshot
+                    .tensor(&format!("layer.{index}.conv_state"))
+                    .expect("validated linear convolution state");
+                let state_cache = snapshot
+                    .tensor(&format!("layer.{index}.state_cache"))
+                    .expect("validated linear recurrent state");
+                let ple_conv_state = layout.has_ple.then(|| {
+                    mlxcel_core::copy(
+                        snapshot
+                            .tensor(&format!("layer.{index}.ple_conv_state"))
+                            .expect("validated PLE convolution state"),
+                    )
+                });
+                restored.push(Qwen4LayerCache::Linear(GatedDeltaCache {
+                    conv_state: Some(mlxcel_core::copy(conv_state)),
+                    state_cache: Some(mlxcel_core::copy(state_cache)),
+                    ple_conv_state,
+                    ple_token_history,
+                    offset: validation.token_len,
+                }));
+            }
+            (
+                Qwen4OwnedSnapshotLayerLayout {
+                    is_linear: false,
+                    ..
+                },
+                Qwen4OwnedSnapshotLayerMetadata::Attention {
+                    tail_start,
+                    tail_end,
+                    horizon,
+                    block_size,
+                    block_count,
+                },
+            ) => {
+                let keys_name = format!("layer.{index}.keys");
+                let keys = take_owned_snapshot_tensor(&mut snapshot, &keys_name)?;
+                let values_name = format!("layer.{index}.values");
+                let values = take_owned_snapshot_tensor(&mut snapshot, &values_name)?;
+                let mut cache = KVCache::new_with_mode(KVCacheMode::Fp8);
+                cache.restore_fp8_snapshot(validation.token_len, keys, values)?;
+
+                let auxiliary_keys = mlxcel_core::copy(
+                    snapshot
+                        .tensor(&format!("layer.{index}.auxiliary_keys"))
+                        .expect("validated QSA raw keys"),
+                );
+                let auxiliary_block_keys = if block_count > 0 {
+                    let block_name = format!("layer.{index}.auxiliary_block_keys");
+                    Some(take_owned_snapshot_tensor(&mut snapshot, &block_name)?)
+                } else {
+                    None
+                };
+                cache.restore_auxiliary_block_keys(block_size, auxiliary_block_keys);
+                cache.restore_auxiliary_keys(
+                    tail_start,
+                    tail_end,
+                    horizon,
+                    auxiliary_keys,
+                )?;
+                cache.set_auxiliary_rollback_horizon(desired_qsa_horizon)?;
+                restored.push(Qwen4LayerCache::Attention(Box::new(cache)));
+            }
+            _ => {
+                return Err(format!(
+                    "Qwen4 snapshot layer {index} validated with inconsistent cache metadata"
+                ));
+            }
+        }
+    }
+
+    let position_ids = snapshot.tensor("mrope.position_ids").map(mlxcel_core::copy);
+    let continuation_logits = snapshot.take_continuation_logits();
+    sequence_state.replace_internal(restored);
+    rope_state.restore(
+        validation.position,
+        position_ids.as_deref(),
+        validation.rope_delta,
+    );
+    Ok(continuation_logits)
+}
+
+
 // LanguageModel trait implementation.
 impl LanguageModel for Qwen4Model {
     fn forward(
@@ -3402,6 +3983,29 @@ impl LanguageModel for Qwen4Model {
         Ok(())
     }
 
+    fn restore_sequence_state_owned(
+        &self,
+        _seq_id: SequenceId,
+        snapshot: ModelStateSnapshot,
+    ) -> std::result::Result<Option<UniquePtr<MlxArray>>, String> {
+        let layouts = self
+            .layers
+            .iter()
+            .map(|layer| Qwen4OwnedSnapshotLayerLayout {
+                is_linear: layer.is_linear,
+                has_ple: layer.ple.is_some(),
+            })
+            .collect::<Vec<_>>();
+        restore_qwen4_snapshot_owned(
+            &self.sequence_state,
+            &self.rope_state,
+            snapshot,
+            &self.config,
+            &layouts,
+            self.qsa_rollback_horizon.get(),
+        )
+    }
+
     fn snapshot_truncatable_to(&self, snapshot: &ModelStateSnapshot, target_len: usize) -> bool {
         snapshot.family() == QWEN4_SNAPSHOT_FAMILY && target_len == snapshot.token_len()
     }
@@ -3448,6 +4052,411 @@ mod tests {
                 .insert("quantization".to_string(), quantization);
         }
         serde_json::from_value(value).expect("minimal dense config")
+    }
+
+    const OWNED_RESTORE_TOKEN_LEN: usize = 300;
+
+    fn owned_restore_config() -> Qwen4Config {
+        let mut config = dense_config(None);
+        config.num_hidden_layers = 2;
+        config.linear_num_value_heads = 2;
+        config.linear_num_key_heads = 1;
+        config.linear_key_head_dim = 2;
+        config.linear_value_head_dim = 3;
+        config.linear_conv_kernel_dim = 3;
+        config.ple_conv_kernel_size = 2;
+        config.ngram_size = 3;
+        config.hc_count = 1;
+        config
+    }
+
+    fn owned_restore_layouts() -> [Qwen4OwnedSnapshotLayerLayout; 2] {
+        [
+            Qwen4OwnedSnapshotLayerLayout {
+                is_linear: true,
+                has_ple: true,
+            },
+            Qwen4OwnedSnapshotLayerLayout {
+                is_linear: false,
+                has_ple: false,
+            },
+        ]
+    }
+
+    fn patterned_f32(len: usize, salt: usize) -> Vec<f32> {
+        (0..len)
+            .map(|index| ((index + salt) % 251) as f32 / 251.0)
+            .collect()
+    }
+
+    fn owned_restore_snapshot(
+        config: &Qwen4Config,
+        tail_end: i32,
+        key_token_axis: usize,
+    ) -> ModelStateSnapshot {
+        let token_len = OWNED_RESTORE_TOKEN_LEN as i32;
+        let mut snapshot =
+            ModelStateSnapshot::new(QWEN4_SNAPSHOT_FAMILY, OWNED_RESTORE_TOKEN_LEN);
+        push_snapshot_i32(&mut snapshot, "meta.layer_count", 2);
+        push_snapshot_i32(&mut snapshot, "mrope.position", token_len);
+        push_snapshot_i32(&mut snapshot, "mrope.rope_delta", 17);
+
+        push_snapshot_i32(&mut snapshot, "layer.0.kind", 1);
+        push_snapshot_i32(&mut snapshot, "layer.0.offset", token_len);
+        let key_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+        let value_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+        let conv_dim = key_dim * 2 + value_dim;
+        let conv_shape = [
+            1,
+            (config.linear_conv_kernel_dim - 1) as i32,
+            conv_dim as i32,
+        ];
+        let conv_state = mlxcel_core::from_slice_f32(
+            &patterned_f32(conv_shape.iter().product::<i32>() as usize, 3),
+            &conv_shape,
+        );
+        snapshot.push_tensor("layer.0.conv_state", &conv_state);
+        let state_shape = [
+            1,
+            config.linear_num_value_heads as i32,
+            config.linear_value_head_dim as i32,
+            config.linear_key_head_dim as i32,
+        ];
+        let state_cache = mlxcel_core::from_slice_f32(
+            &patterned_f32(state_shape.iter().product::<i32>() as usize, 11),
+            &state_shape,
+        );
+        snapshot.push_tensor("layer.0.state_cache", &state_cache);
+        let ple_shape = [
+            1,
+            ((config.ple_conv_kernel_size - 1) * config.ngram_size) as i32,
+            (config.hc_count * config.hidden_size) as i32,
+        ];
+        let ple_state = mlxcel_core::from_slice_f32(
+            &patterned_f32(ple_shape.iter().product::<i32>() as usize, 19),
+            &ple_shape,
+        );
+        snapshot.push_tensor("layer.0.ple_conv_state", &ple_state);
+        let history = mlxcel_core::from_slice_i32(&[41, 42], &[2]);
+        snapshot.push_tensor("layer.0.ple_token_history", &history);
+
+        push_snapshot_i32(&mut snapshot, "layer.1.kind", 0);
+        push_snapshot_i32(&mut snapshot, "layer.1.offset", token_len);
+        let horizon = 5;
+        let block_size = 4;
+        let tail_start = (token_len - horizon) / block_size * block_size;
+        push_snapshot_i32(
+            &mut snapshot,
+            "layer.1.auxiliary_tail_start",
+            tail_start,
+        );
+        push_snapshot_i32(&mut snapshot, "layer.1.auxiliary_tail_end", tail_end);
+        push_snapshot_i32(
+            &mut snapshot,
+            "layer.1.auxiliary_rollback_horizon",
+            horizon,
+        );
+        push_snapshot_i32(
+            &mut snapshot,
+            "layer.1.auxiliary_block_size",
+            block_size,
+        );
+        let qsa_head_dim = config.to_qwen4_attention_config().indexer_head_dim as i32;
+        let tail_shape = [1, token_len - tail_start, qsa_head_dim];
+        let auxiliary_keys = mlxcel_core::from_slice_f32(
+            &patterned_f32(tail_shape.iter().product::<i32>() as usize, 23),
+            &tail_shape,
+        );
+        snapshot.push_tensor("layer.1.auxiliary_keys", &auxiliary_keys);
+
+        let kv_shape = [
+            1,
+            config.num_key_value_heads as i32,
+            token_len,
+            config.head_dim_resolved() as i32,
+        ];
+        let kv_elements = kv_shape.iter().product::<i32>() as usize;
+        let keys = (0..kv_elements)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let values = (0..kv_elements)
+            .map(|index| ((index + 37) % 251) as u8)
+            .collect::<Vec<_>>();
+        let keys = mlxcel_core::from_bytes(&keys, &kv_shape, mlxcel_core::dtype::UINT8);
+        let values = mlxcel_core::from_bytes(&values, &kv_shape, mlxcel_core::dtype::UINT8);
+        snapshot
+            .push_paged_tensor(None, "layer.1.keys", &keys, key_token_axis)
+            .expect("capture test keys");
+        snapshot
+            .push_paged_tensor(None, "layer.1.values", &values, 2)
+            .expect("capture test values");
+
+        let block_count = token_len / block_size;
+        let block_shape = [1, 1, block_count, qsa_head_dim];
+        let blocks = mlxcel_core::from_slice_f32(
+            &patterned_f32(block_shape.iter().product::<i32>() as usize, 31),
+            &block_shape,
+        );
+        snapshot
+            .push_paged_tensor(None, "layer.1.auxiliary_block_keys", &blocks, 2)
+            .expect("capture test QSA blocks");
+
+        let logits = mlxcel_core::from_slice_f32(
+            &patterned_f32(config.vocab_size, 43),
+            &[1, 1, config.vocab_size as i32],
+        );
+        snapshot.set_continuation_logits(&logits);
+        snapshot
+    }
+
+    fn restore_test_snapshot_borrowed(
+        snapshot: &ModelStateSnapshot,
+        config: &Qwen4Config,
+        layouts: &[Qwen4OwnedSnapshotLayerLayout],
+        desired_qsa_horizon: i32,
+    ) -> (
+        ModelOwnedSequenceState<Qwen4LayerCache>,
+        RopeState,
+        Option<UniquePtr<MlxArray>>,
+    ) {
+        let validation =
+            validate_qwen4_owned_snapshot(snapshot, config, layouts, desired_qsa_horizon)
+                .expect("validate borrowed test snapshot");
+        let history = mlxcel_core::array_to_raw_bytes(
+            snapshot
+                .tensor("layer.0.ple_token_history")
+                .expect("PLE token history"),
+        )
+        .chunks_exact(4)
+        .map(|chunk| i32::from_ne_bytes(chunk.try_into().expect("four-byte token")))
+        .collect();
+        let linear = Qwen4LayerCache::Linear(GatedDeltaCache {
+            conv_state: Some(mlxcel_core::copy(
+                snapshot
+                    .tensor("layer.0.conv_state")
+                    .expect("linear convolution state"),
+            )),
+            state_cache: Some(mlxcel_core::copy(
+                snapshot
+                    .tensor("layer.0.state_cache")
+                    .expect("linear recurrent state"),
+            )),
+            ple_conv_state: Some(mlxcel_core::copy(
+                snapshot
+                    .tensor("layer.0.ple_conv_state")
+                    .expect("PLE convolution state"),
+            )),
+            ple_token_history: history,
+            offset: validation.token_len,
+        });
+
+        let keys = snapshot
+            .paged_tensor("layer.1.keys")
+            .and_then(SnapshotPagedTensor::materialize)
+            .expect("borrowed keys");
+        let values = snapshot
+            .paged_tensor("layer.1.values")
+            .and_then(SnapshotPagedTensor::materialize)
+            .expect("borrowed values");
+        let mut attention = KVCache::new_with_mode(KVCacheMode::Fp8);
+        attention
+            .restore_fp8_snapshot(validation.token_len, keys, values)
+            .expect("restore borrowed FP8 state");
+        let block_keys = snapshot
+            .paged_tensor("layer.1.auxiliary_block_keys")
+            .and_then(SnapshotPagedTensor::materialize);
+        attention.restore_auxiliary_block_keys(4, block_keys);
+        attention
+            .restore_auxiliary_keys(
+                292,
+                validation.token_len,
+                5,
+                mlxcel_core::copy(
+                    snapshot
+                        .tensor("layer.1.auxiliary_keys")
+                        .expect("borrowed QSA raw keys"),
+                ),
+            )
+            .expect("restore borrowed QSA raw keys");
+        attention
+            .set_auxiliary_rollback_horizon(desired_qsa_horizon)
+            .expect("restore borrowed QSA horizon");
+
+        let state = ModelOwnedSequenceState::new(vec![
+            linear,
+            Qwen4LayerCache::Attention(Box::new(attention)),
+        ]);
+        let rope = RopeState::new();
+        rope.restore(
+            validation.position,
+            snapshot.tensor("mrope.position_ids"),
+            validation.rope_delta,
+        );
+        let logits = snapshot.continuation_logits().map(mlxcel_core::copy);
+        (state, rope, logits)
+    }
+
+    fn assert_exact_array(left: &MlxArray, right: &MlxArray) {
+        mlxcel_core::eval(left);
+        mlxcel_core::eval(right);
+        assert_eq!(mlxcel_core::array_shape(left), mlxcel_core::array_shape(right));
+        assert_eq!(mlxcel_core::array_dtype(left), mlxcel_core::array_dtype(right));
+        assert_eq!(
+            mlxcel_core::array_to_raw_bytes(left),
+            mlxcel_core::array_to_raw_bytes(right)
+        );
+    }
+
+    fn assert_owned_restore_states_equal(
+        left: &ModelOwnedSequenceState<Qwen4LayerCache>,
+        right: &ModelOwnedSequenceState<Qwen4LayerCache>,
+    ) {
+        left.with_internal(|left| {
+            right.with_internal(|right| {
+                assert_eq!(left.len(), right.len());
+                let (Qwen4LayerCache::Linear(left), Qwen4LayerCache::Linear(right)) =
+                    (&left[0], &right[0])
+                else {
+                    panic!("expected matching linear cache");
+                };
+                assert_eq!(left.offset, right.offset);
+                assert_eq!(left.ple_token_history, right.ple_token_history);
+                for (left, right) in [
+                    (left.conv_state.as_deref(), right.conv_state.as_deref()),
+                    (left.state_cache.as_deref(), right.state_cache.as_deref()),
+                    (
+                        left.ple_conv_state.as_deref(),
+                        right.ple_conv_state.as_deref(),
+                    ),
+                ] {
+                    assert_exact_array(
+                        left.expect("left recurrent tensor"),
+                        right.expect("right recurrent tensor"),
+                    );
+                }
+
+                let (
+                    Qwen4LayerCache::Attention(left),
+                    Qwen4LayerCache::Attention(right),
+                ) = (&left[1], &right[1])
+                else {
+                    panic!("expected matching attention cache");
+                };
+                assert_eq!(left.offset, right.offset);
+                assert_eq!(
+                    left.auxiliary_raw_tail_range(),
+                    right.auxiliary_raw_tail_range()
+                );
+                assert_eq!(
+                    left.auxiliary_rollback_horizon(),
+                    right.auxiliary_rollback_horizon()
+                );
+                assert_eq!(
+                    left.auxiliary_block_size(),
+                    right.auxiliary_block_size()
+                );
+                assert_eq!(
+                    left.auxiliary_block_len(),
+                    right.auxiliary_block_len()
+                );
+                for (left, right) in [
+                    (left.keys.as_deref(), right.keys.as_deref()),
+                    (left.values.as_deref(), right.values.as_deref()),
+                    (
+                        left.auxiliary_keys.as_deref(),
+                        right.auxiliary_keys.as_deref(),
+                    ),
+                    (
+                        left.auxiliary_block_keys.as_deref(),
+                        right.auxiliary_block_keys.as_deref(),
+                    ),
+                ] {
+                    assert_exact_array(
+                        left.expect("left attention tensor"),
+                        right.expect("right attention tensor"),
+                    );
+                }
+            });
+        });
+    }
+
+    #[test]
+    fn owned_qwen_restore_matches_borrowed_cache_geometry_and_state() {
+        let config = owned_restore_config();
+        let layouts = owned_restore_layouts();
+        let borrowed_snapshot =
+            owned_restore_snapshot(&config, OWNED_RESTORE_TOKEN_LEN as i32, 2);
+        let owned_snapshot = owned_restore_snapshot(&config, OWNED_RESTORE_TOKEN_LEN as i32, 2);
+        let continuation_identity = owned_snapshot
+            .continuation_logits()
+            .expect("owned continuation logits")
+            as *const MlxArray;
+        let (borrowed_state, borrowed_rope, borrowed_logits) =
+            restore_test_snapshot_borrowed(&borrowed_snapshot, &config, &layouts, 5);
+        let owned_state = ModelOwnedSequenceState::new(Vec::new());
+        let owned_rope = RopeState::new();
+        let owned_logits = restore_qwen4_snapshot_owned(
+            &owned_state,
+            &owned_rope,
+            owned_snapshot,
+            &config,
+            &layouts,
+            5,
+        )
+        .expect("restore owned snapshot")
+        .expect("owned continuation logits");
+
+        assert_owned_restore_states_equal(&borrowed_state, &owned_state);
+        assert_eq!(borrowed_rope.position(), owned_rope.position());
+        assert_eq!(borrowed_rope.rope_delta(), owned_rope.rope_delta());
+        assert_exact_array(
+            borrowed_logits
+                .as_deref()
+                .expect("borrowed continuation logits"),
+            owned_logits
+                .as_ref()
+                .expect("owned continuation logits must not be null"),
+        );
+        assert_eq!(
+            owned_logits
+                .as_ref()
+                .expect("owned continuation logits must not be null")
+                as *const MlxArray,
+            continuation_identity
+        );
+    }
+
+    #[test]
+    fn malformed_owned_qwen_snapshot_leaves_runtime_state_unchanged() {
+        let config = owned_restore_config();
+        let layouts = owned_restore_layouts();
+        let prior_linear = Qwen4LayerCache::Linear(GatedDeltaCache {
+            offset: 7,
+            ..GatedDeltaCache::new()
+        });
+        let mut prior_attention = KVCache::new_with_mode(KVCacheMode::Fp8);
+        prior_attention.offset = 7;
+        let state = ModelOwnedSequenceState::new(vec![
+            prior_linear,
+            Qwen4LayerCache::Attention(Box::new(prior_attention)),
+        ]);
+        let rope = RopeState::new();
+        rope.restore(7, None, Some(9));
+        let malformed = owned_restore_snapshot(&config, OWNED_RESTORE_TOKEN_LEN as i32, 1);
+
+        let error =
+            restore_qwen4_snapshot_owned(&state, &rope, malformed, &config, &layouts, 5)
+                .err()
+                .expect("malformed key page coordinates must fail");
+        assert!(error.contains("paged tensor layer.1.keys coordinates"), "{error}");
+        state.with_internal(|caches| {
+            assert_eq!(
+                caches.iter().map(|cache| cache.offset()).collect::<Vec<_>>(),
+                vec![7, 7]
+            );
+        });
+        assert_eq!(rope.position(), 7);
+        assert_eq!(rope.rope_delta(), Some(9));
     }
 
     struct TestDir(std::path::PathBuf);

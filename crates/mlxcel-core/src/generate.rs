@@ -250,6 +250,60 @@ impl SnapshotPagedTensor {
         }
         Some(dense)
     }
+    /// Materialize this tensor while consuming and releasing its source pages.
+    ///
+    /// The returned array is evaluated and detached from its construction
+    /// graph before the final page references are dropped. A uniquely owned
+    /// single page transfers its array handle directly instead of copying it.
+    pub fn into_materialized(self) -> Option<UniquePtr<MlxArray>> {
+        let Self {
+            name,
+            token_axis,
+            token_len,
+            mut pages,
+        } = self;
+        let page_count = pages.len();
+        let page_bytes = pages.iter().map(|page| page.nbytes()).sum::<usize>();
+        let trace_enabled = tracing::enabled!(Level::DEBUG);
+        let started = trace_enabled.then(Instant::now);
+        let dense = match pages.len() {
+            0 => return None,
+            1 => {
+                let page = pages.pop().expect("single snapshot page");
+                match Arc::try_unwrap(page) {
+                    Ok(page) => page.array,
+                    Err(page) => ffi::copy(page.array()),
+                }
+            }
+            _ => {
+                let ptrs: Vec<*const MlxArray> = pages
+                    .iter()
+                    .map(|page| page.array() as *const MlxArray)
+                    .collect();
+                // SAFETY: every pointer references a live array owned by
+                // `pages` until the concatenation is evaluated below.
+                unsafe { ffi::concatenate(&ptrs, token_axis as i32) }
+            }
+        };
+        ffi::eval(&dense);
+        let dense_ptr = dense
+            .as_ref()
+            .expect("materialized snapshot tensor must not be null")
+            as *const MlxArray;
+        // SAFETY: `dense_ptr` remains live through the returned `UniquePtr`.
+        unsafe { ffi::detach_all(&[dense_ptr]) };
+        if let Some(started) = started {
+            tracing::debug!(
+                phase = "snapshot.sparse_materialize_owned",
+                tensor = %name,
+                page_count,
+                page_bytes,
+                token_len,
+                duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
+            );
+        }
+        Some(dense)
+    }
     pub fn portable_pages(&self) -> impl Iterator<Item = Arc<[u8]>> + '_ {
         self.pages.iter().map(|p| p.portable_bytes())
     }
@@ -345,6 +399,11 @@ impl ModelStateSnapshot {
 
     pub fn paged_tensor(&self, name: &str) -> Option<&SnapshotPagedTensor> {
         self.paged_tensors.iter().find(|t| t.name == name)
+    }
+    /// Remove and return one named paged tensor.
+    pub fn take_paged_tensor(&mut self, name: &str) -> Option<SnapshotPagedTensor> {
+        let index = self.paged_tensors.iter().position(|t| t.name == name)?;
+        Some(self.paged_tensors.remove(index))
     }
     pub fn paged_tensor_names(&self) -> impl Iterator<Item = &str> {
         self.paged_tensors.iter().map(SnapshotPagedTensor::name)
@@ -484,6 +543,10 @@ impl ModelStateSnapshot {
     /// Borrow the prefill logits associated with this exact prefix.
     pub fn continuation_logits(&self) -> Option<&MlxArray> {
         self.continuation_logits.as_deref()
+    }
+    /// Move the prefill logits associated with this exact prefix out.
+    pub fn take_continuation_logits(&mut self) -> Option<UniquePtr<MlxArray>> {
+        self.continuation_logits.take()
     }
 
     /// Number of named dense tensors stored in this snapshot.
@@ -1270,6 +1333,20 @@ pub trait LanguageModel {
         _snapshot: &ModelStateSnapshot,
     ) -> Result<(), String> {
         Err("model does not support exact-prefix state snapshots".to_string())
+    }
+
+    /// Consume and restore an exact-prefix snapshot into `seq_id`.
+    ///
+    /// Models with large paged state may override this to release source pages
+    /// incrementally. The conservative default delegates to the borrowed
+    /// restore before moving the continuation logits out.
+    fn restore_sequence_state_owned(
+        &self,
+        seq_id: SequenceId,
+        mut snapshot: ModelStateSnapshot,
+    ) -> Result<Option<UniquePtr<MlxArray>>, String> {
+        self.restore_sequence_state(seq_id, &snapshot)?;
+        Ok(snapshot.take_continuation_logits())
     }
 
     /// Whether `snapshot` can be restored covering only its first
@@ -5444,6 +5521,97 @@ mod tests {
         assert_eq!(child_pages[1].identity(), parent_pages[1].identity());
         assert_ne!(child_pages[2].identity(), parent_pages[1].identity());
         assert_eq!(child_pages[2].token_range(), 512..700);
+    }
+
+    #[test]
+    fn consuming_paged_tensor_releases_child_pages_without_changing_parent_identity() {
+        let values = (0..256 * 2).map(|i| i as f32).collect::<Vec<_>>();
+        let array = ffi::from_slice_f32(&values, &[1, 256, 2]);
+        let mut parent = ModelStateSnapshot::new("test", 256);
+        parent
+            .push_paged_tensor(None, "kv", &array, 1)
+            .expect("capture parent");
+        let mut child = ModelStateSnapshot::new("test", 256);
+        child
+            .push_paged_tensor(Some(&parent), "kv", &array, 1)
+            .expect("capture child");
+
+        let parent_page = &parent.paged_tensor("kv").expect("parent tensor").pages()[0];
+        let identity = parent_page.identity();
+        assert_eq!(Arc::strong_count(parent_page), 2);
+        let child_tensor = child.take_paged_tensor("kv").expect("take child tensor");
+        assert_eq!(child.paged_tensor_count(), 0);
+        assert_eq!(Arc::strong_count(parent_page), 2);
+
+        let materialized = child_tensor
+            .into_materialized()
+            .expect("consume child pages");
+        assert_eq!(Arc::strong_count(parent_page), 1);
+        assert_eq!(parent_page.identity(), identity);
+        assert_eq!(
+            ffi::array_to_raw_bytes(&materialized),
+            ffi::array_to_raw_bytes(&array)
+        );
+    }
+
+    #[test]
+    fn consuming_unique_single_page_transfers_array_identity() {
+        let array = ffi::from_slice_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 2, 2]);
+        let mut snapshot = ModelStateSnapshot::new("test", 2);
+        snapshot
+            .push_paged_tensor(None, "kv", &array, 1)
+            .expect("capture page");
+        let source = snapshot.paged_tensor("kv").expect("paged tensor").pages()[0].array()
+            as *const MlxArray;
+
+        let materialized = snapshot
+            .take_paged_tensor("kv")
+            .expect("take tensor")
+            .into_materialized()
+            .expect("materialize tensor");
+        let restored = materialized
+            .as_ref()
+            .expect("materialized tensor must not be null")
+            as *const MlxArray;
+        assert_eq!(restored, source);
+    }
+
+    #[test]
+    fn continuation_logits_are_moved_out_without_copying() {
+        let logits = ffi::from_slice_f32(&[0.25, 0.75], &[1, 1, 2]);
+        let mut snapshot = ModelStateSnapshot::new("test", 1);
+        snapshot.set_continuation_logits(&logits);
+        let source = snapshot
+            .continuation_logits()
+            .expect("continuation logits")
+            as *const MlxArray;
+
+        let moved = snapshot
+            .take_continuation_logits()
+            .expect("move continuation logits");
+        let restored = moved.as_ref().expect("moved logits must not be null") as *const MlxArray;
+        assert_eq!(restored, source);
+        assert!(snapshot.continuation_logits().is_none());
+    }
+
+    #[test]
+    fn default_owned_restore_preserves_borrowed_restore_and_moves_logits() {
+        let logits = ffi::from_slice_f32(&[0.25, 0.75], &[1, 1, 2]);
+        let mut snapshot = ModelStateSnapshot::new("stub", 1);
+        snapshot.set_continuation_logits(&logits);
+        let source = snapshot
+            .continuation_logits()
+            .expect("continuation logits")
+            as *const MlxArray;
+
+        let moved = StubModel
+            .restore_sequence_state_owned(SequenceId::from_raw(0), snapshot)
+            .expect("default owned restore")
+            .expect("moved continuation logits");
+        assert_eq!(
+            moved.as_ref().expect("moved logits must not be null") as *const MlxArray,
+            source
+        );
     }
 
     #[test]
