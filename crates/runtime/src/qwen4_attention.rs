@@ -599,6 +599,64 @@ impl Qwen4QsaIndexer {
     }
 }
 
+fn qsa_decode_uses_raw_fp8(cache_mode: KVCacheMode, metal_available: bool) -> bool {
+    cache_mode == KVCacheMode::Fp8 && metal_available
+}
+
+fn qsa_selected_decode_attention(
+    queries: &MlxArray,
+    cache: &mut KVCache,
+    keys: UniquePtr<MlxArray>,
+    values: UniquePtr<MlxArray>,
+    indices: &MlxArray,
+    scale: f32,
+    metal_available: bool,
+) -> UniquePtr<MlxArray> {
+    if qsa_decode_uses_raw_fp8(cache.mode, metal_available) {
+        let query_shape = mlxcel_core::array_shape(queries);
+        assert_eq!(query_shape.len(), 4, "QSA decode queries must be rank four");
+        assert_eq!(query_shape[0], 1, "raw FP8 QSA decode requires batch one");
+        assert_eq!(
+            query_shape[2], 1,
+            "raw FP8 QSA decode requires one query token"
+        );
+        let index_shape = mlxcel_core::array_shape(indices);
+        assert_eq!(
+            index_shape.len(),
+            1,
+            "QSA decode indices must be an ordered flat vector"
+        );
+
+        let raw = cache.update_and_fetch_raw_fp8(keys, values);
+        debug_assert_eq!(mlxcel_core::array_shape(&raw.keys)[2], raw.live_len);
+        debug_assert_eq!(mlxcel_core::array_shape(&raw.values)[2], raw.live_len);
+        let sparse_shape = [1, 1, index_shape[0]];
+        let sparse_indices = mlxcel_core::reshape(indices, &sparse_shape);
+        let valid = mlxcel_core::ones(&sparse_shape, mlxcel_core::dtype::BOOL);
+        mlxcel_core::qsa_sparse_prefill_attention_raw_fp8(
+            queries,
+            &raw.keys,
+            &raw.values,
+            &sparse_indices,
+            &valid,
+            scale,
+        )
+    } else {
+        let (cache_k, cache_v) = cache.update_and_fetch_selected(keys, values, indices);
+        unsafe {
+            mlxcel_core::layers::attention_from_ptr(
+                queries,
+                &cache_k,
+                &cache_v,
+                scale,
+                std::ptr::null(),
+                0.0,
+                0,
+            )
+        }
+    }
+}
+
 // Attention with Gated Output.
 pub(crate) struct Qwen4Attention {
     qkv_proj: FusedQKVLinear,
@@ -800,18 +858,15 @@ impl Qwen4Attention {
                 )
             }
         } else if let Some(indices) = qsa_indices {
-            let (cache_k, cache_v) = cache.update_and_fetch_selected(keys, values, indices);
-            unsafe {
-                mlxcel_core::layers::attention_from_ptr(
-                    &queries,
-                    &cache_k,
-                    &cache_v,
-                    self.scale,
-                    std::ptr::null(),
-                    0.0,
-                    0,
-                )
-            }
+            qsa_selected_decode_attention(
+                &queries,
+                cache,
+                keys,
+                values,
+                indices,
+                self.scale,
+                mlxcel_core::metal_is_available(),
+            )
         } else {
             let (cache_k, cache_v) = cache.update_and_fetch(keys, values);
             if l > 1 && mask.is_none() {
@@ -1524,6 +1579,114 @@ mod tests {
         let mut verify_cache = KVCache::new();
         let verify = attention.forward_verify(&input, &mut verify_cache, None, None);
         assert_eq!(mlxcel_core::array_shape(&verify), vec![1, 2, 3]);
+    }
+
+    fn qsa_decode_bf16(values: &[f32], shape: &[i32]) -> UniquePtr<MlxArray> {
+        mlxcel_core::astype(
+            &mlxcel_core::from_slice_f32(values, shape),
+            mlxcel_core::dtype::BFLOAT16,
+        )
+    }
+
+    fn seed_raw_fp8_qsa_decode_cache(cache: &mut KVCache) {
+        let keys = (0..40)
+            .map(|index| ((index % 13) as f32 - 6.0) * 0.125)
+            .collect::<Vec<_>>();
+        let values = (0..40)
+            .map(|index| ((index % 17) as f32 - 8.0) * -0.25)
+            .collect::<Vec<_>>();
+        cache.update(
+            qsa_decode_bf16(&keys, &[1, 2, 5, 4]),
+            qsa_decode_bf16(&values, &[1, 2, 5, 4]),
+        );
+    }
+
+    fn raw_fp8_qsa_decode_step() -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        (
+            qsa_decode_bf16(
+                &[-0.75, 0.5, 0.25, 1.0, 0.375, -0.625, 0.875, -0.25],
+                &[1, 2, 1, 4],
+            ),
+            qsa_decode_bf16(
+                &[1.5, -0.5, 0.75, -1.25, -0.875, 1.25, -1.5, 0.625],
+                &[1, 2, 1, 4],
+            ),
+        )
+    }
+
+    #[test]
+    fn raw_fp8_qsa_decode_matches_gathered_native_and_repeats_exactly() {
+        if !mlxcel_core::metal_is_available() {
+            return;
+        }
+        let queries = qsa_decode_bf16(
+            &[
+                -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8, -0.8, -0.6, -0.4, -0.2, 0.0,
+                0.2, 0.4,
+            ],
+            &[1, 4, 1, 4],
+        );
+        let indices = mlxcel_core::from_slice_i32(&[4, 0, 5, 2], &[4]);
+        let direct = || {
+            let mut cache = KVCache::new_with_mode(KVCacheMode::Fp8);
+            seed_raw_fp8_qsa_decode_cache(&mut cache);
+            let (keys, values) = raw_fp8_qsa_decode_step();
+            let output = qsa_selected_decode_attention(
+                &queries, &mut cache, keys, values, &indices, 0.5, true,
+            );
+            mlxcel_core::eval(&output);
+            output
+        };
+        let actual = direct();
+        let repeated = direct();
+        assert_arrays_equal(&actual, &repeated);
+
+        let mut reference_cache = KVCache::new_with_mode(KVCacheMode::Fp8);
+        seed_raw_fp8_qsa_decode_cache(&mut reference_cache);
+        let (keys, values) = raw_fp8_qsa_decode_step();
+        let (selected_keys, selected_values) =
+            reference_cache.update_and_fetch_selected(keys, values, &indices);
+        let expected = unsafe {
+            mlxcel_core::layers::attention_from_ptr(
+                &queries,
+                &selected_keys,
+                &selected_values,
+                0.5,
+                std::ptr::null(),
+                0.0,
+                0,
+            )
+        };
+        let close = mlxcel_core::allclose(&actual, &expected, 1e-3, 1e-3);
+        mlxcel_core::eval(&close);
+        assert!(
+            mlxcel_core::item_bool(&close),
+            "direct raw-FP8 QSA decode must match gathered native attention within 1e-3"
+        );
+    }
+
+    #[test]
+    fn raw_fp8_qsa_decode_dispatch_is_fp8_metal_only() {
+        let modes = [
+            KVCacheMode::Fp16,
+            KVCacheMode::Int8,
+            KVCacheMode::Fp8,
+            KVCacheMode::Turbo4Asym,
+            KVCacheMode::Turbo3Asym,
+            KVCacheMode::Turbo4,
+            KVCacheMode::Turbo4Delegated,
+        ];
+        for mode in modes {
+            assert_eq!(
+                qsa_decode_uses_raw_fp8(mode, true),
+                mode == KVCacheMode::Fp8,
+                "Metal dispatch mismatch for {mode:?}"
+            );
+            assert!(
+                !qsa_decode_uses_raw_fp8(mode, false),
+                "non-Metal dispatch must retain the selected/native fallback for {mode:?}"
+            );
+        }
     }
 
     #[test]
