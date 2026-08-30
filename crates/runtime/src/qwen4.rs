@@ -443,6 +443,36 @@ fn fuse_gated_aux_projections(
     )
 }
 
+// MLX's Metal implicit-GEMM depthwise-convolution kernel loads a full `bn8`
+// filter tile. For a filter ending exactly at its allocation boundary, the
+// final tile can read up to 64 bytes past the logical bfloat16 tensor. Keep the
+// public shape unchanged while retaining one zeroed tile in the backing
+// allocation. The leading slice is contiguous, so convolution geometry and
+// dispatch stay unchanged.
+const MLX_CONV_FILTER_GUARD_CHANNELS: i32 = 8;
+
+fn guard_qwen_conv1d_filter(weight: &MlxArray) -> UniquePtr<MlxArray> {
+    let shape = mlxcel_core::array_shape(weight);
+    debug_assert_eq!(shape.len(), 3);
+    debug_assert_eq!(shape[2], 1);
+    let guard = mlxcel_core::zeros(
+        &[MLX_CONV_FILTER_GUARD_CHANNELS, shape[1], shape[2]],
+        mlxcel_core::array_dtype(weight),
+    );
+    let padded = concatenate(weight, &guard, 0);
+    mlxcel_core::slice(&padded, &[0, 0, 0], &shape)
+}
+
+fn load_qwen_conv1d_filter(weight: &MlxArray) -> UniquePtr<MlxArray> {
+    let shape = mlxcel_core::array_shape(weight);
+    let converted = if shape.len() >= 3 && shape[shape.len() - 1] != 1 {
+        mlxcel_core::swap_axes(weight, -1, -2)
+    } else {
+        mlxcel_core::copy(weight)
+    };
+    guard_qwen_conv1d_filter(&converted)
+}
+
 // GatedDeltaNet - Qwen4 variant with separately stored projections.
 /// Fuses compatible z, beta, and decay projections at load time.
 #[allow(dead_code)]
@@ -782,14 +812,7 @@ impl Qwen4GatedDeltaNet {
 
         let conv1d_weight = weights
             .get(&format!("{}.conv1d.weight", prefix))
-            .map(|w| {
-                let shape = mlxcel_core::array_shape(w);
-                if shape.len() >= 3 && shape[shape.len() - 1] != 1 {
-                    mlxcel_core::swap_axes(w, -1, -2)
-                } else {
-                    mlxcel_core::copy(w)
-                }
-            })
+            .map(|weight| load_qwen_conv1d_filter(weight))
             .ok_or_else(|| format!("Missing conv1d weight: {}", prefix))?;
 
         // Qwen4 uses separate projections instead of combined projections.
@@ -1341,12 +1364,7 @@ impl Qwen4Ple {
         let conv = weights
             .get(&conv_name)
             .ok_or_else(|| format!("missing required tensor {conv_name}"))?;
-        let conv_shape = mlxcel_core::array_shape(conv);
-        let conv1d_weight = if conv_shape.last().copied() != Some(1) {
-            mlxcel_core::swap_axes(conv, -1, -2)
-        } else {
-            mlxcel_core::copy(conv)
-        };
+        let conv1d_weight = load_qwen_conv1d_filter(conv);
         let ngram_heads = (config.ngram_size - 1) * config.heads_per_ngram;
         let mut head_sizes = Vec::with_capacity(ngram_heads);
         let mut head_offsets = Vec::with_capacity(ngram_heads);
@@ -4712,6 +4730,104 @@ mod tests {
         let close = mlxcel_core::allclose(left, right, tolerance, tolerance);
         mlxcel_core::eval(&close);
         assert!(mlxcel_core::item_bool(&close));
+    }
+
+    fn straightforward_depthwise_conv1d(
+        input: &MlxArray,
+        weight: &MlxArray,
+        dilation: i32,
+    ) -> UniquePtr<MlxArray> {
+        let input_shape = mlxcel_core::array_shape(input);
+        let weight_shape = mlxcel_core::array_shape(weight);
+        let output_len = input_shape[1] - (weight_shape[1] - 1) * dilation;
+        let output_dtype = mlxcel_core::array_dtype(input);
+        let input = mlxcel_core::astype(input, mlxcel_core::dtype::FLOAT32);
+        let weight = mlxcel_core::astype(weight, mlxcel_core::dtype::FLOAT32);
+        let mut output: Option<UniquePtr<MlxArray>> = None;
+        for tap in 0..weight_shape[1] {
+            let start = tap * dilation;
+            let values = mlxcel_core::slice(
+                &input,
+                &[0, start, 0],
+                &[input_shape[0], start + output_len, input_shape[2]],
+            );
+            let coefficient = mlxcel_core::reshape(
+                &mlxcel_core::slice(
+                    &weight,
+                    &[0, tap, 0],
+                    &[weight_shape[0], tap + 1, 1],
+                ),
+                &[1, 1, weight_shape[0]],
+            );
+            let term = mlxcel_core::multiply(&values, &coefficient);
+            output = Some(match output {
+                Some(accumulator) => mlxcel_core::add(&accumulator, &term),
+                None => term,
+            });
+        }
+        mlxcel_core::astype(
+            output
+                .as_deref()
+                .expect("a convolution filter has at least one tap"),
+            output_dtype,
+        )
+    }
+
+    fn max_abs_difference(left: &MlxArray, right: &MlxArray) -> f32 {
+        let difference = mlxcel_core::abs(&mlxcel_core::subtract(left, right));
+        let maximum = mlxcel_core::astype(
+            &mlxcel_core::max_all(&difference),
+            mlxcel_core::dtype::FLOAT32,
+        );
+        mlxcel_core::eval(&maximum);
+        mlxcel_core::item_f32(&maximum)
+    }
+
+    #[test]
+    fn guarded_real_shape_conv_filter_is_numerically_identical_at_sequence_boundaries() {
+        const CHANNELS: i32 = 10_240;
+        const KERNEL: i32 = 4;
+        let weight_values = (0..CHANNELS * KERNEL)
+            .map(|index| 0.01 * (((index * 13) % 31) as f32 - 15.0))
+            .collect::<Vec<_>>();
+        let weight = mlxcel_core::astype(
+            &mlxcel_core::from_slice_f32(&weight_values, &[CHANNELS, KERNEL, 1]),
+            mlxcel_core::dtype::BFLOAT16,
+        );
+        let guarded = guard_qwen_conv1d_filter(&weight);
+        assert_eq!(mlxcel_core::array_shape(&guarded), vec![CHANNELS, KERNEL, 1]);
+        assert_eq!(
+            mlxcel_core::array_nbytes(&guarded),
+            (CHANNELS * KERNEL * 2) as usize
+        );
+
+        for sequence in [1, 55, 128] {
+            for dilation in [1, 3] {
+                let input_len = sequence + (KERNEL - 1) * dilation;
+                let input_values = (0..input_len * CHANNELS)
+                    .map(|index| 0.02 * (((index * 7) % 29) as f32 - 14.0))
+                    .collect::<Vec<_>>();
+                let input = mlxcel_core::astype(
+                    &mlxcel_core::from_slice_f32(
+                        &input_values,
+                        &[1, input_len, CHANNELS],
+                    ),
+                    mlxcel_core::dtype::BFLOAT16,
+                );
+                let reference =
+                    mlxcel_core::conv1d(&input, &weight, 1, 0, dilation, CHANNELS);
+                let actual =
+                    mlxcel_core::conv1d(&input, &guarded, 1, 0, dilation, CHANNELS);
+                assert_arrays_close(&actual, &reference, 0.0);
+                let straightforward =
+                    straightforward_depthwise_conv1d(&input, &weight, dilation);
+                let max_difference = max_abs_difference(&actual, &straightforward);
+                assert!(
+                    max_difference <= 0.001,
+                    "sequence={sequence} dilation={dilation} max_abs_difference={max_difference}"
+                );
+            }
+        }
     }
 
     fn test_regular_linear(out_dim: i32, in_dim: i32, salt: i32) -> UnifiedLinear {
