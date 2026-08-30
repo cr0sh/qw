@@ -790,10 +790,26 @@ impl Qwen4Attention {
             }
             mlxcel_core::concatenate_owned(&outputs, 2)
         } else if let Some((indices, valid)) = qsa_prefill {
-            let (cache_k, cache_v) = cache.update_and_fetch(keys, values);
-            mlxcel_core::qsa_sparse_prefill_attention(
-                &queries, &cache_k, &cache_v, indices, valid, self.scale,
-            )
+            if cache.mode == KVCacheMode::Fp8 && mlxcel_core::metal_is_available() {
+                let raw = cache.update_and_fetch_raw_fp8(keys, values);
+                debug_assert_eq!(mlxcel_core::array_shape(&raw.keys)[2], raw.live_len);
+                debug_assert_eq!(mlxcel_core::array_shape(&raw.values)[2], raw.live_len);
+                mlxcel_core::qsa_sparse_prefill_attention_raw_fp8(
+                    &queries,
+                    &raw.keys,
+                    &raw.values,
+                    indices,
+                    valid,
+                    self.scale,
+                )
+            } else {
+                // Keep the decoded path for FP16/INT8 and for FP8 whenever
+                // raw-E4M3 Metal execution is unavailable.
+                let (cache_k, cache_v) = cache.update_and_fetch(keys, values);
+                mlxcel_core::qsa_sparse_prefill_attention(
+                    &queries, &cache_k, &cache_v, indices, valid, self.scale,
+                )
+            }
         } else if let Some(indices) = qsa_indices {
             let (cache_k, cache_v) = cache.update_and_fetch_selected(keys, values, indices);
             unsafe {
@@ -1397,5 +1413,123 @@ mod tests {
         let close = mlxcel_core::allclose(&actual, &expected, 1e-5, 1e-5);
         mlxcel_core::eval(&close);
         assert!(mlxcel_core::item_bool(&close));
+    }
+
+    #[test]
+    fn raw_fp8_sparse_prefill_decoder_matches_mlx_for_every_byte() {
+        if !mlxcel_core::metal_is_available() {
+            return;
+        }
+        let bytes: Vec<u8> = (0..=u8::MAX).collect();
+        let raw_values = mlxcel_core::from_bytes(
+            &bytes,
+            &[1, 1, 1, 256],
+            mlxcel_core::dtype::UINT8,
+        );
+        let raw_keys =
+            mlxcel_core::zeros(&[1, 1, 1, 256], mlxcel_core::dtype::UINT8);
+        let queries =
+            mlxcel_core::zeros(&[1, 1, 1, 256], mlxcel_core::dtype::BFLOAT16);
+        let indices = mlxcel_core::from_slice_i32(&[0], &[1, 1, 1]);
+        let valid = mlxcel_core::ones(&[1, 1, 1], mlxcel_core::dtype::BOOL);
+        let actual = mlxcel_core::qsa_sparse_prefill_attention_raw_fp8(
+            &queries,
+            &raw_keys,
+            &raw_values,
+            &indices,
+            &valid,
+            1.0,
+        );
+        let expected = mlxcel_core::from_fp8(&raw_values);
+        let read_f32 = |array: &MlxArray| {
+            let array = mlxcel_core::astype(array, mlxcel_core::dtype::FLOAT32);
+            mlxcel_core::eval(&array);
+            mlxcel_core::array_to_raw_bytes(&array)
+                .chunks_exact(4)
+                .map(|bytes| {
+                    f32::from_le_bytes(bytes.try_into().expect("four-byte float"))
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(read_f32(&actual), read_f32(&expected));
+    }
+
+    #[test]
+    fn raw_fp8_sparse_prefill_matches_decoded_for_sparse_multihead_rows() {
+        if !mlxcel_core::metal_is_available() {
+            return;
+        }
+        for eager in [false, true] {
+            let query_values: Vec<f32> = (0..32)
+                .map(|index| ((index % 11) as f32 - 5.0) * 0.125)
+                .collect();
+            let key_values: Vec<f32> = (0..40)
+                .map(|index| ((index % 13) as f32 - 6.0) * 0.25)
+                .collect();
+            let mut value_values: Vec<f32> = (0..40)
+                .map(|index| ((index % 17) as f32 - 8.0) * -0.375)
+                .collect();
+            // Token four is invalid padding in both query rows. Extreme signed
+            // values make accidental UINT8-magnitude reads or invalid-row
+            // accumulation dominate the result.
+            value_values[16..20].copy_from_slice(&[448.0, -448.0, 448.0, -448.0]);
+
+            let queries = mlxcel_core::astype(
+                &mlxcel_core::from_slice_f32(&query_values, &[1, 4, 2, 4]),
+                mlxcel_core::dtype::BFLOAT16,
+            );
+            let compact_keys = mlxcel_core::to_fp8(&mlxcel_core::from_slice_f32(
+                &key_values,
+                &[1, 2, 5, 4],
+            ));
+            let compact_values = mlxcel_core::to_fp8(&mlxcel_core::from_slice_f32(
+                &value_values,
+                &[1, 2, 5, 4],
+            ));
+            // Match a step-reserved cache: the live five-token view retains an
+            // eight-token physical head stride and must not be flattened.
+            let padding =
+                mlxcel_core::zeros(&[1, 2, 3, 4], mlxcel_core::dtype::UINT8);
+            let padded_keys = mlxcel_core::concatenate(&compact_keys, &padding, 2);
+            let padded_values = mlxcel_core::concatenate(&compact_values, &padding, 2);
+            let raw_keys =
+                mlxcel_core::slice(&padded_keys, &[0, 0, 0, 0], &[1, 2, 5, 4]);
+            let raw_values =
+                mlxcel_core::slice(&padded_values, &[0, 0, 0, 0], &[1, 2, 5, 4]);
+            if eager {
+                mlxcel_core::eval(&raw_keys);
+                mlxcel_core::eval(&raw_values);
+            }
+            let decoded_keys = mlxcel_core::from_fp8(&raw_keys);
+            let decoded_values = mlxcel_core::from_fp8(&raw_values);
+            let indices =
+                mlxcel_core::from_slice_i32(&[3, 0, 2, 4, 4, 2, 3, 1], &[1, 2, 4]);
+            let valid = mlxcel_core::astype(
+                &mlxcel_core::from_slice_i32(&[1, 1, 1, 0, 0, 1, 1, 1], &[1, 2, 4]),
+                mlxcel_core::dtype::BOOL,
+            );
+            let actual = mlxcel_core::qsa_sparse_prefill_attention_raw_fp8(
+                &queries,
+                &raw_keys,
+                &raw_values,
+                &indices,
+                &valid,
+                0.5,
+            );
+            let expected = mlxcel_core::qsa_sparse_prefill_attention(
+                &queries,
+                &decoded_keys,
+                &decoded_values,
+                &indices,
+                &valid,
+                0.5,
+            );
+            let close = mlxcel_core::allclose(&actual, &expected, 1e-5, 1e-5);
+            mlxcel_core::eval(&close);
+            assert!(
+                mlxcel_core::item_bool(&close),
+                "raw FP8 sparse attention mismatch (eager={eager})"
+            );
+        }
     }
 }

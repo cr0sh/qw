@@ -488,8 +488,30 @@ namespace {
                 * head_dim;
             float dot = 0.0f;
             for (uint dim = lane; dim < head_dim; dim += 32u) {
-                dot += (float)queries[query_base + dim]
-                     * (float)keys[key_base + dim];
+                uint key_offset = raw_fp8 != 0
+                    ? batch_index * keys_strides[0]
+                        + kv_head * keys_strides[1]
+                        + token * keys_strides[2]
+                        + dim * keys_strides[3]
+                    : key_base + dim;
+                float key_value;
+                if (raw_fp8 != 0) {
+                    uint bits = (uint)keys[key_offset];
+                    uint exponent = (bits >> 3u) & 15u;
+                    uint mantissa = bits & 7u;
+                    if (exponent == 0u) {
+                        key_value = (float)mantissa * 0.001953125f;
+                    } else {
+                        key_value = (1.0f + (float)mantissa * 0.125f)
+                                  * exp2((float)((int)exponent - 7));
+                    }
+                    if ((bits & 128u) != 0u) {
+                        key_value = -key_value;
+                    }
+                } else {
+                    key_value = (float)keys[key_offset];
+                }
+                dot += (float)queries[query_base + dim] * key_value;
             }
             dot = simd_sum(dot);
             if (lane == 0u) {
@@ -548,11 +570,31 @@ namespace {
                 uint selection_offset = selection_base + selection;
                 if (valid[selection_offset]) {
                     uint token = (uint)indices[selection_offset];
-                    uint value_offset =
-                        (((batch_index * kv_heads + kv_head) * key_length
-                          + token) * head_dim) + dim;
-                    output += logits[selection]
-                            * (float)values[value_offset];
+                    uint value_offset = raw_fp8 != 0
+                        ? batch_index * values_strides[0]
+                            + kv_head * values_strides[1]
+                            + token * values_strides[2]
+                            + dim * values_strides[3]
+                        : (((batch_index * kv_heads + kv_head) * key_length
+                            + token) * head_dim) + dim;
+                    float value;
+                    if (raw_fp8 != 0) {
+                        uint bits = (uint)values[value_offset];
+                        uint exponent = (bits >> 3u) & 15u;
+                        uint mantissa = bits & 7u;
+                        if (exponent == 0u) {
+                            value = (float)mantissa * 0.001953125f;
+                        } else {
+                            value = (1.0f + (float)mantissa * 0.125f)
+                                  * exp2((float)((int)exponent - 7));
+                        }
+                        if ((bits & 128u) != 0u) {
+                            value = -value;
+                        }
+                    } else {
+                        value = (float)values[value_offset];
+                    }
+                    output += logits[selection] * value;
                 }
             }
             outputs[query_base + dim] = (T)output;
@@ -560,22 +602,33 @@ namespace {
     )";
 
     struct QsaSparsePrefillKernelHolder {
+        const char* name;
+        bool ensure_row_contiguous;
         std::optional<mlx::core::fast::CustomKernelFunction> kernel;
         mlx::core::fast::CustomKernelFunction& get() {
             if (!kernel) {
                 kernel = mlx::core::fast::metal_kernel(
-                    "qsa_sparse_prefill_attention",
+                    name,
                     {"queries", "keys", "values", "indices", "valid",
                      "scale_value"},
                     {"outputs"},
-                    QSA_SPARSE_PREFILL_METAL_SOURCE);
+                    QSA_SPARSE_PREFILL_METAL_SOURCE,
+                    "",
+                    ensure_row_contiguous);
             }
             return *kernel;
         }
     };
 
     static QsaSparsePrefillKernelHolder& get_qsa_sparse_prefill_kernel() {
-        static QsaSparsePrefillKernelHolder holder;
+        static QsaSparsePrefillKernelHolder holder{
+            "qsa_sparse_prefill_attention", true};
+        return holder;
+    }
+
+    static QsaSparsePrefillKernelHolder& get_qsa_sparse_prefill_raw_fp8_kernel() {
+        static QsaSparsePrefillKernelHolder holder{
+            "qsa_sparse_prefill_attention_raw_fp8", false};
         return holder;
     }
 }
@@ -610,12 +663,65 @@ std::unique_ptr<MlxArray> qsa_sparse_prefill_attention(
         {"key_length", key_length},
         {"head_dim", head_dim},
         {"selected", selected},
+        {"raw_fp8", 0},
     };
     std::vector<array> inputs = {
         queries.inner, keys.inner, values.inner, indices.inner, valid.inner,
         scale_value,
     };
     auto results = get_qsa_sparse_prefill_kernel().get()(
+        inputs,
+        {Shape{batch, query_heads, query_length, head_dim}},
+        {T},
+        std::make_tuple(256, query_length, batch * query_heads),
+        std::make_tuple(256, 1, 1),
+        ta,
+        std::nullopt,
+        false,
+        {});
+    return std::make_unique<MlxArray>(std::move(results[0]));
+}
+
+std::unique_ptr<MlxArray> qsa_sparse_prefill_attention_raw_fp8(
+    const MlxArray& queries,
+    const MlxArray& keys,
+    const MlxArray& values,
+    const MlxArray& indices,
+    const MlxArray& valid,
+    float scale
+) {
+    using namespace mlx::core;
+    auto query_shape = queries.inner.shape();
+    auto key_shape = keys.inner.shape();
+    int batch = query_shape[0];
+    int query_heads = query_shape[1];
+    int query_length = query_shape[2];
+    int head_dim = query_shape[3];
+    int kv_heads = key_shape[1];
+    int key_length = key_shape[2];
+    int selected = indices.inner.shape()[2];
+    auto T = queries.inner.dtype();
+    auto scale_value = full({1}, scale, float32);
+
+    std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>> ta = {
+        {"T", T},
+        {"query_heads", query_heads},
+        {"kv_heads", kv_heads},
+        {"query_length", query_length},
+        {"key_length", key_length},
+        {"head_dim", head_dim},
+        {"selected", selected},
+        {"raw_fp8", 1},
+    };
+    std::vector<array> inputs = {
+        contiguous(queries.inner),
+        keys.inner,
+        values.inner,
+        contiguous(indices.inner),
+        contiguous(valid.inner),
+        scale_value,
+    };
+    auto results = get_qsa_sparse_prefill_raw_fp8_kernel().get()(
         inputs,
         {Shape{batch, query_heads, query_length, head_dim}},
         {T},
