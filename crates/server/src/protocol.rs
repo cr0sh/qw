@@ -74,6 +74,7 @@ pub struct CompletionRequest {
     pub max_tokens: usize,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
+    pub top_k: Option<i32>,
     pub seed: Option<u64>,
     pub output_format: OutputFormat,
     pub image_params: Vec<String>,
@@ -119,6 +120,7 @@ pub(crate) fn request_fingerprint(request: &CompletionRequest) -> String {
         "max_tokens": request.max_tokens,
         "temperature": request.temperature,
         "top_p": request.top_p,
+        "top_k": request.top_k,
         "seed": request.seed,
         "output_format": output_format,
     });
@@ -206,6 +208,7 @@ struct ChatWire {
     _mcp_timeout: Option<Value>,
     temperature: Option<f32>,
     top_p: Option<f32>,
+    top_k: Option<i32>,
     seed: Option<u64>,
     response_format: Option<ChatFormat>,
     #[serde(rename = "n")]
@@ -315,6 +318,7 @@ struct ResponsesWire {
     max_output_tokens: Option<usize>,
     temperature: Option<f32>,
     top_p: Option<f32>,
+    top_k: Option<i32>,
     text: Option<ResponsesText>,
     tools: Option<Vec<Value>>,
     tool_choice: Option<Value>,
@@ -390,7 +394,7 @@ pub fn parse_chat(value: Value) -> Result<CompletionRequest, RequestError> {
         .max_completion_tokens
         .or(wire.max_tokens)
         .unwrap_or(DEFAULT_MAX_TOKENS);
-    validate_sampling(max_tokens, wire.temperature, wire.top_p)?;
+    validate_sampling(max_tokens, wire.temperature, wire.top_p, wire.top_k)?;
     let reasoning_effort =
         parse_reasoning_effort(wire.reasoning_effort.as_deref(), "reasoning_effort")?;
     let template_reasoning_effort = wire
@@ -463,6 +467,7 @@ pub fn parse_chat(value: Value) -> Result<CompletionRequest, RequestError> {
         max_tokens,
         temperature: wire.temperature,
         top_p: wire.top_p,
+        top_k: wire.top_k,
         seed: wire.seed,
         output_format,
         image_params,
@@ -482,7 +487,7 @@ pub fn parse_responses(value: Value) -> Result<CompletionRequest, RequestError> 
     let wire: ResponsesWire = serde_json::from_value(value)
         .map_err(|error| RequestError::new(format!("invalid Responses request: {error}"), None))?;
     let max_tokens = wire.max_output_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
-    validate_sampling(max_tokens, wire.temperature, wire.top_p)?;
+    validate_sampling(max_tokens, wire.temperature, wire.top_p, wire.top_k)?;
     let output_format = parse_responses_format(wire.text.and_then(|text| text.format))?;
     let tools = parse_tools(
         wire.tools.as_deref().unwrap_or_default(),
@@ -527,6 +532,7 @@ pub fn parse_responses(value: Value) -> Result<CompletionRequest, RequestError> 
         max_tokens,
         temperature: wire.temperature,
         top_p: wire.top_p,
+        top_k: wire.top_k,
         seed: None,
         output_format,
         image_params,
@@ -1792,6 +1798,7 @@ fn validate_sampling(
     max_tokens: usize,
     temperature: Option<f32>,
     top_p: Option<f32>,
+    top_k: Option<i32>,
 ) -> Result<(), RequestError> {
     if max_tokens == 0 {
         return Err(RequestError::at(
@@ -1809,6 +1816,12 @@ fn validate_sampling(
         return Err(RequestError::at(
             "top_p must be finite and greater than 0 and at most 1",
             "top_p",
+        ));
+    }
+    if top_k.is_some_and(|value| value < 0) {
+        return Err(RequestError::at(
+            "top_k must be greater than or equal to 0",
+            "top_k",
         ));
     }
     Ok(())

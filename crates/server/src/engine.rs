@@ -1326,6 +1326,7 @@ impl QwenWorker {
 
         let sampling = self.provider.baseline_sampling(
             generation_temperature(job.request.temperature, constraint.is_some()),
+            job.request.top_k,
             job.request.top_p,
             job.request.seed,
         );
@@ -1492,6 +1493,7 @@ impl QwenWorker {
             max_tokens,
             temperature = ?job.request.temperature,
             top_p = ?job.request.top_p,
+            top_k = sampling.top_k,
             seed = ?job.request.seed,
             route = ?route,
         );
