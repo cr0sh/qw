@@ -30,17 +30,54 @@ impl BenchmarkMemoryReport {
         Self { enabled }
     }
 
-    /// Emit one newline-delimited JSON record after fixture construction.
-    ///
-    /// This method is called only from benchmark setup, never from a timed
-    /// Criterion closure.
-    pub fn emit_post_fixture(
+    /// Emit the first long-context record after the prefix snapshot is
+    /// extracted, before any cached restore.
+    pub fn emit_fresh_snapshot(
         &self,
         context_tokens: usize,
         prefix_tokens: usize,
-        snapshot: Option<&PromptSnapshot>,
+        snapshot: &PromptSnapshot,
+    ) {
+        self.emit(
+            "fresh_snapshot",
+            context_tokens,
+            prefix_tokens,
+            snapshot,
+            None,
+            None,
+        );
+    }
+
+    /// Emit the second long-context record after fixture warm restores.
+    ///
+    /// Report emission is benchmark setup only, never a timed Criterion
+    /// closure.
+    pub fn emit_post_restore_fixture(
+        &self,
+        context_tokens: usize,
+        prefix_tokens: usize,
+        snapshot: &PromptSnapshot,
         baseline_token_ids: &[i32],
         mtp_token_ids: &[i32],
+    ) {
+        self.emit(
+            "post_restore_fixture",
+            context_tokens,
+            prefix_tokens,
+            snapshot,
+            Some(baseline_token_ids),
+            Some(mtp_token_ids),
+        );
+    }
+
+    fn emit(
+        &self,
+        phase: &'static str,
+        context_tokens: usize,
+        prefix_tokens: usize,
+        snapshot: &PromptSnapshot,
+        baseline_token_ids: Option<&[i32]>,
+        mtp_token_ids: Option<&[i32]>,
     ) {
         if !self.enabled {
             return;
@@ -63,11 +100,11 @@ impl BenchmarkMemoryReport {
             .min(recommended_working_set);
         let record = serde_json::json!({
             "schema": "qw_bench_memory",
-            "phase": "post_fixture",
+            "phase": phase,
             "pid": std::process::id(),
             "context_tokens": context_tokens,
             "prefix_tokens": prefix_tokens,
-            "prompt_snapshot_logical_bytes": snapshot.map(PromptSnapshot::nbytes),
+            "prompt_snapshot_logical_bytes": PromptSnapshot::nbytes(snapshot),
             "baseline_token_ids": baseline_token_ids,
             "mtp_token_ids": mtp_token_ids,
             "mlx": {
@@ -215,6 +252,7 @@ fn long_prompt_ids(provider: &Qwen4Provider, min_tokens: usize) -> Vec<i32> {
 
 pub fn prepare_long_conversation_fixture(
     provider: &mut Qwen4Provider,
+    memory_report: &BenchmarkMemoryReport,
     min_prefix_tokens: usize,
 ) -> LongConversationFixture {
     let prompt_ids = long_prompt_ids(provider, min_prefix_tokens + 1_536);
@@ -240,6 +278,7 @@ pub fn prepare_long_conversation_fixture(
         .into_iter()
         .find(|snapshot| snapshot.token_len() == prefix_tokens)
         .expect("MTP checkpoint at requested 64k prefix");
+    memory_report.emit_fresh_snapshot(prompt_ids.len(), prefix_tokens, &snapshot);
     let target_snapshot = match &snapshot {
         PromptSnapshot::Baseline(snapshot) => snapshot,
         PromptSnapshot::Mtp(snapshot) => snapshot.target_snapshot(),

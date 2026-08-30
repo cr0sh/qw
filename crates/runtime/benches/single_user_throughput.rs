@@ -97,11 +97,15 @@ fn benchmark_64k_cached_decode(criterion: &mut Criterion) {
     }
     let mut provider = load_provider();
     let memory_report = BenchmarkMemoryReport::after_model_load();
-    let fixture = prepare_long_conversation_fixture(&mut provider, long_context_tokens());
-    memory_report.emit_post_fixture(
+    let fixture = prepare_long_conversation_fixture(
+        &mut provider,
+        &memory_report,
+        long_context_tokens(),
+    );
+    memory_report.emit_post_restore_fixture(
         fixture.prompt_ids.len(),
         fixture.prefix_tokens,
-        Some(&fixture.snapshot),
+        &fixture.snapshot,
         &fixture.baseline_token_ids,
         &fixture.mtp_token_ids,
     );
