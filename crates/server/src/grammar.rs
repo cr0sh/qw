@@ -51,7 +51,7 @@ impl GrammarFactory {
         tokenizer_json: &Value,
         tokenizer_vocab_size: usize,
         logits_vocab_size: usize,
-        eos_token: u32,
+        eos_tokens: &[i32],
     ) -> Result<Self> {
         ensure!(
             tokenizer_vocab_size <= logits_vocab_size,
@@ -65,13 +65,25 @@ impl GrammarFactory {
             token_bytes.len()
         );
         token_bytes.resize_with(logits_vocab_size, Vec::new);
+        let mut eos_tokens = eos_tokens
+            .iter()
+            .copied()
+            .map(|token| {
+                u32::try_from(token).context("EOS token is negative")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        eos_tokens.sort_unstable();
+        eos_tokens.dedup();
+        ensure!(!eos_tokens.is_empty(), "EOS token list is empty");
         ensure!(
-            eos_token < logits_vocab_size as u32,
+            eos_tokens
+                .iter()
+                .all(|&token| token < logits_vocab_size as u32),
             "EOS token is outside the model logits vocabulary"
         );
         let info = TokRxInfo {
             vocab_size: logits_vocab_size as u32,
-            tok_eos: eos_token,
+            tok_eos: eos_tokens[0],
             tok_bos: None,
             tok_pad: None,
             tok_unk: None,
@@ -84,7 +96,7 @@ impl GrammarFactory {
         .context("failed to initialize canonical structured-output tokenizer")?;
         let token_bytes = Arc::new(token_bytes);
         let env: TokEnv = Arc::new(LocalTokenizerEnv {
-            trie: TokTrie::from(&info, token_bytes.as_ref()),
+            trie: TokTrie::from(&info, token_bytes.as_ref()).with_eos_tokens(&eos_tokens),
             tokenizer,
         });
         let parser = constraint_parser_factory(&env)
@@ -497,6 +509,9 @@ impl ToolCallState {
         let token_bytes = self.token_bytes.get(token_index).ok_or_else(|| {
             "tool-call constraint received a token outside the vocabulary".to_string()
         })?;
+        let token_bytes = token_bytes
+            .strip_prefix(&[TokTrie::SPECIAL_TOKEN_MARKER])
+            .unwrap_or(token_bytes);
         for (index, &byte) in token_bytes.iter().enumerate() {
             if byte == TOOL_CALL_OPEN[self.marker_prefix] {
                 self.marker_prefix += 1;
@@ -800,6 +815,40 @@ mod tests {
     fn logits() -> impl std::ops::Deref<Target = mlxcel_core::MlxArray> {
         mlxcel_core::from_slice_f32(&[0.0; 262], &[1, 1, 262])
     }
+    struct CanonicalTestTokenizerEnv {
+        trie: TokTrie,
+    }
+
+    impl TokenizerEnv for CanonicalTestTokenizerEnv {
+        fn tok_trie(&self) -> &TokTrie {
+            &self.trie
+        }
+
+        fn tokenize_bytes(&self, bytes: &[u8]) -> Vec<TokenId> {
+            self.trie.greedy_tokenize(bytes)
+        }
+
+        fn tokenize_is_canonical(&self) -> bool {
+            true
+        }
+    }
+
+    fn single_byte_factory_with_eos(eos_tokens: &[TokenId]) -> Result<GrammarFactory> {
+        let base = toktrie::ApproximateTokEnv::single_byte();
+        let env: TokEnv = Arc::new(CanonicalTestTokenizerEnv {
+            trie: base.tok_trie().with_eos_tokens(eos_tokens),
+        });
+        let token_bytes = Arc::new(
+            (0..env.tok_trie().vocab_size())
+                .map(|token| env.tok_trie().token(token as u32).to_vec())
+                .collect(),
+        );
+        let parser = constraint_parser_factory(&env)?;
+        Ok(GrammarFactory {
+            parser,
+            token_bytes,
+        })
+    }
 
     fn output_bytes(output: &[i32]) -> Vec<u8> {
         output
@@ -974,6 +1023,69 @@ mod tests {
     }
 
     #[test]
+    fn special_tool_marker_token_activates_and_constrains_read_body_transactionally() {
+        const TOOL_CALL_TOKEN_ID: usize = 248_058;
+
+        let factory = GrammarFactory::single_byte().expect("single-byte grammar");
+        let tools = [tool(
+            "read",
+            json!({
+                "type":"object",
+                "properties":{"path":{"type":"string"}},
+                "required":["path"],
+                "additionalProperties":false
+            }),
+        )];
+        let mut constraint = factory
+            .compile(&OutputFormat::Text, &tools, false)
+            .expect("compile tool grammar")
+            .expect("constraint");
+        let GuidanceState::ToolCall(state) = &mut constraint.inner else {
+            panic!("tool-call constraint");
+        };
+        let mut token_bytes = state.token_bytes.as_ref().clone();
+        token_bytes.resize_with(TOOL_CALL_TOKEN_ID + 1, Vec::new);
+        token_bytes[TOOL_CALL_TOKEN_ID] = [
+            &[TokTrie::SPECIAL_TOKEN_MARKER][..],
+            TOOL_CALL_OPEN,
+        ]
+        .concat();
+        state.token_bytes = Arc::new(token_bytes);
+        let logits = logits();
+
+        constraint.begin_transaction().expect("begin transaction");
+        constraint
+            .commit_token(TOOL_CALL_TOKEN_ID as i32)
+            .expect("commit speculative special marker");
+        assert!(!matches!(
+            constraint.compute_mask(&logits, &[]),
+            Ok(ConstraintMask::PassThrough)
+        ));
+        constraint.rollback_transaction();
+        assert!(matches!(
+            constraint.compute_mask(&logits, &[]),
+            Ok(ConstraintMask::PassThrough)
+        ));
+
+        constraint.begin_transaction().expect("begin transaction");
+        constraint
+            .commit_token(TOOL_CALL_TOKEN_ID as i32)
+            .expect("commit accepted special marker");
+        constraint
+            .commit_transaction()
+            .expect("commit marker transaction");
+        let target = b"<function=read><parameter=path>\"Cargo.toml\"</parameter></function></tool_call>";
+        let mut output = Vec::new();
+        assert!(drive_to(
+            &mut constraint,
+            &logits,
+            &mut output,
+            target
+        ));
+        assert_eq!(output_bytes(&output).as_slice(), target);
+    }
+
+    #[test]
     fn tool_constraint_rejects_a_token_with_bytes_after_the_marker() {
         let factory = GrammarFactory::single_byte().expect("single-byte grammar");
         let tools = [tool("empty", json!({"type":"object","properties":{}}))];
@@ -1082,6 +1194,45 @@ mod tests {
         assert!(!matches!(
             constraint.compute_mask(&logits, &output),
             Ok(ConstraintMask::PassThrough)
+        ));
+    }
+
+    #[test]
+    fn parallel_tool_constraint_accepts_secondary_eos_token() {
+        const PRIMARY_EOS: TokenId = 260;
+        const SECONDARY_EOS: TokenId = 261;
+
+        let factory = single_byte_factory_with_eos(&[PRIMARY_EOS, SECONDARY_EOS])
+            .expect("multi-EOS single-byte grammar");
+        let tools = [tool("empty", json!({"type":"object","properties":{}}))];
+        let mut constraint = factory
+            .compile(&OutputFormat::Text, &tools, true)
+            .expect("compile tool grammar")
+            .expect("constraint");
+        let logits = logits();
+        let target = b"<tool_call><function=empty></function></tool_call>";
+        let mut output = Vec::new();
+        assert!(!drive_to(
+            &mut constraint,
+            &logits,
+            &mut output,
+            target
+        ));
+
+        let ConstraintMask::Allow(allowed) = constraint
+            .compute_mask(&logits, &output)
+            .expect("accepting grammar mask")
+        else {
+            panic!("accepting parallel grammar must allow EOS");
+        };
+        assert!(allowed.contains(&(PRIMARY_EOS as i32)));
+        assert!(allowed.contains(&(SECONDARY_EOS as i32)));
+        constraint
+            .commit_token(SECONDARY_EOS as i32)
+            .expect("commit secondary EOS");
+        assert!(matches!(
+            constraint.compute_mask(&logits, &output),
+            Ok(ConstraintMask::Accept)
         ));
     }
 

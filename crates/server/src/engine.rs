@@ -1033,7 +1033,7 @@ impl QwenWorker {
             &tokenizer_json,
             tokenizer_vocab_size,
             provider.logits_vocab_size(),
-            provider.eos_token_id(),
+            provider.eos_token_ids(),
         )?;
         let config_bytes = std::fs::read(model_path.join("config.json"))
             .context("failed to read model config for prefix cache namespace")?;
