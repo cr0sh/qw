@@ -39,6 +39,8 @@ impl BenchmarkMemoryReport {
         context_tokens: usize,
         prefix_tokens: usize,
         snapshot: Option<&PromptSnapshot>,
+        baseline_token_ids: &[i32],
+        mtp_token_ids: &[i32],
     ) {
         if !self.enabled {
             return;
@@ -54,12 +56,14 @@ impl BenchmarkMemoryReport {
             })
         });
         let record = serde_json::json!({
-            "schema": "qw_bench_memory.v1",
+            "schema": "qw_bench_memory",
             "phase": "post_fixture",
             "pid": std::process::id(),
             "context_tokens": context_tokens,
             "prefix_tokens": prefix_tokens,
             "prompt_snapshot_logical_bytes": snapshot.map(PromptSnapshot::nbytes),
+            "baseline_token_ids": baseline_token_ids,
+            "mtp_token_ids": mtp_token_ids,
             "mlx": {
                 "active_bytes": mlx.active_bytes,
                 "peak_bytes": mlx.peak_bytes,

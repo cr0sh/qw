@@ -102,6 +102,8 @@ fn benchmark_64k_cached_decode(criterion: &mut Criterion) {
         fixture.prompt_ids.len(),
         fixture.prefix_tokens,
         Some(&fixture.snapshot),
+        &fixture.baseline_token_ids,
+        &fixture.mtp_token_ids,
     );
     let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
     let mut group = criterion.benchmark_group("single_user_decode");
