@@ -6,8 +6,8 @@ use std::time::Duration;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use qw_runtime::provider::Qwen4GenerationMode;
 use support::{
-    DECODE_MAX_TOKENS, load_provider, long_context_tokens, prepare_decode_fixture,
-    prepare_long_conversation_fixture, prepare_prefill_fixture,
+    BenchmarkMemoryReport, DECODE_MAX_TOKENS, load_provider, long_context_tokens,
+    prepare_decode_fixture, prepare_long_conversation_fixture, prepare_prefill_fixture,
 };
 fn case_enabled(name: &str) -> bool {
     std::env::var("QW_BENCH_CASE").map_or(true, |selected| selected == name)
@@ -96,7 +96,13 @@ fn benchmark_64k_cached_decode(criterion: &mut Criterion) {
         return;
     }
     let mut provider = load_provider();
+    let memory_report = BenchmarkMemoryReport::after_model_load();
     let fixture = prepare_long_conversation_fixture(&mut provider, long_context_tokens());
+    memory_report.emit_post_fixture(
+        fixture.prompt_ids.len(),
+        fixture.prefix_tokens,
+        Some(&fixture.snapshot),
+    );
     let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
     let mut group = criterion.benchmark_group("single_user_decode");
     group.sample_size(10);
