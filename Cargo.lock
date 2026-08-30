@@ -1915,6 +1915,7 @@ dependencies = [
  "memmap2",
  "minijinja",
  "mlxcel-core",
+ "qw-prefix-cache",
  "safetensors",
  "serde",
  "serde_json",
