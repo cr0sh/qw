@@ -410,10 +410,7 @@ impl Qwen4QsaIndexer {
         if cached_blocks < complete_blocks {
             let new_block_count = complete_blocks - cached_blocks;
             let pooled = cache
-                .auxiliary_keys_absolute(
-                    cached_blocks * self.compress_ratio,
-                    complete_key_len,
-                )
+                .auxiliary_keys_absolute(cached_blocks * self.compress_ratio, complete_key_len)
                 .unwrap_or_else(|error| {
                     panic!("QSA discarded raw rows required for summary repair: {error}")
                 });
@@ -1343,11 +1340,7 @@ mod tests {
         uninterrupted
             .set_auxiliary_rollback_horizon(5)
             .expect("fresh QSA cache accepts rollback horizon");
-        append_qsa_rows(
-            &indexer,
-            &mut uninterrupted,
-            &(0..19).collect::<Vec<_>>(),
-        );
+        append_qsa_rows(&indexer, &mut uninterrupted, &(0..19).collect::<Vec<_>>());
         let (start, end) = uninterrupted.auxiliary_raw_tail_range();
         let raw = uninterrupted
             .auxiliary_keys
@@ -1383,11 +1376,7 @@ mod tests {
         cache
             .set_auxiliary_rollback_horizon(9)
             .expect("fresh QSA cache accepts rollback horizon");
-        append_qsa_rows(
-            &indexer,
-            &mut cache,
-            &(0..65_536).collect::<Vec<_>>(),
-        );
+        append_qsa_rows(&indexer, &mut cache, &(0..65_536).collect::<Vec<_>>());
         let raw_rows = mlxcel_core::array_shape(
             cache
                 .auxiliary_keys

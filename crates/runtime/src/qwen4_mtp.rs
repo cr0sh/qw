@@ -2205,11 +2205,8 @@ impl Qwen4MtpGenerator {
     ) -> Result<MtpGeneration, String> {
         assert!(!prompt_tokens.is_empty(), "MTP prompt must not be empty");
         assert!(block_size >= 2, "MTP block size must be at least 2");
-        let qsa_horizon = i32::try_from(mtp_qsa_rollback_horizon(
-            block_size,
-            prompt_tokens.len(),
-        ))
-        .map_err(|_| "MTP verify block size exceeds the QSA horizon range".to_string())?;
+        let qsa_horizon = i32::try_from(mtp_qsa_rollback_horizon(block_size, prompt_tokens.len()))
+            .map_err(|_| "MTP verify block size exceeds the QSA horizon range".to_string())?;
         model.set_qsa_rollback_horizon(qsa_horizon)?;
         if checkpoint_token_lengths
             .iter()
@@ -3274,14 +3271,8 @@ mod tests {
     fn arbitrary_k_budget_clamping_and_qsa_horizon_use_verify_block_semantics() {
         for block_size in [2, 3, 5, 9] {
             assert_eq!(mtp_qsa_rollback_horizon(block_size, 8_191), block_size);
-            assert_eq!(
-                mtp_qsa_rollback_horizon(block_size, 8_192),
-                block_size + 1
-            );
-            assert_eq!(
-                mtp_qsa_rollback_horizon(block_size, 32_767),
-                block_size + 1
-            );
+            assert_eq!(mtp_qsa_rollback_horizon(block_size, 8_192), block_size + 1);
+            assert_eq!(mtp_qsa_rollback_horizon(block_size, 32_767), block_size + 1);
             assert_eq!(mtp_qsa_rollback_horizon(block_size, 32_768), block_size);
         }
         assert_eq!(round_proposal_count(2, 8), 1);

@@ -1736,18 +1736,16 @@ impl Qwen4Model {
             .collect()
     }
 
-    pub(crate) fn set_qsa_rollback_horizon(
-        &self,
-        horizon: i32,
-    ) -> std::result::Result<(), String> {
-        self.sequence_state.with_internal(|caches| {
-            for cache in caches {
-                if let Qwen4LayerCache::Attention(cache) = cache {
-                    cache.set_auxiliary_rollback_horizon(horizon)?;
+    pub(crate) fn set_qsa_rollback_horizon(&self, horizon: i32) -> std::result::Result<(), String> {
+        self.sequence_state
+            .with_internal(|caches| -> std::result::Result<(), String> {
+                for cache in caches {
+                    if let Qwen4LayerCache::Attention(cache) = cache {
+                        cache.set_auxiliary_rollback_horizon(horizon)?;
+                    }
                 }
-            }
-            Ok(())
-        })?;
+                Ok(())
+            })?;
         self.qsa_rollback_horizon.set(horizon);
         Ok(())
     }
@@ -2847,10 +2845,8 @@ impl LanguageModel for Qwen4Model {
                         // The bounded raw tail slides in absolute coordinates;
                         // it is not append-only, so relative snapshot pages from
                         // an earlier tail are never reusable.
-                        snapshot.push_tensor(
-                            format!("layer.{index}.auxiliary_keys"),
-                            auxiliary_keys,
-                        );
+                        snapshot
+                            .push_tensor(format!("layer.{index}.auxiliary_keys"), auxiliary_keys);
                         if let Some(auxiliary_block_keys) = cache.auxiliary_block_keys_view()
                             && snapshot
                                 .push_paged_tensor(

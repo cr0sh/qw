@@ -802,10 +802,7 @@ impl KVCache {
         start: i32,
         end: i32,
     ) -> Result<UniquePtr<MlxArray>, String> {
-        if start < self.auxiliary_tail_start
-            || end < start
-            || end > self.auxiliary_tail_end
-        {
+        if start < self.auxiliary_tail_start || end < start || end > self.auxiliary_tail_end {
             return Err(format!(
                 "QSA raw range [{start}, {end}) is outside retained tail [{}, {})",
                 self.auxiliary_tail_start, self.auxiliary_tail_end
@@ -7984,10 +7981,7 @@ mod tests {
                 );
                 cache.restore_auxiliary_block_keys(
                     RATIO,
-                    Some(ffi::from_slice_f32(
-                        &summaries,
-                        &[1, 1, complete_before, 1],
-                    )),
+                    Some(ffi::from_slice_f32(&summaries, &[1, 1, complete_before, 1])),
                 );
                 cache
                     .restore_auxiliary_keys(

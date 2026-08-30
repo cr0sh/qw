@@ -25,7 +25,6 @@ const PROMPT: &str = concat!(
     "one retry succeeded and one payment capture still fails.\n"
 );
 
-
 pub struct DecodeFixture {
     pub request: GenerationRequest,
     pub baseline_token_ids: Vec<i32>,
@@ -45,7 +44,6 @@ pub struct LongConversationFixture {
     pub mtp_token_ids: Vec<i32>,
 }
 
-
 pub fn request(max_tokens: usize) -> GenerationRequest {
     GenerationRequest {
         prompt: PROMPT.to_owned(),
@@ -63,7 +61,6 @@ pub fn load_provider() -> Qwen4Provider {
     Qwen4Provider::load(&model_dir, KVCacheMode::Fp8)
         .unwrap_or_else(|error| panic!("failed to load {}: {error:#}", model_dir.display()))
 }
-
 
 pub fn prepare_decode_fixture(provider: &mut Qwen4Provider) -> DecodeFixture {
     let request = request(DECODE_MAX_TOKENS);
@@ -213,10 +210,7 @@ pub fn prepare_long_conversation_fixture(
         .paged_tensor(&format!("{layer_prefix}auxiliary_block_keys"))
         .and_then(|tensor| tensor.materialize())
         .expect("64k QSA snapshot must retain logical block summaries");
-    assert_eq!(
-        mlxcel_core::array_shape(&block_keys)[2],
-        tail_end / ratio
-    );
+    assert_eq!(mlxcel_core::array_shape(&block_keys)[2], tail_end / ratio);
     let (baseline, stats) = provider
         .benchmark_cached_streaming_in_mode(
             &prompt_ids,
