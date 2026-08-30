@@ -472,39 +472,55 @@ impl Qwen4GatedDeltaNet {
         &self,
         inputs: &MlxArray,
         mask: Option<&MlxArray>,
-        mut cache: Option<&mut GatedDeltaCache>,
+        cache: Option<&mut GatedDeltaCache>,
         snapshot: Option<(usize, &mut Vec<GdnRollbackSnapshot>)>,
     ) -> UniquePtr<MlxArray> {
-        let shape = mlxcel_core::array_shape(inputs);
-        let sequence = shape[1];
-        if sequence <= QWEN4_PREFILL_MICROCHUNK_TOKENS || snapshot.is_some() {
-            return self.forward_hidden_chunk(inputs, mask, cache, snapshot, true);
-        }
+        let sequence = mlxcel_core::array_shape(inputs)[1];
+        let microchunk_convolution =
+            sequence > QWEN4_PREFILL_MICROCHUNK_TOKENS && snapshot.is_none();
+        self.forward_hidden_chunk(inputs, mask, cache, snapshot, microchunk_convolution)
+    }
 
+    fn convolve_qkv_microchunked(
+        &self,
+        qkv: &MlxArray,
+        initial_state: &MlxArray,
+    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        let shape = mlxcel_core::array_shape(qkv);
+        let b = shape[0];
+        let sequence = shape[1];
+        let mut state = mlxcel_core::share(initial_state);
         let mut outputs = Vec::with_capacity(
-            ((sequence + QWEN4_PREFILL_MICROCHUNK_TOKENS - 1) / QWEN4_PREFILL_MICROCHUNK_TOKENS)
-                as usize,
+            ((sequence + QWEN4_PREFILL_MICROCHUNK_TOKENS - 1)
+                / QWEN4_PREFILL_MICROCHUNK_TOKENS) as usize,
         );
         let mut start = 0;
         while start < sequence {
             let stop = (start + QWEN4_PREFILL_MICROCHUNK_TOKENS).min(sequence);
-            let input_chunk =
-                mlxcel_core::slice(inputs, &[0, start, 0], &[shape[0], stop, shape[2]]);
-            let mask_chunk =
-                mask.map(|value| mlxcel_core::slice(value, &[0, start], &[shape[0], stop]));
-            outputs.push(self.forward_hidden_chunk(
-                &input_chunk,
-                mask_chunk.as_deref(),
-                cache.as_deref_mut(),
-                None,
-                false,
-            ));
+            let qkv_slice =
+                mlxcel_core::slice(qkv, &[0, start, 0], &[b, stop, self.conv_dim as i32]);
+            let conv_input = concatenate(&state, &qkv_slice, 1);
+            let conv_input_shape = mlxcel_core::array_shape(&conv_input);
+            let conv_len = conv_input_shape[1];
+            let n_keep = (self.conv_kernel_size - 1) as i32;
+            let tail = mlxcel_core::slice(
+                &conv_input,
+                &[0, conv_len - n_keep, 0],
+                &[b, conv_len, self.conv_dim as i32],
+            );
+            state = mlxcel_core::contiguous(&tail, false);
+            let conv_out = mlxcel_core::conv1d(
+                &conv_input,
+                &self.conv1d_weight,
+                1,
+                0,
+                1,
+                self.conv_dim as i32,
+            );
+            outputs.push(silu(&conv_out));
             start = stop;
         }
-        if let Some(cache) = cache {
-            cache.advance(sequence);
-        }
-        mlxcel_core::concatenate_owned(&outputs, 1)
+        (mlxcel_core::concatenate_owned(&outputs, 1), state)
     }
 
     fn forward_hidden_chunk(
@@ -513,11 +529,12 @@ impl Qwen4GatedDeltaNet {
         mask: Option<&MlxArray>,
         mut cache: Option<&mut GatedDeltaCache>,
         snapshot: Option<(usize, &mut Vec<GdnRollbackSnapshot>)>,
-        advance_cache: bool,
+        microchunk_convolution: bool,
     ) -> UniquePtr<MlxArray> {
         let shape = mlxcel_core::array_shape(inputs);
         let b = shape[0];
         let s = shape[1];
+        debug_assert!(snapshot.is_none() || !microchunk_convolution);
 
         let effective_mask = mask;
 
@@ -584,36 +601,45 @@ impl Qwen4GatedDeltaNet {
             qkv
         };
 
-        // Concatenate with conv state
-        let conv_input = concatenate(&conv_state, &qkv, 1);
+        let (conv_out, snapshot_conv_input) = if microchunk_convolution {
+            let (conv_out, new_conv_state) =
+                self.convolve_qkv_microchunked(&qkv, &conv_state);
+            if let Some(c) = cache.as_deref_mut() {
+                c.conv_state = Some(new_conv_state);
+            }
+            (conv_out, None)
+        } else {
+            // Concatenate with conv state
+            let conv_input = concatenate(&conv_state, &qkv, 1);
 
-        // Update cache with new conv state.
-        // Wrap slice in contiguous() to force MLX to materialize a fresh,
-        // independent buffer. Without this, the slice is a lazy view that
-        // retains a reference to the full conv_input allocation, causing a
-        // memory leak proportional to the sequence length.
-        if let Some(c) = cache.as_deref_mut() {
-            let n_keep = (self.conv_kernel_size - 1) as i32;
-            let conv_shape = mlxcel_core::array_shape(&conv_input);
-            let conv_len = conv_shape[1];
-            let tail = mlxcel_core::slice(
+            // Update cache with new conv state.
+            // Wrap slice in contiguous() to force MLX to materialize a fresh,
+            // independent buffer. Without this, the slice is a lazy view that
+            // retains a reference to the full conv_input allocation, causing a
+            // memory leak proportional to the sequence length.
+            if let Some(c) = cache.as_deref_mut() {
+                let n_keep = (self.conv_kernel_size - 1) as i32;
+                let conv_shape = mlxcel_core::array_shape(&conv_input);
+                let conv_len = conv_shape[1];
+                let tail = mlxcel_core::slice(
+                    &conv_input,
+                    &[0, conv_len - n_keep, 0],
+                    &[b, conv_len, self.conv_dim as i32],
+                );
+                c.conv_state = Some(mlxcel_core::contiguous(&tail, false));
+            }
+
+            // Apply conv1d with SiLU activation
+            let conv_out = mlxcel_core::conv1d(
                 &conv_input,
-                &[0, conv_len - n_keep, 0],
-                &[b, conv_len, self.conv_dim as i32],
+                &self.conv1d_weight,
+                1,
+                0,
+                1,
+                self.conv_dim as i32,
             );
-            c.conv_state = Some(mlxcel_core::contiguous(&tail, false));
-        }
-
-        // Apply conv1d with SiLU activation
-        let conv_out = mlxcel_core::conv1d(
-            &conv_input,
-            &self.conv1d_weight,
-            1,
-            0,
-            1,
-            self.conv_dim as i32,
-        );
-        let conv_out = silu(&conv_out);
+            (silu(&conv_out), Some(conv_input))
+        };
         // Split conv output into q, k, v
         // Note: MLX slice with stop=-1 means dim_size-1 (excludes last), not "to end"
         // Use actual conv_out seq length for correct slicing
@@ -676,7 +702,11 @@ impl Qwen4GatedDeltaNet {
                 a: mlxcel_core::share(&a),
                 b: mlxcel_core::share(&b_proj),
                 init_state: state.as_ref().map(|value| mlxcel_core::share(value)),
-                conv_input: mlxcel_core::share(&conv_input),
+                conv_input: mlxcel_core::share(
+                    snapshot_conv_input
+                        .as_deref()
+                        .expect("snapshot capture uses monolithic convolution"),
+                ),
                 ple_inputs: None,
                 ple_input_ids: None,
                 ple_conv_state: None,
@@ -695,9 +725,7 @@ impl Qwen4GatedDeltaNet {
         // Update cache state
         if let Some(c) = cache {
             c.state_cache = Some(new_state);
-            if advance_cache {
-                c.advance(s);
-            }
+            c.advance(s);
         }
 
         // Apply norm with gating
@@ -3476,7 +3504,7 @@ mod tests {
     }
 
     #[test]
-    fn gated_delta_prefill_microchunks_match_monolithic_output_and_cache() {
+    fn gated_delta_conv_microchunks_match_monolithic_output_and_cache() {
         const SEQUENCE: i32 = 131;
         const HIDDEN: i32 = 2;
         const KEY_DIM: i32 = 2;
@@ -3518,11 +3546,12 @@ mod tests {
 
         let mut reference_cache = GatedDeltaCache::new();
         let reference =
-            layer.forward_hidden_chunk(&inputs, None, Some(&mut reference_cache), None, true);
+            layer.forward_hidden_chunk(&inputs, None, Some(&mut reference_cache), None, false);
         let mut chunked_cache = GatedDeltaCache::new();
         let chunked = layer.forward_hidden_internal(&inputs, None, Some(&mut chunked_cache), None);
 
-        assert_arrays_close(&chunked, &reference, 1e-5);
+        // Conv1d kernels over different sequence extents require a small floating-point tolerance.
+        assert_arrays_close(&chunked, &reference, 1e-6);
         assert_arrays_close(
             chunked_cache
                 .conv_state
@@ -3543,7 +3572,7 @@ mod tests {
                 .state_cache
                 .as_deref()
                 .expect("reference recurrent state"),
-            1e-5,
+            1e-6,
         );
         assert_eq!(chunked_cache.offset, SEQUENCE);
         assert_eq!(reference_cache.offset, SEQUENCE);
