@@ -2378,7 +2378,7 @@ impl Qwen4Model {
                             .as_ref()
                             .expect("PLE rollback snapshot must retain its layer");
                         let output = ple
-                            .forward(&inputs, &replay_ids, cache)
+                            .forward(&inputs, &replay_ids, None, cache)
                             .expect("captured PLE replay must remain valid");
                         mlxcel_core::eval(&output);
                     }
