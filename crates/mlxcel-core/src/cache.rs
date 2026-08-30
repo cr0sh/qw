@@ -378,6 +378,25 @@ pub struct KVCache {
     /// The backing tensor may be larger when prefill capacity was reserved;
     /// sparse attention and snapshots must use only this logical prefix.
     auxiliary_block_len: i32,
+    /// Absolute half-open range represented by [`Self::auxiliary_keys`].
+    ///
+    /// For QSA compression ratio `r`, absolute raw end `E`, and configured
+    /// rollback horizon `H`, a fully summarized cache retains exactly
+    ///
+    /// `A = r * floor(max(0, E - H) / r)` and raw rows `[A, E)`.
+    ///
+    /// Thus `E - A <= H + r - 1`. A rollback by any `d <= H` ends at
+    /// `T = E - d >= A`; truncating summaries to `floor(T / r)` leaves every
+    /// row from that aligned block boundary available for exact reconstruction.
+    /// Rows before `A` are represented permanently by block summaries.
+    auxiliary_tail_start: i32,
+    auxiliary_tail_end: i32,
+    /// Maximum supported speculative rewind in tokens.
+    ///
+    /// This is configured before prefill. A deeper trim is an invariant
+    /// violation because raw rows needed to rebuild an invalidated summary may
+    /// already have been discarded.
+    auxiliary_rollback_horizon: i32,
     /// Monotonically increasing absolute write position. Used as the RoPE
     /// position for new K/Q tokens and as the upper bound of the live window.
     /// Once a token has been written at position `p`, this value never
@@ -570,6 +589,9 @@ impl KVCache {
             auxiliary_block_keys: None,
             auxiliary_block_size: None,
             auxiliary_block_len: 0,
+            auxiliary_tail_start: 0,
+            auxiliary_tail_end: 0,
+            auxiliary_rollback_horizon: 0,
             offset: 0,
             live_start: 0,
             step: 256,
@@ -624,6 +646,9 @@ impl KVCache {
             auxiliary_block_keys: None,
             auxiliary_block_size: None,
             auxiliary_block_len: 0,
+            auxiliary_tail_start: 0,
+            auxiliary_tail_end: 0,
+            auxiliary_rollback_horizon: 0,
             offset: 0,
             live_start: 0,
             step: 256,
@@ -686,6 +711,189 @@ impl KVCache {
             self.auxiliary_block_len = ffi::array_shape(keys)[2];
         }
         self.auxiliary_block_size = Some(block_size);
+    }
+
+    /// Configures the maximum QSA rewind before any raw history is discarded.
+    ///
+    /// Increasing the horizon after pruning is accepted only when the retained
+    /// tail already covers the newly required aligned repair range.
+    pub fn set_auxiliary_rollback_horizon(&mut self, horizon: i32) -> Result<(), String> {
+        if horizon < 0 {
+            return Err(format!(
+                "QSA rollback horizon must be non-negative, got {horizon}"
+            ));
+        }
+        if horizon > self.auxiliary_rollback_horizon
+            && self.auxiliary_tail_end > 0
+            && let Some(block_size) = self.auxiliary_block_size
+        {
+            let required =
+                Self::auxiliary_repair_tail_start(self.auxiliary_tail_end, horizon, block_size);
+            if self.auxiliary_tail_start > required {
+                return Err(format!(
+                    "cannot increase QSA rollback horizon from {} to {horizon}: raw tail starts at {}, but exact repair requires {required}",
+                    self.auxiliary_rollback_horizon, self.auxiliary_tail_start
+                ));
+            }
+        }
+        self.auxiliary_rollback_horizon = horizon;
+        Ok(())
+    }
+
+    /// Absolute metadata for the bounded raw QSA tail.
+    pub fn auxiliary_raw_tail_range(&self) -> (i32, i32) {
+        (self.auxiliary_tail_start, self.auxiliary_tail_end)
+    }
+
+    pub fn auxiliary_rollback_horizon(&self) -> i32 {
+        self.auxiliary_rollback_horizon
+    }
+
+    pub fn auxiliary_block_size(&self) -> Option<i32> {
+        self.auxiliary_block_size
+    }
+
+    /// Append raw QSA rows whose first absolute position is `past_len`.
+    pub fn append_auxiliary_keys(
+        &mut self,
+        past_len: i32,
+        keys: UniquePtr<MlxArray>,
+    ) -> Result<(), String> {
+        let shape = ffi::array_shape(&keys);
+        if shape.len() != 3 {
+            return Err(format!(
+                "QSA raw keys must be rank 3 [batch, sequence, head_dim], got {shape:?}"
+            ));
+        }
+        if past_len != self.offset || past_len != self.auxiliary_tail_end {
+            return Err(format!(
+                "QSA raw append must start at absolute cache end: past_len={past_len}, cache_offset={}, tail_end={}",
+                self.offset, self.auxiliary_tail_end
+            ));
+        }
+        if let Some(previous) = self.auxiliary_keys.take() {
+            let previous_shape = ffi::array_shape(&previous);
+            if previous_shape[0] != shape[0] || previous_shape[2] != shape[2] {
+                self.auxiliary_keys = Some(previous);
+                return Err(format!(
+                    "QSA raw append geometry mismatch: retained={previous_shape:?}, appended={shape:?}"
+                ));
+            }
+            self.auxiliary_keys = Some(crate::concatenate(&previous, &keys, 1));
+        } else {
+            if self.auxiliary_tail_start != self.auxiliary_tail_end {
+                return Err(format!(
+                    "QSA raw tail [{}, {}) has no backing tensor",
+                    self.auxiliary_tail_start, self.auxiliary_tail_end
+                ));
+            }
+            self.auxiliary_tail_start = past_len;
+            self.auxiliary_keys = Some(keys);
+        }
+        self.auxiliary_tail_end = past_len
+            .checked_add(shape[1])
+            .ok_or_else(|| "QSA raw tail end overflowed i32".to_string())?;
+        Ok(())
+    }
+
+    /// Return raw QSA rows by absolute token coordinates.
+    pub fn auxiliary_keys_absolute(
+        &self,
+        start: i32,
+        end: i32,
+    ) -> Result<UniquePtr<MlxArray>, String> {
+        if start < self.auxiliary_tail_start
+            || end < start
+            || end > self.auxiliary_tail_end
+        {
+            return Err(format!(
+                "QSA raw range [{start}, {end}) is outside retained tail [{}, {})",
+                self.auxiliary_tail_start, self.auxiliary_tail_end
+            ));
+        }
+        let keys = self
+            .auxiliary_keys
+            .as_deref()
+            .ok_or_else(|| "QSA raw tail tensor is missing".to_string())?;
+        let shape = ffi::array_shape(keys);
+        let relative_start = start - self.auxiliary_tail_start;
+        let relative_end = end - self.auxiliary_tail_start;
+        Ok(ffi::slice(
+            keys,
+            &[0, relative_start, 0],
+            &[shape[0], relative_end, shape[2]],
+        ))
+    }
+
+    /// Prune summarized raw rows to the minimum aligned repair tail.
+    pub fn prune_auxiliary_keys(&mut self) -> Result<(), String> {
+        let block_size = self
+            .auxiliary_block_size
+            .ok_or_else(|| "QSA block size must be set before raw-tail pruning".to_string())?;
+        let complete_blocks = self.auxiliary_tail_end / block_size;
+        if self.auxiliary_block_len < complete_blocks {
+            return Err(format!(
+                "cannot prune QSA raw keys before summaries are complete: have {}, need {complete_blocks}",
+                self.auxiliary_block_len
+            ));
+        }
+        let keep_start = Self::auxiliary_repair_tail_start(
+            self.auxiliary_tail_end,
+            self.auxiliary_rollback_horizon,
+            block_size,
+        );
+        if keep_start < self.auxiliary_tail_start {
+            return Err(format!(
+                "QSA raw tail starts at {}, but exact repair requires {keep_start}",
+                self.auxiliary_tail_start
+            ));
+        }
+        let keys = self
+            .auxiliary_keys
+            .as_deref()
+            .ok_or_else(|| "QSA raw tail tensor is missing".to_string())?;
+        let shape = ffi::array_shape(keys);
+        let relative_start = keep_start - self.auxiliary_tail_start;
+        self.auxiliary_keys = Some(ffi::slice(
+            keys,
+            &[0, relative_start, 0],
+            &[shape[0], shape[1], shape[2]],
+        ));
+        self.auxiliary_tail_start = keep_start;
+        Ok(())
+    }
+
+    /// Restore the exact bounded raw QSA tail from portable snapshot state.
+    pub fn restore_auxiliary_keys(
+        &mut self,
+        start: i32,
+        end: i32,
+        horizon: i32,
+        keys: UniquePtr<MlxArray>,
+    ) -> Result<(), String> {
+        let shape = ffi::array_shape(&keys);
+        if start < 0
+            || end < start
+            || end != self.offset
+            || horizon < 0
+            || shape.len() != 3
+            || shape[1] != end - start
+        {
+            return Err(format!(
+                "invalid QSA raw snapshot tail: range=[{start}, {end}), offset={}, horizon={horizon}, shape={shape:?}",
+                self.offset
+            ));
+        }
+        self.auxiliary_keys = Some(keys);
+        self.auxiliary_tail_start = start;
+        self.auxiliary_tail_end = end;
+        self.auxiliary_rollback_horizon = horizon;
+        Ok(())
+    }
+
+    #[inline]
+    fn auxiliary_repair_tail_start(end: i32, horizon: i32, block_size: i32) -> i32 {
+        end.saturating_sub(horizon).max(0) / block_size * block_size
     }
 
     /// Number of initialized QSA block summaries.
@@ -2683,6 +2891,17 @@ impl KVCache {
         if n <= 0 {
             return 0;
         }
+        if self.auxiliary_keys.is_some() {
+            assert!(
+                n <= self.auxiliary_rollback_horizon,
+                "QSA trim of {n} tokens exceeds configured rollback horizon {}",
+                self.auxiliary_rollback_horizon
+            );
+            assert_eq!(
+                self.auxiliary_tail_end, self.offset,
+                "QSA raw tail end must match the cache offset before trim"
+            );
+        }
         // Pool-backed caches keep no dense `keys`/`values` buffers (#121); the
         // block table is the authoritative store and is trimmed through the
         // pool API (`CachePool::trim_paged_tokens` / `rewind_paged_tokens`),
@@ -2713,26 +2932,33 @@ impl KVCache {
         // refuses to advance it for them, so the Turbo branches below that
         // still use `self.offset` continue to be correct.
         let live_len_after = self.offset - self.live_start;
-        if live_len_after > 0 {
-            if let Some(auxiliary_keys) = self.auxiliary_keys.as_ref() {
-                let shape = ffi::array_shape(auxiliary_keys);
-                self.auxiliary_keys = Some(ffi::slice(
-                    auxiliary_keys,
-                    &[0, 0, 0],
-                    &[shape[0], live_len_after, shape[2]],
-                ));
-            }
+        if let Some(auxiliary_keys) = self.auxiliary_keys.as_ref() {
+            assert!(
+                self.offset >= self.auxiliary_tail_start,
+                "QSA trim crossed discarded raw history: new end {}, retained start {}",
+                self.offset,
+                self.auxiliary_tail_start
+            );
+            let shape = ffi::array_shape(auxiliary_keys);
+            let retained = self.offset - self.auxiliary_tail_start;
+            self.auxiliary_keys = Some(ffi::slice(
+                auxiliary_keys,
+                &[0, 0, 0],
+                &[shape[0], retained, shape[2]],
+            ));
+            self.auxiliary_tail_end = self.offset;
         }
-        // Drop every summary whose block crosses the rollback boundary now.
-        // Waiting for the next QSA plan is unsafe: replacement tokens can
-        // restore the old block count before the planner gets a chance to
-        // notice that the retained tail summary contains rejected tokens.
-        self.retain_auxiliary_blocks_through(live_len_after);
+        // Drop every summary whose block crosses the absolute rollback boundary
+        // now. Replacement rows may restore the old block count before the
+        // planner runs, so stale summaries cannot remain even transiently.
+        self.retain_auxiliary_blocks_through(self.offset);
         if live_len_after == 0 {
             self.keys = None;
             self.values = None;
             self.auxiliary_keys = None;
             self.clear_auxiliary_blocks();
+            self.auxiliary_tail_start = self.offset;
+            self.auxiliary_tail_end = self.offset;
             self.key_scales = None;
             self.val_scales = None;
             self.v_packed = None;
@@ -2912,14 +3138,6 @@ impl KVCache {
                 }
             }
         }
-        if let Some(keys) = self.auxiliary_keys.as_ref() {
-            let shape = ffi::array_shape(keys);
-            self.auxiliary_keys = Some(ffi::slice(
-                keys,
-                &[0, 0, 0],
-                &[shape[0], self.offset, shape[2]],
-            ));
-        }
         n
     }
 
@@ -3038,6 +3256,10 @@ impl KVCache {
         ) {
             return 0;
         }
+        assert!(
+            self.auxiliary_keys.is_none(),
+            "QSA caches do not support front trimming because absolute block indices would change"
+        );
 
         let new_live_len = live_len - n;
 
@@ -3127,24 +3349,6 @@ impl KVCache {
             }
         }
 
-        if let Some(keys) = self.auxiliary_keys.as_ref() {
-            let shape = ffi::array_shape(keys);
-            self.auxiliary_keys = if keep > 0 {
-                let sink = ffi::slice(keys, &[0, 0, 0], &[shape[0], keep, shape[2]]);
-                let tail = ffi::slice(keys, &[0, keep + n, 0], &[shape[0], live_len, shape[2]]);
-                let arrays = [
-                    sink.as_ref().expect("slice returned null") as *const MlxArray,
-                    tail.as_ref().expect("slice returned null") as *const MlxArray,
-                ];
-                Some(unsafe { ffi::concatenate(&arrays, 1) })
-            } else {
-                Some(ffi::slice(
-                    keys,
-                    &[0, n, 0],
-                    &[shape[0], live_len, shape[2]],
-                ))
-            };
-        }
         self.clear_auxiliary_blocks();
         // CRITICAL: do NOT modify `self.offset`. Advance `live_start` only.
         // See the top-level doc comment for the RoPE rationale.
@@ -7778,10 +7982,21 @@ mod tests {
                     ffi::from_slice_f32(&values, &[1, 1, verify_offset, 1]),
                     ffi::from_slice_f32(&values, &[1, 1, verify_offset, 1]),
                 );
-                cache.auxiliary_keys = Some(ffi::from_slice_f32(&values, &[1, verify_offset, 1]));
-                cache.auxiliary_block_keys =
-                    Some(ffi::from_slice_f32(&summaries, &[1, 1, complete_before, 1]));
-                cache.set_auxiliary_block_size(RATIO);
+                cache.restore_auxiliary_block_keys(
+                    RATIO,
+                    Some(ffi::from_slice_f32(
+                        &summaries,
+                        &[1, 1, complete_before, 1],
+                    )),
+                );
+                cache
+                    .restore_auxiliary_keys(
+                        0,
+                        verify_offset,
+                        VERIFY_LEN,
+                        ffi::from_slice_f32(&values, &[1, verify_offset, 1]),
+                    )
+                    .expect("valid QSA trim fixture");
 
                 assert_eq!(cache.trim(trim), trim);
                 assert_eq!(cache.offset, final_len);

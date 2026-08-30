@@ -377,25 +377,14 @@ impl Qwen4QsaIndexer {
             &[batch, sequence, self.n_heads + self.kv_heads, self.head_dim],
         );
         let raw_keys = mlxcel_core::reshape(&raw_keys, &[batch, sequence, self.head_dim]);
-        cache.auxiliary_keys = Some(match cache.auxiliary_keys.take() {
-            Some(previous) => mlxcel_core::concatenate(&previous, &raw_keys, 1),
-            None => raw_keys,
-        });
-        let raw_keys = mlxcel_core::share(
-            cache
-                .auxiliary_keys
-                .as_deref()
-                .expect("QSA raw keys were just installed"),
-        );
-        let key_len = mlxcel_core::array_shape(&raw_keys)[1];
-        if key_len != past_len + sequence {
-            cache.clear_auxiliary_blocks();
-            return None;
-        }
+        let raw_dtype = mlxcel_core::array_dtype(&raw_keys);
+        cache
+            .append_auxiliary_keys(past_len, raw_keys)
+            .unwrap_or_else(|error| panic!("QSA raw append invariant failed: {error}"));
+        let key_len = past_len
+            .checked_add(sequence)
+            .expect("QSA absolute key length overflowed i32");
         let complete_blocks = key_len / self.compress_ratio;
-        if complete_blocks <= self.block_topk {
-            return None;
-        }
 
         let query = self.q_norm.forward(&query);
         let query = mlxcel_core::transpose_axes(&query, &[0, 2, 1, 3]);
@@ -405,28 +394,29 @@ impl Qwen4QsaIndexer {
         let complete_key_len = complete_blocks * self.compress_ratio;
         let cached_blocks = if let Some(keys) = cache.auxiliary_block_keys.as_deref() {
             let shape = mlxcel_core::array_shape(keys);
-            if shape[0] != batch
-                || shape[1] != 1
-                || shape[3] != self.head_dim
-                || cache.auxiliary_block_len() > shape[2]
-            {
-                cache.clear_auxiliary_blocks();
-                0
-            } else {
-                cache.truncate_auxiliary_blocks(complete_blocks);
-                cache.auxiliary_block_len()
-            }
+            assert!(
+                shape[0] == batch
+                    && shape[1] == 1
+                    && shape[3] == self.head_dim
+                    && cache.auxiliary_block_len() <= shape[2],
+                "QSA summary geometry is incompatible with the active indexer: {shape:?}"
+            );
+            cache.truncate_auxiliary_blocks(complete_blocks);
+            cache.auxiliary_block_len()
         } else {
             cache.truncate_auxiliary_blocks(0);
             0
         };
         if cached_blocks < complete_blocks {
             let new_block_count = complete_blocks - cached_blocks;
-            let pooled = mlxcel_core::slice(
-                &raw_keys,
-                &[0, cached_blocks * self.compress_ratio, 0],
-                &[batch, complete_key_len, self.head_dim],
-            );
+            let pooled = cache
+                .auxiliary_keys_absolute(
+                    cached_blocks * self.compress_ratio,
+                    complete_key_len,
+                )
+                .unwrap_or_else(|error| {
+                    panic!("QSA discarded raw rows required for summary repair: {error}")
+                });
             let pooled = mlxcel_core::reshape(
                 &pooled,
                 &[batch, new_block_count, self.compress_ratio, self.head_dim],
@@ -436,7 +426,7 @@ impl Qwen4QsaIndexer {
                 2,
                 false,
             );
-            let pooled = mlxcel_core::astype(&pooled, mlxcel_core::array_dtype(&raw_keys));
+            let pooled = mlxcel_core::astype(&pooled, raw_dtype);
             let pooled = self.k_norm.forward(&pooled);
             let pooled = mlxcel_core::expand_dims(&pooled, 1);
             let block_positions = (cached_blocks..complete_blocks)
@@ -444,6 +434,12 @@ impl Qwen4QsaIndexer {
                 .collect::<Vec<_>>();
             let pooled = self.apply_rope(&pooled, &block_positions, batch);
             cache.append_auxiliary_blocks(&pooled);
+        }
+        cache
+            .prune_auxiliary_keys()
+            .unwrap_or_else(|error| panic!("QSA raw-tail pruning invariant failed: {error}"));
+        if complete_blocks <= self.block_topk {
+            return None;
         }
         let pooled = cache
             .auxiliary_block_keys_view()
@@ -1231,6 +1227,9 @@ mod tests {
     fn exercise_qsa_rollback_reappend(materialize_before_rollback: bool) {
         let indexer = qsa_rollback_indexer();
         let mut cache = KVCache::new();
+        cache
+            .set_auxiliary_rollback_horizon(3)
+            .expect("fresh QSA cache accepts rollback horizon");
         append_qsa_rows(&indexer, &mut cache, &[1, 2, 3, 4, 5, 6, 7, 8]);
         append_qsa_rows(&indexer, &mut cache, &[9, 10, 11, 12]);
         if materialize_before_rollback {
@@ -1275,6 +1274,128 @@ mod tests {
     fn qsa_rollback_rebuilds_replaced_blocks_before_and_after_materialization() {
         exercise_qsa_rollback_reappend(true);
         exercise_qsa_rollback_reappend(false);
+    }
+
+    fn exercise_qsa_acceptance_alignments(materialize: bool) {
+        let indexer = qsa_rollback_indexer();
+        for horizon in [2_i32, 3, 5, 9] {
+            for alignment in 0..4_i32 {
+                let base_len = 12 + alignment;
+                let base = (0..base_len).collect::<Vec<_>>();
+                for accepted in 0..=horizon {
+                    let mut cache = KVCache::new();
+                    cache
+                        .set_auxiliary_rollback_horizon(horizon)
+                        .expect("fresh QSA cache accepts rollback horizon");
+                    append_qsa_rows(&indexer, &mut cache, &base);
+                    let verify = (0..horizon)
+                        .map(|row| 1_000 + alignment * 100 + row)
+                        .collect::<Vec<_>>();
+                    append_qsa_rows(&indexer, &mut cache, &verify);
+                    if materialize {
+                        cache.materialize_state();
+                    }
+                    let rejected = horizon - accepted;
+                    assert_eq!(cache.trim(rejected), rejected);
+                    let replacements = (0..rejected)
+                        .map(|row| 2_000 + accepted * 100 + row)
+                        .collect::<Vec<_>>();
+                    append_qsa_rows(&indexer, &mut cache, &replacements);
+
+                    let mut expected_tokens = base.clone();
+                    expected_tokens.extend_from_slice(&verify[..accepted as usize]);
+                    expected_tokens.extend_from_slice(&replacements);
+                    let mut expected = KVCache::new();
+                    append_qsa_rows(&indexer, &mut expected, &expected_tokens);
+                    assert_qsa_blocks_equal(&cache, &expected);
+
+                    let (start, end) = cache.auxiliary_raw_tail_range();
+                    assert_eq!(end, cache.offset);
+                    assert!(end - start <= horizon + 3);
+                    assert_eq!(start % 4, 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn qsa_tail_is_exact_for_all_ratio_alignments_mtp_depths_and_acceptance_counts() {
+        exercise_qsa_acceptance_alignments(false);
+        exercise_qsa_acceptance_alignments(true);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds configured rollback horizon")]
+    fn qsa_deep_trim_is_rejected_before_state_changes() {
+        let indexer = qsa_rollback_indexer();
+        let mut cache = KVCache::new();
+        cache
+            .set_auxiliary_rollback_horizon(3)
+            .expect("fresh QSA cache accepts rollback horizon");
+        append_qsa_rows(&indexer, &mut cache, &(0..20).collect::<Vec<_>>());
+        let _ = cache.trim(4);
+    }
+
+    #[test]
+    fn qsa_snapshot_tail_restore_reuses_cached_suffix_exactly() {
+        let indexer = qsa_rollback_indexer();
+        let mut uninterrupted = KVCache::new();
+        uninterrupted
+            .set_auxiliary_rollback_horizon(5)
+            .expect("fresh QSA cache accepts rollback horizon");
+        append_qsa_rows(
+            &indexer,
+            &mut uninterrupted,
+            &(0..19).collect::<Vec<_>>(),
+        );
+        let (start, end) = uninterrupted.auxiliary_raw_tail_range();
+        let raw = uninterrupted
+            .auxiliary_keys
+            .as_deref()
+            .map(mlxcel_core::copy)
+            .expect("snapshot raw tail");
+        let blocks = uninterrupted.auxiliary_block_keys_view();
+
+        let mut restored = KVCache::new();
+        restored.offset = end;
+        restored.restore_auxiliary_block_keys(4, blocks);
+        restored
+            .restore_auxiliary_keys(start, end, 5, raw)
+            .expect("restore bounded QSA raw tail");
+
+        let suffix = [91, 92, 93, 94, 95];
+        let uninterrupted_plan = indexer.plan(&qsa_token_rows(&suffix), &mut uninterrupted);
+        let restored_plan = indexer.plan(&qsa_token_rows(&suffix), &mut restored);
+        assert_qsa_plans_equal(uninterrupted_plan, restored_plan);
+        uninterrupted.offset += suffix.len() as i32;
+        restored.offset += suffix.len() as i32;
+        assert_qsa_blocks_equal(&restored, &uninterrupted);
+        assert_eq!(
+            restored.auxiliary_raw_tail_range(),
+            uninterrupted.auxiliary_raw_tail_range()
+        );
+    }
+
+    #[test]
+    fn qsa_64k_append_keeps_raw_storage_bounded_and_all_logical_summaries() {
+        let indexer = qsa_rollback_indexer();
+        let mut cache = KVCache::new();
+        cache
+            .set_auxiliary_rollback_horizon(9)
+            .expect("fresh QSA cache accepts rollback horizon");
+        append_qsa_rows(
+            &indexer,
+            &mut cache,
+            &(0..65_536).collect::<Vec<_>>(),
+        );
+        let raw_rows = mlxcel_core::array_shape(
+            cache
+                .auxiliary_keys
+                .as_deref()
+                .expect("bounded QSA raw tail"),
+        )[1];
+        assert!(raw_rows <= 9 + 4 - 1);
+        assert_eq!(cache.auxiliary_block_len(), 65_536 / 4);
     }
 
     fn assert_qsa_plans_equal(actual: Option<Qwen4QsaPlan>, expected: Option<Qwen4QsaPlan>) {

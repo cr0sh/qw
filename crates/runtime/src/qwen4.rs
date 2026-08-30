@@ -36,6 +36,7 @@ use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr, concatenate};
 use serde::Deserialize;
 use serde_json::Value;
+use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
@@ -1618,6 +1619,8 @@ pub struct Qwen4Model {
     /// Rotary-position state retained for the active text sequence.
     rope_state: RopeState,
     prefill_policy: Arc<Qwen4PrefillPolicy>,
+    /// Rollback depth that every QSA layer must preserve in its bounded raw tail.
+    qsa_rollback_horizon: Cell<i32>,
 }
 
 impl Qwen4Model {
@@ -1714,16 +1717,39 @@ impl Qwen4Model {
     }
 
     fn make_internal_caches(&self) -> Vec<Qwen4LayerCache> {
+        let horizon = self.qsa_rollback_horizon.get();
         self.layers
             .iter()
             .map(|layer| {
                 if layer.is_linear {
                     Qwen4LayerCache::Linear(GatedDeltaCache::new())
                 } else {
-                    new_initial_attention_cache()
+                    let mut cache = new_initial_attention_cache();
+                    if let Qwen4LayerCache::Attention(cache) = &mut cache {
+                        cache
+                            .set_auxiliary_rollback_horizon(horizon)
+                            .expect("fresh QSA cache accepts configured rollback horizon");
+                    }
+                    cache
                 }
             })
             .collect()
+    }
+
+    pub(crate) fn set_qsa_rollback_horizon(
+        &self,
+        horizon: i32,
+    ) -> std::result::Result<(), String> {
+        self.sequence_state.with_internal(|caches| {
+            for cache in caches {
+                if let Qwen4LayerCache::Attention(cache) = cache {
+                    cache.set_auxiliary_rollback_horizon(horizon)?;
+                }
+            }
+            Ok(())
+        })?;
+        self.qsa_rollback_horizon.set(horizon);
+        Ok(())
     }
 
     pub(crate) fn reserve_prefill_capacity(&self, total_tokens: i32) {
@@ -2407,6 +2433,7 @@ impl Qwen4Model {
             sequence_state: ModelOwnedSequenceState::new(internal_caches),
             rope_state: RopeState::new(),
             prefill_policy,
+            qsa_rollback_horizon: Cell::new(0),
         })
     }
 }
@@ -2572,6 +2599,10 @@ fn validate_snapshot_tensor_names(
         expected.insert(format!("layer.{index}.offset"));
         if !layer.is_linear {
             expected.insert(format!("layer.{index}.auxiliary_keys"));
+            expected.insert(format!("layer.{index}.auxiliary_tail_start"));
+            expected.insert(format!("layer.{index}.auxiliary_tail_end"));
+            expected.insert(format!("layer.{index}.auxiliary_rollback_horizon"));
+            expected.insert(format!("layer.{index}.auxiliary_block_size"));
             let block_name = format!("layer.{index}.auxiliary_block_keys");
             if actual_dense.contains(&block_name) || actual_paged.contains(&block_name) {
                 expected.insert(block_name);
@@ -2598,14 +2629,14 @@ fn validate_snapshot_tensor_names(
         return Err("Qwen4 snapshot tensor layout does not match the loaded model".to_string());
     }
     for (index, layer) in layers.iter().enumerate() {
-        if !layer.is_linear {
-            let names: &[&str] = &["keys", "values", "auxiliary_keys"];
-            if names.iter().any(|suffix| {
-                !actual_paged.contains(&format!("layer.{index}.{suffix}"))
-                    && !actual_dense.contains(&format!("layer.{index}.{suffix}"))
-            }) {
-                return Err("Qwen4 snapshot is missing paged attention state".to_string());
-            }
+        if !layer.is_linear
+            && (!actual_dense.contains(&format!("layer.{index}.auxiliary_keys"))
+                || ["keys", "values"].iter().any(|suffix| {
+                    !actual_paged.contains(&format!("layer.{index}.{suffix}"))
+                        && !actual_dense.contains(&format!("layer.{index}.{suffix}"))
+                }))
+        {
+            return Err("Qwen4 snapshot is missing attention state".to_string());
         }
     }
     Ok(())
@@ -2709,6 +2740,8 @@ impl LanguageModel for Qwen4Model {
     }
 
     fn reserve_prefill_capacity(&self, _caches: &mut [KVCache], total_tokens: usize) {
+        self.set_qsa_rollback_horizon(0)
+            .expect("baseline prefill must configure a zero QSA rewind horizon");
         self.reserve_prefill_capacity(i32::try_from(total_tokens).unwrap_or(i32::MAX));
     }
 
@@ -2787,24 +2820,41 @@ impl LanguageModel for Qwen4Model {
                 );
                 match cache {
                     Qwen4LayerCache::Attention(cache) => {
+                        let (tail_start, tail_end) = cache.auxiliary_raw_tail_range();
+                        push_snapshot_i32(
+                            &mut snapshot,
+                            &format!("layer.{index}.auxiliary_tail_start"),
+                            tail_start,
+                        );
+                        push_snapshot_i32(
+                            &mut snapshot,
+                            &format!("layer.{index}.auxiliary_tail_end"),
+                            tail_end,
+                        );
+                        push_snapshot_i32(
+                            &mut snapshot,
+                            &format!("layer.{index}.auxiliary_rollback_horizon"),
+                            cache.auxiliary_rollback_horizon(),
+                        );
+                        push_snapshot_i32(
+                            &mut snapshot,
+                            &format!("layer.{index}.auxiliary_block_size"),
+                            cache.auxiliary_block_size().unwrap_or(0),
+                        );
                         let Some(auxiliary_keys) = cache.auxiliary_keys.as_deref() else {
                             return false;
                         };
-                        if snapshot
-                            .push_paged_tensor(
-                                previous,
-                                format!("layer.{index}.auxiliary_keys"),
-                                auxiliary_keys,
-                                1,
-                            )
-                            .is_err()
-                        {
-                            return false;
-                        }
+                        // The bounded raw tail slides in absolute coordinates;
+                        // it is not append-only, so relative snapshot pages from
+                        // an earlier tail are never reusable.
+                        snapshot.push_tensor(
+                            format!("layer.{index}.auxiliary_keys"),
+                            auxiliary_keys,
+                        );
                         if let Some(auxiliary_block_keys) = cache.auxiliary_block_keys_view()
                             && snapshot
                                 .push_paged_tensor(
-                                    previous,
+                                    previous.filter(|snapshot| snapshot.token_len() < token_len),
                                     format!("layer.{index}.auxiliary_block_keys"),
                                     &auxiliary_block_keys,
                                     2,
@@ -2987,19 +3037,20 @@ impl LanguageModel for Qwen4Model {
                 }
                 let mut cache = KVCache::new_with_mode(KVCacheMode::Fp8);
                 cache.restore_fp8_snapshot(token_len, keys, values)?;
-                cache.auxiliary_keys = Some(
-                    snapshot
-                        .paged_tensor(&format!("layer.{index}.auxiliary_keys"))
-                        .and_then(|paged| paged.materialize())
-                        .or_else(|| {
-                            snapshot
-                                .tensor(&format!("layer.{index}.auxiliary_keys"))
-                                .map(mlxcel_core::copy)
-                        })
-                        .ok_or_else(|| {
-                            format!("Qwen4 snapshot is missing layer {index} QSA keys")
-                        })?,
-                );
+                let auxiliary_keys = snapshot
+                    .tensor(&format!("layer.{index}.auxiliary_keys"))
+                    .map(mlxcel_core::copy)
+                    .ok_or_else(|| format!("Qwen4 snapshot is missing layer {index} QSA keys"))?;
+                let tail_start =
+                    snapshot_i32(snapshot, &format!("layer.{index}.auxiliary_tail_start"))?;
+                let tail_end =
+                    snapshot_i32(snapshot, &format!("layer.{index}.auxiliary_tail_end"))?;
+                let horizon = snapshot_i32(
+                    snapshot,
+                    &format!("layer.{index}.auxiliary_rollback_horizon"),
+                )?;
+                let block_size =
+                    snapshot_i32(snapshot, &format!("layer.{index}.auxiliary_block_size"))?;
                 let auxiliary_block_keys = snapshot
                     .paged_tensor(&format!("layer.{index}.auxiliary_block_keys"))
                     .and_then(|paged| paged.materialize())
@@ -3008,7 +3059,9 @@ impl LanguageModel for Qwen4Model {
                             .tensor(&format!("layer.{index}.auxiliary_block_keys"))
                             .map(mlxcel_core::copy)
                     });
-                cache.restore_auxiliary_block_keys(0, auxiliary_block_keys);
+                cache.restore_auxiliary_block_keys(block_size, auxiliary_block_keys);
+                cache.restore_auxiliary_keys(tail_start, tail_end, horizon, auxiliary_keys)?;
+                cache.set_auxiliary_rollback_horizon(self.qsa_rollback_horizon.get())?;
                 restored.push(Qwen4LayerCache::Attention(Box::new(cache)));
             }
         }

@@ -981,6 +981,20 @@ fn adaptive_proposal_count(block_size: usize, remaining: usize, extend: bool) ->
     }
 }
 
+/// Maximum target rows that this request can append and then rewind.
+///
+/// The configured `block_size` is the ordinary verify width (bonus plus
+/// `block_size - 1` proposals). In the adaptive long-context band a fully
+/// accepted round may extend by one proposal, so its actual verify width is
+/// `block_size + 1`. QSA must know that maximum before prefill pruning.
+fn mtp_qsa_rollback_horizon(block_size: usize, prompt_tokens: usize) -> usize {
+    block_size
+        + usize::from(
+            prompt_tokens >= MTP_ADAPTIVE_DEPTH_MIN_CONTEXT
+                && prompt_tokens < MTP_ADAPTIVE_DEPTH_MAX_CONTEXT,
+        )
+}
+
 fn should_extend_greedy_draft(
     greedy: bool,
     prompt_tokens: usize,
@@ -2191,6 +2205,12 @@ impl Qwen4MtpGenerator {
     ) -> Result<MtpGeneration, String> {
         assert!(!prompt_tokens.is_empty(), "MTP prompt must not be empty");
         assert!(block_size >= 2, "MTP block size must be at least 2");
+        let qsa_horizon = i32::try_from(mtp_qsa_rollback_horizon(
+            block_size,
+            prompt_tokens.len(),
+        ))
+        .map_err(|_| "MTP verify block size exceeds the QSA horizon range".to_string())?;
+        model.set_qsa_rollback_horizon(qsa_horizon)?;
         if checkpoint_token_lengths
             .iter()
             .any(|&length| length == 0 || length > prompt_tokens.len())
@@ -3251,7 +3271,19 @@ mod tests {
     }
 
     #[test]
-    fn k_two_k_three_and_budget_clamping_use_verify_block_semantics() {
+    fn arbitrary_k_budget_clamping_and_qsa_horizon_use_verify_block_semantics() {
+        for block_size in [2, 3, 5, 9] {
+            assert_eq!(mtp_qsa_rollback_horizon(block_size, 8_191), block_size);
+            assert_eq!(
+                mtp_qsa_rollback_horizon(block_size, 8_192),
+                block_size + 1
+            );
+            assert_eq!(
+                mtp_qsa_rollback_horizon(block_size, 32_767),
+                block_size + 1
+            );
+            assert_eq!(mtp_qsa_rollback_horizon(block_size, 32_768), block_size);
+        }
         assert_eq!(round_proposal_count(2, 8), 1);
         assert_eq!(round_proposal_count(3, 8), 2);
         assert_eq!(round_proposal_count(3, 1), 1);

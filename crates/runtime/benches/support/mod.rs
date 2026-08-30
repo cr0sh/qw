@@ -179,17 +179,43 @@ pub fn prepare_long_conversation_fixture(
         PromptSnapshot::Mtp(snapshot) => snapshot.target_snapshot(),
     };
     let auxiliary_name = target_snapshot
-        .paged_tensor_names()
+        .tensor_names()
         .find(|name| name.ends_with(".auxiliary_keys"))
-        .expect("64k target snapshot must include QSA keys");
-    let auxiliary_keys = target_snapshot
-        .paged_tensor(auxiliary_name)
-        .and_then(|tensor| tensor.materialize())
-        .expect("materialize 64k QSA keys");
+        .expect("64k target snapshot must include bounded QSA keys");
+    let auxiliary_keys = mlxcel_core::copy(
+        target_snapshot
+            .tensor(auxiliary_name)
+            .expect("materialize 64k QSA keys"),
+    );
+    let layer_prefix = auxiliary_name
+        .strip_suffix("auxiliary_keys")
+        .expect("QSA snapshot tensor suffix");
+    let scalar = |suffix: &str| {
+        let value = target_snapshot
+            .tensor(&format!("{layer_prefix}{suffix}"))
+            .unwrap_or_else(|| panic!("64k QSA snapshot must include {suffix}"));
+        mlxcel_core::item_i32(&mlxcel_core::reshape(value, &[]))
+    };
+    let tail_start = scalar("auxiliary_tail_start");
+    let tail_end = scalar("auxiliary_tail_end");
+    let horizon = scalar("auxiliary_rollback_horizon");
+    let ratio = scalar("auxiliary_block_size");
+    let raw_rows = mlxcel_core::array_shape(&auxiliary_keys)[1];
+    assert_eq!(tail_end as usize, prefix_tokens);
+    assert_eq!(horizon as usize, MTP_BLOCK_SIZE);
     assert_eq!(
-        mlxcel_core::array_shape(&auxiliary_keys)[1] as usize,
-        prefix_tokens,
-        "64k QSA snapshot must retain the complete prefix"
+        tail_start,
+        tail_end.saturating_sub(horizon).max(0) / ratio * ratio
+    );
+    assert_eq!(raw_rows, tail_end - tail_start);
+    assert!(raw_rows <= horizon + ratio - 1);
+    let block_keys = target_snapshot
+        .paged_tensor(&format!("{layer_prefix}auxiliary_block_keys"))
+        .and_then(|tensor| tensor.materialize())
+        .expect("64k QSA snapshot must retain logical block summaries");
+    assert_eq!(
+        mlxcel_core::array_shape(&block_keys)[2],
+        tail_end / ratio
     );
     let (baseline, stats) = provider
         .benchmark_cached_streaming_in_mode(
