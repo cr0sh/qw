@@ -1813,6 +1813,17 @@ mod ffi {
             scale: f32,
         ) -> UniquePtr<MlxArray>;
 
+        /// FP8-cache QSA prefill variant. `keys` and `values` are raw MLX E4M3
+        /// UINT8 tensors decoded only for selected rows inside the Metal kernel.
+        fn qsa_sparse_prefill_attention_raw_fp8(
+            queries: &MlxArray,
+            keys: &MlxArray,
+            values: &MlxArray,
+            indices: &MlxArray,
+            valid: &MlxArray,
+            scale: f32,
+        ) -> UniquePtr<MlxArray>;
+
 
         /// BitLinear ternary matmul (BitNet b1.58). `packed_weights` is
         /// [out_features/4, in_features] uint8 (2-bit ternary, 4 rows/byte),

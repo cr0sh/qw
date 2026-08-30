@@ -503,6 +503,16 @@ pub struct Fp8SnapshotTensors<'a> {
     pub keys: &'a MlxArray,
     pub values: &'a MlxArray,
 }
+/// Filled raw E4M3 cache views returned after one FP8 update.
+///
+/// `keys` and `values` are token-axis slices of the cache allocations, so
+/// their visible sequence extent is exactly `live_len`; no BF16 history is
+/// materialized.
+pub struct RawFp8CacheUpdate {
+    pub keys: UniquePtr<MlxArray>,
+    pub values: UniquePtr<MlxArray>,
+    pub live_len: i32,
+}
 
 /// Shared handle that makes one [`KVCache`] write/read through a pooled paged
 /// KV store instead of its own dense buffers.
@@ -3153,6 +3163,45 @@ impl KVCache {
                     ffi::slice(v, &[0, 0, 0, 0], &[vs[0], vs[1], live_len, vs[3]]),
                 )
             }
+        }
+    }
+    /// Update an FP8 cache once and return raw UINT8 views of its filled range.
+    ///
+    /// Unlike [`Self::update_and_fetch`], this does not call [`ffi::from_fp8`].
+    /// The returned slices keep reserved padding outside the visible shape and
+    /// are intended for kernels that decode E4M3 bytes while gathering rows.
+    pub fn update_and_fetch_raw_fp8(
+        &mut self,
+        new_keys: UniquePtr<MlxArray>,
+        new_values: UniquePtr<MlxArray>,
+    ) -> RawFp8CacheUpdate {
+        assert_eq!(
+            self.mode,
+            KVCacheMode::Fp8,
+            "raw FP8 update requires an FP8 cache"
+        );
+        assert!(
+            self.paged_backing.is_none(),
+            "raw FP8 update does not support paged cache backing"
+        );
+        self.update_fp8(new_keys, new_values);
+        let live_len = self.buffer_idx();
+        let keys = self.keys.as_ref().expect("FP8 cache must retain keys");
+        let values = self.values.as_ref().expect("FP8 cache must retain values");
+        let key_shape = ffi::array_shape(keys);
+        let value_shape = ffi::array_shape(values);
+        RawFp8CacheUpdate {
+            keys: ffi::slice(
+                keys,
+                &[0, 0, 0, 0],
+                &[key_shape[0], key_shape[1], live_len, key_shape[3]],
+            ),
+            values: ffi::slice(
+                values,
+                &[0, 0, 0, 0],
+                &[value_shape[0], value_shape[1], live_len, value_shape[3]],
+            ),
+            live_len,
         }
     }
     /// Update the cache and fetch only the selected token positions.
@@ -8027,6 +8076,37 @@ mod tests {
             sparse.update_and_fetch_selected(make(&keys), make(&values), &indices);
         assert_eq!(read_f32(&selected_keys), read_f32(&expected_keys));
         assert_eq!(read_f32(&selected_values), read_f32(&expected_values));
+    }
+
+    #[test]
+    fn raw_fp8_update_returns_only_filled_uint8_range_and_updates_once() {
+        let make = |values: &[f32], sequence| {
+            ffi::from_slice_f32(values, &[1, 1, sequence, 2])
+        };
+        let mut cache = KVCache::new_with_mode(KVCacheMode::Fp8);
+        let first = cache.update_and_fetch_raw_fp8(
+            make(&[1.0, -2.0, 0.5, -0.25], 2),
+            make(&[-1.0, 2.0, -0.5, 0.25], 2),
+        );
+        assert_eq!(first.live_len, 2);
+        assert_eq!(ffi::array_shape(&first.keys), vec![1, 1, 2, 2]);
+        assert_eq!(ffi::array_shape(&first.values), vec![1, 1, 2, 2]);
+        assert_eq!(ffi::array_dtype(&first.keys), dtype::UINT8);
+        assert_eq!(ffi::array_dtype(&first.values), dtype::UINT8);
+        drop(first);
+
+        let second = cache.update_and_fetch_raw_fp8(
+            make(&[4.0, -8.0], 1),
+            make(&[-4.0, 8.0], 1),
+        );
+        assert_eq!(second.live_len, 3);
+        assert_eq!(cache.offset, 3);
+        assert_eq!(ffi::array_shape(&second.keys), vec![1, 1, 3, 2]);
+        assert_eq!(ffi::array_shape(&second.values), vec![1, 1, 3, 2]);
+        let decoded_keys = ffi::from_fp8(&second.keys);
+        let decoded_values = ffi::from_fp8(&second.values);
+        assert_eq!(ffi::array_shape(&decoded_keys), vec![1, 1, 3, 2]);
+        assert_eq!(ffi::array_shape(&decoded_values), vec![1, 1, 3, 2]);
     }
 
     /// INT8 + `--max-kv-size` front-trim interaction on the single-stream

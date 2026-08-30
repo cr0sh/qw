@@ -1757,6 +1757,17 @@ std::unique_ptr<MlxArray> qsa_sparse_prefill_attention(
     float scale
 );
 
+// FP8-cache variant of QSA sparse prefill. K/V are raw MLX E4M3 bytes and
+// selected rows are decoded inside the Metal kernel.
+std::unique_ptr<MlxArray> qsa_sparse_prefill_attention_raw_fp8(
+    const MlxArray& queries,
+    const MlxArray& keys,
+    const MlxArray& values,
+    const MlxArray& indices,
+    const MlxArray& valid,
+    float scale
+);
+
 
 // BitLinear ternary matmul (BitNet b1.58): multiply on 2-bit-packed ternary
 // weights [out_features/4, in_features] uint8 scaled by weight_scale[0].
