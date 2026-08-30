@@ -823,6 +823,12 @@ impl KVCache {
     }
 
     /// Prune summarized raw rows to the minimum aligned repair tail.
+    ///
+    /// A speculative round may rewind the whole retained horizon and then
+    /// commit only its bonus token. Until the next verify block is appended,
+    /// that shorter stable tail cannot be expanded backwards. Keeping it
+    /// unchanged is exact: the next verify append restores the rows needed to
+    /// repair any block summary before another rewind.
     pub fn prune_auxiliary_keys(&mut self) -> Result<(), String> {
         let block_size = self
             .auxiliary_block_size
@@ -840,10 +846,7 @@ impl KVCache {
             block_size,
         );
         if keep_start < self.auxiliary_tail_start {
-            return Err(format!(
-                "QSA raw tail starts at {}, but exact repair requires {keep_start}",
-                self.auxiliary_tail_start
-            ));
+            return Ok(());
         }
         let keys = self
             .auxiliary_keys
@@ -8001,6 +8004,57 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn qsa_tail_recovers_after_full_speculative_rewind_and_bonus_commit() {
+        const RATIO: i32 = 4;
+        const HORIZON: i32 = 3;
+        let values = (0..15).map(|value| value as f32).collect::<Vec<_>>();
+        let mut cache = KVCache::new();
+        cache.update(
+            ffi::from_slice_f32(&values, &[1, 1, 15, 1]),
+            ffi::from_slice_f32(&values, &[1, 1, 15, 1]),
+        );
+        cache.restore_auxiliary_block_keys(
+            RATIO,
+            Some(ffi::from_slice_f32(&[0.0, 1.0, 2.0], &[1, 1, 3, 1])),
+        );
+        cache
+            .restore_auxiliary_keys(
+                12,
+                15,
+                HORIZON,
+                ffi::from_slice_f32(&[12.0, 13.0, 14.0], &[1, 3, 1]),
+            )
+            .expect("valid aligned QSA repair tail");
+
+        assert_eq!(cache.trim(HORIZON), HORIZON);
+        cache
+            .append_auxiliary_keys(12, ffi::from_slice_f32(&[12.0], &[1, 1, 1]))
+            .expect("commit the accepted bonus row");
+        cache
+            .prune_auxiliary_keys()
+            .expect("transient stable tail remains exact");
+        assert_eq!(cache.auxiliary_raw_tail_range(), (12, 13));
+
+        cache.update(
+            ffi::from_slice_f32(&[12.0], &[1, 1, 1, 1]),
+            ffi::from_slice_f32(&[12.0], &[1, 1, 1, 1]),
+        );
+        cache
+            .append_auxiliary_keys(13, ffi::from_slice_f32(&[13.0, 14.0, 15.0], &[1, 3, 1]))
+            .expect("next verify block restores aligned repair rows");
+        let repair = cache
+            .auxiliary_keys_absolute(12, 16)
+            .expect("complete block remains exactly repairable");
+        assert_eq!(
+            ffi::array_to_raw_bytes(&repair)
+                .chunks_exact(4)
+                .map(|bytes| f32::from_ne_bytes(bytes.try_into().expect("four-byte value")))
+                .collect::<Vec<_>>(),
+            vec![12.0, 13.0, 14.0, 15.0],
+        );
     }
 
     #[test]
