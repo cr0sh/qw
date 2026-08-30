@@ -19,6 +19,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+qw-prefix-cache = { path = "../prefix-cache" }
 
 
 [[bench]]
