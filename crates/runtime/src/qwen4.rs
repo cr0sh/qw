@@ -49,6 +49,26 @@ const MTP_VERIFY_PADDED: i32 = 80_928;
 const DRAFT_CONTROL_START: i32 = 248_044;
 const DRAFT_CONTROL_END: i32 = 248_070;
 
+/// Exact QSA score work allowed in one Metal prefill chunk, calibrated to the
+/// validated 1,536-token chunk at the 64K benchmark context.
+const QSA_METAL_PREFILL_WORK_BUDGET: usize = 1_536 * 65_536;
+/// Keep progress nonzero beyond the calibrated range while staying below one
+/// 128-token QSA query tile. Smaller explicit operator chunks still win.
+const QSA_METAL_PREFILL_MIN_CHUNK: usize = 64;
+
+fn qwen4_prefill_chunk_size(
+    configured_chunk: usize,
+    total_context_tokens: usize,
+    is_metal: bool,
+) -> usize {
+    if !is_metal || configured_chunk == 0 {
+        return configured_chunk;
+    }
+    let budget_chunk = (QSA_METAL_PREFILL_WORK_BUDGET / total_context_tokens.max(1))
+        .max(QSA_METAL_PREFILL_MIN_CHUNK);
+    configured_chunk.min(budget_chunk)
+}
+
 fn compact_rows(array: &MlxArray, prefix_len: i32, padded_len: i32) -> UniquePtr<MlxArray> {
     let columns = mlxcel_core::array_shape(array)[1];
     let prefix = mlxcel_core::slice(array, &[0, 0], &[prefix_len, columns]);
@@ -2063,7 +2083,10 @@ impl Qwen4Model {
             self.rope_state.prepare(position_ids, rope_delta);
             self.rope_state.activate_prepared()?;
         }
-        let configured = mlxcel_core::generate::prefill_chunk_len();
+        let configured = self.prefill_chunk_size(
+            mlxcel_core::generate::prefill_chunk_len(),
+            prompt_len as usize,
+        );
         let chunk_len =
             mlxcel_core::generate::effective_prefill_chunk(configured, true, prompt_len as usize)
                 .unwrap_or(prompt_len as usize) as i32;
@@ -2133,6 +2156,7 @@ impl Qwen4Model {
         &self,
         input_ids: &MlxArray,
         host_tokens: &[i32],
+        total_context_tokens: usize,
         mut consume_chunk: F,
     ) -> std::result::Result<Qwen4MtpPrefill, String>
     where
@@ -2150,7 +2174,10 @@ impl Qwen4Model {
             .sequence_state
             .with_internal(|caches| caches.first().map(Qwen4LayerCache::offset).unwrap_or(0));
         self.reserve_prefill_capacity(cached_len.saturating_add(suffix_len));
-        let configured = mlxcel_core::generate::prefill_chunk_len();
+        let configured = self.prefill_chunk_size(
+            mlxcel_core::generate::prefill_chunk_len(),
+            total_context_tokens,
+        );
         let chunk_len =
             mlxcel_core::generate::effective_prefill_chunk(configured, true, suffix_len as usize)
                 .unwrap_or(suffix_len as usize) as i32;
@@ -3012,6 +3039,18 @@ impl LanguageModel for Qwen4Model {
         Vec::new()
     }
 
+    fn prefill_chunk_size(
+        &self,
+        configured_chunk: usize,
+        total_context_tokens: usize,
+    ) -> usize {
+        qwen4_prefill_chunk_size(
+            configured_chunk,
+            total_context_tokens,
+            mlxcel_core::metal_is_available(),
+        )
+    }
+
     fn prepare_embedding_prefill(&self) -> std::result::Result<(), String> {
         self.rope_state.activate_prepared()
     }
@@ -3430,6 +3469,39 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn metal_qsa_prefill_chunk_holds_reference_work_envelope() {
+        for (total_context_tokens, expected_chunk) in [
+            (65_536, 1_536),
+            (131_072, 768),
+            (262_144, 384),
+            (524_288, 192),
+            (1_048_576, 96),
+        ] {
+            let chunk = qwen4_prefill_chunk_size(1_536, total_context_tokens, true);
+            assert_eq!(chunk, expected_chunk);
+            assert!(
+                chunk * total_context_tokens <= QSA_METAL_PREFILL_WORK_BUDGET,
+                "{chunk} * {total_context_tokens} exceeds the calibrated QSA work envelope"
+            );
+        }
+    }
+
+    #[test]
+    fn qsa_prefill_chunk_preserves_overrides_backend_and_floor() {
+        assert_eq!(qwen4_prefill_chunk_size(0, 1_048_576, true), 0);
+        assert_eq!(qwen4_prefill_chunk_size(512, 131_072, true), 512);
+        assert_eq!(
+            qwen4_prefill_chunk_size(32, QSA_METAL_PREFILL_WORK_BUDGET * 2, true),
+            32
+        );
+        assert_eq!(
+            qwen4_prefill_chunk_size(1_536, QSA_METAL_PREFILL_WORK_BUDGET * 2, true),
+            QSA_METAL_PREFILL_MIN_CHUNK
+        );
+        assert_eq!(qwen4_prefill_chunk_size(1_536, 1_048_576, false), 1_536);
     }
 
     #[test]
