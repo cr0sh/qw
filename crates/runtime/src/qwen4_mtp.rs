@@ -3075,11 +3075,16 @@ mod tests {
         assert_eq!(restored.capacity(), 3);
 
         restored.reserve_prefill_capacity(7);
+        assert_eq!(restored.capacity(), 3, "capacity reservation is lazy");
+        restored.update(
+            mlxcel_core::zeros(&[1, 2, 1, 4], mlxcel_core::dtype::FLOAT32),
+            mlxcel_core::zeros(&[1, 2, 1, 4], mlxcel_core::dtype::FLOAT32),
+        );
         let round_trip = restored
             .fp8_snapshot_tensors()
             .expect("restored FP8 draft cache");
-        assert_eq!(mlxcel_core::array_shape(&round_trip.keys), [1, 2, 3, 4]);
-        assert_eq!(mlxcel_core::array_shape(&round_trip.values), [1, 2, 3, 4]);
+        assert_eq!(mlxcel_core::array_shape(&round_trip.keys), [1, 2, 4, 4]);
+        assert_eq!(mlxcel_core::array_shape(&round_trip.values), [1, 2, 4, 4]);
         assert_eq!(
             mlxcel_core::array_dtype(&round_trip.keys),
             mlxcel_core::dtype::UINT8
