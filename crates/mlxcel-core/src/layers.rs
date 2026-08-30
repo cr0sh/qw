@@ -3355,8 +3355,7 @@ impl MoESwitch {
             let output = Self::gather_sorted(&activated, &self.down_proj, &sorted_indices);
             ffi::squeeze_axis(&output, -2)
         } else {
-            let mut parts =
-                Vec::with_capacity(((routes + chunk_rows - 1) / chunk_rows) as usize);
+            let mut parts = Vec::with_capacity(((routes + chunk_rows - 1) / chunk_rows) as usize);
             let mut start = 0;
             while start < routes {
                 let stop = (start + chunk_rows).min(routes);
@@ -3390,7 +3389,6 @@ impl MoESwitch {
     /// indices: [..., top_k]
     /// output: [..., top_k, hidden_dim]
     pub fn forward(&self, x: &MlxArray, indices: &MlxArray) -> UniquePtr<MlxArray> {
-
         let x_shape = ffi::array_shape(x);
         let indices_shape = ffi::array_shape(indices);
         if x_shape.len() == 3
@@ -8155,5 +8153,4 @@ mod tests {
             "microchunked expert rows must preserve the monolithic routed output"
         );
     }
-
 }
