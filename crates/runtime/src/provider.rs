@@ -909,7 +909,15 @@ impl Qwen4Provider {
     }
 }
 
-fn metal_wired_limit(system_memory: u64, max_recommended_working_set: u64) -> Result<u64> {
+struct MetalMemoryLimits {
+    wired: u64,
+    allocator: u64,
+}
+
+fn metal_memory_limits(
+    system_memory: u64,
+    max_recommended_working_set: u64,
+) -> Result<MetalMemoryLimits> {
     ensure!(
         system_memory > 0,
         "failed to determine physical system memory for the Metal wired-memory limit"
@@ -919,7 +927,11 @@ fn metal_wired_limit(system_memory: u64, max_recommended_working_set: u64) -> Re
         "Metal did not report a maximum recommended working-set size"
     );
     let eighty_five_percent = ((u128::from(system_memory) * 85) / 100) as u64;
-    Ok(eighty_five_percent.min(max_recommended_working_set))
+    let wired = eighty_five_percent.min(max_recommended_working_set);
+    Ok(MetalMemoryLimits {
+        wired,
+        allocator: wired,
+    })
 }
 
 fn initialize_runtime() -> Result<()> {
@@ -943,18 +955,18 @@ fn initialize_runtime() -> Result<()> {
         // maximum, so enforce both ceilings: 85% of physical unified memory
         // and `recommendedMaxWorkingSetSize`.
         let max_recommended_working_set = mlxcel_core::get_wired_limit() as u64;
-        let wired_limit = metal_wired_limit(system_memory, max_recommended_working_set)
+        let limits = metal_memory_limits(system_memory, max_recommended_working_set)
             .map_err(|error| error.to_string())?;
-        mlxcel_core::set_wired_limit(wired_limit as usize);
+        mlxcel_core::set_wired_limit(limits.wired as usize);
+        mlxcel_core::memory::set_memory_limit(limits.allocator);
         tracing::info!(
-            wired_limit,
+            allocator_limit = limits.allocator,
+            wired_limit = limits.wired,
             system_memory,
             max_recommended_working_set,
-            "configured Metal wired-memory ceiling"
+            "configured MLX allocator and Metal wired-memory ceilings"
         );
-        const MLX_MEMORY_LIMIT: u64 = 45 * 1024 * 1024 * 1024;
         const MLX_CACHE_LIMIT: u64 = 512 * 1024 * 1024;
-        mlxcel_core::memory::set_memory_limit(MLX_MEMORY_LIMIT);
         mlxcel_core::memory::set_cache_limit(MLX_CACHE_LIMIT);
         Ok(())
     });
@@ -1031,15 +1043,23 @@ mod tests {
     }
 
     #[test]
-    fn metal_wired_limit_is_eighty_five_percent_or_device_max() {
+    fn mlx_allocator_limit_matches_metal_wired_ceiling() {
         let gib = 1024_u64.pow(3);
-        assert_eq!(
-            metal_wired_limit(128 * gib, 120 * gib).unwrap(),
-            108 * gib + 4 * gib / 5
-        );
-        assert_eq!(metal_wired_limit(128 * gib, 96 * gib).unwrap(), 96 * gib);
-        assert!(metal_wired_limit(0, 96 * gib).is_err());
-        assert!(metal_wired_limit(128 * gib, 0).is_err());
+        for (system_memory, recommended_max, expected) in [
+            (64 * gib, 60 * gib, 54 * gib + 2 * gib / 5),
+            (64 * gib, 52 * gib, 52 * gib),
+            (128 * gib, 120 * gib, 108 * gib + 4 * gib / 5),
+            (128 * gib, 96 * gib, 96 * gib),
+        ] {
+            let limits =
+                metal_memory_limits(system_memory, recommended_max).expect("valid limits");
+            assert_eq!(limits.wired, expected);
+            assert_eq!(limits.allocator, limits.wired);
+            assert!(limits.allocator <= limits.wired);
+        }
+
+        assert!(metal_memory_limits(0, 96 * gib).is_err());
+        assert!(metal_memory_limits(128 * gib, 0).is_err());
     }
 
     #[test]
