@@ -622,13 +622,13 @@ namespace {
 
     static QsaSparsePrefillKernelHolder& get_qsa_sparse_prefill_kernel() {
         static QsaSparsePrefillKernelHolder holder{
-            "qsa_sparse_prefill_attention", true};
+            "qsa_sparse_prefill_attention", true, std::nullopt};
         return holder;
     }
 
     static QsaSparsePrefillKernelHolder& get_qsa_sparse_prefill_raw_fp8_kernel() {
         static QsaSparsePrefillKernelHolder holder{
-            "qsa_sparse_prefill_attention_raw_fp8", false};
+            "qsa_sparse_prefill_attention_raw_fp8", false, std::nullopt};
         return holder;
     }
 }
