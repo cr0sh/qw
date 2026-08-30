@@ -42,7 +42,10 @@ use mlxcel_core::speculative::mtp::walk::WalkResult;
 use mlxcel_core::speculative::stochastic_accept::{
     DraftVerdict, sampler_is_greedy, verify_draft_token,
 };
-use mlxcel_core::{MlxArray, UniquePtr};
+use mlxcel_core::streams::{
+    install_thread_local_default_stream, new_thread_local_generation_stream,
+};
+use mlxcel_core::{MlxArray, MlxThreadLocalStream, UniquePtr};
 use tracing::debug;
 
 use crate::qwen_position::decode_rope_positions;
@@ -2238,11 +2241,19 @@ fn capture_mtp_final_snapshot(
     Ok(snapshot)
 }
 
-pub(crate) struct Qwen4MtpGenerator;
+pub(crate) struct Qwen4MtpGenerator {
+    /// Dedicated thread-local generation stream for MTP request dispatch.
+    ///
+    /// The handle resolves on the thread executing the request, which may
+    /// differ from the thread that constructed the generator.
+    generation_stream: Option<UniquePtr<MlxThreadLocalStream>>,
+}
 
 impl Qwen4MtpGenerator {
     pub(crate) fn new() -> Self {
-        Self
+        Self {
+            generation_stream: new_thread_local_generation_stream(),
+        }
     }
 
     pub(crate) fn generate_streaming<F: FnMut(i32) -> bool>(
@@ -2257,6 +2268,7 @@ impl Qwen4MtpGenerator {
         constraint: Option<&mut dyn TokenConstraint>,
         on_token: F,
     ) -> Result<MtpGeneration, String> {
+        install_thread_local_default_stream(self.generation_stream.as_ref());
         let prompt = mlxcel_core::from_slice_i32(
             prompt_tokens,
             &[1, i32::try_from(prompt_tokens.len()).unwrap_or(i32::MAX)],
