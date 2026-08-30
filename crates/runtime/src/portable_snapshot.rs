@@ -250,6 +250,7 @@ impl PromptSnapshot {
     }
 
     pub fn from_portable(portable: PortablePromptSnapshot) -> Result<Self, String> {
+        crate::provider::initialize_runtime().map_err(|error| error.to_string())?;
         match portable {
             PortablePromptSnapshot::Baseline(snapshot) => {
                 model_from_portable(snapshot, true, false).map(Self::Baseline)

@@ -2592,6 +2592,7 @@ impl Qwen4Model {
     }
 
     pub fn load(model_dir: &Path, kv_cache_mode: KVCacheMode) -> Result<Self> {
+        crate::provider::initialize_runtime()?;
         ensure!(
             model_dir.is_dir(),
             "model directory does not exist or is not a directory: {}",
