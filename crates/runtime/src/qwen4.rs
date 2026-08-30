@@ -443,6 +443,8 @@ pub(crate) struct Qwen4GatedDeltaNet {
     out_proj: UnifiedLinear,
 }
 
+const QWEN4_PREFILL_MICROCHUNK_TOKENS: i32 = 128;
+
 impl Qwen4GatedDeltaNet {
     pub(crate) fn forward(
         &self,
@@ -472,6 +474,46 @@ impl Qwen4GatedDeltaNet {
         mask: Option<&MlxArray>,
         mut cache: Option<&mut GatedDeltaCache>,
         snapshot: Option<(usize, &mut Vec<GdnRollbackSnapshot>)>,
+    ) -> UniquePtr<MlxArray> {
+        let shape = mlxcel_core::array_shape(inputs);
+        let sequence = shape[1];
+        if sequence <= QWEN4_PREFILL_MICROCHUNK_TOKENS || snapshot.is_some() {
+            return self.forward_hidden_chunk(inputs, mask, cache, snapshot, true);
+        }
+
+        let mut outputs = Vec::with_capacity(
+            ((sequence + QWEN4_PREFILL_MICROCHUNK_TOKENS - 1)
+                / QWEN4_PREFILL_MICROCHUNK_TOKENS) as usize,
+        );
+        let mut start = 0;
+        while start < sequence {
+            let stop = (start + QWEN4_PREFILL_MICROCHUNK_TOKENS).min(sequence);
+            let input_chunk =
+                mlxcel_core::slice(inputs, &[0, start, 0], &[shape[0], stop, shape[2]]);
+            let mask_chunk =
+                mask.map(|value| mlxcel_core::slice(value, &[0, start], &[shape[0], stop]));
+            outputs.push(self.forward_hidden_chunk(
+                &input_chunk,
+                mask_chunk.as_deref(),
+                cache.as_deref_mut(),
+                None,
+                false,
+            ));
+            start = stop;
+        }
+        if let Some(cache) = cache {
+            cache.advance(sequence);
+        }
+        mlxcel_core::concatenate_owned(&outputs, 1)
+    }
+
+    fn forward_hidden_chunk(
+        &self,
+        inputs: &MlxArray,
+        mask: Option<&MlxArray>,
+        mut cache: Option<&mut GatedDeltaCache>,
+        snapshot: Option<(usize, &mut Vec<GdnRollbackSnapshot>)>,
+        advance_cache: bool,
     ) -> UniquePtr<MlxArray> {
         let shape = mlxcel_core::array_shape(inputs);
         let b = shape[0];
@@ -653,7 +695,9 @@ impl Qwen4GatedDeltaNet {
         // Update cache state
         if let Some(c) = cache {
             c.state_cache = Some(new_state);
-            c.advance(s);
+            if advance_cache {
+                c.advance(s);
+            }
         }
 
         // Apply norm with gating
@@ -1094,6 +1138,97 @@ fn append_ple_conv_state(
     (input, tail)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn ple_convolution(
+    gated: &MlxArray,
+    normed: &MlxArray,
+    state: &MlxArray,
+    weight: &MlxArray,
+    state_len: i32,
+    dilation: i32,
+    channels: i32,
+    chunk_tokens: i32,
+) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+    let shape = mlxcel_core::array_shape(gated);
+    let (batch, sequence) = (shape[0], shape[1]);
+    if sequence <= chunk_tokens {
+        let (conv_input, next_state) = append_ple_conv_state(state, normed, state_len);
+        let conv = mlxcel_core::conv1d(
+            &conv_input,
+            weight,
+            1,
+            0,
+            dilation,
+            channels,
+        );
+        return (mlxcel_core::add(gated, &silu(&conv)), next_state);
+    }
+
+    let mut current_state = mlxcel_core::share(state);
+    let mut outputs =
+        Vec::with_capacity(((sequence + chunk_tokens - 1) / chunk_tokens) as usize);
+    let mut start = 0;
+    while start < sequence {
+        let stop = (start + chunk_tokens).min(sequence);
+        let gated_chunk =
+            mlxcel_core::slice(gated, &[0, start, 0], &[batch, stop, channels]);
+        let normed_chunk =
+            mlxcel_core::slice(normed, &[0, start, 0], &[batch, stop, channels]);
+        let (conv_input, next_state) =
+            append_ple_conv_state(&current_state, &normed_chunk, state_len);
+        let conv = mlxcel_core::conv1d(
+            &conv_input,
+            weight,
+            1,
+            0,
+            dilation,
+            channels,
+        );
+        outputs.push(mlxcel_core::add(&gated_chunk, &silu(&conv)));
+        current_state = next_state;
+        start = stop;
+    }
+    (
+        mlxcel_core::concatenate_owned(&outputs, 1),
+        current_state,
+    )
+}
+
+fn ple_shifted_tokens(
+    tokens: &[i32],
+    history: &[i32],
+    batch: usize,
+    sequence: usize,
+    ngram_size: usize,
+    eos_token_id: i32,
+) -> (Vec<i32>, Vec<i32>) {
+    let context_len = ngram_size - 1;
+    let mut shifted_tokens = Vec::with_capacity(batch * sequence * ngram_size);
+    let mut next_history = Vec::with_capacity(batch * context_len);
+    for row in 0..batch {
+        let mut row_history = history[row * context_len..(row + 1) * context_len].to_vec();
+        for &token in &tokens[row * sequence..(row + 1) * sequence] {
+            shifted_tokens.push(token);
+            for distance in 1..ngram_size {
+                let candidate = row_history[context_len - distance];
+                let crosses_eos = row_history[context_len - distance..]
+                    .iter()
+                    .skip(1)
+                    .any(|&value| value == eos_token_id);
+                shifted_tokens.push(if crosses_eos {
+                    eos_token_id
+                } else {
+                    candidate
+                });
+            }
+            row_history.rotate_left(1);
+            row_history[context_len - 1] = token;
+        }
+        next_history.extend_from_slice(&row_history);
+    }
+    (shifted_tokens, next_history)
+}
+
 impl Qwen4Ple {
     fn from_weights(
         weights: &WeightMap,
@@ -1178,6 +1313,39 @@ impl Qwen4Ple {
         cache: &mut GatedDeltaCache,
     ) -> Result<UniquePtr<MlxArray>, String> {
         let input_shape = mlxcel_core::array_shape(input_ids);
+        let sequence = input_shape[1];
+        if sequence <= QWEN4_PREFILL_MICROCHUNK_TOKENS {
+            return self.forward_chunk(hidden_states, input_ids, cache);
+        }
+
+        let hidden_shape = mlxcel_core::array_shape(hidden_states);
+        let mut outputs = Vec::with_capacity(
+            ((sequence + QWEN4_PREFILL_MICROCHUNK_TOKENS - 1)
+                / QWEN4_PREFILL_MICROCHUNK_TOKENS) as usize,
+        );
+        let mut start = 0;
+        while start < sequence {
+            let stop = (start + QWEN4_PREFILL_MICROCHUNK_TOKENS).min(sequence);
+            let hidden_chunk = mlxcel_core::slice(
+                hidden_states,
+                &[0, start, 0],
+                &[hidden_shape[0], stop, hidden_shape[2]],
+            );
+            let id_chunk =
+                mlxcel_core::slice(input_ids, &[0, start], &[input_shape[0], stop]);
+            outputs.push(self.forward_chunk(&hidden_chunk, &id_chunk, cache)?);
+            start = stop;
+        }
+        Ok(mlxcel_core::concatenate_owned(&outputs, 1))
+    }
+
+    fn forward_chunk(
+        &self,
+        hidden_states: &MlxArray,
+        input_ids: &MlxArray,
+        cache: &mut GatedDeltaCache,
+    ) -> Result<UniquePtr<MlxArray>, String> {
+        let input_shape = mlxcel_core::array_shape(input_ids);
         let batch = input_shape[0] as usize;
         let sequence = input_shape[1] as usize;
         let bytes = mlxcel_core::array_to_raw_bytes(input_ids);
@@ -1192,41 +1360,27 @@ impl Qwen4Ple {
         if cache.ple_token_history.len() != batch * context_len {
             cache.ple_token_history = vec![self.eos_token_id; batch * context_len];
         }
+        let (shifted_tokens, next_history) = ple_shifted_tokens(
+            &tokens,
+            &cache.ple_token_history,
+            batch,
+            sequence,
+            self.ngram_size,
+            self.eos_token_id,
+        );
         let mut indices = Vec::with_capacity(batch * sequence * self.head_sizes.len());
-        let mut next_history = Vec::with_capacity(batch * context_len);
-        for row in 0..batch {
-            let mut history =
-                cache.ple_token_history[row * context_len..(row + 1) * context_len].to_vec();
-            for &token in &tokens[row * sequence..(row + 1) * sequence] {
-                let mut shifted = Vec::with_capacity(self.ngram_size);
-                shifted.push(token);
-                for distance in 1..self.ngram_size {
-                    let candidate = history[context_len - distance];
-                    let crosses_eos = history[context_len - distance..]
-                        .iter()
-                        .skip(1)
-                        .any(|&value| value == self.eos_token_id);
-                    shifted.push(if crosses_eos {
-                        self.eos_token_id
-                    } else {
-                        candidate
-                    });
+        for shifted in shifted_tokens.chunks_exact(self.ngram_size) {
+            for ngram in 2..=self.ngram_size {
+                let mut mixed = (shifted[0] as u64).wrapping_mul(self.multipliers[0]);
+                for position in 1..ngram {
+                    mixed ^=
+                        (shifted[position] as u64).wrapping_mul(self.multipliers[position]);
                 }
-                for ngram in 2..=self.ngram_size {
-                    let mut mixed = (shifted[0] as u64).wrapping_mul(self.multipliers[0]);
-                    for position in 1..ngram {
-                        mixed ^=
-                            (shifted[position] as u64).wrapping_mul(self.multipliers[position]);
-                    }
-                    let first_head = (ngram - 2) * self.heads_per_ngram;
-                    for head in first_head..first_head + self.heads_per_ngram {
-                        indices.push(self.head_offsets[head] + mixed % self.head_sizes[head]);
-                    }
+                let first_head = (ngram - 2) * self.heads_per_ngram;
+                for head in first_head..first_head + self.heads_per_ngram {
+                    indices.push(self.head_offsets[head] + mixed % self.head_sizes[head]);
                 }
-                history.rotate_left(1);
-                history[context_len - 1] = token;
             }
-            next_history.extend_from_slice(&history);
         }
         cache.ple_token_history = next_history;
         let indices = indices
@@ -1313,18 +1467,19 @@ impl Qwen4Ple {
                     mlxcel_core::array_dtype(hidden_states),
                 )
             });
-        let (conv_input, next_state) =
-            append_ple_conv_state(&state, &normed, self.conv_state_len as i32);
-        cache.ple_conv_state = Some(next_state);
-        let conv = mlxcel_core::conv1d(
-            &conv_input,
+        let channels = (self.hc_count * self.hidden_size) as i32;
+        let (output, next_state) = ple_convolution(
+            &gated,
+            &normed,
+            &state,
             &self.conv1d_weight,
-            1,
-            0,
+            self.conv_state_len as i32,
             self.ngram_size as i32,
-            (self.hc_count * self.hidden_size) as i32,
+            channels,
+            QWEN4_PREFILL_MICROCHUNK_TOKENS,
         );
-        Ok(mlxcel_core::add(&gated, &silu(&conv)))
+        cache.ple_conv_state = Some(next_state);
+        Ok(output)
     }
 }
 
@@ -3322,6 +3477,195 @@ mod tests {
         let equal = mlxcel_core::allclose(batched, &sequential, 0.0, 0.0);
         mlxcel_core::eval(&equal);
         assert!(mlxcel_core::item_bool(&equal));
+    }
+
+    fn assert_arrays_close(left: &MlxArray, right: &MlxArray, tolerance: f32) {
+        assert_eq!(
+            mlxcel_core::array_shape(left),
+            mlxcel_core::array_shape(right)
+        );
+        let close = mlxcel_core::allclose(left, right, tolerance, tolerance);
+        mlxcel_core::eval(&close);
+        assert!(mlxcel_core::item_bool(&close));
+    }
+
+    fn test_regular_linear(out_dim: i32, in_dim: i32, salt: i32) -> UnifiedLinear {
+        let values = (0..out_dim * in_dim)
+            .map(|index| 0.01 * (((index * 7 + salt) % 19) as f32 - 9.0))
+            .collect::<Vec<_>>();
+        let mut weights = WeightMap::new();
+        weights.insert(
+            "projection.weight".to_owned(),
+            mlxcel_core::from_slice_f32(&values, &[out_dim, in_dim]),
+        );
+        UnifiedLinear::from_weights(&weights, "projection", 64, 4)
+            .expect("regular test projection")
+    }
+
+    #[test]
+    fn gated_delta_prefill_microchunks_match_monolithic_output_and_cache() {
+        const SEQUENCE: i32 = 131;
+        const HIDDEN: i32 = 2;
+        const KEY_DIM: i32 = 2;
+        const VALUE_DIM: i32 = 2;
+        const CONV_DIM: i32 = 6;
+
+        let conv_values = (0..CONV_DIM * 3)
+            .map(|index| 0.015 * (((index * 5) % 17) as f32 - 8.0))
+            .collect::<Vec<_>>();
+        let layer = Qwen4GatedDeltaNet {
+            hidden_size: HIDDEN as usize,
+            num_v_heads: 1,
+            num_k_heads: 1,
+            head_k_dim: KEY_DIM as usize,
+            head_v_dim: VALUE_DIM as usize,
+            key_dim: KEY_DIM as usize,
+            value_dim: VALUE_DIM as usize,
+            conv_kernel_size: 3,
+            conv_dim: CONV_DIM as usize,
+            conv1d_weight: mlxcel_core::from_slice_f32(
+                &conv_values,
+                &[CONV_DIM, 3, 1],
+            ),
+            in_proj_qkv: test_regular_linear(CONV_DIM, HIDDEN, 1),
+            aux_projections: Qwen4GatedAuxProjections::Separate {
+                z: test_regular_linear(VALUE_DIM, HIDDEN, 3),
+                b: test_regular_linear(1, HIDDEN, 5),
+                a: test_regular_linear(1, HIDDEN, 7),
+            },
+            dt_bias: mlxcel_core::from_slice_f32(&[0.1], &[1]),
+            a_log: mlxcel_core::from_slice_f32(&[-0.2], &[1]),
+            norm: RMSNormGated::new(
+                mlxcel_core::from_slice_f32(&[1.0; VALUE_DIM as usize], &[VALUE_DIM]),
+                1e-6,
+            ),
+            out_proj: test_regular_linear(HIDDEN, VALUE_DIM, 11),
+        };
+        let input_values = (0..SEQUENCE * HIDDEN)
+            .map(|index| 0.02 * ((index % 29) as f32 - 14.0))
+            .collect::<Vec<_>>();
+        let inputs =
+            mlxcel_core::from_slice_f32(&input_values, &[1, SEQUENCE, HIDDEN]);
+
+        let mut reference_cache = GatedDeltaCache::new();
+        let reference =
+            layer.forward_hidden_chunk(&inputs, None, Some(&mut reference_cache), None, true);
+        let mut chunked_cache = GatedDeltaCache::new();
+        let chunked =
+            layer.forward_hidden_internal(&inputs, None, Some(&mut chunked_cache), None);
+
+        assert_arrays_close(&chunked, &reference, 1e-5);
+        assert_arrays_close(
+            chunked_cache.conv_state.as_deref().expect("chunked conv tail"),
+            reference_cache
+                .conv_state
+                .as_deref()
+                .expect("reference conv tail"),
+            0.0,
+        );
+        assert_arrays_close(
+            chunked_cache
+                .state_cache
+                .as_deref()
+                .expect("chunked recurrent state"),
+            reference_cache
+                .state_cache
+                .as_deref()
+                .expect("reference recurrent state"),
+            1e-5,
+        );
+        assert_eq!(chunked_cache.offset, SEQUENCE);
+        assert_eq!(reference_cache.offset, SEQUENCE);
+    }
+
+    #[test]
+    fn ple_convolution_microchunks_preserve_output_and_uneven_tail() {
+        const SEQUENCE: i32 = 7;
+        const CHANNELS: i32 = 2;
+        const STATE_LEN: i32 = 4;
+        let state = mlxcel_core::from_slice_f32(
+            &[0.1, -0.2, 0.3, -0.4, 0.5, -0.6, 0.7, -0.8],
+            &[1, STATE_LEN, CHANNELS],
+        );
+        let gated_values = (0..SEQUENCE * CHANNELS)
+            .map(|index| 0.03 * (index as f32 - 5.0))
+            .collect::<Vec<_>>();
+        let normed_values = (0..SEQUENCE * CHANNELS)
+            .map(|index| 0.02 * (((index * 3) % 11) as f32 - 5.0))
+            .collect::<Vec<_>>();
+        let gated =
+            mlxcel_core::from_slice_f32(&gated_values, &[1, SEQUENCE, CHANNELS]);
+        let normed =
+            mlxcel_core::from_slice_f32(&normed_values, &[1, SEQUENCE, CHANNELS]);
+        let weight = mlxcel_core::from_slice_f32(
+            &[0.2, -0.1, 0.05, -0.15, 0.25, 0.1],
+            &[CHANNELS, 3, 1],
+        );
+
+        let (reference, reference_tail) = ple_convolution(
+            &gated,
+            &normed,
+            &state,
+            &weight,
+            STATE_LEN,
+            2,
+            CHANNELS,
+            SEQUENCE,
+        );
+        let (chunked, chunked_tail) =
+            ple_convolution(&gated, &normed, &state, &weight, STATE_LEN, 2, CHANNELS, 3);
+        assert_arrays_close(&chunked, &reference, 0.0);
+        assert_arrays_close(&chunked_tail, &reference_tail, 0.0);
+        assert_eq!(
+            mlxcel_core::array_shape(&chunked_tail).as_slice(),
+            &[1, STATE_LEN, CHANNELS]
+        );
+    }
+
+    #[test]
+    fn ple_token_history_is_identical_across_uneven_microchunks() {
+        const BATCH: usize = 2;
+        const SEQUENCE: usize = 7;
+        const NGRAM: usize = 4;
+        const EOS: i32 = -1;
+        let tokens = vec![
+            1, 2, 3, 4, 5, 6, 7, 11, 12, 13, 14, 15, 16, 17,
+        ];
+        let initial_history = vec![EOS, EOS, EOS, 91, 92, 93];
+        let (reference_shifted, reference_history) = ple_shifted_tokens(
+            &tokens,
+            &initial_history,
+            BATCH,
+            SEQUENCE,
+            NGRAM,
+            EOS,
+        );
+
+        let mut history = initial_history;
+        let mut shifted_by_row = vec![Vec::new(); BATCH];
+        for (start, stop) in [(0, 3), (3, 6), (6, 7)] {
+            let mut chunk_tokens = Vec::with_capacity(BATCH * (stop - start));
+            for row in 0..BATCH {
+                chunk_tokens.extend_from_slice(
+                    &tokens[row * SEQUENCE + start..row * SEQUENCE + stop],
+                );
+            }
+            let (shifted, next_history) = ple_shifted_tokens(
+                &chunk_tokens,
+                &history,
+                BATCH,
+                stop - start,
+                NGRAM,
+                EOS,
+            );
+            for (row, rows) in shifted.chunks_exact((stop - start) * NGRAM).enumerate() {
+                shifted_by_row[row].extend_from_slice(rows);
+            }
+            history = next_history;
+        }
+        let chunked_shifted = shifted_by_row.into_iter().flatten().collect::<Vec<_>>();
+        assert_eq!(chunked_shifted, reference_shifted);
+        assert_eq!(history, reference_history);
     }
 
     #[test]

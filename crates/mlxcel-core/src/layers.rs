@@ -3287,6 +3287,8 @@ pub struct MoESwitch {
     pub num_experts: i32,
 }
 
+const MOE_PREFILL_EXPERT_CHUNK_ROWS: i32 = 128;
+
 impl MoESwitch {
     /// Create a new MoE switch layer
     pub fn new(
@@ -3325,7 +3327,12 @@ impl MoESwitch {
         }
     }
 
-    fn forward_sorted_prefill(&self, x: &MlxArray, indices: &MlxArray) -> UniquePtr<MlxArray> {
+    fn forward_sorted_prefill_with_chunk(
+        &self,
+        x: &MlxArray,
+        indices: &MlxArray,
+        chunk_rows: i32,
+    ) -> UniquePtr<MlxArray> {
         let x_shape = ffi::array_shape(x);
         let indices_shape = ffi::array_shape(indices);
         let (batch, sequence, hidden) = (x_shape[0], x_shape[1], x_shape[2]);
@@ -3338,21 +3345,44 @@ impl MoESwitch {
         let flat_indices = ffi::reshape(indices, &[routes]);
         let order = ffi::argsort(&flat_indices, -1);
         let sorted_indices = ffi::take(&flat_indices, &order, 0);
-        let sorted_input = ffi::take(&flat_input, &order, 0);
-        let sorted_input = ffi::expand_dims(&sorted_input, -2);
 
-        let gate = Self::gather_sorted(&sorted_input, &self.gate_proj, &sorted_indices);
-        let up = Self::gather_sorted(&sorted_input, &self.up_proj, &sorted_indices);
-        let activated = ffi::compiled_swiglu_activation(&gate, &up);
-        let output = Self::gather_sorted(&activated, &self.down_proj, &sorted_indices);
-        let output = ffi::squeeze_axis(&output, -2);
-
+        let output = if routes <= chunk_rows {
+            let sorted_input = ffi::take(&flat_input, &order, 0);
+            let sorted_input = ffi::expand_dims(&sorted_input, -2);
+            let gate = Self::gather_sorted(&sorted_input, &self.gate_proj, &sorted_indices);
+            let up = Self::gather_sorted(&sorted_input, &self.up_proj, &sorted_indices);
+            let activated = ffi::compiled_swiglu_activation(&gate, &up);
+            let output = Self::gather_sorted(&activated, &self.down_proj, &sorted_indices);
+            ffi::squeeze_axis(&output, -2)
+        } else {
+            let mut parts =
+                Vec::with_capacity(((routes + chunk_rows - 1) / chunk_rows) as usize);
+            let mut start = 0;
+            while start < routes {
+                let stop = (start + chunk_rows).min(routes);
+                let chunk_order = ffi::slice(&order, &[start], &[stop]);
+                let chunk_indices = ffi::slice(&sorted_indices, &[start], &[stop]);
+                let chunk_input = ffi::take(&flat_input, &chunk_order, 0);
+                let chunk_input = ffi::expand_dims(&chunk_input, -2);
+                let gate = Self::gather_sorted(&chunk_input, &self.gate_proj, &chunk_indices);
+                let up = Self::gather_sorted(&chunk_input, &self.up_proj, &chunk_indices);
+                let activated = ffi::compiled_swiglu_activation(&gate, &up);
+                let output = Self::gather_sorted(&activated, &self.down_proj, &chunk_indices);
+                parts.push(ffi::squeeze_axis(&output, -2));
+                start = stop;
+            }
+            crate::concatenate_owned(&parts, 0)
+        };
         let inverse = ffi::argsort(&order, -1);
         let restored = ffi::take(&output, &inverse, 0);
         let output_width = *ffi::array_shape(&restored)
             .last()
             .expect("MoE expert output has a hidden axis");
         ffi::reshape(&restored, &[batch, sequence, top_k, output_width])
+    }
+
+    fn forward_sorted_prefill(&self, x: &MlxArray, indices: &MlxArray) -> UniquePtr<MlxArray> {
+        self.forward_sorted_prefill_with_chunk(x, indices, MOE_PREFILL_EXPERT_CHUNK_ROWS)
     }
 
     /// Forward pass with expert indices.
@@ -8071,6 +8101,59 @@ mod tests {
                 "packed key must never equal the empty sentinel"
             );
         }
+    }
+
+    #[test]
+    fn sorted_moe_microchunks_match_monolithic_expert_execution() {
+        const EXPERTS: i32 = 3;
+        const WIDTH: i32 = 64;
+        const SEQUENCE: i32 = 67;
+        const TOP_K: i32 = 2;
+
+        fn expert_weight(out_dim: i32, salt: i32) -> QuantizedWeight {
+            let values = (0..EXPERTS * out_dim * WIDTH)
+                .map(|index| 0.02 * (((index * 11 + salt) % 31) as f32 - 15.0))
+                .collect::<Vec<_>>();
+            let weight = ffi::from_slice_f32(&values, &[EXPERTS, out_dim, WIDTH]);
+            let weight = ffi::astype(&weight, crate::dtype::FLOAT16);
+            QuantizedWeight::new(
+                ffi::quantize_weights_w(&weight, WIDTH, 4),
+                ffi::quantize_weights_scales(&weight, WIDTH, 4),
+                ffi::quantize_weights_biases(&weight, WIDTH, 4),
+                WIDTH,
+                4,
+            )
+        }
+
+        let switch = MoESwitch::new(
+            expert_weight(WIDTH, 3),
+            expert_weight(WIDTH, 7),
+            expert_weight(WIDTH, 13),
+            EXPERTS,
+        );
+        let input_values = (0..SEQUENCE * WIDTH)
+            .map(|index| 0.01 * ((index % 37) as f32 - 18.0))
+            .collect::<Vec<_>>();
+        let input = ffi::from_slice_f32(&input_values, &[1, SEQUENCE, WIDTH]);
+        let indices = (0..SEQUENCE * TOP_K)
+            .map(|index| (index * 2 + index / TOP_K) % EXPERTS)
+            .collect::<Vec<_>>();
+        let indices = ffi::from_slice_i32(&indices, &[1, SEQUENCE, TOP_K]);
+
+        let reference =
+            switch.forward_sorted_prefill_with_chunk(&input, &indices, SEQUENCE * TOP_K);
+        let chunked = switch.forward_sorted_prefill_with_chunk(
+            &input,
+            &indices,
+            MOE_PREFILL_EXPERT_CHUNK_ROWS,
+        );
+        assert_eq!(ffi::array_shape(&chunked), ffi::array_shape(&reference));
+        let equal = crate::allclose(&chunked, &reference, 1e-5, 1e-5);
+        ffi::eval(&equal);
+        assert!(
+            ffi::item_bool(&equal),
+            "microchunked expert rows must preserve the monolithic routed output"
+        );
     }
 
 }
