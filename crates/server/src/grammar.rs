@@ -179,7 +179,6 @@ struct ToolCallState {
     inner: Constraint,
     token_bytes: Arc<Vec<Vec<u8>>>,
     marker_prefix: usize,
-    marker_tokens: Vec<TokenId>,
     active: bool,
     accept_on_accepting: bool,
 }
@@ -190,7 +189,6 @@ impl ToolCallState {
             inner: self.inner.deep_clone(),
             token_bytes: Arc::clone(&self.token_bytes),
             marker_prefix: self.marker_prefix,
-            marker_tokens: self.marker_tokens.clone(),
             active: self.active,
             accept_on_accepting: self.accept_on_accepting,
         }
@@ -215,7 +213,6 @@ impl GuidanceConstraint {
                 inner,
                 token_bytes,
                 marker_prefix: 0,
-                marker_tokens: Vec::with_capacity(TOOL_CALL_OPEN.len()),
                 active: false,
                 accept_on_accepting,
             }),
@@ -230,13 +227,13 @@ impl GuidanceConstraint {
 
 fn tool_call_lark(tools: &[ChatTool], parallel_tool_calls: bool) -> Result<String> {
     ensure!(!tools.is_empty(), "tool-call grammar requires at least one tool");
-    let mut grammar = String::from("start: preamble tool_call");
+    let mut grammar = String::from("start: function \"</tool_call>\"");
     if parallel_tool_calls {
-        grammar.push('+');
+        grammar.push_str(
+            " tool_call*\ntool_call: \"<tool_call>\" function \"</tool_call>\"",
+        );
     }
-    grammar.push_str(
-        "\npreamble[lazy]: /(?s:.*)/\ntool_call: \"<tool_call>\" function \"</tool_call>\"\nfunction: ",
-    );
+    grammar.push_str("\nfunction: ");
     for index in 0..tools.len() {
         if index != 0 {
             grammar.push_str(" | ");
@@ -497,47 +494,25 @@ impl ToolCallState {
         token: TokenId,
     ) -> std::result::Result<ConstraintCommit, String> {
         let token_index = token as usize;
-        let token_len = self
-            .token_bytes
-            .get(token_index)
-            .ok_or_else(|| "tool-call constraint received a token outside the vocabulary".to_string())?
-            .len();
-        let mut current_retained = false;
-        for index in 0..token_len {
-            let byte = self.token_bytes[token_index][index];
+        let token_bytes = self.token_bytes.get(token_index).ok_or_else(|| {
+            "tool-call constraint received a token outside the vocabulary".to_string()
+        })?;
+        for (index, &byte) in token_bytes.iter().enumerate() {
             if byte == TOOL_CALL_OPEN[self.marker_prefix] {
-                if self.marker_prefix == 0 {
-                    self.marker_tokens.clear();
-                }
-                if !current_retained {
-                    self.marker_tokens.push(token);
-                    current_retained = true;
-                }
                 self.marker_prefix += 1;
                 if self.marker_prefix == TOOL_CALL_OPEN.len() {
                     self.marker_prefix = 0;
-                    let marker_tokens = std::mem::take(&mut self.marker_tokens);
+                    if index + 1 != token_bytes.len() {
+                        return Err(
+                            "tool-call marker completed before the end of a token".to_string(),
+                        );
+                    }
                     self.inner.start_without_prompt();
-                    self.inner
-                        .force_tokens(&marker_tokens)
-                        .map_err(|error| error.to_string())?;
                     self.active = true;
-                    let accepting =
-                        self.accept_on_accepting && self.inner.parser.is_accepting();
-                    return Ok(ConstraintCommit {
-                        backtrack: 0,
-                        tokens: vec![token as i32],
-                        accept: accepting,
-                    });
+                    return Ok(ConstraintCommit::token(token as i32));
                 }
             } else {
-                self.marker_tokens.clear();
-                current_retained = false;
                 self.marker_prefix = usize::from(byte == TOOL_CALL_OPEN[0]);
-                if self.marker_prefix != 0 {
-                    self.marker_tokens.push(token);
-                    current_retained = true;
-                }
             }
         }
         Ok(ConstraintCommit::token(token as i32))
@@ -996,6 +971,25 @@ mod tests {
             constraint.compute_mask(&logits, &output),
             Ok(ConstraintMask::PassThrough)
         ));
+    }
+
+    #[test]
+    fn tool_constraint_rejects_a_token_with_bytes_after_the_marker() {
+        let factory = GrammarFactory::single_byte().expect("single-byte grammar");
+        let tools = [tool("empty", json!({"type":"object","properties":{}}))];
+        let mut constraint = factory
+            .compile(&OutputFormat::Text, &tools, false)
+            .expect("compile tool grammar")
+            .expect("constraint");
+        let GuidanceState::ToolCall(state) = &mut constraint.inner else {
+            panic!("tool-call constraint");
+        };
+        state.token_bytes = Arc::new(vec![b"<tool_call>x".to_vec()]);
+
+        assert_eq!(
+            constraint.commit_token(0),
+            Err("tool-call marker completed before the end of a token".to_string())
+        );
     }
 
     #[test]
