@@ -2797,6 +2797,39 @@ impl LanguageModel for Qwen4Model {
         logits
     }
 
+    fn forward_prefill_chunk(
+        &self,
+        input_ids: &MlxArray,
+        _caches: &mut [KVCache],
+        _mask: Option<&MlxArray>,
+        last_pos: usize,
+    ) -> UniquePtr<MlxArray> {
+        let sequence_length = mlxcel_core::array_shape(input_ids)[1];
+        let rope_delta = self.rope_state.rope_delta();
+        let (anchor, offset) = self.sequence_state.with_internal(|caches| {
+            let cache_offset = caches.first().map(Qwen4LayerCache::offset).unwrap_or(0);
+            let position_ids =
+                rope_delta.map(|delta| decode_rope_positions(cache_offset, sequence_length, delta));
+            let hidden =
+                self.forward_backbone_with_inputs(input_ids, None, caches, position_ids.as_deref());
+            let shape = mlxcel_core::array_shape(&hidden);
+            let position = i32::try_from(last_pos).unwrap_or(i32::MAX);
+            assert!(
+                position < shape[1],
+                "prefill anchor position is outside the input sequence"
+            );
+            let anchor = mlxcel_core::slice(
+                &hidden,
+                &[0, position, 0],
+                &[shape[0], position + 1, 1],
+            );
+            let offset = caches.first().map(Qwen4LayerCache::offset).unwrap_or(0);
+            (anchor, offset)
+        });
+        self.rope_state.set_position(offset);
+        anchor
+    }
+
     fn forward_last_logits(
         &self,
         input_ids: &MlxArray,

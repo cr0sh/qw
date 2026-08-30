@@ -799,14 +799,14 @@ const DEFAULT_METAL_PREFILL_CHUNK: usize = 1536;
 /// from `MLXCEL_PREFILL_CHUNK` (tokens). Unset defaults to 1536 on Metal and
 /// [`DEFAULT_PREFILL_CHUNK`] elsewhere; `0` forces single-pass prefill.
 ///
-/// When enabled, the prompt is fed through `forward_last_logits` in chunks of
-/// this many tokens, evaluating each chunk before the next so the lazy graph
+/// When enabled, the prompt is fed through consecutive model passes in chunks
+/// of this many tokens, evaluating each chunk before the next so the lazy graph
 /// (and its transients) never spans the whole prompt. This bounds prefill
 /// memory the way the server's `prefill_chunk_size` path does: sliding-window
 /// KV caches rotate down to their window between chunks instead of holding
 /// every prompt token for one giant pass, and per-chunk attention scores,
-/// masks, and logits stay chunk-sized (issue #672). Models that cannot run a
-/// multi-call prefill opt out via
+/// masks, and any projected logits stay chunk-sized (issue #672). Models that
+/// cannot run a multi-call prefill opt out via
 /// [`LanguageModel::supports_chunked_prefill`], mirroring mlx-vlm's
 /// `chunked_prefill_policy`.
 pub fn prefill_chunk_len() -> usize {
@@ -845,10 +845,10 @@ pub fn effective_prefill_chunk(
 /// return the `[1, 1, vocab]` logits of the final prompt position.
 ///
 /// Behavior-equivalent to one `forward_last_logits` over the whole prompt:
-/// each `forward` continues from the KV caches exactly like the multi-token
+/// each backbone pass continues from the KV caches exactly like the multi-token
 /// verify / server chunked-prefill paths, and only the last chunk's final
-/// position is sampled. Intermediate chunks still project a single hidden row
-/// through the LM head (their `[1, 1, vocab]` result is dropped).
+/// position is projected and sampled when the model supplies a cheaper
+/// intermediate-chunk evaluation anchor.
 fn chunked_prefill_last_logits<M: LanguageModel + ?Sized>(
     model: &M,
     caches: &mut [KVCache],
@@ -861,13 +861,17 @@ fn chunked_prefill_last_logits<M: LanguageModel + ?Sized>(
     model.reserve_prefill_capacity(caches, total_tokens);
     let mut logits: Option<UniquePtr<MlxArray>> = None;
     let mut processed_tokens = processed_before;
-    for piece in prompt_tokens.chunks(chunk) {
+    let mut pieces = prompt_tokens.chunks(chunk).peekable();
+    while let Some(piece) = pieces.next() {
         let input = ffi::from_slice_i32(piece, &[1, piece.len() as i32]);
-        let piece_logits =
-            model.forward_last_logits(&input, caches, None, piece.len().saturating_sub(1));
+        let piece_output = if pieces.peek().is_none() {
+            model.forward_last_logits(&input, caches, None, piece.len().saturating_sub(1))
+        } else {
+            model.forward_prefill_chunk(&input, caches, None, piece.len().saturating_sub(1))
+        };
         // Evaluate now so this chunk's transients are released before the
-        // next chunk's graph is built; the result is only [1, 1, vocab].
-        ffi::eval(&piece_logits);
+        // next chunk's graph is built. Intermediate outputs are discarded.
+        ffi::eval(&piece_output);
         processed_tokens += piece.len();
         crate::memory::trace_snapshot(
             "baseline.prefill.chunk_complete",
@@ -875,8 +879,8 @@ fn chunked_prefill_last_logits<M: LanguageModel + ?Sized>(
             total_tokens,
         );
         // Return freed buffers to the OS between chunks. Every chunk sees a
-        // different key length, so its transients (scores, masks, logits)
-        // land in differently-sized allocations; without this the CUDA
+        // different key length, so its transients (scores, masks, optional
+        // logits) land in differently-sized allocations; without this the CUDA
         // async-malloc pool accumulates each shape's high-water mark across
         // the whole prompt (measured ~84 GB system peak for a 32k gemma-4-31b
         // chunked prefill whose live set is ~30 GB, issue #672).
@@ -891,7 +895,7 @@ fn chunked_prefill_last_logits<M: LanguageModel + ?Sized>(
             processed_tokens,
             total_tokens,
         );
-        logits = Some(piece_logits);
+        logits = Some(piece_output);
     }
     logits.expect("chunked_prefill_last_logits requires a non-empty prompt")
 }
@@ -1086,6 +1090,24 @@ pub trait LanguageModel {
     ) -> UniquePtr<MlxArray> {
         let logits = self.forward(input_ids, caches, mask);
         logits_at_position(&logits, last_pos)
+    }
+
+    /// Forward-pass evaluation anchor for a non-final chunk of single-sequence
+    /// prefill. The caller evaluates and discards the returned array.
+    ///
+    /// The default preserves the previous behavior exactly by projecting the
+    /// selected row through [`Self::forward_last_logits`]. Models with
+    /// model-owned cache state may override this to return a smaller hidden
+    /// anchor, provided evaluating it completes the same backbone pass and
+    /// cache/state mutations.
+    fn forward_prefill_chunk(
+        &self,
+        input_ids: &MlxArray,
+        caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+        last_pos: usize,
+    ) -> UniquePtr<MlxArray> {
+        self.forward_last_logits(input_ids, caches, mask, last_pos)
     }
 
     /// Forward with pre-computed embeddings (for VLM prefill)
@@ -3816,6 +3838,126 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct PrefillCallTracker {
+        seen: std::cell::RefCell<Vec<i32>>,
+        calls: std::cell::RefCell<Vec<(&'static str, Vec<i32>)>>,
+    }
+
+    impl PrefillCallTracker {
+        fn record(&self, kind: &'static str, input_ids: &MlxArray) -> f32 {
+            ffi::eval(input_ids);
+            let tokens = ffi::array_to_raw_bytes(input_ids)
+                .chunks_exact(4)
+                .map(|bytes| i32::from_ne_bytes(bytes.try_into().expect("i32 token bytes")))
+                .collect::<Vec<_>>();
+            let snapshot = {
+                let mut seen = self.seen.borrow_mut();
+                seen.extend(tokens);
+                seen.clone()
+            };
+            let total = snapshot.iter().sum::<i32>() as f32;
+            self.calls.borrow_mut().push((kind, snapshot));
+            total
+        }
+
+        fn logits(&self, input_ids: &MlxArray) -> UniquePtr<MlxArray> {
+            let total = self.record("logits", input_ids);
+            ffi::from_slice_f32(
+                &[total, total + 1.0, total + 2.0, total + 3.0],
+                &[1, 1, 4],
+            )
+        }
+    }
+
+    #[derive(Default)]
+    struct HiddenOnlyPrefillStubModel {
+        tracker: PrefillCallTracker,
+    }
+
+    impl LanguageModel for HiddenOnlyPrefillStubModel {
+        fn forward(
+            &self,
+            _input_ids: &MlxArray,
+            _caches: &mut [KVCache],
+            _mask: Option<&MlxArray>,
+        ) -> UniquePtr<MlxArray> {
+            panic!("tracking stub must use its last-logits override")
+        }
+
+        fn forward_last_logits(
+            &self,
+            input_ids: &MlxArray,
+            _caches: &mut [KVCache],
+            _mask: Option<&MlxArray>,
+            _last_pos: usize,
+        ) -> UniquePtr<MlxArray> {
+            self.tracker.logits(input_ids)
+        }
+
+        fn forward_prefill_chunk(
+            &self,
+            input_ids: &MlxArray,
+            _caches: &mut [KVCache],
+            _mask: Option<&MlxArray>,
+            last_pos: usize,
+        ) -> UniquePtr<MlxArray> {
+            assert_eq!(last_pos + 1, ffi::array_shape(input_ids)[1] as usize);
+            let total = self.tracker.record("hidden", input_ids);
+            ffi::from_slice_f32(&[total], &[1, 1, 1])
+        }
+
+        fn make_caches(&self) -> Vec<KVCache> {
+            vec![KVCache::new()]
+        }
+
+        fn num_layers(&self) -> usize {
+            1
+        }
+
+        fn eos_token_ids(&self) -> Vec<i32> {
+            vec![99]
+        }
+    }
+
+    #[derive(Default)]
+    struct FallbackPrefillStubModel {
+        tracker: PrefillCallTracker,
+    }
+
+    impl LanguageModel for FallbackPrefillStubModel {
+        fn forward(
+            &self,
+            _input_ids: &MlxArray,
+            _caches: &mut [KVCache],
+            _mask: Option<&MlxArray>,
+        ) -> UniquePtr<MlxArray> {
+            panic!("tracking stub must use its last-logits override")
+        }
+
+        fn forward_last_logits(
+            &self,
+            input_ids: &MlxArray,
+            _caches: &mut [KVCache],
+            _mask: Option<&MlxArray>,
+            _last_pos: usize,
+        ) -> UniquePtr<MlxArray> {
+            self.tracker.logits(input_ids)
+        }
+
+        fn make_caches(&self) -> Vec<KVCache> {
+            vec![KVCache::new()]
+        }
+
+        fn num_layers(&self) -> usize {
+            1
+        }
+
+        fn eos_token_ids(&self) -> Vec<i32> {
+            vec![99]
+        }
+    }
+
     struct CheckpointStubModel {
         supports_chunking: bool,
         seen: std::cell::RefCell<Vec<i32>>,
@@ -3967,6 +4109,76 @@ mod tests {
                 "chunk={chunk} final logits diverged from single-pass"
             );
         }
+    }
+
+    #[test]
+    fn hidden_prefill_hook_runs_only_before_final_logits_and_preserves_state() {
+        let prompt = (1..=7).collect::<Vec<_>>();
+        let reference = HiddenOnlyPrefillStubModel::default();
+        let mut reference_caches = reference.make_caches();
+        let input = ffi::from_slice_i32(&prompt, &[1, prompt.len() as i32]);
+        let reference_logits =
+            reference.forward_last_logits(&input, &mut reference_caches, None, prompt.len() - 1);
+
+        let chunked = HiddenOnlyPrefillStubModel::default();
+        let mut chunked_caches = chunked.make_caches();
+        let chunked_logits =
+            chunked_prefill_last_logits(&chunked, &mut chunked_caches, &prompt, 3, 0, prompt.len());
+
+        ffi::eval(&reference_logits);
+        ffi::eval(&chunked_logits);
+        assert_eq!(
+            ffi::array_to_raw_bytes(&chunked_logits),
+            ffi::array_to_raw_bytes(&reference_logits),
+            "the final projected logits must be identical to the single-pass path"
+        );
+        assert_eq!(
+            chunked.tracker.calls.borrow().as_slice(),
+            &[
+                ("hidden", vec![1, 2, 3]),
+                ("hidden", vec![1, 2, 3, 4, 5, 6]),
+                ("logits", vec![1, 2, 3, 4, 5, 6, 7]),
+            ],
+            "each chunk must advance state once and only the final chunk may project logits"
+        );
+    }
+
+    #[test]
+    fn hidden_prefill_hook_leaves_single_chunk_on_last_logits_path() {
+        let prompt = vec![1, 2, 3];
+        let model = HiddenOnlyPrefillStubModel::default();
+        let mut caches = model.make_caches();
+
+        let logits =
+            chunked_prefill_last_logits(&model, &mut caches, &prompt, prompt.len(), 0, prompt.len());
+        ffi::eval(&logits);
+
+        assert_eq!(
+            model.tracker.calls.borrow().as_slice(),
+            &[("logits", prompt)],
+            "a one-chunk prefill must not invoke the intermediate hook"
+        );
+    }
+
+    #[test]
+    fn default_prefill_hook_projects_every_chunk() {
+        let prompt = (1..=7).collect::<Vec<_>>();
+        let model = FallbackPrefillStubModel::default();
+        let mut caches = model.make_caches();
+
+        let logits =
+            chunked_prefill_last_logits(&model, &mut caches, &prompt, 3, 0, prompt.len());
+        ffi::eval(&logits);
+
+        assert_eq!(
+            model.tracker.calls.borrow().as_slice(),
+            &[
+                ("logits", vec![1, 2, 3]),
+                ("logits", vec![1, 2, 3, 4, 5, 6]),
+                ("logits", vec![1, 2, 3, 4, 5, 6, 7]),
+            ],
+            "the default hook must retain one forward_last_logits projection per chunk"
+        );
     }
 
     #[test]
