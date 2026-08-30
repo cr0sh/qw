@@ -8,7 +8,7 @@ use futures_util::StreamExt;
 use qw_prefix_cache::CacheConfig;
 use qw_runtime::{KVCacheMode, resolve_model_path};
 use serde_json::{Value, json};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tower::ServiceExt;
 
 use super::*;
@@ -619,16 +619,12 @@ fn terminal_chat_record() -> CompletionRecord {
 }
 
 #[tokio::test]
-async fn completion_acknowledgment_waits_for_terminal_events_to_drain() {
+async fn terminal_stream_events_drain_to_eof() {
     let (events_tx, events_rx) = mpsc::channel(1);
-    let (acknowledged, mut acknowledged_rx) = oneshot::channel();
     let record = terminal_chat_record();
     let admission = record.admission.clone();
     events_tx
-        .send(WorkerEvent::Complete {
-            record,
-            acknowledged: Some(acknowledged),
-        })
+        .send(WorkerEvent::Complete { record })
         .await
         .expect("send completion");
     let mut state = SseState::new(
@@ -642,67 +638,40 @@ async fn completion_acknowledgment_waits_for_terminal_events_to_drain() {
 
     assert!(state.next_event().await.is_some(), "initial event");
     assert!(state.next_event().await.is_some(), "terminal event");
-    assert!(
-        matches!(
-            acknowledged_rx.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ),
-        "cache work must not begin before all terminal events are consumed"
-    );
     assert!(state.next_event().await.is_some(), "done event");
     assert!(
-        matches!(
-            acknowledged_rx.try_recv(),
-            Err(oneshot::error::TryRecvError::Empty)
-        ),
-        "cache work must not begin before the stream reaches EOF"
-    );
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), state.next_event())
-            .await
-            .expect("terminal EOF should not wait for channel closure")
-            .is_none()
-    );
-    assert_eq!(
-        acknowledged_rx.try_recv(),
-        Ok(()),
-        "cache work begins at the EOF boundary"
+        state.next_event().await.is_none(),
+        "terminal stream reaches EOF without waiting for channel closure"
     );
 }
 
 #[tokio::test]
-async fn dropping_stream_releases_pending_completion_acknowledgment() {
-    let (events_tx, events_rx) = mpsc::channel(1);
-    let (acknowledged, acknowledged_rx) = oneshot::channel();
-    let record = terminal_chat_record();
-    let admission = record.admission.clone();
-    events_tx
-        .send(WorkerEvent::Complete {
-            record,
-            acknowledged: Some(acknowledged),
-        })
-        .await
-        .expect("send completion");
-    let mut state = SseState::new(
-        Endpoint::Chat,
-        admission,
-        MODEL.to_string(),
-        events_rx,
-        Arc::new(AtomicBool::new(false)),
-        tracing::info_span!("stream_drop_acknowledgment_test"),
-    );
+async fn completion_publication_releases_worker_to_accept_queued_job() {
+    let engine = Engine::start_fake(Some(MODEL), 1);
+    let mut first = engine
+        .submit(protocol::parse_chat(chat_request("first")).expect("first request"))
+        .expect("submit first request");
+    assert!(matches!(
+        first.events.recv().await,
+        Some(WorkerEvent::Started(_))
+    ));
+    let mut second = engine
+        .submit(protocol::parse_chat(chat_request("second")).expect("second request"))
+        .expect("queue second request");
 
-    assert!(state.next_event().await.is_some(), "initial event");
-    assert!(state.next_event().await.is_some(), "terminal event");
-    drop(state);
+    loop {
+        match first.events.recv().await {
+            Some(WorkerEvent::Complete { record: _ }) => break,
+            Some(WorkerEvent::Started(_) | WorkerEvent::Delta(_)) => {}
+            Some(WorkerEvent::Failed(failure)) => panic!("first request failed: {failure:?}"),
+            None => panic!("first request event channel closed"),
+        }
+    }
 
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), acknowledged_rx)
-            .await
-            .expect("dropping the stream should release the worker")
-            .is_err(),
-        "disconnect must drop rather than send the pending acknowledgment"
-    );
+    assert!(matches!(
+        second.events.recv().await,
+        Some(WorkerEvent::Started(_))
+    ));
 }
 
 #[tokio::test]
@@ -2197,7 +2166,7 @@ async fn cancelling_an_image_request_leaves_the_next_text_request_clean() {
     let mut text_submission = engine.submit(text_request).expect("submit text request");
     let record = loop {
         match text_submission.events.recv().await {
-            Some(WorkerEvent::Complete { record, .. }) => break record,
+            Some(WorkerEvent::Complete { record }) => break record,
             Some(WorkerEvent::Started(_) | WorkerEvent::Delta(_)) => {}
             Some(WorkerEvent::Failed(failure)) => panic!("text request failed: {failure:?}"),
             None => panic!("text request event channel closed"),

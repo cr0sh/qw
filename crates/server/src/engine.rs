@@ -17,7 +17,7 @@ use qw_runtime::ChatContentRef;
 use qw_runtime::ChatMessage;
 use qw_runtime::{KVCacheMode, MtpPrefixReuse, PromptSnapshot, Qwen4Provider};
 use serde_json::Value;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tracing::{Span, debug, error, info, info_span, trace, warn};
 
 use crate::grammar::GrammarFactory;
@@ -213,10 +213,7 @@ pub enum WorkerDelta {
 pub enum WorkerEvent {
     Started(Admission),
     Delta(WorkerDelta),
-    Complete {
-        record: CompletionRecord,
-        acknowledged: Option<oneshot::Sender<()>>,
-    },
+    Complete { record: CompletionRecord },
     Failed(WorkerFailure),
 }
 
@@ -936,10 +933,7 @@ impl Engine {
                     finish_reason = ?record.finish_reason,
                     generated_tool_count = record.tool_calls.len(),
                 );
-                let _ = job.events.blocking_send(WorkerEvent::Complete {
-                    record,
-                    acknowledged: None,
-                });
+                publish_completion(&job.events, record);
             }
         });
         Self {
@@ -1820,16 +1814,7 @@ fn generated_tool_call(
     }
 }
 fn publish_completion(events: &mpsc::Sender<WorkerEvent>, record: CompletionRecord) {
-    let (acknowledged, completed) = oneshot::channel();
-    if events
-        .blocking_send(WorkerEvent::Complete {
-            record,
-            acknowledged: Some(acknowledged),
-        })
-        .is_ok()
-    {
-        let _ = completed.blocking_recv();
-    }
+    let _ = events.blocking_send(WorkerEvent::Complete { record });
 }
 
 fn send_failure(job: &Job, kind: FailureKind, message: String, param: Option<String>) {
@@ -2082,6 +2067,7 @@ mod tests {
             "--mtp-k must be at least 2"
         );
     }
+
     #[test]
     fn queued_job_takes_priority_over_cache_maintenance() {
         let (jobs, mut receiver) = mpsc::channel(1);

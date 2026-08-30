@@ -22,7 +22,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use futures_util::stream;
 use serde_json::{Value, json};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tracing::{Instrument, Span, debug, error, info_span, trace, warn};
 
 use engine::{
@@ -217,10 +217,7 @@ async fn buffered_response_inner(mut submission: engine::Submission) -> Response
     while let Some(event) = submission.events.recv().await {
         match event {
             WorkerEvent::Started(_) | WorkerEvent::Delta(_) => {}
-            WorkerEvent::Complete {
-                record,
-                acknowledged,
-            } => {
+            WorkerEvent::Complete { record } => {
                 guard.armed = false;
                 debug!(
                     phase = "response.buffered_complete",
@@ -231,9 +228,6 @@ async fn buffered_response_inner(mut submission: engine::Submission) -> Response
                     finish_reason = ?record.finish_reason,
                 );
                 let response = Json(buffered_json(&record)).into_response();
-                if let Some(acknowledged) = acknowledged {
-                    let _ = acknowledged.send(());
-                }
                 return response;
             }
             WorkerEvent::Failed(failure) => {
@@ -291,10 +285,7 @@ async fn streaming_response_inner(
             );
             return ApiError::from_worker(failure).into_response();
         }
-        Some(WorkerEvent::Complete {
-            record,
-            acknowledged,
-        }) => {
+        Some(WorkerEvent::Complete { record }) => {
             admission_guard.armed = false;
             debug!(
                 phase = "response.completed_before_stream",
@@ -302,9 +293,6 @@ async fn streaming_response_inner(
                 completion_tokens = record.completion_tokens,
             );
             let response = Json(buffered_json(&record)).into_response();
-            if let Some(acknowledged) = acknowledged {
-                let _ = acknowledged.send(());
-            }
             return response;
         }
         Some(WorkerEvent::Delta(_)) => {
@@ -362,7 +350,6 @@ struct SseState {
     sequence: u64,
     response_message_open: bool,
     terminal_enqueued: bool,
-    pending_acknowledgment: Option<oneshot::Sender<()>>,
     span: Span,
     guard: CancelGuard,
 }
@@ -385,7 +372,6 @@ impl SseState {
             sequence: 0,
             response_message_open: false,
             terminal_enqueued: false,
-            pending_acknowledgment: None,
             guard: CancelGuard {
                 cancelled,
                 armed: true,
@@ -403,22 +389,15 @@ impl SseState {
                 return Some(event);
             }
             if self.terminal_enqueued {
-                if let Some(acknowledged) = self.pending_acknowledgment.take() {
-                    let _ = acknowledged.send(());
-                }
                 return None;
             }
             match self.receiver.recv().await {
                 Some(WorkerEvent::Started(_)) => continue,
                 Some(WorkerEvent::Delta(delta)) => self.enqueue_delta(delta),
-                Some(WorkerEvent::Complete {
-                    record,
-                    acknowledged,
-                }) => {
+                Some(WorkerEvent::Complete { record }) => {
                     self.enqueue_complete(record);
                     self.terminal_enqueued = true;
                     self.guard.armed = false;
-                    self.pending_acknowledgment = acknowledged;
                 }
                 Some(WorkerEvent::Failed(failure)) => {
                     self.enqueue_failure(failure);
