@@ -27,7 +27,9 @@ use crate::media::DecodedImage;
 use crate::protocol::{
     CompletionRequest, Endpoint, OutputFormat, ReasoningEffort, ToolChoice, request_fingerprint,
 };
-use crate::tool_calls::{ToolCallGate, parse_assistant_output};
+use crate::tool_calls::{
+    ToolCallStreamDelta, ToolCallStreamParser, parse_assistant_output,
+};
 
 const JOB_QUEUE_CAPACITY: usize = 8;
 const EVENT_QUEUE_CAPACITY: usize = 32;
@@ -126,13 +128,17 @@ enum QwenGenerationRoute {
     MtpText,
 }
 
-fn qwen_generation_route(has_mtp: bool) -> QwenGenerationRoute {
-    if has_mtp {
+fn qwen_generation_route(has_mtp: bool, constraint_active: bool) -> QwenGenerationRoute {
+    if has_mtp && !constraint_active {
         QwenGenerationRoute::MtpText
     } else {
         QwenGenerationRoute::BaselineText
     }
 }
+fn generation_temperature(requested: Option<f32>, constraint_active: bool) -> Option<f32> {
+    requested.or_else(|| constraint_active.then_some(0.0))
+}
+
 
 fn cache_snapshot_route(route: QwenGenerationRoute) -> Option<CacheSnapshotRoute> {
     match route {
@@ -207,6 +213,8 @@ pub struct WorkerFailure {
 pub enum WorkerDelta {
     Reasoning(String),
     Content(String),
+    ToolCallStart { index: usize, name: String },
+    ToolCallArguments { index: usize, fragment: String },
 }
 
 #[derive(Debug)]
@@ -348,29 +356,48 @@ fn split_reasoning_trace(text: &str) -> (String, String) {
         match delta {
             WorkerDelta::Reasoning(fragment) => reasoning.push_str(&fragment),
             WorkerDelta::Content(fragment) => content.push_str(&fragment),
+            WorkerDelta::ToolCallStart { .. } | WorkerDelta::ToolCallArguments { .. } => {
+                unreachable!("reasoning parser emits only reasoning and content")
+            }
         }
     }
     (reasoning, content)
 }
 
-fn gate_worker_delta(
+fn convert_tool_delta(delta: ToolCallStreamDelta) -> WorkerDelta {
+    match delta {
+        ToolCallStreamDelta::Content(content) => WorkerDelta::Content(content),
+        ToolCallStreamDelta::Start { index, name } => {
+            WorkerDelta::ToolCallStart { index, name }
+        }
+        ToolCallStreamDelta::Arguments { index, fragment } => {
+            WorkerDelta::ToolCallArguments { index, fragment }
+        }
+    }
+}
+
+fn stream_worker_delta(
     delta: WorkerDelta,
     tool_enabled: bool,
-    gate: &mut ToolCallGate,
-) -> Option<WorkerDelta> {
+    tool_parser: &mut ToolCallStreamParser,
+) -> Result<Vec<WorkerDelta>, String> {
     match delta {
-        WorkerDelta::Reasoning(_) => Some(delta),
-        WorkerDelta::Content(content) if tool_enabled => {
-            gate.feed(&content).map(WorkerDelta::Content)
+        WorkerDelta::Reasoning(_) => Ok(vec![delta]),
+        WorkerDelta::Content(content) if tool_enabled => tool_parser
+            .feed(&content)
+            .map(|deltas| deltas.into_iter().map(convert_tool_delta).collect())
+            .map_err(|error| error.to_string()),
+        WorkerDelta::Content(content) if content.is_empty() => Ok(Vec::new()),
+        WorkerDelta::Content(_) => Ok(vec![delta]),
+        WorkerDelta::ToolCallStart { .. } | WorkerDelta::ToolCallArguments { .. } => {
+            Err("reasoning parser emitted a tool delta".to_string())
         }
-        WorkerDelta::Content(content) if content.is_empty() => None,
-        WorkerDelta::Content(_) => Some(delta),
     }
 }
 
 struct StreamOutputTracker {
     trace_parser: ReasoningTraceParser,
-    gate: ToolCallGate,
+    tool_parser: ToolCallStreamParser,
     tool_enabled: bool,
     emitted_reasoning_text: String,
     emitted_content_text: String,
@@ -380,40 +407,51 @@ impl StreamOutputTracker {
     fn new(enable_thinking: bool, tool_enabled: bool) -> Self {
         Self {
             trace_parser: ReasoningTraceParser::new(enable_thinking),
-            gate: ToolCallGate::default(),
+            tool_parser: ToolCallStreamParser::default(),
             tool_enabled,
             emitted_reasoning_text: String::new(),
             emitted_content_text: String::new(),
         }
     }
 
-    fn feed(&mut self, fragment: &str) -> Vec<WorkerDelta> {
-        self.trace_parser
-            .feed(fragment)
-            .into_iter()
-            .filter_map(|delta| gate_worker_delta(delta, self.tool_enabled, &mut self.gate))
-            .collect()
+    fn feed(&mut self, fragment: &str) -> Result<Vec<WorkerDelta>, String> {
+        let mut deltas = Vec::new();
+        for delta in self.trace_parser.feed(fragment) {
+            deltas.extend(stream_worker_delta(
+                delta,
+                self.tool_enabled,
+                &mut self.tool_parser,
+            )?);
+        }
+        Ok(deltas)
     }
 
-    fn finish(&mut self) -> Vec<WorkerDelta> {
-        let mut deltas = self
-            .trace_parser
-            .finish()
-            .into_iter()
-            .filter_map(|delta| gate_worker_delta(delta, self.tool_enabled, &mut self.gate))
-            .collect::<Vec<_>>();
-        if self.tool_enabled
-            && let Some(content) = self.gate.flush()
-        {
-            deltas.push(WorkerDelta::Content(content));
+    fn finish(&mut self) -> Result<Vec<WorkerDelta>, String> {
+        let mut deltas = Vec::new();
+        for delta in self.trace_parser.finish() {
+            deltas.extend(stream_worker_delta(
+                delta,
+                self.tool_enabled,
+                &mut self.tool_parser,
+            )?);
         }
-        deltas
+        if self.tool_enabled {
+            deltas.extend(
+                self.tool_parser
+                    .finish()
+                    .map_err(|error| error.to_string())?
+                    .into_iter()
+                    .map(convert_tool_delta),
+            );
+        }
+        Ok(deltas)
     }
 
     fn record_sent(&mut self, delta: &WorkerDelta) {
         match delta {
             WorkerDelta::Reasoning(fragment) => self.emitted_reasoning_text.push_str(fragment),
             WorkerDelta::Content(fragment) => self.emitted_content_text.push_str(fragment),
+            WorkerDelta::ToolCallStart { .. } | WorkerDelta::ToolCallArguments { .. } => {}
         }
     }
 
@@ -423,7 +461,7 @@ impl StreamOutputTracker {
         emitted_reasoning_text: &str,
         emitted_content_text: &str,
     ) -> Result<Vec<WorkerDelta>, String> {
-        let deltas = self.feed(raw_text);
+        let deltas = self.feed(raw_text)?;
         let mut reasoning_offset = 0;
         let mut content_offset = 0;
         let mut replay = Vec::new();
@@ -437,6 +475,11 @@ impl StreamOutputTracker {
                 ),
                 WorkerDelta::Content(fragment) => {
                     (false, fragment, emitted_content_text, &mut content_offset)
+                }
+                WorkerDelta::ToolCallStart { .. } | WorkerDelta::ToolCallArguments { .. } => {
+                    return Err(
+                        "response continuation cannot replay constrained tool output".to_string()
+                    );
                 }
             };
             let remaining = &emitted[*offset..];
@@ -876,6 +919,25 @@ impl Engine {
                         break;
                     }
                 }
+                if !interrupt {
+                    for (index, call) in tool_calls.iter().enumerate() {
+                        if !send_delta(
+                            &job,
+                            WorkerDelta::ToolCallStart {
+                                index,
+                                name: call.name.clone(),
+                            },
+                        ) || !send_delta(
+                            &job,
+                            WorkerDelta::ToolCallArguments {
+                                index,
+                                fragment: call.arguments.clone(),
+                            },
+                        ) {
+                            break;
+                        }
+                    }
+                }
                 if job.cancelled.load(Ordering::Acquire) {
                     debug!(phase = "generation.cancelled");
                     continue;
@@ -1263,13 +1325,13 @@ impl QwenWorker {
         );
 
         let sampling = self.provider.baseline_sampling(
-            job.request.temperature,
+            generation_temperature(job.request.temperature, constraint.is_some()),
             job.request.top_p,
             job.request.seed,
         );
         let mtp_available =
             self.provider.has_mtp() && std::env::var_os("QW_BENCH_DISABLE_MTP").is_none();
-        let route = qwen_generation_route(mtp_available);
+        let route = qwen_generation_route(mtp_available, constraint.is_some());
         let cache_route = cache_snapshot_route(route);
         let lookup_cache_route = cache_lookup_route(route);
         if job.request.resume_response_id.is_some() && cache_route.is_none() {
@@ -1483,11 +1545,19 @@ impl QwenWorker {
                 output.record_sent(&delta);
             }
         }
+        let mut stream_error = None;
         let mut emit_delta = |fragment: &str| {
             if job.cancelled.load(Ordering::Acquire) {
                 return false;
             }
-            for delta in output.feed(fragment) {
+            let deltas = match output.feed(fragment) {
+                Ok(deltas) => deltas,
+                Err(error) => {
+                    stream_error = Some(error);
+                    return false;
+                }
+            };
+            for delta in deltas {
                 if !send_delta(&job, delta.clone()) {
                     return false;
                 }
@@ -1551,6 +1621,16 @@ impl QwenWorker {
             ),
             _ => unreachable!("response resume route was validated before generation"),
         };
+        drop(emit_delta);
+        if let Some(error) = stream_error {
+            send_failure(
+                &job,
+                FailureKind::Server,
+                format!("generated tool-call stream was invalid: {error}"),
+                None,
+            );
+            return;
+        }
         let mut generated = match generated {
             Ok(generated) => generated,
             Err(generation_error) => {
@@ -1593,7 +1673,19 @@ impl QwenWorker {
             .unwrap_or_default();
         combined_raw_text.push_str(&generated.text);
         if generated.finish_outcome != GenerationStopReason::CallbackCancelled {
-            for delta in output.finish() {
+            let deltas = match output.finish() {
+                Ok(deltas) => deltas,
+                Err(error) => {
+                    send_failure(
+                        &job,
+                        FailureKind::Server,
+                        format!("generated tool-call stream was invalid: {error}"),
+                        None,
+                    );
+                    return;
+                }
+            };
+            for delta in deltas {
                 if !send_delta(&job, delta.clone()) {
                     break;
                 }
@@ -1795,7 +1887,7 @@ impl QwenWorker {
     }
 }
 
-fn generated_tool_call(
+pub(super) fn generated_tool_call(
     admission: &Admission,
     index: usize,
     name: String,
@@ -1888,6 +1980,9 @@ mod tests {
         let mut append = |delta| match delta {
             WorkerDelta::Reasoning(fragment) => reasoning.push_str(&fragment),
             WorkerDelta::Content(fragment) => content.push_str(&fragment),
+            WorkerDelta::ToolCallStart { .. } | WorkerDelta::ToolCallArguments { .. } => {
+                unreachable!("reasoning parser emitted a tool delta")
+            }
         };
         for fragment in fragments {
             for delta in parser.feed(fragment) {
@@ -1959,14 +2054,14 @@ mod tests {
     #[test]
     fn resume_replays_callback_failed_fragment_without_duplicating_delivered_text() {
         let mut interrupted = StreamOutputTracker::new(false, false);
-        let delivered = interrupted.feed("it is the");
+        let delivered = interrupted.feed("it is the").expect("stream text");
         assert_eq!(
             delivered,
             vec![WorkerDelta::Content("it is the".to_string())]
         );
         interrupted.record_sent(&delivered[0]);
 
-        let failed = interrupted.feed(" perfect");
+        let failed = interrupted.feed(" perfect").expect("stream suffix");
         assert_eq!(failed, vec![WorkerDelta::Content(" perfect".to_string())]);
 
         let mut resumed = StreamOutputTracker::new(false, false);
@@ -1979,7 +2074,7 @@ mod tests {
             .expect("stored delivered text is a prefix");
         assert_eq!(replay, vec![WorkerDelta::Content(" perfect".to_string())]);
         resumed.record_sent(&replay[0]);
-        let suffix = resumed.feed(" time");
+        let suffix = resumed.feed(" time").expect("stream continuation");
         resumed.record_sent(&suffix[0]);
 
         assert_eq!(resumed.emitted_content_text, "it is the perfect time");
@@ -1989,7 +2084,7 @@ mod tests {
     fn resume_replays_only_unsent_delta_when_one_fragment_crosses_trace_boundary() {
         let raw_text = "private trace</think>\nfinal answer";
         let mut interrupted = StreamOutputTracker::new(true, false);
-        let deltas = interrupted.feed(raw_text);
+        let deltas = interrupted.feed(raw_text).expect("stream trace");
         assert_eq!(
             deltas,
             vec![
@@ -2036,13 +2131,31 @@ mod tests {
     }
 
     #[test]
-    fn routing_selects_mtp_when_available() {
+    fn active_constraints_always_route_to_baseline_generation() {
         assert_eq!(
-            qwen_generation_route(false),
+            qwen_generation_route(false, false),
             QwenGenerationRoute::BaselineText
         );
-        assert_eq!(qwen_generation_route(true), QwenGenerationRoute::MtpText);
+        assert_eq!(
+            qwen_generation_route(false, true),
+            QwenGenerationRoute::BaselineText
+        );
+        assert_eq!(
+            qwen_generation_route(true, true),
+            QwenGenerationRoute::BaselineText
+        );
+        assert_eq!(
+            qwen_generation_route(true, false),
+            QwenGenerationRoute::MtpText
+        );
     }
+    #[test]
+    fn constrained_generation_defaults_to_greedy_without_overriding_requests() {
+        assert_eq!(generation_temperature(None, true), Some(0.0));
+        assert_eq!(generation_temperature(None, false), None);
+        assert_eq!(generation_temperature(Some(0.4), true), Some(0.4));
+    }
+
 
     #[test]
     fn text_routes_are_prefix_cache_eligible() {
