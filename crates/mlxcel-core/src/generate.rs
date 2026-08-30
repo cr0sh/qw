@@ -922,6 +922,8 @@ fn prefill_with_checkpoints<M: LanguageModel + ?Sized>(
     sequence_id: SequenceId,
 ) -> (UniquePtr<MlxArray>, Vec<ModelStateSnapshot>) {
     model.reserve_prefill_capacity(caches, prompt_tokens.len());
+    let configured_prefill_chunk =
+        model.prefill_chunk_size(configured_prefill_chunk, prompt_tokens.len());
     let requested = checkpoint_token_lengths
         .iter()
         .copied()
@@ -1069,6 +1071,21 @@ pub trait LanguageModel {
     /// opt-out (issue #674).
     fn supports_chunked_prefill(&self) -> bool {
         true
+    }
+
+    /// Adjust the configured chunk length for a prefill ending at
+    /// `total_context_tokens`.
+    ///
+    /// The default preserves the operator-configured value exactly. Models
+    /// whose prefill work grows with the final logical context may return a
+    /// smaller value; `0` must remain available as the single-pass override.
+    fn prefill_chunk_size(
+        &self,
+        configured_chunk: usize,
+        total_context_tokens: usize,
+    ) -> usize {
+        let _ = total_context_tokens;
+        configured_chunk
     }
 
     /// Hint the final logical token length before a prefill loop starts.
@@ -1945,8 +1962,10 @@ impl CxxGenerator {
         }
         let prefill_tokens = &prompt_tokens[cached_tokens..];
         model.set_reference_prefill(true);
+        let configured_prefill_chunk =
+            model.prefill_chunk_size(prefill_chunk_len(), prompt_tokens.len());
         let prefill_chunk = effective_prefill_chunk(
-            prefill_chunk_len(),
+            configured_prefill_chunk,
             model.supports_chunked_prefill(),
             prefill_tokens.len(),
         );
@@ -2090,8 +2109,10 @@ impl CxxGenerator {
                 sequence_id,
             )
         } else {
+            let configured_prefill_chunk =
+                model.prefill_chunk_size(prefill_chunk_len(), prompt_tokens.len());
             let prefill_chunk = effective_prefill_chunk(
-                prefill_chunk_len(),
+                configured_prefill_chunk,
                 model.supports_chunked_prefill(),
                 prefill_tokens.len(),
             );
@@ -2436,8 +2457,10 @@ impl CxxGenerator {
                 model.forward_with_embeddings(&input, input_embeddings, &mut self.caches, mask);
             logits_at_position(&logits, prefill_tokens.len().saturating_sub(1))
         } else {
+            let configured_prefill_chunk =
+                model.prefill_chunk_size(prefill_chunk_len(), prompt_tokens.len());
             let prefill_chunk = effective_prefill_chunk(
-                prefill_chunk_len(),
+                configured_prefill_chunk,
                 model.supports_chunked_prefill(),
                 prefill_tokens.len(),
             );
@@ -2695,8 +2718,9 @@ impl CxxGenerator {
         // On M5+ hardware pad the sequence to a 32-token tile boundary for
         // optimal Neural Accelerator throughput.
         let actual_len = prompt_tokens.len();
+        let configured_prefill_chunk = model.prefill_chunk_size(prefill_chunk_len(), actual_len);
         let prefill_chunk = effective_prefill_chunk(
-            prefill_chunk_len(),
+            configured_prefill_chunk,
             model.supports_chunked_prefill(),
             actual_len,
         );
@@ -3405,8 +3429,9 @@ impl CxxGenerator {
         // optimal Neural Accelerator throughput.
         let actual_len = prompt_tokens.len();
         let prefill_start = Instant::now();
+        let configured_prefill_chunk = model.prefill_chunk_size(prefill_chunk_len(), actual_len);
         let prefill_chunk = effective_prefill_chunk(
-            prefill_chunk_len(),
+            configured_prefill_chunk,
             model.supports_chunked_prefill(),
             actual_len,
         );
@@ -4082,6 +4107,7 @@ mod tests {
         seen: std::cell::RefCell<Vec<i32>>,
         forward_lengths: std::cell::RefCell<Vec<usize>>,
         snapshot_lengths: std::cell::RefCell<Vec<(usize, usize)>>,
+        chunk_size_calls: std::cell::RefCell<Vec<(usize, usize)>>,
     }
 
     impl CheckpointStubModel {
@@ -4091,6 +4117,7 @@ mod tests {
                 seen: std::cell::RefCell::new(cached_prefix.to_vec()),
                 forward_lengths: std::cell::RefCell::new(Vec::new()),
                 snapshot_lengths: std::cell::RefCell::new(Vec::new()),
+                chunk_size_calls: std::cell::RefCell::new(Vec::new()),
             }
         }
     }
@@ -4128,6 +4155,17 @@ mod tests {
 
         fn supports_chunked_prefill(&self) -> bool {
             self.supports_chunking
+        }
+
+        fn prefill_chunk_size(
+            &self,
+            configured_chunk: usize,
+            total_context_tokens: usize,
+        ) -> usize {
+            self.chunk_size_calls
+                .borrow_mut()
+                .push((configured_chunk, total_context_tokens));
+            configured_chunk
         }
 
         fn snapshot_sequence_state(
@@ -4186,6 +4224,7 @@ mod tests {
 
         assert!(StubModel.supports_chunked_prefill());
         assert!(!OptOutModel.supports_chunked_prefill());
+        assert_eq!(StubModel.prefill_chunk_size(321, 1_048_576), 321);
     }
 
     /// Chunked prefill must feed every prompt token exactly once, in order,
@@ -4335,6 +4374,11 @@ mod tests {
             &[8, 11],
             SequenceId::from_raw(7),
         );
+        assert_eq!(
+            model.chunk_size_calls.borrow().as_slice(),
+            &[(2, prompt.len())],
+            "checkpoint ranges must size against the final logical context"
+        );
 
         assert_eq!(
             model.forward_lengths.borrow().as_slice(),
@@ -4366,6 +4410,31 @@ mod tests {
         let first = ffi::slice(&logits, &[0, 0, 0], &[1, 1, 1]);
         ffi::eval(&first);
         assert_eq!(ffi::item_f32(&first), 78.0);
+    }
+
+    #[test]
+    fn cached_prefill_sizing_hook_receives_full_context_not_suffix() {
+        let prompt = (1..=12).collect::<Vec<_>>();
+        let model = CheckpointStubModel::new(true, &prompt[..8]);
+        let mut caches = model.make_caches();
+
+        let (_logits, snapshots) = prefill_with_checkpoints(
+            &model,
+            &mut caches,
+            &prompt,
+            8,
+            2,
+            &[],
+            SequenceId::from_raw(8),
+        );
+
+        assert!(snapshots.is_empty());
+        assert_eq!(model.forward_lengths.borrow().as_slice(), &[2, 2]);
+        assert_eq!(
+            model.chunk_size_calls.borrow().as_slice(),
+            &[(2, prompt.len())],
+            "a cached suffix must not be mistaken for the final context length"
+        );
     }
 
     #[test]

@@ -1906,31 +1906,36 @@ fn prefill_text_with_reuse(
     );
     let mut previous_hidden = mlxcel_core::copy(&reuse.snapshot.last_hidden);
     let mut processed_tokens = reuse.cached_tokens;
-    let prefill = model.forward_mtp_text_suffix_chunks(&suffix_ids, suffix, |ids, hidden| {
-        let shape = mlxcel_core::array_shape(hidden);
-        let target_hidden = if shape[1] == 1 {
-            mlxcel_core::copy(&previous_hidden)
-        } else {
-            let prefix_hidden =
-                mlxcel_core::slice(hidden, &[0, 0, 0], &[shape[0], shape[1] - 1, shape[2]]);
-            mlxcel_core::concatenate(&previous_hidden, &prefix_hidden, 1)
-        };
-        let embeddings = model.embed_tokens.forward(ids);
-        drafter.prefill_target_chunk(model, &embeddings, &target_hidden, None, None, false);
-        previous_hidden = materialize_detached(mlxcel_core::slice(
-            hidden,
-            &[0, shape[1] - 1, 0],
-            &[shape[0], shape[1], shape[2]],
-        ));
-        drafter.materialize_state();
-        model.materialize_mtp_cache_state();
-        processed_tokens += shape[1] as usize;
-        mlxcel_core::memory::trace_snapshot(
-            "mtp.prefill.chunk_complete",
-            processed_tokens,
-            prompt_tokens.len(),
-        );
-    })?;
+    let prefill = model.forward_mtp_text_suffix_chunks(
+        &suffix_ids,
+        suffix,
+        prompt_tokens.len(),
+        |ids, hidden| {
+            let shape = mlxcel_core::array_shape(hidden);
+            let target_hidden = if shape[1] == 1 {
+                mlxcel_core::copy(&previous_hidden)
+            } else {
+                let prefix_hidden =
+                    mlxcel_core::slice(hidden, &[0, 0, 0], &[shape[0], shape[1] - 1, shape[2]]);
+                mlxcel_core::concatenate(&previous_hidden, &prefix_hidden, 1)
+            };
+            let embeddings = model.embed_tokens.forward(ids);
+            drafter.prefill_target_chunk(model, &embeddings, &target_hidden, None, None, false);
+            previous_hidden = materialize_detached(mlxcel_core::slice(
+                hidden,
+                &[0, shape[1] - 1, 0],
+                &[shape[0], shape[1], shape[2]],
+            ));
+            drafter.materialize_state();
+            model.materialize_mtp_cache_state();
+            processed_tokens += shape[1] as usize;
+            mlxcel_core::memory::trace_snapshot(
+                "mtp.prefill.chunk_complete",
+                processed_tokens,
+                prompt_tokens.len(),
+            );
+        },
+    )?;
     Ok((prefill, reuse.cached_tokens))
 }
 
