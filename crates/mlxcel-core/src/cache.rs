@@ -7550,7 +7550,9 @@ mod tests {
                 let final_len = verify_offset - trim;
                 let complete_before = verify_offset / RATIO;
                 let complete_after = final_len / RATIO;
-                let values = (0..verify_offset).map(|value| value as f32).collect::<Vec<_>>();
+                let values = (0..verify_offset)
+                    .map(|value| value as f32)
+                    .collect::<Vec<_>>();
                 let summaries = (0..complete_before)
                     .map(|block| block as f32)
                     .collect::<Vec<_>>();
@@ -7560,12 +7562,9 @@ mod tests {
                     ffi::from_slice_f32(&values, &[1, 1, verify_offset, 1]),
                     ffi::from_slice_f32(&values, &[1, 1, verify_offset, 1]),
                 );
-                cache.auxiliary_keys =
-                    Some(ffi::from_slice_f32(&values, &[1, verify_offset, 1]));
-                cache.auxiliary_block_keys = Some(ffi::from_slice_f32(
-                    &summaries,
-                    &[1, 1, complete_before, 1],
-                ));
+                cache.auxiliary_keys = Some(ffi::from_slice_f32(&values, &[1, verify_offset, 1]));
+                cache.auxiliary_block_keys =
+                    Some(ffi::from_slice_f32(&summaries, &[1, 1, complete_before, 1]));
                 cache.set_auxiliary_block_size(RATIO);
 
                 assert_eq!(cache.trim(trim), trim);
@@ -7587,8 +7586,7 @@ mod tests {
     fn kv_cache_trim_discards_unbounded_auxiliary_summaries() {
         let mut cache = KVCache::new();
         cache.offset = 8;
-        cache.auxiliary_block_keys =
-            Some(ffi::from_slice_f32(&[1.0, 2.0], &[1, 1, 2, 1]));
+        cache.auxiliary_block_keys = Some(ffi::from_slice_f32(&[1.0, 2.0], &[1, 1, 2, 1]));
 
         assert_eq!(cache.trim(1), 1);
         assert!(cache.auxiliary_block_keys.is_none());

@@ -959,10 +959,7 @@ mod tests {
         let mut weights = WeightMap::new();
         weights.insert(
             "self_attn.indexer.index_qk_proj.weight".to_string(),
-            mlxcel_core::from_slice_f32(
-                &[1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0],
-                &[4, HEAD_DIM],
-            ),
+            mlxcel_core::from_slice_f32(&[1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0], &[4, HEAD_DIM]),
         );
         insert_f32(
             &mut weights,
@@ -1058,22 +1055,14 @@ mod tests {
         );
         mlxcel_core::eval(&first_rebuild);
         let mut first_reference = KVCache::new();
-        append_qsa_rows(
-            &indexer,
-            &mut first_reference,
-            &[1, 2, 3, 4, 5, 6, 7, 8],
-        );
+        append_qsa_rows(&indexer, &mut first_reference, &[1, 2, 3, 4, 5, 6, 7, 8]);
         append_qsa_rows(&indexer, &mut first_reference, &[9, 90, 91, 92]);
         assert_qsa_blocks_equal(&cache, &first_reference);
 
         assert_eq!(cache.trim(3), 3);
         append_qsa_rows(&indexer, &mut cache, &[190, 191, 192]);
         let mut second_reference = KVCache::new();
-        append_qsa_rows(
-            &indexer,
-            &mut second_reference,
-            &[1, 2, 3, 4, 5, 6, 7, 8],
-        );
+        append_qsa_rows(&indexer, &mut second_reference, &[1, 2, 3, 4, 5, 6, 7, 8]);
         append_qsa_rows(&indexer, &mut second_reference, &[9, 190, 191, 192]);
         assert_qsa_blocks_equal(&cache, &second_reference);
 
@@ -1214,5 +1203,4 @@ mod tests {
         mlxcel_core::eval(&close);
         assert!(mlxcel_core::item_bool(&close));
     }
-
 }
