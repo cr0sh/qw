@@ -230,11 +230,13 @@ impl GuidanceConstraint {
 
 fn tool_call_lark(tools: &[ChatTool], parallel_tool_calls: bool) -> Result<String> {
     ensure!(!tools.is_empty(), "tool-call grammar requires at least one tool");
-    let mut grammar = String::from("start[lazy]: /(?s:.*)/ tool_call");
+    let mut grammar = String::from("start: preamble tool_call");
     if parallel_tool_calls {
         grammar.push('+');
     }
-    grammar.push_str("\ntool_call: \"<tool_call>\" function \"</tool_call>\"\nfunction: ");
+    grammar.push_str(
+        "\npreamble[lazy]: /(?s:.*)/\ntool_call: \"<tool_call>\" function \"</tool_call>\"\nfunction: ",
+    );
     for index in 0..tools.len() {
         if index != 0 {
             grammar.push_str(" | ");
