@@ -27,7 +27,6 @@ use crate::portable_snapshot::{
     PortableArray, PortableModelState, PortablePromptSnapshot, array_from_portable,
     array_to_portable, portable_model_state,
 };
-use mlxcel_core::cache::KVCacheMode;
 use mlxcel_core::generate::{
     ConstraintCommit, ConstraintMask, GenerationStopReason, LanguageModel, ModelStateSnapshot,
     SamplingConfig, TokenConstraint, mask_logits_to_allowed,
@@ -253,34 +252,12 @@ struct Qwen4MtpDraftState {
 impl Qwen4MtpDraftState {
     fn new() -> Self {
         Self {
-            cache: KVCache::new_with_mode(KVCacheMode::Fp8),
+            cache: KVCache::new(),
             seed_hidden: None,
             rope_delta: None,
             round_appended: 0,
         }
     }
-
-    fn reset(&mut self) {
-        let horizon = self.cache.auxiliary_rollback_horizon();
-        *self = Self::new();
-        self.cache
-            .set_auxiliary_rollback_horizon(horizon)
-            .expect("fresh MTP draft cache accepts configured QSA horizon");
-    }
-}
-
-fn restore_draft_cache(
-    offset: i32,
-    keys: Option<UniquePtr<MlxArray>>,
-    values: Option<UniquePtr<MlxArray>>,
-) -> Result<KVCache, String> {
-    let mut cache = KVCache::new_with_mode(KVCacheMode::Fp8);
-    match (keys, values) {
-        (Some(keys), Some(values)) => cache.restore_fp8_snapshot(offset, keys, values)?,
-        (None, None) if offset == 0 => {}
-        _ => return Err("MTP snapshot drafter KV layout is incomplete".to_string()),
-    }
-    Ok(cache)
 }
 
 fn quantize_drafter_weights(weights: &mut mlxcel_core::weights::WeightMap) {
@@ -429,7 +406,13 @@ impl Qwen4MtpDraftModel {
     }
 
     pub(crate) fn reset(&self) {
-        self.state.borrow_mut().reset();
+        let horizon = self.state.borrow().cache.auxiliary_rollback_horizon();
+        let mut state = Qwen4MtpDraftState::new();
+        state
+            .cache
+            .set_auxiliary_rollback_horizon(horizon)
+            .expect("fresh MTP draft cache accepts configured QSA horizon");
+        *self.state.borrow_mut() = state;
     }
     fn set_qsa_rollback_horizon(&self, horizon: i32) -> Result<(), String> {
         self.state
@@ -836,12 +819,12 @@ impl Qwen4MtpDraftModel {
             return None;
         }
         let mut draft = ModelStateSnapshot::new("qwen4-mtp-draft", expected_offset as usize);
-        if let Some(fp8) = state.cache.fp8_snapshot_tensors() {
+        if let Some((keys, values)) = state.cache.visible_state() {
             draft
                 .push_paged_tensor(
                     previous.map(|snapshot| &snapshot.draft),
                     "draft_keys",
-                    &fp8.keys,
+                    &keys,
                     2,
                 )
                 .ok()?;
@@ -849,7 +832,7 @@ impl Qwen4MtpDraftModel {
                 .push_paged_tensor(
                     previous.map(|snapshot| &snapshot.draft),
                     "draft_values",
-                    &fp8.values,
+                    &values,
                     2,
                 )
                 .ok()?;
@@ -916,7 +899,8 @@ impl Qwen4MtpDraftModel {
             return Err("MTP snapshot drafter KV layout is incomplete".to_string());
         }
         let desired_horizon = self.state.borrow().cache.auxiliary_rollback_horizon();
-        let (keys, values) = if let (Some(keys), Some(values)) = (keys, values) {
+        let mut cache = KVCache::new();
+        if let (Some(keys), Some(values)) = (keys, values) {
             if keys.token_axis() != 2
                 || values.token_axis() != 2
                 || keys.token_len() != expected_offset as usize
@@ -924,11 +908,10 @@ impl Qwen4MtpDraftModel {
             {
                 return Err("MTP snapshot drafter KV page layout is invalid".to_string());
             }
-            (keys.materialize(), values.materialize())
-        } else {
-            (None, None)
-        };
-        let mut cache = restore_draft_cache(expected_offset, keys, values)?;
+            cache.keys = keys.materialize();
+            cache.values = values.materialize();
+        }
+        cache.offset = expected_offset;
         let auxiliary_keys = snapshot.draft.tensor("draft_auxiliary_keys");
         let auxiliary_metadata = snapshot.draft.tensor("draft_auxiliary_metadata");
         if auxiliary_keys.is_some() != auxiliary_metadata.is_some() {
@@ -3050,90 +3033,7 @@ mod tests {
     use crate::qwen4_attention::Qwen4LayerCache;
 
     #[test]
-    fn mtp_draft_cache_stays_fp8_when_fresh_and_reset() {
-        let mut state = Qwen4MtpDraftState::new();
-        assert_eq!(state.cache.mode, KVCacheMode::Fp8);
 
-        state
-            .cache
-            .set_auxiliary_rollback_horizon(7)
-            .expect("valid rollback horizon");
-        state.cache.reserve_prefill_capacity(513);
-        state.cache.update(
-            mlxcel_core::from_slice_f32(&[1.0, 2.0], &[1, 1, 2, 1]),
-            mlxcel_core::from_slice_f32(&[3.0, 4.0], &[1, 1, 2, 1]),
-        );
-        state.reset();
-
-        assert_eq!(state.cache.mode, KVCacheMode::Fp8);
-        assert_eq!(state.cache.seq_len(), 0);
-        assert_eq!(state.cache.capacity(), 0);
-        assert_eq!(state.cache.auxiliary_rollback_horizon(), 7);
-    }
-
-    #[test]
-    fn mtp_draft_fp8_snapshot_round_trip_preserves_geometry() {
-        let values = (0..24).map(|value| value as f32 / 8.0).collect::<Vec<_>>();
-        let mut source = Qwen4MtpDraftState::new();
-        source.cache.reserve_prefill_capacity(7);
-        source.cache.update(
-            mlxcel_core::from_slice_f32(&values, &[1, 2, 3, 4]),
-            mlxcel_core::from_slice_f32(&values, &[1, 2, 3, 4]),
-        );
-        assert_eq!(source.cache.mode, KVCacheMode::Fp8);
-        assert!(source.cache.capacity() >= 7);
-
-        let stored = source
-            .cache
-            .fp8_snapshot_tensors()
-            .expect("populated FP8 draft cache");
-        let mut snapshot = ModelStateSnapshot::new("qwen4-mtp-draft", 3);
-        snapshot
-            .push_paged_tensor(None, "draft_keys", &stored.keys, 2)
-            .expect("snapshot draft keys");
-        snapshot
-            .push_paged_tensor(None, "draft_values", &stored.values, 2)
-            .expect("snapshot draft values");
-        assert_eq!(snapshot.paged_tensor("draft_keys").unwrap().token_axis(), 2);
-        assert_eq!(snapshot.paged_tensor("draft_keys").unwrap().token_len(), 3);
-
-        let mut restored = restore_draft_cache(
-            3,
-            snapshot
-                .paged_tensor("draft_keys")
-                .and_then(|tensor| tensor.materialize()),
-            snapshot
-                .paged_tensor("draft_values")
-                .and_then(|tensor| tensor.materialize()),
-        )
-        .expect("restore FP8 draft cache");
-        assert_eq!(restored.mode, KVCacheMode::Fp8);
-        assert_eq!(restored.seq_len(), 3);
-        assert_eq!(restored.capacity(), 3);
-
-        restored.reserve_prefill_capacity(7);
-        assert_eq!(restored.capacity(), 3, "capacity reservation is lazy");
-        restored.update(
-            mlxcel_core::zeros(&[1, 2, 1, 4], mlxcel_core::dtype::FLOAT32),
-            mlxcel_core::zeros(&[1, 2, 1, 4], mlxcel_core::dtype::FLOAT32),
-        );
-        let round_trip = restored
-            .fp8_snapshot_tensors()
-            .expect("restored FP8 draft cache");
-        assert_eq!(mlxcel_core::array_shape(&round_trip.keys), [1, 2, 4, 4]);
-        assert_eq!(mlxcel_core::array_shape(&round_trip.values), [1, 2, 4, 4]);
-        assert_eq!(
-            mlxcel_core::array_dtype(&round_trip.keys),
-            mlxcel_core::dtype::UINT8
-        );
-        assert_eq!(
-            mlxcel_core::array_dtype(&round_trip.values),
-            mlxcel_core::dtype::UINT8
-        );
-        assert!(restored.capacity() >= 7);
-    }
-
-    #[test]
     fn mtp_prompt_snapshot_arrays_remain_owned_after_sources_drop() {
         let keys = mlxcel_core::from_slice_f32(&[1.0, 2.0], &[1, 1, 1, 2]);
         let values = mlxcel_core::from_slice_f32(&[3.0, 4.0], &[1, 1, 1, 2]);
@@ -3715,7 +3615,7 @@ mod tests {
             assert_eq!(caches[1].offset(), plan.final_offset);
 
             let round_appended = block_size - 2;
-            let mut draft = KVCache::new_with_mode(KVCacheMode::Fp8);
+            let mut draft = KVCache::new();
             draft.offset = prefix + round_appended as i32;
             let kept = trim_draft_cache(&mut draft, round_appended, accepted);
             draft.offset += (accepted - kept + 1) as i32;
@@ -3860,7 +3760,7 @@ mod tests {
         mlxcel_core::clear_memory_cache();
         assert_eq!(array_f32(&hidden), [3.0, 4.0]);
 
-        let mut cache = KVCache::new_with_mode(KVCacheMode::Fp8);
+        let mut cache = KVCache::new();
         cache.update(
             mlxcel_core::from_slice_f32(&[1.0, 2.0, 3.0], &[1, 1, 3, 1]),
             mlxcel_core::from_slice_f32(&[11.0, 12.0, 13.0], &[1, 1, 3, 1]),
@@ -3880,9 +3780,6 @@ mod tests {
         assert_eq!(array_f32(&values), [11.0, 12.0, 13.0, 15.0]);
     }
     fn array_f32(array: &MlxArray) -> Vec<f32> {
-        let cast = (mlxcel_core::array_dtype(array) != mlxcel_core::dtype::FLOAT32)
-            .then(|| mlxcel_core::astype(array, mlxcel_core::dtype::FLOAT32));
-        let array = cast.as_deref().unwrap_or(array);
         mlxcel_core::eval(array);
         mlxcel_core::array_to_raw_bytes(array)
             .chunks_exact(4)
