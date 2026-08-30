@@ -411,6 +411,18 @@ fn prefix_cache_namespaces(namespace: &str) -> (CacheNamespaces, String) {
     )
 }
 
+fn open_prefix_cache(namespaces: CacheNamespaces, prefix_root: &Path) -> AdaptivePrefixCache {
+    AdaptivePrefixCache::new(
+        namespaces,
+        CacheConfig {
+            memory_bytes: PREFIX_CACHE_MEMORY_BYTES,
+            directory: Some(prefix_root.to_owned()),
+            filesystem_bytes: PREFIX_CACHE_FILESYSTEM_BYTES,
+        },
+    )
+    .unwrap_or_else(|error| panic!("open persistent benchmark prefix cache: {error}"))
+}
+
 fn persistent_snapshot_complete(
     prefix_root: &Path,
     namespace: &str,
@@ -720,15 +732,7 @@ pub fn prepare_long_conversation_fixture(
     let manifest_path = fixture_manifest_path("long-conversation", &namespace);
     let (cache_namespaces, mtp_namespace) = prefix_cache_namespaces(&namespace);
     let load_started = Instant::now();
-    let mut prefix_cache = AdaptivePrefixCache::new(
-        cache_namespaces,
-        CacheConfig {
-            memory_bytes: PREFIX_CACHE_MEMORY_BYTES,
-            directory: Some(prefix_root.clone()),
-            filesystem_bytes: PREFIX_CACHE_FILESYSTEM_BYTES,
-        },
-    )
-    .unwrap_or_else(|error| panic!("open persistent benchmark prefix cache: {error}"));
+    let mut prefix_cache = open_prefix_cache(cache_namespaces.clone(), &prefix_root);
     if let Some(manifest) =
         read_fixture_manifest::<LongConversationFixtureManifest>(&manifest_path)
         && long_manifest_valid(
@@ -845,59 +849,6 @@ pub fn prepare_long_conversation_fixture(
     assert_eq!(mlxcel_core::array_shape(&block_keys)[2], tail_end / ratio);
     drop(auxiliary_keys);
     drop(block_keys);
-    let (baseline, stats) = provider
-        .benchmark_cached_streaming_in_mode(
-            &prompt_ids,
-            DECODE_MAX_TOKENS,
-            &sampling,
-            &snapshot,
-            Qwen4GenerationMode::Baseline,
-            |delta| {
-                black_box(delta);
-                true
-            },
-        )
-        .expect("warm cached 64k baseline");
-    assert!(stats.is_none());
-    let (baseline_repeat, stats) = provider
-        .benchmark_cached_streaming_in_mode(
-            &prompt_ids,
-            DECODE_MAX_TOKENS,
-            &sampling,
-            &snapshot,
-            Qwen4GenerationMode::Baseline,
-            |_| true,
-        )
-        .expect("repeat warm cached long-context baseline");
-    assert!(stats.is_none());
-    assert_eq!(
-        baseline_repeat.token_ids, baseline.token_ids,
-        "repeated baseline snapshot restore changed greedy output"
-    );
-    let (mtp_warm, stats) = provider
-        .benchmark_cached_streaming_in_mode(
-            &prompt_ids,
-            DECODE_MAX_TOKENS,
-            &sampling,
-            &snapshot,
-            Qwen4GenerationMode::Mtp,
-            |delta| {
-                black_box(delta);
-                true
-            },
-        )
-        .expect("warm cached 64k MTP");
-    assert!(stats.is_some());
-    assert!(token_ids_valid(
-        &baseline.token_ids,
-        DECODE_MAX_TOKENS,
-        provider.logits_vocab_size(),
-    ));
-    assert!(token_ids_valid(
-        &mtp_warm.token_ids,
-        DECODE_MAX_TOKENS,
-        provider.logits_vocab_size(),
-    ));
     emit_setup_phase("long_conversation_build", build_started.elapsed(), "cold");
 
     let persist_started = Instant::now();
@@ -912,19 +863,103 @@ pub fn prepare_long_conversation_fixture(
         ),
         "persistent MTP snapshot write did not complete"
     );
+    drop(prefix_cache);
+    let mut prefix_cache = open_prefix_cache(cache_namespaces, &prefix_root);
+    emit_setup_phase(
+        "long_conversation_persist",
+        persist_started.elapsed(),
+        "cold",
+    );
+
+    // Warm benchmark iterations restore the filesystem-hydrated snapshot, so
+    // establish both goldens only after taking that same lifecycle transition.
+    let golden_started = Instant::now();
+    let (baseline_token_ids, mtp_token_ids) = {
+        let snapshot = exact_mtp_snapshot(&mut prefix_cache, &prompt_ids, prefix_tokens)
+            .expect("filesystem-hydrated MTP snapshot");
+        let (baseline, stats) = provider
+            .benchmark_cached_streaming_in_mode(
+                &prompt_ids,
+                DECODE_MAX_TOKENS,
+                &sampling,
+                snapshot,
+                Qwen4GenerationMode::Baseline,
+                |delta| {
+                    black_box(delta);
+                    true
+                },
+            )
+            .expect("warm hydrated cached 64k baseline");
+        assert!(stats.is_none());
+        let (baseline_repeat, stats) = provider
+            .benchmark_cached_streaming_in_mode(
+                &prompt_ids,
+                DECODE_MAX_TOKENS,
+                &sampling,
+                snapshot,
+                Qwen4GenerationMode::Baseline,
+                |_| true,
+            )
+            .expect("repeat warm hydrated cached long-context baseline");
+        assert!(stats.is_none());
+        assert_eq!(
+            baseline_repeat.token_ids, baseline.token_ids,
+            "repeated baseline snapshot restore changed greedy output"
+        );
+        let (mtp, stats) = provider
+            .benchmark_cached_streaming_in_mode(
+                &prompt_ids,
+                DECODE_MAX_TOKENS,
+                &sampling,
+                snapshot,
+                Qwen4GenerationMode::Mtp,
+                |delta| {
+                    black_box(delta);
+                    true
+                },
+            )
+            .expect("warm hydrated cached 64k MTP");
+        assert!(stats.is_some());
+        let (mtp_repeat, stats) = provider
+            .benchmark_cached_streaming_in_mode(
+                &prompt_ids,
+                DECODE_MAX_TOKENS,
+                &sampling,
+                snapshot,
+                Qwen4GenerationMode::Mtp,
+                |_| true,
+            )
+            .expect("repeat warm hydrated cached 64k MTP");
+        assert!(stats.is_some());
+        assert_eq!(
+            mtp_repeat.token_ids, mtp.token_ids,
+            "repeated MTP snapshot restore changed greedy output"
+        );
+        assert!(token_ids_valid(
+            &baseline.token_ids,
+            DECODE_MAX_TOKENS,
+            provider.logits_vocab_size(),
+        ));
+        assert!(token_ids_valid(
+            &mtp.token_ids,
+            DECODE_MAX_TOKENS,
+            provider.logits_vocab_size(),
+        ));
+        (baseline.token_ids, mtp.token_ids)
+    };
     let manifest = LongConversationFixtureManifest {
         namespace,
         route: SnapshotRoute::Mtp,
         prompt_ids,
         prefix_tokens,
-        baseline_token_ids: baseline.token_ids,
-        mtp_token_ids: mtp_warm.token_ids,
+        baseline_token_ids,
+        mtp_token_ids,
     };
     publish_fixture_manifest(&manifest_path, &manifest)
         .unwrap_or_else(|error| panic!("publish long-conversation fixture: {error}"));
     emit_setup_phase(
-        "long_conversation_persist",
-        persist_started.elapsed(),
+        "long_conversation_golden",
+        golden_started.elapsed(),
         "cold",
     );
     {
