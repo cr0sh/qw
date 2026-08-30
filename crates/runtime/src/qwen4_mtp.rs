@@ -29,7 +29,7 @@ use crate::portable_snapshot::{
 };
 use mlxcel_core::generate::{
     ConstraintCommit, ConstraintMask, GenerationStopReason, LanguageModel, ModelStateSnapshot,
-    SamplingConfig, TokenConstraint, mask_logits_to_allowed,
+    SamplingConfig, SnapshotPagedTensor, TokenConstraint, mask_logits_to_allowed,
 };
 use mlxcel_core::generation_policy::{merged_eos_token_ids, seed_rng_if_needed};
 use mlxcel_core::layers::{KVCache, UnifiedLinear};
@@ -235,6 +235,289 @@ pub struct MtpPrefixReuse<'a> {
     /// the target snapshot. It becomes the next speculative-round bonus
     /// without being emitted or singly prefetched.
     pub continuation_token: Option<i32>,
+}
+
+enum MtpReuse<'a> {
+    Borrowed(MtpPrefixReuse<'a>),
+    Owned {
+        snapshot: MtpPromptSnapshot,
+        continuation_token: Option<i32>,
+    },
+}
+
+impl<'a> MtpReuse<'a> {
+    fn cached_tokens(&self) -> usize {
+        match self {
+            Self::Borrowed(reuse) => reuse.cached_tokens,
+            Self::Owned { snapshot, .. } => snapshot.token_len(),
+        }
+    }
+
+    fn continuation_token(&self) -> Option<i32> {
+        match self {
+            Self::Borrowed(reuse) => reuse.continuation_token,
+            Self::Owned {
+                continuation_token,
+                ..
+            } => *continuation_token,
+        }
+    }
+
+    fn borrowed(&self) -> Option<MtpPrefixReuse<'a>> {
+        match self {
+            Self::Borrowed(reuse) => Some(*reuse),
+            Self::Owned { .. } => None,
+        }
+    }
+}
+
+#[derive(PartialEq, Eq)]
+struct DraftPagedLayout {
+    shape: Vec<i32>,
+    dtype: i32,
+}
+
+fn validate_draft_paged_tensor(
+    tensor: &SnapshotPagedTensor,
+    name: &str,
+    expected_len: Option<usize>,
+    rank: usize,
+) -> Result<DraftPagedLayout, String> {
+    if tensor.token_axis() != 2
+        || expected_len.is_some_and(|expected| tensor.token_len() != expected)
+        || tensor.pages().is_empty()
+    {
+        return Err(format!("MTP snapshot {name} page layout is invalid"));
+    }
+    let mut cursor = 0usize;
+    let mut layout = None;
+    for page in tensor.pages() {
+        let range = page.token_range();
+        let shape = page.shape();
+        if range.start != cursor
+            || range.start >= range.end
+            || shape.len() != rank
+            || shape[2] != i32::try_from(range.end - range.start).unwrap_or(i32::MAX)
+            || shape.iter().any(|&dimension| dimension <= 0)
+        {
+            return Err(format!("MTP snapshot {name} page layout is invalid"));
+        }
+        let mut logical_shape = shape.to_vec();
+        logical_shape[2] = 0;
+        let page_layout = DraftPagedLayout {
+            shape: logical_shape,
+            dtype: page.dtype(),
+        };
+        if layout
+            .as_ref()
+            .is_some_and(|expected| expected != &page_layout)
+        {
+            return Err(format!("MTP snapshot {name} page layout is invalid"));
+        }
+        layout.get_or_insert(page_layout);
+        cursor = range.end;
+    }
+    if cursor != tensor.token_len() {
+        return Err(format!("MTP snapshot {name} page layout is invalid"));
+    }
+    Ok(layout.expect("nonempty MTP paged tensor"))
+}
+
+fn is_float_dtype(dtype: i32) -> bool {
+    matches!(
+        dtype,
+        mlxcel_core::dtype::FLOAT16
+            | mlxcel_core::dtype::FLOAT32
+            | mlxcel_core::dtype::BFLOAT16
+    )
+}
+
+#[derive(Debug)]
+struct OwnedDraftValidation {
+    auxiliary_metadata: Option<[i32; 4]>,
+    auxiliary_block_is_paged: bool,
+}
+
+fn validate_owned_mtp_reuse(
+    reuse: &MtpReuse<'_>,
+    prompt_tokens: &[i32],
+    desired_horizon: i32,
+) -> Result<OwnedDraftValidation, String> {
+    let MtpReuse::Owned {
+        snapshot,
+        continuation_token,
+    } = reuse
+    else {
+        unreachable!("owned MTP validation requires an owned snapshot");
+    };
+    let cached_tokens = snapshot.token_len();
+    if cached_tokens == 0 || cached_tokens > prompt_tokens.len() {
+        return Err("MTP cached token count is outside the prompt".to_string());
+    }
+    if let Some(token) = continuation_token
+        && (cached_tokens + 1 != prompt_tokens.len() || prompt_tokens[cached_tokens] != *token)
+    {
+        return Err("MTP response continuation token does not match the prompt".to_string());
+    }
+    let expected_offset = i32::try_from(
+        cached_tokens
+            .checked_sub(1)
+            .ok_or_else(|| "MTP snapshots require a non-empty prompt".to_string())?,
+    )
+    .map_err(|_| "MTP snapshot token length exceeds i32".to_string())?;
+    if snapshot.target.token_len() != cached_tokens
+        || snapshot.draft_offset != expected_offset
+        || snapshot.draft.token_len() != expected_offset as usize
+        || snapshot.draft.family() != "qwen4-mtp-draft"
+    {
+        return Err(
+            "MTP snapshot target/drafter offsets do not match the cached prefix".to_string(),
+        );
+    }
+    for (name, array) in [
+        ("last-hidden", snapshot.last_hidden.as_ref()),
+        (
+            "continuation-logits",
+            snapshot.continuation_logits.as_ref(),
+        ),
+    ] {
+        let array = array.ok_or_else(|| format!("MTP snapshot {name} seed is null"))?;
+        let shape = mlxcel_core::array_shape(array);
+        if shape.len() != 3
+            || shape[0] != 1
+            || shape[1] != 1
+            || shape[2] <= 0
+            || !is_float_dtype(mlxcel_core::array_dtype(array))
+        {
+            return Err(format!("MTP snapshot {name} layout must be [1, 1, width]"));
+        }
+    }
+    if snapshot.draft.continuation_logits().is_some()
+        || snapshot
+            .draft
+        .tensor_names()
+        .any(|name| {
+            !matches!(
+                name,
+                "draft_auxiliary_metadata"
+                    | "draft_auxiliary_keys"
+                    | "draft_auxiliary_block_keys"
+            )
+        })
+        || snapshot.draft.paged_tensor_names().any(|name| {
+            !matches!(
+                name,
+                "draft_keys" | "draft_values" | "draft_auxiliary_block_keys"
+            )
+        })
+    {
+        return Err("MTP snapshot drafter tensor layout is invalid".to_string());
+    }
+    let keys = snapshot.draft.paged_tensor("draft_keys");
+    let values = snapshot.draft.paged_tensor("draft_values");
+    if keys.is_some() != values.is_some() || (expected_offset > 0 && keys.is_none()) {
+        return Err("MTP snapshot drafter KV layout is incomplete".to_string());
+    }
+    if let (Some(keys), Some(values)) = (keys, values) {
+        let keys_layout = validate_draft_paged_tensor(
+            keys,
+            "drafter keys",
+            Some(expected_offset as usize),
+            4,
+        )?;
+        let values_layout = validate_draft_paged_tensor(
+            values,
+            "drafter values",
+            Some(expected_offset as usize),
+            4,
+        )?;
+        if keys_layout != values_layout {
+            return Err("MTP snapshot drafter KV page geometry does not match".to_string());
+        }
+    }
+
+    let auxiliary_keys = snapshot.draft.tensor("draft_auxiliary_keys");
+    let auxiliary_metadata = snapshot.draft.tensor("draft_auxiliary_metadata");
+    let paged_block_keys = snapshot
+        .draft
+        .paged_tensor("draft_auxiliary_block_keys");
+    let dense_block_keys = snapshot.draft.tensor("draft_auxiliary_block_keys");
+    if auxiliary_keys.is_some() != auxiliary_metadata.is_some()
+        || (paged_block_keys.is_some() && dense_block_keys.is_some())
+        || (auxiliary_keys.is_none() && (paged_block_keys.is_some() || dense_block_keys.is_some()))
+    {
+        return Err("MTP snapshot drafter QSA layout is incomplete".to_string());
+    }
+    let parsed_metadata =
+        if let (Some(auxiliary_keys), Some(metadata)) = (auxiliary_keys, auxiliary_metadata) {
+            if mlxcel_core::array_shape(metadata) != [4]
+                || mlxcel_core::array_dtype(metadata) != mlxcel_core::dtype::INT32
+            {
+                return Err("MTP snapshot drafter QSA metadata is invalid".to_string());
+            }
+            let bytes = mlxcel_core::array_to_raw_bytes(metadata);
+            let values = bytes
+                .chunks_exact(4)
+                .map(|chunk| i32::from_ne_bytes(chunk.try_into().expect("four-byte QSA field")))
+                .collect::<Vec<_>>();
+            let metadata: [i32; 4] = values
+                .try_into()
+                .map_err(|_| "MTP snapshot drafter QSA metadata is invalid".to_string())?;
+            let [start, end, horizon, block_size] = metadata;
+            let shape = mlxcel_core::array_shape(auxiliary_keys);
+            if start < 0
+                || end < start
+                || end != expected_offset
+                || horizon < 0
+                || shape.len() != 3
+                || shape[1] != end - start
+                || shape[0] <= 0
+                || shape[1] < 0
+                || shape[2] <= 0
+            {
+                return Err("MTP snapshot drafter QSA raw-key layout is invalid".to_string());
+            }
+            if let Some(block_keys) = paged_block_keys {
+                if block_size <= 0 {
+                    return Err(
+                        "MTP snapshot drafter QSA block metadata is invalid".to_string(),
+                    );
+                }
+                validate_draft_paged_tensor(
+                    block_keys,
+                    "drafter auxiliary block keys",
+                    None,
+                    4,
+                )?;
+            }
+            if let Some(block_keys) = dense_block_keys {
+                let block_shape = mlxcel_core::array_shape(block_keys);
+                if block_size <= 0
+                    || block_shape.len() != 4
+                    || block_shape.iter().any(|&dimension| dimension <= 0)
+                {
+                    return Err(
+                        "MTP snapshot drafter QSA block-key layout is invalid".to_string(),
+                    );
+                }
+            }
+            if desired_horizon > horizon && end > 0 && block_size > 0 {
+                let required = end.saturating_sub(desired_horizon).max(0) / block_size * block_size;
+                if start > required {
+                    return Err(
+                        "MTP snapshot drafter QSA tail cannot satisfy the restore horizon"
+                            .to_string(),
+                    );
+                }
+            }
+            Some(metadata)
+        } else {
+            None
+        };
+    Ok(OwnedDraftValidation {
+        auxiliary_metadata: parsed_metadata,
+        auxiliary_block_is_paged: paged_block_keys.is_some(),
+    })
 }
 
 struct MtpProposal {
@@ -952,6 +1235,96 @@ impl Qwen4MtpDraftModel {
             round_appended: 0,
         };
         Ok(())
+    }
+
+    fn restore_prompt_snapshot_owned(
+        &self,
+        model: &Qwen4Model,
+        snapshot: MtpPromptSnapshot,
+        validation: OwnedDraftValidation,
+    ) -> Result<crate::qwen4::Qwen4MtpPrefill, String> {
+        let desired_horizon = self.state.borrow().cache.auxiliary_rollback_horizon();
+        let MtpPromptSnapshot {
+            target,
+            mut draft,
+            draft_offset,
+            last_hidden,
+            continuation_logits,
+        } = snapshot;
+        if let Err(error) = model.restore_sequence_state_owned(
+            mlxcel_core::cache::SequenceId::from_raw(0),
+            target,
+        ) {
+            model.reset_runtime_state();
+            self.reset();
+            return Err(error);
+        }
+
+        let restored = (|| {
+            let mut cache = KVCache::new();
+            if draft_offset > 0 {
+                cache.keys = Some(
+                    draft
+                        .take_paged_tensor("draft_keys")
+                        .expect("prevalidated MTP draft keys")
+                        .into_materialized()
+                        .expect("prevalidated MTP draft key pages"),
+                );
+                cache.values = Some(
+                    draft
+                        .take_paged_tensor("draft_values")
+                        .expect("prevalidated MTP draft values")
+                        .into_materialized()
+                        .expect("prevalidated MTP draft value pages"),
+                );
+            }
+            cache.offset = draft_offset;
+            if let Some([start, end, horizon, block_size]) = validation.auxiliary_metadata {
+                let block_keys = if validation.auxiliary_block_is_paged {
+                    Some(
+                        draft
+                            .take_paged_tensor("draft_auxiliary_block_keys")
+                            .expect("prevalidated MTP auxiliary block pages")
+                            .into_materialized()
+                            .expect("prevalidated MTP auxiliary block tensor"),
+                    )
+                } else {
+                    draft
+                        .take_tensor("draft_auxiliary_block_keys")
+                        .map(materialize_detached)
+                };
+                cache.restore_auxiliary_block_keys(block_size, block_keys);
+                let auxiliary_keys = materialize_detached(
+                    draft
+                        .take_tensor("draft_auxiliary_keys")
+                        .expect("prevalidated MTP auxiliary keys"),
+                );
+                cache.restore_auxiliary_keys(start, end, horizon, auxiliary_keys)?;
+                let _ = draft
+                    .take_tensor("draft_auxiliary_metadata")
+                    .expect("prevalidated MTP auxiliary metadata");
+            }
+            cache.set_auxiliary_rollback_horizon(desired_horizon)?;
+            Ok::<_, String>(cache)
+        })();
+        let cache = match restored {
+            Ok(cache) => cache,
+            Err(error) => {
+                model.reset_runtime_state();
+                self.reset();
+                return Err(error);
+            }
+        };
+        *self.state.borrow_mut() = Qwen4MtpDraftState {
+            cache,
+            seed_hidden: None,
+            rope_delta: None,
+            round_appended: 0,
+        };
+        Ok(crate::qwen4::Qwen4MtpPrefill {
+            hidden: last_hidden,
+            first_logits: continuation_logits,
+        })
     }
 }
 
@@ -1792,7 +2165,7 @@ fn prefill_text_with_reuse(
     model: &Qwen4Model,
     drafter: &Qwen4MtpDraftModel,
     prompt_tokens: &[i32],
-    reuse: Option<MtpPrefixReuse<'_>>,
+    reuse: Option<MtpReuse<'_>>,
 ) -> Result<(crate::qwen4::Qwen4MtpPrefill, usize), String> {
     let Some(reuse) = reuse else {
         mlxcel_core::memory::trace_snapshot("mtp.prefill.started", 0, prompt_tokens.len());
@@ -1818,77 +2191,88 @@ fn prefill_text_with_reuse(
         )
         .map(|prefill| (prefill, 0));
     };
-    if reuse.cached_tokens == 0 || reuse.cached_tokens > prompt_tokens.len() {
+    let cached_tokens = reuse.cached_tokens();
+    let continuation_token = reuse.continuation_token();
+    if cached_tokens == 0 || cached_tokens > prompt_tokens.len() {
         return Err("MTP cached token count is outside the prompt".to_string());
     }
-    model.restore_sequence_state(
-        mlxcel_core::cache::SequenceId::from_raw(0),
-        &reuse.snapshot.target,
-    )?;
-    drafter.restore_prompt_snapshot(reuse.snapshot, reuse.cached_tokens)?;
+    let owned_validation = match &reuse {
+        MtpReuse::Borrowed(_) => None,
+        MtpReuse::Owned { .. } => Some(validate_owned_mtp_reuse(
+            &reuse,
+            prompt_tokens,
+            drafter.state.borrow().cache.auxiliary_rollback_horizon(),
+        )?),
+    };
+    let restored_prefill = match reuse {
+        MtpReuse::Borrowed(reuse) => {
+            model.restore_sequence_state(
+                mlxcel_core::cache::SequenceId::from_raw(0),
+                &reuse.snapshot.target,
+            )?;
+            drafter.restore_prompt_snapshot(reuse.snapshot, cached_tokens)?;
+            crate::qwen4::Qwen4MtpPrefill {
+                hidden: mlxcel_core::copy(&reuse.snapshot.last_hidden),
+                first_logits: mlxcel_core::copy(&reuse.snapshot.continuation_logits),
+            }
+        }
+        MtpReuse::Owned { snapshot, .. } => drafter.restore_prompt_snapshot_owned(
+            model,
+            snapshot,
+            owned_validation.expect("owned MTP reuse was prevalidated"),
+        )?,
+    };
     drafter.reserve_prefill_capacity(
         i32::try_from(prompt_tokens.len().saturating_sub(1)).unwrap_or(i32::MAX),
     );
     mlxcel_core::memory::trace_snapshot(
         "mtp.prefill.started",
-        reuse.cached_tokens,
+        cached_tokens,
         prompt_tokens.len(),
     );
-    if let Some(continuation_token) = reuse.continuation_token {
-        if reuse.cached_tokens + 1 != prompt_tokens.len()
-            || prompt_tokens[reuse.cached_tokens] != continuation_token
+    if let Some(continuation_token) = continuation_token {
+        if cached_tokens + 1 != prompt_tokens.len()
+            || prompt_tokens[cached_tokens] != continuation_token
         {
             return Err("MTP response continuation token does not match the prompt".to_string());
         }
         debug!(
             phase = "prefill.started",
             prompt_tokens = prompt_tokens.len(),
-            requested_cached_tokens = reuse.cached_tokens,
-            prefix_cached_tokens = reuse.cached_tokens,
-            prefill_start = reuse.cached_tokens,
+            requested_cached_tokens = cached_tokens,
+            prefix_cached_tokens = cached_tokens,
+            prefill_start = cached_tokens,
             prefill_tokens = 0,
         );
-        return Ok((
-            crate::qwen4::Qwen4MtpPrefill {
-                hidden: mlxcel_core::copy(&reuse.snapshot.last_hidden),
-                first_logits: mlxcel_core::copy(&reuse.snapshot.continuation_logits),
-            },
-            reuse.cached_tokens,
-        ));
+        return Ok((restored_prefill, cached_tokens));
     }
-    if reuse.cached_tokens == prompt_tokens.len() {
+    if cached_tokens == prompt_tokens.len() {
         debug!(
             phase = "prefill.started",
             prompt_tokens = prompt_tokens.len(),
-            requested_cached_tokens = reuse.cached_tokens,
-            prefix_cached_tokens = reuse.cached_tokens,
-            prefill_start = reuse.cached_tokens,
+            requested_cached_tokens = cached_tokens,
+            prefix_cached_tokens = cached_tokens,
+            prefill_start = cached_tokens,
             prefill_tokens = 0,
         );
-        return Ok((
-            crate::qwen4::Qwen4MtpPrefill {
-                hidden: mlxcel_core::copy(&reuse.snapshot.last_hidden),
-                first_logits: mlxcel_core::copy(&reuse.snapshot.continuation_logits),
-            },
-            reuse.cached_tokens,
-        ));
+        return Ok((restored_prefill, cached_tokens));
     }
 
-    let suffix = &prompt_tokens[reuse.cached_tokens..];
+    let suffix = &prompt_tokens[cached_tokens..];
     debug!(
         phase = "prefill.started",
         prompt_tokens = prompt_tokens.len(),
-        requested_cached_tokens = reuse.cached_tokens,
-        prefix_cached_tokens = reuse.cached_tokens,
-        prefill_start = reuse.cached_tokens,
+        requested_cached_tokens = cached_tokens,
+        prefix_cached_tokens = cached_tokens,
+        prefill_start = cached_tokens,
         prefill_tokens = suffix.len(),
     );
     let suffix_ids = mlxcel_core::from_slice_i32(
         suffix,
         &[1, i32::try_from(suffix.len()).unwrap_or(i32::MAX)],
     );
-    let mut previous_hidden = mlxcel_core::copy(&reuse.snapshot.last_hidden);
-    let mut processed_tokens = reuse.cached_tokens;
+    let mut previous_hidden = restored_prefill.hidden;
+    let mut processed_tokens = cached_tokens;
     let prefill = model.forward_mtp_text_suffix_chunks(
         &suffix_ids,
         suffix,
@@ -1919,7 +2303,7 @@ fn prefill_text_with_reuse(
             );
         },
     )?;
-    Ok((prefill, reuse.cached_tokens))
+    Ok((prefill, cached_tokens))
 }
 
 fn capture_mtp_prompt_snapshot(
@@ -1953,10 +2337,14 @@ fn prefill_text_with_checkpoints(
     model: &Qwen4Model,
     drafter: &Qwen4MtpDraftModel,
     prompt_tokens: &[i32],
-    reuse: Option<MtpPrefixReuse<'_>>,
+    reuse: Option<MtpReuse<'_>>,
     checkpoint_token_lengths: &[usize],
 ) -> Result<(crate::qwen4::Qwen4MtpPrefill, usize, Vec<MtpPromptSnapshot>), String> {
-    let cached_tokens = reuse.map_or(0, |value| value.cached_tokens);
+    let cached_tokens = reuse.as_ref().map_or(0, MtpReuse::cached_tokens);
+    let source_previous = reuse
+        .as_ref()
+        .and_then(MtpReuse::borrowed)
+        .map(|reuse| reuse.snapshot);
     let mut source_reuse = reuse;
     let mut latest_checkpoint = None;
     let mut snapshots = Vec::with_capacity(checkpoint_token_lengths.len());
@@ -1973,10 +2361,12 @@ fn prefill_text_with_checkpoints(
         }
         let active_reuse = latest_checkpoint
             .as_ref()
-            .map(|snapshot| MtpPrefixReuse {
-                snapshot,
-                cached_tokens: snapshot.token_len(),
-                continuation_token: None,
+            .map(|snapshot| {
+                MtpReuse::Borrowed(MtpPrefixReuse {
+                    snapshot,
+                    cached_tokens: snapshot.token_len(),
+                    continuation_token: None,
+                })
             })
             .or_else(|| source_reuse.take());
         let (prefill, _) =
@@ -1986,11 +2376,14 @@ fn prefill_text_with_checkpoints(
         }
         let requested = checkpoint_token_lengths.binary_search(&token_len).is_ok();
         if requested {
-            let snapshot =
-                capture_mtp_prompt_snapshot(model, drafter, token_len, &prefill, snapshots.last())
-                    .ok_or_else(|| {
-                        format!("failed to capture MTP checkpoint at {token_len} tokens")
-                    })?;
+            let snapshot = capture_mtp_prompt_snapshot(
+                model,
+                drafter,
+                token_len,
+                &prefill,
+                snapshots.last().or(source_previous),
+            )
+            .ok_or_else(|| format!("failed to capture MTP checkpoint at {token_len} tokens"))?;
             if token_len == prompt_tokens.len() {
                 snapshots.push(snapshot);
             } else {
@@ -2165,7 +2558,13 @@ fn capture_mtp_final_snapshot(
     // Preserve prefix reuse for final-state capture; rebuilding the whole prompt
     // here delays the terminal response after streamed output has finished.
     let prefill = match prefix_reuse {
-        Some(reuse) => prefill_text_with_reuse(model, drafter, prompt_tokens, Some(reuse))?.0,
+        Some(reuse) => prefill_text_with_reuse(
+            model,
+            drafter,
+            prompt_tokens,
+            Some(MtpReuse::Borrowed(reuse)),
+        )?
+        .0,
         None => prefill_for_input(model, drafter, prefill_input)?,
     };
     if generated.len() == 1 {
@@ -2273,6 +2672,64 @@ impl Qwen4MtpGenerator {
         constraint: Option<&mut dyn TokenConstraint>,
         on_token: F,
     ) -> Result<MtpGeneration, String> {
+        self.generate_streaming_impl(
+            model,
+            prompt_tokens,
+            max_tokens,
+            sampling,
+            block_size,
+            prefix_reuse.map(MtpReuse::Borrowed),
+            checkpoint_token_lengths,
+            constraint,
+            on_token,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn generate_streaming_owned<F: FnMut(i32) -> bool>(
+        &mut self,
+        model: &Qwen4Model,
+        prompt_tokens: &[i32],
+        max_tokens: usize,
+        sampling: &SamplingConfig,
+        block_size: usize,
+        snapshot: MtpPromptSnapshot,
+        continuation_token: Option<i32>,
+        checkpoint_token_lengths: &[usize],
+        constraint: Option<&mut dyn TokenConstraint>,
+        on_token: F,
+    ) -> Result<MtpGeneration, String> {
+        self.generate_streaming_impl(
+            model,
+            prompt_tokens,
+            max_tokens,
+            sampling,
+            block_size,
+            Some(MtpReuse::Owned {
+                snapshot,
+                continuation_token,
+            }),
+            checkpoint_token_lengths,
+            constraint,
+            on_token,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn generate_streaming_impl<F: FnMut(i32) -> bool>(
+        &mut self,
+        model: &Qwen4Model,
+        prompt_tokens: &[i32],
+        max_tokens: usize,
+        sampling: &SamplingConfig,
+        block_size: usize,
+        prefix_reuse: Option<MtpReuse<'_>>,
+        checkpoint_token_lengths: &[usize],
+        constraint: Option<&mut dyn TokenConstraint>,
+        on_token: F,
+    ) -> Result<MtpGeneration, String> {
+        let consumes_snapshot =
+            matches!(prefix_reuse.as_ref(), Some(MtpReuse::Owned { .. }));
         install_thread_local_default_stream(self.generation_stream.as_ref());
         let prompt = mlxcel_core::from_slice_i32(
             prompt_tokens,
@@ -2293,6 +2750,13 @@ impl Qwen4MtpGenerator {
             constraint,
             on_token,
         );
+        if consumes_snapshot && result.is_err() {
+            model.reset_runtime_state();
+            model
+                .mtp()
+                .expect("owned MTP generation requires a bundled MTP head")
+                .reset();
+        }
         finish_mtp_request(model);
         result
     }
@@ -2305,7 +2769,7 @@ impl Qwen4MtpGenerator {
         max_tokens: usize,
         sampling: &SamplingConfig,
         block_size: usize,
-        prefix_reuse: Option<MtpPrefixReuse<'_>>,
+        prefix_reuse: Option<MtpReuse<'_>>,
         checkpoint_token_lengths: &[usize],
         constraint: Option<&mut dyn TokenConstraint>,
         mut on_token: F,
@@ -2352,8 +2816,10 @@ impl Qwen4MtpGenerator {
         let drafter = model
             .mtp()
             .expect("Qwen4MtpGenerator requires a bundled MTP head");
-        let final_prefix_reuse = prefix_reuse;
-        let continuation_token = final_prefix_reuse.and_then(|reuse| reuse.continuation_token);
+        let final_prefix_reuse = prefix_reuse.as_ref().and_then(MtpReuse::borrowed);
+        let continuation_token = prefix_reuse
+            .as_ref()
+            .and_then(MtpReuse::continuation_token);
         let mut sampling = sampling.clone();
         sampling
             .token_bias
@@ -2378,8 +2844,7 @@ impl Qwen4MtpGenerator {
             prompt_tokens,
             prefix_reuse,
             checkpoint_token_lengths,
-        )
-        .expect("MTP prefill requires valid synchronized chunks");
+        )?;
         let first_token = if let Some(token) = continuation_token {
             token
         } else {
@@ -2675,7 +3140,7 @@ impl Qwen4MtpGenerator {
         max_tokens: usize,
         sampling: &SamplingConfig,
         block_size: usize,
-        prefix_reuse: Option<MtpPrefixReuse<'_>>,
+        prefix_reuse: Option<MtpReuse<'_>>,
         checkpoint_token_lengths: &[usize],
         constraint: &mut dyn TokenConstraint,
         mut on_token: F,
@@ -2703,7 +3168,7 @@ impl Qwen4MtpGenerator {
         let mut generated = Vec::with_capacity(max_tokens);
         let mut stats = MtpGenerationStats::default();
         let mut stop_reason = GenerationStopReason::MaxTokens;
-        let final_prefix_reuse = prefix_reuse;
+        let final_prefix_reuse = prefix_reuse.as_ref().and_then(MtpReuse::borrowed);
         let mut prefix_reuse = prefix_reuse;
         let mut prompt_snapshots = Vec::new();
         let mut cached_tokens = 0;
@@ -3013,6 +3478,7 @@ impl Qwen4MtpGenerator {
         } else {
             None
         };
+
         Ok(MtpGeneration {
             token_ids: generated,
             stats,
@@ -3076,6 +3542,46 @@ mod tests {
         mlxcel_core::eval(&hidden_equal);
         assert!(mlxcel_core::item_bool(&keys_equal));
         assert!(mlxcel_core::item_bool(&hidden_equal));
+    }
+    #[test]
+    fn owned_mtp_prevalidation_rejects_malformed_layout_without_consuming_pages() {
+        let keys = mlxcel_core::from_slice_f32(&[1.0, 2.0], &[1, 1, 1, 2]);
+        let hidden = mlxcel_core::from_slice_f32(&[3.0, 4.0], &[1, 1, 2]);
+        let logits = mlxcel_core::from_slice_f32(&[5.0, 6.0], &[1, 1, 2]);
+        let mut draft = ModelStateSnapshot::new("qwen4-mtp-draft", 1);
+        draft
+            .push_paged_tensor(None, "draft_keys", &keys, 2)
+            .expect("draft keys");
+        let page_identity = draft
+            .paged_tensor("draft_keys")
+            .expect("draft key pages")
+            .pages()[0]
+            .identity();
+        let reuse = MtpReuse::Owned {
+            snapshot: MtpPromptSnapshot {
+                target: ModelStateSnapshot::new("test", 2),
+                draft,
+                draft_offset: 1,
+                last_hidden: hidden,
+                continuation_logits: logits,
+            },
+            continuation_token: None,
+        };
+
+        let error = validate_owned_mtp_reuse(&reuse, &[1, 2], 0)
+            .expect_err("missing draft values must fail before restore");
+        assert!(error.contains("KV layout is incomplete"), "{error}");
+        let MtpReuse::Owned { snapshot, .. } = &reuse else {
+            unreachable!();
+        };
+        let pages = snapshot
+            .draft
+            .paged_tensor("draft_keys")
+            .expect("failed validation retains draft keys")
+            .pages();
+        assert_eq!(snapshot.draft.paged_tensor_count(), 1);
+        assert_eq!(pages[0].identity(), page_identity);
+        assert_eq!(Arc::strong_count(&pages[0]), 1);
     }
 
     #[test]

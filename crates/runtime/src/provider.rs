@@ -95,6 +95,19 @@ impl PromptSnapshot {
     }
 }
 
+enum BaselineGenerationReuse<'a> {
+    Borrowed(Option<PrefixReuse<'a>>),
+    Owned(ModelStateSnapshot),
+}
+
+enum MtpGenerationReuse<'a> {
+    Borrowed(Option<MtpPrefixReuse<'a>>),
+    Owned {
+        snapshot: MtpPromptSnapshot,
+        continuation_token: Option<i32>,
+    },
+}
+
 pub struct BaselineGeneration {
     pub text: String,
     pub token_ids: Vec<i32>,
@@ -438,6 +451,61 @@ impl Qwen4Provider {
         prefix_reuse: Option<PrefixReuse<'_>>,
         constraint: Option<&mut dyn TokenConstraint>,
         checkpoint_token_lengths: &[usize],
+        on_delta: F,
+    ) -> Result<BaselineGeneration> {
+        self.generate_baseline_streaming_impl(
+            prompt_ids,
+            max_tokens,
+            sampling,
+            BaselineGenerationReuse::Borrowed(prefix_reuse),
+            constraint,
+            checkpoint_token_lengths,
+            on_delta,
+        )
+    }
+
+    #[tracing::instrument(
+        name = "runtime.generate_baseline_owned_response",
+        skip_all,
+        fields(
+            prompt_tokens = prompt_ids.len(),
+            max_tokens,
+            cached_tokens = snapshot.token_len(),
+            constrained = constraint.is_some(),
+        ),
+        err
+    )]
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_baseline_streaming_owned_response<F: FnMut(&str) -> bool>(
+        &mut self,
+        prompt_ids: &[i32],
+        max_tokens: usize,
+        sampling: &SamplingConfig,
+        snapshot: ModelStateSnapshot,
+        constraint: Option<&mut dyn TokenConstraint>,
+        checkpoint_token_lengths: &[usize],
+        on_delta: F,
+    ) -> Result<BaselineGeneration> {
+        self.generate_baseline_streaming_impl(
+            prompt_ids,
+            max_tokens,
+            sampling,
+            BaselineGenerationReuse::Owned(snapshot),
+            constraint,
+            checkpoint_token_lengths,
+            on_delta,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn generate_baseline_streaming_impl<F: FnMut(&str) -> bool>(
+        &mut self,
+        prompt_ids: &[i32],
+        max_tokens: usize,
+        sampling: &SamplingConfig,
+        prefix_reuse: BaselineGenerationReuse<'_>,
+        constraint: Option<&mut dyn TokenConstraint>,
+        checkpoint_token_lengths: &[usize],
         mut on_delta: F,
     ) -> Result<BaselineGeneration> {
         self.model.clear_prepared_mrope();
@@ -445,39 +513,55 @@ impl Qwen4Provider {
         let mut decoder = IncrementalTextDecoder::new(&self.tokenizer);
         let mut decode_error = None;
         let mut callback_active = true;
-        let controlled: ControlledGeneration = self
-            .generator
-            .generate_streaming_controlled(
-                &self.model,
-                prompt_ids,
-                prefix_reuse,
-                max_tokens,
-                sampling,
-                constraint,
-                checkpoint_token_lengths,
-                |token_id| {
-                    if buffer_output {
-                        callback_active = on_delta("");
-                        return callback_active;
+        let mut on_token = |token_id| {
+            if buffer_output {
+                callback_active = on_delta("");
+                return callback_active;
+            }
+            match decoder.push(token_id) {
+                Ok(delta) => {
+                    if delta.is_empty() {
+                        true
+                    } else {
+                        callback_active = on_delta(&delta);
+                        callback_active
                     }
-                    match decoder.push(token_id) {
-                        Ok(delta) => {
-                            if delta.is_empty() {
-                                true
-                            } else {
-                                callback_active = on_delta(&delta);
-                                callback_active
-                            }
-                        }
-                        Err(error) => {
-                            decode_error = Some(error);
-                            false
-                        }
-                    }
-                },
-            )
-            .map_err(anyhow::Error::msg)
-            .context("baseline generation failed")?;
+                }
+                Err(error) => {
+                    decode_error = Some(error);
+                    false
+                }
+            }
+        };
+        let controlled: ControlledGeneration = match prefix_reuse {
+            BaselineGenerationReuse::Borrowed(prefix_reuse) => {
+                self.generator.generate_streaming_controlled(
+                    &self.model,
+                    prompt_ids,
+                    prefix_reuse,
+                    max_tokens,
+                    sampling,
+                    constraint,
+                    checkpoint_token_lengths,
+                    &mut on_token,
+                )
+            }
+            BaselineGenerationReuse::Owned(snapshot) => {
+                self.generator.generate_streaming_controlled_owned(
+                    &self.model,
+                    prompt_ids,
+                    snapshot,
+                    max_tokens,
+                    sampling,
+                    constraint,
+                    checkpoint_token_lengths,
+                    &mut on_token,
+                )
+            }
+        }
+        .map_err(anyhow::Error::msg)
+        .context("baseline generation failed")?;
+        drop(on_token);
         if let Some(error) = decode_error {
             return Err(error);
         }
@@ -544,12 +628,41 @@ impl Qwen4Provider {
         constraint: Option<&mut dyn TokenConstraint>,
         on_delta: F,
     ) -> Result<BaselineGeneration> {
-        self.generate_mtp_streaming_for_prompt(
+        self.generate_mtp_streaming_impl(
             prompt_ids,
             max_tokens,
             sampling,
             block_size,
-            prefix_reuse,
+            MtpGenerationReuse::Borrowed(prefix_reuse),
+            checkpoint_token_lengths,
+            constraint,
+            on_delta,
+        )
+        .map(|(generation, _)| generation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_mtp_streaming_owned_response<F: FnMut(&str) -> bool>(
+        &mut self,
+        prompt_ids: &[i32],
+        max_tokens: usize,
+        sampling: &SamplingConfig,
+        block_size: usize,
+        snapshot: MtpPromptSnapshot,
+        continuation_token: Option<i32>,
+        checkpoint_token_lengths: &[usize],
+        constraint: Option<&mut dyn TokenConstraint>,
+        on_delta: F,
+    ) -> Result<BaselineGeneration> {
+        self.generate_mtp_streaming_impl(
+            prompt_ids,
+            max_tokens,
+            sampling,
+            block_size,
+            MtpGenerationReuse::Owned {
+                snapshot,
+                continuation_token,
+            },
             checkpoint_token_lengths,
             constraint,
             on_delta,
@@ -564,13 +677,13 @@ impl Qwen4Provider {
         err
     )]
 
-    fn generate_mtp_streaming_for_prompt<F: FnMut(&str) -> bool>(
+    fn generate_mtp_streaming_impl<F: FnMut(&str) -> bool>(
         &mut self,
         prompt_ids: &[i32],
         max_tokens: usize,
         sampling: &SamplingConfig,
         block_size: usize,
-        prefix_reuse: Option<MtpPrefixReuse<'_>>,
+        prefix_reuse: MtpGenerationReuse<'_>,
         checkpoint_token_lengths: &[usize],
         constraint: Option<&mut dyn TokenConstraint>,
         mut on_delta: F,
@@ -589,8 +702,28 @@ impl Qwen4Provider {
             .mtp_generator
             .as_mut()
             .expect("MTP capability was validated");
-        let generated = generator
-            .generate_streaming(
+        let mut on_token = |token_id| {
+            if buffer_output {
+                callback_active = on_delta("");
+                return callback_active;
+            }
+            match decoder.push(token_id) {
+                Ok(delta) => {
+                    if delta.is_empty() {
+                        true
+                    } else {
+                        callback_active = on_delta(&delta);
+                        callback_active
+                    }
+                }
+                Err(error) => {
+                    decode_error = Some(error);
+                    false
+                }
+            }
+        };
+        let generated = match prefix_reuse {
+            MtpGenerationReuse::Borrowed(prefix_reuse) => generator.generate_streaming(
                 &self.model,
                 prompt_ids,
                 max_tokens,
@@ -599,29 +732,27 @@ impl Qwen4Provider {
                 prefix_reuse,
                 checkpoint_token_lengths,
                 constraint,
-                |token_id| {
-                    if buffer_output {
-                        callback_active = on_delta("");
-                        return callback_active;
-                    }
-                    match decoder.push(token_id) {
-                        Ok(delta) => {
-                            if delta.is_empty() {
-                                true
-                            } else {
-                                callback_active = on_delta(&delta);
-                                callback_active
-                            }
-                        }
-                        Err(error) => {
-                            decode_error = Some(error);
-                            false
-                        }
-                    }
-                },
-            )
-            .map_err(anyhow::Error::msg)
-            .context("MTP generation failed")?;
+                &mut on_token,
+            ),
+            MtpGenerationReuse::Owned {
+                snapshot,
+                continuation_token,
+            } => generator.generate_streaming_owned(
+                &self.model,
+                prompt_ids,
+                max_tokens,
+                sampling,
+                block_size,
+                snapshot,
+                continuation_token,
+                checkpoint_token_lengths,
+                constraint,
+                &mut on_token,
+            ),
+        }
+        .map_err(anyhow::Error::msg)
+        .context("MTP generation failed")?;
+        drop(on_token);
         if let Some(error) = decode_error {
             return Err(error);
         }
@@ -737,12 +868,12 @@ impl Qwen4Provider {
             ));
         }
 
-        let (generation, stats) = self.generate_mtp_streaming_for_prompt(
+        let (generation, stats) = self.generate_mtp_streaming_impl(
             &prompt_ids,
             request.max_tokens,
             &sampling,
             DEFAULT_MTP_BLOCK_SIZE,
-            None,
+            MtpGenerationReuse::Borrowed(None),
             &[],
             None,
             on_delta,
@@ -778,12 +909,12 @@ impl Qwen4Provider {
             )?;
             return Ok((generation, None));
         }
-        let (generation, stats) = self.generate_mtp_streaming_for_prompt(
+        let (generation, stats) = self.generate_mtp_streaming_impl(
             &prompt_ids,
             request.max_tokens,
             &sampling,
             DEFAULT_MTP_BLOCK_SIZE,
-            None,
+            MtpGenerationReuse::Borrowed(None),
             &[],
             None,
             on_delta,
@@ -826,16 +957,16 @@ impl Qwen4Provider {
                 Ok((generation, None))
             }
             (Qwen4GenerationMode::Mtp, PromptSnapshot::Mtp(snapshot)) => {
-                let (generation, stats) = self.generate_mtp_streaming_for_prompt(
+                let (generation, stats) = self.generate_mtp_streaming_impl(
                     prompt_ids,
                     max_tokens,
                     sampling,
                     DEFAULT_MTP_BLOCK_SIZE,
-                    Some(MtpPrefixReuse {
+                    MtpGenerationReuse::Borrowed(Some(MtpPrefixReuse {
                         snapshot,
                         cached_tokens: snapshot.token_len(),
                         continuation_token: None,
-                    }),
+                    })),
                     &[],
                     None,
                     on_delta,
@@ -1181,7 +1312,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires the real bundled-MTP checkpoint at QW_MODEL_PATH or the default model cache path"]
-    fn real_model_mtp_prefix_reuse_matches_cold_and_reduces_ttft() {
+    fn real_model_owned_and_borrowed_prefix_reuse_match_cold_and_reduce_ttft() {
         let model_dir = crate::resolve_model_path(None)
             .expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
         let mut provider = Qwen4Provider::load(&model_dir, KVCacheMode::Fp8)
@@ -1247,6 +1378,25 @@ mod tests {
         else {
             panic!("MTP generation must return an MTP snapshot");
         };
+        let borrowed_source_pages = snapshot
+            .storage_summary()
+            .pages
+            .into_iter()
+            .map(|(identity, _)| identity)
+            .collect::<std::collections::HashSet<_>>();
+        let PromptSnapshot::Mtp(owned_mtp_snapshot) = PromptSnapshot::from_portable(
+            snapshot.to_portable(),
+        )
+        .expect("clone MTP prompt snapshot through the portable contract")
+        else {
+            panic!("portable MTP snapshot changed family");
+        };
+        let consumed_mtp_pages = owned_mtp_snapshot
+            .storage_summary()
+            .pages
+            .into_iter()
+            .map(|(identity, _)| identity)
+            .collect::<std::collections::HashSet<_>>();
         let mut warm_ttft = None;
         let warm_started = Instant::now();
         let warm = provider
@@ -1268,10 +1418,65 @@ mod tests {
                 },
             )
             .expect("warm MTP generation");
+        let owned_mtp = provider
+            .generate_mtp_streaming_owned_response(
+                &full_ids,
+                32,
+                &sampling,
+                DEFAULT_MTP_BLOCK_SIZE,
+                owned_mtp_snapshot,
+                None,
+                &[full_ids.len()],
+                None,
+                |_| true,
+            )
+            .expect("owned MTP prefix generation");
+        let owned_mtp_final = owned_mtp
+            .final_snapshot
+            .as_ref()
+            .expect("owned MTP generation final snapshot");
+        assert!(
+            owned_mtp_final
+                .storage_summary()
+                .pages
+                .iter()
+                .all(|(identity, _)| !consumed_mtp_pages.contains(identity)),
+            "owned MTP final capture must not reference consumed source pages",
+        );
 
         let baseline_cold = provider
             .generate_baseline_streaming(&full_ids, 32, &sampling, None, None, &[], |_| true)
             .expect("cold baseline generation");
+        let baseline_prefix = provider
+            .generate_baseline_streaming(
+                &base_ids,
+                1,
+                &sampling,
+                None,
+                None,
+                &[base_ids.len()],
+                |_| true,
+            )
+            .expect("capture baseline prompt snapshot");
+        let PromptSnapshot::Baseline(owned_baseline_snapshot) = baseline_prefix
+            .prompt_snapshots
+            .into_iter()
+            .next()
+            .expect("complete baseline prompt snapshot")
+        else {
+            panic!("baseline generation changed snapshot family");
+        };
+        let owned_baseline = provider
+            .generate_baseline_streaming_owned_response(
+                &full_ids,
+                32,
+                &sampling,
+                owned_baseline_snapshot,
+                None,
+                &[],
+                |_| true,
+            )
+            .expect("owned baseline prefix generation");
         let mtp_snapshot = PromptSnapshot::Mtp(snapshot);
         let (baseline_warm, baseline_stats) = provider
             .benchmark_cached_streaming_in_mode(
@@ -1294,6 +1499,24 @@ mod tests {
         assert_eq!(warm.cached_tokens, base_ids.len());
         assert_eq!(warm.token_ids, cold.token_ids);
         assert_eq!(warm.text, cold.text);
+        assert_eq!(owned_mtp.cached_tokens, base_ids.len());
+        assert_eq!(owned_mtp.token_ids, cold.token_ids);
+        assert_eq!(owned_mtp.text, cold.text);
+        assert_eq!(owned_baseline.cached_tokens, base_ids.len());
+        assert_eq!(owned_baseline.token_ids, baseline_cold.token_ids);
+        assert_eq!(owned_baseline.text, baseline_cold.text);
+        let borrowed_checkpoint = warm
+            .prompt_snapshots
+            .first()
+            .expect("borrowed MTP generation prompt checkpoint");
+        assert!(
+            borrowed_checkpoint
+                .storage_summary()
+                .pages
+                .iter()
+                .any(|(identity, _)| borrowed_source_pages.contains(identity)),
+            "ordinary borrowed MTP reuse must preserve shared page identity",
+        );
         let cold_ttft = cold_ttft.expect("cold generation emitted a token");
         let warm_ttft = warm_ttft.expect("warm generation emitted a token");
         eprintln!(
