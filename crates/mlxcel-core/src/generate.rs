@@ -600,6 +600,8 @@ impl ModelStateSnapshot {
 
 /// Per-step vocabulary decision returned by a generation constraint.
 pub enum ConstraintMask {
+    /// Sample from the original logits without constructing a vocabulary mask.
+    PassThrough,
     /// Continue generation with exactly these token IDs enabled.
     Allow(Vec<i32>),
     /// Apply a parser-requested output splice without sampling a model token.
@@ -2411,6 +2413,9 @@ impl CxxGenerator {
                     logits.as_ref().expect("generation logits must not be null"),
                     &token_history,
                 )? {
+                    ConstraintMask::PassThrough => logits
+                        .as_ref()
+                        .expect("generation logits must not be null"),
                     ConstraintMask::Allow(allowed) => {
                         constrained_logits = mask_logits_to_allowed(
                             logits.as_ref().expect("generation logits must not be null"),
@@ -2724,6 +2729,9 @@ impl CxxGenerator {
                     logits.as_ref().expect("generation logits must not be null"),
                     &token_history,
                 )? {
+                    ConstraintMask::PassThrough => logits
+                        .as_ref()
+                        .expect("generation logits must not be null"),
                     ConstraintMask::Allow(allowed) => {
                         constrained_logits = mask_logits_to_allowed(
                             logits.as_ref().expect("generation logits must not be null"),
@@ -5316,6 +5324,32 @@ mod tests {
         }
     }
 
+    struct PassThroughConstraint;
+
+    impl TokenConstraint for PassThroughConstraint {
+        fn begin_transaction(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn commit_transaction(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn rollback_transaction(&mut self) {}
+
+        fn compute_mask(
+            &mut self,
+            _logits: &MlxArray,
+            _token_history: &[i32],
+        ) -> Result<ConstraintMask, String> {
+            Ok(ConstraintMask::PassThrough)
+        }
+
+        fn commit_token(&mut self, token_id: i32) -> Result<ConstraintCommit, String> {
+            Ok(ConstraintCommit::token(token_id))
+        }
+    }
+
     struct SplicingConstraint {
         phase: u8,
     }
@@ -5386,6 +5420,31 @@ mod tests {
             )
             .expect("constrained generation");
         assert_eq!(constrained.token_ids, vec![2]);
+        assert_eq!(constrained.stop_reason, GenerationStopReason::MaxTokens);
+    }
+
+    #[test]
+    fn controlled_generation_pass_through_preserves_the_winning_token() {
+        let model = StubModel;
+        let sampling = SamplingConfig::greedy();
+        let mut baseline_generator = CxxGenerator::new(1);
+        let baseline = baseline_generator.generate(&model, &[1], 1, &sampling);
+
+        let mut constraint = PassThroughConstraint;
+        let mut constrained_generator = CxxGenerator::new(1);
+        let constrained = constrained_generator
+            .generate_streaming_controlled(
+                &model,
+                &[1],
+                None,
+                1,
+                &sampling,
+                Some(&mut constraint),
+                &[],
+                |_| true,
+            )
+            .expect("pass-through generation");
+        assert_eq!(constrained.token_ids, baseline);
         assert_eq!(constrained.stop_reason, GenerationStopReason::MaxTokens);
     }
 
