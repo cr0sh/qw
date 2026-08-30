@@ -69,6 +69,7 @@ impl BenchmarkMemoryReport {
                 "peak_bytes": mlx.peak_bytes,
                 "cache_bytes": mlx.cache_bytes,
                 "limit_bytes": mlx.limit_bytes,
+                "wired_limit_bytes": mlxcel_core::get_wired_limit(),
             },
             "process": process,
         });
