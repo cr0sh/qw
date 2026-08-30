@@ -10,9 +10,9 @@ import subprocess
 PROJECT_DIR = Path(__file__).resolve().parent
 MIN_FREE_BYTES = 15 * 1024**3
 DATASETS = {
-    "gpqa_diamond": {"temperature": 0.0, "max_tokens": 16_384},
-    "ifbench": {"temperature": 0.0, "max_tokens": 8_192},
-    "live_code_bench": {"temperature": 0.2, "max_tokens": 16_384},
+    "gpqa_diamond": {"temperature": 1.0, "top_p": 0.95, "max_tokens": 16_384},
+    "ifbench": {"temperature": 1.0, "top_p": 0.95, "max_tokens": 8_192},
+    "live_code_bench": {"temperature": 1.0, "top_p": 0.95, "max_tokens": 16_384},
 }
 
 
