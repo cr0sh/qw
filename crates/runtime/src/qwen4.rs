@@ -482,8 +482,8 @@ impl Qwen4GatedDeltaNet {
         }
 
         let mut outputs = Vec::with_capacity(
-            ((sequence + QWEN4_PREFILL_MICROCHUNK_TOKENS - 1)
-                / QWEN4_PREFILL_MICROCHUNK_TOKENS) as usize,
+            ((sequence + QWEN4_PREFILL_MICROCHUNK_TOKENS - 1) / QWEN4_PREFILL_MICROCHUNK_TOKENS)
+                as usize,
         );
         let mut start = 0;
         while start < sequence {
@@ -1153,45 +1153,25 @@ fn ple_convolution(
     let (batch, sequence) = (shape[0], shape[1]);
     if sequence <= chunk_tokens {
         let (conv_input, next_state) = append_ple_conv_state(state, normed, state_len);
-        let conv = mlxcel_core::conv1d(
-            &conv_input,
-            weight,
-            1,
-            0,
-            dilation,
-            channels,
-        );
+        let conv = mlxcel_core::conv1d(&conv_input, weight, 1, 0, dilation, channels);
         return (mlxcel_core::add(gated, &silu(&conv)), next_state);
     }
 
     let mut current_state = mlxcel_core::share(state);
-    let mut outputs =
-        Vec::with_capacity(((sequence + chunk_tokens - 1) / chunk_tokens) as usize);
+    let mut outputs = Vec::with_capacity(((sequence + chunk_tokens - 1) / chunk_tokens) as usize);
     let mut start = 0;
     while start < sequence {
         let stop = (start + chunk_tokens).min(sequence);
-        let gated_chunk =
-            mlxcel_core::slice(gated, &[0, start, 0], &[batch, stop, channels]);
-        let normed_chunk =
-            mlxcel_core::slice(normed, &[0, start, 0], &[batch, stop, channels]);
+        let gated_chunk = mlxcel_core::slice(gated, &[0, start, 0], &[batch, stop, channels]);
+        let normed_chunk = mlxcel_core::slice(normed, &[0, start, 0], &[batch, stop, channels]);
         let (conv_input, next_state) =
             append_ple_conv_state(&current_state, &normed_chunk, state_len);
-        let conv = mlxcel_core::conv1d(
-            &conv_input,
-            weight,
-            1,
-            0,
-            dilation,
-            channels,
-        );
+        let conv = mlxcel_core::conv1d(&conv_input, weight, 1, 0, dilation, channels);
         outputs.push(mlxcel_core::add(&gated_chunk, &silu(&conv)));
         current_state = next_state;
         start = stop;
     }
-    (
-        mlxcel_core::concatenate_owned(&outputs, 1),
-        current_state,
-    )
+    (mlxcel_core::concatenate_owned(&outputs, 1), current_state)
 }
 
 fn ple_shifted_tokens(
@@ -1215,11 +1195,7 @@ fn ple_shifted_tokens(
                     .iter()
                     .skip(1)
                     .any(|&value| value == eos_token_id);
-                shifted_tokens.push(if crosses_eos {
-                    eos_token_id
-                } else {
-                    candidate
-                });
+                shifted_tokens.push(if crosses_eos { eos_token_id } else { candidate });
             }
             row_history.rotate_left(1);
             row_history[context_len - 1] = token;
@@ -1320,8 +1296,8 @@ impl Qwen4Ple {
 
         let hidden_shape = mlxcel_core::array_shape(hidden_states);
         let mut outputs = Vec::with_capacity(
-            ((sequence + QWEN4_PREFILL_MICROCHUNK_TOKENS - 1)
-                / QWEN4_PREFILL_MICROCHUNK_TOKENS) as usize,
+            ((sequence + QWEN4_PREFILL_MICROCHUNK_TOKENS - 1) / QWEN4_PREFILL_MICROCHUNK_TOKENS)
+                as usize,
         );
         let mut start = 0;
         while start < sequence {
@@ -1331,8 +1307,7 @@ impl Qwen4Ple {
                 &[0, start, 0],
                 &[hidden_shape[0], stop, hidden_shape[2]],
             );
-            let id_chunk =
-                mlxcel_core::slice(input_ids, &[0, start], &[input_shape[0], stop]);
+            let id_chunk = mlxcel_core::slice(input_ids, &[0, start], &[input_shape[0], stop]);
             outputs.push(self.forward_chunk(&hidden_chunk, &id_chunk, cache)?);
             start = stop;
         }
@@ -1373,8 +1348,7 @@ impl Qwen4Ple {
             for ngram in 2..=self.ngram_size {
                 let mut mixed = (shifted[0] as u64).wrapping_mul(self.multipliers[0]);
                 for position in 1..ngram {
-                    mixed ^=
-                        (shifted[position] as u64).wrapping_mul(self.multipliers[position]);
+                    mixed ^= (shifted[position] as u64).wrapping_mul(self.multipliers[position]);
                 }
                 let first_head = (ngram - 2) * self.heads_per_ngram;
                 for head in first_head..first_head + self.heads_per_ngram {
@@ -3479,7 +3453,7 @@ mod tests {
         assert!(mlxcel_core::item_bool(&equal));
     }
 
-    fn assert_arrays_close(left: &MlxArray, right: &MlxArray, tolerance: f32) {
+    fn assert_arrays_close(left: &MlxArray, right: &MlxArray, tolerance: f64) {
         assert_eq!(
             mlxcel_core::array_shape(left),
             mlxcel_core::array_shape(right)
@@ -3498,8 +3472,7 @@ mod tests {
             "projection.weight".to_owned(),
             mlxcel_core::from_slice_f32(&values, &[out_dim, in_dim]),
         );
-        UnifiedLinear::from_weights(&weights, "projection", 64, 4)
-            .expect("regular test projection")
+        UnifiedLinear::from_weights(&weights, "projection", 64, 4).expect("regular test projection")
     }
 
     #[test]
@@ -3523,10 +3496,7 @@ mod tests {
             value_dim: VALUE_DIM as usize,
             conv_kernel_size: 3,
             conv_dim: CONV_DIM as usize,
-            conv1d_weight: mlxcel_core::from_slice_f32(
-                &conv_values,
-                &[CONV_DIM, 3, 1],
-            ),
+            conv1d_weight: mlxcel_core::from_slice_f32(&conv_values, &[CONV_DIM, 3, 1]),
             in_proj_qkv: test_regular_linear(CONV_DIM, HIDDEN, 1),
             aux_projections: Qwen4GatedAuxProjections::Separate {
                 z: test_regular_linear(VALUE_DIM, HIDDEN, 3),
@@ -3544,19 +3514,20 @@ mod tests {
         let input_values = (0..SEQUENCE * HIDDEN)
             .map(|index| 0.02 * ((index % 29) as f32 - 14.0))
             .collect::<Vec<_>>();
-        let inputs =
-            mlxcel_core::from_slice_f32(&input_values, &[1, SEQUENCE, HIDDEN]);
+        let inputs = mlxcel_core::from_slice_f32(&input_values, &[1, SEQUENCE, HIDDEN]);
 
         let mut reference_cache = GatedDeltaCache::new();
         let reference =
             layer.forward_hidden_chunk(&inputs, None, Some(&mut reference_cache), None, true);
         let mut chunked_cache = GatedDeltaCache::new();
-        let chunked =
-            layer.forward_hidden_internal(&inputs, None, Some(&mut chunked_cache), None);
+        let chunked = layer.forward_hidden_internal(&inputs, None, Some(&mut chunked_cache), None);
 
         assert_arrays_close(&chunked, &reference, 1e-5);
         assert_arrays_close(
-            chunked_cache.conv_state.as_deref().expect("chunked conv tail"),
+            chunked_cache
+                .conv_state
+                .as_deref()
+                .expect("chunked conv tail"),
             reference_cache
                 .conv_state
                 .as_deref()
@@ -3593,24 +3564,13 @@ mod tests {
         let normed_values = (0..SEQUENCE * CHANNELS)
             .map(|index| 0.02 * (((index * 3) % 11) as f32 - 5.0))
             .collect::<Vec<_>>();
-        let gated =
-            mlxcel_core::from_slice_f32(&gated_values, &[1, SEQUENCE, CHANNELS]);
-        let normed =
-            mlxcel_core::from_slice_f32(&normed_values, &[1, SEQUENCE, CHANNELS]);
-        let weight = mlxcel_core::from_slice_f32(
-            &[0.2, -0.1, 0.05, -0.15, 0.25, 0.1],
-            &[CHANNELS, 3, 1],
-        );
+        let gated = mlxcel_core::from_slice_f32(&gated_values, &[1, SEQUENCE, CHANNELS]);
+        let normed = mlxcel_core::from_slice_f32(&normed_values, &[1, SEQUENCE, CHANNELS]);
+        let weight =
+            mlxcel_core::from_slice_f32(&[0.2, -0.1, 0.05, -0.15, 0.25, 0.1], &[CHANNELS, 3, 1]);
 
         let (reference, reference_tail) = ple_convolution(
-            &gated,
-            &normed,
-            &state,
-            &weight,
-            STATE_LEN,
-            2,
-            CHANNELS,
-            SEQUENCE,
+            &gated, &normed, &state, &weight, STATE_LEN, 2, CHANNELS, SEQUENCE,
         );
         let (chunked, chunked_tail) =
             ple_convolution(&gated, &normed, &state, &weight, STATE_LEN, 2, CHANNELS, 3);
@@ -3628,36 +3588,21 @@ mod tests {
         const SEQUENCE: usize = 7;
         const NGRAM: usize = 4;
         const EOS: i32 = -1;
-        let tokens = vec![
-            1, 2, 3, 4, 5, 6, 7, 11, 12, 13, 14, 15, 16, 17,
-        ];
+        let tokens = vec![1, 2, 3, 4, 5, 6, 7, 11, 12, 13, 14, 15, 16, 17];
         let initial_history = vec![EOS, EOS, EOS, 91, 92, 93];
-        let (reference_shifted, reference_history) = ple_shifted_tokens(
-            &tokens,
-            &initial_history,
-            BATCH,
-            SEQUENCE,
-            NGRAM,
-            EOS,
-        );
+        let (reference_shifted, reference_history) =
+            ple_shifted_tokens(&tokens, &initial_history, BATCH, SEQUENCE, NGRAM, EOS);
 
         let mut history = initial_history;
         let mut shifted_by_row = vec![Vec::new(); BATCH];
         for (start, stop) in [(0, 3), (3, 6), (6, 7)] {
             let mut chunk_tokens = Vec::with_capacity(BATCH * (stop - start));
             for row in 0..BATCH {
-                chunk_tokens.extend_from_slice(
-                    &tokens[row * SEQUENCE + start..row * SEQUENCE + stop],
-                );
+                chunk_tokens
+                    .extend_from_slice(&tokens[row * SEQUENCE + start..row * SEQUENCE + stop]);
             }
-            let (shifted, next_history) = ple_shifted_tokens(
-                &chunk_tokens,
-                &history,
-                BATCH,
-                stop - start,
-                NGRAM,
-                EOS,
-            );
+            let (shifted, next_history) =
+                ple_shifted_tokens(&chunk_tokens, &history, BATCH, stop - start, NGRAM, EOS);
             for (row, rows) in shifted.chunks_exact((stop - start) * NGRAM).enumerate() {
                 shifted_by_row[row].extend_from_slice(rows);
             }
