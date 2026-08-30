@@ -1,13 +1,15 @@
+use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::LazyLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use mlxcel_core::cache::KVCacheMode;
 use mlxcel_core::generate::{
-    ControlledGeneration, CxxGenerator, GenerationStopReason, LanguageModel, ModelStateSnapshot,
-    PrefixReuse, SamplingConfig, TokenConstraint,
+    ConstraintCommit, ConstraintMask, ControlledGeneration, CxxGenerator, GenerationStopReason,
+    LanguageModel, ModelStateSnapshot, PrefixReuse, SamplingConfig, TokenConstraint,
 };
 use serde::Deserialize;
 use tokenizers::Tokenizer;
@@ -108,6 +110,47 @@ enum MtpGenerationReuse<'a> {
         continuation_token: Option<i32>,
     },
 }
+struct StreamingConstraint<'a> {
+    inner: &'a mut dyn TokenConstraint,
+    pending: Rc<RefCell<Vec<ConstraintCommit>>>,
+}
+
+impl TokenConstraint for StreamingConstraint<'_> {
+    fn begin_transaction(&mut self) -> std::result::Result<(), String> {
+        self.inner.begin_transaction()
+    }
+
+    fn commit_transaction(&mut self) -> std::result::Result<(), String> {
+        self.inner.commit_transaction()
+    }
+
+    fn rollback_transaction(&mut self) {
+        self.pending.borrow_mut().clear();
+        self.inner.rollback_transaction();
+    }
+
+    fn compute_mask(
+        &mut self,
+        logits: &mlxcel_core::MlxArray,
+        token_history: &[i32],
+    ) -> std::result::Result<ConstraintMask, String> {
+        let mask = self.inner.compute_mask(logits, token_history)?;
+        if let ConstraintMask::Splice(commit) = &mask {
+            self.pending.borrow_mut().push(commit.clone());
+        }
+        Ok(mask)
+    }
+
+    fn commit_token(
+        &mut self,
+        token_id: i32,
+    ) -> std::result::Result<ConstraintCommit, String> {
+        let commit = self.inner.commit_token(token_id)?;
+        self.pending.borrow_mut().push(commit.clone());
+        Ok(commit)
+    }
+}
+
 
 pub struct BaselineGeneration {
     pub text: String,
@@ -161,6 +204,41 @@ impl<'a> IncrementalTextDecoder<'a> {
         self.emitted.push_str(&delta);
         Ok(delta)
     }
+    fn apply_commit(&mut self, commit: &ConstraintCommit) -> Result<String> {
+        ensure!(
+            commit.backtrack <= self.token_ids.len(),
+            "constraint backtracked past streamed generated tokens"
+        );
+        self.token_ids
+            .truncate(self.token_ids.len() - commit.backtrack);
+        for &token_id in &commit.tokens {
+            self.token_ids.push(
+                u32::try_from(token_id).context("generated a negative token identifier")?,
+            );
+        }
+        let decoded = self
+            .tokenizer
+            .decode(&self.token_ids, false)
+            .map_err(anyhow::Error::msg)
+            .context("failed to decode committed generated tokens")?;
+        self.advance(decoded, false)
+    }
+    fn sync_committed(&mut self, token_ids: &[i32]) -> Result<String> {
+        self.token_ids = token_ids
+            .iter()
+            .map(|&token_id| {
+                u32::try_from(token_id).context("generated a negative token identifier")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let decoded = self
+            .tokenizer
+            .decode(&self.token_ids, false)
+            .map_err(anyhow::Error::msg)
+            .context("failed to decode final committed generated tokens")?;
+        self.advance(decoded, false)
+    }
+
+
 
     fn finish(&mut self) -> Result<String> {
         let decoded = self
@@ -510,16 +588,33 @@ impl Qwen4Provider {
         mut on_delta: F,
     ) -> Result<BaselineGeneration> {
         self.model.clear_prepared_mrope();
-        let buffer_output = constraint.is_some();
+        let pending_commits = Rc::new(RefCell::new(Vec::new()));
+        let mut streaming_constraint = constraint.map(|inner| StreamingConstraint {
+            inner,
+            pending: Rc::clone(&pending_commits),
+        });
+        let decode_committed_tokens = streaming_constraint.is_some();
         let mut decoder = IncrementalTextDecoder::new(&self.tokenizer);
         let mut decode_error = None;
         let mut callback_active = true;
         let mut on_token = |token_id| {
-            if buffer_output {
-                callback_active = on_delta("");
-                return callback_active;
-            }
-            match decoder.push(token_id) {
+            let decoded = if decode_committed_tokens {
+                (|| -> Result<String> {
+                    let commits = std::mem::take(&mut *pending_commits.borrow_mut());
+                    ensure!(
+                        !commits.is_empty(),
+                        "constrained generation callback had no committed output"
+                    );
+                    let mut delta = String::new();
+                    for commit in commits {
+                        delta.push_str(&decoder.apply_commit(&commit)?);
+                    }
+                    Ok(delta)
+                })()
+            } else {
+                decoder.push(token_id)
+            };
+            match decoded {
                 Ok(delta) => {
                     if delta.is_empty() {
                         true
@@ -542,7 +637,9 @@ impl Qwen4Provider {
                     prefix_reuse,
                     max_tokens,
                     sampling,
-                    constraint,
+                    streaming_constraint
+                        .as_mut()
+                        .map(|value| value as &mut dyn TokenConstraint),
                     checkpoint_token_lengths,
                     &mut on_token,
                 )
@@ -554,7 +651,9 @@ impl Qwen4Provider {
                     snapshot,
                     max_tokens,
                     sampling,
-                    constraint,
+                    streaming_constraint
+                        .as_mut()
+                        .map(|value| value as &mut dyn TokenConstraint),
                     checkpoint_token_lengths,
                     &mut on_token,
                 )
@@ -566,19 +665,22 @@ impl Qwen4Provider {
         if let Some(error) = decode_error {
             return Err(error);
         }
-        if buffer_output {
-            for &token_id in &controlled.token_ids {
-                let _ = decoder.push(token_id)?;
-            }
-            let _ = decoder.finish()?;
-            if callback_active && !decoder.emitted.is_empty() {
-                let _ = on_delta(&decoder.emitted);
-            }
-        } else {
-            let final_delta = decoder.finish()?;
-            if callback_active && !final_delta.is_empty() {
-                let _ = on_delta(&final_delta);
-            }
+        pending_commits.borrow_mut().clear();
+        let committed_delta = decoder.sync_committed(&controlled.token_ids)?;
+        if callback_active && !committed_delta.is_empty() {
+            callback_active = on_delta(&committed_delta);
+        }
+        ensure!(
+            decoder
+                .token_ids
+                .iter()
+                .map(|&token| token as i32)
+                .eq(controlled.token_ids.iter().copied()),
+            "streamed committed tokens differed from final constrained output"
+        );
+        let final_delta = decoder.finish()?;
+        if callback_active && !final_delta.is_empty() {
+            let _ = on_delta(&final_delta);
         }
         let text = decoder.emitted;
         let completion_tokens = controlled.token_ids.len();
@@ -1347,6 +1449,7 @@ mod tests {
             top_p: Some(1.0),
             seed: Some(0),
         };
+
         let mut baseline_deltas = String::new();
         let (baseline, _) = provider
             .generate_streaming_in_mode(&request, Qwen4GenerationMode::Baseline, |delta| {
@@ -1365,6 +1468,88 @@ mod tests {
         assert_eq!(baseline.text, mtp.text);
         assert_eq!(baseline_deltas, baseline.text);
         assert_eq!(mtp_deltas, mtp.text);
+    }
+    struct PassThroughTestConstraint;
+
+    impl TokenConstraint for PassThroughTestConstraint {
+        fn begin_transaction(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn commit_transaction(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn rollback_transaction(&mut self) {}
+
+        fn compute_mask(
+            &mut self,
+            _logits: &mlxcel_core::MlxArray,
+            _token_history: &[i32],
+        ) -> Result<mlxcel_core::generate::ConstraintMask, String> {
+            Ok(mlxcel_core::generate::ConstraintMask::PassThrough)
+        }
+
+        fn commit_token(
+            &mut self,
+            token_id: i32,
+        ) -> Result<mlxcel_core::generate::ConstraintCommit, String> {
+            Ok(mlxcel_core::generate::ConstraintCommit::token(token_id))
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the real checkpoint at QW_MODEL_PATH or the default model cache path"]
+    fn real_model_constrained_baseline_streams_before_completion_and_matches_final_text() {
+        let model_dir = crate::resolve_model_path(None)
+            .expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
+        let mut provider =
+            Qwen4Provider::load(&model_dir, KVCacheMode::Fp8).expect("load real Qwen checkpoint");
+        let prompt = provider
+            .tokenizer
+            .encode("Continue this list with several more words: alpha, beta,", true)
+            .expect("encode prompt");
+        let prompt_ids = prompt
+            .get_ids()
+            .iter()
+            .map(|&token| token as i32)
+            .collect::<Vec<_>>();
+        let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
+        let mut constraint = PassThroughTestConstraint;
+        let mut callback_count = 0;
+        let mut first_nonempty_callback = None;
+        let mut streamed = String::new();
+
+        let generated = provider
+            .generate_baseline_streaming(
+                &prompt_ids,
+                16,
+                &sampling,
+                None,
+                Some(&mut constraint),
+                &[],
+                |delta| {
+                    callback_count += 1;
+                    if !delta.is_empty() {
+                        first_nonempty_callback.get_or_insert(callback_count);
+                        streamed.push_str(delta);
+                    }
+                    true
+                },
+            )
+            .expect("constrained baseline generation");
+
+        assert!(
+            generated.completion_tokens > 1,
+            "completion tokens {}",
+            generated.completion_tokens
+        );
+        assert!(
+            first_nonempty_callback.is_some_and(|ordinal| ordinal < generated.completion_tokens),
+            "first non-empty callback {first_nonempty_callback:?}, completion tokens {}",
+            generated.completion_tokens
+        );
+        assert_eq!(streamed, generated.text);
     }
 
     #[test]

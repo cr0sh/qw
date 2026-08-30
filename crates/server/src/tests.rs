@@ -617,6 +617,46 @@ fn terminal_chat_record() -> CompletionRecord {
         stream_include_usage: false,
     }
 }
+#[test]
+fn streamed_tool_prefix_mismatch_is_an_internal_stream_failure() {
+    let (_events_tx, events_rx) = mpsc::channel(1);
+    let mut record = terminal_chat_record();
+    record.content.clear();
+    record.finish_reason = FinishReason::ToolCalls;
+    record.tool_calls.push(generated_tool_call(
+        &record.admission,
+        0,
+        "read".to_string(),
+        r#"{"path":"Cargo.toml"}"#.to_string(),
+    ));
+    let mut state = SseState::new(
+        Endpoint::Chat,
+        record.admission.clone(),
+        MODEL.to_string(),
+        events_rx,
+        Arc::new(AtomicBool::new(false)),
+        tracing::info_span!("stream_prefix_mismatch_test"),
+    );
+    state
+        .enqueue_delta(WorkerDelta::ToolCallStart {
+            index: 0,
+            name: "read".to_string(),
+        })
+        .expect("valid tool start");
+    state
+        .enqueue_delta(WorkerDelta::ToolCallArguments {
+            index: 0,
+            fragment: r#"{"other":"#.to_string(),
+        })
+        .expect("valid argument prefix event");
+
+    let failure = state
+        .enqueue_complete(record)
+        .expect_err("mismatched streamed prefix must fail");
+    assert_eq!(failure.kind, FailureKind::Server);
+    assert!(failure.message.contains("internal stream failure"));
+}
+
 
 #[tokio::test]
 async fn terminal_stream_events_drain_to_eof() {
@@ -1832,10 +1872,10 @@ async fn streamed_responses_has_lazy_exact_function_lifecycle_and_replays() {
             "response.created",
             "response.output_item.added",
             "response.function_call_arguments.delta",
-            "response.function_call_arguments.done",
-            "response.output_item.done",
             "response.output_item.added",
             "response.function_call_arguments.delta",
+            "response.function_call_arguments.done",
+            "response.output_item.done",
             "response.function_call_arguments.done",
             "response.output_item.done",
             "response.completed",

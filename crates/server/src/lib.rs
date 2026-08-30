@@ -27,7 +27,7 @@ use tracing::{Instrument, Span, debug, error, info_span, trace, warn};
 
 use engine::{
     Admission, CompletionRecord, FailureKind, FinishReason, GeneratedToolCall, WorkerDelta,
-    WorkerEvent, WorkerFailure,
+    WorkerEvent, WorkerFailure, generated_tool_call,
 };
 pub use engine::{Engine, SubmitError};
 use protocol::{Endpoint, RequestError};
@@ -341,6 +341,12 @@ impl Drop for CancelGuard {
     }
 }
 
+#[derive(Debug)]
+struct StreamedToolCall {
+    name: String,
+    arguments: String,
+}
+
 struct SseState {
     endpoint: Endpoint,
     admission: Admission,
@@ -349,6 +355,10 @@ struct SseState {
     pending: VecDeque<Event>,
     sequence: u64,
     response_message_open: bool,
+    response_message_done: bool,
+    response_tool_output_offset: Option<usize>,
+    streamed_content: String,
+    streamed_tool_calls: Vec<StreamedToolCall>,
     terminal_enqueued: bool,
     span: Span,
     guard: CancelGuard,
@@ -371,6 +381,10 @@ impl SseState {
             pending: VecDeque::new(),
             sequence: 0,
             response_message_open: false,
+            response_message_done: false,
+            response_tool_output_offset: None,
+            streamed_content: String::new(),
+            streamed_tool_calls: Vec::new(),
             terminal_enqueued: false,
             guard: CancelGuard {
                 cancelled,
@@ -393,9 +407,18 @@ impl SseState {
             }
             match self.receiver.recv().await {
                 Some(WorkerEvent::Started(_)) => continue,
-                Some(WorkerEvent::Delta(delta)) => self.enqueue_delta(delta),
+                Some(WorkerEvent::Delta(delta)) => {
+                    if let Err(failure) = self.enqueue_delta(delta) {
+                        self.guard.cancelled.store(true, Ordering::Release);
+                        self.enqueue_failure(failure);
+                        self.terminal_enqueued = true;
+                        self.guard.armed = false;
+                    }
+                }
                 Some(WorkerEvent::Complete { record }) => {
-                    self.enqueue_complete(record);
+                    if let Err(failure) = self.enqueue_complete(record) {
+                        self.enqueue_failure(failure);
+                    }
                     self.terminal_enqueued = true;
                     self.guard.armed = false;
                 }
@@ -446,11 +469,11 @@ impl SseState {
         }
     }
 
-    fn enqueue_delta(&mut self, delta: WorkerDelta) {
+    fn enqueue_delta(&mut self, delta: WorkerDelta) -> Result<(), WorkerFailure> {
         match delta {
             WorkerDelta::Reasoning(reasoning) => {
                 if reasoning.is_empty() || self.endpoint == Endpoint::Responses {
-                    return;
+                    return Ok(());
                 }
                 self.pending.push_back(data_event(json!({
                     "id": self.admission.response_id,
@@ -466,8 +489,14 @@ impl SseState {
             }
             WorkerDelta::Content(content) => {
                 if content.is_empty() {
-                    return;
+                    return Ok(());
                 }
+                if !self.streamed_tool_calls.is_empty() {
+                    return Err(internal_stream_failure(
+                        "content delta followed a streamed tool-call start",
+                    ));
+                }
+                self.streamed_content.push_str(&content);
                 match self.endpoint {
                     Endpoint::Chat => {
                         self.pending.push_back(data_event(json!({
@@ -497,7 +526,132 @@ impl SseState {
                     }
                 }
             }
+            WorkerDelta::ToolCallStart { index, name } => {
+                self.enqueue_tool_call_start(index, name)?;
+            }
+            WorkerDelta::ToolCallArguments { index, fragment } => {
+                self.enqueue_tool_call_arguments(index, fragment)?;
+            }
         }
+        Ok(())
+    }
+
+    fn enqueue_tool_call_start(
+        &mut self,
+        index: usize,
+        name: String,
+    ) -> Result<(), WorkerFailure> {
+        if index != self.streamed_tool_calls.len() {
+            return Err(internal_stream_failure(
+                "streamed tool-call starts were not sequential",
+            ));
+        }
+        if self.endpoint == Endpoint::Responses && self.response_message_open {
+            let content = self.streamed_content.clone();
+            self.finish_response_message(&content);
+        }
+        let call = generated_tool_call(&self.admission, index, name.clone(), String::new());
+        self.streamed_tool_calls.push(StreamedToolCall {
+            name,
+            arguments: String::new(),
+        });
+        match self.endpoint {
+            Endpoint::Chat => {
+                self.pending.push_back(data_event(json!({
+                    "id": self.admission.response_id,
+                    "object": "chat.completion.chunk",
+                    "created": self.admission.created,
+                    "model": self.model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [{
+                                "index": index,
+                                "id": call.id,
+                                "type": "function",
+                                "function": {"name": call.name, "arguments": ""}
+                            }]
+                        },
+                        "finish_reason": null
+                    }]
+                })));
+            }
+            Endpoint::Responses => {
+                let offset = *self
+                    .response_tool_output_offset
+                    .get_or_insert(usize::from(self.response_message_open));
+                let added = json!({
+                    "type": "response.output_item.added",
+                    "sequence_number": self.next_sequence(),
+                    "output_index": offset + index,
+                    "item": response_function_item(&call, false)
+                });
+                self.pending
+                    .push_back(named_event("response.output_item.added", added));
+            }
+        }
+        Ok(())
+    }
+
+    fn enqueue_tool_call_arguments(
+        &mut self,
+        index: usize,
+        fragment: String,
+    ) -> Result<(), WorkerFailure> {
+        let Some(call) = self.streamed_tool_calls.get_mut(index) else {
+            return Err(internal_stream_failure(
+                "tool arguments arrived before their tool-call start",
+            ));
+        };
+        call.arguments.push_str(&fragment);
+        if fragment.is_empty() {
+            return Ok(());
+        }
+        match self.endpoint {
+            Endpoint::Chat => {
+                self.pending.push_back(data_event(json!({
+                    "id": self.admission.response_id,
+                    "object": "chat.completion.chunk",
+                    "created": self.admission.created,
+                    "model": self.model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [{
+                                "index": index,
+                                "function": {"arguments": fragment}
+                            }]
+                        },
+                        "finish_reason": null
+                    }]
+                })));
+            }
+            Endpoint::Responses => {
+                let Some(offset) = self.response_tool_output_offset else {
+                    return Err(internal_stream_failure(
+                        "Responses tool arguments have no output index",
+                    ));
+                };
+                let call = generated_tool_call(
+                    &self.admission,
+                    index,
+                    self.streamed_tool_calls[index].name.clone(),
+                    String::new(),
+                );
+                let arguments_delta = json!({
+                    "type": "response.function_call_arguments.delta",
+                    "sequence_number": self.next_sequence(),
+                    "item_id": call.item_id,
+                    "output_index": offset + index,
+                    "delta": fragment
+                });
+                self.pending.push_back(named_event(
+                    "response.function_call_arguments.delta",
+                    arguments_delta,
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn ensure_response_message_open(&mut self) {
@@ -530,8 +684,54 @@ impl SseState {
             .push_back(named_event("response.content_part.added", part));
         self.response_message_open = true;
     }
+    fn finish_response_message(&mut self, text: &str) {
+        if !self.response_message_open || self.response_message_done {
+            return;
+        }
+        let text_done = json!({
+            "type": "response.output_text.done",
+            "sequence_number": self.next_sequence(),
+            "item_id": self.admission.message_id,
+            "output_index": 0,
+            "content_index": 0,
+            "text": text
+        });
+        self.pending
+            .push_back(named_event("response.output_text.done", text_done));
+        let part_done = json!({
+            "type": "response.content_part.done",
+            "sequence_number": self.next_sequence(),
+            "item_id": self.admission.message_id,
+            "output_index": 0,
+            "content_index": 0,
+            "part": {"type": "output_text", "text": text, "annotations": []}
+        });
+        self.pending
+            .push_back(named_event("response.content_part.done", part_done));
+        let item_done = json!({
+            "type": "response.output_item.done",
+            "sequence_number": self.next_sequence(),
+            "output_index": 0,
+            "item": {
+                "id": self.admission.message_id,
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": text,
+                    "annotations": []
+                }]
+            }
+        });
+        self.pending
+            .push_back(named_event("response.output_item.done", item_done));
+        self.response_message_done = true;
+    }
 
-    fn enqueue_complete(&mut self, record: CompletionRecord) {
+
+    fn enqueue_complete(&mut self, record: CompletionRecord) -> Result<(), WorkerFailure> {
+        self.validate_streamed_completion(&record)?;
         debug!(
             phase = "response.streaming_complete",
             response_id = %record.admission.response_id,
@@ -544,44 +744,97 @@ impl SseState {
             Endpoint::Chat => self.enqueue_chat_complete(&record),
             Endpoint::Responses => self.enqueue_responses_complete(&record),
         }
+        Ok(())
+    }
+
+    fn validate_streamed_completion(
+        &self,
+        record: &CompletionRecord,
+    ) -> Result<(), WorkerFailure> {
+        if record.endpoint != self.endpoint
+            || record.admission.response_id != self.admission.response_id
+            || record.admission.message_id != self.admission.message_id
+            || record.model != self.model
+        {
+            return Err(internal_stream_failure(
+                "completion metadata did not match stream admission",
+            ));
+        }
+        if self.streamed_content != record.content {
+            return Err(internal_stream_failure(
+                "streamed content did not match the completion record",
+            ));
+        }
+        if self.streamed_tool_calls.len() > record.tool_calls.len() {
+            return Err(internal_stream_failure(
+                "stream exposed more tool calls than the completion record",
+            ));
+        }
+        for (index, streamed) in self.streamed_tool_calls.iter().enumerate() {
+            let completed = &record.tool_calls[index];
+            let expected = generated_tool_call(
+                &record.admission,
+                index,
+                completed.name.clone(),
+                completed.arguments.clone(),
+            );
+            if completed.id != expected.id
+                || completed.item_id != expected.item_id
+                || streamed.name != completed.name
+                || !completed.arguments.starts_with(&streamed.arguments)
+            {
+                return Err(internal_stream_failure(
+                    "streamed tool call was not a prefix of the completion record",
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn enqueue_chat_complete(&mut self, record: &CompletionRecord) {
         for (index, call) in record.tool_calls.iter().enumerate() {
-            self.pending.push_back(data_event(json!({
-                "id": record.admission.response_id,
-                "object": "chat.completion.chunk",
-                "created": record.admission.created,
-                "model": record.model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {
-                        "tool_calls": [{
-                            "index": index,
-                            "id": call.id,
-                            "type": "function",
-                            "function": {"name": call.name, "arguments": ""}
-                        }]
-                    },
-                    "finish_reason": null
-                }]
-            })));
-            self.pending.push_back(data_event(json!({
-                "id": record.admission.response_id,
-                "object": "chat.completion.chunk",
-                "created": record.admission.created,
-                "model": record.model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {
-                        "tool_calls": [{
-                            "index": index,
-                            "function": {"arguments": call.arguments}
-                        }]
-                    },
-                    "finish_reason": null
-                }]
-            })));
+            if index >= self.streamed_tool_calls.len() {
+                self.pending.push_back(data_event(json!({
+                    "id": record.admission.response_id,
+                    "object": "chat.completion.chunk",
+                    "created": record.admission.created,
+                    "model": record.model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [{
+                                "index": index,
+                                "id": call.id,
+                                "type": "function",
+                                "function": {"name": call.name, "arguments": ""}
+                            }]
+                        },
+                        "finish_reason": null
+                    }]
+                })));
+            }
+            let streamed_len = self
+                .streamed_tool_calls
+                .get(index)
+                .map_or(0, |streamed| streamed.arguments.len());
+            if streamed_len < call.arguments.len() {
+                self.pending.push_back(data_event(json!({
+                    "id": record.admission.response_id,
+                    "object": "chat.completion.chunk",
+                    "created": record.admission.created,
+                    "model": record.model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {
+                            "tool_calls": [{
+                                "index": index,
+                                "function": {"arguments": &call.arguments[streamed_len..]}
+                            }]
+                        },
+                        "finish_reason": null
+                    }]
+                })));
+            }
         }
         let mut terminal = json!({
             "id": record.admission.response_id,
@@ -618,58 +871,41 @@ impl SseState {
         if !record.content.is_empty() || record.tool_calls.is_empty() {
             self.ensure_response_message_open();
         }
-        if self.response_message_open {
-            let text_done = json!({
-                "type": "response.output_text.done",
-                "sequence_number": self.next_sequence(),
-                "item_id": record.admission.message_id,
-                "output_index": 0,
-                "content_index": 0,
-                "text": record.content
-            });
-            self.pending
-                .push_back(named_event("response.output_text.done", text_done));
-            let part_done = json!({
-                "type": "response.content_part.done",
-                "sequence_number": self.next_sequence(),
-                "item_id": record.admission.message_id,
-                "output_index": 0,
-                "content_index": 0,
-                "part": {"type": "output_text", "text": record.content, "annotations": []}
-            });
-            self.pending
-                .push_back(named_event("response.content_part.done", part_done));
-            let item_done = json!({
-                "type": "response.output_item.done",
-                "sequence_number": self.next_sequence(),
-                "output_index": 0,
-                "item": response_message_item(record)
-            });
-            self.pending
-                .push_back(named_event("response.output_item.done", item_done));
+        if self.response_message_open && !self.response_message_done {
+            self.finish_response_message(&record.content);
         }
-        let first_call_index = usize::from(self.response_message_open);
+        let first_call_index = self
+            .response_tool_output_offset
+            .unwrap_or(usize::from(self.response_message_open));
         for (index, call) in record.tool_calls.iter().enumerate() {
             let output_index = first_call_index + index;
-            let added = json!({
-                "type": "response.output_item.added",
-                "sequence_number": self.next_sequence(),
-                "output_index": output_index,
-                "item": response_function_item(call, false)
-            });
-            self.pending
-                .push_back(named_event("response.output_item.added", added));
-            let arguments_delta = json!({
-                "type": "response.function_call_arguments.delta",
-                "sequence_number": self.next_sequence(),
-                "item_id": call.item_id,
-                "output_index": output_index,
-                "delta": call.arguments
-            });
-            self.pending.push_back(named_event(
-                "response.function_call_arguments.delta",
-                arguments_delta,
-            ));
+            if index >= self.streamed_tool_calls.len() {
+                let added = json!({
+                    "type": "response.output_item.added",
+                    "sequence_number": self.next_sequence(),
+                    "output_index": output_index,
+                    "item": response_function_item(call, false)
+                });
+                self.pending
+                    .push_back(named_event("response.output_item.added", added));
+            }
+            let streamed_len = self
+                .streamed_tool_calls
+                .get(index)
+                .map_or(0, |streamed| streamed.arguments.len());
+            if streamed_len < call.arguments.len() {
+                let arguments_delta = json!({
+                    "type": "response.function_call_arguments.delta",
+                    "sequence_number": self.next_sequence(),
+                    "item_id": call.item_id,
+                    "output_index": output_index,
+                    "delta": &call.arguments[streamed_len..]
+                });
+                self.pending.push_back(named_event(
+                    "response.function_call_arguments.delta",
+                    arguments_delta,
+                ));
+            }
             let arguments_done = json!({
                 "type": "response.function_call_arguments.done",
                 "sequence_number": self.next_sequence(),
@@ -752,6 +988,14 @@ impl SseState {
         current
     }
 }
+fn internal_stream_failure(message: &str) -> WorkerFailure {
+    WorkerFailure {
+        kind: FailureKind::Server,
+        message: format!("internal stream failure: {message}"),
+        param: None,
+    }
+}
+
 
 fn buffered_json(record: &CompletionRecord) -> Value {
     match record.endpoint {
