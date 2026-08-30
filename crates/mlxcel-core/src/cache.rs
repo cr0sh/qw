@@ -7603,8 +7603,7 @@ mod tests {
         let mut cache = KVCache::new();
         cache.keys = Some(ffi::from_slice_f32(&[0.0; 8], &[1, 1, 4, 2]));
         cache.values = Some(ffi::from_slice_f32(&[0.0; 8], &[1, 1, 4, 2]));
-        cache.auxiliary_keys =
-            raw_auxiliary.then(|| ffi::from_slice_f32(&[0.0; 12], &[1, 4, 3]));
+        cache.auxiliary_keys = raw_auxiliary.then(|| ffi::from_slice_f32(&[0.0; 12], &[1, 4, 3]));
         cache.auxiliary_block_keys =
             block_auxiliary.then(|| ffi::from_slice_f32(&[0.0; 12], &[1, 2, 2, 3]));
         cache.offset = 4;
