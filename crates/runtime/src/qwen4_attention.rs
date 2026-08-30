@@ -167,6 +167,137 @@ enum Qwen4QsaPlan {
     },
 }
 
+const QSA_PREFILL_QUERY_TILE: i32 = 128;
+const QSA_PREFILL_BLOCK_TILE: i32 = 2048;
+
+fn qsa_ranked_tile(
+    query: &MlxArray,
+    pooled: &MlxArray,
+    complete_counts: Option<&MlxArray>,
+    block_start: i32,
+    block_end: i32,
+    complete_blocks: i32,
+    head_dim: i32,
+) -> UniquePtr<MlxArray> {
+    let pooled_t = mlxcel_core::transpose_axes(pooled, &[0, 1, 3, 2]);
+    let scores = mlxcel_core::matmul(query, &pooled_t);
+    let zero = mlxcel_core::full_f32(&[1], 0.0, mlxcel_core::dtype::FLOAT32);
+    let scores = mlxcel_core::sum_axis(&mlxcel_core::maximum(&scores, &zero), 1, false);
+    let scores = mlxcel_core::multiply_scalar(&scores, 1.0 / (head_dim as f32).sqrt());
+    // Quantization stabilizes the score bin; the global block ID makes every
+    // rank unique and preserves the recent-first tie break across tiles.
+    let half = mlxcel_core::full_f32(&[1], 0.5, mlxcel_core::dtype::FLOAT32);
+    let quantized = mlxcel_core::astype(
+        &mlxcel_core::floor(&mlxcel_core::add(
+            &mlxcel_core::multiply_scalar(&scores, 256.0),
+            &half,
+        )),
+        mlxcel_core::dtype::INT32,
+    );
+    let rank_stride = mlxcel_core::from_slice_i32(&[complete_blocks + 1], &[1]);
+    let block_ids = mlxcel_core::arange_i32(block_start, block_end, 1);
+    let block_ids = mlxcel_core::reshape(&block_ids, &[1, 1, block_end - block_start]);
+    let ranked = mlxcel_core::add(
+        &mlxcel_core::multiply(&quantized, &rank_stride),
+        &block_ids,
+    );
+    match complete_counts {
+        Some(complete_counts) => {
+            let valid_blocks = mlxcel_core::less(&block_ids, complete_counts);
+            let invalid_rank = mlxcel_core::from_slice_i32(&[i32::MIN], &[1]);
+            mlxcel_core::where_cond(&valid_blocks, &ranked, &invalid_rank)
+        }
+        None => ranked,
+    }
+}
+
+fn qsa_topk_block_ids(
+    ranked: &MlxArray,
+    block_topk: i32,
+    complete_blocks: i32,
+) -> UniquePtr<MlxArray> {
+    let selected = mlxcel_core::topk(ranked, block_topk, -1);
+    let selected = mlxcel_core::negative(&mlxcel_core::sort(
+        &mlxcel_core::negative(&selected),
+        -1,
+    ));
+    let rank_stride = mlxcel_core::from_slice_i32(&[complete_blocks + 1], &[1]);
+    mlxcel_core::remainder(&selected, &rank_stride)
+}
+
+fn qsa_tiled_topk_block_ids(
+    query: &MlxArray,
+    pooled: &MlxArray,
+    complete_counts: &MlxArray,
+    block_topk: i32,
+    query_tile_size: i32,
+    block_tile_size: i32,
+) -> UniquePtr<MlxArray> {
+    let query_shape = mlxcel_core::array_shape(query);
+    let batch = query_shape[0];
+    let n_heads = query_shape[1];
+    let sequence = query_shape[2];
+    let head_dim = query_shape[3];
+    let complete_blocks = mlxcel_core::array_shape(pooled)[2];
+    let mut query_tiles = Vec::with_capacity(sequence.div_ceil(query_tile_size) as usize);
+    for query_start in (0..sequence).step_by(query_tile_size as usize) {
+        let query_end = (query_start + query_tile_size).min(sequence);
+        let query_tile = mlxcel_core::slice(
+            query,
+            &[0, 0, query_start, 0],
+            &[batch, n_heads, query_end, head_dim],
+        );
+        let complete_counts = mlxcel_core::slice(
+            complete_counts,
+            &[0, query_start, 0],
+            &[1, query_end, 1],
+        );
+        let mut running: Option<UniquePtr<MlxArray>> = None;
+        for block_start in (0..complete_blocks).step_by(block_tile_size as usize) {
+            let block_end = (block_start + block_tile_size).min(complete_blocks);
+            let pooled_tile = mlxcel_core::slice(
+                pooled,
+                &[0, 0, block_start, 0],
+                &[batch, 1, block_end, head_dim],
+            );
+            let ranked = qsa_ranked_tile(
+                &query_tile,
+                &pooled_tile,
+                Some(&complete_counts),
+                block_start,
+                block_end,
+                complete_blocks,
+                head_dim,
+            );
+            let tile_topk = block_topk.min(block_end - block_start);
+            let candidates = mlxcel_core::topk(&ranked, tile_topk, -1);
+            running = Some(match running {
+                Some(previous) => {
+                    let merged = mlxcel_core::concatenate(&previous, &candidates, -1);
+                    let merged_width = mlxcel_core::array_shape(&merged)[2];
+                    mlxcel_core::topk(&merged, block_topk.min(merged_width), -1)
+                }
+                None => candidates,
+            });
+        }
+        let ranked = running.expect("QSA tiling requires at least one complete block");
+        query_tiles.push(qsa_topk_block_ids(
+            &ranked,
+            block_topk,
+            complete_blocks,
+        ));
+    }
+    let mut query_tiles = query_tiles.into_iter();
+    let mut selected = query_tiles
+        .next()
+        .expect("QSA tiling requires at least one query");
+    for tile in query_tiles {
+        selected = mlxcel_core::concatenate(&selected, &tile, 1);
+    }
+    selected
+}
+
+
 impl Qwen4QsaIndexer {
     fn from_weights(
         weights: &WeightMap,
@@ -337,58 +468,54 @@ impl Qwen4QsaIndexer {
 
         let query_f32 = mlxcel_core::astype(&query, mlxcel_core::dtype::FLOAT32);
         let pooled_f32 = mlxcel_core::astype(&pooled, mlxcel_core::dtype::FLOAT32);
-        let pooled_t = mlxcel_core::transpose_axes(&pooled_f32, &[0, 1, 3, 2]);
-        let scores = mlxcel_core::matmul(&query_f32, &pooled_t);
-        let zero = mlxcel_core::full_f32(&[1], 0.0, mlxcel_core::dtype::FLOAT32);
-        let scores = mlxcel_core::sum_axis(&mlxcel_core::maximum(&scores, &zero), 1, false);
-        let scores = mlxcel_core::multiply_scalar(&scores, 1.0 / (self.head_dim as f32).sqrt());
-
         let query_ends = mlxcel_core::arange_i32(past_len + 1, past_len + sequence + 1, 1);
         let query_ends = mlxcel_core::reshape(&query_ends, &[1, sequence, 1]);
         let ratio = mlxcel_core::from_slice_i32(&[self.compress_ratio], &[1]);
         let complete_counts = mlxcel_core::floor_divide(&query_ends, &ratio);
-        let block_ids = mlxcel_core::arange_i32(0, complete_blocks, 1);
-        let block_ids = mlxcel_core::reshape(&block_ids, &[1, 1, complete_blocks]);
-        // Quantize the relevance score before selection. Long-context QSA
-        // matmuls can vary by a few low bits across Metal schedules; without
-        // a stable key, those differences change the top-k boundary and then
-        // cascade through subsequent recurrent layers. Integer ranking keeps
-        // the score bin and recent-first block-ID tie break exact.
-        let half = mlxcel_core::full_f32(&[1], 0.5, mlxcel_core::dtype::FLOAT32);
-        let quantized = mlxcel_core::astype(
-            &mlxcel_core::floor(&mlxcel_core::add(
-                &mlxcel_core::multiply_scalar(&scores, 256.0),
-                &half,
-            )),
-            mlxcel_core::dtype::INT32,
-        );
-        let rank_stride = mlxcel_core::from_slice_i32(&[complete_blocks + 1], &[1]);
-        let ranked = mlxcel_core::add(&mlxcel_core::multiply(&quantized, &rank_stride), &block_ids);
-        let ranked = if sequence == 1 {
-            // A single decode query sees every complete block, so the causal
-            // validity mask is all true. Avoid materializing and selecting
-            // through that redundant Metal buffer.
-            ranked
-        } else {
-            let valid_blocks = mlxcel_core::less(&block_ids, &complete_counts);
-            let invalid_rank = mlxcel_core::from_slice_i32(&[i32::MIN], &[1]);
-            mlxcel_core::where_cond(&valid_blocks, &ranked, &invalid_rank)
-        };
-        // When every query has at least top-k valid blocks, the rank key's
-        // remainder is the unique block id. Early prefill rows can contain the
-        // i32::MIN invalid sentinel, whose remainder is not an index, so retain
-        // the index-producing argpartition fallback for that case.
-        let selected = if past_len / self.compress_ratio > self.block_topk {
-            let selected = mlxcel_core::topk(&ranked, self.block_topk, -1);
-            mlxcel_core::remainder(&selected, &rank_stride)
-        } else {
-            let selected = mlxcel_core::argpartition(&ranked, -self.block_topk, -1);
-            mlxcel_core::slice(
-                &selected,
-                &[0, 0, complete_blocks - self.block_topk],
-                &[batch, sequence, complete_blocks],
+
+        // Every tile uses the same globally unique integer rank, so retaining
+        // each tile's top-k and repeatedly taking the top-k of their union is
+        // exactly the global top-k. Query tiling only separates independent rows.
+        let all_rows_have_topk = past_len / self.compress_ratio > self.block_topk;
+        let selected = if all_rows_have_topk
+            && sequence > QSA_PREFILL_QUERY_TILE
+            && complete_blocks > QSA_PREFILL_BLOCK_TILE
+        {
+            qsa_tiled_topk_block_ids(
+                &query_f32,
+                &pooled_f32,
+                &complete_counts,
+                self.block_topk,
+                QSA_PREFILL_QUERY_TILE,
+                QSA_PREFILL_BLOCK_TILE,
             )
+        } else {
+            let ranked = qsa_ranked_tile(
+                &query_f32,
+                &pooled_f32,
+                (sequence != 1).then_some(&*complete_counts),
+                0,
+                complete_blocks,
+                complete_blocks,
+                self.head_dim,
+            );
+            if all_rows_have_topk {
+                qsa_topk_block_ids(&ranked, self.block_topk, complete_blocks)
+            } else {
+                // Early prefill rows can contain the i32::MIN invalid sentinel,
+                // whose remainder is not an index. Retain index-producing
+                // argpartition for those rows.
+                let selected =
+                    mlxcel_core::argpartition(&ranked, -self.block_topk, -1);
+                mlxcel_core::slice(
+                    &selected,
+                    &[0, 0, complete_blocks - self.block_topk],
+                    &[batch, sequence, complete_blocks],
+                )
+            }
         };
+        // Attention consumes selected tokens in block order; ranking helpers
+        // above keep descending global rank until this existing presentation step.
         let selected = mlxcel_core::sort(&selected, -1);
         let selected = mlxcel_core::expand_dims(&selected, -1);
         let selected = mlxcel_core::multiply(&selected, &ratio);
@@ -954,6 +1081,100 @@ mod tests {
         );
     }
 
+
+    fn assert_arrays_equal(actual: &MlxArray, expected: &MlxArray) {
+        let equal = mlxcel_core::array_equal(actual, expected, false);
+        mlxcel_core::eval(&equal);
+        assert!(mlxcel_core::item_bool(&equal));
+    }
+
+    fn exercise_tiled_qsa_ranking(materialize_inputs: bool) {
+        const QUERIES: i32 = 7;
+        const BLOCKS: i32 = 11;
+        const HEADS: i32 = 2;
+        const HEAD_DIM: i32 = 2;
+        const TOPK: i32 = 3;
+
+        let mut query_values = Vec::new();
+        for head in 0..HEADS {
+            for row in 0..QUERIES {
+                if row == 0 {
+                    query_values.extend_from_slice(&[0.0, 0.0]);
+                } else {
+                    query_values.extend_from_slice(&[
+                        (row - 3) as f32,
+                        if head == 0 {
+                            (2 - row) as f32
+                        } else {
+                            (row - 5) as f32
+                        },
+                    ]);
+                }
+            }
+        }
+        let query =
+            mlxcel_core::from_slice_f32(&query_values, &[1, HEADS, QUERIES, HEAD_DIM]);
+        let pooled_values = (0..BLOCKS)
+            .flat_map(|block| [(block - 5) as f32, ((block * 3) % 7 - 3) as f32])
+            .collect::<Vec<_>>();
+        let pooled =
+            mlxcel_core::from_slice_f32(&pooled_values, &[1, 1, BLOCKS, HEAD_DIM]);
+        let complete_counts =
+            mlxcel_core::from_slice_i32(&[3, 4, 4, 7, 8, 10, 11], &[1, QUERIES, 1]);
+        if materialize_inputs {
+            mlxcel_core::eval(&query);
+            mlxcel_core::eval(&pooled);
+            mlxcel_core::eval(&complete_counts);
+        }
+
+        let ranked = qsa_ranked_tile(
+            &query,
+            &pooled,
+            Some(&complete_counts),
+            0,
+            BLOCKS,
+            BLOCKS,
+            HEAD_DIM,
+        );
+        let monolithic = qsa_topk_block_ids(&ranked, TOPK, BLOCKS);
+        if materialize_inputs {
+            mlxcel_core::eval(&monolithic);
+        }
+        let tiled = qsa_tiled_topk_block_ids(&query, &pooled, &complete_counts, TOPK, 3, 4);
+        assert_arrays_equal(&tiled, &monolithic);
+
+        let first_row = mlxcel_core::slice(&tiled, &[0, 0, 0], &[1, 1, TOPK]);
+        let expected_tie_order = mlxcel_core::from_slice_i32(&[2, 1, 0], &[1, 1, TOPK]);
+        assert_arrays_equal(&first_row, &expected_tie_order);
+    }
+
+    #[test]
+    fn qsa_tiled_ranking_matches_monolithic_across_causal_tails_lazy_and_eager() {
+        exercise_tiled_qsa_ranking(false);
+        exercise_tiled_qsa_ranking(true);
+    }
+
+    #[test]
+    fn qsa_tiled_ranking_preserves_relu_and_global_tie_order() {
+        let query = mlxcel_core::from_slice_f32(&[1.0, -1.0, -1.0, -1.0], &[1, 2, 2, 1]);
+        let pooled =
+            mlxcel_core::from_slice_f32(&[-2.0, -1.0, 0.0, 1.0, 2.0], &[1, 1, 5, 1]);
+        let complete_counts = mlxcel_core::from_slice_i32(&[5, 5], &[1, 2, 1]);
+        let ranked = qsa_ranked_tile(
+            &query,
+            &pooled,
+            Some(&complete_counts),
+            0,
+            5,
+            5,
+            1,
+        );
+        let monolithic = qsa_topk_block_ids(&ranked, 3, 5);
+        let tiled = qsa_tiled_topk_block_ids(&query, &pooled, &complete_counts, 3, 1, 2);
+        let expected = mlxcel_core::from_slice_i32(&[4, 0, 3, 0, 1, 4], &[1, 2, 3]);
+        assert_arrays_equal(&monolithic, &expected);
+        assert_arrays_equal(&tiled, &expected);
+    }
     fn qsa_rollback_indexer() -> Qwen4QsaIndexer {
         const HEAD_DIM: i32 = 2;
         let mut weights = WeightMap::new();
