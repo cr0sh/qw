@@ -348,7 +348,6 @@ impl Qwen4QsaIndexer {
         let complete_counts = mlxcel_core::floor_divide(&query_ends, &ratio);
         let block_ids = mlxcel_core::arange_i32(0, complete_blocks, 1);
         let block_ids = mlxcel_core::reshape(&block_ids, &[1, 1, complete_blocks]);
-        let valid_blocks = mlxcel_core::less(&block_ids, &complete_counts);
         // Quantize the relevance score before selection. Long-context QSA
         // matmuls can vary by a few low bits across Metal schedules; without
         // a stable key, those differences change the top-k boundary and then
@@ -364,17 +363,31 @@ impl Qwen4QsaIndexer {
         );
         let rank_stride = mlxcel_core::from_slice_i32(&[complete_blocks + 1], &[1]);
         let ranked = mlxcel_core::add(&mlxcel_core::multiply(&quantized, &rank_stride), &block_ids);
-        let invalid_rank = mlxcel_core::from_slice_i32(&[i32::MIN], &[1]);
-        let ranked = mlxcel_core::where_cond(&valid_blocks, &ranked, &invalid_rank);
-        let selected = mlxcel_core::argpartition(&ranked, -self.block_topk, -1);
-        let selected = mlxcel_core::slice(
-            &selected,
-            &[0, 0, complete_blocks - self.block_topk],
-            &[batch, sequence, complete_blocks],
-        );
-        // `argpartition` leaves the selected suffix unordered. Sparse
-        // attention must reduce tokens in chronological order so repeated
-        // snapshot restores use the same BF16 accumulation path.
+        let ranked = if sequence == 1 {
+            // A single decode query sees every complete block, so the causal
+            // validity mask is all true. Avoid materializing and selecting
+            // through that redundant Metal buffer.
+            ranked
+        } else {
+            let valid_blocks = mlxcel_core::less(&block_ids, &complete_counts);
+            let invalid_rank = mlxcel_core::from_slice_i32(&[i32::MIN], &[1]);
+            mlxcel_core::where_cond(&valid_blocks, &ranked, &invalid_rank)
+        };
+        // When every query has at least top-k valid blocks, the rank key's
+        // remainder is the unique block id. Early prefill rows can contain the
+        // i32::MIN invalid sentinel, whose remainder is not an index, so retain
+        // the index-producing argpartition fallback for that case.
+        let selected = if past_len / self.compress_ratio > self.block_topk {
+            let selected = mlxcel_core::topk(&ranked, self.block_topk, -1);
+            mlxcel_core::remainder(&selected, &rank_stride)
+        } else {
+            let selected = mlxcel_core::argpartition(&ranked, -self.block_topk, -1);
+            mlxcel_core::slice(
+                &selected,
+                &[0, 0, complete_blocks - self.block_topk],
+                &[batch, sequence, complete_blocks],
+            )
+        };
         let selected = mlxcel_core::sort(&selected, -1);
         let selected = mlxcel_core::expand_dims(&selected, -1);
         let selected = mlxcel_core::multiply(&selected, &ratio);

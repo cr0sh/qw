@@ -2,3 +2,4 @@ target/
 worktrees/
 .autoresearch.env
 /outputs
+/autoresearch.sh
