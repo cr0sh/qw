@@ -922,7 +922,11 @@ fn mtp_cache_should_clear(
         || mtp_round_reaches_cache_clear(previous, emitted, configured_interval)
 }
 
-fn clear_mtp_cache_if_needed(previous: usize, emitted: usize) -> Option<Duration> {
+fn clear_mtp_cache_if_needed(
+    previous: usize,
+    emitted: usize,
+    total_tokens: usize,
+) -> Option<Duration> {
     let memory = mlxcel_core::memory::snapshot();
     if !mtp_cache_should_clear(
         previous,
@@ -934,32 +938,22 @@ fn clear_mtp_cache_if_needed(previous: usize, emitted: usize) -> Option<Duration
         return None;
     }
     if emitted <= 64 {
-        debug!(
-            phase = "mtp.decode.cache_clear.before",
-            tokens = emitted,
-            active_bytes = memory.active_bytes,
-            cache_bytes = memory.cache_bytes,
-            peak_bytes = memory.peak_bytes,
-            limit_bytes = memory.limit_bytes,
+        mlxcel_core::memory::trace_snapshot(
+            "mtp.decode.cache_clear.before",
+            emitted,
+            total_tokens,
         );
     }
     let started = Instant::now();
     mlxcel_core::clear_memory_cache();
     if emitted <= 64 {
-        log_mtp_memory("mtp.decode.cache_clear.after", emitted);
+        mlxcel_core::memory::trace_snapshot(
+            "mtp.decode.cache_clear.after",
+            emitted,
+            total_tokens,
+        );
     }
     Some(started.elapsed())
-}
-
-fn log_mtp_memory(phase: &'static str, tokens: usize) {
-    let memory = mlxcel_core::memory::snapshot();
-    debug!(
-        phase,
-        tokens,
-        cache_bytes = memory.cache_bytes,
-        peak_bytes = memory.peak_bytes,
-        limit_bytes = memory.limit_bytes,
-    );
 }
 
 fn finish_mtp_request(model: &Qwen4Model) {
@@ -1631,6 +1625,7 @@ fn prefill_for_input(
 ) -> Result<crate::qwen4::Qwen4MtpPrefill, String> {
     drafter.reset();
     let prompt = prompt_for_prefill(prefill_input);
+    let prompt_len = mlxcel_core::array_shape(prompt)[1] as usize;
     let (embeddings, positions, rope_delta) = (None, None, None);
     let prefill = model.forward_mtp_prefill_chunks(
         prompt,
@@ -1651,11 +1646,26 @@ fn prefill_for_input(
             materialize_borrowed(hidden);
             drafter.materialize_state();
             model.materialize_mtp_cache_state();
+            let processed_tokens = end as usize;
+            mlxcel_core::memory::trace_snapshot(
+                "mtp.prefill.chunk_complete",
+                processed_tokens,
+                prompt_len,
+            );
+            mlxcel_core::memory::trace_snapshot(
+                "mtp.prefill.cache_clear.before",
+                processed_tokens,
+                prompt_len,
+            );
             mlxcel_core::clear_memory_cache();
-            log_mtp_memory("mtp.prefill.chunk_complete", end as usize);
+            mlxcel_core::memory::trace_snapshot(
+                "mtp.prefill.cache_clear.after",
+                processed_tokens,
+                prompt_len,
+            );
         },
     )?;
-    let prompt_len = mlxcel_core::array_shape(prompt)[1];
+    let prompt_len = prompt_len as i32;
     let final_shape = mlxcel_core::array_shape(&prefill.hidden);
     let final_len = final_shape[1];
     if final_len > 1 {
@@ -1689,6 +1699,7 @@ fn prefill_text_with_reuse(
     reuse: Option<MtpPrefixReuse<'_>>,
 ) -> Result<(crate::qwen4::Qwen4MtpPrefill, usize), String> {
     let Some(reuse) = reuse else {
+        mlxcel_core::memory::trace_snapshot("mtp.prefill.started", 0, prompt_tokens.len());
         debug!(
             phase = "prefill.started",
             prompt_tokens = prompt_tokens.len(),
@@ -1712,6 +1723,11 @@ fn prefill_text_with_reuse(
         &reuse.snapshot.target,
     )?;
     drafter.restore_prompt_snapshot(reuse.snapshot, reuse.cached_tokens)?;
+    mlxcel_core::memory::trace_snapshot(
+        "mtp.prefill.started",
+        reuse.cached_tokens,
+        prompt_tokens.len(),
+    );
     if let Some(continuation_token) = reuse.continuation_token {
         if reuse.cached_tokens + 1 != prompt_tokens.len()
             || prompt_tokens[reuse.cached_tokens] != continuation_token
@@ -1766,6 +1782,7 @@ fn prefill_text_with_reuse(
         &[1, i32::try_from(suffix.len()).unwrap_or(i32::MAX)],
     );
     let mut previous_hidden = mlxcel_core::copy(&reuse.snapshot.last_hidden);
+    let mut processed_tokens = reuse.cached_tokens;
     let prefill = model.forward_mtp_text_suffix_chunks(&suffix_ids, |ids, hidden| {
         let shape = mlxcel_core::array_shape(hidden);
         let target_hidden = if shape[1] == 1 {
@@ -1784,6 +1801,12 @@ fn prefill_text_with_reuse(
         ));
         drafter.materialize_state();
         model.materialize_mtp_cache_state();
+        processed_tokens += shape[1] as usize;
+        mlxcel_core::memory::trace_snapshot(
+            "mtp.prefill.chunk_complete",
+            processed_tokens,
+            prompt_tokens.len(),
+        );
     })?;
     Ok((prefill, reuse.cached_tokens))
 }
@@ -1905,8 +1928,23 @@ fn finish_drafter_prefill(
     drafter.materialize_state();
     model.materialize_mtp_cache_state();
     drop(prefill);
+    let prompt_len = prompt_len as usize;
+    mlxcel_core::memory::trace_snapshot(
+        "mtp.prefill.final_complete",
+        prompt_len,
+        prompt_len,
+    );
+    mlxcel_core::memory::trace_snapshot(
+        "mtp.prefill.cache_clear.before",
+        prompt_len,
+        prompt_len,
+    );
     mlxcel_core::clear_memory_cache();
-    log_mtp_memory("mtp.prefill.final_complete", prompt_len as usize);
+    mlxcel_core::memory::trace_snapshot(
+        "mtp.prefill.cache_clear.after",
+        prompt_len,
+        prompt_len,
+    );
     last_hidden
 }
 fn rebuild_mtp_state(
@@ -2229,7 +2267,11 @@ impl Qwen4MtpGenerator {
             mlxcel_core::item_i32(&token)
         };
         mlxcel_core::eval(&prefill.hidden);
-        log_mtp_memory("mtp.first_token.handoff", prompt_tokens.len());
+        mlxcel_core::memory::trace_snapshot(
+            "mtp.first_token.handoff",
+            prompt_tokens.len(),
+            prompt_tokens.len(),
+        );
         let prefill_time = prefill_start.elapsed();
 
         let mut generated = Vec::with_capacity(max_tokens);
@@ -2469,7 +2511,9 @@ impl Qwen4MtpGenerator {
                         .last()
                         .expect("speculative walk emits at least one token");
                 }
-                if let Some(elapsed) = clear_mtp_cache_if_needed(emitted_before, generated.len()) {
+                if let Some(elapsed) =
+                    clear_mtp_cache_if_needed(emitted_before, generated.len(), max_tokens)
+                {
                     mtp_stats.record_cache_clear(elapsed);
                 }
                 mtp_stats.reconcile_time += phase_start.elapsed();
@@ -2796,7 +2840,9 @@ impl Qwen4MtpGenerator {
             }
             drafter.materialize_state();
             model.materialize_mtp_cache_state();
-            if let Some(elapsed) = clear_mtp_cache_if_needed(emitted_before, generated.len()) {
+            if let Some(elapsed) =
+                clear_mtp_cache_if_needed(emitted_before, generated.len(), max_tokens)
+            {
                 stats.record_cache_clear(elapsed);
             }
 

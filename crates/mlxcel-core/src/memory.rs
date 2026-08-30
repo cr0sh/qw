@@ -241,6 +241,28 @@ pub fn snapshot() -> MemorySnapshot {
         limit_bytes: memory_limit(),
     }
 }
+/// Emit a phase-aware MLX memory snapshot at debug level.
+///
+/// The tracing gate precedes every allocator-counter FFI call, so disabled
+/// instrumentation does not observe or otherwise touch allocator state.
+#[inline]
+pub fn trace_snapshot(phase: &'static str, processed_tokens: usize, total_tokens: usize) {
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+    let memory = snapshot();
+    tracing::debug!(
+        phase,
+        processed_tokens,
+        total_tokens,
+        active_bytes = memory.active_bytes,
+        peak_bytes = memory.peak_bytes,
+        cache_bytes = memory.cache_bytes,
+        used_bytes = memory.used_bytes(),
+        limit_bytes = memory.limit_bytes,
+    );
+}
+
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
