@@ -4,6 +4,7 @@ use std::hint::black_box;
 use std::time::Duration;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use qw_prefix_cache::SnapshotRoute;
 use qw_runtime::provider::Qwen4GenerationMode;
 use support::{
     BenchmarkMemoryReport, DECODE_MAX_TOKENS, load_provider, long_context_tokens,
@@ -97,17 +98,16 @@ fn benchmark_64k_cached_decode(criterion: &mut Criterion) {
     }
     let mut provider = load_provider();
     let memory_report = BenchmarkMemoryReport::after_model_load();
-    let fixture = prepare_long_conversation_fixture(
+    let support::LongConversationFixture {
+        prompt_ids,
+        prefix_tokens,
+        mut prefix_cache,
+        baseline_token_ids,
+        mtp_token_ids,
+    } = prepare_long_conversation_fixture(
         &mut provider,
         &memory_report,
         long_context_tokens(),
-    );
-    memory_report.emit_post_restore_fixture(
-        fixture.prompt_ids.len(),
-        fixture.prefix_tokens,
-        &fixture.snapshot,
-        &fixture.baseline_token_ids,
-        &fixture.mtp_token_ids,
     );
     let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
     let mut group = criterion.benchmark_group("single_user_decode");
@@ -118,24 +118,28 @@ fn benchmark_64k_cached_decode(criterion: &mut Criterion) {
         (
             "cached_64k_baseline",
             Qwen4GenerationMode::Baseline,
-            fixture.baseline_token_ids.as_slice(),
+            baseline_token_ids.as_slice(),
         ),
         (
             "cached_64k_mtp",
             Qwen4GenerationMode::Mtp,
-            fixture.mtp_token_ids.as_slice(),
+            mtp_token_ids.as_slice(),
         ),
     ] {
         group.bench_function(name, |bencher| {
             bencher.iter_custom(|iterations| {
                 let mut decode_time = Duration::ZERO;
                 for _ in 0..iterations {
+                    let cache_hit = prefix_cache
+                        .lookup(&prompt_ids, SnapshotRoute::Mtp)
+                        .expect("cache-owned 64k MTP snapshot");
+                    assert_eq!(cache_hit.token_count, prefix_tokens);
                     let (output, stats) = provider
                         .benchmark_cached_streaming_in_mode(
-                            &fixture.prompt_ids,
+                            &prompt_ids,
                             DECODE_MAX_TOKENS,
                             &sampling,
-                            &fixture.snapshot,
+                            cache_hit.snapshot,
                             mode,
                             |delta| {
                                 black_box(delta);
@@ -143,7 +147,7 @@ fn benchmark_64k_cached_decode(criterion: &mut Criterion) {
                             },
                         )
                         .unwrap_or_else(|error| panic!("benchmark {name}: {error:#}"));
-                    assert_eq!(output.cached_tokens, fixture.prefix_tokens);
+                    assert_eq!(output.cached_tokens, prefix_tokens);
                     assert_eq!(output.token_ids.len(), DECODE_MAX_TOKENS);
                     assert_eq!(output.token_ids, expected, "deterministic output changed");
                     assert_eq!(stats.is_some(), mode == Qwen4GenerationMode::Mtp);
@@ -155,7 +159,7 @@ fn benchmark_64k_cached_decode(criterion: &mut Criterion) {
         });
     }
     group.finish();
-    let uncached_tokens = fixture.prompt_ids.len() - fixture.prefix_tokens;
+    let uncached_tokens = prompt_ids.len() - prefix_tokens;
     let mut prefill_group = criterion.benchmark_group("single_user_prefill");
     prefill_group.sample_size(10);
     prefill_group.throughput(Throughput::Elements(uncached_tokens as u64));
@@ -163,12 +167,16 @@ fn benchmark_64k_cached_decode(criterion: &mut Criterion) {
         bencher.iter_custom(|iterations| {
             let mut prefill_time = Duration::ZERO;
             for _ in 0..iterations {
+                let cache_hit = prefix_cache
+                    .lookup(&prompt_ids, SnapshotRoute::Mtp)
+                    .expect("cache-owned 64k MTP snapshot");
+                assert_eq!(cache_hit.token_count, prefix_tokens);
                 let (output, stats) = provider
                     .benchmark_cached_streaming_in_mode(
-                        &fixture.prompt_ids,
+                        &prompt_ids,
                         1,
                         &sampling,
-                        &fixture.snapshot,
+                        cache_hit.snapshot,
                         Qwen4GenerationMode::Baseline,
                         |delta| {
                             black_box(delta);
@@ -176,9 +184,9 @@ fn benchmark_64k_cached_decode(criterion: &mut Criterion) {
                         },
                     )
                     .unwrap_or_else(|error| panic!("benchmark cached 64k prefill: {error:#}"));
-                assert_eq!(output.cached_tokens, fixture.prefix_tokens);
-                assert_eq!(output.prompt_tokens, fixture.prompt_ids.len());
-                assert_eq!(output.token_ids, fixture.baseline_token_ids[..1]);
+                assert_eq!(output.cached_tokens, prefix_tokens);
+                assert_eq!(output.prompt_tokens, prompt_ids.len());
+                assert_eq!(output.token_ids, baseline_token_ids[..1]);
                 assert!(stats.is_none());
                 prefill_time += output.prefill_time;
                 black_box(output);

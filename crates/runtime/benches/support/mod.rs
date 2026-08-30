@@ -1,9 +1,21 @@
+use std::fs::{self, OpenOptions};
 use std::hint::black_box;
+use std::io::Write as _;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt as _;
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use qw_prefix_cache::{
+    AdaptivePrefixCache, CacheConfig, CacheNamespaces, Manifest as PrefixCacheManifest,
+    SnapshotRoute, namespace_hash,
+};
 use qw_runtime::provider::Qwen4GenerationMode;
 use qw_runtime::{
     ChatMessage, ChatMessageContent, GenerationRequest, KVCacheMode, PromptSnapshot, Qwen4Provider,
 };
+use serde::{Deserialize, Serialize};
 
 pub const DECODE_MAX_TOKENS: usize = 32;
 pub const MTP_BLOCK_SIZE: usize = 3;
@@ -131,6 +143,59 @@ const PROMPT: &str = concat!(
     "one retry succeeded and one payment capture still fails.\n"
 );
 
+const LONG_CONTEXT_SUFFIX_TOKENS: usize = 1_536;
+const LONG_PROMPT_TAIL_TOKENS: usize = 16;
+const LONG_PROMPT_MAX_RECORDS: usize = 20_000;
+const LONG_PROMPT_TOKENIZE_INTERVAL: usize = 128;
+const PREFIX_CACHE_MEMORY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const PREFIX_CACHE_FILESYSTEM_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+static BENCHMARK_STARTED: OnceLock<Instant> = OnceLock::new();
+static MODEL_IDENTITY: LazyLock<Result<BenchmarkModelIdentity, String>> = LazyLock::new(|| {
+    let target = qw_runtime::resolve_model_path(None)
+        .map_err(|error| format!("resolve target model: {error:#}"))?;
+    let draft = qw_runtime::resolve_mtp_model_path()
+        .map_err(|error| format!("resolve draft model: {error:#}"))?;
+    Ok(BenchmarkModelIdentity {
+        target: model_directory_identity(&target)?,
+        draft: model_directory_identity(&draft)?,
+    })
+});
+
+struct BenchmarkModelIdentity {
+    target: String,
+    draft: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DecodeFixtureManifest {
+    namespace: String,
+    baseline_route: SnapshotRoute,
+    mtp_route: SnapshotRoute,
+    baseline_token_ids: Vec<i32>,
+    mtp_token_ids: Vec<i32>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrefillFixtureManifest {
+    namespace: String,
+    route: SnapshotRoute,
+    prompt_tokens: usize,
+    first_token_id: i32,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LongConversationFixtureManifest {
+    namespace: String,
+    route: SnapshotRoute,
+    prompt_ids: Vec<i32>,
+    prefix_tokens: usize,
+    baseline_token_ids: Vec<i32>,
+    mtp_token_ids: Vec<i32>,
+}
+
 pub struct DecodeFixture {
     pub request: GenerationRequest,
     pub baseline_token_ids: Vec<i32>,
@@ -145,7 +210,7 @@ pub struct PrefillFixture {
 pub struct LongConversationFixture {
     pub prompt_ids: Vec<i32>,
     pub prefix_tokens: usize,
-    pub snapshot: PromptSnapshot,
+    pub prefix_cache: AdaptivePrefixCache,
     pub baseline_token_ids: Vec<i32>,
     pub mtp_token_ids: Vec<i32>,
 }
@@ -161,7 +226,255 @@ pub fn request(max_tokens: usize) -> GenerationRequest {
     }
 }
 
+fn emit_setup_phase(phase: &str, elapsed: Duration, source: &str) {
+    let total = BENCHMARK_STARTED.get_or_init(Instant::now).elapsed();
+    eprintln!(
+        "QW_BENCH_SETUP phase={phase} elapsed_ms={} total_ms={} source={source}",
+        elapsed.as_millis(),
+        total.as_millis(),
+    );
+}
+
+fn append_identity_field(identity: &mut Vec<u8>, field: &[u8]) {
+    identity.extend_from_slice(&(field.len() as u64).to_le_bytes());
+    identity.extend_from_slice(field);
+}
+
+fn model_directory_identity(model_dir: &Path) -> Result<String, String> {
+    let canonical_dir = fs::canonicalize(model_dir)
+        .map_err(|error| format!("canonicalize {}: {error}", model_dir.display()))?;
+    let mut identity = Vec::new();
+    append_identity_field(
+        &mut identity,
+        canonical_dir.to_string_lossy().as_bytes(),
+    );
+    let mut entries = fs::read_dir(model_dir)
+        .map_err(|error| format!("read {}: {error}", model_dir.display()))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("read {}: {error}", model_dir.display()))?;
+    entries.sort_by_key(|entry| entry.file_name());
+    for entry in entries {
+        let path = entry.path();
+        let metadata = fs::metadata(&path)
+            .map_err(|error| format!("stat {}: {error}", path.display()))?;
+        if !metadata.is_file() {
+            continue;
+        }
+        append_identity_field(&mut identity, entry.file_name().to_string_lossy().as_bytes());
+        let canonical_path = fs::canonicalize(&path)
+            .map_err(|error| format!("canonicalize {}: {error}", path.display()))?;
+        append_identity_field(
+            &mut identity,
+            canonical_path.to_string_lossy().as_bytes(),
+        );
+        append_identity_field(&mut identity, &metadata.len().to_le_bytes());
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .unwrap_or_default();
+        append_identity_field(&mut identity, &modified.as_secs().to_le_bytes());
+        append_identity_field(&mut identity, &modified.subsec_nanos().to_le_bytes());
+        #[cfg(unix)]
+        {
+            append_identity_field(&mut identity, &metadata.dev().to_le_bytes());
+            append_identity_field(&mut identity, &metadata.ino().to_le_bytes());
+            append_identity_field(&mut identity, &metadata.ctime().to_le_bytes());
+            append_identity_field(&mut identity, &metadata.ctime_nsec().to_le_bytes());
+        }
+        if path.extension().and_then(|extension| extension.to_str()).is_some_and(
+            |extension| matches!(extension, "json" | "jinja" | "txt"),
+        ) {
+            let bytes =
+                fs::read(&path).map_err(|error| format!("read {}: {error}", path.display()))?;
+            append_identity_field(&mut identity, &bytes);
+        }
+    }
+    Ok(namespace_hash(&[&identity]))
+}
+
+fn benchmark_model_identity() -> &'static BenchmarkModelIdentity {
+    MODEL_IDENTITY
+        .as_ref()
+        .unwrap_or_else(|error| panic!("fingerprint benchmark models: {error}"))
+}
+
+fn fixture_namespace(kind: &[u8], request_parts: &[&[u8]]) -> String {
+    let models = benchmark_model_identity();
+    let mut parts = vec![
+        kind,
+        b"kv_cache_mode=fp8",
+        models.target.as_bytes(),
+        models.draft.as_bytes(),
+    ];
+    parts.extend_from_slice(request_parts);
+    namespace_hash(&parts)
+}
+
+fn cache_root() -> PathBuf {
+    PathBuf::from(
+        std::env::var_os("HOME").unwrap_or_else(|| panic!("HOME is required for benchmark cache")),
+    )
+    .join(".cache/qw/benchmarks/single_user_throughput")
+}
+
+fn fixture_manifest_path(kind: &str, namespace: &str) -> PathBuf {
+    cache_root()
+        .join("fixtures")
+        .join(format!("{kind}-{namespace}.json"))
+}
+
+fn read_fixture_manifest<T>(path: &Path) -> Option<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    serde_json::from_slice(&fs::read(path).ok()?).ok()
+}
+
+fn publish_fixture_manifest<T>(path: &Path, manifest: &T) -> Result<(), String>
+where
+    T: Serialize,
+{
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("fixture manifest has no parent: {}", path.display()))?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("create {}: {error}", parent.display()))?;
+    let bytes = serde_json::to_vec(manifest).map_err(|error| error.to_string())?;
+    let temp = path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temp)
+        .map_err(|error| format!("create {}: {error}", temp.display()))?;
+    file.write_all(&bytes)
+        .map_err(|error| format!("write {}: {error}", temp.display()))?;
+    file.sync_all()
+        .map_err(|error| format!("sync {}: {error}", temp.display()))?;
+    drop(file);
+    fs::rename(&temp, path).map_err(|error| {
+        let _ = fs::remove_file(&temp);
+        format!("publish {}: {error}", path.display())
+    })
+}
+
+fn token_ids_valid(token_ids: &[i32], expected_len: usize, vocab_size: usize) -> bool {
+    token_ids.len() == expected_len
+        && token_ids
+            .iter()
+            .all(|token| *token >= 0 && (*token as usize) < vocab_size)
+}
+
+fn long_manifest_valid(
+    manifest: &LongConversationFixtureManifest,
+    namespace: &str,
+    prefix_tokens: usize,
+    vocab_size: usize,
+) -> bool {
+    let Some(prompt_tokens) = prefix_tokens.checked_add(LONG_CONTEXT_SUFFIX_TOKENS) else {
+        return false;
+    };
+    manifest.namespace == namespace
+        && manifest.route == SnapshotRoute::Mtp
+        && manifest.prefix_tokens == prefix_tokens
+        && token_ids_valid(&manifest.prompt_ids, prompt_tokens, vocab_size)
+        && token_ids_valid(
+            &manifest.baseline_token_ids,
+            DECODE_MAX_TOKENS,
+            vocab_size,
+        )
+        && token_ids_valid(&manifest.mtp_token_ids, DECODE_MAX_TOKENS, vocab_size)
+}
+
+fn prefix_cache_namespaces(namespace: &str) -> (CacheNamespaces, String) {
+    let baseline = namespace_hash(&[
+        namespace.as_bytes(),
+        SnapshotRoute::Baseline.as_str().as_bytes(),
+    ]);
+    let mtp = namespace_hash(&[
+        namespace.as_bytes(),
+        SnapshotRoute::Mtp.as_str().as_bytes(),
+    ]);
+    (
+        CacheNamespaces {
+            baseline,
+            mtp: mtp.clone(),
+        },
+        mtp,
+    )
+}
+
+fn persistent_snapshot_complete(
+    prefix_root: &Path,
+    namespace: &str,
+    prompt_ids: &[i32],
+    prefix_tokens: usize,
+) -> bool {
+    let Some(prefix_ids) = prompt_ids.get(..prefix_tokens) else {
+        return false;
+    };
+    let Ok(entries) = fs::read_dir(prefix_root.join("entries").join(namespace)) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(manifest) = fs::read(entry.path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<PrefixCacheManifest>(&bytes).ok())
+        else {
+            continue;
+        };
+        if manifest.namespace != namespace
+            || manifest.route != SnapshotRoute::Mtp
+            || manifest.token_len != prefix_tokens
+            || manifest.token_ids != prefix_ids
+        {
+            continue;
+        }
+        if manifest.blob_sha256.is_empty() {
+            continue;
+        }
+        let stored_bytes = manifest
+            .blob_sha256
+            .iter()
+            .try_fold(0u64, |total, digest| {
+                let metadata = fs::metadata(prefix_root.join("blobs").join(digest)).ok()?;
+                metadata
+                    .is_file()
+                    .then(|| total.checked_add(metadata.len()))
+                    .flatten()
+            });
+        if stored_bytes == Some(manifest.total_bytes) {
+            return true;
+        }
+    }
+    false
+}
+
+fn exact_mtp_snapshot<'a>(
+    cache: &'a mut AdaptivePrefixCache,
+    prompt_ids: &[i32],
+    prefix_tokens: usize,
+) -> Option<&'a PromptSnapshot> {
+    let hit = cache.lookup(prompt_ids, SnapshotRoute::Mtp)?;
+    (hit.token_count == prefix_tokens
+        && hit.snapshot.token_len() == prefix_tokens
+        && SnapshotRoute::Mtp.matches(hit.snapshot))
+    .then_some(hit.snapshot)
+}
+
+
 pub fn load_provider() -> Qwen4Provider {
+    let _ = BENCHMARK_STARTED.set(Instant::now());
     let model_dir = qw_runtime::resolve_model_path(None)
         .unwrap_or_else(|error| panic!("failed to resolve benchmark model path: {error:#}"));
     Qwen4Provider::load(&model_dir, KVCacheMode::Fp8)
@@ -169,7 +482,48 @@ pub fn load_provider() -> Qwen4Provider {
 }
 
 pub fn prepare_decode_fixture(provider: &mut Qwen4Provider) -> DecodeFixture {
+    let setup_started = Instant::now();
     let request = request(DECODE_MAX_TOKENS);
+    let max_tokens = (DECODE_MAX_TOKENS as u64).to_le_bytes();
+    let mtp_block_size = (MTP_BLOCK_SIZE as u64).to_le_bytes();
+    let namespace = fixture_namespace(
+        b"fresh_decode",
+        &[
+            PROMPT.as_bytes(),
+            b"temperature=0;top_k=1;top_p=1;seed=0",
+            b"routes=baseline,mtp",
+            &max_tokens,
+            &mtp_block_size,
+        ],
+    );
+    let manifest_path = fixture_manifest_path("fresh-decode", &namespace);
+    let load_started = Instant::now();
+    if let Some(manifest) = read_fixture_manifest::<DecodeFixtureManifest>(&manifest_path)
+        && manifest.namespace == namespace
+        && manifest.baseline_route == SnapshotRoute::Baseline
+        && manifest.mtp_route == SnapshotRoute::Mtp
+        && token_ids_valid(
+            &manifest.baseline_token_ids,
+            DECODE_MAX_TOKENS,
+            provider.logits_vocab_size(),
+        )
+        && token_ids_valid(
+            &manifest.mtp_token_ids,
+            DECODE_MAX_TOKENS,
+            provider.logits_vocab_size(),
+        )
+    {
+        emit_setup_phase("fresh_decode_load", load_started.elapsed(), "persistent");
+        emit_setup_phase("fresh_decode_ready", setup_started.elapsed(), "persistent");
+        return DecodeFixture {
+            request,
+            baseline_token_ids: manifest.baseline_token_ids,
+            mtp_token_ids: manifest.mtp_token_ids,
+        };
+    }
+    emit_setup_phase("fresh_decode_load", load_started.elapsed(), "cold");
+
+    let build_started = Instant::now();
     let (baseline, _) = provider
         .generate_streaming_in_mode(&request, Qwen4GenerationMode::Baseline, |delta| {
             black_box(delta);
@@ -189,6 +543,32 @@ pub fn prepare_decode_fixture(provider: &mut Qwen4Provider) -> DecodeFixture {
         stats.is_some_and(|stats| stats.proposed_draft_tokens > 0),
         "MTP warmup must propose draft tokens"
     );
+    assert!(token_ids_valid(
+        &baseline.token_ids,
+        DECODE_MAX_TOKENS,
+        provider.logits_vocab_size(),
+    ));
+    assert!(token_ids_valid(
+        &mtp.token_ids,
+        DECODE_MAX_TOKENS,
+        provider.logits_vocab_size(),
+    ));
+    emit_setup_phase("fresh_decode_build", build_started.elapsed(), "cold");
+
+    let persist_started = Instant::now();
+    publish_fixture_manifest(
+        &manifest_path,
+        &DecodeFixtureManifest {
+            namespace,
+            baseline_route: SnapshotRoute::Baseline,
+            mtp_route: SnapshotRoute::Mtp,
+            baseline_token_ids: baseline.token_ids.clone(),
+            mtp_token_ids: mtp.token_ids.clone(),
+        },
+    )
+    .unwrap_or_else(|error| panic!("persist fresh decode fixture: {error}"));
+    emit_setup_phase("fresh_decode_persist", persist_started.elapsed(), "cold");
+    emit_setup_phase("fresh_decode_ready", setup_started.elapsed(), "cold");
     DecodeFixture {
         request,
         baseline_token_ids: baseline.token_ids,
@@ -196,6 +576,7 @@ pub fn prepare_decode_fixture(provider: &mut Qwen4Provider) -> DecodeFixture {
     }
 }
 pub fn prepare_prefill_fixture(provider: &mut Qwen4Provider) -> PrefillFixture {
+    let setup_started = Instant::now();
     let request = GenerationRequest {
         prompt: PROMPT.repeat(FRESH_PREFILL_REPETITIONS),
         max_tokens: 1,
@@ -204,6 +585,39 @@ pub fn prepare_prefill_fixture(provider: &mut Qwen4Provider) -> PrefillFixture {
         top_p: Some(1.0),
         seed: Some(0),
     };
+    let repetitions = (FRESH_PREFILL_REPETITIONS as u64).to_le_bytes();
+    let namespace = fixture_namespace(
+        b"fresh_prefill",
+        &[
+            PROMPT.as_bytes(),
+            b"max_tokens=1;temperature=0;top_k=1;top_p=1;seed=0",
+            b"route=baseline",
+            &repetitions,
+        ],
+    );
+    let manifest_path = fixture_manifest_path("fresh-prefill", &namespace);
+    let load_started = Instant::now();
+    if let Some(manifest) = read_fixture_manifest::<PrefillFixtureManifest>(&manifest_path)
+        && manifest.namespace == namespace
+        && manifest.route == SnapshotRoute::Baseline
+        && manifest.prompt_tokens > 0
+        && token_ids_valid(
+            &[manifest.first_token_id],
+            1,
+            provider.logits_vocab_size(),
+        )
+    {
+        emit_setup_phase("fresh_prefill_load", load_started.elapsed(), "persistent");
+        emit_setup_phase("fresh_prefill_ready", setup_started.elapsed(), "persistent");
+        return PrefillFixture {
+            request,
+            prompt_tokens: manifest.prompt_tokens,
+            first_token_id: manifest.first_token_id,
+        };
+    }
+    emit_setup_phase("fresh_prefill_load", load_started.elapsed(), "cold");
+
+    let build_started = Instant::now();
     let (generation, stats) = provider
         .benchmark_streaming_in_mode(&request, Qwen4GenerationMode::Baseline, |delta| {
             black_box(delta);
@@ -211,6 +625,27 @@ pub fn prepare_prefill_fixture(provider: &mut Qwen4Provider) -> PrefillFixture {
         })
         .expect("warm fresh prefill");
     assert!(stats.is_none());
+    assert!(generation.prompt_tokens > 0);
+    assert!(token_ids_valid(
+        &generation.token_ids,
+        1,
+        provider.logits_vocab_size(),
+    ));
+    emit_setup_phase("fresh_prefill_build", build_started.elapsed(), "cold");
+
+    let persist_started = Instant::now();
+    publish_fixture_manifest(
+        &manifest_path,
+        &PrefillFixtureManifest {
+            namespace,
+            route: SnapshotRoute::Baseline,
+            prompt_tokens: generation.prompt_tokens,
+            first_token_id: generation.token_ids[0],
+        },
+    )
+    .unwrap_or_else(|error| panic!("persist fresh prefill fixture: {error}"));
+    emit_setup_phase("fresh_prefill_persist", persist_started.elapsed(), "cold");
+    emit_setup_phase("fresh_prefill_ready", setup_started.elapsed(), "cold");
     PrefillFixture {
         request,
         prompt_tokens: generation.prompt_tokens,
@@ -220,9 +655,9 @@ pub fn prepare_prefill_fixture(provider: &mut Qwen4Provider) -> PrefillFixture {
 
 fn long_prompt_ids(provider: &Qwen4Provider, min_tokens: usize) -> Vec<i32> {
     let mut prompt = String::new();
-    for index in 0..20_000 {
+    for index in 0..LONG_PROMPT_MAX_RECORDS {
         prompt.push_str(&format!("Record {index}: {PROMPT}\n"));
-        if index % 128 != 127 {
+        if index % LONG_PROMPT_TOKENIZE_INTERVAL != LONG_PROMPT_TOKENIZE_INTERVAL - 1 {
             continue;
         }
         let ids = provider
@@ -241,7 +676,7 @@ fn long_prompt_ids(provider: &Qwen4Provider, min_tokens: usize) -> Vec<i32> {
             )
             .expect("tokenize long benchmark prompt");
         if ids.len() >= min_tokens {
-            let suffix_len = 16.min(min_tokens);
+            let suffix_len = LONG_PROMPT_TAIL_TOKENS.min(min_tokens);
             let mut truncated = ids[..min_tokens - suffix_len].to_vec();
             truncated.extend_from_slice(&ids[ids.len() - suffix_len..]);
             return truncated;
@@ -255,7 +690,96 @@ pub fn prepare_long_conversation_fixture(
     memory_report: &BenchmarkMemoryReport,
     min_prefix_tokens: usize,
 ) -> LongConversationFixture {
-    let prompt_ids = long_prompt_ids(provider, min_prefix_tokens + 1_536);
+    let setup_started = Instant::now();
+    let requested_tokens = (min_prefix_tokens as u64).to_le_bytes();
+    let suffix_tokens = (LONG_CONTEXT_SUFFIX_TOKENS as u64).to_le_bytes();
+    let tail_tokens = (LONG_PROMPT_TAIL_TOKENS as u64).to_le_bytes();
+    let max_records = (LONG_PROMPT_MAX_RECORDS as u64).to_le_bytes();
+    let tokenize_interval = (LONG_PROMPT_TOKENIZE_INTERVAL as u64).to_le_bytes();
+    let decode_tokens = (DECODE_MAX_TOKENS as u64).to_le_bytes();
+    let mtp_block_size = (MTP_BLOCK_SIZE as u64).to_le_bytes();
+    let namespace = fixture_namespace(
+        b"long_conversation",
+        &[
+            PROMPT.as_bytes(),
+            b"prompt_format=Record {index}: {PROMPT}\\n;truncate=head_plus_template_tail",
+            b"role=user;tools=[];reasoning_effort=null;enable_thinking=true",
+            b"temperature=0;top_p=1;seed=0",
+            b"snapshot_route=mtp;benchmark_routes=baseline,mtp",
+            &requested_tokens,
+            &suffix_tokens,
+            &tail_tokens,
+            &max_records,
+            &tokenize_interval,
+            &decode_tokens,
+            &mtp_block_size,
+        ],
+    );
+    let root = cache_root();
+    let prefix_root = root.join("prefix");
+    let manifest_path = fixture_manifest_path("long-conversation", &namespace);
+    let (cache_namespaces, mtp_namespace) = prefix_cache_namespaces(&namespace);
+    let load_started = Instant::now();
+    let mut prefix_cache = AdaptivePrefixCache::new(
+        cache_namespaces,
+        CacheConfig {
+            memory_bytes: PREFIX_CACHE_MEMORY_BYTES,
+            directory: Some(prefix_root.clone()),
+            filesystem_bytes: PREFIX_CACHE_FILESYSTEM_BYTES,
+        },
+    )
+    .unwrap_or_else(|error| panic!("open persistent benchmark prefix cache: {error}"));
+    if let Some(manifest) =
+        read_fixture_manifest::<LongConversationFixtureManifest>(&manifest_path)
+        && long_manifest_valid(
+            &manifest,
+            &namespace,
+            min_prefix_tokens,
+            provider.logits_vocab_size(),
+        )
+        && exact_mtp_snapshot(
+            &mut prefix_cache,
+            &manifest.prompt_ids,
+            manifest.prefix_tokens,
+        )
+        .is_some()
+    {
+        emit_setup_phase("long_conversation_load", load_started.elapsed(), "persistent");
+        {
+            let snapshot = exact_mtp_snapshot(
+                &mut prefix_cache,
+                &manifest.prompt_ids,
+                manifest.prefix_tokens,
+            )
+            .expect("validated persistent MTP snapshot");
+            memory_report.emit_post_restore_fixture(
+                manifest.prompt_ids.len(),
+                manifest.prefix_tokens,
+                snapshot,
+                &manifest.baseline_token_ids,
+                &manifest.mtp_token_ids,
+            );
+        }
+        emit_setup_phase(
+            "long_conversation_ready",
+            setup_started.elapsed(),
+            "persistent",
+        );
+        return LongConversationFixture {
+            prompt_ids: manifest.prompt_ids,
+            prefix_tokens: manifest.prefix_tokens,
+            prefix_cache,
+            baseline_token_ids: manifest.baseline_token_ids,
+            mtp_token_ids: manifest.mtp_token_ids,
+        };
+    }
+    emit_setup_phase("long_conversation_load", load_started.elapsed(), "cold");
+
+    let build_started = Instant::now();
+    let prompt_tokens = min_prefix_tokens
+        .checked_add(LONG_CONTEXT_SUFFIX_TOKENS)
+        .expect("long benchmark prompt length");
+    let prompt_ids = long_prompt_ids(provider, prompt_tokens);
     let prefix_tokens = min_prefix_tokens;
     let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
     let mtp = provider
@@ -305,6 +829,7 @@ pub fn prepare_long_conversation_fixture(
     let tail_end = scalar("auxiliary_tail_end");
     let horizon = scalar("auxiliary_rollback_horizon");
     let ratio = scalar("auxiliary_block_size");
+    drop(scalar);
     let raw_rows = mlxcel_core::array_shape(&auxiliary_keys)[1];
     assert_eq!(tail_end as usize, prefix_tokens);
     assert_eq!(horizon as usize, MTP_BLOCK_SIZE);
@@ -319,6 +844,8 @@ pub fn prepare_long_conversation_fixture(
         .and_then(|tensor| tensor.materialize())
         .expect("64k QSA snapshot must retain logical block summaries");
     assert_eq!(mlxcel_core::array_shape(&block_keys)[2], tail_end / ratio);
+    drop(auxiliary_keys);
+    drop(block_keys);
     let (baseline, stats) = provider
         .benchmark_cached_streaming_in_mode(
             &prompt_ids,
@@ -362,13 +889,66 @@ pub fn prepare_long_conversation_fixture(
         )
         .expect("warm cached 64k MTP");
     assert!(stats.is_some());
-    // The cached MTP benchmark validates repeatability against this warmed MTP
-    // sequence; baseline repeatability is checked separately above.
-    LongConversationFixture {
+    assert!(token_ids_valid(
+        &baseline.token_ids,
+        DECODE_MAX_TOKENS,
+        provider.logits_vocab_size(),
+    ));
+    assert!(token_ids_valid(
+        &mtp_warm.token_ids,
+        DECODE_MAX_TOKENS,
+        provider.logits_vocab_size(),
+    ));
+    emit_setup_phase("long_conversation_build", build_started.elapsed(), "cold");
+
+    let persist_started = Instant::now();
+    prefix_cache.insert(&prompt_ids, vec![snapshot], SnapshotRoute::Mtp);
+    prefix_cache.flush_persistence();
+    assert!(
+        persistent_snapshot_complete(
+            &prefix_root,
+            &mtp_namespace,
+            &prompt_ids,
+            prefix_tokens,
+        ),
+        "persistent MTP snapshot write did not complete"
+    );
+    let manifest = LongConversationFixtureManifest {
+        namespace,
+        route: SnapshotRoute::Mtp,
         prompt_ids,
         prefix_tokens,
-        snapshot,
         baseline_token_ids: baseline.token_ids,
         mtp_token_ids: mtp_warm.token_ids,
+    };
+    publish_fixture_manifest(&manifest_path, &manifest)
+        .unwrap_or_else(|error| panic!("publish long-conversation fixture: {error}"));
+    emit_setup_phase(
+        "long_conversation_persist",
+        persist_started.elapsed(),
+        "cold",
+    );
+    {
+        let snapshot = exact_mtp_snapshot(
+            &mut prefix_cache,
+            &manifest.prompt_ids,
+            manifest.prefix_tokens,
+        )
+        .expect("cache-owned freshly persisted MTP snapshot");
+        memory_report.emit_post_restore_fixture(
+            manifest.prompt_ids.len(),
+            manifest.prefix_tokens,
+            snapshot,
+            &manifest.baseline_token_ids,
+            &manifest.mtp_token_ids,
+        );
+    }
+    emit_setup_phase("long_conversation_ready", setup_started.elapsed(), "cold");
+    LongConversationFixture {
+        prompt_ids: manifest.prompt_ids,
+        prefix_tokens: manifest.prefix_tokens,
+        prefix_cache,
+        baseline_token_ids: manifest.baseline_token_ids,
+        mtp_token_ids: manifest.mtp_token_ids,
     }
 }
