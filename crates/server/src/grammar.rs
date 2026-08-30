@@ -44,6 +44,7 @@ const MAX_TOOL_PARAMETERS: usize = 256;
 pub struct GrammarFactory {
     parser: ParserFactory,
     token_bytes: Arc<Vec<Vec<u8>>>,
+    eos_tokens: Arc<[TokenId]>,
 }
 
 impl GrammarFactory {
@@ -94,6 +95,7 @@ impl GrammarFactory {
         )
         .map_err(anyhow::Error::msg)
         .context("failed to initialize canonical structured-output tokenizer")?;
+        let eos_tokens: Arc<[TokenId]> = eos_tokens.into();
         let token_bytes = Arc::new(token_bytes);
         let env: TokEnv = Arc::new(LocalTokenizerEnv {
             trie: TokTrie::from(&info, token_bytes.as_ref()).with_eos_tokens(&eos_tokens),
@@ -104,6 +106,7 @@ impl GrammarFactory {
         Ok(Self {
             parser,
             token_bytes,
+            eos_tokens,
         })
     }
 
@@ -115,10 +118,12 @@ impl GrammarFactory {
                 .map(|token| env.tok_trie().token(token as u32).to_vec())
                 .collect(),
         );
+        let eos_tokens = Arc::from(env.tok_trie().eos_tokens());
         let parser = constraint_parser_factory(&env)?;
         Ok(Self {
             parser,
             token_bytes,
+            eos_tokens,
         })
     }
 
@@ -146,6 +151,7 @@ impl GrammarFactory {
                 return Ok(Some(GuidanceConstraint::tool_call(
                     Constraint::new(parser),
                     Arc::clone(&self.token_bytes),
+                    Arc::clone(&self.eos_tokens),
                     !parallel_tool_calls,
                 )));
             }
@@ -164,13 +170,17 @@ impl GrammarFactory {
             .parser
             .create_parser(grammar)
             .context("failed to compile structured-output grammar")?;
-        Ok(Some(GuidanceConstraint::grammar(Constraint::new(parser))))
+        Ok(Some(GuidanceConstraint::grammar(
+            Constraint::new(parser),
+            Arc::clone(&self.eos_tokens),
+        )))
     }
 }
 
 pub struct GuidanceConstraint {
     inner: GuidanceState,
     transaction: Option<GuidanceState>,
+    eos_tokens: Arc<[TokenId]>,
 }
 
 enum GuidanceState {
@@ -208,16 +218,18 @@ impl ToolCallState {
 }
 
 impl GuidanceConstraint {
-    fn grammar(inner: Constraint) -> Self {
+    fn grammar(inner: Constraint, eos_tokens: Arc<[TokenId]>) -> Self {
         Self {
             inner: GuidanceState::Grammar(inner),
             transaction: None,
+            eos_tokens,
         }
     }
 
     fn tool_call(
         inner: Constraint,
         token_bytes: Arc<Vec<Vec<u8>>>,
+        eos_tokens: Arc<[TokenId]>,
         accept_on_accepting: bool,
     ) -> Self {
         Self {
@@ -229,6 +241,7 @@ impl GuidanceConstraint {
                 accept_on_accepting,
             }),
             transaction: None,
+            eos_tokens,
         }
     }
 
@@ -467,15 +480,22 @@ fn guidance_commit(
 
 fn guidance_mask(
     active: &mut Constraint,
+    eos_tokens: &[TokenId],
     accept_on_accepting: bool,
 ) -> std::result::Result<ConstraintMask, String> {
+    let parser_accepting = active.parser.is_accepting();
     let step = active.compute_mask().map_err(|error| error.to_string())?;
     if step.is_stop() {
         return Ok(ConstraintMask::Accept);
     }
     if let Some(mask) = step.sample_mask.as_ref() {
         let mut allowed = Vec::new();
-        mask.iter_set_entries(|token| allowed.push(token as i32));
+        mask.iter_set_entries(|token| {
+            let token = token as TokenId;
+            if parser_accepting || eos_tokens.binary_search(&token).is_err() {
+                allowed.push(token as i32);
+            }
+        });
         if allowed.is_empty() {
             return Err("structured-output grammar produced an empty token mask".to_string());
         }
@@ -560,14 +580,16 @@ impl TokenConstraint for GuidanceConstraint {
         _logits: &mlxcel_core::MlxArray,
         _token_history: &[i32],
     ) -> std::result::Result<ConstraintMask, String> {
-        match self.active() {
-            GuidanceState::Grammar(active) => guidance_mask(active, true),
+        let eos_tokens = self.eos_tokens.as_ref();
+        let active = self.transaction.as_mut().unwrap_or(&mut self.inner);
+        match active {
+            GuidanceState::Grammar(active) => guidance_mask(active, eos_tokens, true),
             GuidanceState::ToolCall(active) if !active.active => {
                 Ok(ConstraintMask::PassThrough)
             }
             GuidanceState::ToolCall(active) => {
                 let accept_on_accepting = active.accept_on_accepting;
-                guidance_mask(&mut active.inner, accept_on_accepting)
+                guidance_mask(&mut active.inner, eos_tokens, accept_on_accepting)
             }
         }
     }
@@ -832,23 +854,30 @@ mod tests {
             true
         }
     }
+    const PRIMARY_EOS: TokenId = 248_044;
+    const SECONDARY_EOS: TokenId = 248_046;
+    const TOOL_CALL_TOKEN: TokenId = 248_058;
+    const QWEN_VOCAB_SIZE: usize = 248_064;
 
-    fn single_byte_factory_with_eos(eos_tokens: &[TokenId]) -> Result<GrammarFactory> {
+    fn qwen_token_factory() -> Result<GrammarFactory> {
         let base = toktrie::ApproximateTokEnv::single_byte();
-        let env: TokEnv = Arc::new(CanonicalTestTokenizerEnv {
-            trie: base.tok_trie().with_eos_tokens(eos_tokens),
-        });
-        let token_bytes = Arc::new(
-            (0..env.tok_trie().vocab_size())
-                .map(|token| env.tok_trie().token(token as u32).to_vec())
-                .collect(),
-        );
+        let mut token_bytes = (0..base.tok_trie().vocab_size())
+            .map(|token| base.tok_trie().token(token as TokenId).to_vec())
+            .collect::<Vec<_>>();
+        token_bytes.resize_with(QWEN_VOCAB_SIZE, Vec::new);
+        token_bytes[TOOL_CALL_TOKEN as usize] = TOOL_CALL_OPEN.to_vec();
+        let info = TokRxInfo::new(QWEN_VOCAB_SIZE as u32, PRIMARY_EOS);
+        let trie =
+            TokTrie::from(&info, &token_bytes).with_eos_tokens(&[PRIMARY_EOS, SECONDARY_EOS]);
+        let env: TokEnv = Arc::new(CanonicalTestTokenizerEnv { trie });
         let parser = constraint_parser_factory(&env)?;
         Ok(GrammarFactory {
             parser,
-            token_bytes,
+            token_bytes: Arc::new(token_bytes),
+            eos_tokens: Arc::from([PRIMARY_EOS, SECONDARY_EOS]),
         })
     }
+
 
     fn output_bytes(output: &[i32]) -> Vec<u8> {
         output
@@ -1198,38 +1227,124 @@ mod tests {
     }
 
     #[test]
-    fn parallel_tool_constraint_accepts_secondary_eos_token() {
-        const PRIMARY_EOS: TokenId = 260;
-        const SECONDARY_EOS: TokenId = 261;
-
-        let factory = single_byte_factory_with_eos(&[PRIMARY_EOS, SECONDARY_EOS])
-            .expect("multi-EOS single-byte grammar");
-        let tools = [tool("empty", json!({"type":"object","properties":{}}))];
+    fn qwen_eos_tokens_are_masked_until_parallel_tool_call_is_complete() {
+        let factory = qwen_token_factory().expect("Qwen-token grammar");
+        let tools = [tool(
+            "read",
+            json!({
+                "type":"object",
+                "properties":{"path":{"type":"string"}},
+                "required":["path"],
+                "additionalProperties":false
+            }),
+        )];
         let mut constraint = factory
             .compile(&OutputFormat::Text, &tools, true)
             .expect("compile tool grammar")
             .expect("constraint");
         let logits = logits();
-        let target = b"<tool_call><function=empty></function></tool_call>";
+        constraint
+            .commit_token(TOOL_CALL_TOKEN as i32)
+            .expect("activate real tool-call token");
+
         let mut output = Vec::new();
+        let string_prefix = b"<function=read><parameter=path>\"";
         assert!(!drive_to(
             &mut constraint,
             &logits,
             &mut output,
-            target
+            string_prefix
         ));
-
-        let ConstraintMask::Allow(allowed) = constraint
+        let ConstraintMask::Allow(string_mask) = constraint
             .compute_mask(&logits, &output)
-            .expect("accepting grammar mask")
+            .expect("path string mask")
         else {
-            panic!("accepting parallel grammar must allow EOS");
+            panic!("path string must produce a sample mask");
         };
-        assert!(allowed.contains(&(PRIMARY_EOS as i32)));
-        assert!(allowed.contains(&(SECONDARY_EOS as i32)));
+        assert!(!string_mask.contains(&(PRIMARY_EOS as i32)));
+        assert!(!string_mask.contains(&(SECONDARY_EOS as i32)));
+
+        let body_prefix = b"<function=read><parameter=path>\"Cargo";
+        assert!(!drive_to(
+            &mut constraint,
+            &logits,
+            &mut output,
+            body_prefix
+        ));
+        let ConstraintMask::Allow(body_mask) = constraint
+            .compute_mask(&logits, &output)
+            .expect("path body mask")
+        else {
+            panic!("path body must produce a sample mask");
+        };
+        assert!(!body_mask.contains(&(PRIMARY_EOS as i32)));
+        assert!(!body_mask.contains(&(SECONDARY_EOS as i32)));
+        constraint.begin_transaction().expect("begin transaction");
+        assert!(constraint.commit_token(PRIMARY_EOS as i32).is_err());
+        constraint.rollback_transaction();
+        constraint.begin_transaction().expect("begin transaction");
+        assert!(constraint.commit_token(SECONDARY_EOS as i32).is_err());
+        constraint.rollback_transaction();
+
+        let checkpoint = output.clone();
+        let complete =
+            b"<function=read><parameter=path>\"Cargo.toml\"</parameter></function></tool_call>";
+        constraint.begin_transaction().expect("begin transaction");
+        assert!(!drive_to(
+            &mut constraint,
+            &logits,
+            &mut output,
+            complete
+        ));
+        let ConstraintMask::Allow(accepting_mask) = constraint
+            .compute_mask(&logits, &output)
+            .expect("accepting parallel mask")
+        else {
+            panic!("accepting parallel grammar must produce a sample mask");
+        };
+        assert!(accepting_mask.contains(&(PRIMARY_EOS as i32)));
+        assert!(accepting_mask.contains(&(SECONDARY_EOS as i32)));
+        assert!(accepting_mask.contains(&(TOOL_CALL_TOKEN as i32)));
         constraint
             .commit_token(SECONDARY_EOS as i32)
             .expect("commit secondary EOS");
+        assert!(matches!(
+            constraint.compute_mask(&logits, &output),
+            Ok(ConstraintMask::Accept)
+        ));
+
+        constraint.rollback_transaction();
+        output = checkpoint.clone();
+        let ConstraintMask::Allow(rolled_back_mask) = constraint
+            .compute_mask(&logits, &output)
+            .expect("rolled-back path body mask")
+        else {
+            panic!("rolled-back path body must produce a sample mask");
+        };
+        assert!(!rolled_back_mask.contains(&(PRIMARY_EOS as i32)));
+        assert!(!rolled_back_mask.contains(&(SECONDARY_EOS as i32)));
+
+        constraint.begin_transaction().expect("begin transaction");
+        assert!(!drive_to(
+            &mut constraint,
+            &logits,
+            &mut output,
+            complete
+        ));
+        let ConstraintMask::Allow(primary_accepting_mask) = constraint
+            .compute_mask(&logits, &output)
+            .expect("accepting parallel mask")
+        else {
+            panic!("accepting parallel grammar must produce a sample mask");
+        };
+        assert!(primary_accepting_mask.contains(&(PRIMARY_EOS as i32)));
+        assert!(primary_accepting_mask.contains(&(SECONDARY_EOS as i32)));
+        constraint
+            .commit_token(PRIMARY_EOS as i32)
+            .expect("commit primary EOS");
+        constraint
+            .commit_transaction()
+            .expect("commit primary EOS transaction");
         assert!(matches!(
             constraint.compute_mask(&logits, &output),
             Ok(ConstraintMask::Accept)
