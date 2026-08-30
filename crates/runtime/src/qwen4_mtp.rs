@@ -1676,7 +1676,10 @@ pub(crate) fn emit_walk_tokens<F: FnMut(i32) -> bool>(
 
 #[derive(Clone, Copy)]
 enum MtpPrefill<'a> {
-    Text { prompt: &'a MlxArray },
+    Text {
+        prompt: &'a MlxArray,
+        host_tokens: &'a [i32],
+    },
 }
 
 struct ActiveMtpState {
@@ -1686,7 +1689,13 @@ struct ActiveMtpState {
 
 fn prompt_for_prefill(prefill: MtpPrefill<'_>) -> &MlxArray {
     match prefill {
-        MtpPrefill::Text { prompt } => prompt,
+        MtpPrefill::Text { prompt, .. } => prompt,
+    }
+}
+
+fn host_tokens_for_prefill(prefill: MtpPrefill<'_>) -> &[i32] {
+    match prefill {
+        MtpPrefill::Text { host_tokens, .. } => host_tokens,
     }
 }
 
@@ -1732,6 +1741,7 @@ fn prefill_for_input(
     let (embeddings, positions, rope_delta) = (None, None, None);
     let prefill = model.forward_mtp_prefill_chunks(
         prompt,
+        host_tokens_for_prefill(prefill_input),
         embeddings,
         positions,
         rope_delta,
@@ -1815,8 +1825,15 @@ fn prefill_text_with_reuse(
             prompt_tokens,
             &[1, i32::try_from(prompt_tokens.len()).unwrap_or(i32::MAX)],
         );
-        return prefill_for_input(model, drafter, MtpPrefill::Text { prompt: &prompt })
-            .map(|prefill| (prefill, 0));
+        return prefill_for_input(
+            model,
+            drafter,
+            MtpPrefill::Text {
+                prompt: &prompt,
+                host_tokens: prompt_tokens,
+            },
+        )
+        .map(|prefill| (prefill, 0));
     };
     if reuse.cached_tokens == 0 || reuse.cached_tokens > prompt_tokens.len() {
         return Err("MTP cached token count is outside the prompt".to_string());
@@ -1889,7 +1906,7 @@ fn prefill_text_with_reuse(
     );
     let mut previous_hidden = mlxcel_core::copy(&reuse.snapshot.last_hidden);
     let mut processed_tokens = reuse.cached_tokens;
-    let prefill = model.forward_mtp_text_suffix_chunks(&suffix_ids, |ids, hidden| {
+    let prefill = model.forward_mtp_text_suffix_chunks(&suffix_ids, suffix, |ids, hidden| {
         let shape = mlxcel_core::array_shape(hidden);
         let target_hidden = if shape[1] == 1 {
             mlxcel_core::copy(&previous_hidden)
@@ -2276,7 +2293,10 @@ impl Qwen4MtpGenerator {
         let result = self.generate_streaming_for_prefill(
             model,
             prompt_tokens,
-            MtpPrefill::Text { prompt: &prompt },
+            MtpPrefill::Text {
+                prompt: &prompt,
+                host_tokens: prompt_tokens,
+            },
             max_tokens,
             sampling,
             block_size,
