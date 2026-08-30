@@ -1,0 +1,8 @@
+[project]
+name = "eval"
+version = "0.1.0"
+description = "EvalScope benchmarks for the local qw-server"
+requires-python = ">=3.11"
+dependencies = [
+    "evalscope[sandbox]>=1.11.0",
+]
