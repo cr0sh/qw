@@ -829,7 +829,6 @@ pub fn prepare_long_conversation_fixture(
     let tail_end = scalar("auxiliary_tail_end");
     let horizon = scalar("auxiliary_rollback_horizon");
     let ratio = scalar("auxiliary_block_size");
-    drop(scalar);
     let raw_rows = mlxcel_core::array_shape(&auxiliary_keys)[1];
     assert_eq!(tail_end as usize, prefix_tokens);
     assert_eq!(horizon as usize, MTP_BLOCK_SIZE);
