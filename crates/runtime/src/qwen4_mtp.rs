@@ -3421,10 +3421,10 @@ mod tests {
     }
 
     #[test]
-    fn rejection_reconciles_target_draft_and_mrope_at_zero_partial_full() {
+    fn rejection_reconciles_target_draft_and_mrope_at_every_acceptance_count() {
         let prefix = 10;
         let block_size = 5;
-        for accepted in [0, 2, 4] {
+        for accepted in 0..block_size {
             let plan = rollback_plan(prefix + block_size as i32, accepted, block_size);
             assert_eq!(plan.final_offset, prefix + accepted as i32 + 1);
             let mut attention = KVCache::new();
