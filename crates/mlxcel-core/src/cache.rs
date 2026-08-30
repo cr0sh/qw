@@ -3451,7 +3451,8 @@ impl KVCache {
         (k_slice, full_v)
     }
 
-    /// Get the total memory size of the cached keys and values in bytes.
+    /// Get the total memory size of every tensor owned by the cache in bytes,
+    /// including model-specific raw and block auxiliary keys.
     ///
     /// In INT8 mode this includes both the INT8 buffers and the scale tensors.
     /// In Turbo4Asym mode this counts the FP16 keys plus the packed-V and
@@ -3484,6 +3485,10 @@ impl KVCache {
             .auxiliary_keys
             .as_ref()
             .map_or(0, |keys| ffi::array_nbytes(keys));
+        let auxiliary_block_bytes = self
+            .auxiliary_block_keys
+            .as_ref()
+            .map_or(0, |keys| ffi::array_nbytes(keys));
         // retired the earlier `cold_v_dequant_cache` memo: the
         // fused kernel reads packed cold V directly so there is no longer a
         // FP16 cold-V working set to count here.
@@ -3497,6 +3502,7 @@ impl KVCache {
             + kp_bytes
             + kn_bytes
             + auxiliary_bytes
+            + auxiliary_block_bytes
     }
 
     /// Force MLX to materialise the KV cache state without touching the logit
@@ -4356,9 +4362,10 @@ impl KVCache {
 
     /// Estimated storage bytes per reserved token slot in the backing buffer.
     ///
-    /// This uses the allocated buffer capacity rather than the visible offset
-    /// so callers can mirror dense-cache physical storage into paged block
-    /// accounting even when the buffer is step-allocated.
+    /// This uses the allocated K/V buffer capacity rather than the visible
+    /// offset. Auxiliary tensors, including block summaries, are included in
+    /// the total and amortized over that token capacity; their own non-token
+    /// axes are not interpreted as reserved tokens.
     pub fn bytes_per_reserved_token(&self) -> usize {
         let capacity = self.buffer_seq_len();
         if capacity <= 0 {
@@ -7590,6 +7597,46 @@ mod tests {
 
         assert_eq!(cache.trim(1), 1);
         assert!(cache.auxiliary_block_keys.is_none());
+    }
+
+    fn qsa_accounting_cache(raw_auxiliary: bool, block_auxiliary: bool) -> KVCache {
+        let mut cache = KVCache::new();
+        cache.keys = Some(ffi::from_slice_f32(&[0.0; 8], &[1, 1, 4, 2]));
+        cache.values = Some(ffi::from_slice_f32(&[0.0; 8], &[1, 1, 4, 2]));
+        cache.auxiliary_keys =
+            raw_auxiliary.then(|| ffi::from_slice_f32(&[0.0; 12], &[1, 4, 3]));
+        cache.auxiliary_block_keys =
+            block_auxiliary.then(|| ffi::from_slice_f32(&[0.0; 12], &[1, 2, 2, 3]));
+        cache.offset = 4;
+        cache
+    }
+
+    #[test]
+    fn kv_cache_nbytes_counts_raw_and_block_auxiliary_storage_exactly() {
+        // K and V are 32 bytes each. The raw and block auxiliaries are 48
+        // bytes each despite using different sequence/block layouts.
+        for (raw_auxiliary, block_auxiliary, expected) in [
+            (false, false, 64),
+            (true, false, 112),
+            (false, true, 112),
+            (true, true, 160),
+        ] {
+            let cache = qsa_accounting_cache(raw_auxiliary, block_auxiliary);
+            assert_eq!(
+                cache.nbytes(),
+                expected,
+                "raw_auxiliary={raw_auxiliary}, block_auxiliary={block_auxiliary}",
+            );
+        }
+    }
+
+    #[test]
+    fn kv_cache_bytes_per_reserved_token_amortizes_block_auxiliary_storage() {
+        let cache = qsa_accounting_cache(true, true);
+
+        assert_eq!(cache.buffer_seq_len(), 4);
+        assert_eq!(cache.nbytes(), 160);
+        assert_eq!(cache.bytes_per_reserved_token(), 40);
     }
 
     /// #678 repro at the cache layer: every suspect prefill shape (single-pass
