@@ -63,6 +63,145 @@ pub struct MemorySnapshot {
     pub limit_bytes: u64,
 }
 
+/// Current-process memory counters reported by the operating system.
+///
+/// Darwin supplies these values through `proc_pid_rusage(RUSAGE_INFO_V4)`.
+/// Other platforms do not expose an equivalent stable API through this crate,
+/// so [`process_snapshot`] returns `None` there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessMemorySnapshot {
+    /// Current resident set size.
+    pub resident_bytes: u64,
+    /// Current wired (non-pageable) resident bytes.
+    pub wired_bytes: u64,
+    /// Current physical footprint as accounted by Darwin's jetsam ledger.
+    pub physical_footprint_bytes: u64,
+    /// Lifetime high-water mark of the physical footprint.
+    pub lifetime_peak_physical_footprint_bytes: u64,
+}
+
+#[cfg(target_os = "macos")]
+mod darwin {
+    use super::ProcessMemorySnapshot;
+    use std::ffi::c_int;
+    use std::mem::MaybeUninit;
+
+    const RUSAGE_INFO_V4: c_int = 4;
+
+    // Layout from <sys/resource.h>. RUSAGE_INFO_V4 has been available since
+    // macOS 10.9; keeping the complete struct prevents libproc from writing
+    // past the destination while exposing only the four counters we need.
+    #[repr(C)]
+    struct RusageInfoV4 {
+        ri_uuid: [u8; 16],
+        ri_user_time: u64,
+        ri_system_time: u64,
+        ri_pkg_idle_wkups: u64,
+        ri_interrupt_wkups: u64,
+        ri_pageins: u64,
+        ri_wired_size: u64,
+        ri_resident_size: u64,
+        ri_phys_footprint: u64,
+        ri_proc_start_abstime: u64,
+        ri_proc_exit_abstime: u64,
+        ri_child_user_time: u64,
+        ri_child_system_time: u64,
+        ri_child_pkg_idle_wkups: u64,
+        ri_child_interrupt_wkups: u64,
+        ri_child_pageins: u64,
+        ri_child_elapsed_abstime: u64,
+        ri_diskio_bytesread: u64,
+        ri_diskio_byteswritten: u64,
+        ri_cpu_time_qos_default: u64,
+        ri_cpu_time_qos_maintenance: u64,
+        ri_cpu_time_qos_background: u64,
+        ri_cpu_time_qos_utility: u64,
+        ri_cpu_time_qos_legacy: u64,
+        ri_cpu_time_qos_user_initiated: u64,
+        ri_cpu_time_qos_user_interactive: u64,
+        ri_billed_system_time: u64,
+        ri_serviced_system_time: u64,
+        ri_logical_writes: u64,
+        ri_lifetime_max_phys_footprint: u64,
+        ri_instructions: u64,
+        ri_cycles: u64,
+        ri_billed_energy: u64,
+        ri_serviced_energy: u64,
+        ri_interval_max_phys_footprint: u64,
+        ri_runnable_time: u64,
+    }
+
+    #[link(name = "proc")]
+    unsafe extern "C" {
+        fn proc_pid_rusage(
+            pid: c_int,
+            flavor: c_int,
+            buffer: *mut RusageInfoV4,
+        ) -> c_int;
+    }
+
+    pub(super) fn process_snapshot() -> Option<ProcessMemorySnapshot> {
+        let mut usage = MaybeUninit::<RusageInfoV4>::zeroed();
+        // SAFETY: `usage` points to a writable, correctly sized repr(C)
+        // RUSAGE_INFO_V4 buffer and the PID is the current process.
+        let result = unsafe {
+            proc_pid_rusage(
+                std::process::id() as c_int,
+                RUSAGE_INFO_V4,
+                usage.as_mut_ptr(),
+            )
+        };
+        if result != 0 {
+            return None;
+        }
+        // SAFETY: a successful proc_pid_rusage call initialized the complete
+        // RUSAGE_INFO_V4 buffer.
+        let usage = unsafe { usage.assume_init() };
+        Some(ProcessMemorySnapshot {
+            resident_bytes: usage.ri_resident_size,
+            wired_bytes: usage.ri_wired_size,
+            physical_footprint_bytes: usage.ri_phys_footprint,
+            lifetime_peak_physical_footprint_bytes: usage.ri_lifetime_max_phys_footprint,
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::RusageInfoV4;
+        use std::mem::{align_of, offset_of, size_of};
+
+        #[test]
+        fn rusage_info_v4_matches_darwin_layout() {
+            assert_eq!(align_of::<RusageInfoV4>(), 8);
+            assert_eq!(size_of::<RusageInfoV4>(), 296);
+            assert_eq!(offset_of!(RusageInfoV4, ri_wired_size), 56);
+            assert_eq!(offset_of!(RusageInfoV4, ri_resident_size), 64);
+            assert_eq!(offset_of!(RusageInfoV4, ri_phys_footprint), 72);
+            assert_eq!(
+                offset_of!(RusageInfoV4, ri_lifetime_max_phys_footprint),
+                240
+            );
+        }
+    }
+}
+
+/// Capture current-process memory counters from the host operating system.
+///
+/// Returns `None` when the platform has no supported authoritative API or if
+/// the Darwin query fails.
+#[cfg(target_os = "macos")]
+#[inline]
+pub fn process_snapshot() -> Option<ProcessMemorySnapshot> {
+    darwin::process_snapshot()
+}
+
+/// Capture current-process memory counters from the host operating system.
+#[cfg(not(target_os = "macos"))]
+#[inline]
+pub fn process_snapshot() -> Option<ProcessMemorySnapshot> {
+    None
+}
+
 impl MemorySnapshot {
     /// Bytes that count against the soft `limit_bytes` (active + cache).
     ///
@@ -485,5 +624,23 @@ mod tests {
         for (p, n) in [(0_usize, 256_usize), (250, 260), (0, 100_000)] {
             assert!(!should_clear_cache_crossing(p, n, 0));
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn process_snapshot_reads_current_process() {
+        let snapshot = process_snapshot().expect("proc_pid_rusage for current process");
+        assert!(snapshot.resident_bytes > 0);
+        assert!(snapshot.physical_footprint_bytes > 0);
+        assert!(
+            snapshot.lifetime_peak_physical_footprint_bytes
+                >= snapshot.physical_footprint_bytes
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn process_snapshot_is_unavailable_off_macos() {
+        assert_eq!(process_snapshot(), None);
     }
 }

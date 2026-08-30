@@ -15,6 +15,63 @@ pub fn long_context_tokens() -> usize {
         .unwrap_or(LONG_CONTEXT_64K_MIN_TOKENS)
 }
 
+pub struct BenchmarkMemoryReport {
+    enabled: bool,
+}
+
+impl BenchmarkMemoryReport {
+    /// Resolve the opt-in once and reset the MLX peak immediately after model
+    /// load, before fixture construction contributes to the measured peak.
+    pub fn after_model_load() -> Self {
+        let enabled = std::env::var("QW_BENCH_MEMORY").as_deref() == Ok("1");
+        if enabled {
+            mlxcel_core::memory::reset_peak_memory();
+        }
+        Self { enabled }
+    }
+
+    /// Emit one newline-delimited JSON record after fixture construction.
+    ///
+    /// This method is called only from benchmark setup, never from a timed
+    /// Criterion closure.
+    pub fn emit_post_fixture(
+        &self,
+        context_tokens: usize,
+        prefix_tokens: usize,
+        snapshot: Option<&PromptSnapshot>,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let mlx = mlxcel_core::memory::snapshot();
+        let process = mlxcel_core::memory::process_snapshot().map(|process| {
+            serde_json::json!({
+                "resident_bytes": process.resident_bytes,
+                "wired_bytes": process.wired_bytes,
+                "physical_footprint_bytes": process.physical_footprint_bytes,
+                "lifetime_peak_physical_footprint_bytes":
+                    process.lifetime_peak_physical_footprint_bytes,
+            })
+        });
+        let record = serde_json::json!({
+            "schema": "qw_bench_memory.v1",
+            "phase": "post_fixture",
+            "pid": std::process::id(),
+            "context_tokens": context_tokens,
+            "prefix_tokens": prefix_tokens,
+            "prompt_snapshot_logical_bytes": snapshot.map(PromptSnapshot::nbytes),
+            "mlx": {
+                "active_bytes": mlx.active_bytes,
+                "peak_bytes": mlx.peak_bytes,
+                "cache_bytes": mlx.cache_bytes,
+                "limit_bytes": mlx.limit_bytes,
+            },
+            "process": process,
+        });
+        eprintln!("QW_BENCH_MEMORY={record}");
+    }
+}
+
 pub const FRESH_PREFILL_REPETITIONS: usize = 24;
 
 const PROMPT: &str = concat!(
