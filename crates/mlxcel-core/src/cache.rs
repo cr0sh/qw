@@ -373,6 +373,11 @@ pub struct KVCache {
     /// so tail rollback can discard summaries that intersect the rewound
     /// region before replacement tokens are appended.
     auxiliary_block_size: Option<i32>,
+    /// Number of initialized entries in `auxiliary_block_keys`.
+    ///
+    /// The backing tensor may be larger when prefill capacity was reserved;
+    /// sparse attention and snapshots must use only this logical prefix.
+    auxiliary_block_len: i32,
     /// Monotonically increasing absolute write position. Used as the RoPE
     /// position for new K/Q tokens and as the upper bound of the live window.
     /// Once a token has been written at position `p`, this value never
@@ -398,6 +403,11 @@ pub struct KVCache {
     /// correct relative position `offset - (live_start + i)`.
     pub(crate) live_start: i32,
     step: i32,
+    /// Step-aligned token capacity requested before the first prefill write.
+    ///
+    /// This is an allocation hint only. `offset`/`live_start` remain the
+    /// authoritative logical bounds, and writes beyond the hint grow normally.
+    reserved_seq_len: i32,
     /// Quantization mode for stored keys/values.
     pub mode: KVCacheMode,
     // INT8-mode scale factors: [B, H, L, 1] FP16, None when mode == Fp16
@@ -498,10 +508,13 @@ pub struct Int8SnapshotTensors<'a> {
     pub key_scales: &'a MlxArray,
     pub val_scales: &'a MlxArray,
 }
-/// Borrowed raw E4M3 tensors required to preserve an FP8 cache.
-pub struct Fp8SnapshotTensors<'a> {
-    pub keys: &'a MlxArray,
-    pub values: &'a MlxArray,
+/// Owned raw E4M3 tensor views required to preserve an FP8 cache.
+///
+/// The views are sliced to the logical live token count, excluding any
+/// step-aligned reservation slack in the backing allocations.
+pub struct Fp8SnapshotTensors {
+    pub keys: UniquePtr<MlxArray>,
+    pub values: UniquePtr<MlxArray>,
 }
 /// Filled raw E4M3 cache views returned after one FP8 update.
 ///
@@ -556,9 +569,11 @@ impl KVCache {
             auxiliary_keys: None,
             auxiliary_block_keys: None,
             auxiliary_block_size: None,
+            auxiliary_block_len: 0,
             offset: 0,
             live_start: 0,
             step: 256,
+            reserved_seq_len: 0,
             mode: KVCacheMode::Fp16,
             key_scales: None,
             val_scales: None,
@@ -608,9 +623,11 @@ impl KVCache {
             auxiliary_keys: None,
             auxiliary_block_keys: None,
             auxiliary_block_size: None,
+            auxiliary_block_len: 0,
             offset: 0,
             live_start: 0,
             step: 256,
+            reserved_seq_len: 0,
             mode,
             key_scales: None,
             val_scales: None,
@@ -631,12 +648,29 @@ impl KVCache {
         }
     }
 
+    /// Reserve step-aligned dense K/V and QSA-summary capacity for a known
+    /// final prefill length without changing any logical cache length.
+    ///
+    /// Tensor geometry is not known until the first write, so this records a
+    /// narrow hint that the first FP16/FP8 allocation consumes. Restored exact
+    /// snapshots retain their logical arrays and use the same hint on growth.
+    pub fn reserve_prefill_capacity(&mut self, total_tokens: i32) {
+        if total_tokens > 0 {
+            self.reserved_seq_len = self.reserved_seq_len.max(total_tokens);
+        }
+    }
+
+    /// Token capacity of the current dense K/V backing allocation.
+    pub fn capacity(&self) -> i32 {
+        self.buffer_seq_len()
+    }
+
     /// Register the token width used by sparse-attention block summaries.
     ///
     /// Changing widths invalidates summaries built under the previous layout.
     pub fn set_auxiliary_block_size(&mut self, block_size: i32) {
         if block_size <= 0 {
-            self.auxiliary_block_keys = None;
+            self.clear_auxiliary_blocks();
             self.auxiliary_block_size = None;
             return;
         }
@@ -644,32 +678,127 @@ impl KVCache {
             .auxiliary_block_size
             .is_some_and(|previous| previous != block_size)
         {
-            self.auxiliary_block_keys = None;
+            self.clear_auxiliary_blocks();
+        } else if self.auxiliary_block_size.is_none()
+            && self.auxiliary_block_len == 0
+            && let Some(keys) = self.auxiliary_block_keys.as_ref()
+        {
+            self.auxiliary_block_len = ffi::array_shape(keys)[2];
         }
         self.auxiliary_block_size = Some(block_size);
     }
 
+    /// Number of initialized QSA block summaries.
+    pub fn auxiliary_block_len(&self) -> i32 {
+        self.auxiliary_block_len
+    }
+
+    /// Capacity of the QSA block-summary backing allocation.
+    pub fn auxiliary_block_capacity(&self) -> i32 {
+        self.auxiliary_block_keys
+            .as_ref()
+            .map_or(0, |keys| ffi::array_shape(keys)[2])
+    }
+
+    /// Return a logical QSA-summary view that excludes reservation slack.
+    pub fn auxiliary_block_keys_view(&self) -> Option<UniquePtr<MlxArray>> {
+        let keys = self.auxiliary_block_keys.as_ref()?;
+        if self.auxiliary_block_len <= 0 {
+            return None;
+        }
+        let shape = ffi::array_shape(keys);
+        Some(ffi::slice(
+            keys,
+            &[0, 0, 0, 0],
+            &[shape[0], shape[1], self.auxiliary_block_len, shape[3]],
+        ))
+    }
+
+    /// Install exact logical QSA summaries restored from a snapshot.
+    pub fn restore_auxiliary_block_keys(
+        &mut self,
+        block_size: i32,
+        keys: Option<UniquePtr<MlxArray>>,
+    ) {
+        self.clear_auxiliary_blocks();
+        self.auxiliary_block_size = (block_size > 0).then_some(block_size);
+        if let Some(keys) = keys {
+            self.auxiliary_block_len = ffi::array_shape(&keys)[2];
+            self.auxiliary_block_keys = Some(keys);
+        }
+    }
+
+    /// Append normalized QSA block summaries into reserved backing storage.
+    pub fn append_auxiliary_blocks(&mut self, blocks: &MlxArray) {
+        let shape = ffi::array_shape(blocks);
+        let new_blocks = shape[2];
+        if new_blocks <= 0 {
+            return;
+        }
+        let previous = self.auxiliary_block_len;
+        let needed = previous + new_blocks;
+        let reserved = self
+            .auxiliary_block_size
+            .map_or(0, |block_size| self.reserved_seq_len / block_size);
+        let current_capacity = self.auxiliary_block_capacity();
+        if self.auxiliary_block_keys.is_none() || needed > current_capacity {
+            let capacity = needed.max(reserved);
+            let backing = ffi::zeros(
+                &[shape[0], shape[1], capacity, shape[3]],
+                ffi::array_dtype(blocks),
+            );
+            self.auxiliary_block_keys = Some(if let Some(previous_keys) =
+                self.auxiliary_block_keys.as_ref()
+            {
+                let old_shape = ffi::array_shape(previous_keys);
+                let logical = ffi::slice(
+                    previous_keys,
+                    &[0, 0, 0, 0],
+                    &[old_shape[0], old_shape[1], previous, old_shape[3]],
+                );
+                ffi::slice_update(
+                    &backing,
+                    &logical,
+                    &[0, 0, 0, 0],
+                    &[shape[0], shape[1], previous, shape[3]],
+                )
+            } else {
+                backing
+            });
+        }
+        let backing = self
+            .auxiliary_block_keys
+            .as_ref()
+            .expect("QSA backing allocated");
+        let backing_shape = ffi::array_shape(backing);
+        self.auxiliary_block_keys = Some(ffi::slice_update(
+            backing,
+            blocks,
+            &[0, 0, previous, 0],
+            &[backing_shape[0], backing_shape[1], needed, backing_shape[3]],
+        ));
+        self.auxiliary_block_len = needed;
+    }
+
+    /// Discard all QSA summary storage and reset its logical block count.
+    pub fn clear_auxiliary_blocks(&mut self) {
+        self.auxiliary_block_keys = None;
+        self.auxiliary_block_len = 0;
+    }
+
+    /// Reduce the logical QSA summary prefix without shrinking its backing.
+    pub fn truncate_auxiliary_blocks(&mut self, block_len: i32) {
+        self.auxiliary_block_len = self.auxiliary_block_len.min(block_len.max(0));
+    }
+
     fn retain_auxiliary_blocks_through(&mut self, token_len: i32) {
         let Some(block_size) = self.auxiliary_block_size else {
-            // Without layout metadata no existing summary is provably outside
-            // the rewound suffix.
-            self.auxiliary_block_keys = None;
+            self.clear_auxiliary_blocks();
             return;
         };
-        let retained_blocks = token_len / block_size;
-        let Some(keys) = self.auxiliary_block_keys.as_ref() else {
-            return;
-        };
-        let shape = ffi::array_shape(keys);
-        if retained_blocks <= 0 {
-            self.auxiliary_block_keys = None;
-        } else if shape[2] > retained_blocks {
-            self.auxiliary_block_keys = Some(ffi::slice(
-                keys,
-                &[0, 0, 0, 0],
-                &[shape[0], shape[1], retained_blocks, shape[3]],
-            ));
-        }
+        self.auxiliary_block_len = self
+            .auxiliary_block_len
+            .min((token_len / block_size).max(0));
     }
     /// Quantize V once on each FP16 write while retaining FP16 cache storage.
     pub fn enable_fp16_v_quantization_on_write(&mut self) {
@@ -696,10 +825,26 @@ impl KVCache {
             val_scales: self.val_scales.as_deref()?,
         })
     }
-    pub fn fp8_snapshot_tensors(&self) -> Option<Fp8SnapshotTensors<'_>> {
-        (self.mode == KVCacheMode::Fp8).then_some(Fp8SnapshotTensors {
-            keys: self.keys.as_deref()?,
-            values: self.values.as_deref()?,
+    pub fn fp8_snapshot_tensors(&self) -> Option<Fp8SnapshotTensors> {
+        if self.mode != KVCacheMode::Fp8 {
+            return None;
+        }
+        let keys = self.keys.as_ref()?;
+        let values = self.values.as_ref()?;
+        let logical_len = self.buffer_idx();
+        let key_shape = ffi::array_shape(keys);
+        let value_shape = ffi::array_shape(values);
+        Some(Fp8SnapshotTensors {
+            keys: ffi::slice(
+                keys,
+                &[0, 0, 0, 0],
+                &[key_shape[0], key_shape[1], logical_len, key_shape[3]],
+            ),
+            values: ffi::slice(
+                values,
+                &[0, 0, 0, 0],
+                &[value_shape[0], value_shape[1], logical_len, value_shape[3]],
+            ),
         })
     }
 
@@ -1110,6 +1255,12 @@ impl KVCache {
         }
     }
 
+    fn rounded_dense_capacity(&self, needed: i32) -> i32 {
+        let reserved = self.reserved_seq_len.saturating_sub(self.live_start);
+        let target = needed.max(reserved).max(self.step);
+        ((target + self.step - 1) / self.step) * self.step
+    }
+
     /// Update cache with new key/value using pre-allocated buffer + slice_update.
     ///
     /// In `KVCacheMode::Int8` the incoming tensors are quantized to INT8 before
@@ -1172,7 +1323,11 @@ impl KVCache {
         let new_seq_len = key_shape[2];
         let prev = self.buffer_idx();
 
-        if prev == 0 && self.keys.is_none() && direct_prefill_cache_store_enabled() {
+        if prev == 0
+            && self.keys.is_none()
+            && self.reserved_seq_len == 0
+            && direct_prefill_cache_store_enabled()
+        {
             self.keys = Some(ffi::contiguous(&new_keys, false));
             self.values = Some(ffi::contiguous(&new_values, false));
             self.offset += new_seq_len;
@@ -1186,29 +1341,37 @@ impl KVCache {
             let val_shape = ffi::array_shape(&new_values);
             let v_head_dim = val_shape[3];
 
-            let n_steps = (self.step + new_seq_len - 1) / self.step;
-            let buf_size = n_steps * self.step;
-
+            let buf_size = self.rounded_dense_capacity(prev + new_seq_len);
             let k_dtype = ffi::array_dtype(&new_keys);
             let v_dtype = ffi::array_dtype(&new_values);
             let new_k = ffi::zeros(&[b, n_kv_heads, buf_size, k_head_dim], k_dtype);
             let new_v = ffi::zeros(&[b, n_kv_heads, buf_size, v_head_dim], v_dtype);
 
-            if self.keys.is_some() {
-                if prev % self.step != 0 {
-                    self.keys = Some(ffi::slice(
-                        self.keys.as_ref().unwrap(),
-                        &[0, 0, 0, 0],
-                        &[b, n_kv_heads, prev, k_head_dim],
-                    ));
-                    self.values = Some(ffi::slice(
-                        self.values.as_ref().unwrap(),
-                        &[0, 0, 0, 0],
-                        &[b, n_kv_heads, prev, v_head_dim],
-                    ));
-                }
-                self.keys = Some(concatenate(self.keys.as_ref().unwrap(), &new_k, 2));
-                self.values = Some(concatenate(self.values.as_ref().unwrap(), &new_v, 2));
+            if prev > 0 {
+                let old_k = self.keys.as_ref().expect("existing FP16 K backing");
+                let old_v = self.values.as_ref().expect("existing FP16 V backing");
+                let old_k = ffi::slice(
+                    old_k,
+                    &[0, 0, 0, 0],
+                    &[b, n_kv_heads, prev, k_head_dim],
+                );
+                let old_v = ffi::slice(
+                    old_v,
+                    &[0, 0, 0, 0],
+                    &[b, n_kv_heads, prev, v_head_dim],
+                );
+                self.keys = Some(ffi::slice_update(
+                    &new_k,
+                    &old_k,
+                    &[0, 0, 0, 0],
+                    &[b, n_kv_heads, prev, k_head_dim],
+                ));
+                self.values = Some(ffi::slice_update(
+                    &new_v,
+                    &old_v,
+                    &[0, 0, 0, 0],
+                    &[b, n_kv_heads, prev, v_head_dim],
+                ));
             } else {
                 self.keys = Some(new_k);
                 self.values = Some(new_v);
@@ -1242,7 +1405,11 @@ impl KVCache {
         let new_seq_len = key_shape[2];
         let prev = self.buffer_idx();
 
-        if prev == 0 && self.keys.is_none() && direct_prefill_cache_store_enabled() {
+        if prev == 0
+            && self.keys.is_none()
+            && self.reserved_seq_len == 0
+            && direct_prefill_cache_store_enabled()
+        {
             self.keys = Some(ffi::contiguous(&new_keys, false));
             self.values = Some(ffi::contiguous(&new_values, false));
             self.offset += new_seq_len;
@@ -1255,26 +1422,35 @@ impl KVCache {
             let k_head_dim = key_shape[3];
             let val_shape = ffi::array_shape(&new_values);
             let v_head_dim = val_shape[3];
-            let n_steps = (self.step + new_seq_len - 1) / self.step;
-            let buf_size = n_steps * self.step;
+            let buf_size = self.rounded_dense_capacity(prev + new_seq_len);
             let new_k = ffi::zeros(&[b, n_kv_heads, buf_size, k_head_dim], dtype::UINT8);
             let new_v = ffi::zeros(&[b, n_kv_heads, buf_size, v_head_dim], dtype::UINT8);
 
-            if self.keys.is_some() {
-                if prev % self.step != 0 {
-                    self.keys = Some(ffi::slice(
-                        self.keys.as_ref().unwrap(),
-                        &[0, 0, 0, 0],
-                        &[b, n_kv_heads, prev, k_head_dim],
-                    ));
-                    self.values = Some(ffi::slice(
-                        self.values.as_ref().unwrap(),
-                        &[0, 0, 0, 0],
-                        &[b, n_kv_heads, prev, v_head_dim],
-                    ));
-                }
-                self.keys = Some(concatenate(self.keys.as_ref().unwrap(), &new_k, 2));
-                self.values = Some(concatenate(self.values.as_ref().unwrap(), &new_v, 2));
+            if prev > 0 {
+                let old_k = self.keys.as_ref().expect("existing FP8 K backing");
+                let old_v = self.values.as_ref().expect("existing FP8 V backing");
+                let old_k = ffi::slice(
+                    old_k,
+                    &[0, 0, 0, 0],
+                    &[b, n_kv_heads, prev, k_head_dim],
+                );
+                let old_v = ffi::slice(
+                    old_v,
+                    &[0, 0, 0, 0],
+                    &[b, n_kv_heads, prev, v_head_dim],
+                );
+                self.keys = Some(ffi::slice_update(
+                    &new_k,
+                    &old_k,
+                    &[0, 0, 0, 0],
+                    &[b, n_kv_heads, prev, k_head_dim],
+                ));
+                self.values = Some(ffi::slice_update(
+                    &new_v,
+                    &old_v,
+                    &[0, 0, 0, 0],
+                    &[b, n_kv_heads, prev, v_head_dim],
+                ));
             } else {
                 self.keys = Some(new_k);
                 self.values = Some(new_v);
@@ -2572,7 +2748,7 @@ impl KVCache {
             self.keys = None;
             self.values = None;
             self.auxiliary_keys = None;
-            self.auxiliary_block_keys = None;
+            self.clear_auxiliary_blocks();
             self.key_scales = None;
             self.val_scales = None;
             self.v_packed = None;
@@ -2891,7 +3067,7 @@ impl KVCache {
             self.keys = None;
             self.values = None;
             self.auxiliary_keys = None;
-            self.auxiliary_block_keys = None;
+            self.clear_auxiliary_blocks();
             self.key_scales = None;
             self.val_scales = None;
             return n;
@@ -2985,7 +3161,7 @@ impl KVCache {
                 ))
             };
         }
-        self.auxiliary_block_keys = None;
+        self.clear_auxiliary_blocks();
         // CRITICAL: do NOT modify `self.offset`. Advance `live_start` only.
         // See the top-level doc comment for the RoPE rationale.
         self.live_start += n;
@@ -7626,11 +7802,7 @@ mod tests {
                 assert_eq!(cache.trim(trim), trim);
                 assert_eq!(cache.offset, final_len);
                 assert_eq!(
-                    cache
-                        .auxiliary_block_keys
-                        .as_deref()
-                        .map(|keys| ffi::array_shape(keys)[2])
-                        .unwrap_or(0),
+                    cache.auxiliary_block_len(),
                     complete_after,
                     "alignment={alignment}, accepted={accepted}",
                 );
@@ -8102,6 +8274,101 @@ mod tests {
         let decoded_values = ffi::from_fp8(&second.values);
         assert_eq!(ffi::array_shape(&decoded_keys), vec![1, 1, 3, 2]);
         assert_eq!(ffi::array_shape(&decoded_values), vec![1, 1, 3, 2]);
+    }
+
+    #[test]
+    fn reserved_fp16_capacity_is_logically_empty_stable_and_grows_on_overrun() {
+        let rows = |start: i32, len: i32| {
+            let values = (start..start + len).map(|value| value as f32).collect::<Vec<_>>();
+            ffi::from_slice_f32(&values, &[1, 1, len, 1])
+        };
+        let mut cache = KVCache::new();
+        cache.reserve_prefill_capacity(600);
+        assert_eq!(cache.offset, 0);
+        assert_eq!(cache.seq_len(), 0);
+        assert_eq!(cache.capacity(), 0);
+
+        cache.update(rows(0, 128), rows(1000, 128));
+        assert_eq!(cache.seq_len(), 128);
+        assert_eq!(cache.capacity(), 768);
+        cache.update(rows(128, 256), rows(1128, 256));
+        cache.update(rows(384, 216), rows(1384, 216));
+        assert_eq!(cache.seq_len(), 600);
+        assert_eq!(cache.capacity(), 768);
+
+        cache.update(rows(600, 200), rows(1600, 200));
+        assert_eq!(cache.seq_len(), 800);
+        assert_eq!(cache.capacity(), 1024);
+    }
+
+    #[test]
+    fn fp8_snapshot_excludes_reserved_slack_and_restore_append_reuses_hint() {
+        let rows = |start: i32, len: i32| {
+            let values = (start..start + len)
+                .flat_map(|value| [value as f32 / 16.0, -(value as f32) / 32.0])
+                .collect::<Vec<_>>();
+            ffi::from_slice_f32(&values, &[1, 1, len, 2])
+        };
+        let mut source = KVCache::new_with_mode(KVCacheMode::Fp8);
+        source.reserve_prefill_capacity(500);
+        source.update(rows(0, 100), rows(1000, 100));
+        source.update(rows(100, 100), rows(1100, 100));
+        assert_eq!(source.capacity(), 512);
+        assert_eq!(source.seq_len(), 200);
+
+        let snapshot = source
+            .fp8_snapshot_tensors()
+            .expect("populated FP8 snapshot");
+        assert_eq!(ffi::array_shape(&snapshot.keys)[2], 200);
+        assert_eq!(ffi::array_shape(&snapshot.values)[2], 200);
+
+        let mut restored = KVCache::new_with_mode(KVCacheMode::Fp8);
+        restored
+            .restore_fp8_snapshot(200, snapshot.keys, snapshot.values)
+            .expect("restore exact FP8 snapshot");
+        assert_eq!(restored.capacity(), 200);
+        restored.reserve_prefill_capacity(500);
+        restored.update(rows(200, 100), rows(1200, 100));
+        assert_eq!(restored.seq_len(), 300);
+        assert_eq!(restored.capacity(), 512);
+        let visible = restored
+            .fp8_snapshot_tensors()
+            .expect("restored FP8 snapshot after append");
+        assert_eq!(ffi::array_shape(&visible.keys)[2], 300);
+        assert_eq!(ffi::array_shape(&visible.values)[2], 300);
+    }
+
+    #[test]
+    fn qsa_snapshot_view_excludes_slack_and_restore_append_reserves_again() {
+        let mut source = KVCache::new();
+        source.reserve_prefill_capacity(20);
+        source.set_auxiliary_block_size(4);
+        let first = ffi::from_slice_f32(&[1.0, 2.0], &[1, 1, 2, 1]);
+        source.append_auxiliary_blocks(&first);
+        assert_eq!(source.auxiliary_block_len(), 2);
+        assert_eq!(source.auxiliary_block_capacity(), 5);
+        let snapshot = source
+            .auxiliary_block_keys_view()
+            .expect("logical QSA snapshot view");
+        assert_eq!(ffi::array_shape(&snapshot)[2], 2);
+
+        let mut restored = KVCache::new();
+        restored.restore_auxiliary_block_keys(4, Some(snapshot));
+        assert_eq!(restored.auxiliary_block_len(), 2);
+        assert_eq!(restored.auxiliary_block_capacity(), 2);
+        restored.reserve_prefill_capacity(20);
+        let next = ffi::from_slice_f32(&[3.0], &[1, 1, 1, 1]);
+        restored.append_auxiliary_blocks(&next);
+        assert_eq!(restored.auxiliary_block_len(), 3);
+        assert_eq!(restored.auxiliary_block_capacity(), 5);
+        assert_eq!(
+            ffi::array_shape(
+                &restored
+                    .auxiliary_block_keys_view()
+                    .expect("restored logical QSA summaries"),
+            )[2],
+            3,
+        );
     }
 
     /// INT8 + `--max-kv-size` front-trim interaction on the single-stream

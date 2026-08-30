@@ -406,6 +406,13 @@ impl Qwen4MtpDraftModel {
         *self.state.borrow_mut() = Qwen4MtpDraftState::new();
     }
 
+    fn reserve_prefill_capacity(&self, total_tokens: i32) {
+        self.state
+            .borrow_mut()
+            .cache
+            .reserve_prefill_capacity(total_tokens);
+    }
+
     fn forward_embeddings(
         &self,
         token_embeddings: &MlxArray,
@@ -797,14 +804,12 @@ impl Qwen4MtpDraftModel {
             return None;
         }
         let mut draft = ModelStateSnapshot::new("qwen4-mtp-draft", expected_offset as usize);
-        if let (Some(keys), Some(values)) =
-            (state.cache.keys.as_deref(), state.cache.values.as_deref())
-        {
+        if let Some((keys, values)) = state.cache.visible_state() {
             draft
                 .push_paged_tensor(
                     previous.map(|snapshot| &snapshot.draft),
                     "draft_keys",
-                    keys,
+                    &keys,
                     2,
                 )
                 .ok()?;
@@ -812,7 +817,7 @@ impl Qwen4MtpDraftModel {
                 .push_paged_tensor(
                     previous.map(|snapshot| &snapshot.draft),
                     "draft_values",
-                    values,
+                    &values,
                     2,
                 )
                 .ok()?;
@@ -1618,6 +1623,9 @@ fn prefill_for_input(
     drafter.reset();
     let prompt = prompt_for_prefill(prefill_input);
     let prompt_len = mlxcel_core::array_shape(prompt)[1] as usize;
+    drafter.reserve_prefill_capacity(
+        i32::try_from(prompt_len.saturating_sub(1)).unwrap_or(i32::MAX),
+    );
     let (embeddings, positions, rope_delta) = (None, None, None);
     let prefill = model.forward_mtp_prefill_chunks(
         prompt,
@@ -1715,6 +1723,9 @@ fn prefill_text_with_reuse(
         &reuse.snapshot.target,
     )?;
     drafter.restore_prompt_snapshot(reuse.snapshot, reuse.cached_tokens)?;
+    drafter.reserve_prefill_capacity(
+        i32::try_from(prompt_tokens.len().saturating_sub(1)).unwrap_or(i32::MAX),
+    );
     mlxcel_core::memory::trace_snapshot(
         "mtp.prefill.started",
         reuse.cached_tokens,
