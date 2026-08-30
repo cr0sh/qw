@@ -1,29 +1,63 @@
+import argparse
 import json
+from pathlib import Path
+from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 from eval import run
 
 
 class GenerationConfigTests(unittest.TestCase):
-    def test_thinking_suites_emit_only_supported_sampling_keys(self) -> None:
-        expected_keys = {"temperature", "top_p", "top_k", "max_tokens", "seed"}
+    def test_suites_emit_exact_non_thinking_generation_config(self) -> None:
         expected_max_tokens = {
-            "gpqa_diamond": 16_384,
-            "ifbench": 8_192,
-            "live_code_bench": 16_384,
+            "gpqa_diamond": 4_096,
+            "ifbench": 4_096,
+            "live_code_bench": 8_192,
         }
 
         for dataset, max_tokens in expected_max_tokens.items():
             with self.subTest(dataset=dataset):
-                emitted = json.loads(
-                    json.dumps(run.generation_config(dataset), separators=(",", ":"))
+                expected = {
+                    "temperature": 0.7,
+                    "top_p": 0.8,
+                    "top_k": 20,
+                    "max_tokens": max_tokens,
+                    "seed": 42,
+                    "extra_body": {
+                        "chat_template_kwargs": {
+                            "enable_thinking": False,
+                        },
+                    },
+                }
+                args = argparse.Namespace(
+                    dataset=dataset,
+                    limit=None,
+                    repeats=1,
+                    output_root=Path("/tmp/qwr-eval-test"),
                 )
-                self.assertEqual(set(emitted), expected_keys)
-                self.assertEqual(emitted["temperature"], 1.0)
-                self.assertEqual(emitted["top_p"], 0.95)
-                self.assertEqual(emitted["top_k"], 20)
-                self.assertEqual(emitted["max_tokens"], max_tokens)
-                self.assertEqual(emitted["seed"], 42)
+
+                with (
+                    mock.patch.object(run, "parse_args", return_value=args),
+                    mock.patch.object(
+                        run.shutil,
+                        "disk_usage",
+                        return_value=SimpleNamespace(free=run.MIN_FREE_BYTES),
+                    ),
+                    mock.patch.object(
+                        run.subprocess,
+                        "run",
+                        return_value=SimpleNamespace(returncode=0),
+                    ) as subprocess_run,
+                ):
+                    self.assertEqual(run.main(), 0)
+
+                command = subprocess_run.call_args.args[0]
+                config_index = command.index("--generation-config") + 1
+                self.assertEqual(
+                    command[config_index],
+                    json.dumps(expected, separators=(",", ":")),
+                )
 
 
 if __name__ == "__main__":

@@ -11,22 +11,22 @@ PROJECT_DIR = Path(__file__).resolve().parent
 MIN_FREE_BYTES = 15 * 1024**3
 DATASETS = {
     "gpqa_diamond": {
-        "temperature": 1.0,
-        "top_p": 0.95,
+        "temperature": 0.7,
+        "top_p": 0.8,
         "top_k": 20,
-        "max_tokens": 16_384,
+        "max_tokens": 4_096,
     },
     "ifbench": {
-        "temperature": 1.0,
-        "top_p": 0.95,
+        "temperature": 0.7,
+        "top_p": 0.8,
         "top_k": 20,
-        "max_tokens": 8_192,
+        "max_tokens": 4_096,
     },
     "live_code_bench": {
-        "temperature": 1.0,
-        "top_p": 0.95,
+        "temperature": 0.7,
+        "top_p": 0.8,
         "top_k": 20,
-        "max_tokens": 16_384,
+        "max_tokens": 8_192,
     },
 }
 
@@ -38,10 +38,15 @@ def positive_int(value: str) -> int:
     return parsed
 
 
-def generation_config(dataset: str) -> dict[str, int | float]:
+def generation_config(dataset: str) -> dict[str, object]:
     return {
         **DATASETS[dataset],
         "seed": 42,
+        "extra_body": {
+            "chat_template_kwargs": {
+                "enable_thinking": False,
+            },
+        },
     }
 
 
