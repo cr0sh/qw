@@ -315,6 +315,25 @@ struct GenerationDefaults {
     top_p: f32,
 }
 
+impl GenerationDefaults {
+    fn sampling(
+        &self,
+        temperature: Option<f32>,
+        top_k: Option<i32>,
+        top_p: Option<f32>,
+        seed: Option<u64>,
+    ) -> SamplingConfig {
+        SamplingConfig {
+            temperature: temperature.unwrap_or(self.temperature),
+            top_k: top_k.unwrap_or(self.top_k),
+            top_p: top_p.unwrap_or(self.top_p),
+            seed,
+            stop_token_ids: self.stop_token_ids.clone(),
+            ..SamplingConfig::default()
+        }
+    }
+}
+
 impl Qwen4Provider {
     pub fn load(model_dir: impl AsRef<Path>, kv_cache_mode: KVCacheMode) -> Result<Self> {
         Self::load_target_only(model_dir.as_ref(), kv_cache_mode)
@@ -497,17 +516,11 @@ impl Qwen4Provider {
     pub fn baseline_sampling(
         &self,
         temperature: Option<f32>,
+        top_k: Option<i32>,
         top_p: Option<f32>,
         seed: Option<u64>,
     ) -> SamplingConfig {
-        SamplingConfig {
-            temperature: temperature.unwrap_or(self.defaults.temperature),
-            top_k: self.defaults.top_k,
-            top_p: top_p.unwrap_or(self.defaults.top_p),
-            seed,
-            stop_token_ids: self.defaults.stop_token_ids.clone(),
-            ..SamplingConfig::default()
-        }
+        self.defaults.sampling(temperature, top_k, top_p, seed)
     }
 
     #[tracing::instrument(
@@ -1131,14 +1144,12 @@ impl Qwen4Provider {
             "rendered prompt tokenized to an empty sequence"
         );
 
-        let sampling = SamplingConfig {
-            temperature: request.temperature.unwrap_or(self.defaults.temperature),
-            top_k: request.top_k.unwrap_or(self.defaults.top_k),
-            top_p: request.top_p.unwrap_or(self.defaults.top_p),
-            seed: request.seed,
-            stop_token_ids: self.defaults.stop_token_ids.clone(),
-            ..SamplingConfig::default()
-        };
+        let sampling = self.defaults.sampling(
+            request.temperature,
+            request.top_k,
+            request.top_p,
+            request.seed,
+        );
         Ok((prompt_ids, sampling))
     }
 }
@@ -1353,7 +1364,7 @@ mod tests {
     }
 
     #[test]
-    fn generation_defaults_match_checkpoint_contract() {
+    fn generation_defaults_and_top_k_override_reach_sampling_config() {
         let fixture = TestDir::new("generation-defaults");
         let fallback = load_generation_defaults(&fixture.0).expect("fallback defaults");
         assert_eq!(fallback.stop_token_ids, vec![248044, 248046]);
@@ -1371,6 +1382,19 @@ mod tests {
         assert_eq!(loaded.temperature, 0.7);
         assert_eq!(loaded.top_k, 11);
         assert_eq!(loaded.top_p, 0.8);
+
+        let checkpoint_sampling = loaded.sampling(None, None, None, None);
+        assert_eq!(checkpoint_sampling.temperature, 0.7);
+        assert_eq!(checkpoint_sampling.top_k, 11);
+        assert_eq!(checkpoint_sampling.top_p, 0.8);
+        assert_eq!(checkpoint_sampling.stop_token_ids, vec![7, 9]);
+
+        let overridden_sampling = loaded.sampling(None, Some(20), None, Some(42));
+        assert_eq!(overridden_sampling.temperature, 0.7);
+        assert_eq!(overridden_sampling.top_k, 20);
+        assert_eq!(overridden_sampling.top_p, 0.8);
+        assert_eq!(overridden_sampling.seed, Some(42));
+        assert_eq!(overridden_sampling.stop_token_ids, vec![7, 9]);
     }
 
     #[test]
@@ -1514,7 +1538,7 @@ mod tests {
             .iter()
             .map(|&token| token as i32)
             .collect::<Vec<_>>();
-        let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
+        let sampling = provider.baseline_sampling(Some(0.0), None, Some(1.0), Some(0));
         let mut constraint = PassThroughTestConstraint;
         let mut callback_count = 0;
         let mut first_nonempty_callback = None;
@@ -1580,7 +1604,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut full_ids = base_ids.clone();
         full_ids.extend(suffix.get_ids().iter().map(|&token| token as i32));
-        let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
+        let sampling = provider.baseline_sampling(Some(0.0), None, Some(1.0), Some(0));
 
         let mut cold_ttft = None;
         let cold_started = Instant::now();
@@ -1784,7 +1808,7 @@ mod tests {
             .expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
         let mut provider = Qwen4Provider::load(&model_dir, KVCacheMode::Fp8)
             .expect("load real bundled-MTP checkpoint");
-        let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
+        let sampling = provider.baseline_sampling(Some(0.0), None, Some(1.0), Some(0));
         let user = |content: &str| ChatMessage {
             role: "user".to_string(),
             name: None,
@@ -1918,7 +1942,7 @@ mod tests {
             .iter()
             .map(|&token| token as i32)
             .collect::<Vec<_>>();
-        let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
+        let sampling = provider.baseline_sampling(Some(0.0), None, Some(1.0), Some(0));
         let mut callback_count = 0;
         let mut last_callback = None;
         let generated = provider
@@ -1974,7 +1998,7 @@ mod tests {
             .iter()
             .map(|&token| token as i32)
             .collect::<Vec<_>>();
-        let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
+        let sampling = provider.baseline_sampling(Some(0.0), None, Some(1.0), Some(0));
         let mut generator = provider
             .mtp_generator
             .take()
@@ -2057,7 +2081,7 @@ mod tests {
 
         let mut completed_prompt = prompt_ids.clone();
         completed_prompt.extend_from_slice(&stopped.token_ids);
-        let resume_sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
+        let resume_sampling = provider.baseline_sampling(Some(0.0), None, Some(1.0), Some(0));
         let cold = generator
             .generate_streaming(
                 &provider.model,
@@ -2150,7 +2174,7 @@ mod tests {
         let prompt_ids = provider
             .tokenize_messages(&messages, &[], None, false)
             .expect("tokenize deterministic resume conversation");
-        let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(7));
+        let sampling = provider.baseline_sampling(Some(0.0), None, Some(1.0), Some(7));
         let mut control = provider
             .generate_mtp_streaming(
                 &prompt_ids,

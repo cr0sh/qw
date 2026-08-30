@@ -109,7 +109,7 @@ fn benchmark_64k_cached_decode(criterion: &mut Criterion) {
         &memory_report,
         long_context_tokens(),
     );
-    let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
+    let sampling = provider.baseline_sampling(Some(0.0), None, Some(1.0), Some(0));
     let mut group = criterion.benchmark_group("single_user_decode");
     group.sample_size(10);
     group.throughput(Throughput::Elements(DECODE_MAX_TOKENS as u64));

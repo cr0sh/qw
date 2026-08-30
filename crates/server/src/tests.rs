@@ -994,6 +994,51 @@ fn strict_protocols_accept_top_level_resume_response_id() {
     );
 }
 
+#[test]
+fn protocols_accept_top_k_sampling() {
+    let mut chat = chat_request("hello");
+    chat["top_k"] = json!(20);
+    let parsed_chat = protocol::parse_chat(chat).expect("Chat Completions top_k");
+    assert_eq!(parsed_chat.top_k, Some(20));
+    let omitted_chat = protocol::parse_chat(chat_request("hello")).expect("omitted top_k");
+    assert_eq!(omitted_chat.top_k, None);
+    assert_ne!(
+        protocol::request_fingerprint(&parsed_chat),
+        protocol::request_fingerprint(&omitted_chat)
+    );
+
+    let mut responses = responses_request("hello");
+    responses["top_k"] = json!(20);
+    assert_eq!(
+        protocol::parse_responses(responses)
+            .expect("Responses top_k")
+            .top_k,
+        Some(20)
+    );
+}
+
+#[test]
+fn protocols_reject_negative_top_k_at_exact_param() {
+    let mut chat = chat_request("hello");
+    chat["top_k"] = json!(-1);
+    let chat_error = protocol::parse_chat(chat).expect_err("negative Chat Completions top_k");
+    assert_eq!(chat_error.param.as_deref(), Some("top_k"));
+    assert_eq!(
+        chat_error.message,
+        "top_k must be greater than or equal to 0"
+    );
+
+    let mut responses = responses_request("hello");
+    responses["top_k"] = json!(-1);
+    let responses_error =
+        protocol::parse_responses(responses).expect_err("negative Responses top_k");
+    assert_eq!(responses_error.param.as_deref(), Some("top_k"));
+    assert_eq!(
+        responses_error.message,
+        "top_k must be greater than or equal to 0"
+    );
+}
+
 #[tokio::test]
 async fn configured_model_id_accepts_exact_match_and_rejects_mismatch() {
     let app = router(Engine::start_fake(Some(MODEL), 8));

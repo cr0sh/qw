@@ -785,7 +785,7 @@ pub fn prepare_long_conversation_fixture(
         .expect("long benchmark prompt length");
     let prompt_ids = long_prompt_ids(provider, prompt_tokens);
     let prefix_tokens = min_prefix_tokens;
-    let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
+    let sampling = provider.baseline_sampling(Some(0.0), None, Some(1.0), Some(0));
     let mtp = provider
         .generate_mtp_streaming(
             &prompt_ids,

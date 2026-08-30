@@ -10,9 +10,24 @@ import subprocess
 PROJECT_DIR = Path(__file__).resolve().parent
 MIN_FREE_BYTES = 15 * 1024**3
 DATASETS = {
-    "gpqa_diamond": {"temperature": 1.0, "top_p": 0.95, "max_tokens": 16_384},
-    "ifbench": {"temperature": 1.0, "top_p": 0.95, "max_tokens": 8_192},
-    "live_code_bench": {"temperature": 1.0, "top_p": 0.95, "max_tokens": 16_384},
+    "gpqa_diamond": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "max_tokens": 16_384,
+    },
+    "ifbench": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "max_tokens": 8_192,
+    },
+    "live_code_bench": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "max_tokens": 16_384,
+    },
 }
 
 
@@ -21,6 +36,13 @@ def positive_int(value: str) -> int:
     if parsed < 1:
         raise argparse.ArgumentTypeError("must be at least 1")
     return parsed
+
+
+def generation_config(dataset: str) -> dict[str, int | float]:
+    return {
+        **DATASETS[dataset],
+        "seed": 42,
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -53,10 +75,7 @@ def main() -> int:
         "XDG_CACHE_HOME": str(cache_dir / "xdg"),
     }
 
-    generation_config = {
-        **DATASETS[args.dataset],
-        "seed": 42,
-    }
+    config = generation_config(args.dataset)
     command = [
         "evalscope",
         "eval",
@@ -71,7 +90,7 @@ def main() -> int:
         "--datasets",
         args.dataset,
         "--generation-config",
-        json.dumps(generation_config, separators=(",", ":")),
+        json.dumps(config, separators=(",", ":")),
         "--eval-batch-size",
         "1",
         "--repeats",
