@@ -303,8 +303,8 @@ impl Qwen4Provider {
         self.model.config.max_position_embeddings
     }
 
-    pub fn eos_token_id(&self) -> u32 {
-        self.defaults.stop_token_ids[0] as u32
+    pub fn eos_token_ids(&self) -> &[i32] {
+        &self.defaults.stop_token_ids
     }
 
     pub fn has_mtp(&self) -> bool {
