@@ -36,6 +36,7 @@ use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr, concatenate};
 use serde::Deserialize;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::cell::Cell;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -1232,6 +1233,76 @@ fn ple_shifted_tokens(
     (shifted_tokens, next_history)
 }
 
+fn ple_input_tokens<'a>(
+    input_ids: &MlxArray,
+    host_tokens: Option<&'a [i32]>,
+    readback: impl FnOnce(&MlxArray) -> Vec<u8>,
+) -> std::result::Result<Cow<'a, [i32]>, String> {
+    let input_shape = mlxcel_core::array_shape(input_ids);
+    let expected = input_shape[0] as usize * input_shape[1] as usize;
+    if let Some(tokens) = host_tokens {
+        if tokens.len() != expected {
+            return Err("Qwen4 PLE input token shape does not match host data".to_owned());
+        }
+        return Ok(Cow::Borrowed(tokens));
+    }
+    let bytes = readback(input_ids);
+    let tokens = bytes
+        .chunks_exact(4)
+        .map(|chunk| i32::from_ne_bytes(chunk.try_into().expect("four-byte token")))
+        .collect::<Vec<_>>();
+    if tokens.len() != expected {
+        return Err("Qwen4 PLE input token shape does not match host data".to_owned());
+    }
+    Ok(Cow::Owned(tokens))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_ple_indices(
+    input_ids: &MlxArray,
+    host_tokens: Option<&[i32]>,
+    history: &mut Vec<i32>,
+    ngram_size: usize,
+    heads_per_ngram: usize,
+    head_sizes: &[u64],
+    head_offsets: &[u64],
+    multipliers: &[u64],
+    eos_token_id: i32,
+    readback: impl FnOnce(&MlxArray) -> Vec<u8>,
+) -> std::result::Result<Vec<usize>, String> {
+    let input_shape = mlxcel_core::array_shape(input_ids);
+    let batch = input_shape[0] as usize;
+    let sequence = input_shape[1] as usize;
+    let tokens = ple_input_tokens(input_ids, host_tokens, readback)?;
+    let context_len = ngram_size - 1;
+    if history.len() != batch * context_len {
+        *history = vec![eos_token_id; batch * context_len];
+    }
+    let (shifted_tokens, next_history) = ple_shifted_tokens(
+        tokens.as_ref(),
+        history,
+        batch,
+        sequence,
+        ngram_size,
+        eos_token_id,
+    );
+    let mut indices = Vec::with_capacity(batch * sequence * head_sizes.len());
+    for shifted in shifted_tokens.chunks_exact(ngram_size) {
+        for ngram in 2..=ngram_size {
+            let mut mixed = (shifted[0] as u64).wrapping_mul(multipliers[0]);
+            for position in 1..ngram {
+                mixed ^= (shifted[position] as u64).wrapping_mul(multipliers[position]);
+            }
+            let first_head = (ngram - 2) * heads_per_ngram;
+            for head in first_head..first_head + heads_per_ngram {
+                indices.push((head_offsets[head] + mixed % head_sizes[head]) as usize);
+            }
+        }
+    }
+    *history = next_history;
+    Ok(indices)
+}
+
 impl Qwen4Ple {
     fn from_weights(
         weights: &WeightMap,
@@ -1313,58 +1384,34 @@ impl Qwen4Ple {
         &self,
         hidden_states: &MlxArray,
         input_ids: &MlxArray,
+        host_tokens: Option<&[i32]>,
         cache: &mut GatedDeltaCache,
     ) -> Result<UniquePtr<MlxArray>, String> {
-        self.forward_chunk(hidden_states, input_ids, cache)
+        self.forward_chunk(hidden_states, input_ids, host_tokens, cache)
     }
 
     fn forward_chunk(
         &self,
         hidden_states: &MlxArray,
         input_ids: &MlxArray,
+        host_tokens: Option<&[i32]>,
         cache: &mut GatedDeltaCache,
     ) -> Result<UniquePtr<MlxArray>, String> {
         let input_shape = mlxcel_core::array_shape(input_ids);
         let batch = input_shape[0] as usize;
         let sequence = input_shape[1] as usize;
-        let bytes = mlxcel_core::array_to_raw_bytes(input_ids);
-        let tokens = bytes
-            .chunks_exact(4)
-            .map(|chunk| i32::from_ne_bytes(chunk.try_into().expect("four-byte token")))
-            .collect::<Vec<_>>();
-        if tokens.len() != batch * sequence {
-            return Err("Qwen4 PLE input token shape does not match host data".to_owned());
-        }
-        let context_len = self.ngram_size - 1;
-        if cache.ple_token_history.len() != batch * context_len {
-            cache.ple_token_history = vec![self.eos_token_id; batch * context_len];
-        }
-        let (shifted_tokens, next_history) = ple_shifted_tokens(
-            &tokens,
-            &cache.ple_token_history,
-            batch,
-            sequence,
+        let indices = prepare_ple_indices(
+            input_ids,
+            host_tokens,
+            &mut cache.ple_token_history,
             self.ngram_size,
+            self.heads_per_ngram,
+            &self.head_sizes,
+            &self.head_offsets,
+            &self.multipliers,
             self.eos_token_id,
-        );
-        let mut indices = Vec::with_capacity(batch * sequence * self.head_sizes.len());
-        for shifted in shifted_tokens.chunks_exact(self.ngram_size) {
-            for ngram in 2..=self.ngram_size {
-                let mut mixed = (shifted[0] as u64).wrapping_mul(self.multipliers[0]);
-                for position in 1..ngram {
-                    mixed ^= (shifted[position] as u64).wrapping_mul(self.multipliers[position]);
-                }
-                let first_head = (ngram - 2) * self.heads_per_ngram;
-                for head in first_head..first_head + self.heads_per_ngram {
-                    indices.push(self.head_offsets[head] + mixed % self.head_sizes[head]);
-                }
-            }
-        }
-        cache.ple_token_history = next_history;
-        let indices = indices
-            .into_iter()
-            .map(|value| value as usize)
-            .collect::<Vec<_>>();
+            mlxcel_core::array_to_raw_bytes,
+        )?;
         let embeddings = self
             .table
             .gather_bf16(&indices)
@@ -1520,6 +1567,7 @@ impl Qwen4DecoderLayer {
         &self,
         x: &MlxArray,
         input_ids: &MlxArray,
+        host_tokens: Option<&[i32]>,
         mask: Option<&MlxArray>,
         cache: &mut Qwen4LayerCache,
         position_ids: Option<&MlxArray>,
@@ -1528,7 +1576,7 @@ impl Qwen4DecoderLayer {
             if let (Some(ple), Qwen4LayerCache::Linear(linear_cache)) = (&self.ple, &mut *cache) {
                 mlxcel_core::add(
                     x,
-                    &ple.forward(x, input_ids, linear_cache)
+                    &ple.forward(x, input_ids, host_tokens, linear_cache)
                         .expect("validated Qwen4 PLE lookup must succeed"),
                 )
             } else {
@@ -1584,7 +1632,7 @@ impl Qwen4DecoderLayer {
             if let (Some(ple), Qwen4LayerCache::Linear(linear_cache)) = (&self.ple, &mut *cache) {
                 mlxcel_core::add(
                     x,
-                    &ple.forward(x, input_ids, linear_cache)
+                    &ple.forward(x, input_ids, None, linear_cache)
                         .expect("validated Qwen4 PLE lookup must succeed"),
                 )
             } else {
@@ -1768,6 +1816,7 @@ impl Qwen4Model {
     fn forward_backbone_with_inputs(
         &self,
         input_ids: &MlxArray,
+        host_tokens: Option<&[i32]>,
         input_embeddings: Option<&MlxArray>,
         caches: &mut [Qwen4LayerCache],
         position_ids: Option<&MlxArray>,
@@ -1778,9 +1827,84 @@ impl Qwen4Model {
         let mut hidden = mlxcel_core::tile(&embedded, &[1, 1, self.config.hc_count as i32]);
 
         for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
-            hidden = layer.forward(&hidden, input_ids, None, cache, position_ids);
+            hidden = layer.forward(&hidden, input_ids, host_tokens, None, cache, position_ids);
         }
         hidden
+    }
+
+    fn forward_prefill_chunk_impl(
+        &self,
+        input_ids: &MlxArray,
+        host_tokens: Option<&[i32]>,
+        last_pos: usize,
+    ) -> UniquePtr<MlxArray> {
+        let sequence_length = mlxcel_core::array_shape(input_ids)[1];
+        let rope_delta = self.rope_state.rope_delta();
+        let (anchor, offset) = self.sequence_state.with_internal(|caches| {
+            let cache_offset = caches.first().map(Qwen4LayerCache::offset).unwrap_or(0);
+            let position_ids =
+                rope_delta.map(|delta| decode_rope_positions(cache_offset, sequence_length, delta));
+            let hidden = self.forward_backbone_with_inputs(
+                input_ids,
+                host_tokens,
+                None,
+                caches,
+                position_ids.as_deref(),
+            );
+            let shape = mlxcel_core::array_shape(&hidden);
+            let position = i32::try_from(last_pos).unwrap_or(i32::MAX);
+            assert!(
+                position < shape[1],
+                "prefill anchor position is outside the input sequence"
+            );
+            let anchor = mlxcel_core::slice(
+                &hidden,
+                &[0, position, 0],
+                &[shape[0], position + 1, 1],
+            );
+            let offset = caches.first().map(Qwen4LayerCache::offset).unwrap_or(0);
+            (anchor, offset)
+        });
+        self.rope_state.set_position(offset);
+        anchor
+    }
+
+    fn forward_last_logits_impl(
+        &self,
+        input_ids: &MlxArray,
+        host_tokens: Option<&[i32]>,
+        last_pos: usize,
+    ) -> UniquePtr<MlxArray> {
+        let sequence_length = mlxcel_core::array_shape(input_ids)[1];
+        let rope_delta = self.rope_state.rope_delta();
+        let (logits, offset) = self.sequence_state.with_internal(|caches| {
+            let cache_offset = caches.first().map(Qwen4LayerCache::offset).unwrap_or(0);
+            let position_ids =
+                rope_delta.map(|delta| decode_rope_positions(cache_offset, sequence_length, delta));
+            let hidden = self.forward_backbone_with_inputs(
+                input_ids,
+                host_tokens,
+                None,
+                caches,
+                position_ids.as_deref(),
+            );
+            let shape = mlxcel_core::array_shape(&hidden);
+            let position = i32::try_from(last_pos).unwrap_or(i32::MAX);
+            assert!(
+                position < shape[1],
+                "last logits position is outside the input sequence"
+            );
+            let hidden = mlxcel_core::slice(
+                &hidden,
+                &[0, position, 0],
+                &[shape[0], position + 1, shape[2]],
+            );
+            let logits = self.project_logits(&self.norm.forward(&hidden));
+            let offset = caches.first().map(Qwen4LayerCache::offset).unwrap_or(0);
+            (logits, offset)
+        });
+        self.rope_state.set_position(offset);
+        logits
     }
 
     pub(crate) fn project_logits(&self, hidden: &MlxArray) -> UniquePtr<MlxArray> {
@@ -1916,6 +2040,7 @@ impl Qwen4Model {
     pub(crate) fn forward_mtp_prefill_chunks<F>(
         &self,
         input_ids: &MlxArray,
+        host_tokens: &[i32],
         input_embeddings: Option<&MlxArray>,
         position_ids: Option<&MlxArray>,
         rope_delta: Option<i32>,
@@ -1924,12 +2049,15 @@ impl Qwen4Model {
     where
         F: FnMut(i32, i32, &MlxArray),
     {
-        self.reset_runtime_state();
         let shape = mlxcel_core::array_shape(input_ids);
         let prompt_len = shape[1];
         if prompt_len == 0 {
             return Err("MTP prefill requires at least one token".to_string());
         }
+        if host_tokens.len() != shape[0] as usize * prompt_len as usize {
+            return Err("MTP prefill host token shape does not match input IDs".to_string());
+        }
+        self.reset_runtime_state();
         self.reserve_prefill_capacity(prompt_len);
         if let (Some(position_ids), Some(rope_delta)) = (position_ids, rope_delta) {
             self.rope_state.prepare(position_ids, rope_delta);
@@ -1962,9 +2090,11 @@ impl Qwen4Model {
                     &[position_shape[0], position_shape[1], end],
                 )
             });
+            let piece = &host_tokens[start as usize..end as usize];
             let hidden = self.sequence_state.with_internal(|caches| {
                 self.forward_backbone_with_inputs(
                     &ids,
+                    Some(piece),
                     embeddings.as_deref(),
                     caches,
                     positions.as_deref(),
@@ -2002,6 +2132,7 @@ impl Qwen4Model {
     pub(crate) fn forward_mtp_text_suffix_chunks<F>(
         &self,
         input_ids: &MlxArray,
+        host_tokens: &[i32],
         mut consume_chunk: F,
     ) -> std::result::Result<Qwen4MtpPrefill, String>
     where
@@ -2011,6 +2142,9 @@ impl Qwen4Model {
         let suffix_len = shape[1];
         if suffix_len == 0 {
             return Err("MTP suffix prefill requires at least one token".to_string());
+        }
+        if host_tokens.len() != shape[0] as usize * suffix_len as usize {
+            return Err("MTP suffix host token shape does not match input IDs".to_string());
         }
         let cached_len = self
             .sequence_state
@@ -2025,8 +2159,9 @@ impl Qwen4Model {
         while start < suffix_len {
             let end = (start + chunk_len).min(suffix_len);
             let ids = mlxcel_core::slice(input_ids, &[0, start], &[shape[0], end]);
+            let piece = &host_tokens[start as usize..end as usize];
             let hidden = self.sequence_state.with_internal(|caches| {
-                self.forward_backbone_with_inputs(&ids, None, caches, None)
+                self.forward_backbone_with_inputs(&ids, Some(piece), None, caches, None)
             });
             consume_chunk(&ids, &hidden);
             final_hidden = Some(hidden);
@@ -2787,8 +2922,13 @@ impl LanguageModel for Qwen4Model {
             let cache_offset = caches.first().map(Qwen4LayerCache::offset).unwrap_or(0);
             let position_ids =
                 rope_delta.map(|delta| decode_rope_positions(cache_offset, sequence_length, delta));
-            let hidden =
-                self.forward_backbone_with_inputs(input, None, caches, position_ids.as_deref());
+            let hidden = self.forward_backbone_with_inputs(
+                input,
+                None,
+                None,
+                caches,
+                position_ids.as_deref(),
+            );
             let logits = self.project_logits(&self.norm.forward(&hidden));
             let offset = caches.first().map(Qwen4LayerCache::offset).unwrap_or(0);
             (logits, offset)
@@ -2804,30 +2944,18 @@ impl LanguageModel for Qwen4Model {
         _mask: Option<&MlxArray>,
         last_pos: usize,
     ) -> UniquePtr<MlxArray> {
-        let sequence_length = mlxcel_core::array_shape(input_ids)[1];
-        let rope_delta = self.rope_state.rope_delta();
-        let (anchor, offset) = self.sequence_state.with_internal(|caches| {
-            let cache_offset = caches.first().map(Qwen4LayerCache::offset).unwrap_or(0);
-            let position_ids =
-                rope_delta.map(|delta| decode_rope_positions(cache_offset, sequence_length, delta));
-            let hidden =
-                self.forward_backbone_with_inputs(input_ids, None, caches, position_ids.as_deref());
-            let shape = mlxcel_core::array_shape(&hidden);
-            let position = i32::try_from(last_pos).unwrap_or(i32::MAX);
-            assert!(
-                position < shape[1],
-                "prefill anchor position is outside the input sequence"
-            );
-            let anchor = mlxcel_core::slice(
-                &hidden,
-                &[0, position, 0],
-                &[shape[0], position + 1, 1],
-            );
-            let offset = caches.first().map(Qwen4LayerCache::offset).unwrap_or(0);
-            (anchor, offset)
-        });
-        self.rope_state.set_position(offset);
-        anchor
+        self.forward_prefill_chunk_impl(input_ids, None, last_pos)
+    }
+
+    fn forward_prefill_chunk_with_host_tokens(
+        &self,
+        input_ids: &MlxArray,
+        host_tokens: &[i32],
+        _caches: &mut [KVCache],
+        _mask: Option<&MlxArray>,
+        last_pos: usize,
+    ) -> UniquePtr<MlxArray> {
+        self.forward_prefill_chunk_impl(input_ids, Some(host_tokens), last_pos)
     }
 
     fn forward_last_logits(
@@ -2837,31 +2965,18 @@ impl LanguageModel for Qwen4Model {
         _mask: Option<&MlxArray>,
         last_pos: usize,
     ) -> UniquePtr<MlxArray> {
-        let sequence_length = mlxcel_core::array_shape(input_ids)[1];
-        let rope_delta = self.rope_state.rope_delta();
-        let (logits, offset) = self.sequence_state.with_internal(|caches| {
-            let cache_offset = caches.first().map(Qwen4LayerCache::offset).unwrap_or(0);
-            let position_ids =
-                rope_delta.map(|delta| decode_rope_positions(cache_offset, sequence_length, delta));
-            let hidden =
-                self.forward_backbone_with_inputs(input_ids, None, caches, position_ids.as_deref());
-            let shape = mlxcel_core::array_shape(&hidden);
-            let position = i32::try_from(last_pos).unwrap_or(i32::MAX);
-            assert!(
-                position < shape[1],
-                "last logits position is outside the input sequence"
-            );
-            let hidden = mlxcel_core::slice(
-                &hidden,
-                &[0, position, 0],
-                &[shape[0], position + 1, shape[2]],
-            );
-            let logits = self.project_logits(&self.norm.forward(&hidden));
-            let offset = caches.first().map(Qwen4LayerCache::offset).unwrap_or(0);
-            (logits, offset)
-        });
-        self.rope_state.set_position(offset);
-        logits
+        self.forward_last_logits_impl(input_ids, None, last_pos)
+    }
+
+    fn forward_last_logits_with_host_tokens(
+        &self,
+        input_ids: &MlxArray,
+        host_tokens: &[i32],
+        _caches: &mut [KVCache],
+        _mask: Option<&MlxArray>,
+        last_pos: usize,
+    ) -> UniquePtr<MlxArray> {
+        self.forward_last_logits_impl(input_ids, Some(host_tokens), last_pos)
     }
 
     fn forward_with_embeddings(
@@ -2873,7 +2988,13 @@ impl LanguageModel for Qwen4Model {
     ) -> UniquePtr<MlxArray> {
         let (logits, offset) = self.sequence_state.with_internal(|caches| {
             let hidden = self.rope_state.with_position_ids(|position_ids| {
-                self.forward_backbone_with_inputs(input_ids, input_embeddings, caches, position_ids)
+                self.forward_backbone_with_inputs(
+                    input_ids,
+                    None,
+                    input_embeddings,
+                    caches,
+                    position_ids,
+                )
             });
             let logits = self.project_logits(&self.norm.forward(&hidden));
             let offset = caches.first().map(Qwen4LayerCache::offset).unwrap_or(0);
@@ -3648,6 +3769,113 @@ mod tests {
         let chunked_shifted = shifted_by_row.into_iter().flatten().collect::<Vec<_>>();
         assert_eq!(chunked_shifted, reference_shifted);
         assert_eq!(history, reference_history);
+    }
+
+    #[test]
+    fn host_ple_tokens_skip_readback_and_match_device_chunk_boundaries() {
+        const NGRAM: usize = 4;
+        const HEADS_PER_NGRAM: usize = 2;
+        const EOS: i32 = -1;
+        let head_sizes = [11, 13, 17, 19, 23, 29];
+        let head_offsets = [0, 11, 24, 41, 60, 83];
+        let multipliers = [3, 5, 7, 11];
+        let tokens = [1, 2, EOS, 4, 5, 6, 7];
+        let device = mlxcel_core::from_slice_i32(&tokens, &[1, tokens.len() as i32]);
+        let initial_history = vec![91, 92, 93];
+
+        let (reference_shifted, reference_history) =
+            ple_shifted_tokens(&tokens, &initial_history, 1, tokens.len(), NGRAM, EOS);
+        let mut reference_index_history = initial_history.clone();
+        let reference_indices = prepare_ple_indices(
+            &device,
+            Some(&tokens),
+            &mut reference_index_history,
+            NGRAM,
+            HEADS_PER_NGRAM,
+            &head_sizes,
+            &head_offsets,
+            &multipliers,
+            EOS,
+            |_| panic!("host PLE tokens must not read input IDs back from the device"),
+        )
+        .expect("valid host PLE tokens");
+
+        let mut host_history = initial_history.clone();
+        let mut device_history = initial_history.clone();
+        let mut chunked_shifted = Vec::new();
+        let mut host_indices = Vec::new();
+        let mut device_indices = Vec::new();
+        for (start, end) in [(0, 2), (2, 5), (5, 7)] {
+            let ids = mlxcel_core::slice(&device, &[0, start], &[1, end]);
+            let piece = &tokens[start as usize..end as usize];
+            let (shifted, _) =
+                ple_shifted_tokens(piece, &host_history, 1, piece.len(), NGRAM, EOS);
+            chunked_shifted.extend(shifted);
+            host_indices.extend(
+                prepare_ple_indices(
+                    &ids,
+                    Some(piece),
+                    &mut host_history,
+                    NGRAM,
+                    HEADS_PER_NGRAM,
+                    &head_sizes,
+                    &head_offsets,
+                    &multipliers,
+                    EOS,
+                    |_| panic!("host PLE tokens must not use the device readback seam"),
+                )
+                .expect("valid host PLE chunk"),
+            );
+            device_indices.extend(
+                prepare_ple_indices(
+                    &ids,
+                    None,
+                    &mut device_history,
+                    NGRAM,
+                    HEADS_PER_NGRAM,
+                    &head_sizes,
+                    &head_offsets,
+                    &multipliers,
+                    EOS,
+                    mlxcel_core::array_to_raw_bytes,
+                )
+                .expect("valid device PLE chunk"),
+            );
+            assert_eq!(host_history, device_history);
+        }
+
+        assert_eq!(chunked_shifted, reference_shifted);
+        assert_eq!(host_indices, reference_indices);
+        assert_eq!(device_indices, reference_indices);
+        assert_eq!(host_history, reference_history);
+        assert_eq!(device_history, reference_history);
+        assert_eq!(reference_index_history, reference_history);
+    }
+
+    #[test]
+    fn invalid_host_ple_length_fails_before_history_mutation() {
+        let input_ids = mlxcel_core::from_slice_i32(&[1, 2, 3], &[1, 3]);
+        let mut history = vec![91, 92, 93];
+        let original_history = history.clone();
+        let error = prepare_ple_indices(
+            &input_ids,
+            Some(&[1, 2]),
+            &mut history,
+            4,
+            1,
+            &[11, 13, 17],
+            &[0, 11, 24],
+            &[3, 5, 7, 11],
+            -1,
+            |_| panic!("invalid host PLE tokens must fail before device readback"),
+        )
+        .expect_err("host token length must match the device input shape");
+
+        assert_eq!(
+            error,
+            "Qwen4 PLE input token shape does not match host data"
+        );
+        assert_eq!(history, original_history);
     }
 
     #[test]

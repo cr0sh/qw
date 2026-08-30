@@ -865,9 +865,21 @@ fn chunked_prefill_last_logits<M: LanguageModel + ?Sized>(
     while let Some(piece) = pieces.next() {
         let input = ffi::from_slice_i32(piece, &[1, piece.len() as i32]);
         let piece_output = if pieces.peek().is_none() {
-            model.forward_last_logits(&input, caches, None, piece.len().saturating_sub(1))
+            model.forward_last_logits_with_host_tokens(
+                &input,
+                piece,
+                caches,
+                None,
+                piece.len().saturating_sub(1),
+            )
         } else {
-            model.forward_prefill_chunk(&input, caches, None, piece.len().saturating_sub(1))
+            model.forward_prefill_chunk_with_host_tokens(
+                &input,
+                piece,
+                caches,
+                None,
+                piece.len().saturating_sub(1),
+            )
         };
         // Evaluate now so this chunk's transients are released before the
         // next chunk's graph is built. Intermediate outputs are discarded.
@@ -938,8 +950,13 @@ fn prefill_with_checkpoints<M: LanguageModel + ?Sized>(
             )
         } else {
             let input = ffi::from_slice_i32(piece, &[1, piece.len() as i32]);
-            let logits =
-                model.forward_last_logits(&input, caches, None, piece.len().saturating_sub(1));
+            let logits = model.forward_last_logits_with_host_tokens(
+                &input,
+                piece,
+                caches,
+                None,
+                piece.len().saturating_sub(1),
+            );
             ffi::eval(&logits);
             crate::memory::trace_snapshot(
                 "baseline.prefill.chunk_complete",
@@ -1092,6 +1109,20 @@ pub trait LanguageModel {
         logits_at_position(&logits, last_pos)
     }
 
+    /// Host-token-aware variant of [`Self::forward_last_logits`] for text
+    /// prefill. The default preserves existing model behavior exactly.
+    fn forward_last_logits_with_host_tokens(
+        &self,
+        input_ids: &MlxArray,
+        host_tokens: &[i32],
+        caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+        last_pos: usize,
+    ) -> UniquePtr<MlxArray> {
+        let _ = host_tokens;
+        self.forward_last_logits(input_ids, caches, mask, last_pos)
+    }
+
     /// Forward-pass evaluation anchor for a non-final chunk of single-sequence
     /// prefill. The caller evaluates and discards the returned array.
     ///
@@ -1108,6 +1139,20 @@ pub trait LanguageModel {
         last_pos: usize,
     ) -> UniquePtr<MlxArray> {
         self.forward_last_logits(input_ids, caches, mask, last_pos)
+    }
+
+    /// Host-token-aware variant of [`Self::forward_prefill_chunk`] for text
+    /// prefill. The default preserves existing model behavior exactly.
+    fn forward_prefill_chunk_with_host_tokens(
+        &self,
+        input_ids: &MlxArray,
+        host_tokens: &[i32],
+        caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+        last_pos: usize,
+    ) -> UniquePtr<MlxArray> {
+        let _ = host_tokens;
+        self.forward_prefill_chunk(input_ids, caches, mask, last_pos)
     }
 
     /// Forward with pre-computed embeddings (for VLM prefill)
@@ -1916,8 +1961,9 @@ impl CxxGenerator {
             )
         } else {
             let input = ffi::from_slice_i32(prefill_tokens, &[1, prefill_tokens.len() as i32]);
-            model.forward_last_logits(
+            model.forward_last_logits_with_host_tokens(
                 &input,
+                prefill_tokens,
                 &mut self.caches,
                 None,
                 prefill_tokens.len().saturating_sub(1),
@@ -2060,8 +2106,9 @@ impl CxxGenerator {
                 )
             } else {
                 let input = ffi::from_slice_i32(prefill_tokens, &[1, prefill_tokens.len() as i32]);
-                model.forward_last_logits(
+                model.forward_last_logits_with_host_tokens(
                     &input,
+                    prefill_tokens,
                     &mut self.caches,
                     None,
                     prefill_tokens.len().saturating_sub(1),
@@ -2405,8 +2452,9 @@ impl CxxGenerator {
                 )
             } else {
                 let input = ffi::from_slice_i32(prefill_tokens, &[1, prefill_tokens.len() as i32]);
-                model.forward_last_logits(
+                model.forward_last_logits_with_host_tokens(
                     &input,
+                    prefill_tokens,
                     &mut self.caches,
                     None,
                     prefill_tokens.len().saturating_sub(1),
@@ -2672,8 +2720,9 @@ impl CxxGenerator {
             let input = ffi::from_slice_i32(&padded_tokens, &[1, padded_len as i32]);
             // Last *real* token position; `forward_last_logits` slices there,
             // replacing the previous forward + `logits_at_position` pair.
-            let raw_logits = model.forward_last_logits(
+            let raw_logits = model.forward_last_logits_with_host_tokens(
                 &input,
+                &padded_tokens,
                 &mut self.caches,
                 mask_opt.as_ref().map(|m| m.as_ref().unwrap()),
                 actual_len.saturating_sub(1),
@@ -2687,7 +2736,13 @@ impl CxxGenerator {
             raw_logits
         } else {
             let input = ffi::from_slice_i32(prompt_tokens, &[1, actual_len as i32]);
-            model.forward_last_logits(&input, &mut self.caches, None, actual_len.saturating_sub(1))
+            model.forward_last_logits_with_host_tokens(
+                &input,
+                prompt_tokens,
+                &mut self.caches,
+                None,
+                actual_len.saturating_sub(1),
+            )
         };
 
         if trace_dtype {
@@ -3375,8 +3430,9 @@ impl CxxGenerator {
             let input = ffi::from_slice_i32(&padded_tokens, &[1, padded_len as i32]);
             // Last *real* token position; `forward_last_logits` slices there,
             // replacing the previous forward + `logits_at_position` pair.
-            let raw_logits = model.forward_last_logits(
+            let raw_logits = model.forward_last_logits_with_host_tokens(
                 &input,
+                &padded_tokens,
                 &mut self.caches,
                 mask_opt.as_ref().map(|m| m.as_ref().unwrap()),
                 actual_len.saturating_sub(1),
@@ -3388,7 +3444,13 @@ impl CxxGenerator {
             raw_logits
         } else {
             let input = ffi::from_slice_i32(prompt_tokens, &[1, actual_len as i32]);
-            model.forward_last_logits(&input, &mut self.caches, None, actual_len.saturating_sub(1))
+            model.forward_last_logits_with_host_tokens(
+                &input,
+                prompt_tokens,
+                &mut self.caches,
+                None,
+                actual_len.saturating_sub(1),
+            )
         };
 
         // Sample first token and force sync to measure prefill accurately
@@ -3958,6 +4020,63 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct HostTokenPrefillStubModel {
+        calls: std::cell::RefCell<Vec<(&'static str, Vec<i32>)>>,
+    }
+
+    impl HostTokenPrefillStubModel {
+        fn record(&self, kind: &'static str, host_tokens: &[i32]) -> UniquePtr<MlxArray> {
+            self.calls.borrow_mut().push((kind, host_tokens.to_vec()));
+            ffi::from_slice_f32(&[host_tokens.iter().sum::<i32>() as f32], &[1, 1, 1])
+        }
+    }
+
+    impl LanguageModel for HostTokenPrefillStubModel {
+        fn forward(
+            &self,
+            _input_ids: &MlxArray,
+            _caches: &mut [KVCache],
+            _mask: Option<&MlxArray>,
+        ) -> UniquePtr<MlxArray> {
+            panic!("host-token tracking stub must use the host-aware hooks")
+        }
+
+        fn forward_last_logits_with_host_tokens(
+            &self,
+            _input_ids: &MlxArray,
+            host_tokens: &[i32],
+            _caches: &mut [KVCache],
+            _mask: Option<&MlxArray>,
+            _last_pos: usize,
+        ) -> UniquePtr<MlxArray> {
+            self.record("logits", host_tokens)
+        }
+
+        fn forward_prefill_chunk_with_host_tokens(
+            &self,
+            _input_ids: &MlxArray,
+            host_tokens: &[i32],
+            _caches: &mut [KVCache],
+            _mask: Option<&MlxArray>,
+            _last_pos: usize,
+        ) -> UniquePtr<MlxArray> {
+            self.record("hidden", host_tokens)
+        }
+
+        fn make_caches(&self) -> Vec<KVCache> {
+            vec![KVCache::new()]
+        }
+
+        fn num_layers(&self) -> usize {
+            1
+        }
+
+        fn eos_token_ids(&self) -> Vec<i32> {
+            vec![99]
+        }
+    }
+
     struct CheckpointStubModel {
         supports_chunking: bool,
         seen: std::cell::RefCell<Vec<i32>>,
@@ -4178,6 +4297,26 @@ mod tests {
                 ("logits", vec![1, 2, 3, 4, 5, 6, 7]),
             ],
             "the default hook must retain one forward_last_logits projection per chunk"
+        );
+    }
+
+    #[test]
+    fn chunked_prefill_passes_exact_host_piece_to_each_hook() {
+        let prompt = (1..=7).collect::<Vec<_>>();
+        let model = HostTokenPrefillStubModel::default();
+        let mut caches = model.make_caches();
+
+        let logits =
+            chunked_prefill_last_logits(&model, &mut caches, &prompt, 3, 0, prompt.len());
+        ffi::eval(&logits);
+
+        assert_eq!(
+            model.calls.borrow().as_slice(),
+            &[
+                ("hidden", vec![1, 2, 3]),
+                ("hidden", vec![4, 5, 6]),
+                ("logits", vec![7]),
+            ]
         );
     }
 
