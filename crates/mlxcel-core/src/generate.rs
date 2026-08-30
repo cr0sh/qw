@@ -858,6 +858,7 @@ fn chunked_prefill_last_logits<M: LanguageModel + ?Sized>(
     total_tokens: usize,
 ) -> UniquePtr<MlxArray> {
     debug_assert!(chunk > 0 && !prompt_tokens.is_empty());
+    model.reserve_prefill_capacity(caches, total_tokens);
     let mut logits: Option<UniquePtr<MlxArray>> = None;
     let mut processed_tokens = processed_before;
     for piece in prompt_tokens.chunks(chunk) {
@@ -904,6 +905,7 @@ fn prefill_with_checkpoints<M: LanguageModel + ?Sized>(
     checkpoint_token_lengths: &[usize],
     sequence_id: SequenceId,
 ) -> (UniquePtr<MlxArray>, Vec<ModelStateSnapshot>) {
+    model.reserve_prefill_capacity(caches, prompt_tokens.len());
     let requested = checkpoint_token_lengths
         .iter()
         .copied()
@@ -1046,6 +1048,17 @@ pub trait LanguageModel {
     /// opt-out (issue #674).
     fn supports_chunked_prefill(&self) -> bool {
         true
+    }
+
+    /// Hint the final logical token length before a prefill loop starts.
+    ///
+    /// The default reserves external dense caches. Models with model-owned
+    /// heterogeneous cache state override this hook and may ignore `caches`.
+    fn reserve_prefill_capacity(&self, caches: &mut [KVCache], total_tokens: usize) {
+        let total_tokens = i32::try_from(total_tokens).unwrap_or(i32::MAX);
+        for cache in caches {
+            cache.reserve_prefill_capacity(total_tokens);
+        }
     }
 
     /// Forward pass for a single-sequence prefill whose caller only needs the

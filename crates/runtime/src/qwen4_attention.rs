@@ -387,7 +387,7 @@ impl Qwen4QsaIndexer {
             .expect("QSA raw keys were just installed");
         let key_len = mlxcel_core::array_shape(raw_keys)[1];
         if key_len != past_len + sequence {
-            cache.auxiliary_block_keys = None;
+            cache.clear_auxiliary_blocks();
             return None;
         }
         let complete_blocks = key_len / self.compress_ratio;
@@ -401,24 +401,22 @@ impl Qwen4QsaIndexer {
         let query = self.apply_rope(&query, &query_positions, batch);
 
         let complete_key_len = complete_blocks * self.compress_ratio;
-        let cached_blocks = match cache.auxiliary_block_keys.as_deref() {
-            Some(keys) => {
-                let shape = mlxcel_core::array_shape(keys);
-                if shape[0] != batch || shape[1] != 1 || shape[3] != self.head_dim {
-                    cache.auxiliary_block_keys = None;
-                    0
-                } else if shape[2] > complete_blocks {
-                    cache.auxiliary_block_keys = Some(mlxcel_core::slice(
-                        keys,
-                        &[0, 0, 0, 0],
-                        &[batch, 1, complete_blocks, self.head_dim],
-                    ));
-                    complete_blocks
-                } else {
-                    shape[2]
-                }
+        let cached_blocks = if let Some(keys) = cache.auxiliary_block_keys.as_deref() {
+            let shape = mlxcel_core::array_shape(keys);
+            if shape[0] != batch
+                || shape[1] != 1
+                || shape[3] != self.head_dim
+                || cache.auxiliary_block_len() > shape[2]
+            {
+                cache.clear_auxiliary_blocks();
+                0
+            } else {
+                cache.truncate_auxiliary_blocks(complete_blocks);
+                cache.auxiliary_block_len()
             }
-            None => 0,
+        } else {
+            cache.truncate_auxiliary_blocks(0);
+            0
         };
         if cached_blocks < complete_blocks {
             let new_block_count = complete_blocks - cached_blocks;
@@ -443,15 +441,11 @@ impl Qwen4QsaIndexer {
                 .map(|block| block * self.compress_ratio)
                 .collect::<Vec<_>>();
             let pooled = self.apply_rope(&pooled, &block_positions, batch);
-            cache.auxiliary_block_keys = Some(match cache.auxiliary_block_keys.take() {
-                Some(previous) => mlxcel_core::concatenate(&previous, &pooled, 2),
-                None => pooled,
-            });
+            cache.append_auxiliary_blocks(&pooled);
         }
         let pooled = cache
-            .auxiliary_block_keys
-            .as_deref()
-            .expect("QSA block keys were just installed");
+            .auxiliary_block_keys_view()
+            .expect("QSA logical block keys were just installed");
 
         let query_f32 = mlxcel_core::astype(&query, mlxcel_core::dtype::FLOAT32);
         let pooled_f32 = mlxcel_core::astype(&pooled, mlxcel_core::dtype::FLOAT32);
@@ -1222,14 +1216,12 @@ mod tests {
 
     fn assert_qsa_blocks_equal(actual: &KVCache, expected: &KVCache) {
         let actual = actual
-            .auxiliary_block_keys
-            .as_deref()
+            .auxiliary_block_keys_view()
             .expect("actual QSA summaries");
         let expected = expected
-            .auxiliary_block_keys
-            .as_deref()
+            .auxiliary_block_keys_view()
             .expect("expected QSA summaries");
-        let equal = mlxcel_core::allclose(actual, expected, 0.0, 0.0);
+        let equal = mlxcel_core::allclose(&actual, &expected, 0.0, 0.0);
         mlxcel_core::eval(&equal);
         assert!(mlxcel_core::item_bool(&equal));
     }
@@ -1247,23 +1239,12 @@ mod tests {
         if !materialize_before_rollback {
             cache.materialize_state();
         }
-        assert_eq!(
-            mlxcel_core::array_shape(
-                cache
-                    .auxiliary_block_keys
-                    .as_deref()
-                    .expect("immutable prefix summaries"),
-            )[2],
-            2,
-        );
+        assert_eq!(cache.auxiliary_block_len(), 2);
 
         append_qsa_rows(&indexer, &mut cache, &[90, 91, 92]);
-        let first_rebuild = mlxcel_core::copy(
-            cache
-                .auxiliary_block_keys
-                .as_deref()
-                .expect("first rebuilt summaries"),
-        );
+        let first_rebuild = cache
+            .auxiliary_block_keys_view()
+            .expect("first rebuilt summaries");
         mlxcel_core::eval(&first_rebuild);
         let mut first_reference = KVCache::new();
         append_qsa_rows(&indexer, &mut first_reference, &[1, 2, 3, 4, 5, 6, 7, 8]);
@@ -1277,15 +1258,10 @@ mod tests {
         append_qsa_rows(&indexer, &mut second_reference, &[9, 190, 191, 192]);
         assert_qsa_blocks_equal(&cache, &second_reference);
 
-        let changed = mlxcel_core::allclose(
-            &first_rebuild,
-            cache
-                .auxiliary_block_keys
-                .as_deref()
-                .expect("second rebuilt summaries"),
-            0.0,
-            0.0,
-        );
+        let second_rebuild = cache
+            .auxiliary_block_keys_view()
+            .expect("second rebuilt summaries");
+        let changed = mlxcel_core::allclose(&first_rebuild, &second_rebuild, 0.0, 0.0);
         mlxcel_core::eval(&changed);
         assert!(
             !mlxcel_core::item_bool(&changed),
@@ -1297,6 +1273,74 @@ mod tests {
     fn qsa_rollback_rebuilds_replaced_blocks_before_and_after_materialization() {
         exercise_qsa_rollback_reappend(true);
         exercise_qsa_rollback_reappend(false);
+    }
+
+    fn assert_qsa_plans_equal(actual: Option<Qwen4QsaPlan>, expected: Option<Qwen4QsaPlan>) {
+        let arrays_equal = |actual: &MlxArray, expected: &MlxArray| {
+            assert_arrays_equal(actual, expected);
+        };
+        match (actual, expected) {
+            (None, None) => {}
+            (Some(Qwen4QsaPlan::Mask(actual)), Some(Qwen4QsaPlan::Mask(expected)))
+            | (
+                Some(Qwen4QsaPlan::DecodeIndices(actual)),
+                Some(Qwen4QsaPlan::DecodeIndices(expected)),
+            ) => arrays_equal(&actual, &expected),
+            (
+                Some(Qwen4QsaPlan::VerifyIndices(actual)),
+                Some(Qwen4QsaPlan::VerifyIndices(expected)),
+            ) => {
+                assert_eq!(actual.len(), expected.len());
+                for (actual, expected) in actual.iter().zip(expected.iter()) {
+                    arrays_equal(actual, expected);
+                }
+            }
+            (
+                Some(Qwen4QsaPlan::PrefillIndices {
+                    indices: actual_indices,
+                    valid: actual_valid,
+                }),
+                Some(Qwen4QsaPlan::PrefillIndices {
+                    indices: expected_indices,
+                    valid: expected_valid,
+                }),
+            ) => {
+                arrays_equal(&actual_indices, &expected_indices);
+                arrays_equal(&actual_valid, &expected_valid);
+            }
+            _ => panic!("reserved and unreserved QSA selected different plan variants"),
+        }
+    }
+
+    fn exercise_reserved_qsa_matches_unreserved(materialize_between_chunks: bool) {
+        let indexer = qsa_rollback_indexer();
+        let mut reserved = KVCache::new();
+        reserved.reserve_prefill_capacity(20);
+        let mut unreserved = KVCache::new();
+
+        for tokens in [&[1, 2, 3, 4, 5, 6, 7, 8][..], &[9, 10, 11, 12][..]] {
+            let reserved_plan = indexer.plan(&qsa_token_rows(tokens), &mut reserved);
+            let unreserved_plan = indexer.plan(&qsa_token_rows(tokens), &mut unreserved);
+            assert_qsa_plans_equal(reserved_plan, unreserved_plan);
+            reserved.offset += tokens.len() as i32;
+            unreserved.offset += tokens.len() as i32;
+            if materialize_between_chunks {
+                reserved.materialize_state();
+                unreserved.materialize_state();
+            }
+        }
+
+        assert_eq!(reserved.auxiliary_block_len(), 3);
+        assert_eq!(reserved.auxiliary_block_capacity(), 5);
+        assert_eq!(unreserved.auxiliary_block_len(), 3);
+        assert_eq!(unreserved.auxiliary_block_capacity(), 3);
+        assert_qsa_blocks_equal(&reserved, &unreserved);
+    }
+
+    #[test]
+    fn reserved_qsa_matches_unreserved_plans_lazy_and_eager() {
+        exercise_reserved_qsa_matches_unreserved(false);
+        exercise_reserved_qsa_matches_unreserved(true);
     }
 
     fn unequal_width_attention() -> Qwen4Attention {

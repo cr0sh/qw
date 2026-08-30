@@ -1726,6 +1726,16 @@ impl Qwen4Model {
             .collect()
     }
 
+    pub(crate) fn reserve_prefill_capacity(&self, total_tokens: i32) {
+        self.sequence_state.with_internal(|caches| {
+            for cache in caches {
+                if let Qwen4LayerCache::Attention(cache) = cache {
+                    cache.reserve_prefill_capacity(total_tokens);
+                }
+            }
+        });
+    }
+
     pub(crate) fn has_mtp(&self) -> bool {
         self.mtp.is_some()
     }
@@ -1763,6 +1773,7 @@ impl Qwen4Model {
         if prompt_len == 0 {
             return Err("MTP prefill requires at least one token".to_string());
         }
+        self.reserve_prefill_capacity(prompt_len);
         if let (Some(position_ids), Some(rope_delta)) = (position_ids, rope_delta) {
             self.rope_state.prepare(position_ids, rope_delta);
             self.rope_state.activate_prepared()?;
@@ -1844,6 +1855,10 @@ impl Qwen4Model {
         if suffix_len == 0 {
             return Err("MTP suffix prefill requires at least one token".to_string());
         }
+        let cached_len = self
+            .sequence_state
+            .with_internal(|caches| caches.first().map(Qwen4LayerCache::offset).unwrap_or(0));
+        self.reserve_prefill_capacity(cached_len.saturating_add(suffix_len));
         let configured = mlxcel_core::generate::prefill_chunk_len();
         let chunk_len =
             mlxcel_core::generate::effective_prefill_chunk(configured, true, suffix_len as usize)
@@ -2694,6 +2709,10 @@ impl LanguageModel for Qwen4Model {
         Vec::new()
     }
 
+    fn reserve_prefill_capacity(&self, _caches: &mut [KVCache], total_tokens: usize) {
+        self.reserve_prefill_capacity(i32::try_from(total_tokens).unwrap_or(i32::MAX));
+    }
+
     fn num_layers(&self) -> usize {
         self.layers.len()
     }
@@ -2783,12 +2802,12 @@ impl LanguageModel for Qwen4Model {
                         {
                             return false;
                         }
-                        if let Some(auxiliary_block_keys) = cache.auxiliary_block_keys.as_deref()
+                        if let Some(auxiliary_block_keys) = cache.auxiliary_block_keys_view()
                             && snapshot
                                 .push_paged_tensor(
                                     previous,
                                     format!("layer.{index}.auxiliary_block_keys"),
-                                    auxiliary_block_keys,
+                                    &auxiliary_block_keys,
                                     2,
                                 )
                                 .is_err()
@@ -2805,7 +2824,7 @@ impl LanguageModel for Qwen4Model {
                             .push_paged_tensor(
                                 previous,
                                 format!("layer.{index}.keys"),
-                                tensors.keys,
+                                &tensors.keys,
                                 2,
                             )
                             .is_err()
@@ -2813,7 +2832,7 @@ impl LanguageModel for Qwen4Model {
                                 .push_paged_tensor(
                                     previous,
                                     format!("layer.{index}.values"),
-                                    tensors.values,
+                                    &tensors.values,
                                     2,
                                 )
                                 .is_err()
@@ -2982,7 +3001,7 @@ impl LanguageModel for Qwen4Model {
                             format!("Qwen4 snapshot is missing layer {index} QSA keys")
                         })?,
                 );
-                cache.auxiliary_block_keys = snapshot
+                let auxiliary_block_keys = snapshot
                     .paged_tensor(&format!("layer.{index}.auxiliary_block_keys"))
                     .and_then(|paged| paged.materialize())
                     .or_else(|| {
@@ -2990,6 +3009,7 @@ impl LanguageModel for Qwen4Model {
                             .tensor(&format!("layer.{index}.auxiliary_block_keys"))
                             .map(mlxcel_core::copy)
                     });
+                cache.restore_auxiliary_block_keys(0, auxiliary_block_keys);
                 restored.push(Qwen4LayerCache::Attention(Box::new(cache)));
             }
         }
