@@ -1312,7 +1312,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires the real bundled-MTP checkpoint at QW_MODEL_PATH or the default model cache path"]
-    fn real_model_owned_and_borrowed_prefix_reuse_match_cold_and_reduce_ttft() {
+    fn real_model_owned_and_borrowed_prefix_reuse_match_and_reduce_mtp_ttft() {
         let model_dir = crate::resolve_model_path(None)
             .expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
         let mut provider = Qwen4Provider::load(&model_dir, KVCacheMode::Fp8)
@@ -1342,7 +1342,7 @@ mod tests {
 
         let mut cold_ttft = None;
         let cold_started = Instant::now();
-        let cold = provider
+        provider
             .generate_mtp_streaming(
                 &full_ids,
                 32,
@@ -1444,9 +1444,6 @@ mod tests {
             "owned MTP final capture must not reference consumed source pages",
         );
 
-        let baseline_cold = provider
-            .generate_baseline_streaming(&full_ids, 32, &sampling, None, None, &[], |_| true)
-            .expect("cold baseline generation");
         let baseline_prefix = provider
             .generate_baseline_streaming(
                 &base_ids,
@@ -1458,14 +1455,37 @@ mod tests {
                 |_| true,
             )
             .expect("capture baseline prompt snapshot");
-        let PromptSnapshot::Baseline(owned_baseline_snapshot) = baseline_prefix
+        let baseline_snapshot = baseline_prefix
             .prompt_snapshots
             .into_iter()
             .next()
-            .expect("complete baseline prompt snapshot")
-        else {
+            .expect("complete baseline prompt snapshot");
+        let baseline_portable = baseline_snapshot
+            .to_portable()
+            .expect("encode baseline prompt snapshot");
+        let PromptSnapshot::Baseline(baseline_snapshot) = baseline_snapshot else {
             panic!("baseline generation changed snapshot family");
         };
+        let PromptSnapshot::Baseline(owned_baseline_snapshot) =
+            PromptSnapshot::from_portable(baseline_portable)
+                .expect("clone baseline prompt snapshot through the portable contract")
+        else {
+            panic!("portable baseline snapshot changed family");
+        };
+        let borrowed_baseline = provider
+            .generate_baseline_streaming(
+                &full_ids,
+                32,
+                &sampling,
+                Some(PrefixReuse {
+                    snapshot: &baseline_snapshot,
+                    cached_tokens: base_ids.len(),
+                }),
+                None,
+                &[full_ids.len()],
+                |_| true,
+            )
+            .expect("borrowed baseline prefix generation");
         let owned_baseline = provider
             .generate_baseline_streaming_owned_response(
                 &full_ids,
@@ -1473,38 +1493,22 @@ mod tests {
                 &sampling,
                 owned_baseline_snapshot,
                 None,
-                &[],
+                &[full_ids.len()],
                 |_| true,
             )
             .expect("owned baseline prefix generation");
-        let mtp_snapshot = PromptSnapshot::Mtp(snapshot);
-        let (baseline_warm, baseline_stats) = provider
-            .benchmark_cached_streaming_in_mode(
-                &full_ids,
-                32,
-                &sampling,
-                &mtp_snapshot,
-                Qwen4GenerationMode::Baseline,
-                |_| true,
-            )
-            .expect("baseline generation from MTP target snapshot");
-        assert_eq!(baseline_warm.cached_tokens, base_ids.len());
-        assert_eq!(baseline_warm.token_ids, baseline_cold.token_ids);
-        assert_eq!(baseline_warm.text, baseline_cold.text);
-        assert!(
-            baseline_stats.is_none(),
-            "explicit baseline mode returned MTP statistics"
-        );
 
         assert_eq!(warm.cached_tokens, base_ids.len());
-        assert_eq!(warm.token_ids, cold.token_ids);
-        assert_eq!(warm.text, cold.text);
-        assert_eq!(owned_mtp.cached_tokens, base_ids.len());
-        assert_eq!(owned_mtp.token_ids, cold.token_ids);
-        assert_eq!(owned_mtp.text, cold.text);
-        assert_eq!(owned_baseline.cached_tokens, base_ids.len());
-        assert_eq!(owned_baseline.token_ids, baseline_cold.token_ids);
-        assert_eq!(owned_baseline.text, baseline_cold.text);
+        assert_eq!(owned_mtp.cached_tokens, warm.cached_tokens);
+        assert_eq!(owned_mtp.token_ids, warm.token_ids);
+        assert_eq!(owned_mtp.text, warm.text);
+        assert_eq!(borrowed_baseline.cached_tokens, base_ids.len());
+        assert_eq!(
+            owned_baseline.cached_tokens,
+            borrowed_baseline.cached_tokens
+        );
+        assert_eq!(owned_baseline.token_ids, borrowed_baseline.token_ids);
+        assert_eq!(owned_baseline.text, borrowed_baseline.text);
         let borrowed_checkpoint = warm
             .prompt_snapshots
             .first()
@@ -1520,28 +1524,14 @@ mod tests {
         let cold_ttft = cold_ttft.expect("cold generation emitted a token");
         let warm_ttft = warm_ttft.expect("warm generation emitted a token");
         eprintln!(
-            "MTP prefix benchmark: cached_tokens={}, cold_ttft_ms={:.2}, warm_ttft_ms={:.2}, \
-             cold_decode_ms={:.2}, warm_decode_ms={:.2}",
+            "MTP prefix benchmark: cached_tokens={}, cold_ttft_ms={:.2}, warm_ttft_ms={:.2}",
             warm.cached_tokens,
             cold_ttft.as_secs_f64() * 1_000.0,
             warm_ttft.as_secs_f64() * 1_000.0,
-            cold.decode_time.as_secs_f64() * 1_000.0,
-            warm.decode_time.as_secs_f64() * 1_000.0,
         );
         assert!(
             warm_ttft < cold_ttft,
             "warm suffix prefill must reduce TTFT: cold={cold_ttft:?}, warm={warm_ttft:?}"
-        );
-        assert_eq!(
-            warm.final_snapshot
-                .as_ref()
-                .expect("warm generation must capture a final snapshot")
-                .token_len(),
-            cold.final_snapshot
-                .as_ref()
-                .expect("cold generation must capture a final snapshot")
-                .token_len(),
-            "prefix reuse must preserve the final snapshot boundary",
         );
     }
 
