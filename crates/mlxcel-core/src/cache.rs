@@ -747,24 +747,24 @@ impl KVCache {
                 &[shape[0], shape[1], capacity, shape[3]],
                 ffi::array_dtype(blocks),
             );
-            self.auxiliary_block_keys = Some(if let Some(previous_keys) =
-                self.auxiliary_block_keys.as_ref()
-            {
-                let old_shape = ffi::array_shape(previous_keys);
-                let logical = ffi::slice(
-                    previous_keys,
-                    &[0, 0, 0, 0],
-                    &[old_shape[0], old_shape[1], previous, old_shape[3]],
-                );
-                ffi::slice_update(
-                    &backing,
-                    &logical,
-                    &[0, 0, 0, 0],
-                    &[shape[0], shape[1], previous, shape[3]],
-                )
-            } else {
-                backing
-            });
+            self.auxiliary_block_keys = Some(
+                if let Some(previous_keys) = self.auxiliary_block_keys.as_ref() {
+                    let old_shape = ffi::array_shape(previous_keys);
+                    let logical = ffi::slice(
+                        previous_keys,
+                        &[0, 0, 0, 0],
+                        &[old_shape[0], old_shape[1], previous, old_shape[3]],
+                    );
+                    ffi::slice_update(
+                        &backing,
+                        &logical,
+                        &[0, 0, 0, 0],
+                        &[shape[0], shape[1], previous, shape[3]],
+                    )
+                } else {
+                    backing
+                },
+            );
         }
         let backing = self
             .auxiliary_block_keys
@@ -1350,16 +1350,8 @@ impl KVCache {
             if prev > 0 {
                 let old_k = self.keys.as_ref().expect("existing FP16 K backing");
                 let old_v = self.values.as_ref().expect("existing FP16 V backing");
-                let old_k = ffi::slice(
-                    old_k,
-                    &[0, 0, 0, 0],
-                    &[b, n_kv_heads, prev, k_head_dim],
-                );
-                let old_v = ffi::slice(
-                    old_v,
-                    &[0, 0, 0, 0],
-                    &[b, n_kv_heads, prev, v_head_dim],
-                );
+                let old_k = ffi::slice(old_k, &[0, 0, 0, 0], &[b, n_kv_heads, prev, k_head_dim]);
+                let old_v = ffi::slice(old_v, &[0, 0, 0, 0], &[b, n_kv_heads, prev, v_head_dim]);
                 self.keys = Some(ffi::slice_update(
                     &new_k,
                     &old_k,
@@ -1429,16 +1421,8 @@ impl KVCache {
             if prev > 0 {
                 let old_k = self.keys.as_ref().expect("existing FP8 K backing");
                 let old_v = self.values.as_ref().expect("existing FP8 V backing");
-                let old_k = ffi::slice(
-                    old_k,
-                    &[0, 0, 0, 0],
-                    &[b, n_kv_heads, prev, k_head_dim],
-                );
-                let old_v = ffi::slice(
-                    old_v,
-                    &[0, 0, 0, 0],
-                    &[b, n_kv_heads, prev, v_head_dim],
-                );
+                let old_k = ffi::slice(old_k, &[0, 0, 0, 0], &[b, n_kv_heads, prev, k_head_dim]);
+                let old_v = ffi::slice(old_v, &[0, 0, 0, 0], &[b, n_kv_heads, prev, v_head_dim]);
                 self.keys = Some(ffi::slice_update(
                     &new_k,
                     &old_k,
@@ -8279,7 +8263,9 @@ mod tests {
     #[test]
     fn reserved_fp16_capacity_is_logically_empty_stable_and_grows_on_overrun() {
         let rows = |start: i32, len: i32| {
-            let values = (start..start + len).map(|value| value as f32).collect::<Vec<_>>();
+            let values = (start..start + len)
+                .map(|value| value as f32)
+                .collect::<Vec<_>>();
             ffi::from_slice_f32(&values, &[1, 1, len, 1])
         };
         let mut cache = KVCache::new();

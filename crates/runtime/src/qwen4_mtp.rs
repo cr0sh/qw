@@ -1623,9 +1623,8 @@ fn prefill_for_input(
     drafter.reset();
     let prompt = prompt_for_prefill(prefill_input);
     let prompt_len = mlxcel_core::array_shape(prompt)[1] as usize;
-    drafter.reserve_prefill_capacity(
-        i32::try_from(prompt_len.saturating_sub(1)).unwrap_or(i32::MAX),
-    );
+    drafter
+        .reserve_prefill_capacity(i32::try_from(prompt_len.saturating_sub(1)).unwrap_or(i32::MAX));
     let (embeddings, positions, rope_delta) = (None, None, None);
     let prefill = model.forward_mtp_prefill_chunks(
         prompt,

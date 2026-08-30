@@ -381,11 +381,13 @@ impl Qwen4QsaIndexer {
             Some(previous) => mlxcel_core::concatenate(&previous, &raw_keys, 1),
             None => raw_keys,
         });
-        let raw_keys = cache
-            .auxiliary_keys
-            .as_deref()
-            .expect("QSA raw keys were just installed");
-        let key_len = mlxcel_core::array_shape(raw_keys)[1];
+        let raw_keys = mlxcel_core::share(
+            cache
+                .auxiliary_keys
+                .as_deref()
+                .expect("QSA raw keys were just installed"),
+        );
+        let key_len = mlxcel_core::array_shape(&raw_keys)[1];
         if key_len != past_len + sequence {
             cache.clear_auxiliary_blocks();
             return None;
@@ -421,7 +423,7 @@ impl Qwen4QsaIndexer {
         if cached_blocks < complete_blocks {
             let new_block_count = complete_blocks - cached_blocks;
             let pooled = mlxcel_core::slice(
-                raw_keys,
+                &raw_keys,
                 &[0, cached_blocks * self.compress_ratio, 0],
                 &[batch, complete_key_len, self.head_dim],
             );
@@ -434,7 +436,7 @@ impl Qwen4QsaIndexer {
                 2,
                 false,
             );
-            let pooled = mlxcel_core::astype(&pooled, mlxcel_core::array_dtype(raw_keys));
+            let pooled = mlxcel_core::astype(&pooled, mlxcel_core::array_dtype(&raw_keys));
             let pooled = self.k_norm.forward(&pooled);
             let pooled = mlxcel_core::expand_dims(&pooled, 1);
             let block_positions = (cached_blocks..complete_blocks)

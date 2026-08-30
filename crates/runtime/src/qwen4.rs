@@ -1935,8 +1935,7 @@ impl Qwen4Model {
                 .and_then(UnifiedLinear::as_quantized_weight)
                 .is_some_and(|weight| {
                     weight.mode == "affine"
-                        && mlxcel_core::array_dtype(&weight.scales)
-                            == mlxcel_core::dtype::BFLOAT16
+                        && mlxcel_core::array_dtype(&weight.scales) == mlxcel_core::dtype::BFLOAT16
                 });
             // For affine QMM, FP16 rows plus BF16 scales promote the verifier
             // logits to FP32. Cast only after RMSNorm so earlier residual
@@ -3213,8 +3212,7 @@ mod tests {
     fn batched_expert_selection_matches_sequential_row_order() {
         let indices = mlxcel_core::from_slice_i32(&[7, 2, 5, 3, 4, 1], &[1, 2, 3]);
         let scores = mlxcel_core::from_slice_f32(&[0.7, 0.2, 0.5, 0.3, 0.4, 0.1], &[1, 2, 3]);
-        let (batch_indices, batch_scores) =
-            canonicalize_expert_selection(&indices, &scores);
+        let (batch_indices, batch_scores) = canonicalize_expert_selection(&indices, &scores);
 
         let mut sequential_indices = Vec::new();
         let mut sequential_scores = Vec::new();
@@ -3229,8 +3227,7 @@ mod tests {
         let sequential_indices = mlxcel_core::concatenate_owned(&sequential_indices, 1);
         let sequential_scores = mlxcel_core::concatenate_owned(&sequential_scores, 1);
 
-        let expected_indices =
-            mlxcel_core::from_slice_i32(&[2, 5, 7, 1, 3, 4], &[1, 2, 3]);
+        let expected_indices = mlxcel_core::from_slice_i32(&[2, 5, 7, 1, 3, 4], &[1, 2, 3]);
         let expected_scores =
             mlxcel_core::from_slice_f32(&[0.2, 0.5, 0.7, 0.1, 0.3, 0.4], &[1, 2, 3]);
         for equal in [
@@ -3248,12 +3245,9 @@ mod tests {
     fn batched_ple_tail_matches_sequential_dispatches_at_materialization_boundary() {
         const STATE_LEN: i32 = 6;
         const SEQUENCE: i32 = 4;
-        let initial = mlxcel_core::from_slice_f32(
-            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-            &[1, STATE_LEN, 1],
-        );
-        let rows =
-            mlxcel_core::from_slice_f32(&[7.0, 8.0, 9.0, 10.0], &[1, SEQUENCE, 1]);
+        let initial =
+            mlxcel_core::from_slice_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[1, STATE_LEN, 1]);
+        let rows = mlxcel_core::from_slice_f32(&[7.0, 8.0, 9.0, 10.0], &[1, SEQUENCE, 1]);
 
         let (_, batched_tail) = append_ple_conv_state(&initial, &rows, STATE_LEN);
         let mut batched_cache = Qwen4LayerCache::Linear(GatedDeltaCache {
