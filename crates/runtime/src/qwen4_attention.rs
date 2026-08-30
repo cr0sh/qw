@@ -1421,15 +1421,10 @@ mod tests {
             return;
         }
         let bytes: Vec<u8> = (0..=u8::MAX).collect();
-        let raw_values = mlxcel_core::from_bytes(
-            &bytes,
-            &[1, 1, 1, 256],
-            mlxcel_core::dtype::UINT8,
-        );
-        let raw_keys =
-            mlxcel_core::zeros(&[1, 1, 1, 256], mlxcel_core::dtype::UINT8);
-        let queries =
-            mlxcel_core::zeros(&[1, 1, 1, 256], mlxcel_core::dtype::BFLOAT16);
+        let raw_values =
+            mlxcel_core::from_bytes(&bytes, &[1, 1, 1, 256], mlxcel_core::dtype::UINT8);
+        let raw_keys = mlxcel_core::zeros(&[1, 1, 1, 256], mlxcel_core::dtype::UINT8);
+        let queries = mlxcel_core::zeros(&[1, 1, 1, 256], mlxcel_core::dtype::BFLOAT16);
         let indices = mlxcel_core::from_slice_i32(&[0], &[1, 1, 1]);
         let valid = mlxcel_core::ones(&[1, 1, 1], mlxcel_core::dtype::BOOL);
         let actual = mlxcel_core::qsa_sparse_prefill_attention_raw_fp8(
@@ -1446,9 +1441,7 @@ mod tests {
             mlxcel_core::eval(&array);
             mlxcel_core::array_to_raw_bytes(&array)
                 .chunks_exact(4)
-                .map(|bytes| {
-                    f32::from_le_bytes(bytes.try_into().expect("four-byte float"))
-                })
+                .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte float")))
                 .collect::<Vec<_>>()
         };
         assert_eq!(read_f32(&actual), read_f32(&expected));
@@ -1478,32 +1471,24 @@ mod tests {
                 &mlxcel_core::from_slice_f32(&query_values, &[1, 4, 2, 4]),
                 mlxcel_core::dtype::BFLOAT16,
             );
-            let compact_keys = mlxcel_core::to_fp8(&mlxcel_core::from_slice_f32(
-                &key_values,
-                &[1, 2, 5, 4],
-            ));
-            let compact_values = mlxcel_core::to_fp8(&mlxcel_core::from_slice_f32(
-                &value_values,
-                &[1, 2, 5, 4],
-            ));
+            let compact_keys =
+                mlxcel_core::to_fp8(&mlxcel_core::from_slice_f32(&key_values, &[1, 2, 5, 4]));
+            let compact_values =
+                mlxcel_core::to_fp8(&mlxcel_core::from_slice_f32(&value_values, &[1, 2, 5, 4]));
             // Match a step-reserved cache: the live five-token view retains an
             // eight-token physical head stride and must not be flattened.
-            let padding =
-                mlxcel_core::zeros(&[1, 2, 3, 4], mlxcel_core::dtype::UINT8);
+            let padding = mlxcel_core::zeros(&[1, 2, 3, 4], mlxcel_core::dtype::UINT8);
             let padded_keys = mlxcel_core::concatenate(&compact_keys, &padding, 2);
             let padded_values = mlxcel_core::concatenate(&compact_values, &padding, 2);
-            let raw_keys =
-                mlxcel_core::slice(&padded_keys, &[0, 0, 0, 0], &[1, 2, 5, 4]);
-            let raw_values =
-                mlxcel_core::slice(&padded_values, &[0, 0, 0, 0], &[1, 2, 5, 4]);
+            let raw_keys = mlxcel_core::slice(&padded_keys, &[0, 0, 0, 0], &[1, 2, 5, 4]);
+            let raw_values = mlxcel_core::slice(&padded_values, &[0, 0, 0, 0], &[1, 2, 5, 4]);
             if eager {
                 mlxcel_core::eval(&raw_keys);
                 mlxcel_core::eval(&raw_values);
             }
             let decoded_keys = mlxcel_core::from_fp8(&raw_keys);
             let decoded_values = mlxcel_core::from_fp8(&raw_values);
-            let indices =
-                mlxcel_core::from_slice_i32(&[3, 0, 2, 4, 4, 2, 3, 1], &[1, 2, 4]);
+            let indices = mlxcel_core::from_slice_i32(&[3, 0, 2, 4, 4, 2, 3, 1], &[1, 2, 4]);
             let valid = mlxcel_core::astype(
                 &mlxcel_core::from_slice_i32(&[1, 1, 1, 0, 0, 1, 1, 1], &[1, 2, 4]),
                 mlxcel_core::dtype::BOOL,

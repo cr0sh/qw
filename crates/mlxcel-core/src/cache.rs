@@ -8080,9 +8080,7 @@ mod tests {
 
     #[test]
     fn raw_fp8_update_returns_only_filled_uint8_range_and_updates_once() {
-        let make = |values: &[f32], sequence| {
-            ffi::from_slice_f32(values, &[1, 1, sequence, 2])
-        };
+        let make = |values: &[f32], sequence| ffi::from_slice_f32(values, &[1, 1, sequence, 2]);
         let mut cache = KVCache::new_with_mode(KVCacheMode::Fp8);
         let first = cache.update_and_fetch_raw_fp8(
             make(&[1.0, -2.0, 0.5, -0.25], 2),
@@ -8095,10 +8093,7 @@ mod tests {
         assert_eq!(ffi::array_dtype(&first.values), dtype::UINT8);
         drop(first);
 
-        let second = cache.update_and_fetch_raw_fp8(
-            make(&[4.0, -8.0], 1),
-            make(&[-4.0, 8.0], 1),
-        );
+        let second = cache.update_and_fetch_raw_fp8(make(&[4.0, -8.0], 1), make(&[-4.0, 8.0], 1));
         assert_eq!(second.live_len, 3);
         assert_eq!(cache.offset, 3);
         assert_eq!(ffi::array_shape(&second.keys), vec![1, 1, 3, 2]);
