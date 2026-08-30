@@ -5,6 +5,7 @@ use anyhow::{Context, Result, bail, ensure};
 use llguidance::api::{GrammarWithLexer, TopLevelGrammar};
 use llguidance::{Constraint, ParserFactory, token_bytes_from_tokenizer_json};
 use mlxcel_core::generate::{ConstraintCommit, ConstraintMask, TokenConstraint};
+use qw_runtime::ChatTool;
 use serde_json::{Map, Value};
 use tokenizers::Tokenizer;
 use toktrie::{InferenceCapabilities, TokEnv, TokRxInfo, TokTrie, TokenId, TokenizerEnv};
@@ -36,8 +37,13 @@ impl TokenizerEnv for LocalTokenizerEnv {
     }
 }
 
+const TOOL_CALL_OPEN: &[u8] = b"<tool_call>";
+const MAX_TOOL_CALL_NAME_BYTES: usize = 256;
+const MAX_TOOL_PARAMETERS: usize = 256;
+
 pub struct GrammarFactory {
     parser: ParserFactory,
+    token_bytes: Arc<Vec<Vec<u8>>>,
 }
 
 impl GrammarFactory {
@@ -76,25 +82,61 @@ impl GrammarFactory {
         )
         .map_err(anyhow::Error::msg)
         .context("failed to initialize canonical structured-output tokenizer")?;
+        let token_bytes = Arc::new(token_bytes);
         let env: TokEnv = Arc::new(LocalTokenizerEnv {
-            trie: TokTrie::from(&info, &token_bytes),
+            trie: TokTrie::from(&info, token_bytes.as_ref()),
             tokenizer,
         });
         let parser = constraint_parser_factory(&env)
             .context("failed to initialize structured-output parser")?;
-        Ok(Self { parser })
+        Ok(Self {
+            parser,
+            token_bytes,
+        })
     }
 
     #[cfg(test)]
     pub fn single_byte() -> Result<Self> {
         let env = toktrie::ApproximateTokEnv::single_byte_env();
+        let token_bytes = Arc::new(
+            (0..env.tok_trie().vocab_size())
+                .map(|token| env.tok_trie().token(token as u32).to_vec())
+                .collect(),
+        );
         let parser = constraint_parser_factory(&env)?;
-        Ok(Self { parser })
+        Ok(Self {
+            parser,
+            token_bytes,
+        })
     }
 
-    pub fn compile(&self, format: &OutputFormat) -> Result<Option<GuidanceConstraint>> {
+    pub fn compile(
+        &self,
+        format: &OutputFormat,
+        tools: &[ChatTool],
+        parallel_tool_calls: bool,
+    ) -> Result<Option<GuidanceConstraint>> {
         let schema = match format {
-            OutputFormat::Text => return Ok(None),
+            OutputFormat::Text if tools.is_empty() => return Ok(None),
+            OutputFormat::Text => {
+                let grammar = tool_call_lark(tools, parallel_tool_calls)?;
+                let parser = self
+                    .parser
+                    .create_parser(TopLevelGrammar {
+                        grammars: vec![GrammarWithLexer {
+                            name: None,
+                            json_schema: None,
+                            lark_grammar: Some(grammar),
+                        }],
+                        max_tokens: None,
+                    })
+                    .context("failed to compile tool-call grammar")?;
+                return Ok(Some(GuidanceConstraint::tool_call(
+                    Constraint::new(parser),
+                    Arc::clone(&self.token_bytes),
+                    !parallel_tool_calls,
+                )));
+            }
             OutputFormat::JsonObject => Value::Object(Map::new()),
             OutputFormat::JsonSchema { schema, .. } => validate_and_normalize_schema(schema)?,
         };
@@ -110,22 +152,274 @@ impl GrammarFactory {
             .parser
             .create_parser(grammar)
             .context("failed to compile structured-output grammar")?;
-        Ok(Some(GuidanceConstraint {
-            inner: Constraint::new(parser),
-            transaction: None,
-        }))
+        Ok(Some(GuidanceConstraint::grammar(Constraint::new(parser))))
     }
 }
 
 pub struct GuidanceConstraint {
+    inner: GuidanceState,
+    transaction: Option<GuidanceState>,
+}
+
+enum GuidanceState {
+    Grammar(Constraint),
+    ToolCall(ToolCallState),
+}
+
+impl GuidanceState {
+    fn deep_clone(&self) -> Self {
+        match self {
+            Self::Grammar(inner) => Self::Grammar(inner.deep_clone()),
+            Self::ToolCall(inner) => Self::ToolCall(inner.deep_clone()),
+        }
+    }
+}
+
+struct ToolCallState {
     inner: Constraint,
-    transaction: Option<Constraint>,
+    token_bytes: Arc<Vec<Vec<u8>>>,
+    marker_prefix: usize,
+    marker_tokens: Vec<TokenId>,
+    active: bool,
+    accept_on_accepting: bool,
+}
+
+impl ToolCallState {
+    fn deep_clone(&self) -> Self {
+        Self {
+            inner: self.inner.deep_clone(),
+            token_bytes: Arc::clone(&self.token_bytes),
+            marker_prefix: self.marker_prefix,
+            marker_tokens: self.marker_tokens.clone(),
+            active: self.active,
+            accept_on_accepting: self.accept_on_accepting,
+        }
+    }
 }
 
 impl GuidanceConstraint {
-    fn active(&mut self) -> &mut Constraint {
+    fn grammar(inner: Constraint) -> Self {
+        Self {
+            inner: GuidanceState::Grammar(inner),
+            transaction: None,
+        }
+    }
+
+    fn tool_call(
+        inner: Constraint,
+        token_bytes: Arc<Vec<Vec<u8>>>,
+        accept_on_accepting: bool,
+    ) -> Self {
+        Self {
+            inner: GuidanceState::ToolCall(ToolCallState {
+                inner,
+                token_bytes,
+                marker_prefix: 0,
+                marker_tokens: Vec::with_capacity(TOOL_CALL_OPEN.len()),
+                active: false,
+                accept_on_accepting,
+            }),
+            transaction: None,
+        }
+    }
+
+    fn active(&mut self) -> &mut GuidanceState {
         self.transaction.as_mut().unwrap_or(&mut self.inner)
     }
+}
+
+fn tool_call_lark(tools: &[ChatTool], parallel_tool_calls: bool) -> Result<String> {
+    ensure!(!tools.is_empty(), "tool-call grammar requires at least one tool");
+    let mut grammar = String::from("start[lazy]: /(?s:.*)/ tool_call");
+    if parallel_tool_calls {
+        grammar.push('+');
+    }
+    grammar.push_str("\ntool_call: \"<tool_call>\" function \"</tool_call>\"\nfunction: ");
+    for index in 0..tools.len() {
+        if index != 0 {
+            grammar.push_str(" | ");
+        }
+        grammar.push_str(&format!("function_{index}"));
+    }
+    grammar.push('\n');
+
+    const ROOT_KEYWORDS: &[&str] = &[
+        "$schema",
+        "$id",
+        "$defs",
+        "definitions",
+        "title",
+        "description",
+        "default",
+        "examples",
+        "deprecated",
+        "readOnly",
+        "writeOnly",
+        "type",
+        "properties",
+        "required",
+        "additionalProperties",
+    ];
+    for (function_index, tool) in tools.iter().enumerate() {
+        validate_tag_name(&tool.function.name, "function")?;
+        let schema = validate_and_normalize_schema(&tool.function.parameters)
+            .with_context(|| format!("invalid parameters for tool {:?}", tool.function.name))?;
+        let object = schema
+            .as_object()
+            .expect("normalized tool parameters must be an object");
+        for key in object.keys() {
+            ensure!(
+                ROOT_KEYWORDS.contains(&key.as_str()),
+                "tool {:?} uses root JSON Schema keyword {key:?}, which cannot be represented as ordered parameters",
+                tool.function.name
+            );
+        }
+        if let Some(schema_type) = object.get("type") {
+            ensure!(
+                schema_type.as_str() == Some("object"),
+                "tool {:?} parameters must have JSON Schema type \"object\"",
+                tool.function.name
+            );
+        }
+        let empty_properties = Map::new();
+        let properties = match object.get("properties") {
+            None => &empty_properties,
+            Some(Value::Object(properties)) => properties,
+            Some(_) => bail!(
+                "tool {:?} JSON Schema properties must be an object",
+                tool.function.name
+            ),
+        };
+        ensure!(
+            properties.len() <= MAX_TOOL_PARAMETERS,
+            "tool {:?} declares too many parameters",
+            tool.function.name
+        );
+        let mut required = BTreeSet::new();
+        if let Some(required_values) = object.get("required") {
+            let required_values = required_values.as_array().with_context(|| {
+                format!(
+                    "tool {:?} JSON Schema required must be an array",
+                    tool.function.name
+                )
+            })?;
+            for value in required_values {
+                let name = value.as_str().with_context(|| {
+                    format!(
+                        "tool {:?} JSON Schema required entries must be strings",
+                        tool.function.name
+                    )
+                })?;
+                ensure!(
+                    required.insert(name.to_string()),
+                    "tool {:?} lists required parameter {name:?} more than once",
+                    tool.function.name
+                );
+                ensure!(
+                    properties.contains_key(name),
+                    "tool {:?} requires undeclared parameter {name:?}",
+                    tool.function.name
+                );
+            }
+        }
+
+        grammar.push_str(&format!(
+            "function_{function_index}: {}",
+            lark_literal(&format!("<function={}>", tool.function.name))?
+        ));
+        for (parameter_index, (name, schema)) in properties.iter().enumerate() {
+            validate_tag_name(name, "parameter")?;
+            validate_nested_references(schema, &tool.function.name, name)?;
+            grammar.push(' ');
+            grammar.push_str(&format!("parameter_{function_index}_{parameter_index}"));
+            if !required.contains(name.as_str()) {
+                grammar.push('?');
+            }
+        }
+        grammar.push(' ');
+        grammar.push_str(&lark_literal("</function>")?);
+        grammar.push('\n');
+
+        for (parameter_index, (name, schema)) in properties.iter().enumerate() {
+            let nested_schema = nested_property_schema(object, schema);
+            grammar.push_str(&format!(
+                "parameter_{function_index}_{parameter_index}: {} value_{function_index}_{parameter_index} {}\n",
+                lark_literal(&format!("<parameter={name}>"))?,
+                lark_literal("</parameter>")?,
+            ));
+            grammar.push_str(&format!(
+                "value_{function_index}_{parameter_index}: %json {}\n",
+                serde_json::to_string(&nested_schema)
+                    .context("failed to serialize tool parameter schema")?
+            ));
+        }
+    }
+    Ok(grammar)
+}
+
+fn lark_literal(value: &str) -> Result<String> {
+    serde_json::to_string(value).context("failed to escape tool-call grammar literal")
+}
+
+fn validate_tag_name(name: &str, kind: &str) -> Result<()> {
+    ensure!(!name.is_empty(), "{kind} name must not be empty");
+    ensure!(
+        name.len() <= MAX_TOOL_CALL_NAME_BYTES,
+        "{kind} name is too long"
+    );
+    ensure!(
+        name.trim() == name,
+        "{kind} name must not have leading or trailing whitespace"
+    );
+    ensure!(
+        !name.bytes().any(|byte| matches!(byte, b'<' | b'>')),
+        "{kind} name contains an XML delimiter"
+    );
+    ensure!(
+        !(name.len() >= 2
+            && ((name.starts_with('"') && name.ends_with('"'))
+                || (name.starts_with('\'') && name.ends_with('\'')))),
+        "{kind} name cannot be represented without changing its value"
+    );
+    Ok(())
+}
+
+fn validate_nested_references(schema: &Value, tool: &str, parameter: &str) -> Result<()> {
+    match schema {
+        Value::Array(values) => {
+            for value in values {
+                validate_nested_references(value, tool, parameter)?;
+            }
+        }
+        Value::Object(object) => {
+            if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
+                ensure!(
+                    reference == "#"
+                        || reference.starts_with("#/$defs/")
+                        || reference.starts_with("#/definitions/"),
+                    "tool {tool:?} parameter {parameter:?} uses reference {reference:?}, which cannot be represented independently"
+                );
+            }
+            for value in object.values() {
+                validate_nested_references(value, tool, parameter)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn nested_property_schema(root: &Map<String, Value>, property: &Value) -> Value {
+    let Value::Object(property) = property else {
+        return property.clone();
+    };
+    let mut nested = property.clone();
+    for key in ["$defs", "definitions"] {
+        if let Some(definitions) = root.get(key) {
+            nested.insert(key.to_string(), definitions.clone());
+        }
+    }
+    Value::Object(nested)
 }
 
 fn constraint_parser_factory(env: &TokEnv) -> Result<ParserFactory> {
@@ -160,6 +454,94 @@ fn guidance_commit(
     })
 }
 
+fn guidance_mask(
+    active: &mut Constraint,
+    accept_on_accepting: bool,
+) -> std::result::Result<ConstraintMask, String> {
+    let step = active.compute_mask().map_err(|error| error.to_string())?;
+    if step.is_stop() {
+        return Ok(ConstraintMask::Accept);
+    }
+    if let Some(mask) = step.sample_mask.as_ref() {
+        let mut allowed = Vec::new();
+        mask.iter_set_entries(|token| allowed.push(token as i32));
+        if allowed.is_empty() {
+            return Err("structured-output grammar produced an empty token mask".to_string());
+        }
+        return Ok(ConstraintMask::Allow(allowed));
+    }
+    let result = active
+        .commit_token(None)
+        .map_err(|error| error.to_string())?;
+    let accepting = accept_on_accepting && active.parser.is_accepting();
+    guidance_commit(result, accepting).map(ConstraintMask::Splice)
+}
+
+fn guidance_token(
+    active: &mut Constraint,
+    token: TokenId,
+    accept_on_accepting: bool,
+) -> std::result::Result<ConstraintCommit, String> {
+    let result = active
+        .commit_token(Some(token))
+        .map_err(|error| error.to_string())?;
+    let accepting = accept_on_accepting && active.parser.is_accepting();
+    guidance_commit(result, accepting)
+}
+
+impl ToolCallState {
+    fn commit_passthrough(
+        &mut self,
+        token: TokenId,
+    ) -> std::result::Result<ConstraintCommit, String> {
+        let token_index = token as usize;
+        let token_len = self
+            .token_bytes
+            .get(token_index)
+            .ok_or_else(|| "tool-call constraint received a token outside the vocabulary".to_string())?
+            .len();
+        let mut current_retained = false;
+        for index in 0..token_len {
+            let byte = self.token_bytes[token_index][index];
+            if byte == TOOL_CALL_OPEN[self.marker_prefix] {
+                if self.marker_prefix == 0 {
+                    self.marker_tokens.clear();
+                }
+                if !current_retained {
+                    self.marker_tokens.push(token);
+                    current_retained = true;
+                }
+                self.marker_prefix += 1;
+                if self.marker_prefix == TOOL_CALL_OPEN.len() {
+                    self.marker_prefix = 0;
+                    let marker_tokens = std::mem::take(&mut self.marker_tokens);
+                    self.inner.start_without_prompt();
+                    self.inner
+                        .force_tokens(&marker_tokens)
+                        .map_err(|error| error.to_string())?;
+                    self.active = true;
+                    let accepting =
+                        self.accept_on_accepting && self.inner.parser.is_accepting();
+                    return Ok(ConstraintCommit {
+                        backtrack: 0,
+                        tokens: vec![token as i32],
+                        accept: accepting,
+                    });
+                }
+            } else {
+                self.marker_tokens.clear();
+                current_retained = false;
+                self.marker_prefix = usize::from(byte == TOOL_CALL_OPEN[0]);
+                if self.marker_prefix != 0 {
+                    self.marker_tokens.push(token);
+                    current_retained = true;
+                }
+            }
+        }
+        Ok(ConstraintCommit::token(token as i32))
+    }
+}
+
 impl TokenConstraint for GuidanceConstraint {
     fn begin_transaction(&mut self) -> std::result::Result<(), String> {
         if self.transaction.is_some() {
@@ -186,35 +568,31 @@ impl TokenConstraint for GuidanceConstraint {
         _logits: &mlxcel_core::MlxArray,
         _token_history: &[i32],
     ) -> std::result::Result<ConstraintMask, String> {
-        let active = self.active();
-        let step = active.compute_mask().map_err(|error| error.to_string())?;
-        if step.is_stop() {
-            return Ok(ConstraintMask::Accept);
-        }
-        if let Some(mask) = step.sample_mask.as_ref() {
-            let mut allowed = Vec::new();
-            mask.iter_set_entries(|token| allowed.push(token as i32));
-            if allowed.is_empty() {
-                return Err("structured-output grammar produced an empty token mask".to_string());
+        match self.active() {
+            GuidanceState::Grammar(active) => guidance_mask(active, true),
+            GuidanceState::ToolCall(active) if !active.active => {
+                Ok(ConstraintMask::PassThrough)
             }
-            return Ok(ConstraintMask::Allow(allowed));
+            GuidanceState::ToolCall(active) => {
+                let accept_on_accepting = active.accept_on_accepting;
+                guidance_mask(&mut active.inner, accept_on_accepting)
+            }
         }
-        let result = active
-            .commit_token(None)
-            .map_err(|error| error.to_string())?;
-        let accepting = active.parser.is_accepting();
-        guidance_commit(result, accepting).map(ConstraintMask::Splice)
     }
 
     fn commit_token(&mut self, token_id: i32) -> std::result::Result<ConstraintCommit, String> {
         let token = u32::try_from(token_id)
             .map_err(|_| "structured-output grammar received a negative token".to_string())?;
-        let active = self.active();
-        let result = active
-            .commit_token(Some(token))
-            .map_err(|error| error.to_string())?;
-        let accepting = active.parser.is_accepting();
-        guidance_commit(result, accepting)
+        match self.active() {
+            GuidanceState::Grammar(active) => guidance_token(active, token, true),
+            GuidanceState::ToolCall(active) if !active.active => {
+                active.commit_passthrough(token)
+            }
+            GuidanceState::ToolCall(active) => {
+                let accept_on_accepting = active.accept_on_accepting;
+                guidance_token(&mut active.inner, token, accept_on_accepting)
+            }
+        }
     }
 }
 
@@ -414,31 +792,110 @@ fn reject_regex_lookaround(pattern: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qw_runtime::ChatToolFunction;
     use serde_json::json;
 
     fn mask_signature(mask: ConstraintMask) -> (u8, Vec<i32>) {
         match mask {
-            ConstraintMask::Allow(tokens) => (0, tokens),
+            ConstraintMask::PassThrough => (0, Vec::new()),
+            ConstraintMask::Allow(tokens) => (1, tokens),
             ConstraintMask::Splice(commit) => {
                 let mut values = vec![commit.backtrack as i32, i32::from(commit.accept)];
                 values.extend(commit.tokens);
-                (1, values)
+                (2, values)
             }
-            ConstraintMask::Accept => (2, Vec::new()),
+            ConstraintMask::Accept => (3, Vec::new()),
         }
+    }
+
+    fn tool(name: &str, parameters: Value) -> ChatTool {
+        ChatTool {
+            tool_type: "function".to_string(),
+            function: ChatToolFunction {
+                name: name.to_string(),
+                description: None,
+                parameters,
+                strict: None,
+            },
+        }
+    }
+
+    fn logits() -> impl std::ops::Deref<Target = mlxcel_core::MlxArray> {
+        mlxcel_core::from_slice_f32(&[0.0; 262], &[1, 1, 262])
+    }
+
+    fn output_bytes(output: &[i32]) -> Vec<u8> {
+        output
+            .iter()
+            .map(|&token| u8::try_from(token).expect("single-byte token"))
+            .collect()
+    }
+
+    fn drive_to(
+        constraint: &mut GuidanceConstraint,
+        logits: &mlxcel_core::MlxArray,
+        output: &mut Vec<i32>,
+        target: &[u8],
+    ) -> bool {
+        let mut accepted = false;
+        for _ in 0..1024 {
+            let bytes = output_bytes(output);
+            assert!(target.starts_with(&bytes), "grammar emitted {bytes:?}");
+            if bytes.len() == target.len() {
+                return accepted;
+            }
+            match constraint
+                .compute_mask(logits, output)
+                .expect("constraint mask")
+            {
+                ConstraintMask::PassThrough => {
+                    let token = target[bytes.len()] as i32;
+                    let commit = constraint
+                        .commit_token(token)
+                        .expect("commit pass-through token");
+                    accepted = commit.accept;
+                    commit.apply_to(output).expect("apply pass-through token");
+                }
+                ConstraintMask::Allow(allowed) => {
+                    let token = target[bytes.len()] as i32;
+                    assert!(
+                        allowed.contains(&token),
+                        "target byte {:?} is not allowed",
+                        target[bytes.len()]
+                    );
+                    let commit = constraint.commit_token(token).expect("commit allowed token");
+                    accepted = commit.accept;
+                    commit.apply_to(output).expect("apply allowed token");
+                }
+                ConstraintMask::Splice(commit) => {
+                    accepted = commit.accept;
+                    commit.apply_to(output).expect("apply fast-forward");
+                }
+                ConstraintMask::Accept => return true,
+            }
+            if accepted {
+                assert_eq!(output_bytes(output).as_slice(), target);
+                return true;
+            }
+        }
+        panic!("constraint did not reach target");
     }
 
     #[test]
     fn guidance_transaction_rollback_restores_parser_state() {
         let factory = GrammarFactory::single_byte().expect("single-byte grammar");
         let mut constraint = factory
-            .compile(&OutputFormat::JsonSchema {
-                name: "one".to_string(),
-                schema: json!({"type":"integer","const":1}),
-            })
+            .compile(
+                &OutputFormat::JsonSchema {
+                    name: "one".to_string(),
+                    schema: json!({"type":"integer","const":1}),
+                },
+                &[],
+                false,
+            )
             .expect("compile grammar")
             .expect("constraint");
-        let logits = mlxcel_core::from_slice_f32(&[0.0; 262], &[1, 1, 262]);
+        let logits = logits();
 
         constraint.begin_transaction().expect("begin transaction");
         let speculative = mask_signature(
@@ -459,13 +916,17 @@ mod tests {
     fn guidance_fast_forward_produces_schema_valid_json() {
         let factory = GrammarFactory::single_byte().expect("single-byte grammar");
         let mut constraint = factory
-            .compile(&OutputFormat::JsonSchema {
-                name: "one".to_string(),
-                schema: json!({"type":"integer","const":1}),
-            })
+            .compile(
+                &OutputFormat::JsonSchema {
+                    name: "one".to_string(),
+                    schema: json!({"type":"integer","const":1}),
+                },
+                &[],
+                false,
+            )
             .expect("compile grammar")
             .expect("constraint");
-        let logits = mlxcel_core::from_slice_f32(&[0.0; 262], &[1, 1, 262]);
+        let logits = logits();
         let mut output = Vec::new();
 
         for _ in 0..16 {
@@ -473,6 +934,7 @@ mod tests {
                 .compute_mask(&logits, &output)
                 .expect("constraint mask")
             {
+                ConstraintMask::PassThrough => panic!("structured grammar passed through"),
                 ConstraintMask::Allow(allowed) => {
                     let token = if allowed.contains(&(b'1' as i32)) {
                         b'1' as i32
@@ -496,11 +958,222 @@ mod tests {
             }
         }
 
-        let bytes = output
-            .into_iter()
-            .map(|token| u8::try_from(token).expect("single-byte token"))
-            .collect::<Vec<_>>();
-        let value: Value = serde_json::from_slice(&bytes).expect("valid JSON");
+        let value: Value =
+            serde_json::from_slice(&output_bytes(&output)).expect("valid generated JSON");
         assert_eq!(value, json!(1));
+    }
+
+    #[test]
+    fn tool_constraint_passes_through_until_complete_marker() {
+        let factory = GrammarFactory::single_byte().expect("single-byte grammar");
+        let tools = [tool("empty", json!({"type":"object","properties":{}}))];
+        let mut constraint = factory
+            .compile(&OutputFormat::Text, &tools, false)
+            .expect("compile tool grammar")
+            .expect("constraint");
+        let logits = logits();
+        let mut output = Vec::new();
+
+        assert!(!drive_to(
+            &mut constraint,
+            &logits,
+            &mut output,
+            b"ordinary<tool_",
+        ));
+        assert!(matches!(
+            constraint.compute_mask(&logits, &output),
+            Ok(ConstraintMask::PassThrough)
+        ));
+        assert!(!drive_to(
+            &mut constraint,
+            &logits,
+            &mut output,
+            b"ordinary<tool_call>",
+        ));
+        assert!(!matches!(
+            constraint.compute_mask(&logits, &output),
+            Ok(ConstraintMask::PassThrough)
+        ));
+    }
+
+    #[test]
+    fn tool_constraint_emits_declared_schema_values_in_property_order() {
+        let factory = GrammarFactory::single_byte().expect("single-byte grammar");
+        let tools = [tool(
+            "weather",
+            json!({
+                "type":"object",
+                "properties":{
+                    "city":{"type":"string"},
+                    "days":{"type":"integer","minimum":1},
+                    "units":{"type":"string","enum":["c","f"]}
+                },
+                "required":["city","days"],
+                "additionalProperties":false
+            }),
+        )];
+        let mut constraint = factory
+            .compile(&OutputFormat::Text, &tools, false)
+            .expect("compile tool grammar")
+            .expect("constraint");
+        let logits = logits();
+        let target = b"<tool_call><function=weather><parameter=city>\"Paris\"</parameter><parameter=days>2</parameter><parameter=units>\"c\"</parameter></function></tool_call>";
+        let mut output = Vec::new();
+
+        assert!(drive_to(
+            &mut constraint,
+            &logits,
+            &mut output,
+            target
+        ));
+        let parsed = crate::tool_calls::parse_assistant_output(
+            std::str::from_utf8(target).expect("ASCII tool call"),
+            &["weather"],
+            output.len(),
+            output.len(),
+        )
+        .expect("parse constrained tool call");
+        assert_eq!(
+            serde_json::from_str::<Value>(&parsed.tool_calls[0].arguments)
+                .expect("tool arguments"),
+            json!({"city":"Paris","days":2,"units":"c"})
+        );
+    }
+
+    #[test]
+    fn non_parallel_tool_constraint_accepts_at_the_close_tag() {
+        let factory = GrammarFactory::single_byte().expect("single-byte grammar");
+        let tools = [tool("empty", json!({"type":"object","properties":{}}))];
+        let mut constraint = factory
+            .compile(&OutputFormat::Text, &tools, false)
+            .expect("compile tool grammar")
+            .expect("constraint");
+        let logits = logits();
+        let target = b"<tool_call><function=empty></function></tool_call>";
+        let mut output = Vec::new();
+
+        assert!(drive_to(
+            &mut constraint,
+            &logits,
+            &mut output,
+            target
+        ));
+        assert_eq!(output_bytes(&output).as_slice(), target);
+    }
+
+    #[test]
+    fn parallel_tool_constraint_allows_a_second_call() {
+        let factory = GrammarFactory::single_byte().expect("single-byte grammar");
+        let tools = [
+            tool("first", json!({"type":"object","properties":{}})),
+            tool("second", json!({"type":"object","properties":{}})),
+        ];
+        let mut constraint = factory
+            .compile(&OutputFormat::Text, &tools, true)
+            .expect("compile tool grammar")
+            .expect("constraint");
+        let logits = logits();
+        let target = b"<tool_call><function=first></function></tool_call><tool_call><function=second></function></tool_call>";
+        let mut output = Vec::new();
+
+        assert!(!drive_to(
+            &mut constraint,
+            &logits,
+            &mut output,
+            target
+        ));
+        assert_eq!(output_bytes(&output).as_slice(), target);
+        assert!(!matches!(
+            constraint.compute_mask(&logits, &output),
+            Ok(ConstraintMask::PassThrough)
+        ));
+    }
+
+    #[test]
+    fn tool_constraint_transaction_restores_pretrigger_and_active_state() {
+        let factory = GrammarFactory::single_byte().expect("single-byte grammar");
+        let tools = [tool("empty", json!({"type":"object","properties":{}}))];
+        let mut constraint = factory
+            .compile(&OutputFormat::Text, &tools, false)
+            .expect("compile tool grammar")
+            .expect("constraint");
+        let logits = logits();
+        let mut output = Vec::new();
+        assert!(!drive_to(
+            &mut constraint,
+            &logits,
+            &mut output,
+            b"<tool_",
+        ));
+
+        constraint.begin_transaction().expect("begin transaction");
+        let mut speculative_output = output.clone();
+        assert!(!drive_to(
+            &mut constraint,
+            &logits,
+            &mut speculative_output,
+            b"<tool_call>",
+        ));
+        let speculative_active = mask_signature(
+            constraint
+                .compute_mask(&logits, &speculative_output)
+                .expect("active speculative mask"),
+        );
+        assert_ne!(speculative_active.0, 0);
+        constraint.rollback_transaction();
+        assert!(matches!(
+            constraint.compute_mask(&logits, &output),
+            Ok(ConstraintMask::PassThrough)
+        ));
+
+        assert!(!drive_to(
+            &mut constraint,
+            &logits,
+            &mut output,
+            b"<tool_call>",
+        ));
+        constraint.begin_transaction().expect("begin active transaction");
+        let speculative = mask_signature(
+            constraint
+                .compute_mask(&logits, &output)
+                .expect("speculative active mask"),
+        );
+        constraint.rollback_transaction();
+        let committed = mask_signature(
+            constraint
+                .compute_mask(&logits, &output)
+                .expect("committed active mask"),
+        );
+        assert_eq!(speculative, committed);
+    }
+
+    #[test]
+    fn tool_constraint_rejects_unrepresentable_names_and_parameter_schemas() {
+        let factory = GrammarFactory::single_byte().expect("single-byte grammar");
+        assert!(
+            factory
+                .compile(
+                    &OutputFormat::Text,
+                    &[tool("<bad", json!({"type":"object"}))],
+                    false,
+                )
+                .is_err()
+        );
+        assert!(
+            factory
+                .compile(
+                    &OutputFormat::Text,
+                    &[tool(
+                        "bad_schema",
+                        json!({
+                            "type":"object",
+                            "properties":{},
+                            "required":["missing"]
+                        }),
+                    )],
+                    false,
+                )
+                .is_err()
+        );
     }
 }

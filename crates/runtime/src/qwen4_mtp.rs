@@ -946,7 +946,7 @@ impl Qwen4MtpDraftModel {
 
         while tokens.len() < proposal_count {
             let step = constraint_step(&logits, constraint, &history)?;
-            let Some(logits_for_sample) = step.logits() else {
+            let Some(logits_for_sample) = step.logits(&logits) else {
                 if let ConstraintStepLogits::Splice(commit) = step {
                     commit.apply_to(&mut output)?;
                 }
@@ -998,7 +998,7 @@ impl Qwen4MtpDraftModel {
 
         while proposals.len() < proposal_count {
             let step = constraint_step(&logits, constraint, &history)?;
-            let Some(logits_for_sample) = step.logits() else {
+            let Some(logits_for_sample) = step.logits(&logits) else {
                 if let ConstraintStepLogits::Splice(commit) = step {
                     commit.apply_to(&mut output)?;
                 }
@@ -1463,14 +1463,16 @@ fn logits_at(logits: &MlxArray, position: usize) -> UniquePtr<MlxArray> {
 }
 
 enum ConstraintStepLogits {
+    Original,
     Masked(UniquePtr<MlxArray>),
     Splice(ConstraintCommit),
     Accept,
 }
 
 impl ConstraintStepLogits {
-    fn logits(&self) -> Option<&MlxArray> {
+    fn logits<'a>(&'a self, original: &'a MlxArray) -> Option<&'a MlxArray> {
         match self {
+            Self::Original => Some(original),
             Self::Masked(logits) => logits.as_ref(),
             Self::Splice(_) | Self::Accept => None,
         }
@@ -1483,6 +1485,7 @@ fn constraint_step(
     history: &[i32],
 ) -> Result<ConstraintStepLogits, String> {
     match constraint.compute_mask(logits, history)? {
+        ConstraintMask::PassThrough => Ok(ConstraintStepLogits::Original),
         ConstraintMask::Allow(allowed) => Ok(ConstraintStepLogits::Masked(mask_logits_to_allowed(
             logits, &allowed,
         )?)),
@@ -1649,6 +1652,7 @@ fn constrained_initial_step(
     rebuild_history(prompt_tokens, &output, &mut history);
     let step = constraint_step(logits, constraint, &history)?;
     let logits_for_sample = match &step {
+        ConstraintStepLogits::Original => logits,
         ConstraintStepLogits::Masked(logits) => logits
             .as_ref()
             .expect("masked constraint logits must not be null"),
@@ -1775,6 +1779,9 @@ fn constrained_greedy_walk(
         let logits = logits_at(verify_logits, position);
         let step = constraint_step(&logits, constraint, &history)?;
         let logits_for_sample = match &step {
+            ConstraintStepLogits::Original => logits
+                .as_ref()
+                .expect("constraint logits must not be null"),
             ConstraintStepLogits::Masked(logits) => logits
                 .as_ref()
                 .expect("masked constraint logits must not be null"),
@@ -1866,6 +1873,9 @@ fn constrained_stochastic_walk(
         let logits = logits_at(verify_logits, position);
         let step = constraint_step(&logits, constraint, &history)?;
         let logits_for_sample = match &step {
+            ConstraintStepLogits::Original => logits
+                .as_ref()
+                .expect("constraint logits must not be null"),
             ConstraintStepLogits::Masked(logits) => logits
                 .as_ref()
                 .expect("masked constraint logits must not be null"),
@@ -1937,6 +1947,9 @@ fn constrained_stochastic_walk(
     let bonus_logits = logits_at(verify_logits, proposals.len());
     let step = constraint_step(&bonus_logits, constraint, &history)?;
     let logits_for_sample = match &step {
+        ConstraintStepLogits::Original => bonus_logits
+            .as_ref()
+            .expect("constraint logits must not be null"),
         ConstraintStepLogits::Masked(logits) => logits
             .as_ref()
             .expect("masked constraint logits must not be null"),

@@ -153,6 +153,9 @@ fn trim_parameter_value(mut value: &str) -> &str {
 }
 
 fn coerce_parameter(value: &str) -> Value {
+    if let Ok(parsed) = serde_json::from_str(value) {
+        return parsed;
+    }
     let lower = value.to_lowercase();
     if matches!(lower.as_str(), "null" | "none" | "nil") {
         return Value::Null;
@@ -170,11 +173,6 @@ fn coerce_parameter(value: &str) -> Value {
     }
     if matches!(lower.as_str(), "false" | "0" | "no" | "off") {
         return Value::Bool(false);
-    }
-    if (value.starts_with('{') || value.starts_with('['))
-        && let Ok(parsed) = serde_json::from_str(value)
-    {
-        return parsed;
     }
     Value::String(value.to_string())
 }
@@ -320,6 +318,7 @@ mod tests {
              <parameter=bool>TRUE</parameter>\
              <parameter=obj>{\"nested\":[1,{\"x\":false}]}</parameter>\
              <parameter=array>[1,\"two\"]</parameter>\
+             <parameter=quoted>\"hello\"</parameter>\
              <parameter=text>hello</parameter>\
              </function></tool_call>",
         )
@@ -332,6 +331,7 @@ mod tests {
         assert_eq!(arguments["obj"], json!({"nested":[1,{"x":false}]}));
         assert_eq!(arguments["array"], json!([1, "two"]));
         assert_eq!(arguments["text"], "hello");
+        assert_eq!(arguments["quoted"], "hello");
     }
 
     #[test]

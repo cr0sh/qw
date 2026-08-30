@@ -645,21 +645,44 @@ impl Engine {
                 let span = job.span.clone();
                 let _entered = span.enter();
                 debug!(phase = "worker.accepted");
-                if let Err(error) = grammar.compile(&job.request.output_format) {
-                    send_failure(
-                        &job,
-                        FailureKind::InvalidRequest,
-                        format!("invalid structured output schema: {error}"),
-                        Some(output_format_param(job.request.endpoint).to_string()),
-                    );
-                    continue;
-                }
+                let effective_tools = if job.request.tool_choice == ToolChoice::None {
+                    &[][..]
+                } else {
+                    job.request.tools.as_slice()
+                };
+                let tool_grammar = matches!(job.request.output_format, OutputFormat::Text)
+                    && !effective_tools.is_empty();
+                let grammar_active = match grammar.compile(
+                    &job.request.output_format,
+                    effective_tools,
+                    job.request.parallel_tool_calls,
+                ) {
+                    Ok(constraint) => constraint.is_some(),
+                    Err(error) => {
+                        send_failure(
+                            &job,
+                            FailureKind::InvalidRequest,
+                            if tool_grammar {
+                                format!("invalid tool schema: {error}")
+                            } else {
+                                format!("invalid structured output schema: {error}")
+                            },
+                            Some(
+                                if tool_grammar {
+                                    "tools"
+                                } else {
+                                    output_format_param(job.request.endpoint)
+                                }
+                                .to_string(),
+                            ),
+                        );
+                        continue;
+                    }
+                };
                 let fingerprint = request_fingerprint(&job.request);
                 let mut resumed = None;
                 if let Some(response_id) = &job.request.resume_response_id {
-                    if !job.request.image_params.is_empty()
-                        || !matches!(job.request.output_format, OutputFormat::Text)
-                    {
+                    if !job.request.image_params.is_empty() || grammar_active {
                         send_failure(
                             &job,
                             FailureKind::ResumeUnsupported,
@@ -1138,14 +1161,36 @@ impl QwenWorker {
         let span = job.span.clone();
         let _entered = span.enter();
         debug!(phase = "worker.accepted");
-        let mut constraint = match self.grammar.compile(&job.request.output_format) {
+        let effective_tools = if job.request.tool_choice == ToolChoice::None {
+            &[][..]
+        } else {
+            job.request.tools.as_slice()
+        };
+        let tool_grammar = matches!(job.request.output_format, OutputFormat::Text)
+            && !effective_tools.is_empty();
+        let mut constraint = match self.grammar.compile(
+            &job.request.output_format,
+            effective_tools,
+            job.request.parallel_tool_calls,
+        ) {
             Ok(constraint) => constraint,
             Err(error) => {
                 send_failure(
                     &job,
                     FailureKind::InvalidRequest,
-                    format!("invalid structured output schema: {error}"),
-                    Some(output_format_param(job.request.endpoint).to_string()),
+                    if tool_grammar {
+                        format!("invalid tool schema: {error}")
+                    } else {
+                        format!("invalid structured output schema: {error}")
+                    },
+                    Some(
+                        if tool_grammar {
+                            "tools"
+                        } else {
+                            output_format_param(job.request.endpoint)
+                        }
+                        .to_string(),
+                    ),
                 );
                 return;
             }
@@ -1170,11 +1215,6 @@ impl QwenWorker {
             );
             return;
         }
-        let effective_tools = if job.request.tool_choice == ToolChoice::None {
-            &[][..]
-        } else {
-            job.request.tools.as_slice()
-        };
         let tool_enabled = !effective_tools.is_empty();
         let reasoning_effort = job.request.reasoning_effort.map(ReasoningEffort::as_str);
         let prompt_ids = match self.provider.tokenize_messages(
