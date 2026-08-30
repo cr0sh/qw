@@ -29,7 +29,8 @@ use crate::portable_snapshot::{
 };
 use mlxcel_core::generate::{
     ConstraintCommit, ConstraintMask, GenerationStopReason, LanguageModel, ModelStateSnapshot,
-    SamplingConfig, SnapshotPagedTensor, TokenConstraint, mask_logits_to_allowed,
+    SamplingConfig, SnapshotPagedTensor, TokenConstraint, commit_constraint_sample,
+    mask_logits_to_allowed,
 };
 use mlxcel_core::generation_policy::{merged_eos_token_ids, seed_rng_if_needed};
 use mlxcel_core::layers::{KVCache, UnifiedLinear};
@@ -955,11 +956,11 @@ impl Qwen4MtpDraftModel {
             let (token_array, _) = sample_token_optimized(logits_for_sample, sampling, &history);
             mlxcel_core::eval(&token_array);
             let token = mlxcel_core::item_i32(&token_array);
+            let commit = step.commit_sample(constraint, token, eos_tokens)?;
             tokens.push(token);
-            if eos_tokens.contains(&token) {
+            let Some(commit) = commit else {
                 break;
-            }
-            let commit = constraint.commit_token(token)?;
+            };
             let changed = !commit.is_token(token);
             commit.apply_to(&mut output)?;
             rebuild_history(prompt_tokens, &output, &mut history);
@@ -1008,14 +1009,14 @@ impl Qwen4MtpDraftModel {
                 sample_token_with_distribution(logits_for_sample, sampling, &history);
             mlxcel_core::eval(&token_array);
             let token = mlxcel_core::item_i32(&token_array);
+            let commit = step.commit_sample(constraint, token, eos_tokens)?;
             proposals.push(MtpProposal {
                 token,
                 proposal_probs,
             });
-            if eos_tokens.contains(&token) {
+            let Some(commit) = commit else {
                 break;
-            }
-            let commit = constraint.commit_token(token)?;
+            };
             let changed = !commit.is_token(token);
             commit.apply_to(&mut output)?;
             rebuild_history(prompt_tokens, &output, &mut history);
@@ -1464,7 +1465,10 @@ fn logits_at(logits: &MlxArray, position: usize) -> UniquePtr<MlxArray> {
 
 enum ConstraintStepLogits {
     Original,
-    Masked(UniquePtr<MlxArray>),
+    Masked {
+        logits: UniquePtr<MlxArray>,
+        allowed: Vec<i32>,
+    },
     Splice(ConstraintCommit),
     Accept,
 }
@@ -1473,9 +1477,27 @@ impl ConstraintStepLogits {
     fn logits<'a>(&'a self, original: &'a MlxArray) -> Option<&'a MlxArray> {
         match self {
             Self::Original => Some(original),
-            Self::Masked(logits) => logits.as_ref(),
+            Self::Masked { logits, .. } => logits.as_ref(),
             Self::Splice(_) | Self::Accept => None,
         }
+    }
+
+    fn commit_sample(
+        &self,
+        constraint: &mut dyn TokenConstraint,
+        token: i32,
+        eos_tokens: &[i32],
+    ) -> Result<Option<ConstraintCommit>, String> {
+        let allowed = match self {
+            Self::Masked { allowed, .. } => Some(allowed.as_slice()),
+            Self::Original | Self::Splice(_) | Self::Accept => None,
+        };
+        commit_constraint_sample(
+            constraint,
+            token,
+            eos_tokens.contains(&token),
+            allowed,
+        )
     }
 }
 
@@ -1486,9 +1508,10 @@ fn constraint_step(
 ) -> Result<ConstraintStepLogits, String> {
     match constraint.compute_mask(logits, history)? {
         ConstraintMask::PassThrough => Ok(ConstraintStepLogits::Original),
-        ConstraintMask::Allow(allowed) => Ok(ConstraintStepLogits::Masked(mask_logits_to_allowed(
-            logits, &allowed,
-        )?)),
+        ConstraintMask::Allow(allowed) => {
+            let logits = mask_logits_to_allowed(logits, &allowed)?;
+            Ok(ConstraintStepLogits::Masked { logits, allowed })
+        }
         ConstraintMask::Splice(commit) => Ok(ConstraintStepLogits::Splice(commit)),
         ConstraintMask::Accept => Ok(ConstraintStepLogits::Accept),
     }
@@ -1653,7 +1676,7 @@ fn constrained_initial_step(
     let step = constraint_step(logits, constraint, &history)?;
     let logits_for_sample = match &step {
         ConstraintStepLogits::Original => logits,
-        ConstraintStepLogits::Masked(logits) => logits
+        ConstraintStepLogits::Masked { logits, .. } => logits
             .as_ref()
             .expect("masked constraint logits must not be null"),
         ConstraintStepLogits::Splice(commit) => {
@@ -1685,7 +1708,8 @@ fn constrained_initial_step(
     let (token, _) = sample_token_optimized(logits_for_sample, sampling, &history);
     mlxcel_core::eval(&token);
     let token = mlxcel_core::item_i32(&token);
-    if eos_tokens.contains(&token) {
+    let commit = step.commit_sample(constraint, token, eos_tokens)?;
+    if commit.is_none() {
         return Ok(ConstrainedWalk {
             accepted: 0,
             new_tokens: vec![token],
@@ -1694,7 +1718,7 @@ fn constrained_initial_step(
             stop_reason: Some(GenerationStopReason::Eos),
         });
     }
-    let commit = constraint.commit_token(token)?;
+    let commit = commit.expect("non-EOS constraint sample must produce a commit");
     let (rebuild, stop_reason) = apply_walk_commit(
         token,
         commit,
@@ -1782,7 +1806,7 @@ fn constrained_greedy_walk(
             ConstraintStepLogits::Original => logits
                 .as_ref()
                 .expect("constraint logits must not be null"),
-            ConstraintStepLogits::Masked(logits) => logits
+            ConstraintStepLogits::Masked { logits, .. } => logits
                 .as_ref()
                 .expect("masked constraint logits must not be null"),
             ConstraintStepLogits::Splice(commit) => {
@@ -1814,8 +1838,9 @@ fn constrained_greedy_walk(
         let (token_array, _) = sample_token_optimized(logits_for_sample, sampling, &history);
         mlxcel_core::eval(&token_array);
         let target_token = mlxcel_core::item_i32(&token_array);
+        let commit = step.commit_sample(constraint, target_token, eos_tokens)?;
         new_tokens.push(target_token);
-        if eos_tokens.contains(&target_token) {
+        if commit.is_none() {
             return Ok(ConstrainedWalk {
                 accepted,
                 new_tokens,
@@ -1824,13 +1849,12 @@ fn constrained_greedy_walk(
                 stop_reason: Some(GenerationStopReason::Eos),
             });
         }
-
+        let commit = commit.expect("non-EOS constraint sample must produce a commit");
         let matches_proposal =
             position < draft_tokens.len() && target_token == draft_tokens[position];
         if matches_proposal {
             accepted += 1;
         }
-        let commit = constraint.commit_token(target_token)?;
         let (rebuild, stop_reason) = apply_walk_commit(
             target_token,
             commit,
@@ -1876,7 +1900,7 @@ fn constrained_stochastic_walk(
             ConstraintStepLogits::Original => logits
                 .as_ref()
                 .expect("constraint logits must not be null"),
-            ConstraintStepLogits::Masked(logits) => logits
+            ConstraintStepLogits::Masked { logits, .. } => logits
                 .as_ref()
                 .expect("masked constraint logits must not be null"),
             ConstraintStepLogits::Splice(commit) => {
@@ -1914,8 +1938,9 @@ fn constrained_stochastic_walk(
                 }
                 DraftVerdict::Reject { replacement } => replacement,
             };
+        let commit = step.commit_sample(constraint, target_token, eos_tokens)?;
         new_tokens.push(target_token);
-        if eos_tokens.contains(&target_token) {
+        if commit.is_none() {
             return Ok(ConstrainedWalk {
                 accepted,
                 new_tokens,
@@ -1924,7 +1949,7 @@ fn constrained_stochastic_walk(
                 stop_reason: Some(GenerationStopReason::Eos),
             });
         }
-        let commit = constraint.commit_token(target_token)?;
+        let commit = commit.expect("non-EOS constraint sample must produce a commit");
         let (rebuild, stop_reason) = apply_walk_commit(
             target_token,
             commit,
@@ -1950,7 +1975,7 @@ fn constrained_stochastic_walk(
         ConstraintStepLogits::Original => bonus_logits
             .as_ref()
             .expect("constraint logits must not be null"),
-        ConstraintStepLogits::Masked(logits) => logits
+        ConstraintStepLogits::Masked { logits, .. } => logits
             .as_ref()
             .expect("masked constraint logits must not be null"),
         ConstraintStepLogits::Splice(commit) => {
@@ -1982,8 +2007,9 @@ fn constrained_stochastic_walk(
     let (bonus, _) = sample_token_optimized(logits_for_sample, sampling, &history);
     mlxcel_core::eval(&bonus);
     let bonus = mlxcel_core::item_i32(&bonus);
+    let commit = step.commit_sample(constraint, bonus, eos_tokens)?;
     new_tokens.push(bonus);
-    if eos_tokens.contains(&bonus) {
+    if commit.is_none() {
         return Ok(ConstrainedWalk {
             accepted,
             new_tokens,
@@ -1992,7 +2018,7 @@ fn constrained_stochastic_walk(
             stop_reason: Some(GenerationStopReason::Eos),
         });
     }
-    let commit = constraint.commit_token(bonus)?;
+    let commit = commit.expect("non-EOS constraint sample must produce a commit");
     let (rebuild, stop_reason) = apply_walk_commit(
         bonus,
         commit,
@@ -3716,6 +3742,7 @@ mod tests {
         transaction: Option<Vec<i32>>,
         masks: Vec<Vec<i32>>,
         splice_on: Option<(i32, ConstraintCommit)>,
+        accept_on: Option<i32>,
     }
 
     impl RecordingConstraint {
@@ -3761,12 +3788,14 @@ mod tests {
 
         fn commit_token(&mut self, token_id: i32) -> Result<ConstraintCommit, String> {
             self.active().push(token_id);
-            Ok(self
+            let mut commit = self
                 .splice_on
                 .as_ref()
                 .filter(|(token, _)| *token == token_id)
                 .map(|(_, commit)| commit.clone())
-                .unwrap_or_else(|| ConstraintCommit::token(token_id)))
+                .unwrap_or_else(|| ConstraintCommit::token(token_id));
+            commit.accept |= self.accept_on == Some(token_id);
+            Ok(commit)
         }
     }
 
@@ -3776,6 +3805,7 @@ mod tests {
             transaction: None,
             masks: vec![(0..vocab).collect(); phases],
             splice_on: None,
+            accept_on: None,
         }
     }
 
@@ -3889,16 +3919,91 @@ mod tests {
     }
 
     #[test]
-    fn constrained_eos_is_not_committed_to_parser_or_output() {
+    fn constrained_initial_eos_is_committed_before_terminal_stop() {
         let sampling = SamplingConfig::greedy();
         let logits = logits_rows(&[&[0.0, 0.0, 10.0]]);
         let mut constraint = recording_constraint(1, 3);
+        constraint.accept_on = Some(2);
         let walk = commit_constraint_transaction(&mut constraint, |active| {
             constrained_initial_step(&logits, &sampling, &[9], &[], &[2], 8, active)
         })
         .expect("EOS constrained walk");
         assert!(walk.output.is_empty());
+        assert_eq!(constraint.committed, [2]);
+        assert_eq!(walk.stop_reason, Some(GenerationStopReason::Eos));
+    }
+
+    #[test]
+    fn constrained_initial_nonaccepting_eos_is_rejected() {
+        let sampling = SamplingConfig::greedy();
+        let logits = logits_rows(&[&[0.0, 0.0, 10.0]]);
+        let mut constraint = recording_constraint(1, 3);
+        let error = commit_constraint_transaction(&mut constraint, |active| {
+            constrained_initial_step(&logits, &sampling, &[9], &[], &[2], 8, active)
+        })
+        .err()
+        .expect("nonaccepting EOS must fail");
+        assert!(error.contains("before reaching an accepting state"));
         assert!(constraint.committed.is_empty());
+    }
+
+    #[test]
+    fn constrained_greedy_eos_is_committed_before_terminal_stop() {
+        let sampling = SamplingConfig::greedy();
+        let logits = logits_rows(&[&[0.0, 0.0, 10.0]]);
+        let mut constraint = recording_constraint(1, 3);
+        constraint.accept_on = Some(2);
+        let walk = commit_constraint_transaction(&mut constraint, |active| {
+            constrained_greedy_walk(&[2], &logits, &sampling, &[9], &[], &[2], 8, active)
+        })
+        .expect("greedy EOS constrained walk");
+        assert!(walk.output.is_empty());
+        assert_eq!(constraint.committed, [2]);
+        assert_eq!(walk.stop_reason, Some(GenerationStopReason::Eos));
+    }
+
+    #[test]
+    fn constrained_stochastic_eos_is_committed_before_terminal_stop() {
+        let sampling = stochastic_config(7);
+        seed_rng_if_needed(&sampling);
+        let proposal = MtpProposal {
+            token: 2,
+            proposal_probs: probs(&[0.0, 0.0, 1.0]),
+        };
+        let logits = logits_rows(&[&[f32::NEG_INFINITY, f32::NEG_INFINITY, 0.0]]);
+        let mut constraint = recording_constraint(1, 3);
+        constraint.accept_on = Some(2);
+        let walk = commit_constraint_transaction(&mut constraint, |active| {
+            constrained_stochastic_walk(
+                &[proposal],
+                &logits,
+                &sampling,
+                &[9],
+                &[],
+                &[2],
+                8,
+                active,
+            )
+        })
+        .expect("stochastic EOS constrained walk");
+        assert!(walk.output.is_empty());
+        assert_eq!(constraint.committed, [2]);
+        assert_eq!(walk.stop_reason, Some(GenerationStopReason::Eos));
+    }
+
+    #[test]
+    fn constrained_stochastic_bonus_eos_is_committed_before_terminal_stop() {
+        let sampling = stochastic_config(11);
+        seed_rng_if_needed(&sampling);
+        let logits = logits_rows(&[&[f32::NEG_INFINITY, f32::NEG_INFINITY, 0.0]]);
+        let mut constraint = recording_constraint(1, 3);
+        constraint.accept_on = Some(2);
+        let walk = commit_constraint_transaction(&mut constraint, |active| {
+            constrained_stochastic_walk(&[], &logits, &sampling, &[9], &[], &[2], 8, active)
+        })
+        .expect("stochastic bonus EOS constrained walk");
+        assert!(walk.output.is_empty());
+        assert_eq!(constraint.committed, [2]);
         assert_eq!(walk.stop_reason, Some(GenerationStopReason::Eos));
     }
 

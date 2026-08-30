@@ -512,11 +512,15 @@ fn guidance_token(
     active: &mut Constraint,
     token: TokenId,
     accept_on_accepting: bool,
+    accept_eos: bool,
 ) -> std::result::Result<ConstraintCommit, String> {
+    let parser_accepting_before = active.parser.is_accepting();
+    let accepting_eos = accept_eos && parser_accepting_before;
     let result = active
         .commit_token(Some(token))
         .map_err(|error| error.to_string())?;
-    let accepting = accept_on_accepting && active.parser.is_accepting();
+    let parser_accepting_after = active.parser.is_accepting();
+    let accepting = accepting_eos || (accept_on_accepting && parser_accepting_after);
     guidance_commit(result, accepting)
 }
 
@@ -597,17 +601,24 @@ impl TokenConstraint for GuidanceConstraint {
     fn commit_token(&mut self, token_id: i32) -> std::result::Result<ConstraintCommit, String> {
         let token = u32::try_from(token_id)
             .map_err(|_| "structured-output grammar received a negative token".to_string())?;
+        let accept_eos = self.eos_tokens.binary_search(&token).is_ok();
         match self.active() {
-            GuidanceState::Grammar(active) => guidance_token(active, token, true),
+            GuidanceState::Grammar(active) => guidance_token(active, token, true, accept_eos),
             GuidanceState::ToolCall(active) if !active.active => {
                 active.commit_passthrough(token)
             }
             GuidanceState::ToolCall(active) => {
                 let accept_on_accepting = active.accept_on_accepting;
-                guidance_token(&mut active.inner, token, accept_on_accepting)
+                guidance_token(
+                    &mut active.inner,
+                    token,
+                    accept_on_accepting,
+                    accept_eos,
+                )
             }
         }
     }
+
 }
 
 pub fn validate_and_normalize_schema(schema: &Value) -> Result<Value> {
@@ -1305,9 +1316,10 @@ mod tests {
         assert!(accepting_mask.contains(&(PRIMARY_EOS as i32)));
         assert!(accepting_mask.contains(&(SECONDARY_EOS as i32)));
         assert!(accepting_mask.contains(&(TOOL_CALL_TOKEN as i32)));
-        constraint
+        let secondary_eos = constraint
             .commit_token(SECONDARY_EOS as i32)
             .expect("commit secondary EOS");
+        assert!(secondary_eos.accept);
         assert!(matches!(
             constraint.compute_mask(&logits, &output),
             Ok(ConstraintMask::Accept)
@@ -1339,9 +1351,10 @@ mod tests {
         };
         assert!(primary_accepting_mask.contains(&(PRIMARY_EOS as i32)));
         assert!(primary_accepting_mask.contains(&(SECONDARY_EOS as i32)));
-        constraint
+        let primary_eos = constraint
             .commit_token(PRIMARY_EOS as i32)
             .expect("commit primary EOS");
+        assert!(primary_eos.accept);
         constraint
             .commit_transaction()
             .expect("commit primary EOS transaction");

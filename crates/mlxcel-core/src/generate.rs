@@ -602,7 +602,8 @@ impl ModelStateSnapshot {
 pub enum ConstraintMask {
     /// Sample from the original logits without constructing a vocabulary mask.
     PassThrough,
-    /// Continue generation with exactly these token IDs enabled.
+    /// Continue generation with exactly these token IDs enabled. IDs must be
+    /// strictly increasing so sampled-token membership is logarithmic.
     Allow(Vec<i32>),
     /// Apply a parser-requested output splice without sampling a model token.
     Splice(ConstraintCommit),
@@ -669,6 +670,40 @@ pub trait TokenConstraint {
     ) -> Result<ConstraintMask, String>;
 
     fn commit_token(&mut self, token_id: i32) -> Result<ConstraintCommit, String>;
+}
+
+/// Validate and commit one token sampled while a constraint is present.
+///
+/// `allowed_token_ids` is `Some` only when the current constraint step supplied
+/// an allow-list. EOS remains pass-through before a tool grammar activates, but
+/// an EOS selected from an allow-list must advance the same constraint state
+/// that produced that list and may terminate only when that state accepts.
+pub fn commit_constraint_sample(
+    constraint: &mut dyn TokenConstraint,
+    token_id: i32,
+    is_eos: bool,
+    allowed_token_ids: Option<&[i32]>,
+) -> Result<Option<ConstraintCommit>, String> {
+    if allowed_token_ids
+        .is_some_and(|allowed| allowed.binary_search(&token_id).is_err())
+    {
+        return Err(format!(
+            "generation constraint sampled token {token_id} outside its current allowed mask"
+        ));
+    }
+    if !is_eos {
+        return constraint.commit_token(token_id).map(Some);
+    }
+    let Some(_) = allowed_token_ids else {
+        return Ok(None);
+    };
+    let commit = constraint.commit_token(token_id)?;
+    if !commit.accept {
+        return Err(format!(
+            "generation constraint sampled EOS token {token_id} before reaching an accepting state"
+        ));
+    }
+    Ok(None)
 }
 
 /// Why a single-sequence generation loop stopped.
@@ -1090,6 +1125,11 @@ pub fn mask_logits_to_allowed(
         return Err(format!(
             "generation constraint returned a token outside vocabulary 0..{vocab_size}"
         ));
+    }
+    if allowed_token_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(
+            "generation constraint returned token IDs that are not sorted and unique".to_string(),
+        );
     }
     let indices = ffi::from_slice_i32(allowed_token_ids, &[1, 1, allowed_token_ids.len() as i32]);
     let values = ffi::take_along_axis(logits, &indices, -1);
@@ -2407,6 +2447,7 @@ impl CxxGenerator {
                     );
                 }
             }
+            let mut allowed_token_ids = None;
             let constrained_logits;
             let logits_for_sample = if let Some(active) = constraint.as_deref_mut() {
                 match active.compute_mask(
@@ -2421,6 +2462,7 @@ impl CxxGenerator {
                             logits.as_ref().expect("generation logits must not be null"),
                             &allowed,
                         )?;
+                        allowed_token_ids = Some(allowed);
                         constrained_logits
                             .as_ref()
                             .expect("masked generation logits must not be null")
@@ -2473,21 +2515,32 @@ impl CxxGenerator {
             };
             ffi::eval(&token);
             let token_id = ffi::item_i32(&token);
-            if eos_tokens.contains(&token_id) {
-                stop_reason = GenerationStopReason::Eos;
-                break;
-            }
-
+            let sampled_eos = eos_tokens.contains(&token_id);
             let mut replay = false;
             let constraint_accepted = if let Some(active) = constraint.as_deref_mut() {
-                let commit = active.commit_token(token_id)?;
-                replay = !commit.is_token(token_id);
-                commit.apply_to(&mut self.generated_tokens)?;
-                commit.accept
+                let commit = commit_constraint_sample(
+                    active,
+                    token_id,
+                    sampled_eos,
+                    allowed_token_ids.as_deref(),
+                )?;
+                if let Some(commit) = commit {
+                    replay = !commit.is_token(token_id);
+                    commit.apply_to(&mut self.generated_tokens)?;
+                    commit.accept
+                } else {
+                    false
+                }
+            } else if sampled_eos {
+                false
             } else {
                 self.generated_tokens.push(token_id);
                 false
             };
+            if sampled_eos {
+                stop_reason = GenerationStopReason::Eos;
+                break;
+            }
             if self.generated_tokens.len() > max_tokens {
                 self.generated_tokens.truncate(max_tokens);
             }
@@ -2723,6 +2776,7 @@ impl CxxGenerator {
         let mut stop_reason = GenerationStopReason::MaxTokens;
 
         while self.generated_tokens.len() < max_tokens {
+            let mut allowed_token_ids = None;
             let constrained_logits;
             let logits_for_sample = if let Some(active) = constraint.as_deref_mut() {
                 match active.compute_mask(
@@ -2737,6 +2791,7 @@ impl CxxGenerator {
                             logits.as_ref().expect("generation logits must not be null"),
                             &allowed,
                         )?;
+                        allowed_token_ids = Some(allowed);
                         constrained_logits
                             .as_ref()
                             .expect("masked generation logits must not be null")
@@ -2788,21 +2843,32 @@ impl CxxGenerator {
             };
             ffi::eval(&token);
             let token_id = ffi::item_i32(&token);
-            if eos_tokens.contains(&token_id) {
-                stop_reason = GenerationStopReason::Eos;
-                break;
-            }
-
+            let sampled_eos = eos_tokens.contains(&token_id);
             let mut replay = false;
             let constraint_accepted = if let Some(active) = constraint.as_deref_mut() {
-                let commit = active.commit_token(token_id)?;
-                replay = !commit.is_token(token_id);
-                commit.apply_to(&mut self.generated_tokens)?;
-                commit.accept
+                let commit = commit_constraint_sample(
+                    active,
+                    token_id,
+                    sampled_eos,
+                    allowed_token_ids.as_deref(),
+                )?;
+                if let Some(commit) = commit {
+                    replay = !commit.is_token(token_id);
+                    commit.apply_to(&mut self.generated_tokens)?;
+                    commit.accept
+                } else {
+                    false
+                }
+            } else if sampled_eos {
+                false
             } else {
                 self.generated_tokens.push(token_id);
                 false
             };
+            if sampled_eos {
+                stop_reason = GenerationStopReason::Eos;
+                break;
+            }
             if self.generated_tokens.len() > max_tokens {
                 self.generated_tokens.truncate(max_tokens);
             }
@@ -5298,6 +5364,31 @@ mod tests {
             vec![99]
         }
     }
+
+    struct EosStubModel;
+
+    impl LanguageModel for EosStubModel {
+        fn forward(
+            &self,
+            input_ids: &MlxArray,
+            caches: &mut [KVCache],
+            mask: Option<&MlxArray>,
+        ) -> UniquePtr<MlxArray> {
+            StubModel.forward(input_ids, caches, mask)
+        }
+
+        fn make_caches(&self) -> Vec<KVCache> {
+            vec![KVCache::new()]
+        }
+
+        fn num_layers(&self) -> usize {
+            1
+        }
+
+        fn eos_token_ids(&self) -> Vec<i32> {
+            vec![2]
+        }
+    }
     struct AllowOnly(i32);
 
     impl TokenConstraint for AllowOnly {
@@ -5346,6 +5437,35 @@ mod tests {
         }
 
         fn commit_token(&mut self, token_id: i32) -> Result<ConstraintCommit, String> {
+            Ok(ConstraintCommit::token(token_id))
+        }
+    }
+
+    struct NonAcceptingEosConstraint {
+        committed: bool,
+    }
+
+    impl TokenConstraint for NonAcceptingEosConstraint {
+        fn begin_transaction(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn commit_transaction(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn rollback_transaction(&mut self) {}
+
+        fn compute_mask(
+            &mut self,
+            _logits: &MlxArray,
+            _token_history: &[i32],
+        ) -> Result<ConstraintMask, String> {
+            Ok(ConstraintMask::Allow(vec![0, 1, 2]))
+        }
+
+        fn commit_token(&mut self, token_id: i32) -> Result<ConstraintCommit, String> {
+            self.committed = true;
             Ok(ConstraintCommit::token(token_id))
         }
     }
@@ -5421,6 +5541,75 @@ mod tests {
             .expect("constrained generation");
         assert_eq!(constrained.token_ids, vec![2]);
         assert_eq!(constrained.stop_reason, GenerationStopReason::MaxTokens);
+    }
+
+    #[test]
+    fn allowed_mask_stochastic_sampling_never_selects_disallowed_eos() {
+        const VOCAB: usize = 248_320;
+        const EOS: i32 = 248_046;
+        let allowed = [7, 1_024, 248_058];
+        let mut values = vec![-20.0f32; VOCAB];
+        values[EOS as usize] = 100.0;
+        values[allowed[0] as usize] = 2.0;
+        values[allowed[1] as usize] = 1.0;
+        values[allowed[2] as usize] = 0.0;
+        let logits = ffi::from_slice_f32(&values, &[1, 1, VOCAB as i32]);
+        let masked = mask_logits_to_allowed(&logits, &allowed).expect("allowed mask");
+        let sampling = SamplingConfig {
+            temperature: 1.0,
+            top_k: 20,
+            top_p: 0.95,
+            ..SamplingConfig::default()
+        };
+
+        for seed in 0..32 {
+            ffi::random_seed(seed);
+            let (token, _) = sample_token_optimized(&masked, &sampling, &[]);
+            ffi::eval(&token);
+            let token = ffi::item_i32(&token);
+            assert!(
+                allowed.contains(&token),
+                "seed {seed} sampled disallowed token {token}"
+            );
+        }
+    }
+
+    #[test]
+    fn controlled_generation_rejects_nonaccepting_eos_after_constraint_commit() {
+        let mut constraint = NonAcceptingEosConstraint { committed: false };
+        let error = CxxGenerator::new(1)
+            .generate_streaming_controlled(
+                &EosStubModel,
+                &[2],
+                None,
+                1,
+                &SamplingConfig::greedy(),
+                Some(&mut constraint),
+                &[],
+                |_| true,
+            )
+            .err()
+            .expect("nonaccepting EOS must fail");
+        assert!(constraint.committed);
+        assert!(error.contains("before reaching an accepting state"));
+    }
+
+    #[test]
+    fn uncontrolled_generation_still_stops_on_eos_without_emitting_it() {
+        let result = CxxGenerator::new(1)
+            .generate_streaming_controlled(
+                &EosStubModel,
+                &[2],
+                None,
+                1,
+                &SamplingConfig::greedy(),
+                None,
+                &[],
+                |_| true,
+            )
+            .expect("uncontrolled EOS");
+        assert!(result.token_ids.is_empty());
+        assert_eq!(result.stop_reason, GenerationStopReason::Eos);
     }
 
     #[test]

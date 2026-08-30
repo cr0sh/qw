@@ -93,11 +93,9 @@ pub fn parse_assistant_output(
                 !arguments.contains_key(&parameter),
                 "duplicate parameter name {parameter:?}"
             );
-            let end = after_parameter_name
-                .find(PARAMETER_CLOSE)
+            let (end, value) = parse_parameter_value(after_parameter_name)
                 .ok_or_else(|| anyhow::anyhow!("unclosed parameter {parameter:?}"))?;
-            let value = trim_parameter_value(&after_parameter_name[..end]);
-            arguments.insert(parameter, coerce_parameter(value));
+            arguments.insert(parameter, value);
             remaining = &after_parameter_name[end + PARAMETER_CLOSE.len()..];
         }
         remaining = trim_leading_whitespace(remaining);
@@ -150,6 +148,22 @@ fn trim_parameter_value(mut value: &str) -> &str {
         value = stripped;
     }
     value.trim()
+}
+
+fn parse_parameter_value(input: &str) -> Option<(usize, Value)> {
+    let mut first_close = None;
+    for (end, _) in input.match_indices(PARAMETER_CLOSE) {
+        first_close.get_or_insert(end);
+        let value = trim_parameter_value(&input[..end]);
+        if let Ok(parsed) = serde_json::from_str(value) {
+            return Some((end, parsed));
+        }
+    }
+    let end = first_close?;
+    Some((
+        end,
+        coerce_parameter(trim_parameter_value(&input[..end])),
+    ))
 }
 
 fn coerce_parameter(value: &str) -> Value {
@@ -332,6 +346,18 @@ mod tests {
         assert_eq!(arguments["array"], json!([1, "two"]));
         assert_eq!(arguments["text"], "hello");
         assert_eq!(arguments["quoted"], "hello");
+    }
+
+    #[test]
+    fn parses_a_json_string_containing_the_parameter_close_marker() {
+        let output = parse(
+            "<tool_call><function=weather>\
+             <parameter=city>\"/>.</parameter>=\"</parameter>\
+             </function></tool_call>",
+        )
+        .expect("parse embedded marker");
+        let arguments: Value = serde_json::from_str(&output.tool_calls[0].arguments).unwrap();
+        assert_eq!(arguments["city"], "/>.</parameter>=");
     }
 
     #[test]
