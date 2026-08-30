@@ -1,3 +1,4 @@
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -1065,8 +1066,42 @@ fn metal_memory_limits(
     })
 }
 
-fn initialize_runtime() -> Result<()> {
-    static INITIALIZED: LazyLock<std::result::Result<(), String>> = LazyLock::new(|| {
+const RESOURCE_LOCK_RELATIVE_PATH: &str = ".cache/qw/resource_lock";
+
+struct RuntimeState {
+    _resource_lock: File,
+}
+
+fn resource_lock_path(home: &Path) -> PathBuf {
+    home.join(RESOURCE_LOCK_RELATIVE_PATH)
+}
+
+fn acquire_resource_lock() -> Result<File> {
+    let home = std::env::var_os("HOME")
+        .context("failed to determine resource lock path: HOME is not set")?;
+    let path = resource_lock_path(Path::new(&home));
+    let directory = path.parent().expect("resource lock path has a parent");
+    std::fs::create_dir_all(directory).with_context(|| {
+        format!(
+            "failed to create resource lock directory {}",
+            directory.display()
+        )
+    })?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&path)
+        .with_context(|| format!("failed to open resource lock {}", path.display()))?;
+    file.lock()
+        .with_context(|| format!("failed to acquire resource lock {}", path.display()))?;
+    Ok(file)
+}
+
+pub(crate) fn initialize_runtime() -> Result<()> {
+    static INITIALIZED: LazyLock<std::result::Result<RuntimeState, String>> = LazyLock::new(|| {
+        let resource_lock =
+            acquire_resource_lock().map_err(|error| format!("{error:#}"))?;
         // MLX's 256 MiB default command-buffer cap lets this model accumulate
         // enough decode work to delay submission. Fifteen MiB measured best on
         // the supported Apple-Silicon path. Respect an explicit operator override.
@@ -1099,9 +1134,14 @@ fn initialize_runtime() -> Result<()> {
         );
         const MLX_CACHE_LIMIT: u64 = 512 * 1024 * 1024;
         mlxcel_core::memory::set_cache_limit(MLX_CACHE_LIMIT);
-        Ok(())
+        Ok(RuntimeState {
+            _resource_lock: resource_lock,
+        })
     });
-    (*INITIALIZED).clone().map_err(anyhow::Error::msg)
+    match &*INITIALIZED {
+        Ok(_) => Ok(()),
+        Err(error) => Err(anyhow::Error::msg(error.clone())),
+    }
 }
 
 fn load_generation_defaults(model_dir: &Path) -> Result<GenerationDefaults> {
@@ -1145,6 +1185,14 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Instant;
+
+    #[test]
+    fn resource_lock_path_matches_global_contract() {
+        assert_eq!(
+            resource_lock_path(Path::new("/Users/qwr")),
+            PathBuf::from("/Users/qwr/.cache/qw/resource_lock")
+        );
+    }
 
     #[test]
     fn generation_metric_throughput_uses_elapsed_seconds() {
