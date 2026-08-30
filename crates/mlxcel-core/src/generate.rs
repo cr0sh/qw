@@ -3932,14 +3932,8 @@ mod tests {
                 seen: std::cell::RefCell::new(Vec::new()),
             };
             let mut caches = chunked.make_caches();
-            let chunked_logits = chunked_prefill_last_logits(
-                &chunked,
-                &mut caches,
-                &prompt,
-                chunk,
-                0,
-                prompt.len(),
-            );
+            let chunked_logits =
+                chunked_prefill_last_logits(&chunked, &mut caches, &prompt, chunk, 0, prompt.len());
             assert_eq!(
                 ffi::array_shape(&chunked_logits).as_slice(),
                 &[1, 1, 4],

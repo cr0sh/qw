@@ -263,7 +263,6 @@ pub fn trace_snapshot(phase: &'static str, processed_tokens: usize, total_tokens
     );
 }
 
-
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

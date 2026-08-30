@@ -938,20 +938,12 @@ fn clear_mtp_cache_if_needed(
         return None;
     }
     if emitted <= 64 {
-        mlxcel_core::memory::trace_snapshot(
-            "mtp.decode.cache_clear.before",
-            emitted,
-            total_tokens,
-        );
+        mlxcel_core::memory::trace_snapshot("mtp.decode.cache_clear.before", emitted, total_tokens);
     }
     let started = Instant::now();
     mlxcel_core::clear_memory_cache();
     if emitted <= 64 {
-        mlxcel_core::memory::trace_snapshot(
-            "mtp.decode.cache_clear.after",
-            emitted,
-            total_tokens,
-        );
+        mlxcel_core::memory::trace_snapshot("mtp.decode.cache_clear.after", emitted, total_tokens);
     }
     Some(started.elapsed())
 }
@@ -1929,22 +1921,10 @@ fn finish_drafter_prefill(
     model.materialize_mtp_cache_state();
     drop(prefill);
     let prompt_len = prompt_len as usize;
-    mlxcel_core::memory::trace_snapshot(
-        "mtp.prefill.final_complete",
-        prompt_len,
-        prompt_len,
-    );
-    mlxcel_core::memory::trace_snapshot(
-        "mtp.prefill.cache_clear.before",
-        prompt_len,
-        prompt_len,
-    );
+    mlxcel_core::memory::trace_snapshot("mtp.prefill.final_complete", prompt_len, prompt_len);
+    mlxcel_core::memory::trace_snapshot("mtp.prefill.cache_clear.before", prompt_len, prompt_len);
     mlxcel_core::clear_memory_cache();
-    mlxcel_core::memory::trace_snapshot(
-        "mtp.prefill.cache_clear.after",
-        prompt_len,
-        prompt_len,
-    );
+    mlxcel_core::memory::trace_snapshot("mtp.prefill.cache_clear.after", prompt_len, prompt_len);
     last_hidden
 }
 fn rebuild_mtp_state(
