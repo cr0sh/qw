@@ -491,8 +491,8 @@ impl Qwen4GatedDeltaNet {
         let sequence = shape[1];
         let mut state = mlxcel_core::share(initial_state);
         let mut outputs = Vec::with_capacity(
-            ((sequence + QWEN4_PREFILL_MICROCHUNK_TOKENS - 1)
-                / QWEN4_PREFILL_MICROCHUNK_TOKENS) as usize,
+            ((sequence + QWEN4_PREFILL_MICROCHUNK_TOKENS - 1) / QWEN4_PREFILL_MICROCHUNK_TOKENS)
+                as usize,
         );
         let mut start = 0;
         while start < sequence {
@@ -602,8 +602,7 @@ impl Qwen4GatedDeltaNet {
         };
 
         let (conv_out, snapshot_conv_input) = if microchunk_convolution {
-            let (conv_out, new_conv_state) =
-                self.convolve_qkv_microchunked(&qkv, &conv_state);
+            let (conv_out, new_conv_state) = self.convolve_qkv_microchunked(&qkv, &conv_state);
             if let Some(c) = cache.as_deref_mut() {
                 c.conv_state = Some(new_conv_state);
             }
@@ -1316,30 +1315,7 @@ impl Qwen4Ple {
         input_ids: &MlxArray,
         cache: &mut GatedDeltaCache,
     ) -> Result<UniquePtr<MlxArray>, String> {
-        let input_shape = mlxcel_core::array_shape(input_ids);
-        let sequence = input_shape[1];
-        if sequence <= QWEN4_PREFILL_MICROCHUNK_TOKENS {
-            return self.forward_chunk(hidden_states, input_ids, cache);
-        }
-
-        let hidden_shape = mlxcel_core::array_shape(hidden_states);
-        let mut outputs = Vec::with_capacity(
-            ((sequence + QWEN4_PREFILL_MICROCHUNK_TOKENS - 1) / QWEN4_PREFILL_MICROCHUNK_TOKENS)
-                as usize,
-        );
-        let mut start = 0;
-        while start < sequence {
-            let stop = (start + QWEN4_PREFILL_MICROCHUNK_TOKENS).min(sequence);
-            let hidden_chunk = mlxcel_core::slice(
-                hidden_states,
-                &[0, start, 0],
-                &[hidden_shape[0], stop, hidden_shape[2]],
-            );
-            let id_chunk = mlxcel_core::slice(input_ids, &[0, start], &[input_shape[0], stop]);
-            outputs.push(self.forward_chunk(&hidden_chunk, &id_chunk, cache)?);
-            start = stop;
-        }
-        Ok(mlxcel_core::concatenate_owned(&outputs, 1))
+        self.forward_chunk(hidden_states, input_ids, cache)
     }
 
     fn forward_chunk(
@@ -3550,8 +3526,7 @@ mod tests {
         let mut chunked_cache = GatedDeltaCache::new();
         let chunked = layer.forward_hidden_internal(&inputs, None, Some(&mut chunked_cache), None);
 
-        // Conv1d kernels over different sequence extents require a small floating-point tolerance.
-        assert_arrays_close(&chunked, &reference, 1e-6);
+        assert_arrays_close(&chunked, &reference, 0.0);
         assert_arrays_close(
             chunked_cache
                 .conv_state
@@ -3572,7 +3547,7 @@ mod tests {
                 .state_cache
                 .as_deref()
                 .expect("reference recurrent state"),
-            1e-6,
+            0.0,
         );
         assert_eq!(chunked_cache.offset, SEQUENCE);
         assert_eq!(reference_cache.offset, SEQUENCE);
