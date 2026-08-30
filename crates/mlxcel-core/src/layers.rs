@@ -29,6 +29,48 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 pub use crate::cache::{ChunkedKVCache, KVCache, KVCacheMode, RotatingKVCache};
 
+// MLX's Metal transposed-QMM kernel loads a complete 32-row weight tile even
+// when `N` is not tile-aligned. Its logical bounds keep those rows out of the
+// output, but the packed weights and quantization sidecars still need readable,
+// initialized backing storage through the rounded row count.
+const METAL_QMM_OUTPUT_TILE: i32 = 32;
+
+fn metal_qmm_guard_rows(out_features: i32) -> i32 {
+    (METAL_QMM_OUTPUT_TILE - out_features.rem_euclid(METAL_QMM_OUTPUT_TILE))
+        % METAL_QMM_OUTPUT_TILE
+}
+
+fn guard_metal_qmm_operand(array: UniquePtr<MlxArray>) -> UniquePtr<MlxArray> {
+    if !crate::metal_is_available() {
+        return array;
+    }
+    let shape = ffi::array_shape(&array);
+    if shape.len() < 2 {
+        return array;
+    }
+    let guard_rows = metal_qmm_guard_rows(shape[shape.len() - 2]);
+    if guard_rows == 0 {
+        return array;
+    }
+    crate::utils::zero_guarded_axis(&array, -2, guard_rows)
+}
+
+fn guard_metal_qmm_operands(
+    weight: UniquePtr<MlxArray>,
+    scales: UniquePtr<MlxArray>,
+    biases: Option<UniquePtr<MlxArray>>,
+) -> (
+    UniquePtr<MlxArray>,
+    UniquePtr<MlxArray>,
+    Option<UniquePtr<MlxArray>>,
+) {
+    (
+        guard_metal_qmm_operand(weight),
+        guard_metal_qmm_operand(scales),
+        biases.map(guard_metal_qmm_operand),
+    )
+}
+
 /// Quantized weight structure for 4-bit/8-bit quantized layers
 /// Supports affine, mxfp4, nvfp4, and mxfp8 quantization modes.
 /// For mxfp4/nvfp4/mxfp8 modes, biases is None.
@@ -62,10 +104,12 @@ impl QuantizedWeight {
         group_size: i32,
         bits: i32,
     ) -> Self {
+        let (weight, scales, biases) =
+            guard_metal_qmm_operands(weight, scales, Some(biases));
         Self {
             weight,
             scales,
-            biases: Some(biases),
+            biases,
             group_size,
             bits,
             mode: "affine".to_string(),
@@ -101,6 +145,7 @@ impl QuantizedWeight {
     ) -> Result<Self, String> {
         validate_quantization_params(group_size, bits)?;
         validate_quantization_biases(&mode, biases.is_some())?;
+        let (weight, scales, biases) = guard_metal_qmm_operands(weight, scales, biases);
         Ok(Self {
             weight,
             scales,
@@ -1885,6 +1930,8 @@ impl UnifiedLinear {
             // mode (gpt-oss) can.
             validate_quantization_biases(mode, biases.is_some())
                 .map_err(|e| format!("{e} (prefix: {prefix})"))?;
+            let (weight, scales, biases) =
+                guard_metal_qmm_operands(weight, scales, biases);
 
             // Optional native-NVFP4 global-scale sidecar (`weight_scale_2`).
             // Emitted by the direct ModelOpt transcode (issue #693); absent for
@@ -5441,6 +5488,112 @@ mod tests {
         weights.insert(
             format!("{prefix}.bias"),
             ffi::zeros(&[out_dim], dtype::FLOAT16),
+        );
+    }
+
+    #[test]
+    fn metal_qmm_guard_rounds_narrow_output_to_full_tile() {
+        assert_eq!(metal_qmm_guard_rows(4), 28);
+        assert_eq!(metal_qmm_guard_rows(31), 1);
+        assert_eq!(metal_qmm_guard_rows(32), 0);
+        assert_eq!(metal_qmm_guard_rows(48), 16);
+
+        // Qwen's [4, 10240] affine projection packs to [4, 1280] u32 with
+        // [4, 160] bf16 scales and biases. Rounding four rows to the 32-row
+        // Metal tile retains 143,360 + 8,960 + 8,960 guarded bytes.
+        assert_eq!(
+            28 * (1_280 * 4 + 160 * 2 + 160 * 2),
+            161_280
+        );
+    }
+
+    #[test]
+    fn guarded_narrow_qmm_is_logically_and_numerically_identical() {
+        if !crate::metal_is_available() {
+            return;
+        }
+
+        const M: i32 = 55;
+        const N: i32 = 4;
+        const K: i32 = 10_240;
+        const GROUP_SIZE: i32 = 64;
+        const BITS: i32 = 4;
+
+        let dense_values = (0..N * K)
+            .map(|index| 0.001 * (((index * 13) % 31) as f32 - 15.0))
+            .collect::<Vec<_>>();
+        let dense = ffi::astype(
+            &ffi::from_slice_f32(&dense_values, &[N, K]),
+            crate::dtype::BFLOAT16,
+        );
+        let quantized = ffi::quantize_weights(&dense, GROUP_SIZE, BITS);
+        let weight = ffi::quantized_weights_w(&quantized);
+        let scales = ffi::quantized_weights_scales(&quantized);
+        let biases = ffi::quantized_weights_biases(&quantized);
+
+        let raw = UnifiedLinear::new(
+            QuantizedWeight {
+                weight: ffi::copy(&weight),
+                scales: ffi::copy(&scales),
+                biases: Some(ffi::copy(&biases)),
+                group_size: GROUP_SIZE,
+                bits: BITS,
+                mode: "affine".to_owned(),
+                global_scale: None,
+            },
+            None,
+        );
+        let guarded = UnifiedLinear::new(
+            QuantizedWeight::new(weight, scales, biases, GROUP_SIZE, BITS),
+            None,
+        );
+        let raw_weight = raw.as_quantized_weight().expect("raw quantized weight");
+        let guarded_weight = guarded
+            .as_quantized_weight()
+            .expect("guarded quantized weight");
+
+        assert_eq!(ffi::array_shape(&guarded_weight.weight), vec![N, 1_280]);
+        assert_eq!(ffi::array_shape(&guarded_weight.scales), vec![N, 160]);
+        assert_eq!(
+            ffi::array_shape(guarded_weight.biases.as_deref().expect("affine biases")),
+            vec![N, 160]
+        );
+        assert_eq!(ffi::array_nbytes(&guarded_weight.scales), 1_280);
+        for (actual, expected) in [
+            (&guarded_weight.weight, &raw_weight.weight),
+            (&guarded_weight.scales, &raw_weight.scales),
+            (
+                guarded_weight.biases.as_ref().expect("guarded biases"),
+                raw_weight.biases.as_ref().expect("raw biases"),
+            ),
+        ] {
+            let equal = ffi::array_equal(actual, expected, false);
+            ffi::eval(&equal);
+            assert!(ffi::item_bool(&equal), "the logical tensor changed");
+        }
+
+        let input_values = (0..M * K)
+            .map(|index| 0.002 * (((index * 7) % 29) as f32 - 14.0))
+            .collect::<Vec<_>>();
+        let input = ffi::astype(
+            &ffi::from_slice_f32(&input_values, &[M, K]),
+            crate::dtype::BFLOAT16,
+        );
+        let raw_output = raw.forward(&input);
+        let guarded_output = guarded.forward(&input);
+        let exact = ffi::array_equal(&guarded_output, &raw_output, false);
+        ffi::eval(&exact);
+        assert!(
+            ffi::item_bool(&exact),
+            "zeroed tail changed a logical qmm output"
+        );
+
+        let reference_weight = raw.dequantized_weight();
+        let reference = ffi::matmul(&input, &ffi::transpose(&reference_weight));
+        let max_difference = plane_max_abs_diff(&guarded_output, &reference);
+        assert!(
+            max_difference <= 0.000_5,
+            "guarded qmm diverged from dequantized matmul: {max_difference}"
         );
     }
 

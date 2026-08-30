@@ -455,12 +455,7 @@ fn guard_qwen_conv1d_filter(weight: &MlxArray) -> UniquePtr<MlxArray> {
     let shape = mlxcel_core::array_shape(weight);
     debug_assert_eq!(shape.len(), 3);
     debug_assert_eq!(shape[2], 1);
-    let guard = mlxcel_core::zeros(
-        &[MLX_CONV_FILTER_GUARD_CHANNELS, shape[1], shape[2]],
-        mlxcel_core::array_dtype(weight),
-    );
-    let padded = concatenate(weight, &guard, 0);
-    mlxcel_core::slice(&padded, &[0, 0, 0], &shape)
+    mlxcel_core::utils::zero_guarded_axis(weight, 0, MLX_CONV_FILTER_GUARD_CHANNELS)
 }
 
 fn load_qwen_conv1d_filter(weight: &MlxArray) -> UniquePtr<MlxArray> {
