@@ -4314,19 +4314,30 @@ mod tests {
         left.with_internal(|left| {
             right.with_internal(|right| {
                 assert_eq!(left.len(), right.len());
-                let (Qwen4LayerCache::Linear(left), Qwen4LayerCache::Linear(right)) =
-                    (&left[0], &right[0])
+                let (
+                    Qwen4LayerCache::Linear(linear_left),
+                    Qwen4LayerCache::Linear(linear_right),
+                ) = (&left[0], &right[0])
                 else {
                     panic!("expected matching linear cache");
                 };
-                assert_eq!(left.offset, right.offset);
-                assert_eq!(left.ple_token_history, right.ple_token_history);
+                assert_eq!(linear_left.offset, linear_right.offset);
+                assert_eq!(
+                    linear_left.ple_token_history,
+                    linear_right.ple_token_history
+                );
                 for (left, right) in [
-                    (left.conv_state.as_deref(), right.conv_state.as_deref()),
-                    (left.state_cache.as_deref(), right.state_cache.as_deref()),
                     (
-                        left.ple_conv_state.as_deref(),
-                        right.ple_conv_state.as_deref(),
+                        linear_left.conv_state.as_deref(),
+                        linear_right.conv_state.as_deref(),
+                    ),
+                    (
+                        linear_left.state_cache.as_deref(),
+                        linear_right.state_cache.as_deref(),
+                    ),
+                    (
+                        linear_left.ple_conv_state.as_deref(),
+                        linear_right.ple_conv_state.as_deref(),
                     ),
                 ] {
                     assert_exact_array(
