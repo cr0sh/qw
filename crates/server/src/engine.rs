@@ -1575,7 +1575,7 @@ impl QwenWorker {
                     }),
                     None,
                 ),
-                PromptSnapshot::Mtp(_) | PromptSnapshot::Dflash2(_) => {
+                _ => {
                     send_failure(
                         &job,
                         FailureKind::ResumeNotFound,
@@ -1594,7 +1594,7 @@ impl QwenWorker {
                         continuation_token: resume.metadata.generated_token_ids.last().copied(),
                     }),
                 ),
-                PromptSnapshot::Baseline(_) | PromptSnapshot::Dflash2(_) => {
+                _ => {
                     send_failure(
                         &job,
                         FailureKind::ResumeNotFound,
@@ -1619,7 +1619,8 @@ impl QwenWorker {
                     }),
                     None,
                 ),
-                PromptSnapshot::Dflash2(_) => (None, None),
+                #[cfg(feature = "dflash2")]
+                _ => (None, None),
             },
             (QwenGenerationRoute::MtpText, None, Some(hit)) => match hit.snapshot {
                 PromptSnapshot::Mtp(snapshot) => (
@@ -1630,7 +1631,7 @@ impl QwenWorker {
                         continuation_token: None,
                     }),
                 ),
-                PromptSnapshot::Baseline(_) | PromptSnapshot::Dflash2(_) => (None, None),
+                _ => (None, None),
             },
             _ => (None, None),
         };

@@ -7,7 +7,7 @@ publish = false
 
 [features]
 default = []
-dflash2 = ["qw-runtime/dflash2"]
+dflash2 = ["qw-runtime/dflash2", "qw-server/dflash2"]
 specprefill = ["qw-runtime/specprefill", "qw-server/specprefill"]
 
 [[bin]]
