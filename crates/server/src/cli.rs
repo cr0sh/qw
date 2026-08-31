@@ -101,6 +101,10 @@ pub struct ServerArgs {
     #[arg(long, default_value = "127.0.0.1:8000")]
     bind: String,
 
+    /// Disable prefix snapshot lookup and persistence.
+    #[arg(long)]
+    disable_prefix_cache: bool,
+
     /// Byte capacity of the in-memory prefix snapshot tier (decimal SI suffixes K-E accepted).
     #[arg(
         long,
@@ -298,7 +302,11 @@ pub async fn serve(cli: ServerArgs) -> Result<()> {
         .bind
         .parse()
         .with_context(|| format!("invalid --bind address {:?}", cli.bind))?;
-    info!(phase = "server.starting", bind = %bind);
+    info!(
+        phase = "server.starting",
+        bind = %bind,
+        prefix_cache_enabled = !cli.disable_prefix_cache,
+    );
 
     let kv_cache_mode = cli.kv_cache_mode();
     #[cfg(feature = "specprefill")]
@@ -313,6 +321,7 @@ pub async fn serve(cli: ServerArgs) -> Result<()> {
             directory: Some(prefix_cache_directory),
             filesystem_bytes: cli.prefix_cache_filesystem_bytes,
         },
+        !cli.disable_prefix_cache,
         cli.mtp_k,
         kv_cache_mode,
         #[cfg(feature = "specprefill")]
@@ -418,6 +427,20 @@ mod tests {
         let help = TestCli::command().render_long_help().to_string();
         assert!(help.contains("--model-id <MODEL_ID>"), "{help}");
     }
+
+    #[test]
+    fn cli_prefix_cache_opt_out_defaults_to_enabled() {
+        let default = TestCli::try_parse_from(["qw-server"]).expect("CLI");
+        assert!(!default.args.disable_prefix_cache);
+
+        let disabled =
+            TestCli::try_parse_from(["qw-server", "--disable-prefix-cache"]).expect("CLI");
+        assert!(disabled.args.disable_prefix_cache);
+
+        let help = TestCli::command().render_long_help().to_string();
+        assert!(help.contains("--disable-prefix-cache"), "{help}");
+    }
+
     fn capture_persistent_log_filter_events(filter: EnvFilter) -> String {
         let path = std::env::temp_dir().join(format!(
             "qw-persistent-log-filter-{}-{}.log",

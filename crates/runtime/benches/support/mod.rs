@@ -1031,6 +1031,7 @@ fn prepare_long_conversation_fixture_uncached(
             &[prefix_tokens],
             None,
             |_| true,
+            false,
         )
         .expect("prefill long-conversation MTP prefix");
     let mtp_snapshot = mtp_prefix

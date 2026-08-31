@@ -265,6 +265,53 @@ fn cache_lookup_route(
     cache_snapshot_route(route)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CacheBehavior {
+    snapshot_route: Option<CacheSnapshotRoute>,
+    lookup_route: Option<CacheSnapshotRoute>,
+    capture_checkpoints: bool,
+}
+
+impl CacheBehavior {
+    fn apply_checkpoint_policy(self, checkpoint_token_lengths: &mut Vec<usize>) {
+        if !self.capture_checkpoints {
+            checkpoint_token_lengths.clear();
+        }
+    }
+
+    fn capture_final_snapshot(self) -> bool {
+        self.snapshot_route.is_some()
+    }
+}
+
+fn cache_behavior(
+    route: QwenGenerationRoute,
+    prefix_cache_enabled: bool,
+    #[cfg(feature = "specprefill")] mtp_available: bool,
+    #[cfg(feature = "specprefill")] specprefill_active: bool,
+) -> CacheBehavior {
+    if !prefix_cache_enabled {
+        return CacheBehavior {
+            snapshot_route: None,
+            lookup_route: None,
+            capture_checkpoints: false,
+        };
+    }
+    let snapshot_route = cache_snapshot_route(route);
+    let lookup_route = cache_lookup_route(
+        route,
+        #[cfg(feature = "specprefill")]
+        mtp_available,
+        #[cfg(feature = "specprefill")]
+        specprefill_active,
+    );
+    CacheBehavior {
+        snapshot_route,
+        lookup_route,
+        capture_checkpoints: snapshot_route.is_some(),
+    }
+}
+
 fn validate_mtp_k(mtp_k: usize) -> Result<()> {
     ensure!(mtp_k >= 2, "--mtp-k must be at least 2");
     Ok(())
@@ -632,6 +679,7 @@ impl Engine {
         model_path: PathBuf,
         model_id: Option<String>,
         cache_config: CacheConfig,
+        prefix_cache_enabled: bool,
         mtp_k: usize,
         kv_cache_mode: KVCacheMode,
         #[cfg(feature = "specprefill")]
@@ -649,6 +697,7 @@ impl Engine {
                 match QwenWorker::load(
                     &model_path,
                     cache_config,
+                    prefix_cache_enabled,
                     mtp_k,
                     kv_cache_mode,
                     #[cfg(feature = "specprefill")]
@@ -1071,6 +1120,7 @@ struct QwenWorker {
     provider: Qwen35Provider,
     grammar: GrammarFactory,
     prefix_cache: AdaptivePrefixCache,
+    prefix_cache_enabled: bool,
     mtp_k: usize,
 }
 
@@ -1138,6 +1188,7 @@ impl QwenWorker {
     fn load(
         model_path: &Path,
         cache_config: CacheConfig,
+        prefix_cache_enabled: bool,
         mtp_k: usize,
         kv_cache_mode: KVCacheMode,
         #[cfg(feature = "specprefill")]
@@ -1206,6 +1257,7 @@ impl QwenWorker {
             specprefill_policy,
             grammar,
             prefix_cache,
+            prefix_cache_enabled,
             mtp_k,
         })
     }
@@ -1434,7 +1486,7 @@ impl QwenWorker {
             specprefill_active,
         );
         let mut checkpoint_token_lengths = Vec::new();
-        if !has_images {
+        if self.prefix_cache_enabled && !has_images {
             match self.provider.tokenize_history(
                 &job.request.messages,
                 effective_tools,
@@ -1478,12 +1530,17 @@ impl QwenWorker {
         let route = qwen_generation_route(mtp_available, has_images, specprefill_active);
         #[cfg(not(feature = "specprefill"))]
         let route = qwen_generation_route(mtp_available, has_images);
-        let cache_route = cache_snapshot_route(route);
-        #[cfg(feature = "specprefill")]
-        let lookup_cache_route =
-            cache_lookup_route(route, mtp_available, specprefill_active);
-        #[cfg(not(feature = "specprefill"))]
-        let lookup_cache_route = cache_lookup_route(route);
+        let cache_behavior = cache_behavior(
+            route,
+            self.prefix_cache_enabled,
+            #[cfg(feature = "specprefill")]
+            mtp_available,
+            #[cfg(feature = "specprefill")]
+            specprefill_active,
+        );
+        cache_behavior.apply_checkpoint_policy(&mut checkpoint_token_lengths);
+        let cache_route = cache_behavior.snapshot_route;
+        let lookup_cache_route = cache_behavior.lookup_route;
         if job.request.resume_response_id.is_some() && cache_route.is_none() {
             send_failure(
                 &job,
@@ -1756,6 +1813,7 @@ impl QwenWorker {
                     .as_mut()
                     .map(|value| value as &mut dyn mlxcel_core::generate::TokenConstraint),
                 &mut emit_delta,
+                cache_behavior.capture_final_snapshot(),
             ),
             QwenGenerationRoute::BaselineMultimodal => provider.generate_multimodal_streaming(
                 multimodal_prefill.expect("multimodal route requires prepared embeddings"),
@@ -2484,30 +2542,63 @@ mod tests {
     }
 
     #[test]
-    fn text_routes_are_prefix_cache_eligible() {
+    fn enabled_prefix_cache_preserves_snapshot_ownership() {
         for route in [
             QwenGenerationRoute::BaselineText,
             QwenGenerationRoute::BaselineMultimodal,
             QwenGenerationRoute::MtpText,
             QwenGenerationRoute::MtpMultimodal,
         ] {
-            assert_eq!(
-                cache_snapshot_route(route).is_some(),
-                matches!(
-                    route,
-                    QwenGenerationRoute::BaselineText | QwenGenerationRoute::MtpText
-                )
-            );
-        }
-        assert_ne!(
-            qwen_generation_route(
+            let behavior = cache_behavior(
+                route,
                 true,
+                #[cfg(feature = "specprefill")]
                 true,
                 #[cfg(feature = "specprefill")]
                 false,
-            ),
-            QwenGenerationRoute::BaselineText
-        );
+            );
+            let expected_route = match route {
+                QwenGenerationRoute::BaselineText => Some(CacheSnapshotRoute::Baseline),
+                QwenGenerationRoute::MtpText => Some(CacheSnapshotRoute::Mtp),
+                QwenGenerationRoute::BaselineMultimodal
+                | QwenGenerationRoute::MtpMultimodal => None,
+            };
+            assert_eq!(behavior.snapshot_route, expected_route);
+            assert_eq!(behavior.lookup_route, expected_route);
+            assert_eq!(behavior.capture_final_snapshot(), expected_route.is_some());
+            let mut checkpoint_token_lengths = vec![64, 128];
+            behavior.apply_checkpoint_policy(&mut checkpoint_token_lengths);
+            if expected_route.is_some() {
+                assert_eq!(checkpoint_token_lengths, [64, 128]);
+            } else {
+                assert!(checkpoint_token_lengths.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn disabled_prefix_cache_removes_lookup_persistence_and_snapshot_ownership() {
+        for route in [
+            QwenGenerationRoute::BaselineText,
+            QwenGenerationRoute::BaselineMultimodal,
+            QwenGenerationRoute::MtpText,
+            QwenGenerationRoute::MtpMultimodal,
+        ] {
+            let behavior = cache_behavior(
+                route,
+                false,
+                #[cfg(feature = "specprefill")]
+                true,
+                #[cfg(feature = "specprefill")]
+                false,
+            );
+            assert_eq!(behavior.snapshot_route, None);
+            assert_eq!(behavior.lookup_route, None);
+            assert!(!behavior.capture_final_snapshot());
+            let mut checkpoint_token_lengths = vec![64, 128];
+            behavior.apply_checkpoint_policy(&mut checkpoint_token_lengths);
+            assert!(checkpoint_token_lengths.is_empty());
+        }
     }
 
     #[cfg(feature = "specprefill")]
@@ -2515,25 +2606,33 @@ mod tests {
     fn specprefill_over_mtp_looks_up_the_mtp_target_snapshot() {
         let sparse_route = qwen_generation_route(true, false, true);
         assert_eq!(sparse_route, QwenGenerationRoute::BaselineText);
+        let sparse_behavior = cache_behavior(sparse_route, true, true, true);
         assert_eq!(
-            cache_lookup_route(sparse_route, true, true),
+            sparse_behavior.lookup_route,
             Some(CacheSnapshotRoute::Mtp)
         );
         assert_eq!(
-            cache_snapshot_route(sparse_route),
+            sparse_behavior.snapshot_route,
             Some(CacheSnapshotRoute::Baseline)
         );
+        assert!(sparse_behavior.capture_final_snapshot());
 
         assert_eq!(
-            cache_lookup_route(QwenGenerationRoute::MtpText, true, false),
+            cache_behavior(QwenGenerationRoute::MtpText, true, true, false).lookup_route,
             Some(CacheSnapshotRoute::Mtp)
         );
         assert_eq!(
-            cache_lookup_route(QwenGenerationRoute::BaselineText, false, true),
+            cache_behavior(QwenGenerationRoute::BaselineText, true, false, true).lookup_route,
             Some(CacheSnapshotRoute::Baseline)
         );
         assert_eq!(
-            cache_lookup_route(QwenGenerationRoute::BaselineMultimodal, true, true),
+            cache_behavior(
+                QwenGenerationRoute::BaselineMultimodal,
+                true,
+                true,
+                true
+            )
+            .lookup_route,
             None
         );
     }
