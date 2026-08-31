@@ -123,3 +123,32 @@ This repository adopts several optimization approaches from
 [oMLX](https://github.com/Jundot/oMLX), [ds4](https://github.com/antirez/ds4),
 and [qwen-3.8-mtp-challenge](https://github.com/Layr-Labs/qwen-3.8-mtp-challenge). Each derivative work is attributed in the relevant commit messages.
 
+## Qwen3.8 Flash Next Experiment Outcome
+
+The experimental Qwen4 architecture and MTP work is preserved on the
+`qwen4exp` branch. The experiment established that the runtime can generate
+32,768 output tokens with a 384,000-token context cap and prefix caching
+disabled without exhausting 64 GB of unified memory. A terminal-generation OOM
+was fixed by avoiding an unowned final MTP snapshot whose fallback replay
+materialized full-sequence vocabulary logits. The 32K probe completed at 73.2
+tokens/s decode, peaked at 43.6 GB of active memory, and left the server healthy
+for a follow-up request.
+
+The selected `Qwen3.8-Flash-Next-REAP-288-MLX-4bit` checkpoint was not suitable
+for GPQA. A three-sample smoke evaluation with a 32K output allowance scored
+66.7%, averaging 9,798 output tokens. One chemistry response naturally stopped
+after 13,971 tokens without an answer after entering a heavily repetitive,
+chemically invalid RDKit-themed trajectory. The saved text round-tripped
+exactly through the tokenizer, and controlled fixed-seed baseline and MTP
+generations independently reproduced the same semantic failure. Enabling
+thinking and requesting a direct answer did not resolve it.
+
+The affected GPQA prompt contains an apparent `3 was treated ... forming
+product 3` typo, but the model became chemically incorrect before reasoning
+about that step. The checkpoint is pruned from 512 to 288 experts using
+agentic-coding calibration data, and its model card warns that domains far from
+code may degrade. Giving the response a larger token budget therefore exposed
+model degeneration rather than improving answer quality.
+
+The experiment is stopped at this point. Development on `main` returns to the
+Qwen3.8 27B implementation tagged `qwen27b`.
