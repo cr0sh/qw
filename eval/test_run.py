@@ -37,7 +37,6 @@ class GenerationConfigTests(unittest.TestCase):
             "gpqa_diamond": {
                 "temperature": 1.0,
                 "top_p": 0.95,
-                "top_k": 20,
                 "max_tokens": 32_768,
                 "reasoning_effort": "xhigh",
                 "extra_body": {
@@ -50,7 +49,6 @@ class GenerationConfigTests(unittest.TestCase):
             "ifbench": {
                 "temperature": 1.0,
                 "top_p": 0.95,
-                "top_k": 20,
                 "max_tokens": 32_768,
                 "reasoning_effort": "xhigh",
                 "extra_body": {
@@ -63,7 +61,6 @@ class GenerationConfigTests(unittest.TestCase):
             "live_code_bench": {
                 "temperature": 1.0,
                 "top_p": 0.95,
-                "top_k": 20,
                 "max_tokens": 32_768,
                 "reasoning_effort": "xhigh",
                 "extra_body": {

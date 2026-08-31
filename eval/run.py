@@ -9,12 +9,13 @@ import subprocess
 
 PROJECT_DIR = Path(__file__).resolve().parent
 MIN_FREE_BYTES = 15 * 1024**3
+# The qwen27b server does not expose top_k on its Chat Completions protocol.
+# The checkpoint generation_config.json supplies the official top_k=20 default.
 SUITES = {
     "gpqa_diamond": {
         "generation_config": {
             "temperature": 1.0,
             "top_p": 0.95,
-            "top_k": 20,
             "max_tokens": 32_768,
             "reasoning_effort": "xhigh",
             "extra_body": {
@@ -30,7 +31,6 @@ SUITES = {
         "generation_config": {
             "temperature": 1.0,
             "top_p": 0.95,
-            "top_k": 20,
             "max_tokens": 32_768,
             "reasoning_effort": "xhigh",
             "extra_body": {
@@ -46,7 +46,6 @@ SUITES = {
         "generation_config": {
             "temperature": 1.0,
             "top_p": 0.95,
-            "top_k": 20,
             "max_tokens": 32_768,
             "reasoning_effort": "xhigh",
             "extra_body": {
