@@ -15,7 +15,7 @@ SUITES = {
             "temperature": 0.7,
             "top_p": 0.8,
             "top_k": 20,
-            "max_tokens": 4_096,
+            "max_tokens": 8_192,
             "extra_body": {
                 "chat_template_kwargs": {"enable_thinking": False}
             },
