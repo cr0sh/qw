@@ -90,7 +90,7 @@ class GenerationConfigTests(unittest.TestCase):
                     "--generation-config",
                     json.dumps(config, separators=(",", ":")),
                     "--eval-batch-size",
-                    "4",
+                    "2",
                     "--timeout",
                     "1800",
                     "--repeats",
