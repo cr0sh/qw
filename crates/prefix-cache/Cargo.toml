@@ -5,6 +5,10 @@ edition = "2024"
 repository = "https://github.com/cr0sh/qw"
 publish = false
 
+[features]
+default = []
+dflash2 = ["qw-runtime/dflash2"]
+
 [dependencies]
 qw-runtime = { path = "../runtime" }
 serde.workspace = true

@@ -628,6 +628,47 @@ fn filesystem_restart_promotes_valid_entry_and_deletes_corrupt_payload() {
     assert!(!entry_path.exists(), "corrupt entry is deletion-as-miss");
 }
 
+#[cfg(feature = "dflash2")]
+#[test]
+fn dflash2_portable_snapshot_is_rejected() {
+    let array = qw_runtime::PortableArray {
+        name: None,
+        shape: vec![1],
+        dtype: mlxcel_core::dtype::FLOAT32,
+        bytes: vec![0; std::mem::size_of::<f32>()],
+    };
+    let snapshot = PortablePromptSnapshot::Dflash2 {
+        target: qw_runtime::PortableModelState {
+            family: "test".to_string(),
+            token_len: 1,
+            tensors: Vec::new(),
+            paged_tensors: Vec::new(),
+            continuation_logits: None,
+        },
+        hidden_concat: array.clone(),
+        hidden_offset: 0,
+        continuation_logits: array,
+    };
+    let error = codec::encode_portable(
+        NAMESPACE,
+        SnapshotRoute::Baseline,
+        &[1],
+        snapshot,
+        RetentionMetadata {
+            observations: 1,
+            reuse_count: 0,
+            last_access_unix_ms: 0,
+        },
+        INITIAL_TTL_MS,
+        None,
+    )
+    .expect_err("DFlash2 snapshots must not enter the prefix cache");
+    assert_eq!(
+        error,
+        "portable snapshot route and token length must match the cache entry"
+    );
+}
+
 #[test]
 fn strict_manifest_rejects_unknown_fields_and_namespace_mismatch() {
     let encoded = codec::encode_portable(
