@@ -95,6 +95,10 @@ pub struct ServerArgs {
     #[arg(long)]
     model_id: Option<String>,
 
+    /// Maximum combined prompt and generated tokens per request (decimal SI suffixes K-E accepted).
+    #[arg(long, value_parser = parse_si_bytes)]
+    max_context_tokens: Option<u64>,
+
     /// HTTP listen address.
     #[arg(long, default_value = "127.0.0.1:8000")]
     bind: String,
@@ -150,6 +154,10 @@ fn validate_cli(cli: &ServerArgs) -> Result<()> {
     ensure!(
         cli.prefix_cache_filesystem_bytes > 0,
         "--prefix-cache-filesystem-bytes must be greater than zero"
+    );
+    ensure!(
+        cli.max_context_tokens != Some(0),
+        "--max-context-tokens must be greater than zero"
     );
     ensure!(cli.mtp_k >= 2, "--mtp-k must be at least 2");
     Ok(())
@@ -259,7 +267,16 @@ pub async fn serve(cli: ServerArgs) -> Result<()> {
         .bind
         .parse()
         .with_context(|| format!("invalid --bind address {:?}", cli.bind))?;
-    info!(phase = "server.starting", bind = %bind);
+    info!(
+        phase = "server.starting",
+        bind = %bind,
+        max_context_tokens = ?cli.max_context_tokens,
+    );
+    let max_context_tokens = cli
+        .max_context_tokens
+        .map(usize::try_from)
+        .transpose()
+        .context("--max-context-tokens exceeds this platform's supported token count")?;
 
     let kv_cache_mode = cli.kv_cache_mode();
     let model = resolve_model_path(cli.model.as_deref())?;
@@ -272,6 +289,7 @@ pub async fn serve(cli: ServerArgs) -> Result<()> {
             directory: Some(prefix_cache_directory),
             filesystem_bytes: cli.prefix_cache_filesystem_bytes,
         },
+        max_context_tokens,
         cli.mtp_k,
         kv_cache_mode,
     )?;
@@ -378,6 +396,33 @@ mod tests {
         let help = TestCli::command().render_long_help().to_string();
         assert!(help.contains("--model-id <MODEL_ID>"), "{help}");
     }
+
+    #[test]
+    fn cli_parses_decimal_si_max_context_tokens() {
+        let unbounded = TestCli::try_parse_from(["qw-server"]).expect("CLI");
+        assert_eq!(unbounded.args.max_context_tokens, None);
+        validate_cli(&unbounded.args).expect("unbounded context");
+
+        let configured =
+            TestCli::try_parse_from(["qw-server", "--max-context-tokens", "384K"])
+                .expect("decimal SI context limit");
+        assert_eq!(configured.args.max_context_tokens, Some(384_000));
+        validate_cli(&configured.args).expect("configured context limit");
+
+        let zero = TestCli::try_parse_from(["qw-server", "--max-context-tokens", "0"])
+            .expect("CLI parsing reaches startup validation");
+        assert_eq!(
+            validate_cli(&zero.args).unwrap_err().to_string(),
+            "--max-context-tokens must be greater than zero"
+        );
+
+        let help = TestCli::command().render_long_help().to_string();
+        assert!(
+            help.contains("--max-context-tokens <MAX_CONTEXT_TOKENS>"),
+            "{help}"
+        );
+    }
+
     fn capture_persistent_log_filter_events(filter: EnvFilter) -> String {
         let path = std::env::temp_dir().join(format!(
             "qw-persistent-log-filter-{}-{}.log",

@@ -156,6 +156,18 @@ fn validate_mtp_k(mtp_k: usize) -> Result<()> {
     Ok(())
 }
 
+fn exceeds_context_budget(
+    prompt_tokens: usize,
+    max_tokens: usize,
+    max_context_tokens: Option<usize>,
+) -> bool {
+    max_context_tokens.is_some_and(|limit| {
+        prompt_tokens
+            .checked_add(max_tokens)
+            .map_or(true, |requested| requested > limit)
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct Admission {
     pub response_id: String,
@@ -552,6 +564,7 @@ impl Engine {
         model_path: PathBuf,
         model_id: Option<String>,
         cache_config: CacheConfig,
+        max_context_tokens: Option<usize>,
         mtp_k: usize,
         kv_cache_mode: KVCacheMode,
     ) -> Result<Self> {
@@ -562,7 +575,13 @@ impl Engine {
         thread::Builder::new()
             .name("qw-generation".to_string())
             .spawn(move || {
-                match QwenWorker::load(&model_path, cache_config, mtp_k, kv_cache_mode) {
+                match QwenWorker::load(
+                    &model_path,
+                    cache_config,
+                    max_context_tokens,
+                    mtp_k,
+                    kv_cache_mode,
+                ) {
                     Ok(mut worker) => {
                         let _ = ready_tx.send(Ok(false));
                         worker.run(jobs_rx);
@@ -1016,6 +1035,7 @@ struct QwenWorker {
     provider: Qwen4Provider,
     grammar: GrammarFactory,
     prefix_cache: AdaptivePrefixCache,
+    max_context_tokens: Option<usize>,
     mtp_k: usize,
 }
 
@@ -1069,6 +1089,7 @@ impl QwenWorker {
     fn load(
         model_path: &Path,
         cache_config: CacheConfig,
+        max_context_tokens: Option<usize>,
         mtp_k: usize,
         kv_cache_mode: KVCacheMode,
     ) -> Result<Self> {
@@ -1131,6 +1152,7 @@ impl QwenWorker {
             provider,
             grammar,
             prefix_cache,
+            max_context_tokens,
             mtp_k,
         })
     }
@@ -1290,6 +1312,24 @@ impl QwenWorker {
                 return;
             }
         };
+        if exceeds_context_budget(
+            prompt_ids.len(),
+            job.request.max_tokens,
+            self.max_context_tokens,
+        ) {
+            let requested_tokens = prompt_ids.len().saturating_add(job.request.max_tokens);
+            send_failure(
+                &job,
+                FailureKind::InvalidRequest,
+                format!(
+                    "prompt tokens plus max_tokens require {requested_tokens} tokens, exceeding the configured context limit of {} tokens",
+                    self.max_context_tokens
+                        .expect("context budget is configured when exceeded")
+                ),
+                Some("max_tokens".to_string()),
+            );
+            return;
+        }
         let mut checkpoint_token_lengths = Vec::new();
         if !has_images {
             match self.provider.tokenize_history(
@@ -1973,6 +2013,26 @@ mod tests {
                 .total_tokens,
             usize::MAX,
         );
+    }
+
+    #[test]
+    fn context_budget_accepts_exact_boundary_and_unbounded_requests() {
+        assert!(!exceeds_context_budget(380_000, 4_000, Some(384_000)));
+        assert!(!exceeds_context_budget(
+            usize::MAX,
+            usize::MAX,
+            None
+        ));
+    }
+
+    #[test]
+    fn context_budget_rejects_one_token_over_and_overflow() {
+        assert!(exceeds_context_budget(380_001, 4_000, Some(384_000)));
+        assert!(exceeds_context_budget(
+            usize::MAX,
+            1,
+            Some(usize::MAX)
+        ));
     }
 
     fn parse_fragments(fragments: &[&str]) -> (String, String) {
