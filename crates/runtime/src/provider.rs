@@ -23,7 +23,7 @@ use mlxcel_core::sampling::{
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use tokenizers::Tokenizer;
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::chat_template::ChatTemplateProcessor;
 pub use crate::chat_template::{
@@ -1604,11 +1604,67 @@ impl Qwen35Provider {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WiredLimitPolicy {
+    system_memory_bytes: u64,
+    metal_recommended_bytes: u64,
+    wired_limit_bytes: u64,
+}
+
+fn configure_metal_wired_limit_with(
+    physical_memory_bytes: impl FnOnce() -> Option<u64>,
+    metal_recommended_bytes: impl FnOnce() -> u64,
+    set_wired_limit: impl FnOnce(u64) -> std::result::Result<(), String>,
+) -> std::result::Result<WiredLimitPolicy, String> {
+    let system_memory_bytes = physical_memory_bytes()
+        .ok_or_else(|| "failed to detect physical system memory via hw.memsize".to_string())?;
+    if system_memory_bytes == 0 {
+        return Err("physical system memory detection returned zero bytes".to_string());
+    }
+
+    let metal_recommended_bytes = metal_recommended_bytes();
+    if metal_recommended_bytes == 0 {
+        return Err(
+            "Metal max_recommended_working_set_size detection returned zero bytes".to_string(),
+        );
+    }
+
+    let wired_limit_bytes = mlxcel_core::memory::recommended_wired_limit(
+        system_memory_bytes,
+        metal_recommended_bytes,
+    );
+    if wired_limit_bytes == 0 {
+        return Err("wired-memory policy computed a zero-byte limit".to_string());
+    }
+    set_wired_limit(wired_limit_bytes).map_err(|error| {
+        format!(
+            "failed to configure MLX Metal wired-memory limit to {wired_limit_bytes} bytes: {error}"
+        )
+    })?;
+
+    Ok(WiredLimitPolicy {
+        system_memory_bytes,
+        metal_recommended_bytes,
+        wired_limit_bytes,
+    })
+}
+
 fn initialize_runtime() -> Result<()> {
     static INITIALIZED: LazyLock<std::result::Result<(), String>> = LazyLock::new(|| {
         if !mlxcel_core::metal_is_available() {
             return Err("the MLX Metal backend is unavailable on this host".to_string());
         }
+        let policy = configure_metal_wired_limit_with(
+            mlxcel_core::hardware::physical_memory_bytes,
+            mlxcel_core::memory::metal_recommended_working_set_size,
+            |bytes| mlxcel_core::memory::set_wired_limit(bytes).map(|_| ()),
+        )?;
+        info!(
+            system_memory_bytes = policy.system_memory_bytes,
+            metal_recommended_bytes = policy.metal_recommended_bytes,
+            wired_limit_bytes = policy.wired_limit_bytes,
+            "configured MLX Metal wired-memory limit"
+        );
         mlxcel_core::set_default_device(true);
         Ok(())
     });
@@ -1698,6 +1754,77 @@ mod tests {
     fn generation_metric_throughput_uses_elapsed_seconds() {
         assert_eq!(tokens_per_second(25, Duration::from_millis(500)), 50.0);
         assert_eq!(tokens_per_second(25, Duration::ZERO), 0.0);
+    }
+
+    #[test]
+    fn wired_limit_initialization_applies_computed_policy() {
+        use std::cell::Cell;
+
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let applied = Cell::new(None);
+        let policy = configure_metal_wired_limit_with(
+            || Some(64 * GIB),
+            || 40 * GIB,
+            |bytes| {
+                applied.set(Some(bytes));
+                Ok(())
+            },
+        )
+        .expect("valid wired-memory policy");
+
+        assert_eq!(
+            policy,
+            WiredLimitPolicy {
+                system_memory_bytes: 64 * GIB,
+                metal_recommended_bytes: 40 * GIB,
+                wired_limit_bytes: 44 * GIB,
+            }
+        );
+        assert_eq!(applied.get(), Some(44 * GIB));
+    }
+
+    #[test]
+    fn wired_limit_initialization_fails_closed_without_mutating_metal() {
+        use std::cell::Cell;
+
+        let setter_called = Cell::new(false);
+        let error = configure_metal_wired_limit_with(
+            || None,
+            || 1,
+            |_| {
+                setter_called.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("missing physical memory must fail");
+        assert!(error.contains("hw.memsize"), "{error}");
+        assert!(!setter_called.get());
+
+        let error = configure_metal_wired_limit_with(
+            || Some(0),
+            || 1,
+            |_| {
+                setter_called.set(true);
+                Ok(())
+            },
+        )
+        .expect_err("zero physical memory must fail");
+        assert!(error.contains("zero bytes"), "{error}");
+        assert!(!setter_called.get());
+
+        let error = configure_metal_wired_limit_with(|| Some(1), || 0, |_| Ok(()))
+            .expect_err("zero Metal recommendation must fail");
+        assert!(
+            error.contains("max_recommended_working_set_size"),
+            "{error}"
+        );
+
+        let error = configure_metal_wired_limit_with(|| Some(1024), || 1024, |_| {
+            Err("backend rejected limit".to_string())
+        })
+        .expect_err("setter failure must abort initialization");
+        assert!(error.contains("failed to configure"), "{error}");
+        assert!(error.contains("backend rejected limit"), "{error}");
     }
 
     struct TestDir(PathBuf);

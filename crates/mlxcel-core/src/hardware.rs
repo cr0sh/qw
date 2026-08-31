@@ -110,6 +110,25 @@ pub fn get_hardware() -> &'static HardwareCapabilities {
     HARDWARE_CAPABILITIES.get_or_init(detect_hardware)
 }
 
+/// Physical system memory reported by the operating system, in bytes.
+///
+/// macOS exposes the byte-precise value through `hw.memsize`. Other platforms
+/// return `None`; callers must not reconstruct this value from
+/// [`HardwareCapabilities::unified_memory_gb`], which is intentionally rounded
+/// down for hardware classification.
+#[inline]
+pub fn physical_memory_bytes() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        platform::sysctl_u64("hw.memsize")
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 /// True only on M5-class Apple Silicon whose Neural Accelerator is driven by
 /// the running macOS (Metal GPU Family 4).
 ///
@@ -382,7 +401,7 @@ mod platform {
 
 #[cfg(target_os = "macos")]
 fn detect_hardware_macos() -> HardwareCapabilities {
-    use platform::{sysctl_string, sysctl_u32, sysctl_u64};
+    use platform::{sysctl_string, sysctl_u32};
 
     // ── Chip generation ───────────────────────────────────────────────────────
     let brand = sysctl_string("machdep.cpu.brand_string").unwrap_or_default();
@@ -394,7 +413,7 @@ fn detect_hardware_macos() -> HardwareCapabilities {
     let gpu_core_count = sysctl_u32("hw.perflevel0.logicalcpu").unwrap_or(0);
 
     // ── Unified memory ────────────────────────────────────────────────────────
-    let mem_bytes = sysctl_u64("hw.memsize").unwrap_or(0);
+    let mem_bytes = physical_memory_bytes().unwrap_or(0);
     let unified_memory_gb = (mem_bytes / (1024 * 1024 * 1024)) as u32;
 
     // ── macOS version ─────────────────────────────────────────────────────────
@@ -867,6 +886,15 @@ mod tests {
         // but the enum must be one of the valid variants.
         let _ = format!("{}", caps.silicon_gen);
         let _ = caps.has_neural_accelerator;
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn physical_memory_query_returns_byte_count() {
+        assert!(
+            physical_memory_bytes().is_some_and(|bytes| bytes > 0),
+            "hw.memsize must report a nonzero byte count on macOS"
+        );
     }
 
     #[test]

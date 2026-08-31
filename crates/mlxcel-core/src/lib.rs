@@ -1960,10 +1960,11 @@ mod ffi {
         /// Set default device for subsequent operations
         fn set_default_device(gpu: bool);
 
-        /// Set wired memory limit, returns previous limit
-        fn set_wired_limit(limit: usize) -> usize;
+        /// Set wired memory limit, returning the previous limit. C++ exceptions
+        /// are surfaced to Rust so startup can fail safely.
+        fn set_wired_limit(limit: usize) -> Result<usize>;
 
-        /// Get current wired memory limit
+        /// Get Metal's maximum recommended working-set size.
         fn get_wired_limit() -> usize;
 
         // MLX runtime memory accounting (issue #55).
