@@ -2461,7 +2461,7 @@ impl Qwen4Model {
         self.rollback_mtp_verify_to_retained_inputs(gdn_states, 0, block_size, materialize)
     }
 
-    /// Sever persistent target state from the completed MTP round.
+    /// Sever persistent target state from completed decode work.
     pub(crate) fn materialize_mtp_cache_state(&self) {
         self.sequence_state.with_internal(|caches| {
             for cache in caches.iter_mut() {
@@ -3652,6 +3652,10 @@ impl LanguageModel for Qwen4Model {
 
     fn after_prefill(&self) {
         self.rope_state.finish_prefill();
+    }
+
+    fn materialize_decode_state(&self) {
+        self.materialize_mtp_cache_state();
     }
 
     fn make_caches(&self) -> Vec<KVCache> {

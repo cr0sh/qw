@@ -742,6 +742,9 @@ enum ControlledPrefixReuse<'a> {
     Borrowed(PrefixReuse<'a>),
     Owned(ModelStateSnapshot),
 }
+
+const CONTROLLED_DECODE_STATE_MATERIALIZE_INTERVAL: usize = 128;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct IllConditionedGreedyDecision {
     pub row: usize,
@@ -1325,6 +1328,12 @@ pub trait LanguageModel {
     /// Called once after prefill completes and before decode starts.
     /// Used by models that need to adjust internal state between phases.
     fn after_prefill(&self) {}
+
+    /// Materialize and detach model-owned state accumulated during decode.
+    ///
+    /// The default is a no-op for models whose decode state lives entirely in
+    /// the caller-owned cache slice.
+    fn materialize_decode_state(&self) {}
 
     /// Trim internal caches after padded prefill. Models with internal
     /// cache state (e.g. NemotronH) override this to trim their own caches
@@ -2577,6 +2586,14 @@ impl CxxGenerator {
             let next_input = ffi::reshape_token_for_forward(&token);
             logits = model.forward_last_logits(&next_input, &mut self.caches, None, 0);
             aligned_token_len += 1;
+            if crate::memory::should_clear_cache_crossing(
+                self.generated_tokens.len().saturating_sub(1),
+                self.generated_tokens.len(),
+                CONTROLLED_DECODE_STATE_MATERIALIZE_INTERVAL,
+            ) {
+                model.materialize_decode_state();
+                ffi::clear_memory_cache();
+            }
         }
 
         if !self.generated_tokens.is_empty() {
@@ -2902,6 +2919,14 @@ impl CxxGenerator {
             }
             let next_input = ffi::reshape_token_for_forward(&token);
             logits = model.forward_last_logits(&next_input, &mut self.caches, None, 0);
+            if crate::memory::should_clear_cache_crossing(
+                self.generated_tokens.len().saturating_sub(1),
+                self.generated_tokens.len(),
+                CONTROLLED_DECODE_STATE_MATERIALIZE_INTERVAL,
+            ) {
+                model.materialize_decode_state();
+                ffi::clear_memory_cache();
+            }
         }
         let decode_time = decode_start.elapsed();
         Ok(ControlledGeneration {
@@ -5365,6 +5390,60 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct ControlledMaterializationModel {
+        decode_forwards: std::cell::Cell<usize>,
+        materialized_after_forwards: std::cell::RefCell<Vec<usize>>,
+    }
+
+    impl LanguageModel for ControlledMaterializationModel {
+        fn forward(
+            &self,
+            input_ids: &MlxArray,
+            caches: &mut [KVCache],
+            mask: Option<&MlxArray>,
+        ) -> UniquePtr<MlxArray> {
+            if ffi::array_shape(input_ids)[1] == 1 {
+                self.decode_forwards
+                    .set(self.decode_forwards.get().saturating_add(1));
+            }
+            StubModel.forward(input_ids, caches, mask)
+        }
+
+        fn forward_with_embeddings(
+            &self,
+            input_ids: &MlxArray,
+            input_embeddings: Option<&MlxArray>,
+            caches: &mut [KVCache],
+            mask: Option<&MlxArray>,
+        ) -> UniquePtr<MlxArray> {
+            assert!(input_embeddings.is_some());
+            StubModel.forward(input_ids, caches, mask)
+        }
+
+        fn materialize_decode_state(&self) {
+            self.materialized_after_forwards
+                .borrow_mut()
+                .push(self.decode_forwards.get());
+        }
+
+        fn supports_chunked_prefill(&self) -> bool {
+            false
+        }
+
+        fn make_caches(&self) -> Vec<KVCache> {
+            vec![KVCache::new()]
+        }
+
+        fn num_layers(&self) -> usize {
+            1
+        }
+
+        fn eos_token_ids(&self) -> Vec<i32> {
+            vec![99]
+        }
+    }
+
     struct EosStubModel;
 
     impl LanguageModel for EosStubModel {
@@ -5733,6 +5812,48 @@ mod tests {
         let final_snapshot = result.final_snapshot.expect("cancelled final snapshot");
         assert_eq!(final_snapshot.token_len(), 1);
         assert!(final_snapshot.continuation_logits().is_some());
+    }
+
+    #[test]
+    fn controlled_generation_materializes_after_each_forwarded_boundary_token() {
+        let model = ControlledMaterializationModel::default();
+        let result = CxxGenerator::new(1)
+            .generate_streaming_controlled(
+                &model,
+                &[1, 1],
+                None,
+                257,
+                &SamplingConfig::greedy(),
+                None,
+                &[],
+                |_| true,
+            )
+            .expect("controlled generation");
+
+        assert_eq!(result.token_ids, vec![1; 257]);
+        assert_eq!(*model.materialized_after_forwards.borrow(), vec![128, 256]);
+    }
+
+    #[test]
+    fn controlled_embedding_generation_materializes_after_forwarded_boundary_token() {
+        let model = ControlledMaterializationModel::default();
+        let embeddings = ffi::from_slice_f32(&[0.0; 8], &[1, 2, 4]);
+        let result = CxxGenerator::new(1)
+            .generate_streaming_controlled_with_embeddings(
+                &model,
+                &[1, 1],
+                Some(&embeddings),
+                None,
+                None,
+                129,
+                &SamplingConfig::greedy(),
+                None,
+                |_| true,
+            )
+            .expect("controlled embedding generation");
+
+        assert_eq!(result.token_ids, vec![1; 129]);
+        assert_eq!(*model.materialized_after_forwards.borrow(), vec![128]);
     }
 
     #[test]
