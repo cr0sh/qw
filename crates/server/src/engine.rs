@@ -34,6 +34,9 @@ use crate::tool_calls::{ToolCallGate, parse_assistant_output};
 const JOB_QUEUE_CAPACITY: usize = 8;
 const EVENT_QUEUE_CAPACITY: usize = 32;
 const JOB_BATCH_CAPACITY: usize = 4;
+// One two-millisecond grace per batch lets near-simultaneous submissions coalesce
+// without repeatedly delaying an isolated job.
+const JOB_BATCH_COALESCING_GRACE: Duration = Duration::from_millis(2);
 const CACHE_MAINTENANCE_CAPACITY: usize = JOB_QUEUE_CAPACITY;
 const CACHE_MAINTENANCE_GRACE: Duration = Duration::from_millis(5);
 struct CacheMaintenance {
@@ -1091,12 +1094,25 @@ fn next_worker_action<T>(
 }
 
 fn collect_job_batch<T>(first: T, jobs: &mut mpsc::Receiver<T>) -> Vec<T> {
+    collect_job_batch_with_wait(first, jobs, thread::sleep)
+}
+
+fn collect_job_batch_with_wait<T>(
+    first: T,
+    jobs: &mut mpsc::Receiver<T>,
+    wait: impl FnOnce(Duration),
+) -> Vec<T> {
     let mut batch = Vec::with_capacity(JOB_BATCH_CAPACITY);
     batch.push(first);
+    let mut wait = Some(wait);
     while batch.len() < JOB_BATCH_CAPACITY {
         match jobs.try_recv() {
             Ok(job) => batch.push(job),
-            Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => break,
+            Err(mpsc::error::TryRecvError::Empty) => match wait.take() {
+                Some(wait) => wait(JOB_BATCH_COALESCING_GRACE),
+                None => break,
+            },
+            Err(mpsc::error::TryRecvError::Disconnected) => break,
         }
     }
     batch
@@ -2574,6 +2590,51 @@ mod tests {
         let action = next_worker_action(receiver.try_recv(), true);
 
         assert!(matches!(action, WorkerNextAction::Job(7)));
+    }
+
+    #[test]
+    fn job_batch_coalesces_arrivals_during_grace() {
+        let (jobs, mut receiver) = mpsc::channel(JOB_QUEUE_CAPACITY);
+        jobs.try_send(1).expect("test queue has capacity");
+        let first = receiver.try_recv().expect("first queued job");
+        let mut waits = 0;
+
+        let batch = collect_job_batch_with_wait(first, &mut receiver, |grace| {
+            waits += 1;
+            assert_eq!(grace, JOB_BATCH_COALESCING_GRACE);
+            for value in 2..=JOB_BATCH_CAPACITY {
+                jobs.try_send(value).expect("test queue has capacity");
+            }
+        });
+
+        assert_eq!(waits, 1);
+        assert_eq!(batch, (1..=JOB_BATCH_CAPACITY).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn job_batch_single_request_waits_for_only_one_coalescing_grace() {
+        let (_jobs, mut receiver) = mpsc::channel::<usize>(JOB_QUEUE_CAPACITY);
+        let mut waits = 0;
+
+        let batch = collect_job_batch_with_wait(1, &mut receiver, |grace| {
+            waits += 1;
+            assert_eq!(grace, JOB_BATCH_COALESCING_GRACE);
+        });
+
+        assert_eq!(waits, 1);
+        assert_eq!(batch, vec![1]);
+    }
+
+    #[test]
+    fn job_batch_disconnected_queue_does_not_wait() {
+        let (jobs, mut receiver) = mpsc::channel::<usize>(JOB_QUEUE_CAPACITY);
+        drop(jobs);
+
+        let batch = collect_job_batch_with_wait(1, &mut receiver, |_| {
+            panic!("disconnected queue must not enter coalescing grace");
+        });
+
+        assert_eq!(batch, vec![1]);
     }
 
     #[test]
