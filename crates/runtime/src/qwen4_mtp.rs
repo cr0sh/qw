@@ -2727,6 +2727,7 @@ impl Qwen4MtpGenerator {
         checkpoint_token_lengths: &[usize],
         constraint: Option<&mut dyn TokenConstraint>,
         on_token: F,
+        capture_final_snapshot: bool,
     ) -> Result<MtpGeneration, String> {
         self.generate_streaming_impl(
             model,
@@ -2738,6 +2739,7 @@ impl Qwen4MtpGenerator {
             checkpoint_token_lengths,
             constraint,
             on_token,
+            capture_final_snapshot,
         )
     }
 
@@ -2754,6 +2756,7 @@ impl Qwen4MtpGenerator {
         checkpoint_token_lengths: &[usize],
         constraint: Option<&mut dyn TokenConstraint>,
         on_token: F,
+        capture_final_snapshot: bool,
     ) -> Result<MtpGeneration, String> {
         self.generate_streaming_impl(
             model,
@@ -2768,6 +2771,7 @@ impl Qwen4MtpGenerator {
             checkpoint_token_lengths,
             constraint,
             on_token,
+            capture_final_snapshot,
         )
     }
 
@@ -2783,6 +2787,7 @@ impl Qwen4MtpGenerator {
         checkpoint_token_lengths: &[usize],
         constraint: Option<&mut dyn TokenConstraint>,
         on_token: F,
+        capture_final_snapshot: bool,
     ) -> Result<MtpGeneration, String> {
         let consumes_snapshot =
             matches!(prefix_reuse.as_ref(), Some(MtpReuse::Owned { .. }));
@@ -2805,6 +2810,7 @@ impl Qwen4MtpGenerator {
             checkpoint_token_lengths,
             constraint,
             on_token,
+            capture_final_snapshot,
         );
         if consumes_snapshot && result.is_err() {
             model.reset_runtime_state();
@@ -2829,6 +2835,7 @@ impl Qwen4MtpGenerator {
         checkpoint_token_lengths: &[usize],
         constraint: Option<&mut dyn TokenConstraint>,
         mut on_token: F,
+        capture_final_snapshot: bool,
     ) -> Result<MtpGeneration, String> {
         assert!(!prompt_tokens.is_empty(), "MTP prompt must not be empty");
         assert!(block_size >= 2, "MTP block size must be at least 2");
@@ -2867,6 +2874,7 @@ impl Qwen4MtpGenerator {
                 checkpoint_token_lengths,
                 constraint,
                 on_token,
+                capture_final_snapshot,
             );
         }
         let drafter = model
@@ -3132,12 +3140,26 @@ impl Qwen4MtpGenerator {
                 if full_state_materialized {
                     mtp_stats.full_state_materializations += 1;
                 }
+                if full_state_materialized
+                    && mtp_round_reaches_cache_clear(
+                        emitted_before,
+                        generated.len(),
+                        4 * 1024,
+                    )
+                {
+                    mlxcel_core::memory::trace_snapshot(
+                        "mtp.decode.state_boundary",
+                        generated.len(),
+                        max_tokens,
+                    );
+                }
                 if let Some(elapsed) =
                     clear_mtp_cache_if_needed(emitted_before, generated.len(), max_tokens)
                 {
                     mtp_stats.record_cache_clear(elapsed);
                 }
-                let can_capture_round_snapshot = matches!(prefill_input, MtpPrefill::Text { .. })
+                let can_capture_round_snapshot = capture_final_snapshot
+                    && matches!(prefill_input, MtpPrefill::Text { .. })
                     && round_stop_reason.is_some()
                     && emitted_in_round > 0;
                 if can_capture_round_snapshot {
@@ -3171,18 +3193,19 @@ impl Qwen4MtpGenerator {
             }
         }
         mtp_stats.decode_time = decode_start.elapsed();
-        let final_snapshot = if matches!(prefill_input, MtpPrefill::Text { .. }) {
-            capture_mtp_final_snapshot(
-                model,
-                drafter,
-                prompt_tokens,
-                prefill_input,
-                final_prefix_reuse,
-                &generated,
-            )?
-        } else {
-            None
-        };
+        let final_snapshot =
+            if capture_final_snapshot && matches!(prefill_input, MtpPrefill::Text { .. }) {
+                capture_mtp_final_snapshot(
+                    model,
+                    drafter,
+                    prompt_tokens,
+                    prefill_input,
+                    final_prefix_reuse,
+                    &generated,
+                )?
+            } else {
+                None
+            };
         Ok(MtpGeneration {
             token_ids: generated,
             stats: mtp_stats,
@@ -3205,6 +3228,7 @@ impl Qwen4MtpGenerator {
         checkpoint_token_lengths: &[usize],
         constraint: &mut dyn TokenConstraint,
         mut on_token: F,
+        capture_final_snapshot: bool,
     ) -> Result<MtpGeneration, String> {
         let drafter = model
             .mtp()
@@ -3283,18 +3307,19 @@ impl Qwen4MtpGenerator {
                 callback_cancelled = true;
             }
             if callback_cancelled {
-                let final_snapshot = if matches!(prefill_input, MtpPrefill::Text { .. }) {
-                    capture_mtp_final_snapshot(
-                        model,
-                        drafter,
-                        prompt_tokens,
-                        prefill_input,
-                        final_prefix_reuse,
-                        &generated,
-                    )?
-                } else {
-                    None
-                };
+                let final_snapshot =
+                    if capture_final_snapshot && matches!(prefill_input, MtpPrefill::Text { .. }) {
+                        capture_mtp_final_snapshot(
+                            model,
+                            drafter,
+                            prompt_tokens,
+                            prefill_input,
+                            final_prefix_reuse,
+                            &generated,
+                        )?
+                    } else {
+                        None
+                    };
                 return Ok(MtpGeneration {
                     token_ids: generated,
                     stats,
@@ -3308,18 +3333,19 @@ impl Qwen4MtpGenerator {
                 if initial.rebuild && !generated.is_empty() {
                     let _ = rebuild_mtp_state(model, drafter, prefill_input, &generated)?;
                 }
-                let final_snapshot = if matches!(prefill_input, MtpPrefill::Text { .. }) {
-                    capture_mtp_final_snapshot(
-                        model,
-                        drafter,
-                        prompt_tokens,
-                        prefill_input,
-                        final_prefix_reuse,
-                        &generated,
-                    )?
-                } else {
-                    None
-                };
+                let final_snapshot =
+                    if capture_final_snapshot && matches!(prefill_input, MtpPrefill::Text { .. }) {
+                        capture_mtp_final_snapshot(
+                            model,
+                            drafter,
+                            prompt_tokens,
+                            prefill_input,
+                            final_prefix_reuse,
+                            &generated,
+                        )?
+                    } else {
+                        None
+                    };
                 return Ok(MtpGeneration {
                     token_ids: generated,
                     stats,
@@ -3527,18 +3553,19 @@ impl Qwen4MtpGenerator {
             }
         }
 
-        let final_snapshot = if matches!(prefill_input, MtpPrefill::Text { .. }) {
-            capture_mtp_final_snapshot(
-                model,
-                drafter,
-                prompt_tokens,
-                prefill_input,
-                final_prefix_reuse,
-                &generated,
-            )?
-        } else {
-            None
-        };
+        let final_snapshot =
+            if capture_final_snapshot && matches!(prefill_input, MtpPrefill::Text { .. }) {
+                capture_mtp_final_snapshot(
+                    model,
+                    drafter,
+                    prompt_tokens,
+                    prefill_input,
+                    final_prefix_reuse,
+                    &generated,
+                )?
+            } else {
+                None
+            };
 
         Ok(MtpGeneration {
             token_ids: generated,

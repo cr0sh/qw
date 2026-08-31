@@ -152,6 +152,10 @@ impl CacheBehavior {
             checkpoint_token_lengths.clear();
         }
     }
+
+    fn capture_final_snapshot(self) -> bool {
+        self.snapshot_route.is_some()
+    }
 }
 
 fn cache_behavior(route: QwenGenerationRoute, prefix_cache_enabled: bool) -> CacheBehavior {
@@ -1645,6 +1649,7 @@ impl QwenWorker {
                         .as_mut()
                         .map(|value| value as &mut dyn mlxcel_core::generate::TokenConstraint),
                     &mut emit_delta,
+                    cache_behavior.capture_final_snapshot(),
                 ),
             (
                 QwenGenerationRoute::BaselineText,
@@ -1671,6 +1676,7 @@ impl QwenWorker {
                     .as_mut()
                     .map(|value| value as &mut dyn mlxcel_core::generate::TokenConstraint),
                 &mut emit_delta,
+                cache_behavior.capture_final_snapshot(),
             ),
             (QwenGenerationRoute::BaselineText, None) => provider.generate_baseline_streaming(
                 &generation_prompt_ids,
@@ -2251,6 +2257,7 @@ mod tests {
         ] {
             let behavior = cache_behavior(route, true);
             assert_eq!(behavior.snapshot_route, Some(expected_cache_route));
+            assert!(behavior.capture_final_snapshot());
             assert_eq!(behavior.lookup_route, Some(expected_cache_route));
             let mut checkpoint_token_lengths = vec![64, 128];
             behavior.apply_checkpoint_policy(&mut checkpoint_token_lengths);
@@ -2266,6 +2273,7 @@ mod tests {
         ] {
             let behavior = cache_behavior(route, false);
             assert_eq!(behavior.snapshot_route, None);
+            assert!(!behavior.capture_final_snapshot());
             assert_eq!(behavior.lookup_route, None);
             let mut checkpoint_token_lengths = vec![64, 128];
             behavior.apply_checkpoint_policy(&mut checkpoint_token_lengths);

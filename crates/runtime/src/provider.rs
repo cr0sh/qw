@@ -743,6 +743,7 @@ impl Qwen4Provider {
         checkpoint_token_lengths: &[usize],
         constraint: Option<&mut dyn TokenConstraint>,
         on_delta: F,
+        capture_final_snapshot: bool,
     ) -> Result<BaselineGeneration> {
         self.generate_mtp_streaming_impl(
             prompt_ids,
@@ -753,6 +754,7 @@ impl Qwen4Provider {
             checkpoint_token_lengths,
             constraint,
             on_delta,
+            capture_final_snapshot,
         )
         .map(|(generation, _)| generation)
     }
@@ -769,6 +771,7 @@ impl Qwen4Provider {
         checkpoint_token_lengths: &[usize],
         constraint: Option<&mut dyn TokenConstraint>,
         on_delta: F,
+        capture_final_snapshot: bool,
     ) -> Result<BaselineGeneration> {
         self.generate_mtp_streaming_impl(
             prompt_ids,
@@ -782,6 +785,7 @@ impl Qwen4Provider {
             checkpoint_token_lengths,
             constraint,
             on_delta,
+            capture_final_snapshot,
         )
         .map(|(generation, _)| generation)
     }
@@ -803,6 +807,7 @@ impl Qwen4Provider {
         checkpoint_token_lengths: &[usize],
         constraint: Option<&mut dyn TokenConstraint>,
         mut on_delta: F,
+        capture_final_snapshot: bool,
     ) -> Result<(BaselineGeneration, MtpGenerationStats)> {
         ensure!(block_size >= 2, "MTP block size must be at least 2");
         ensure!(
@@ -849,6 +854,7 @@ impl Qwen4Provider {
                 checkpoint_token_lengths,
                 constraint,
                 &mut on_token,
+                capture_final_snapshot,
             ),
             MtpGenerationReuse::Owned {
                 snapshot,
@@ -864,6 +870,7 @@ impl Qwen4Provider {
                 checkpoint_token_lengths,
                 constraint,
                 &mut on_token,
+                capture_final_snapshot,
             ),
         }
         .map_err(anyhow::Error::msg)
@@ -993,6 +1000,7 @@ impl Qwen4Provider {
             &[],
             None,
             on_delta,
+            false,
         )?;
         Ok((
             GenerationOutput {
@@ -1034,6 +1042,7 @@ impl Qwen4Provider {
             &[],
             None,
             on_delta,
+            false,
         )?;
         Ok((generation, Some(stats)))
     }
@@ -1086,6 +1095,7 @@ impl Qwen4Provider {
                     &[],
                     None,
                     on_delta,
+                    false,
                 )?;
                 Ok((generation, Some(stats)))
             }
@@ -1621,6 +1631,7 @@ mod tests {
                     cold_ttft.get_or_insert_with(|| cold_started.elapsed());
                     true
                 },
+                true,
             )
             .expect("cold MTP generation");
 
@@ -1634,6 +1645,7 @@ mod tests {
                 &[base_ids.len()],
                 None,
                 |_| true,
+                true,
             )
             .expect("capture MTP prompt snapshot");
         let PromptSnapshot::Mtp(snapshot) = prefix
@@ -1682,6 +1694,7 @@ mod tests {
                     warm_ttft.get_or_insert_with(|| warm_started.elapsed());
                     true
                 },
+                true,
             )
             .expect("warm MTP generation");
         let owned_mtp = provider
@@ -1695,6 +1708,7 @@ mod tests {
                 &[full_ids.len()],
                 None,
                 |_| true,
+                true,
             )
             .expect("owned MTP prefix generation");
         let owned_mtp_final = owned_mtp
@@ -1858,6 +1872,7 @@ mod tests {
                     &[history_ids.len()],
                     None,
                     |_| true,
+                    true,
                 )
                 .expect("capture reasoning-aware history snapshot");
             let PromptSnapshot::Mtp(snapshot) = checkpoint
@@ -1883,6 +1898,7 @@ mod tests {
                     &[next_ids.len()],
                     None,
                     |_| true,
+                    true,
                 )
                 .expect("reuse reasoning-aware history snapshot");
             assert_eq!(
@@ -1959,6 +1975,7 @@ mod tests {
                     last_callback = Some(Instant::now());
                     true
                 },
+                false,
             )
             .expect("long MTP generation");
         let tail = last_callback
@@ -1966,6 +1983,7 @@ mod tests {
             .elapsed();
         assert_eq!(callback_count, 1024);
         assert_eq!(generated.finish_outcome, GenerationStopReason::MaxTokens);
+        assert!(generated.final_snapshot.is_none());
         eprintln!(
             "MTP terminal-tail benchmark: completion_tokens={}, callbacks={}, tail_ms={:.2}",
             generated.completion_tokens,
@@ -1974,7 +1992,7 @@ mod tests {
         );
         assert!(
             tail < Duration::from_secs(10),
-            "terminal snapshot must not replay the output: tail={tail:?}"
+            "uncached generation must not perform terminal snapshot work: tail={tail:?}"
         );
     }
 
@@ -2014,6 +2032,7 @@ mod tests {
                 &[],
                 None,
                 |_| true,
+                true,
             )
             .expect("generate deterministic greedy control sequence");
         let candidate = control
@@ -2057,6 +2076,7 @@ mod tests {
                     last_callback = Some(Instant::now());
                     true
                 },
+                true,
             )
             .expect("generate until selected stop token");
         let terminal_tail = last_callback
@@ -2093,6 +2113,7 @@ mod tests {
                 &[],
                 None,
                 |_| true,
+                true,
             )
             .expect("cold greedy continuation");
         let warm = generator
@@ -2110,6 +2131,7 @@ mod tests {
                 &[],
                 None,
                 |_| true,
+                true,
             )
             .expect("snapshot-resumed greedy continuation");
         assert_eq!(
@@ -2185,6 +2207,7 @@ mod tests {
                 &[prompt_ids.len()],
                 None,
                 |_| true,
+                true,
             )
             .expect("uninterrupted MTP generation");
         let prompt_snapshot = control
@@ -2214,6 +2237,7 @@ mod tests {
                     cold_callbacks += 1;
                     cold_callbacks < 20
                 },
+                true,
             )
             .expect("cold cancelled MTP generation");
         let cold_accepted = cold_interrupted.token_ids.len();
@@ -2238,6 +2262,7 @@ mod tests {
                 &[],
                 None,
                 |_| true,
+                true,
             )
             .expect("uninterrupted full-prompt restore");
         assert_eq!(
@@ -2263,6 +2288,7 @@ mod tests {
                     callbacks += 1;
                     callbacks < 20
                 },
+                true,
             )
             .expect("cancelled MTP generation");
         assert_eq!(
@@ -2344,6 +2370,7 @@ mod tests {
                 &[],
                 None,
                 |_| true,
+                true,
             )
             .expect("resume live MTP snapshot");
         let mut direct_combined = interrupted.token_ids.clone();
@@ -2372,6 +2399,7 @@ mod tests {
                 &[],
                 None,
                 |_| true,
+                true,
             )
             .expect("resume portable MTP snapshot");
         let mut combined = interrupted.token_ids;
