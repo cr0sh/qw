@@ -10,36 +10,41 @@ import subprocess
 PROJECT_DIR = Path(__file__).resolve().parent
 MIN_FREE_BYTES = 15 * 1024**3
 SUITES = {
-    # Qwen's official sampling defaults:
-    # https://huggingface.co/Qwen/Qwen3.8-Flash-Next/resolve/main/generation_config.json
     "gpqa_diamond": {
         "generation_config": {
-            "temperature": 1.0,
-            "top_p": 0.95,
+            "temperature": 0.7,
+            "top_p": 0.8,
             "top_k": 20,
-            "do_sample": True,
-            "max_tokens": 32_768,
+            "max_tokens": 4_096,
+            "extra_body": {
+                "chat_template_kwargs": {"enable_thinking": False}
+            },
         },
         "repeats": 1,
     },
-    # IFBench uses greedy decoding and a larger allowance for thinking models:
-    # https://github.com/allenai/IFBench
     "ifbench": {
         "generation_config": {
-            "temperature": 0,
-            "max_tokens": 32_768,
+            "temperature": 0.7,
+            "top_p": 0.8,
+            "top_k": 20,
+            "max_tokens": 4_096,
+            "extra_body": {
+                "chat_template_kwargs": {"enable_thinking": False}
+            },
         },
         "repeats": 1,
     },
-    # The official runner uses n=10 and these release_v6 sampling settings:
-    # https://github.com/LiveCodeBench/LiveCodeBench
     "live_code_bench": {
         "generation_config": {
-            "temperature": 0.2,
-            "top_p": 0.95,
-            "max_tokens": 2_000,
+            "temperature": 0.7,
+            "top_p": 0.8,
+            "top_k": 20,
+            "max_tokens": 8_192,
+            "extra_body": {
+                "chat_template_kwargs": {"enable_thinking": False}
+            },
         },
-        "repeats": 10,
+        "repeats": 1,
     },
 }
 

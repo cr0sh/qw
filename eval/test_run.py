@@ -32,109 +32,101 @@ class GenerationConfigTests(unittest.TestCase):
 
         return subprocess_run.call_args.args[0]
 
-    def test_suites_emit_exact_generation_protocols(self) -> None:
-        expected = {
+    def test_suites_emit_exact_evalscope_commands(self) -> None:
+        expected_configs = {
             "gpqa_diamond": {
-                "generation_config": {
-                    "temperature": 1.0,
-                    "top_p": 0.95,
-                    "top_k": 20,
-                    "do_sample": True,
-                    "max_tokens": 32_768,
+                "temperature": 0.7,
+                "top_p": 0.8,
+                "top_k": 20,
+                "max_tokens": 4_096,
+                "extra_body": {
+                    "chat_template_kwargs": {"enable_thinking": False}
                 },
-                "repeats": "1",
             },
             "ifbench": {
-                "generation_config": {
-                    "temperature": 0,
-                    "max_tokens": 32_768,
+                "temperature": 0.7,
+                "top_p": 0.8,
+                "top_k": 20,
+                "max_tokens": 4_096,
+                "extra_body": {
+                    "chat_template_kwargs": {"enable_thinking": False}
                 },
-                "repeats": "1",
             },
             "live_code_bench": {
-                "generation_config": {
-                    "temperature": 0.2,
-                    "top_p": 0.95,
-                    "max_tokens": 2_000,
+                "temperature": 0.7,
+                "top_p": 0.8,
+                "top_k": 20,
+                "max_tokens": 8_192,
+                "extra_body": {
+                    "chat_template_kwargs": {"enable_thinking": False}
                 },
-                "repeats": "10",
             },
         }
 
-        for dataset, protocol in expected.items():
+        for dataset, config in expected_configs.items():
             with self.subTest(dataset=dataset):
-                command = self.command_for(dataset)
-                config_index = command.index("--generation-config") + 1
-                config_json = command[config_index]
-                self.assertEqual(
-                    config_json,
-                    json.dumps(
-                        protocol["generation_config"], separators=(",", ":")
-                    ),
-                )
-                config = json.loads(config_json)
-                self.assertNotIn("seed", config)
-                self.assertNotIn("extra_body", config)
-                self.assertNotIn("enable_thinking", config_json)
-
-                repeats_index = command.index("--repeats") + 1
-                self.assertEqual(command[repeats_index], protocol["repeats"])
-                seed_index = command.index("--seed") + 1
-                self.assertEqual(command[seed_index], "42")
-                datasets_index = command.index("--datasets") + 1
-                self.assertEqual(command[datasets_index], dataset)
-                api_url_index = command.index("--api-url") + 1
-                self.assertEqual(command[api_url_index], "http://127.0.0.1:8883/v1")
-                batch_size_index = command.index("--eval-batch-size") + 1
-                self.assertEqual(command[batch_size_index], "1")
-                self.assertEqual(command.count("--timeout"), 1)
-                timeout_index = command.index("--timeout") + 1
-                self.assertEqual(command[timeout_index], "1800")
-                work_dir_index = command.index("--work-dir") + 1
-                self.assertEqual(
-                    command[work_dir_index],
+                expected = [
+                    "evalscope",
+                    "eval",
+                    "--model",
+                    "qwen3.8-flash-next",
+                    "--eval-type",
+                    "openai_api",
+                    "--api-url",
+                    "http://127.0.0.1:8883/v1",
+                    "--api-key",
+                    "EMPTY",
+                    "--datasets",
+                    dataset,
+                    "--generation-config",
+                    json.dumps(config, separators=(",", ":")),
+                    "--eval-batch-size",
+                    "1",
+                    "--timeout",
+                    "1800",
+                    "--repeats",
+                    "1",
+                    "--seed",
+                    "42",
+                    "--work-dir",
                     str(Path("/tmp/qwr-eval-test").resolve() / dataset),
-                )
-                self.assertNotIn("--limit", command)
-
+                    "--enable-progress-tracker",
+                ]
                 if dataset == "live_code_bench":
-                    dataset_args_index = command.index("--dataset-args") + 1
-                    self.assertEqual(
-                        command[dataset_args_index],
-                        json.dumps(
-                            {
-                                "live_code_bench": {
-                                    "subset_list": ["release_v6"]
-                                }
-                            },
-                            separators=(",", ":"),
-                        ),
-                    )
-                    sandbox_index = command.index("--sandbox") + 1
-                    self.assertEqual(
-                        command[sandbox_index],
-                        json.dumps(
-                            {
-                                "enabled": True,
-                                "engine": "docker",
-                                "pool_size": 4,
-                                "default_config": {
-                                    "image": "python:3.11-slim",
-                                    "platform": None,
-                                    "network_enabled": False,
-                                    "memory_limit": "512m",
-                                    "tools_config": {
-                                        "shell_executor": {},
-                                        "python_executor": {},
+                    expected.extend(
+                        [
+                            "--dataset-args",
+                            json.dumps(
+                                {
+                                    "live_code_bench": {
+                                        "subset_list": ["release_v6"]
+                                    }
+                                },
+                                separators=(",", ":"),
+                            ),
+                            "--sandbox",
+                            json.dumps(
+                                {
+                                    "enabled": True,
+                                    "engine": "docker",
+                                    "pool_size": 4,
+                                    "default_config": {
+                                        "image": "python:3.11-slim",
+                                        "platform": None,
+                                        "network_enabled": False,
+                                        "memory_limit": "512m",
+                                        "tools_config": {
+                                            "shell_executor": {},
+                                            "python_executor": {},
+                                        },
                                     },
                                 },
-                            },
-                            separators=(",", ":"),
-                        ),
+                                separators=(",", ":"),
+                            ),
+                        ]
                     )
-                else:
-                    self.assertNotIn("--dataset-args", command)
-                    self.assertNotIn("--sandbox", command)
+
+                self.assertEqual(self.command_for(dataset), expected)
 
     def test_limit_is_forwarded_to_evalscope(self) -> None:
         command = self.command_for("gpqa_diamond", limit=7)
