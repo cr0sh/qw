@@ -1346,6 +1346,23 @@ fn materialize_detached(array: UniquePtr<MlxArray>) -> UniquePtr<MlxArray> {
 fn mtp_round_reaches_cache_clear(previous: usize, emitted: usize, interval: usize) -> bool {
     mlxcel_core::memory::should_clear_cache_crossing(previous, emitted, interval)
 }
+
+fn materialize_mtp_round_state_if_needed<S>(
+    previous: usize,
+    emitted: usize,
+    state: S,
+    materialize_target: impl FnOnce(),
+    materialize_drafter: impl FnOnce(),
+    materialize_hidden: impl FnOnce(S) -> S,
+) -> (S, bool) {
+    if !mtp_round_reaches_cache_clear(previous, emitted, MTP_STATE_MATERIALIZE_INTERVAL) {
+        return (state, false);
+    }
+    materialize_target();
+    materialize_drafter();
+    (materialize_hidden(state), true)
+}
+
 /// Number of target tokens to retain before the emitted round bonus.
 fn target_cache_accepted_count(emitted: usize) -> usize {
     emitted.saturating_sub(1)
@@ -3082,14 +3099,6 @@ impl Qwen4MtpGenerator {
                         false,
                     );
                 }
-                if mtp_round_reaches_cache_clear(
-                    emitted_before,
-                    generated.len(),
-                    MTP_STATE_MATERIALIZE_INTERVAL,
-                ) {
-                    model.materialize_mtp_cache_state();
-                    mtp_stats.full_state_materializations += 1;
-                }
                 drafter.accept_verified_tokens(
                     model,
                     &verify.hidden,
@@ -3097,6 +3106,37 @@ impl Qwen4MtpGenerator {
                     walk.accepted,
                     &walk.new_tokens,
                 );
+                let hidden_shape = mlxcel_core::array_shape(&verify.hidden);
+                let accepted = i32::try_from(walk.accepted).unwrap_or(i32::MAX);
+                next_hidden = mlxcel_core::slice(
+                    &verify.hidden,
+                    &[0, accepted, 0],
+                    &[hidden_shape[0], accepted + 1, hidden_shape[2]],
+                );
+                if round_stop_reason.is_none() {
+                    bonus = *walk
+                        .new_tokens
+                        .last()
+                        .expect("speculative walk emits at least one token");
+                }
+                let (materialized_next_hidden, full_state_materialized) =
+                    materialize_mtp_round_state_if_needed(
+                        emitted_before,
+                        generated.len(),
+                        next_hidden,
+                        || model.materialize_mtp_cache_state(),
+                        || drafter.materialize_state(),
+                        materialize_detached,
+                    );
+                next_hidden = materialized_next_hidden;
+                if full_state_materialized {
+                    mtp_stats.full_state_materializations += 1;
+                }
+                if let Some(elapsed) =
+                    clear_mtp_cache_if_needed(emitted_before, generated.len(), max_tokens)
+                {
+                    mtp_stats.record_cache_clear(elapsed);
+                }
                 let can_capture_round_snapshot = matches!(prefill_input, MtpPrefill::Text { .. })
                     && round_stop_reason.is_some()
                     && emitted_in_round > 0;
@@ -3123,24 +3163,6 @@ impl Qwen4MtpGenerator {
                         final_snapshot,
                         cached_tokens,
                     });
-                }
-                if round_stop_reason.is_none() {
-                    let hidden_shape = mlxcel_core::array_shape(&verify.hidden);
-                    let accepted = i32::try_from(walk.accepted).unwrap_or(i32::MAX);
-                    next_hidden = mlxcel_core::slice(
-                        &verify.hidden,
-                        &[0, accepted, 0],
-                        &[hidden_shape[0], accepted + 1, hidden_shape[2]],
-                    );
-                    bonus = *walk
-                        .new_tokens
-                        .last()
-                        .expect("speculative walk emits at least one token");
-                }
-                if let Some(elapsed) =
-                    clear_mtp_cache_if_needed(emitted_before, generated.len(), max_tokens)
-                {
-                    mtp_stats.record_cache_clear(elapsed);
                 }
                 mtp_stats.reconcile_time += phase_start.elapsed();
                 if round_stop_reason.is_some() {
@@ -4259,6 +4281,41 @@ mod tests {
         assert!(mtp_round_reaches_cache_clear(7, 12, 4));
         assert!(!mtp_round_reaches_cache_clear(4, 7, 4));
         assert!(!mtp_round_reaches_cache_clear(0, usize::MAX, 0));
+    }
+
+    #[test]
+    fn full_state_materialization_runs_all_components_only_at_crossed_boundaries() {
+        let actions = std::cell::RefCell::new(Vec::new());
+        let run = |previous, emitted, hidden| {
+            materialize_mtp_round_state_if_needed(
+                previous,
+                emitted,
+                hidden,
+                || actions.borrow_mut().push("target"),
+                || actions.borrow_mut().push("drafter"),
+                |hidden| {
+                    actions.borrow_mut().push("hidden");
+                    hidden + 1
+                },
+            )
+        };
+
+        let (hidden, materialized) = run(0, 127, 7);
+        assert_eq!((hidden, materialized), (7, false));
+        assert!(actions.borrow().is_empty());
+
+        let (hidden, materialized) = run(127, 131, hidden);
+        assert_eq!((hidden, materialized), (8, true));
+        assert_eq!(&*actions.borrow(), &["target", "drafter", "hidden"]);
+        actions.borrow_mut().clear();
+
+        let (hidden, materialized) = run(131, 255, hidden);
+        assert_eq!((hidden, materialized), (8, false));
+        assert!(actions.borrow().is_empty());
+
+        let (hidden, materialized) = run(255, 259, hidden);
+        assert_eq!((hidden, materialized), (9, true));
+        assert_eq!(&*actions.borrow(), &["target", "drafter", "hidden"]);
     }
 
     const fn tensor_bytes(elements: u64, bits_per_element: u64) -> u64 {
