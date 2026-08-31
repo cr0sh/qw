@@ -1766,7 +1766,7 @@ fn test_memory_functions() {
     let max_size = gpu_max_memory_size();
     assert!(max_size > 0);
 
-    let _old = set_wired_limit(1024 * 1024 * 1024);
+    let _old = set_wired_limit(1024 * 1024 * 1024).expect("set wired limit");
     let limit = get_wired_limit();
     #[cfg(target_os = "macos")]
     assert!(
@@ -1778,7 +1778,7 @@ fn test_memory_functions() {
         limit, 0,
         "non-Metal backends have no wired limit; the getter must report 0"
     );
-    set_wired_limit(0);
+    set_wired_limit(0).expect("restore default wired limit");
 }
 
 #[test]

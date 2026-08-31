@@ -150,6 +150,50 @@ pub fn set_cache_limit(bytes: u64) -> u64 {
     ffi::set_cache_limit(clamped) as u64
 }
 
+/// Metal's maximum recommended working-set size for the active device, in bytes.
+///
+/// Returns `0` when the active backend does not publish Metal's
+/// `max_recommended_working_set_size` device property.
+#[inline]
+pub fn metal_recommended_working_set_size() -> u64 {
+    ffi::get_wired_limit() as u64
+}
+
+/// Set MLX's Metal wired-memory limit in bytes and return the previous limit.
+///
+/// The fallible bridge converts C++ exceptions into an error instead of
+/// aborting startup. The `u64` to `size_t` conversion is checked so a byte
+/// count can never be silently truncated on a narrower host.
+#[inline]
+pub fn set_wired_limit(bytes: u64) -> Result<u64, String> {
+    let bytes = usize::try_from(bytes)
+        .map_err(|_| "wired-memory limit does not fit this host's size_t".to_string())?;
+    ffi::set_wired_limit(bytes)
+        .map(|previous| previous as u64)
+        .map_err(|error| error.to_string())
+}
+
+/// Compute the Metal wired-memory limit from system and device byte counts.
+///
+/// The policy is exactly:
+///
+/// `min(80% of physical system memory, 110% of Metal's recommended working set)`.
+///
+/// Intermediate arithmetic uses `u128`, so both percentages remain exact and
+/// overflow-free across the full `u64` input range. Integer division rounds
+/// fractional bytes down.
+#[must_use]
+pub fn recommended_wired_limit(
+    system_memory_bytes: u64,
+    metal_recommended_bytes: u64,
+) -> u64 {
+    let system_cap = u128::from(system_memory_bytes) * 80 / 100;
+    let metal_cap = u128::from(metal_recommended_bytes) * 110 / 100;
+    // `system_cap` is at most 80% of u64::MAX, so the selected minimum always
+    // fits in u64 even when `metal_cap` exceeds u64::MAX.
+    system_cap.min(metal_cap) as u64
+}
+
 /// Default periodic decode-loop cache-clear cadence, in generated tokens.
 ///
 /// On Metal, trimming the MLX buffer cache every 256 tokens is cheap and
@@ -264,6 +308,35 @@ mod tests {
             .get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|p| p.into_inner())
+    }
+
+    #[test]
+    fn wired_limit_uses_eighty_percent_of_system_memory() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let system_bytes = 64 * GIB;
+        let limit = recommended_wired_limit(system_bytes, 60 * GIB);
+
+        assert_eq!(limit, 54_975_581_388);
+        assert!((limit as f64 / GIB as f64 - 51.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn wired_limit_uses_one_hundred_ten_percent_of_metal_recommendation() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        assert_eq!(
+            recommended_wired_limit(64 * GIB, 40 * GIB),
+            44 * GIB
+        );
+    }
+
+    #[test]
+    fn wired_limit_formula_handles_rounding_and_u64_boundaries() {
+        assert_eq!(recommended_wired_limit(5, u64::MAX), 4);
+        assert_eq!(recommended_wired_limit(u64::MAX, 10), 11);
+        assert_eq!(
+            recommended_wired_limit(u64::MAX, u64::MAX),
+            (u128::from(u64::MAX) * 80 / 100) as u64
+        );
     }
 
     #[test]
