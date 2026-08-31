@@ -9,24 +9,37 @@ import subprocess
 
 PROJECT_DIR = Path(__file__).resolve().parent
 MIN_FREE_BYTES = 15 * 1024**3
-DATASETS = {
+SUITES = {
+    # Qwen's official sampling defaults:
+    # https://huggingface.co/Qwen/Qwen3.8-Flash-Next/resolve/main/generation_config.json
     "gpqa_diamond": {
-        "temperature": 0.7,
-        "top_p": 0.8,
-        "top_k": 20,
-        "max_tokens": 4_096,
+        "generation_config": {
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "top_k": 20,
+            "do_sample": True,
+            "max_tokens": 32_768,
+        },
+        "repeats": 1,
     },
+    # IFBench uses greedy decoding and a larger allowance for thinking models:
+    # https://github.com/allenai/IFBench
     "ifbench": {
-        "temperature": 0.7,
-        "top_p": 0.8,
-        "top_k": 20,
-        "max_tokens": 4_096,
+        "generation_config": {
+            "temperature": 0,
+            "max_tokens": 32_768,
+        },
+        "repeats": 1,
     },
+    # The official runner uses n=10 and these release_v6 sampling settings:
+    # https://github.com/LiveCodeBench/LiveCodeBench
     "live_code_bench": {
-        "temperature": 0.7,
-        "top_p": 0.8,
-        "top_k": 20,
-        "max_tokens": 8_192,
+        "generation_config": {
+            "temperature": 0.2,
+            "top_p": 0.95,
+            "max_tokens": 2_000,
+        },
+        "repeats": 10,
     },
 }
 
@@ -39,24 +52,15 @@ def positive_int(value: str) -> int:
 
 
 def generation_config(dataset: str) -> dict[str, object]:
-    return {
-        **DATASETS[dataset],
-        "seed": 42,
-        "extra_body": {
-            "chat_template_kwargs": {
-                "enable_thinking": False,
-            },
-        },
-    }
+    return SUITES[dataset]["generation_config"].copy()
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run a bounded EvalScope benchmark against the local qw-server."
     )
-    parser.add_argument("dataset", choices=DATASETS)
+    parser.add_argument("dataset", choices=SUITES)
     parser.add_argument("--limit", type=positive_int)
-    parser.add_argument("--repeats", type=positive_int, default=1)
     parser.add_argument(
         "--output-root",
         type=Path,
@@ -99,7 +103,7 @@ def main() -> int:
         "--eval-batch-size",
         "1",
         "--repeats",
-        str(args.repeats),
+        str(SUITES[args.dataset]["repeats"]),
         "--seed",
         "42",
         "--work-dir",
@@ -111,7 +115,7 @@ def main() -> int:
             [
                 "--dataset-args",
                 json.dumps(
-                    {"live_code_bench": {"subset_list": ["release_latest"]}},
+                    {"live_code_bench": {"subset_list": ["release_v6"]}},
                     separators=(",", ":"),
                 ),
             ]
