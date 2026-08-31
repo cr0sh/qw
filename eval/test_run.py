@@ -87,6 +87,9 @@ class GenerationConfigTests(unittest.TestCase):
                 self.assertEqual(command[api_url_index], "http://127.0.0.1:8883/v1")
                 batch_size_index = command.index("--eval-batch-size") + 1
                 self.assertEqual(command[batch_size_index], "1")
+                self.assertEqual(command.count("--timeout"), 1)
+                timeout_index = command.index("--timeout") + 1
+                self.assertEqual(command[timeout_index], "1800")
                 work_dir_index = command.index("--work-dir") + 1
                 self.assertEqual(
                     command[work_dir_index],

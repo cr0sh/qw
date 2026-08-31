@@ -102,6 +102,8 @@ def main() -> int:
         json.dumps(config, separators=(",", ":")),
         "--eval-batch-size",
         "1",
+        "--timeout",
+        "1800",
         "--repeats",
         str(SUITES[args.dataset]["repeats"]),
         "--seed",
