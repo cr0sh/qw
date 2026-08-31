@@ -59,6 +59,22 @@ class GenerationConfigTests(unittest.TestCase):
                     json.dumps(expected, separators=(",", ":")),
                 )
 
+                if dataset == "live_code_bench":
+                    dataset_args_index = command.index("--dataset-args") + 1
+                    self.assertEqual(
+                        command[dataset_args_index],
+                        json.dumps(
+                            {
+                                "live_code_bench": {
+                                    "subset_list": ["release_latest"]
+                                }
+                            },
+                            separators=(",", ":"),
+                        ),
+                    )
+                else:
+                    self.assertNotIn("--dataset-args", command)
+
 
 if __name__ == "__main__":
     unittest.main()

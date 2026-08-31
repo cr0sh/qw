@@ -107,6 +107,15 @@ def main() -> int:
         "--enable-progress-tracker",
     ]
     if args.dataset == "live_code_bench":
+        command.extend(
+            [
+                "--dataset-args",
+                json.dumps(
+                    {"live_code_bench": {"subset_list": ["release_latest"]}},
+                    separators=(",", ":"),
+                ),
+            ]
+        )
         sandbox = {
             "enabled": True,
             "engine": "docker",
