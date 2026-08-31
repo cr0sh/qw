@@ -139,16 +139,31 @@ fn generation_temperature(requested: Option<f32>, constraint_active: bool) -> Op
     requested.or_else(|| constraint_active.then_some(0.0))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CacheBehavior {
+    snapshot_route: Option<CacheSnapshotRoute>,
+    lookup_route: Option<CacheSnapshotRoute>,
+    capture_checkpoints: bool,
+}
 
-fn cache_snapshot_route(route: QwenGenerationRoute) -> Option<CacheSnapshotRoute> {
-    match route {
-        QwenGenerationRoute::BaselineText => Some(CacheSnapshotRoute::Baseline),
-        QwenGenerationRoute::MtpText => Some(CacheSnapshotRoute::Mtp),
+impl CacheBehavior {
+    fn apply_checkpoint_policy(self, checkpoint_token_lengths: &mut Vec<usize>) {
+        if !self.capture_checkpoints {
+            checkpoint_token_lengths.clear();
+        }
     }
 }
 
-fn cache_lookup_route(route: QwenGenerationRoute) -> Option<CacheSnapshotRoute> {
-    cache_snapshot_route(route)
+fn cache_behavior(route: QwenGenerationRoute, prefix_cache_enabled: bool) -> CacheBehavior {
+    let snapshot_route = prefix_cache_enabled.then(|| match route {
+        QwenGenerationRoute::BaselineText => CacheSnapshotRoute::Baseline,
+        QwenGenerationRoute::MtpText => CacheSnapshotRoute::Mtp,
+    });
+    CacheBehavior {
+        snapshot_route,
+        lookup_route: snapshot_route,
+        capture_checkpoints: prefix_cache_enabled,
+    }
 }
 
 fn validate_mtp_k(mtp_k: usize) -> Result<()> {
@@ -564,6 +579,7 @@ impl Engine {
         model_path: PathBuf,
         model_id: Option<String>,
         cache_config: CacheConfig,
+        prefix_cache_enabled: bool,
         max_context_tokens: Option<usize>,
         mtp_k: usize,
         kv_cache_mode: KVCacheMode,
@@ -578,6 +594,7 @@ impl Engine {
                 match QwenWorker::load(
                     &model_path,
                     cache_config,
+                    prefix_cache_enabled,
                     max_context_tokens,
                     mtp_k,
                     kv_cache_mode,
@@ -1035,6 +1052,7 @@ struct QwenWorker {
     provider: Qwen4Provider,
     grammar: GrammarFactory,
     prefix_cache: AdaptivePrefixCache,
+    prefix_cache_enabled: bool,
     max_context_tokens: Option<usize>,
     mtp_k: usize,
 }
@@ -1089,6 +1107,7 @@ impl QwenWorker {
     fn load(
         model_path: &Path,
         cache_config: CacheConfig,
+        prefix_cache_enabled: bool,
         max_context_tokens: Option<usize>,
         mtp_k: usize,
         kv_cache_mode: KVCacheMode,
@@ -1152,6 +1171,7 @@ impl QwenWorker {
             provider,
             grammar,
             prefix_cache,
+            prefix_cache_enabled,
             max_context_tokens,
             mtp_k,
         })
@@ -1331,7 +1351,7 @@ impl QwenWorker {
             return;
         }
         let mut checkpoint_token_lengths = Vec::new();
-        if !has_images {
+        if self.prefix_cache_enabled && !has_images {
             match self.provider.tokenize_history(
                 &job.request.messages,
                 effective_tools,
@@ -1373,8 +1393,10 @@ impl QwenWorker {
         let mtp_available =
             self.provider.has_mtp() && std::env::var_os("QW_BENCH_DISABLE_MTP").is_none();
         let route = qwen_generation_route(mtp_available, constraint.is_some());
-        let cache_route = cache_snapshot_route(route);
-        let lookup_cache_route = cache_lookup_route(route);
+        let cache_behavior = cache_behavior(route, self.prefix_cache_enabled);
+        cache_behavior.apply_checkpoint_policy(&mut checkpoint_token_lengths);
+        let cache_route = cache_behavior.snapshot_route;
+        let lookup_cache_route = cache_behavior.lookup_route;
         if job.request.resume_response_id.is_some() && cache_route.is_none() {
             send_failure(
                 &job,
@@ -2218,15 +2240,36 @@ mod tests {
         assert_eq!(generation_temperature(Some(0.4), true), Some(0.4));
     }
 
+    #[test]
+    fn enabled_prefix_cache_preserves_routes_and_checkpoints() {
+        for (route, expected_cache_route) in [
+            (
+                QwenGenerationRoute::BaselineText,
+                CacheSnapshotRoute::Baseline,
+            ),
+            (QwenGenerationRoute::MtpText, CacheSnapshotRoute::Mtp),
+        ] {
+            let behavior = cache_behavior(route, true);
+            assert_eq!(behavior.snapshot_route, Some(expected_cache_route));
+            assert_eq!(behavior.lookup_route, Some(expected_cache_route));
+            let mut checkpoint_token_lengths = vec![64, 128];
+            behavior.apply_checkpoint_policy(&mut checkpoint_token_lengths);
+            assert_eq!(checkpoint_token_lengths, [64, 128]);
+        }
+    }
 
     #[test]
-    fn text_routes_are_prefix_cache_eligible() {
+    fn disabled_prefix_cache_removes_routes_and_checkpoints() {
         for route in [
             QwenGenerationRoute::BaselineText,
             QwenGenerationRoute::MtpText,
         ] {
-            assert!(cache_snapshot_route(route).is_some());
-            assert!(cache_lookup_route(route).is_some());
+            let behavior = cache_behavior(route, false);
+            assert_eq!(behavior.snapshot_route, None);
+            assert_eq!(behavior.lookup_route, None);
+            let mut checkpoint_token_lengths = vec![64, 128];
+            behavior.apply_checkpoint_policy(&mut checkpoint_token_lengths);
+            assert!(checkpoint_token_lengths.is_empty());
         }
     }
 

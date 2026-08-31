@@ -103,6 +103,10 @@ pub struct ServerArgs {
     #[arg(long, default_value = "127.0.0.1:8000")]
     bind: String,
 
+    /// Disable prefix snapshot lookup and persistence.
+    #[arg(long)]
+    disable_prefix_cache: bool,
+
     /// Byte capacity of the in-memory prefix snapshot tier (decimal SI suffixes K-E accepted).
     #[arg(
         long,
@@ -271,6 +275,7 @@ pub async fn serve(cli: ServerArgs) -> Result<()> {
         phase = "server.starting",
         bind = %bind,
         max_context_tokens = ?cli.max_context_tokens,
+        prefix_cache_enabled = !cli.disable_prefix_cache,
     );
     let max_context_tokens = cli
         .max_context_tokens
@@ -289,6 +294,7 @@ pub async fn serve(cli: ServerArgs) -> Result<()> {
             directory: Some(prefix_cache_directory),
             filesystem_bytes: cli.prefix_cache_filesystem_bytes,
         },
+        !cli.disable_prefix_cache,
         max_context_tokens,
         cli.mtp_k,
         kv_cache_mode,
@@ -395,6 +401,19 @@ mod tests {
 
         let help = TestCli::command().render_long_help().to_string();
         assert!(help.contains("--model-id <MODEL_ID>"), "{help}");
+    }
+
+    #[test]
+    fn cli_prefix_cache_opt_out_defaults_to_enabled() {
+        let default = TestCli::try_parse_from(["qw-server"]).expect("CLI");
+        assert!(!default.args.disable_prefix_cache);
+
+        let disabled =
+            TestCli::try_parse_from(["qw-server", "--disable-prefix-cache"]).expect("CLI");
+        assert!(disabled.args.disable_prefix_cache);
+
+        let help = TestCli::command().render_long_help().to_string();
+        assert!(help.contains("--disable-prefix-cache"), "{help}");
     }
 
     #[test]
