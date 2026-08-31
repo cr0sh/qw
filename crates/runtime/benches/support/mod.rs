@@ -799,6 +799,7 @@ pub fn prepare_long_conversation_fixture(
                 black_box(delta);
                 true
             },
+            false,
         )
         .expect("prepare long-context MTP snapshot");
     let snapshot = mtp
