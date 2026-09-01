@@ -78,6 +78,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("dataset", choices=SUITES)
     parser.add_argument("--limit", type=positive_int)
     parser.add_argument(
+        "--resume-from",
+        type=Path,
+        help="resume cached predictions and reviews from an existing EvalScope run",
+    )
+    parser.add_argument(
         "--output-root",
         type=Path,
         default=PROJECT_DIR / "outputs",
@@ -89,6 +94,18 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     output_dir = args.output_root.expanduser().resolve() / args.dataset
+    resume_dir = (
+        args.resume_from.expanduser().resolve()
+        if args.resume_from is not None
+        else None
+    )
+    if resume_dir is not None:
+        if args.limit is not None:
+            print("Refusing to resume with --limit: the cached sample set must stay unchanged.")
+            return 1
+        if not resume_dir.is_dir():
+            print(f"Refusing to resume: checkpoint directory does not exist: {resume_dir}")
+            return 1
     cache_dir = PROJECT_DIR / "cache"
     cache_environment = {
         "EVALSCOPE_CACHE": str(cache_dir / "evalscope"),
@@ -158,6 +175,8 @@ def main() -> int:
         )
     if args.limit is not None:
         command.extend(["--limit", str(args.limit)])
+    if resume_dir is not None:
+        command.extend(["--use-cache", str(resume_dir)])
 
     free_bytes = shutil.disk_usage(PROJECT_DIR).free
     print(

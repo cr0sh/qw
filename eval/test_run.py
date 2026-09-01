@@ -8,10 +8,17 @@ from eval import run
 
 
 class GenerationConfigTests(unittest.TestCase):
-    def command_for(self, dataset: str, *, limit: int | None = None) -> list[str]:
+    def command_for(
+        self,
+        dataset: str,
+        *,
+        limit: int | None = None,
+        resume_from: Path | None = None,
+    ) -> list[str]:
         args = SimpleNamespace(
             dataset=dataset,
             limit=limit,
+            resume_from=resume_from,
             output_root=Path("/tmp/qwr-eval-test"),
         )
 
@@ -141,6 +148,16 @@ class GenerationConfigTests(unittest.TestCase):
         command = self.command_for("gpqa_diamond", limit=7)
         limit_index = command.index("--limit") + 1
         self.assertEqual(command[limit_index], "7")
+
+    def test_resume_checkpoint_is_forwarded_to_evalscope(self) -> None:
+        checkpoint = Path("/tmp/qwr-eval-checkpoint")
+        with mock.patch.object(Path, "is_dir", return_value=True):
+            command = self.command_for(
+                "live_code_bench",
+                resume_from=checkpoint,
+            )
+        cache_index = command.index("--use-cache") + 1
+        self.assertEqual(command[cache_index], str(checkpoint.resolve()))
 
 if __name__ == "__main__":
     unittest.main()
