@@ -17,7 +17,7 @@ SUITES = {
             "temperature": 1.0,
             "top_p": 0.95,
             "max_tokens": 32_768,
-            "reasoning_effort": "xhigh",
+            "reasoning_effort": "medium",
             "extra_body": {
                 "chat_template_kwargs": {
                     "enable_thinking": True,
@@ -32,7 +32,7 @@ SUITES = {
             "temperature": 1.0,
             "top_p": 0.95,
             "max_tokens": 32_768,
-            "reasoning_effort": "xhigh",
+            "reasoning_effort": "medium",
             "extra_body": {
                 "chat_template_kwargs": {
                     "enable_thinking": True,
@@ -47,7 +47,7 @@ SUITES = {
             "temperature": 1.0,
             "top_p": 0.95,
             "max_tokens": 32_768,
-            "reasoning_effort": "xhigh",
+            "reasoning_effort": "medium",
             "extra_body": {
                 "chat_template_kwargs": {
                     "enable_thinking": True,
