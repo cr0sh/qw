@@ -20,6 +20,7 @@ pub(crate) enum Qwen35Linear {
     Legacy(UnifiedLinear),
     Affine(GgmlAffineMatrix),
     PinnedM23Affine(GgmlAffineMatrix),
+    PinnedM2Affine(GgmlAffineMatrix),
     AffineRows(GgmlAffineRows),
     Q6Dual(Qwen38Q6DualMatrix),
     Gguf(GgmlQuantizedMatrix),
@@ -42,6 +43,9 @@ impl Qwen35Linear {
             Self::PinnedM23Affine(linear) => linear
                 .forward_qwen38_m23(input)
                 .expect("validated pinned Qwen3.8 M2/M3 affine execution must succeed"),
+            Self::PinnedM2Affine(linear) => linear
+                .forward_qwen38_m2(input)
+                .expect("validated pinned Qwen3.8 M2 affine execution must succeed"),
             Self::AffineRows(linear) => linear
                 .forward(input)
                 .expect("validated GGML affine row projection must succeed"),
@@ -61,10 +65,21 @@ impl Qwen35Linear {
         matches!(self, Self::Affine(_) | Self::PinnedM23Affine(_))
     }
 
+    pub(crate) fn is_m2_affine(&self) -> bool {
+        matches!(self, Self::PinnedM2Affine(_))
+    }
+
     pub(crate) fn into_affine(self) -> Option<(GgmlAffineMatrix, bool)> {
         match self {
             Self::Affine(matrix) => Some((matrix, false)),
             Self::PinnedM23Affine(matrix) => Some((matrix, true)),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn into_m2_affine(self) -> Option<GgmlAffineMatrix> {
+        match self {
+            Self::PinnedM2Affine(matrix) => Some(matrix),
             _ => None,
         }
     }
@@ -75,6 +90,7 @@ impl Qwen35Linear {
             Self::Legacy(linear) => Some(linear),
             Self::Affine(_)
             | Self::PinnedM23Affine(_)
+            | Self::PinnedM2Affine(_)
             | Self::AffineRows(_)
             | Self::Q6Dual(_)
             | Self::Gguf(_)
@@ -86,6 +102,7 @@ impl Qwen35Linear {
         match self {
             Self::Affine(linear) => linear.select_rows(ranges).ok().map(Self::AffineRows),
             Self::PinnedM23Affine(linear) => linear.select_rows(ranges).ok().map(Self::AffineRows),
+            Self::PinnedM2Affine(linear) => linear.select_rows(ranges).ok().map(Self::AffineRows),
             Self::Gguf(linear) => linear.select_rows(ranges).ok().map(Self::GgufRows),
             #[cfg(any(feature = "specprefill", test))]
             Self::Legacy(_) => None,
@@ -431,6 +448,40 @@ fn pinned_m23_affine_signature(slot: TensorSlot) -> Option<PinnedM23AffineSignat
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PinnedM2AffineSignature {
+    mtp_slot: usize,
+    qtype: u32,
+    dimensions: [u64; 2],
+}
+
+fn pinned_m2_affine_signature(slot: TensorSlot) -> Option<PinnedM2AffineSignature> {
+    let (mtp_slot, dimensions) = match slot {
+        TensorSlot::Layer {
+            role: ModelRole::Mtp,
+            layer: 0,
+            tensor: LayerTensor::MlpDown,
+        } => (10, [17_408, 5120]),
+        TensorSlot::Layer {
+            role: ModelRole::Mtp,
+            layer: 0,
+            tensor: LayerTensor::MlpGate,
+        } => (11, [5120, 17_408]),
+        TensorSlot::Layer {
+            role: ModelRole::Mtp,
+            layer: 0,
+            tensor: LayerTensor::MlpUp,
+        } => (12, [5120, 17_408]),
+        TensorSlot::MtpProjection => (13, [10_240, 5120]),
+        _ => return None,
+    };
+    Some(PinnedM2AffineSignature {
+        mtp_slot,
+        qtype: 12,
+        dimensions,
+    })
+}
+
 fn pinned_q6_shape(slot: PinnedSlot, tensor: &GgufTensorInfo) -> Result<Option<Qwen38Q6Shape>> {
     if tensor.tensor_type.id() != 14 {
         return Ok(None);
@@ -672,10 +723,17 @@ impl GgufWeightSource {
         label: &str,
     ) -> Result<Qwen35Linear> {
         let m23_signature = pinned_m23_affine_signature(typed_slot);
+        let m2_signature = pinned_m2_affine_signature(typed_slot);
         if let Some(signature) = m23_signature {
             ensure!(
                 slot == PinnedSlot::Target(signature.target_slot),
                 "typed pinned M2/M3 slot changed"
+            );
+        }
+        if let Some(signature) = m2_signature {
+            ensure!(
+                slot == PinnedSlot::Mtp(signature.mtp_slot),
+                "typed pinned M2 slot changed"
             );
         }
         let (tensor, bytes) = self.lookup(slot)?;
@@ -691,6 +749,13 @@ impl GgufWeightSource {
                 tensor.tensor_type.id() == signature.qtype
                     && tensor.dimensions == signature.dimensions,
                 "typed pinned M2/M3 descriptor changed"
+            );
+        }
+        if let Some(signature) = m2_signature {
+            ensure!(
+                tensor.tensor_type.id() == signature.qtype
+                    && tensor.dimensions == signature.dimensions,
+                "typed pinned M2 descriptor changed"
             );
         }
         let q6_shape = pinned_q6_shape(slot, tensor)?;
@@ -714,6 +779,8 @@ impl GgufWeightSource {
             self.record_affine(affine.transcode_stats());
             if self.enable_m23 && m23_signature.is_some() {
                 Qwen35Linear::PinnedM23Affine(affine)
+            } else if self.enable_m23 && m2_signature.is_some() {
+                Qwen35Linear::PinnedM2Affine(affine)
             } else {
                 Qwen35Linear::Affine(affine)
             }
@@ -962,6 +1029,111 @@ mod tests {
     }
 
     #[test]
+    fn pinned_m2_allowlist_is_exactly_four_mtp_descriptors() {
+        const TENSORS: [LayerTensor; 20] = [
+            LayerTensor::InputNorm,
+            LayerTensor::PostAttentionNorm,
+            LayerTensor::AttentionQuery,
+            LayerTensor::AttentionKey,
+            LayerTensor::AttentionValue,
+            LayerTensor::AttentionOutput,
+            LayerTensor::AttentionQueryNorm,
+            LayerTensor::AttentionKeyNorm,
+            LayerTensor::MlpGate,
+            LayerTensor::MlpUp,
+            LayerTensor::MlpDown,
+            LayerTensor::LinearQkv,
+            LayerTensor::LinearGate,
+            LayerTensor::LinearBeta,
+            LayerTensor::LinearAlpha,
+            LayerTensor::LinearConv,
+            LayerTensor::LinearDtBias,
+            LayerTensor::LinearA,
+            LayerTensor::LinearNorm,
+            LayerTensor::LinearOutput,
+        ];
+
+        let mut slots = Vec::new();
+        for tensor in TENSORS {
+            let mtp = TensorSlot::Layer {
+                role: ModelRole::Mtp,
+                layer: 0,
+                tensor,
+            };
+            if let Some(signature) = pinned_m2_affine_signature(mtp) {
+                assert_eq!(pinned_slot(mtp), Ok(PinnedSlot::Mtp(signature.mtp_slot)));
+                let descriptor = &crate::qwen38_plan::MTP_TENSOR_PLAN[signature.mtp_slot];
+                assert_eq!(descriptor.qtype, signature.qtype);
+                assert_eq!(descriptor.dimensions, signature.dimensions);
+                slots.push(signature.mtp_slot);
+            }
+            assert!(
+                pinned_m2_affine_signature(TensorSlot::Layer {
+                    role: ModelRole::Target,
+                    layer: 0,
+                    tensor,
+                })
+                .is_none()
+            );
+            assert!(
+                pinned_m2_affine_signature(TensorSlot::Layer {
+                    role: ModelRole::Mtp,
+                    layer: 1,
+                    tensor,
+                })
+                .is_none()
+            );
+        }
+
+        let projection =
+            pinned_m2_affine_signature(TensorSlot::MtpProjection).expect("MTP projection");
+        assert_eq!(projection.mtp_slot, 13);
+        assert_eq!(projection.qtype, 12);
+        assert_eq!(projection.dimensions, [10_240, 5120]);
+        slots.push(projection.mtp_slot);
+        slots.sort_unstable();
+        assert_eq!(slots, [10, 11, 12, 13]);
+        assert_eq!(
+            slots
+                .iter()
+                .map(|&slot| crate::qwen38_plan::MTP_TENSOR_PLAN[slot].name)
+                .collect::<Vec<_>>(),
+            [
+                "blk.64.ffn_down.weight",
+                "blk.64.ffn_gate.weight",
+                "blk.64.ffn_up.weight",
+                "blk.64.nextn.eh_proj.weight",
+            ]
+        );
+
+        for root in [
+            TensorSlot::TokenEmbedding,
+            TensorSlot::Output,
+            TensorSlot::OutputNorm,
+            TensorSlot::MtpEmbeddingNorm,
+            TensorSlot::MtpHiddenNorm,
+            TensorSlot::MtpHeadNorm,
+        ] {
+            assert!(pinned_m2_affine_signature(root).is_none());
+        }
+        for (slot, tensor) in [
+            (3, LayerTensor::AttentionKey),
+            (6, LayerTensor::AttentionOutput),
+            (7, LayerTensor::AttentionQuery),
+            (9, LayerTensor::AttentionValue),
+        ] {
+            let typed = TensorSlot::Layer {
+                role: ModelRole::Mtp,
+                layer: 0,
+                tensor,
+            };
+            assert!(pinned_m2_affine_signature(typed).is_none());
+            assert_eq!(pinned_slot(typed), Ok(PinnedSlot::Mtp(slot)));
+            assert_eq!(crate::qwen38_plan::MTP_TENSOR_PLAN[slot].qtype, 14);
+        }
+    }
+
+    #[test]
     fn pinned_m23_allowlist_is_exactly_the_326_target_descriptors() {
         const TENSORS: [LayerTensor; 7] = [
             LayerTensor::AttentionQuery,
@@ -1083,6 +1255,139 @@ mod tests {
         assert_eq!(slots.last(), Some(&844));
         assert_eq!(slots.iter().sum::<usize>(), 134_189);
         assert_eq!(slot_fingerprint, 0x03be_e87b_92d9_9aca);
+    }
+
+    #[test]
+    #[ignore = "requires the complete pinned Qwen3.8 target and MTP GGUF pair"]
+    fn real_mtp_m2_all_affine_rows_and_q6_sharing() {
+        if !mlxcel_core::metal_is_available() {
+            return;
+        }
+
+        let layer_slot = |tensor| TensorSlot::Layer {
+            role: ModelRole::Mtp,
+            layer: 0,
+            tensor,
+        };
+        let weights = GgufWeightSource::open().expect("open pinned GGUF pair");
+        let affine = [
+            (10usize, layer_slot(LayerTensor::MlpDown)),
+            (11, layer_slot(LayerTensor::MlpGate)),
+            (12, layer_slot(LayerTensor::MlpUp)),
+            (13, TensorSlot::MtpProjection),
+        ];
+        let ordered = |value: f32| {
+            let bits = value.to_bits() as i32;
+            if bits < 0 { i32::MIN - bits } else { bits }
+        };
+        for (plan_slot, typed_slot) in affine {
+            let descriptor = &crate::qwen38_plan::MTP_TENSOR_PLAN[plan_slot];
+            let signature =
+                pinned_m2_affine_signature(typed_slot).expect("allowlisted MTP M2 signature");
+            assert_eq!(signature.mtp_slot, plan_slot);
+            assert_eq!(descriptor.qtype, 12);
+            assert_eq!(descriptor.dimensions, signature.dimensions);
+            let linear = weights
+                .load_linear(typed_slot, PinnedSlot::Mtp(plan_slot), descriptor.name)
+                .expect("load MTP affine");
+            let Qwen35Linear::PinnedM2Affine(matrix) = &linear else {
+                panic!("MTP slot {plan_slot} did not receive the pinned M2 path");
+            };
+
+            let width = matrix.in_features();
+            for input_rows in [1usize, 2, 3, 4] {
+                let values = (0..input_rows * width)
+                    .map(|index| {
+                        let row = index / width;
+                        let column = index % width;
+                        (column as i32 % 43 - 21) as f32 * 0.001953125 + row as f32 * 0.00048828125
+                    })
+                    .collect::<Vec<_>>();
+                let input =
+                    mlxcel_core::from_slice_f32(&values, &[1, input_rows as i32, width as i32]);
+                let split_stats = matrix.dispatch_stats(input_rows).unwrap();
+                let selected_stats = matrix.qwen38_m2_dispatch_stats(input_rows).unwrap();
+                if input_rows == 2 {
+                    assert_eq!(
+                        selected_stats.path,
+                        mlxcel_core::GgmlKernelPath::Qwen38AffineM23
+                    );
+                    assert_eq!(
+                        split_stats.packed_bytes_read,
+                        selected_stats.packed_bytes_read * 2
+                    );
+                    assert_eq!(
+                        split_stats.activation_bytes_read,
+                        selected_stats.activation_bytes_read
+                    );
+                    assert_eq!(
+                        split_stats.output_bytes_written,
+                        selected_stats.output_bytes_written
+                    );
+                } else {
+                    assert_eq!(
+                        selected_stats, split_stats,
+                        "MTP slot {plan_slot} changed M={input_rows} dispatch"
+                    );
+                }
+
+                let split = matrix.forward(input.as_ref().unwrap()).unwrap();
+                let selected = linear.forward(input.as_ref().unwrap());
+                mlxcel_core::eval(split.as_ref().unwrap());
+                mlxcel_core::eval(selected.as_ref().unwrap());
+                let split = mlxcel_core::array_to_raw_bytes(split.as_ref().unwrap());
+                let selected = mlxcel_core::array_to_raw_bytes(selected.as_ref().unwrap());
+                let max_ulp = split
+                    .chunks_exact(4)
+                    .zip(selected.chunks_exact(4))
+                    .map(|(left, right)| {
+                        let left = f32::from_le_bytes(left.try_into().unwrap());
+                        let right = f32::from_le_bytes(right.try_into().unwrap());
+                        ordered(left).abs_diff(ordered(right))
+                    })
+                    .max()
+                    .unwrap_or(0);
+                assert!(
+                    split == selected || max_ulp <= 1,
+                    "MTP slot {plan_slot} M={input_rows} differs by {max_ulp} ULP"
+                );
+            }
+        }
+
+        for (plan_slot, tensor) in [
+            (3usize, LayerTensor::AttentionKey),
+            (6, LayerTensor::AttentionOutput),
+            (7, LayerTensor::AttentionQuery),
+            (9, LayerTensor::AttentionValue),
+        ] {
+            let typed_slot = layer_slot(tensor);
+            let descriptor = &crate::qwen38_plan::MTP_TENSOR_PLAN[plan_slot];
+            assert_eq!(descriptor.qtype, 14);
+            let linear = weights
+                .load_linear(typed_slot, PinnedSlot::Mtp(plan_slot), descriptor.name)
+                .expect("load MTP Q6");
+            let Qwen35Linear::Q6Dual(matrix) = &linear else {
+                panic!("MTP slot {plan_slot} no longer uses Q6Dual");
+            };
+            let stats = matrix.dispatch_stats(2).unwrap();
+            assert_eq!(stats.path, mlxcel_core::GgmlKernelPath::VerifyM2To4);
+            assert_eq!(
+                stats.packed_bytes_read,
+                usize::try_from(descriptor.byte_len).unwrap()
+            );
+
+            let width = usize::try_from(descriptor.dimensions[0]).unwrap();
+            let values = (0..2 * width)
+                .map(|index| (index as i32 % 29 - 14) as f32 * 0.001953125)
+                .collect::<Vec<_>>();
+            let input = mlxcel_core::from_slice_f32(&values, &[1, 2, width as i32]);
+            let output = linear.forward(input.as_ref().unwrap());
+            mlxcel_core::eval(output.as_ref().unwrap());
+            assert_eq!(
+                mlxcel_core::array_shape(output.as_ref().unwrap()),
+                [1, 2, i32::try_from(descriptor.dimensions[1]).unwrap()]
+            );
+        }
     }
 
     #[test]

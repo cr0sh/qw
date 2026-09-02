@@ -518,6 +518,22 @@ impl Mlp {
                     }
         });
         if weights.qwen38_fusion_enabled()
+            && role == ModelRole::Mtp
+            && descriptor.is_some_and(|descriptor| descriptor.all_affine())
+            && gate.is_m2_affine()
+            && up.is_m2_affine()
+            && down.is_m2_affine()
+        {
+            let gate = gate.into_m2_affine().expect("checked M2 affine gate");
+            let up = up.into_m2_affine().expect("checked M2 affine up");
+            let down = down.into_m2_affine().expect("checked M2 affine down");
+            return mlxcel_core::Qwen38AffineMlpFusion::new_m2(gate, up, down)
+                .map(|fusion| Self {
+                    execution: MlpExecution::PinnedAffine(fusion),
+                })
+                .map_err(|error| error.to_string());
+        }
+        if weights.qwen38_fusion_enabled()
             && descriptor.is_some_and(|descriptor| descriptor.all_affine())
             && gate.is_affine()
             && up.is_affine()
