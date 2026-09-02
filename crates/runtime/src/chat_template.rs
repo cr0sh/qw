@@ -17,7 +17,6 @@ use minijinja::value::{Value, ValueKind, from_args};
 use minijinja::{Environment, Error, ErrorKind, context};
 use serde::Serialize;
 use serde_json::Value as JsonValue;
-use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ChatMessage {
@@ -199,49 +198,6 @@ pub(crate) struct ChatTemplateProcessor {
 }
 
 impl ChatTemplateProcessor {
-    pub(crate) fn from_model_path(model_dir: &Path) -> Result<Self> {
-        let tokenizer_config_path = model_dir.join("tokenizer_config.json");
-        let tokenizer_config_text = std::fs::read_to_string(&tokenizer_config_path)
-            .with_context(|| format!("failed to read {}", tokenizer_config_path.display()))?;
-        let tokenizer_config: JsonValue = serde_json::from_str(&tokenizer_config_text)
-            .with_context(|| format!("failed to parse {}", tokenizer_config_path.display()))?;
-
-        let standalone_path = model_dir.join("chat_template.jinja");
-        let standalone = match std::fs::read_to_string(&standalone_path) {
-            Ok(value) if !value.trim().is_empty() => Some(value),
-            Ok(_) => None,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("failed to read {}", standalone_path.display()));
-            }
-        };
-        let configured = tokenizer_config
-            .get("chat_template")
-            .and_then(JsonValue::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .map(str::to_owned);
-        let template = standalone.or(configured).with_context(|| {
-            format!(
-                "missing chat template: expected non-empty {} or chat_template in {}",
-                standalone_path.display(),
-                tokenizer_config_path.display()
-            )
-        })?;
-
-        let mut environment = Environment::new();
-        configure_environment(&mut environment);
-        environment
-            .add_template("chat", &template)
-            .with_context(|| format!("failed to parse {}", standalone_path.display()))?;
-
-        Ok(Self {
-            template,
-            bos_token: extract_token(&tokenizer_config, "bos_token"),
-            eos_token: extract_token(&tokenizer_config, "eos_token"),
-        })
-    }
-
     pub(crate) fn from_template(
         template: String,
         bos_token: String,
@@ -413,27 +369,6 @@ impl ChatTemplateProcessor {
             && self.template.contains("<function=")
             && self.template.contains("<parameter=")
     }
-
-    pub(crate) fn supports_image_content(&self) -> bool {
-        self.template.contains("image_url")
-            || (self.template.contains("content")
-                && (self.template.contains("\"image\"") || self.template.contains("'image'"))
-                && (self.template.contains("vision_start") || self.template.contains("image_pad")))
-    }
-}
-
-fn extract_token(config: &JsonValue, name: &str) -> String {
-    let Some(value) = config.get(name) else {
-        return String::new();
-    };
-    if let Some(value) = value.as_str() {
-        return value.to_owned();
-    }
-    value
-        .get("content")
-        .and_then(JsonValue::as_str)
-        .unwrap_or_default()
-        .to_owned()
 }
 
 fn configure_environment(environment: &mut Environment<'_>) {

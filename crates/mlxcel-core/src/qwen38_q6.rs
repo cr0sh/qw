@@ -93,13 +93,9 @@ impl Qwen38Q6DualMatrix {
                 actual: bytes.len(),
             });
         }
-        let packed = GgmlQuantizedMatrix::from_bytes(
-            bytes,
-            GgmlQType::Q6K,
-            in_features,
-            out_features,
-        )
-        .map_err(|error| Qwen38Q6Error::Packed(error.to_string()))?;
+        let packed =
+            GgmlQuantizedMatrix::from_bytes(bytes, GgmlQType::Q6K, in_features, out_features)
+                .map_err(|error| Qwen38Q6Error::Packed(error.to_string()))?;
         let dense_bytes = in_features
             .checked_mul(out_features)
             .and_then(|values| values.checked_mul(2))
@@ -123,14 +119,9 @@ impl Qwen38Q6DualMatrix {
         if dense.len() != dense_bytes {
             return Err(Qwen38Q6Error::InvalidDensePlane);
         }
-        let dense_f16 = crate::from_bytes_f16(
-            &dense,
-            &[out_features as i32, in_features as i32],
-            false,
-        );
-        let dense_ref = dense_f16
-            .as_ref()
-            .ok_or(Qwen38Q6Error::InvalidDensePlane)?;
+        let dense_f16 =
+            crate::from_bytes_f16(&dense, &[out_features as i32, in_features as i32], false);
+        let dense_ref = dense_f16.as_ref().ok_or(Qwen38Q6Error::InvalidDensePlane)?;
         if crate::array_dtype(dense_ref) != dtype::FLOAT16
             || crate::array_shape(dense_ref) != [out_features as i32, in_features as i32]
             || crate::array_nbytes(dense_ref) != dense_bytes
@@ -187,10 +178,7 @@ impl Qwen38Q6DualMatrix {
         ))
     }
 
-    pub fn dispatch_stats(
-        &self,
-        input_rows: usize,
-    ) -> Result<GgmlDispatchStats, Qwen38Q6Error> {
+    pub fn dispatch_stats(&self, input_rows: usize) -> Result<GgmlDispatchStats, Qwen38Q6Error> {
         let (in_features, out_features) = self.shape.dimensions();
         if input_rows == 0 {
             return Err(Qwen38Q6Error::InvalidInput);
@@ -238,8 +226,7 @@ fn validate_input(input: &MlxArray, shape: Qwen38Q6Shape) -> Result<usize, Qwen3
     dimensions[..dimensions.len() - 1]
         .iter()
         .try_fold(1usize, |rows, dimension| {
-            let dimension =
-                usize::try_from(*dimension).map_err(|_| Qwen38Q6Error::InvalidInput)?;
+            let dimension = usize::try_from(*dimension).map_err(|_| Qwen38Q6Error::InvalidInput)?;
             rows.checked_mul(dimension).ok_or(Qwen38Q6Error::Overflow)
         })
 }
@@ -272,7 +259,12 @@ fn f32_to_f16_bits(value: f32) -> u16 {
     let sign = ((bits >> 16) & 0x8000) as u16;
     let magnitude = bits & 0x7fff_ffff;
     if magnitude >= 0x7f80_0000 {
-        return sign | if magnitude == 0x7f80_0000 { 0x7c00 } else { 0x7e00 };
+        return sign
+            | if magnitude == 0x7f80_0000 {
+                0x7c00
+            } else {
+                0x7e00
+            };
     }
     let exponent = ((magnitude >> 23) as i32) - 127;
     let mantissa = magnitude & 0x7f_ffff;
@@ -295,8 +287,7 @@ fn f32_to_f16_bits(value: f32) -> u16 {
     }
     let significand = mantissa | 0x80_0000;
     let shift = (-exponent - 14 + 13) as u32;
-    let rounded =
-        significand + ((1u32 << (shift - 1)) - 1) + ((significand >> shift) & 1);
+    let rounded = significand + ((1u32 << (shift - 1)) - 1) + ((significand >> shift) & 1);
     sign | (rounded >> shift) as u16
 }
 

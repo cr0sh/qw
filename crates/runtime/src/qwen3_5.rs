@@ -25,19 +25,25 @@ use crate::model_owned::ModelOwnedSequenceState;
 use crate::qwen_mrope_state::MRopeState;
 use crate::qwen_vl_position::decode_rope_positions;
 use crate::qwen3_5_mtp::Qwen35MtpDraftModel;
-use crate::qwen3_5_weights::{GgufWeightSource, Qwen35Embedding, Qwen35Linear, Qwen35WeightSource};
+use crate::qwen3_5_weights::{
+    GgufWeightSource, LayerTensor, ModelRole, Qwen35Embedding, Qwen35Linear, Qwen35WeightSource,
+    TensorSlot,
+};
 use crate::qwen3_next::{Mlp, Quantization, Qwen3NextAttention, Qwen3NextCache, Qwen3NextConfig};
 use crate::qwen3_vl_vision::{Qwen3VLVisionConfig, Qwen3VLVisionEncoder};
 use anyhow::{Context, Result, ensure};
 use mlxcel_core::cache::{KVCacheMode, SequenceId, Turbo4SnapshotTensors};
 use mlxcel_core::generate::{LanguageModel, ModelStateSnapshot};
-use mlxcel_core::layers::{KVCache, QuantizedWeight, RMSNorm, UnifiedLinear};
+use mlxcel_core::layers::{KVCache, RMSNorm};
+#[cfg(any(feature = "specprefill", test))]
+use mlxcel_core::layers::{QuantizedWeight, UnifiedLinear};
 use mlxcel_core::utils::silu;
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr, concatenate};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeSet;
+#[cfg(any(feature = "specprefill", test))]
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -51,6 +57,7 @@ const TURBO4_PACKED_MTP_THRESHOLD_TOKENS: i32 = 2_048;
 #[cfg(any(feature = "specprefill", test))]
 const SPECPREFILL_TARGET_CHUNK_TOKENS: usize = 512;
 
+#[cfg(any(feature = "specprefill", test))]
 fn compact_rows(array: &MlxArray, prefix_len: i32, padded_len: i32) -> UniquePtr<MlxArray> {
     let columns = mlxcel_core::array_shape(array)[1];
     let prefix = mlxcel_core::slice(array, &[0, 0], &[prefix_len, columns]);
@@ -69,20 +76,21 @@ fn compact_head(
     head: &Qwen35Linear,
     vocab_size: usize,
     prefix_len: i32,
-    padded_len: i32,
+    _padded_len: i32,
 ) -> Option<Qwen35Linear> {
     if vocab_size != 248_320 {
         return None;
     }
+    #[cfg(any(feature = "specprefill", test))]
     if let Some(UnifiedLinear::Quantized { weight, bias: None }) = head.legacy_ref() {
         return Some(Qwen35Linear::legacy(UnifiedLinear::Quantized {
             weight: QuantizedWeight {
-                weight: compact_rows(&weight.weight, prefix_len, padded_len),
-                scales: compact_rows(&weight.scales, prefix_len, padded_len),
+                weight: compact_rows(&weight.weight, prefix_len, _padded_len),
+                scales: compact_rows(&weight.scales, prefix_len, _padded_len),
                 biases: weight
                     .biases
                     .as_ref()
-                    .map(|x| compact_rows(x, prefix_len, padded_len)),
+                    .map(|x| compact_rows(x, prefix_len, _padded_len)),
                 group_size: weight.group_size,
                 bits: weight.bits,
                 mode: weight.mode.clone(),
@@ -100,9 +108,11 @@ fn compact_head(
 // Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Qwen35Config {
+    #[cfg(any(feature = "specprefill", test))]
     pub model_type: String,
     pub hidden_size: usize,
     pub num_hidden_layers: usize,
+    #[cfg(any(feature = "specprefill", test))]
     #[serde(default)]
     pub intermediate_size: usize,
     pub num_attention_heads: usize,
@@ -137,8 +147,10 @@ pub struct Qwen35Config {
     pub max_position_embeddings: usize,
     #[serde(default, alias = "quantization_config")]
     pub quantization: Option<Quantization>,
+    #[cfg(any(feature = "specprefill", test))]
     #[serde(default)]
     pub mtp_num_hidden_layers: Option<usize>,
+    #[cfg(any(feature = "specprefill", test))]
     #[serde(default)]
     pub mtp_use_dedicated_embeddings: Option<bool>,
     #[serde(default)]
@@ -174,6 +186,44 @@ fn default_linear_conv_kernel_dim() -> usize {
 }
 
 impl Qwen35Config {
+    pub(crate) fn pinned() -> Self {
+        Self {
+            #[cfg(any(feature = "specprefill", test))]
+            model_type: "qwen3_5_text".to_owned(),
+            hidden_size: 5_120,
+            num_hidden_layers: 64,
+            #[cfg(any(feature = "specprefill", test))]
+            intermediate_size: 17_408,
+            num_attention_heads: 24,
+            num_key_value_heads: 4,
+            head_dim: Some(256),
+            linear_num_value_heads: 48,
+            linear_num_key_heads: 16,
+            linear_key_head_dim: 128,
+            linear_value_head_dim: 128,
+            linear_conv_kernel_dim: 4,
+            rope_parameters: Some(serde_json::json!({
+                "rope_theta": 10_000_000.0,
+                "partial_rotary_factor": 0.25,
+                "mrope_section": [11, 11, 10],
+            })),
+            full_attention_interval: 4,
+            rms_norm_eps: 1e-6,
+            tie_word_embeddings: false,
+            vocab_size: 248_320,
+            max_position_embeddings: 262_144,
+            quantization: None,
+            #[cfg(any(feature = "specprefill", test))]
+            mtp_num_hidden_layers: Some(1),
+            #[cfg(any(feature = "specprefill", test))]
+            mtp_use_dedicated_embeddings: Some(false),
+            vision_config: None,
+            image_token_id: None,
+            video_token_id: None,
+            vision_start_token_id: None,
+        }
+    }
+
     pub fn quant_params(&self, prefix: &str) -> (i32, i32) {
         let Some(quantization) = &self.quantization else {
             return (64, 4);
@@ -244,6 +294,7 @@ impl Qwen35Config {
         }
     }
 
+    #[cfg(any(feature = "specprefill", test))]
     fn validate_mtp_metadata(&self, config_path: &Path) -> Result<()> {
         match (
             self.mtp_num_hidden_layers,
@@ -267,6 +318,7 @@ impl Qwen35Config {
         }
     }
 
+    #[cfg(any(feature = "specprefill", test))]
     pub(crate) fn has_mtp_metadata(&self) -> bool {
         self.mtp_num_hidden_layers == Some(1) && self.mtp_use_dedicated_embeddings == Some(false)
     }
@@ -349,9 +401,11 @@ enum Qwen35GatedAuxProjections {
         b: Qwen35Linear,
         a: Qwen35Linear,
     },
+    #[cfg(any(feature = "specprefill", test))]
     Fused(Qwen35Linear),
 }
 
+#[cfg(any(feature = "specprefill", test))]
 fn fuse_gated_aux_projections(
     weights: Option<&WeightMap>,
     prefixes: [&str; 3],
@@ -409,6 +463,17 @@ fn fuse_gated_aux_projections(
         Qwen35GatedAuxProjections::Separate { z, b, a },
         Qwen35GatedAuxProjections::Fused,
     )
+}
+
+#[cfg(not(any(feature = "specprefill", test)))]
+fn fuse_gated_aux_projections(
+    _weights: Option<&WeightMap>,
+    _prefixes: [&str; 3],
+    z: Qwen35Linear,
+    b: Qwen35Linear,
+    a: Qwen35Linear,
+) -> Qwen35GatedAuxProjections {
+    Qwen35GatedAuxProjections::Separate { z, b, a }
 }
 
 // GatedDeltaNet - Qwen3.5 variant with separately stored projections.
@@ -476,6 +541,7 @@ impl Qwen35GatedDeltaNet {
             Qwen35GatedAuxProjections::Separate { z, b, a } => {
                 (z.forward(inputs), b.forward(inputs), a.forward(inputs))
             }
+            #[cfg(any(feature = "specprefill", test))]
             Qwen35GatedAuxProjections::Fused(projection) => {
                 let projected = projection.forward(inputs);
                 let z_end = self.value_dim as i32;
@@ -657,7 +723,8 @@ impl Qwen35GatedDeltaNet {
     fn from_weights(
         weights: &dyn Qwen35WeightSource,
         config: &Qwen35Config,
-        prefix: &str,
+        role: ModelRole,
+        layer: usize,
     ) -> Result<Self, String> {
         let hidden_size = config.hidden_size;
         let num_v_heads = config.linear_num_value_heads;
@@ -668,19 +735,28 @@ impl Qwen35GatedDeltaNet {
         let value_dim = head_v_dim * num_v_heads;
         let conv_kernel_size = config.linear_conv_kernel_dim;
         let conv_dim = key_dim * 2 + value_dim;
-        let qkv_prefix = format!("{}.in_proj_qkv", prefix);
-        let z_prefix = format!("{}.in_proj_z", prefix);
-        let b_prefix = format!("{}.in_proj_b", prefix);
-        let a_prefix = format!("{}.in_proj_a", prefix);
-        let out_prefix = format!("{}.out_proj", prefix);
+        let prefix = match role {
+            ModelRole::Target => format!("model.layers.{layer}.linear_attn"),
+            ModelRole::Mtp => format!("mtp.layers.{layer}.linear_attn"),
+        };
+        let qkv_prefix = format!("{prefix}.in_proj_qkv");
+        let z_prefix = format!("{prefix}.in_proj_z");
+        let b_prefix = format!("{prefix}.in_proj_b");
+        let a_prefix = format!("{prefix}.in_proj_a");
+        let out_prefix = format!("{prefix}.out_proj");
         let (qkv_group_size, qkv_bits) = config.quant_params(&qkv_prefix);
         let (z_group_size, z_bits) = config.quant_params(&z_prefix);
         let (b_group_size, b_bits) = config.quant_params(&b_prefix);
         let (a_group_size, a_bits) = config.quant_params(&a_prefix);
         let (out_group_size, out_bits) = config.quant_params(&out_prefix);
+        let slot = |tensor| TensorSlot::Layer {
+            role,
+            layer,
+            tensor,
+        };
 
         let conv1d_weight = {
-            let weight = weights.tensor(&format!("{}.conv1d.weight", prefix))?;
+            let weight = weights.tensor(slot(LayerTensor::LinearConv))?;
             let shape = mlxcel_core::array_shape(&weight);
             if shape.len() == 2 {
                 mlxcel_core::expand_dims(&weight, -1)
@@ -690,12 +766,10 @@ impl Qwen35GatedDeltaNet {
                 weight
             }
         };
-
-        // Qwen3.5 uses separate projections instead of combined projections.
-        let in_proj_qkv = weights.linear(&qkv_prefix, qkv_group_size, qkv_bits)?;
-        let in_proj_z = weights.linear(&z_prefix, z_group_size, z_bits)?;
-        let in_proj_b = weights.linear(&b_prefix, b_group_size, b_bits)?;
-        let in_proj_a = weights.linear(&a_prefix, a_group_size, a_bits)?;
+        let in_proj_qkv = weights.linear(slot(LayerTensor::LinearQkv), qkv_group_size, qkv_bits)?;
+        let in_proj_z = weights.linear(slot(LayerTensor::LinearGate), z_group_size, z_bits)?;
+        let in_proj_b = weights.linear(slot(LayerTensor::LinearBeta), b_group_size, b_bits)?;
+        let in_proj_a = weights.linear(slot(LayerTensor::LinearAlpha), a_group_size, a_bits)?;
         let aux_projections = fuse_gated_aux_projections(
             weights.legacy_weights(),
             [&z_prefix, &b_prefix, &a_prefix],
@@ -703,12 +777,10 @@ impl Qwen35GatedDeltaNet {
             in_proj_b,
             in_proj_a,
         );
-
-        let dt_bias = weights.tensor(&format!("{}.dt_bias", prefix))?;
-        let a_log = weights.tensor(&format!("{}.A_log", prefix))?;
-        let norm_weight = weights.tensor(&format!("{}.norm.weight", prefix))?;
-
-        let out_proj = weights.linear(&out_prefix, out_group_size, out_bits)?;
+        let dt_bias = weights.tensor(slot(LayerTensor::LinearDtBias))?;
+        let a_log = weights.tensor(slot(LayerTensor::LinearA))?;
+        let norm_weight = weights.tensor(slot(LayerTensor::LinearNorm))?;
+        let out_proj = weights.linear(slot(LayerTensor::LinearOutput), out_group_size, out_bits)?;
 
         Ok(Self {
             hidden_size,
@@ -869,41 +941,41 @@ impl Qwen35DecoderLayer {
         qn_config: &Qwen3NextConfig,
         layer_idx: usize,
     ) -> Result<Self, String> {
-        Self::from_weights_at_prefix(
+        Self::from_weights_for_role(
             weights,
             config,
             qn_config,
-            &format!("model.layers.{layer_idx}"),
+            ModelRole::Target,
+            layer_idx,
             config.is_linear_layer(layer_idx),
         )
     }
 
-    pub(crate) fn from_weights_at_prefix(
+    pub(crate) fn from_weights_for_role(
         weights: &dyn Qwen35WeightSource,
         config: &Qwen35Config,
         qn_config: &Qwen3NextConfig,
-        prefix: &str,
+        role: ModelRole,
+        layer: usize,
         is_linear: bool,
     ) -> Result<Self, String> {
         let attention = if is_linear {
             Qwen35AttentionVariant::Linear(Qwen35GatedDeltaNet::from_weights(
-                weights,
-                config,
-                &format!("{}.linear_attn", prefix),
+                weights, config, role, layer,
             )?)
         } else {
             Qwen35AttentionVariant::FullAttention(Qwen3NextAttention::from_weights(
-                weights,
-                qn_config,
-                &format!("{}.self_attn", prefix),
+                weights, qn_config, role, layer,
             )?)
         };
-
-        let mlp = Mlp::from_weights(weights, qn_config, &format!("{}.mlp", prefix))?;
-
-        let input_norm_weight = weights.tensor(&format!("{}.input_layernorm.weight", prefix))?;
-        let post_norm_weight =
-            weights.tensor(&format!("{}.post_attention_layernorm.weight", prefix))?;
+        let mlp = Mlp::from_weights(weights, qn_config, role, layer)?;
+        let slot = |tensor| TensorSlot::Layer {
+            role,
+            layer,
+            tensor,
+        };
+        let input_norm_weight = weights.tensor(slot(LayerTensor::InputNorm))?;
+        let post_norm_weight = weights.tensor(slot(LayerTensor::PostAttentionNorm))?;
 
         Ok(Self {
             is_linear,
@@ -1109,10 +1181,6 @@ impl Qwen35Model {
             finish_initial_attention_prefill(caches, self.kv_cache_mode);
         });
         self.initial_prefill_complete.store(true, Ordering::Relaxed);
-    }
-
-    pub(crate) fn has_mtp(&self) -> bool {
-        self.mtp.is_some()
     }
 
     pub(crate) fn vocab_size(&self) -> usize {
@@ -1665,6 +1733,7 @@ impl Qwen35Model {
         });
     }
 
+    #[cfg(any(feature = "specprefill", test))]
     fn parse_config(model_dir: &Path) -> Result<Qwen35Config> {
         let config_path = model_dir.join("config.json");
         let config_text = std::fs::read_to_string(&config_path)
@@ -1835,6 +1904,7 @@ impl Qwen35Model {
         Ok(config)
     }
 
+    #[cfg(any(feature = "specprefill", test))]
     fn validate_shard_index(model_dir: &Path) -> Result<()> {
         let index_path = model_dir.join("model.safetensors.index.json");
         let index_text = std::fs::read_to_string(&index_path)
@@ -1878,41 +1948,23 @@ impl Qwen35Model {
         Ok(())
     }
 
-    pub(crate) fn load_gguf(
-        model_dir: &Path,
-        kv_cache_mode: KVCacheMode,
-    ) -> Result<(Self, GgufTextAssets)> {
-        let weights = GgufWeightSource::open(model_dir).with_context(|| {
-            format!(
-                "failed to open selected GGUF pair in {}",
-                model_dir.display()
-            )
-        })?;
+    pub(crate) fn load_pinned(kv_cache_mode: KVCacheMode) -> Result<(Self, GgufTextAssets)> {
+        let weights = GgufWeightSource::open().context("failed to open pinned GGUF pair")?;
         let assets = GgufTextAssets::load(weights.target())?;
         let config = weights.config()?;
         let target_cache_mode = mtp_target_cache_mode(true, kv_cache_mode);
         tracing::info!(
             requested_cache_mode = ?kv_cache_mode,
             effective_target_cache_mode = ?target_cache_mode,
-            "selected Qwen3.5 GGUF target cache policy"
+            "pinned Qwen3.8 target cache policy"
         );
         let mut model = Self::from_weights(&weights, &config, target_cache_mode)
             .map_err(anyhow::Error::msg)
-            .with_context(|| {
-                format!(
-                    "failed to construct Qwen3.5 target from selected GGUF in {}",
-                    model_dir.display()
-                )
-            })?;
+            .context("failed to construct pinned Qwen3.8 target")?;
         model.mtp = Some(
             Qwen35MtpDraftModel::from_weights(&weights, &config)
                 .map_err(anyhow::Error::msg)
-                .with_context(|| {
-                    format!(
-                        "failed to construct separate Qwen3.5 MTP head from selected GGUF in {}",
-                        model_dir.display()
-                    )
-                })?,
+                .context("failed to construct pinned Qwen3.8 MTP head")?,
         );
         weights.finish()?;
         let affine = weights.affine_stats();
@@ -1951,82 +2003,6 @@ impl Qwen35Model {
             affine.q6_elapsed,
         );
         Ok((model, assets))
-    }
-
-    pub fn load(model_dir: &Path, kv_cache_mode: KVCacheMode) -> Result<Self> {
-        ensure!(
-            model_dir.is_dir(),
-            "model directory does not exist or is not a directory: {}",
-            model_dir.display()
-        );
-        let config = Self::parse_config(model_dir)?;
-        Self::validate_shard_index(model_dir)?;
-
-        let weights = mlxcel_core::weights::load_weights_from_dir_filtered(model_dir, |name| {
-            name.starts_with("language_model.")
-                || name.starts_with("model.language_model.")
-                || name.starts_with("model.visual.")
-                || name.starts_with("visual.")
-                || name.starts_with("vision_tower.")
-                || name.starts_with("lm_head.")
-        })
-        .map_err(anyhow::Error::msg)
-        .with_context(|| {
-            format!(
-                "failed to load checkpoint shards from {}",
-                model_dir.display()
-            )
-        })?;
-        ensure!(
-            !weights.is_empty(),
-            "checkpoint {} contains no Qwen3.5 model tensors",
-            model_dir.display()
-        );
-        let weights = sanitize_language_model_weights(weights, &config, model_dir)?;
-        let target_cache_mode = mtp_target_cache_mode(weights.mtp.is_some(), kv_cache_mode);
-        tracing::info!(
-            requested_cache_mode = ?kv_cache_mode,
-            effective_target_cache_mode = ?target_cache_mode,
-            "selected Qwen3.5 target cache policy"
-        );
-        let mut model = Self::from_weights(&weights.target, &config, target_cache_mode)
-            .map_err(anyhow::Error::msg)
-            .with_context(|| {
-                format!(
-                    "failed to construct dense model from checkpoint {}",
-                    model_dir.display()
-                )
-            })?;
-        if let Some(mtp_weights) = weights.mtp.as_ref() {
-            model.mtp = Some(
-                Qwen35MtpDraftModel::from_weights(mtp_weights, &config)
-                    .map_err(anyhow::Error::msg)
-                    .with_context(|| {
-                        format!(
-                            "failed to construct bundled MTP head from checkpoint {}",
-                            model_dir.display()
-                        )
-                    })?,
-            );
-        }
-        if let Some(mut vision_config) = config.vision_config.clone() {
-            if vision_config.quantization_config.is_none() {
-                let (group_size, bits) = config.quant_params("model.visual");
-                vision_config.quant_group_size = group_size;
-                vision_config.quant_bits = bits;
-            }
-            model.vision = Some(
-                Qwen3VLVisionEncoder::from_weights(&weights.vision, &vision_config, "vision_tower")
-                    .map_err(anyhow::Error::msg)
-                    .with_context(|| {
-                        format!(
-                            "failed to construct Qwen3.5 vision encoder from checkpoint {}",
-                            model_dir.display()
-                        )
-                    })?,
-            );
-        }
-        Ok(model)
     }
 
     #[cfg(any(feature = "specprefill", test))]
@@ -2264,8 +2240,8 @@ impl Qwen35Model {
     ) -> std::result::Result<Self, String> {
         let qn_config = config.to_qwen3next_config();
         let (embed_group_size, embed_bits) = config.quant_params("model.embed_tokens");
-        let embed_tokens = weights.embedding("model.embed_tokens", embed_group_size, embed_bits)?;
-
+        let embed_tokens =
+            weights.embedding(TensorSlot::TokenEmbedding, embed_group_size, embed_bits)?;
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for layer_idx in 0..config.num_hidden_layers {
             layers.push(Qwen35DecoderLayer::from_weights(
@@ -2273,12 +2249,12 @@ impl Qwen35Model {
             )?);
         }
 
-        let norm_weight = weights.tensor("model.norm.weight")?;
+        let norm_weight = weights.tensor(TensorSlot::OutputNorm)?;
         let lm_head = if config.tie_word_embeddings {
             None
         } else {
             let (group_size, bits) = config.quant_params("lm_head");
-            Some(weights.linear("lm_head", group_size, bits)?)
+            Some(weights.linear(TensorSlot::Output, group_size, bits)?)
         };
         let compact_draft_head = lm_head.as_ref().and_then(|head| {
             compact_head(head, config.vocab_size, MTP_DRAFT_PREFIX, MTP_DRAFT_PADDED)
@@ -2320,6 +2296,7 @@ impl Qwen35Model {
     }
 }
 
+#[cfg(any(feature = "specprefill", test))]
 fn validate_quantization(value: &Value, config_path: &Path) -> Result<()> {
     let object = value.as_object().with_context(|| {
         format!(
@@ -2344,6 +2321,7 @@ fn validate_quantization(value: &Value, config_path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(feature = "specprefill", test))]
 fn validate_quantization_entry(
     object: &serde_json::Map<String, Value>,
     name: &str,
@@ -2398,10 +2376,12 @@ fn validate_quantization_entry(
 /// tensor of rank < 3 carries no layout information, so it reads as converted:
 /// the norm-shift gate in [`sanitize_weights`] keys on this predicate, and a
 /// degenerate tensor must not be able to trigger a shift that transposes nothing.
+#[cfg(any(feature = "specprefill", test))]
 fn is_raw_conv1d_layout(shape: &[i32]) -> bool {
     shape.len() >= 3 && shape[shape.len() - 1] != 1
 }
 
+#[cfg(any(feature = "specprefill", test))]
 pub(crate) fn sanitize_weights(mut weights: WeightMap, config: &Qwen35Config) -> WeightMap {
     let raw_conv1d = weights.iter().any(|(name, value)| {
         name.contains("conv1d.weight") && is_raw_conv1d_layout(&mlxcel_core::array_shape(value))
@@ -2442,12 +2422,14 @@ pub(crate) fn sanitize_weights(mut weights: WeightMap, config: &Qwen35Config) ->
     weights
 }
 
+#[cfg(any(feature = "specprefill", test))]
 struct SanitizedLanguageWeights {
     target: WeightMap,
     vision: WeightMap,
     mtp: Option<WeightMap>,
 }
 
+#[cfg(any(feature = "specprefill", test))]
 fn sanitize_language_model_weights(
     weights: WeightMap,
     config: &Qwen35Config,
@@ -2518,6 +2500,7 @@ fn sanitize_language_model_weights(
     })
 }
 
+#[cfg(any(feature = "specprefill", test))]
 fn validate_mtp_weights(weights: &WeightMap, checkpoint_path: &Path) -> Result<()> {
     const REQUIRED: &[&str] = &[
         "mtp.fc.weight",
@@ -2565,6 +2548,7 @@ fn validate_mtp_weights(weights: &WeightMap, checkpoint_path: &Path) -> Result<(
     Ok(())
 }
 
+#[cfg(any(feature = "specprefill", test))]
 fn sanitize_mtp_weights(mut weights: WeightMap, raw_layout: bool) -> WeightMap {
     if !raw_layout {
         return weights;
@@ -3734,9 +3718,8 @@ mod tests {
     #[test]
     #[ignore = "requires the complete pinned Qwen3.8 27B GGUF pair"]
     fn restored_turbo4_target_snapshot_matches_uninterrupted_next_token_and_text() {
-        let model_dir = crate::resolve_model_path(None).expect("resolve selected GGUF cache");
         let (model, assets) =
-            Qwen35Model::load_gguf(&model_dir, KVCacheMode::Turbo4).expect("load Qwen3.8 GGUF");
+            Qwen35Model::load_pinned(KVCacheMode::Turbo4).expect("load Qwen3.8 GGUF");
         let tokenizer = assets.tokenizer;
         let prompt = tokenizer
             .encode("Snapshot restore invariant", true)
@@ -3800,9 +3783,7 @@ mod tests {
     #[test]
     #[ignore = "requires the complete pinned Qwen3.8 27B GGUF pair"]
     fn real_gguf_target_verify_logits_stay_within_one_ulp() {
-        let model_dir = crate::resolve_model_path(None).expect("resolve selected GGUF cache");
-        let (model, _) =
-            Qwen35Model::load_gguf(&model_dir, KVCacheMode::Fp16).expect("load Qwen3.8 GGUF");
+        let (model, _) = Qwen35Model::load_pinned(KVCacheMode::Fp16).expect("load Qwen3.8 GGUF");
         let token_ids = [9_707_i32, 11, 1_879];
         let all = mlxcel_core::from_slice_i32(&token_ids, &[1, token_ids.len() as i32]);
         let direct = model

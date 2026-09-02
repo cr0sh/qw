@@ -8,9 +8,9 @@ use std::thread;
 use clap::Parser as _;
 use clap_derive::{Args, Parser, Subcommand};
 use qw_runtime::{
-    DEFAULT_MODEL_IDENTIFIER, DEFAULT_MODEL_REVISION, GenerationRequest, KVCacheMode,
-    Qwen35Provider, SELECTED_MTP_DIRECTORY, SELECTED_MTP_FILE, SELECTED_TARGET_FILE,
-    model_cache_path, resolve_model_path, sha256_file,
+    GenerationRequest, KVCacheMode, PINNED_ARTIFACTS, PINNED_REPOSITORY, PINNED_REVISION,
+    PinnedArtifact, Qwen35Provider, io_verify_artifact_file, pinned_model_dir,
+    resolve_pinned_model_dir,
 };
 use qw_server::serve;
 
@@ -42,10 +42,6 @@ struct DownloadArgs {}
 
 #[derive(Debug, Args)]
 struct GenerateArgs {
-    /// Checkpoint directory or HF identifier; defaults to the qw model cache unless QW_MODEL_PATH is set.
-    #[arg(long)]
-    model: Option<PathBuf>,
-
     /// User prompt text.
     #[arg(long)]
     prompt: String,
@@ -128,14 +124,7 @@ fn stats_report() -> Result<String, Box<dyn std::error::Error>> {
     let (model_cache_files, model_cache_bytes) = cache_usage(&cache_root.join("models"))?;
     let (checkpoint_cache_files, checkpoint_cache_bytes) =
         cache_usage(&cache_root.join("checkpoint"))?;
-    let model_path = resolve_model_path(None)?;
-    let model_override = std::env::var_os("QW_MODEL_PATH")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from);
-    let selected_model = model_override.as_deref().map_or_else(
-        || DEFAULT_MODEL_IDENTIFIER.to_owned(),
-        |path| path.display().to_string(),
-    );
+    let model_path = resolve_pinned_model_dir()?;
     let model_exists = model_path.try_exists()?;
 
     let mut report = String::new();
@@ -155,7 +144,10 @@ fn stats_report() -> Result<String, Box<dyn std::error::Error>> {
         "Checkpoint cache usage: {checkpoint_cache_files} files, {checkpoint_cache_bytes} bytes ({})",
         human_readable_bytes(checkpoint_cache_bytes)
     )?;
-    writeln!(report, "Selected model: {selected_model}")?;
+    writeln!(
+        report,
+        "Pinned model: {PINNED_REPOSITORY}@{PINNED_REVISION}"
+    )?;
     writeln!(report, "Model path: {}", model_path.display())?;
     writeln!(
         report,
@@ -190,28 +182,7 @@ fn add_hf_token(command: &mut ProcessCommand) {
 
 const MAX_CONCURRENT_DOWNLOADS: usize = 2;
 
-#[derive(Clone, Copy)]
-struct SelectedFile {
-    source: &'static str,
-    relative: &'static str,
-    size: u64,
-    sha256: &'static str,
-}
-
-const SELECTED_FILES: [SelectedFile; 2] = [
-    SelectedFile {
-        source: "Qwen3.8-27B-UD-Q4_K_XL.gguf",
-        relative: "Qwen3.8-27B-UD-Q4_K_XL.gguf",
-        size: 17_559_178_144,
-        sha256: "3f227079003add2511437e5b1e94812e363385225bf6a9b47b0054a72bc8b01e",
-    },
-    SelectedFile {
-        source: "MTP/mtp-Qwen3.8-27B-Q4_0.gguf",
-        relative: "MTP/mtp-Qwen3.8-27B-Q4_0.gguf",
-        size: 1_369_590_656,
-        sha256: "50d9ce5a6da381bbcfb31061cf73df94a90e6faf8efeddee379a9cb8f1501c6e",
-    },
-];
+type SelectedFile = PinnedArtifact;
 
 struct DownloadJob {
     selected: SelectedFile,
@@ -249,11 +220,11 @@ where
 fn download_selected_file(job: &DownloadJob) -> Result<(), Error> {
     let file_url = format!(
         "https://huggingface.co/{}/resolve/{}/{}",
-        encode_url_path(DEFAULT_MODEL_IDENTIFIER),
-        DEFAULT_MODEL_REVISION,
-        encode_url_path(job.selected.source),
+        encode_url_path(PINNED_REPOSITORY),
+        PINNED_REVISION,
+        encode_url_path(job.selected.source_path),
     );
-    eprintln!("Downloading {}", job.selected.relative);
+    eprintln!("Downloading {}", job.selected.relative_path);
     let mut command = ProcessCommand::new("curl");
     command.args(["--fail", "--location", "--show-error"]);
     let resume = match std::fs::symlink_metadata(&job.partial_path) {
@@ -290,14 +261,14 @@ fn download_selected_file(job: &DownloadJob) -> Result<(), Error> {
                 error.kind(),
                 format!(
                     "failed to run curl while downloading `{}`: {error}",
-                    job.selected.relative
+                    job.selected.relative_path
                 ),
             )
         })?;
     if !status.success() {
         return Err(Error::other(format!(
             "curl failed while downloading `{}` ({status})",
-            job.selected.relative
+            job.selected.relative_path
         )));
     }
     if let Err(error) = verify_selected_file(&job.partial_path, job.selected) {
@@ -308,56 +279,24 @@ fn download_selected_file(job: &DownloadJob) -> Result<(), Error> {
 }
 
 fn verify_selected_file(path: &Path, selected: SelectedFile) -> Result<(), Error> {
-    let metadata = std::fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-        return Err(Error::other(format!(
-            "selected download path is not a regular file: {}",
-            path.display()
-        )));
-    }
-    if metadata.len() != selected.size {
-        return Err(Error::other(format!(
-            "{} has {} bytes; expected {}",
-            path.display(),
-            metadata.len(),
-            selected.size
-        )));
-    }
-    let digest = sha256_file(path)?;
-    if digest != selected.sha256 {
-        return Err(Error::other(format!(
-            "{} SHA-256 {digest} does not match pinned {}",
-            path.display(),
-            selected.sha256
-        )));
-    }
-    Ok(())
+    io_verify_artifact_file(path, selected)
 }
 
 fn download_selected_snapshot() -> Result<(), Box<dyn std::error::Error>> {
-    debug_assert_eq!(SELECTED_TARGET_FILE.0, SELECTED_FILES[0].relative);
-    debug_assert_eq!(SELECTED_TARGET_FILE.1, SELECTED_FILES[0].size);
-    debug_assert_eq!(SELECTED_TARGET_FILE.2, SELECTED_FILES[0].sha256);
-    debug_assert_eq!(
-        format!("{SELECTED_MTP_DIRECTORY}/{}", SELECTED_MTP_FILE.0),
-        SELECTED_FILES[1].relative
-    );
-    debug_assert_eq!(SELECTED_MTP_FILE.1, SELECTED_FILES[1].size);
-    debug_assert_eq!(SELECTED_MTP_FILE.2, SELECTED_FILES[1].sha256);
     let home = std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
         .ok_or_else(|| Error::new(ErrorKind::NotFound, "HOME is not set"))?;
-    let destination = model_cache_path(Path::new(&home), DEFAULT_MODEL_IDENTIFIER)?;
+    let destination = pinned_model_dir(Path::new(&home));
     std::fs::create_dir_all(&destination)?;
     let mut jobs = Vec::new();
-    for selected in SELECTED_FILES {
-        let file_path = destination.join(selected.relative);
+    for selected in PINNED_ARTIFACTS {
+        let file_path = destination.join(selected.relative_path);
         if let Some(parent) = file_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         if file_path.exists() {
             verify_selected_file(&file_path, selected)?;
-            eprintln!("Verified {}", selected.relative);
+            eprintln!("Verified {}", selected.relative_path);
             continue;
         }
         let mut partial_name = file_path
@@ -373,37 +312,37 @@ fn download_selected_snapshot() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     run_bounded(&jobs, MAX_CONCURRENT_DOWNLOADS, &download_selected_file)?;
-    for selected in SELECTED_FILES {
-        verify_selected_file(&destination.join(selected.relative), selected)?;
+    for selected in PINNED_ARTIFACTS {
+        verify_selected_file(&destination.join(selected.relative_path), selected)?;
     }
     write_selected_provenance(&destination)?;
     eprintln!(
         "Downloaded {}@{} to {}",
-        DEFAULT_MODEL_IDENTIFIER,
-        DEFAULT_MODEL_REVISION,
+        PINNED_REPOSITORY,
+        PINNED_REVISION,
         destination.display()
     );
     Ok(())
 }
 
 fn write_selected_provenance(destination: &Path) -> Result<(), Error> {
-    let files = SELECTED_FILES
+    let files = PINNED_ARTIFACTS
         .iter()
         .map(|file| {
             serde_json::json!({
-                "repository": DEFAULT_MODEL_IDENTIFIER,
-                "revision": DEFAULT_MODEL_REVISION,
-                "source": file.source,
-                "relative": file.relative,
+                "repository": PINNED_REPOSITORY,
+                "revision": PINNED_REVISION,
+                "source": file.source_path,
+                "relative": file.relative_path,
                 "size": file.size,
                 "sha256": file.sha256,
             })
         })
         .collect::<Vec<_>>();
     let provenance = serde_json::json!({
-        "schema": "qwr.gguf.selection.v1",
-        "repository": DEFAULT_MODEL_IDENTIFIER,
-        "revision": DEFAULT_MODEL_REVISION,
+        "schema": "qwr.pinned-gguf-pair",
+        "repository": PINNED_REPOSITORY,
+        "revision": PINNED_REVISION,
         "files": files,
     });
     let bytes = serde_json::to_vec_pretty(&provenance).map_err(Error::other)?;
@@ -427,9 +366,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             print!("{}", stats_report()?);
         }
         Command::Generate(args) => {
-            let model = qw_runtime::resolve_model_path(args.model.as_deref())?;
-            eprintln!("Loading model from {}", model.display());
-            let mut provider = Qwen35Provider::load(&model, KVCacheMode::Fp16)?;
+            let model = resolve_pinned_model_dir()?;
+            eprintln!("Loading pinned model from {}", model.display());
+            let mut provider = Qwen35Provider::load(KVCacheMode::Fp16)?;
             let stdout = std::io::stdout();
             let mut stdout = stdout.lock();
             let mut io_error = None;
@@ -515,63 +454,26 @@ mod tests {
         assert!(matches!(cli.command, Command::Download(_)));
         assert!(
             Cli::try_parse_from(["qw", "download", "Qwen/Qwen3.5-0.8B"]).is_err(),
-            "the unreleased checkpoint contract has no identifier override"
+            "the pinned checkpoint contract has no identifier override"
         );
-        assert_eq!(SELECTED_FILES[0].relative, SELECTED_TARGET_FILE.0);
-        assert_eq!(
-            SELECTED_FILES[1].relative,
-            format!("{SELECTED_MTP_DIRECTORY}/{}", SELECTED_MTP_FILE.0)
-        );
+        assert_eq!(PINNED_ARTIFACTS.len(), 2);
+        assert_eq!(PINNED_ARTIFACTS[0].role, PinnedArtifactRole::Target);
+        assert_eq!(PINNED_ARTIFACTS[1].role, PinnedArtifactRole::Mtp);
     }
 
     #[test]
-    fn selected_file_verification_enforces_size_and_sha256() {
-        let directory = std::env::temp_dir().join(format!(
-            "qw-selected-download-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
-        let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir_all(&directory).expect("create fixture directory");
-        let path = directory.join("fixture.gguf");
-        std::fs::write(&path, b"abc").expect("write fixture");
-        let valid = SelectedFile {
-            source: "fixture.gguf",
-            relative: "fixture.gguf",
-            size: 3,
-            sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
-        };
-        verify_selected_file(&path, valid).expect("valid selected file");
-        let wrong_size = SelectedFile { size: 4, ..valid };
-        assert!(verify_selected_file(&path, wrong_size).is_err());
-        let wrong_hash = SelectedFile {
-            sha256: "0000000000000000000000000000000000000000000000000000000000000000",
-            ..valid
-        };
-        assert!(verify_selected_file(&path, wrong_hash).is_err());
-        std::fs::remove_dir_all(directory).expect("remove fixture directory");
-    }
-
-    #[test]
-    fn generate_requires_model_and_prompt() {
+    fn generate_requires_prompt_and_rejects_model_overrides() {
         assert!(Cli::try_parse_from(["qw", "generate"]).is_err());
         assert!(Cli::try_parse_from(["qw", "generate", "--model", "/tmp/model"]).is_err());
         let cli = Cli::try_parse_from(["qw", "generate", "--prompt", "hello"])
-            .expect("model is optional");
-        assert!(matches!(cli.command, Command::Generate(args) if args.model.is_none()));
+            .expect("parse fixed-model generation");
+        assert!(matches!(cli.command, Command::Generate(_)));
     }
 
     #[test]
     fn omitted_sampling_flags_use_checkpoint_defaults() {
-        let cli = Cli::try_parse_from([
-            "qw",
-            "generate",
-            "--model",
-            "/tmp/model",
-            "--prompt",
-            "hello",
-        ])
-        .expect("parse generate command");
+        let cli = Cli::try_parse_from(["qw", "generate", "--prompt", "hello"])
+            .expect("parse generate command");
         let Command::Generate(args) = cli.command else {
             panic!("expected generate command");
         };
@@ -588,8 +490,6 @@ mod tests {
         let cli = Cli::try_parse_from([
             "qw",
             "generate",
-            "--model",
-            "/tmp/model",
             "--prompt",
             "hello",
             "--max-tokens",
@@ -621,8 +521,6 @@ mod tests {
         let cli = Cli::try_parse_from([
             "qw",
             "serve",
-            "--model",
-            "/tmp/model",
             "--model-id",
             "served-model",
             "--bind",
@@ -659,7 +557,7 @@ mod tests {
         let serve_help = Cli::try_parse_from(["qw", "serve", "--help"])
             .expect_err("serve help exits through clap");
         let serve_help = serve_help.to_string();
-        assert!(serve_help.contains("--model"), "{serve_help}");
+        assert!(!serve_help.contains("--model <"), "{serve_help}");
         assert!(serve_help.contains("--bind"), "{serve_help}");
         assert!(serve_help.contains("--model-id"), "{serve_help}");
         assert!(

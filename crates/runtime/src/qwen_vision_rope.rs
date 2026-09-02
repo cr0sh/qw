@@ -1,9 +1,6 @@
 use mlxcel_core::{MlxArray, UniquePtr};
 
-pub(crate) fn concat_many(
-    arrays: &[UniquePtr<MlxArray>],
-    axis: i32,
-) -> UniquePtr<MlxArray> {
+pub(crate) fn concat_many(arrays: &[UniquePtr<MlxArray>], axis: i32) -> UniquePtr<MlxArray> {
     assert!(!arrays.is_empty());
     let mut result = mlxcel_core::copy(
         arrays[0]
@@ -12,8 +9,12 @@ pub(crate) fn concat_many(
     );
     for array in &arrays[1..] {
         result = mlxcel_core::concatenate(
-            result.as_ref().expect("vision concatenate result must not be null"),
-            array.as_ref().expect("vision concatenate input must not be null"),
+            result
+                .as_ref()
+                .expect("vision concatenate result must not be null"),
+            array
+                .as_ref()
+                .expect("vision concatenate input must not be null"),
             axis,
         );
     }
@@ -26,6 +27,7 @@ pub(crate) struct VisionRotaryEmbedding {
 }
 
 impl VisionRotaryEmbedding {
+    #[cfg(any(feature = "specprefill", test))]
     pub(crate) fn new(dim: usize) -> Self {
         Self {
             dim,
@@ -52,8 +54,14 @@ pub(crate) fn apply_rotary_pos_emb_vision(
 ) -> UniquePtr<MlxArray> {
     let original_dtype = mlxcel_core::array_dtype(tensor);
     let tensor = mlxcel_core::astype(tensor, mlxcel_core::dtype::FLOAT32);
-    let cosine = mlxcel_core::tile(&mlxcel_core::expand_dims(&mlxcel_core::cos(frequencies), 1), &[1, 1, 2]);
-    let sine = mlxcel_core::tile(&mlxcel_core::expand_dims(&mlxcel_core::sin(frequencies), 1), &[1, 1, 2]);
+    let cosine = mlxcel_core::tile(
+        &mlxcel_core::expand_dims(&mlxcel_core::cos(frequencies), 1),
+        &[1, 1, 2],
+    );
+    let sine = mlxcel_core::tile(
+        &mlxcel_core::expand_dims(&mlxcel_core::sin(frequencies), 1),
+        &[1, 1, 2],
+    );
     let rotated = rotate_half(&tensor);
     let output = mlxcel_core::add(
         &mlxcel_core::multiply(&tensor, &cosine),

@@ -16,11 +16,17 @@
 
 use crate::gated_delta::GatedDeltaCache;
 use crate::qwen_mrope::{InterleavedMRoPE, apply_multimodal_rotary_pos_emb};
-use crate::qwen3_5_weights::{Qwen35Linear, Qwen35QkvProjection, Qwen35WeightSource};
+use crate::qwen3_5_weights::{
+    LayerTensor, ModelRole, Qwen35Linear, Qwen35QkvProjection, Qwen35WeightSource, TensorSlot,
+};
 use mlxcel_core::cache::KVCacheMode;
-use mlxcel_core::layers::{KVCache, QuantizedWeight, RMSNorm, UnifiedLinear};
+#[cfg(any(feature = "specprefill", test))]
+use mlxcel_core::concatenate;
+use mlxcel_core::layers::{KVCache, RMSNorm};
+#[cfg(any(feature = "specprefill", test))]
+use mlxcel_core::layers::{QuantizedWeight, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
-use mlxcel_core::{MlxArray, UniquePtr, concatenate};
+use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::collections::HashMap;
 
@@ -291,25 +297,32 @@ impl Qwen3NextAttention {
     pub(crate) fn from_weights(
         weights: &dyn Qwen35WeightSource,
         config: &Qwen3NextConfig,
-        prefix: &str,
+        role: ModelRole,
+        layer: usize,
     ) -> Result<Self, String> {
-        let q_prefix = format!("{}.q_proj", prefix);
-        let o_prefix = format!("{}.o_proj", prefix);
-        let (q_group_size, q_bits) = config.quant_params(&q_prefix);
-        let (o_group_size, o_bits) = config.quant_params(&o_prefix);
-
+        let prefix = match role {
+            ModelRole::Target => format!("model.layers.{layer}.self_attn"),
+            ModelRole::Mtp => format!("mtp.layers.{layer}.self_attn"),
+        };
+        let (q_group_size, q_bits) = config.quant_params(&format!("{prefix}.q_proj"));
+        let (o_group_size, o_bits) = config.quant_params(&format!("{prefix}.o_proj"));
+        let slot = |tensor| TensorSlot::Layer {
+            role,
+            layer,
+            tensor,
+        };
         let qkv_proj = weights.qkv(
-            prefix,
+            role,
+            layer,
             q_group_size,
             q_bits,
             (config.num_attention_heads * 2) as i32,
             config.num_key_value_heads as i32,
             config.head_dim as i32,
         )?;
-        let o_proj = weights.linear(&o_prefix, o_group_size, o_bits)?;
-        let q_norm_weight = weights.tensor(&format!("{}.q_norm.weight", prefix))?;
-        let k_norm_weight = weights.tensor(&format!("{}.k_norm.weight", prefix))?;
-
+        let o_proj = weights.linear(slot(LayerTensor::AttentionOutput), o_group_size, o_bits)?;
+        let q_norm_weight = weights.tensor(slot(LayerTensor::AttentionQueryNorm))?;
+        let k_norm_weight = weights.tensor(slot(LayerTensor::AttentionKeyNorm))?;
         let head_dim = config.head_dim as i32;
 
         Ok(Self {
@@ -338,12 +351,14 @@ enum MlpInputProjections {
         gate: Qwen35Linear,
         up: Qwen35Linear,
     },
+    #[cfg(any(feature = "specprefill", test))]
     Fused {
         projection: Qwen35Linear,
         intermediate_size: i32,
     },
 }
 
+#[cfg(any(feature = "specprefill", test))]
 fn fuse_mlp_input_projections(
     weights: Option<&WeightMap>,
     gate_prefix: &str,
@@ -394,6 +409,17 @@ fn fuse_mlp_input_projections(
     fused.unwrap_or(MlpInputProjections::Separate { gate, up })
 }
 
+#[cfg(not(any(feature = "specprefill", test)))]
+fn fuse_mlp_input_projections(
+    _weights: Option<&WeightMap>,
+    _gate_prefix: &str,
+    _up_prefix: &str,
+    gate: Qwen35Linear,
+    up: Qwen35Linear,
+) -> MlpInputProjections {
+    MlpInputProjections::Separate { gate, up }
+}
+
 /// Dense MLP layer
 pub(crate) struct Mlp {
     input_projections: MlpInputProjections,
@@ -409,6 +435,7 @@ impl Mlp {
     pub(crate) fn forward_hidden(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
         let (gate, up) = match &self.input_projections {
             MlpInputProjections::Separate { gate, up } => (gate.forward(x), up.forward(x)),
+            #[cfg(any(feature = "specprefill", test))]
             MlpInputProjections::Fused {
                 projection,
                 intermediate_size,
@@ -435,16 +462,26 @@ impl Mlp {
     pub(crate) fn from_weights(
         weights: &dyn Qwen35WeightSource,
         config: &Qwen3NextConfig,
-        prefix: &str,
+        role: ModelRole,
+        layer: usize,
     ) -> Result<Self, String> {
-        let gate_prefix = format!("{}.gate_proj", prefix);
-        let up_prefix = format!("{}.up_proj", prefix);
-        let down_prefix = format!("{}.down_proj", prefix);
+        let prefix = match role {
+            ModelRole::Target => format!("model.layers.{layer}.mlp"),
+            ModelRole::Mtp => format!("mtp.layers.{layer}.mlp"),
+        };
+        let gate_prefix = format!("{prefix}.gate_proj");
+        let up_prefix = format!("{prefix}.up_proj");
+        let down_prefix = format!("{prefix}.down_proj");
         let (gate_group_size, gate_bits) = config.quant_params(&gate_prefix);
         let (up_group_size, up_bits) = config.quant_params(&up_prefix);
         let (down_group_size, down_bits) = config.quant_params(&down_prefix);
-        let gate = weights.linear(&gate_prefix, gate_group_size, gate_bits)?;
-        let up = weights.linear(&up_prefix, up_group_size, up_bits)?;
+        let slot = |tensor| TensorSlot::Layer {
+            role,
+            layer,
+            tensor,
+        };
+        let gate = weights.linear(slot(LayerTensor::MlpGate), gate_group_size, gate_bits)?;
+        let up = weights.linear(slot(LayerTensor::MlpUp), up_group_size, up_bits)?;
 
         Ok(Self {
             input_projections: fuse_mlp_input_projections(
@@ -454,7 +491,7 @@ impl Mlp {
                 gate,
                 up,
             ),
-            down_proj: weights.linear(&down_prefix, down_group_size, down_bits)?,
+            down_proj: weights.linear(slot(LayerTensor::MlpDown), down_group_size, down_bits)?,
         })
     }
 }
@@ -481,30 +518,40 @@ mod tests {
         let mut weights = WeightMap::new();
         insert_f32(
             &mut weights,
-            "self_attn.q_proj.weight",
+            "model.layers.0.self_attn.q_proj.weight",
             &[2 * ATTENTION_WIDTH, HIDDEN_SIZE],
             0.0,
         );
         insert_f32(
             &mut weights,
-            "self_attn.k_proj.weight",
+            "model.layers.0.self_attn.k_proj.weight",
             &[NUM_KV_HEADS * HEAD_DIM, HIDDEN_SIZE],
             0.0,
         );
         insert_f32(
             &mut weights,
-            "self_attn.v_proj.weight",
+            "model.layers.0.self_attn.v_proj.weight",
             &[NUM_KV_HEADS * HEAD_DIM, HIDDEN_SIZE],
             0.0,
         );
         insert_f32(
             &mut weights,
-            "self_attn.o_proj.weight",
+            "model.layers.0.self_attn.o_proj.weight",
             &[HIDDEN_SIZE, ATTENTION_WIDTH],
             0.0,
         );
-        insert_f32(&mut weights, "self_attn.q_norm.weight", &[HEAD_DIM], 1.0);
-        insert_f32(&mut weights, "self_attn.k_norm.weight", &[HEAD_DIM], 1.0);
+        insert_f32(
+            &mut weights,
+            "model.layers.0.self_attn.q_norm.weight",
+            &[HEAD_DIM],
+            1.0,
+        );
+        insert_f32(
+            &mut weights,
+            "model.layers.0.self_attn.k_norm.weight",
+            &[HEAD_DIM],
+            1.0,
+        );
 
         Qwen3NextAttention::from_weights(
             &weights,
@@ -518,7 +565,8 @@ mod tests {
                 quantization: None,
                 mrope_section: vec![1, 1, 1],
             },
-            "self_attn",
+            ModelRole::Target,
+            0,
         )
         .expect("synthetic attention weights")
     }

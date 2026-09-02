@@ -94,7 +94,7 @@ fn hash_bytes(hash: &mut u64, bytes: &[u8]) {
 }
 
 fn long_context_cache_identity(context_label: &str, min_prefix_tokens: usize) -> io::Result<u64> {
-    let model_dir = qw_runtime::resolve_model_path(None)
+    let model_dir = qw_runtime::resolve_pinned_model_dir()
         .map_err(|error| io::Error::other(error.to_string()))?
         .canonicalize()?;
     let mut hash = 0xcbf29ce484222325_u64;
@@ -119,20 +119,20 @@ fn long_context_cache_identity(context_label: &str, min_prefix_tokens: usize) ->
     hash_bytes(&mut hash, model_dir.as_os_str().as_encoded_bytes());
 
     for bytes in [
-        qw_runtime::DEFAULT_MODEL_IDENTIFIER.as_bytes(),
-        qw_runtime::DEFAULT_MODEL_REVISION.as_bytes(),
-        qw_runtime::SELECTED_TARGET_FILE.0.as_bytes(),
-        qw_runtime::SELECTED_TARGET_FILE.2.as_bytes(),
-        qw_runtime::SELECTED_MTP_DIRECTORY.as_bytes(),
-        qw_runtime::SELECTED_MTP_FILE.0.as_bytes(),
-        qw_runtime::SELECTED_MTP_FILE.2.as_bytes(),
+        qw_runtime::PINNED_REPOSITORY.as_bytes(),
+        qw_runtime::PINNED_REVISION.as_bytes(),
+        qw_runtime::PINNED_TARGET.relative_path.as_bytes(),
+        qw_runtime::PINNED_TARGET.sha256.as_bytes(),
+        qw_runtime::PINNED_MTP.relative_path.as_bytes(),
+        qw_runtime::PINNED_MTP.sha256.as_bytes(),
         include_bytes!("../../src/gguf.rs").as_slice(),
+        include_bytes!("../../src/qwen38_plan.rs").as_slice(),
         include_bytes!("../../src/qwen3_5_weights.rs").as_slice(),
     ] {
         hash_bytes(&mut hash, bytes);
     }
-    hash_bytes(&mut hash, &qw_runtime::SELECTED_TARGET_FILE.1.to_le_bytes());
-    hash_bytes(&mut hash, &qw_runtime::SELECTED_MTP_FILE.1.to_le_bytes());
+    hash_bytes(&mut hash, &qw_runtime::PINNED_TARGET.size.to_le_bytes());
+    hash_bytes(&mut hash, &qw_runtime::PINNED_MTP.size.to_le_bytes());
     #[cfg(feature = "dflash2")]
     {
         let draft_dir = draft_model_dir().canonicalize()?;
@@ -711,12 +711,8 @@ pub fn request(max_tokens: usize) -> GenerationRequest {
 }
 
 pub fn load_provider() -> Qwen35Provider {
-    // Unified with `qw generate` / `qw serve`: QW_MODEL_PATH override, else
-    // the model cache path for the resolver's default identifier.
-    let model_dir = qw_runtime::resolve_model_path(None)
-        .unwrap_or_else(|error| panic!("failed to resolve benchmark model path: {error:#}"));
-    Qwen35Provider::load(&model_dir, KVCacheMode::Turbo4)
-        .unwrap_or_else(|error| panic!("failed to load {}: {error:#}", model_dir.display()))
+    Qwen35Provider::load(KVCacheMode::Turbo4)
+        .unwrap_or_else(|error| panic!("failed to load pinned model: {error:#}"))
 }
 
 pub fn prompt_token_ids(provider: &Qwen35Provider) -> Vec<i32> {

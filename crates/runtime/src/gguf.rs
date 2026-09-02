@@ -5,20 +5,6 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 
-pub const SELECTED_GGUF_REPOSITORY: &str = "unsloth/Qwen3.8-27B-GGUF";
-pub const SELECTED_GGUF_REVISION: &str = "4ca720788d1e01f1bff70c033e0d0028fd02e502";
-pub const SELECTED_TARGET_FILE: (&str, u64, &str) = (
-    "Qwen3.8-27B-UD-Q4_K_XL.gguf",
-    17_559_178_144,
-    "3f227079003add2511437e5b1e94812e363385225bf6a9b47b0054a72bc8b01e",
-);
-pub const SELECTED_MTP_FILE: (&str, u64, &str) = (
-    "mtp-Qwen3.8-27B-Q4_0.gguf",
-    1_369_590_656,
-    "50d9ce5a6da381bbcfb31061cf73df94a90e6faf8efeddee379a9cb8f1501c6e",
-);
-pub const SELECTED_MTP_DIRECTORY: &str = "MTP";
-pub(crate) const SELECTED_GGML_TYPES: &[u32] = &[0, 8, 11, 12, 13, 14, 20, 21, 23];
 const GGUF_MAGIC: [u8; 4] = *b"GGUF";
 const GGUF_VERSION: u32 = 3;
 const DEFAULT_ALIGNMENT: u32 = 32;
@@ -35,7 +21,6 @@ pub(crate) struct GgufLimits {
     pub max_tensor_count: u64,
     pub max_alignment: u32,
     pub max_array_depth: usize,
-    pub max_shards: usize,
 }
 
 impl Default for GgufLimits {
@@ -51,7 +36,6 @@ impl Default for GgufLimits {
             max_tensor_count: 1_000_000,
             max_alignment: 1 << 20,
             max_array_depth: 4,
-            max_shards: 1_024,
         }
     }
 }
@@ -145,13 +129,6 @@ impl MetadataValue {
         }
     }
 
-    pub(crate) fn as_bool(&self) -> Option<bool> {
-        match self {
-            Self::Bool(value) => Some(*value),
-            _ => None,
-        }
-    }
-
     pub(crate) fn as_array(&self) -> Option<&[MetadataValue]> {
         match self {
             Self::Array { values, .. } => Some(values),
@@ -166,22 +143,6 @@ pub(crate) struct GgmlType(u32);
 impl GgmlType {
     pub(crate) fn id(self) -> u32 {
         self.0
-    }
-
-    pub(crate) fn name(self) -> &'static str {
-        type_layout(self.0).expect("validated GGML type").name
-    }
-
-    pub(crate) fn block_elements(self) -> u64 {
-        type_layout(self.0)
-            .expect("validated GGML type")
-            .block_elements
-    }
-
-    pub(crate) fn block_bytes(self) -> u64 {
-        type_layout(self.0)
-            .expect("validated GGML type")
-            .block_bytes
     }
 }
 
@@ -203,7 +164,6 @@ pub(crate) struct GgufFile {
     alignment: u32,
     metadata: BTreeMap<String, MetadataValue>,
     tensors: Vec<GgufTensorInfo>,
-    tensor_indices: BTreeMap<String, usize>,
 }
 
 impl GgufFile {
@@ -378,11 +338,6 @@ impl GgufFile {
             );
         }
 
-        let tensor_indices = tensors
-            .iter()
-            .enumerate()
-            .map(|(index, tensor)| (tensor.name.clone(), index))
-            .collect();
         Ok(Self {
             path: path.to_owned(),
             file_len,
@@ -390,24 +345,11 @@ impl GgufFile {
             alignment,
             metadata,
             tensors,
-            tensor_indices,
         })
     }
 
     pub(crate) fn path(&self) -> &Path {
         &self.path
-    }
-
-    pub(crate) fn file_len(&self) -> u64 {
-        self.file_len
-    }
-
-    pub(crate) fn data_offset(&self) -> u64 {
-        self.data_offset
-    }
-
-    pub(crate) fn alignment(&self) -> u32 {
-        self.alignment
     }
 
     pub(crate) fn metadata(&self) -> &BTreeMap<String, MetadataValue> {
@@ -417,316 +359,95 @@ impl GgufFile {
     pub(crate) fn tensors(&self) -> &[GgufTensorInfo] {
         &self.tensors
     }
-
-    pub(crate) fn tensor(&self, name: &str) -> Option<&GgufTensorInfo> {
-        self.tensor_indices
-            .get(name)
-            .map(|index| &self.tensors[*index])
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GgufArtifactKind {
-    Target,
-    Mtp,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ImmutableGgufIdentity {
-    repository: String,
-    revision: String,
-    filename: String,
-    kind: GgufArtifactKind,
-}
-
-impl ImmutableGgufIdentity {
-    pub(crate) fn new(
-        repository: &str,
-        revision: &str,
-        filename: &str,
-        kind: GgufArtifactKind,
-    ) -> Result<Self> {
-        ensure!(
-            repository == SELECTED_GGUF_REPOSITORY,
-            "GGUF repository must be pinned to {SELECTED_GGUF_REPOSITORY}"
-        );
-        ensure!(
-            revision.len() == 40
-                && revision
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
-            "GGUF revision must be a 40-character lowercase commit hash"
-        );
-        validate_gguf_filename(filename)?;
-        ensure!(
-            !filename.starts_with("mmproj-"),
-            "vision GGUF artifacts are not loadable"
-        );
-        match kind {
-            GgufArtifactKind::Target => ensure!(
-                !filename.starts_with("mtp-"),
-                "target GGUF filename cannot name an MTP sidecar"
-            ),
-            GgufArtifactKind::Mtp => ensure!(
-                filename.starts_with("mtp-"),
-                "MTP GGUF filename must use the mtp- sidecar prefix"
-            ),
-        }
-        Ok(Self {
-            repository: repository.to_owned(),
-            revision: revision.to_owned(),
-            filename: filename.to_owned(),
-            kind,
-        })
-    }
-
-    pub(crate) fn repository(&self) -> &str {
-        &self.repository
-    }
-
-    pub(crate) fn revision(&self) -> &str {
-        &self.revision
-    }
-
-    pub(crate) fn filename(&self) -> &str {
-        &self.filename
-    }
-
-    pub(crate) fn kind(&self) -> GgufArtifactKind {
-        self.kind
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ShardedTensor<'a> {
-    pub shard: usize,
-    pub tensor: &'a GgufTensorInfo,
 }
 
 #[derive(Debug)]
-pub(crate) struct GgufShardSet {
-    identity: ImmutableGgufIdentity,
-    shards: Vec<GgufFile>,
-    tensor_locations: BTreeMap<String, (usize, usize)>,
+pub(crate) struct PinnedGgufPair {
+    pub target: GgufFile,
+    pub mtp: GgufFile,
 }
 
-impl GgufShardSet {
-    pub(crate) fn open(model_dir: &Path, identity: ImmutableGgufIdentity) -> Result<Self> {
-        Self::open_with_limits(model_dir, identity, GgufLimits::default())
+impl PinnedGgufPair {
+    pub(crate) fn open() -> Result<Self> {
+        let root = crate::pinned_model::resolve_pinned_model_dir()?;
+        Self::open_in(&root)
     }
 
-    pub(crate) fn open_with_limits(
-        model_dir: &Path,
-        identity: ImmutableGgufIdentity,
-        limits: GgufLimits,
-    ) -> Result<Self> {
-        validate_directory(model_dir)?;
-        let split = SplitFilename::parse(identity.filename(), limits.max_shards)?;
-        let filenames = split.filenames();
-        let mut shards = Vec::new();
-        shards
-            .try_reserve_exact(filenames.len())
-            .context("failed to reserve GGUF shards")?;
-        for filename in &filenames {
-            shards.push(
-                GgufFile::open_with_limits(&model_dir.join(filename), limits)
-                    .with_context(|| format!("failed to open GGUF shard {filename}"))?,
-            );
-        }
-        validate_split_metadata(&shards, &split)?;
-
-        let mut tensor_locations = BTreeMap::new();
-        for (shard_index, shard) in shards.iter().enumerate() {
-            for (tensor_index, tensor) in shard.tensors.iter().enumerate() {
-                ensure!(
-                    tensor_locations
-                        .insert(tensor.name.clone(), (shard_index, tensor_index))
-                        .is_none(),
-                    "duplicate tensor {:?} across GGUF shards",
-                    tensor.name
-                );
-            }
-        }
-        Ok(Self {
-            identity,
-            shards,
-            tensor_locations,
-        })
-    }
-
-    pub(crate) fn identity(&self) -> &ImmutableGgufIdentity {
-        &self.identity
-    }
-
-    pub(crate) fn shards(&self) -> &[GgufFile] {
-        &self.shards
-    }
-
-    pub(crate) fn tensor(&self, name: &str) -> Option<ShardedTensor<'_>> {
-        self.tensor_locations
-            .get(name)
-            .map(|(shard, tensor)| ShardedTensor {
-                shard: *shard,
-                tensor: &self.shards[*shard].tensors[*tensor],
-            })
-    }
-
-    pub(crate) fn tensor_count(&self) -> usize {
-        self.tensor_locations.len()
-    }
-
-    pub(crate) fn metadata(&self) -> &BTreeMap<String, MetadataValue> {
-        self.shards
-            .first()
-            .expect("validated GGUF shard set is non-empty")
-            .metadata()
-    }
-
-    pub(crate) fn payload_bytes(&self) -> Result<u64> {
-        self.shards
-            .iter()
-            .flat_map(|shard| shard.tensors())
-            .try_fold(0_u64, |total, tensor| {
-                total
-                    .checked_add(tensor.byte_len)
-                    .context("GGUF tensor payload byte count overflow")
-            })
-    }
-
-    pub(crate) fn type_histogram(&self) -> BTreeMap<u32, usize> {
-        let mut histogram = BTreeMap::new();
-        for tensor in self.shards.iter().flat_map(|shard| shard.tensors()) {
-            *histogram.entry(tensor.tensor_type.id()).or_default() += 1;
-        }
-        histogram
-    }
-}
-
-#[derive(Debug)]
-pub(crate) struct GgufModelPair {
-    pub target: GgufShardSet,
-    pub mtp: GgufShardSet,
-}
-
-impl GgufModelPair {
-    pub(crate) fn open_from_directories(
-        target_dir: &Path,
-        mtp_dir: &Path,
-        target: ImmutableGgufIdentity,
-        mtp: ImmutableGgufIdentity,
-    ) -> Result<Self> {
-        ensure!(
-            target.kind == GgufArtifactKind::Target && mtp.kind == GgufArtifactKind::Mtp,
-            "GGUF pair must contain one target and one MTP artifact"
-        );
-        ensure!(
-            target.repository == mtp.repository && target.revision == mtp.revision,
-            "target and MTP GGUF artifacts must share one immutable repository revision"
-        );
-        ensure!(
-            target.filename != mtp.filename,
-            "target and MTP GGUF filenames must be distinct"
-        );
-        Ok(Self {
-            target: GgufShardSet::open(target_dir, target)?,
-            mtp: GgufShardSet::open(mtp_dir, mtp)?,
-        })
-    }
-
-    pub(crate) fn open_selected(root: &Path) -> Result<Self> {
-        validate_selected_inventory(root)?;
-        let target = ImmutableGgufIdentity::new(
-            SELECTED_GGUF_REPOSITORY,
-            SELECTED_GGUF_REVISION,
-            SELECTED_TARGET_FILE.0,
-            GgufArtifactKind::Target,
+    fn open_in(root: &Path) -> Result<Self> {
+        // Payload integrity is established before parsing, mmap, MLX, or FFI.
+        let (target_path, mtp_path) = crate::pinned_model::verify_pair_directory(root)?;
+        let target = GgufFile::open(&target_path).context("failed to parse pinned target GGUF")?;
+        let mtp = GgufFile::open(&mtp_path).context("failed to parse pinned MTP GGUF")?;
+        validate_plan(
+            &target,
+            crate::pinned_model::PINNED_TARGET.size,
+            crate::qwen38_plan::TARGET_DATA_OFFSET,
+            &crate::qwen38_plan::TARGET_TENSOR_PLAN,
+            "target",
         )?;
-        let mtp = ImmutableGgufIdentity::new(
-            SELECTED_GGUF_REPOSITORY,
-            SELECTED_GGUF_REVISION,
-            SELECTED_MTP_FILE.0,
-            GgufArtifactKind::Mtp,
+        validate_plan(
+            &mtp,
+            crate::pinned_model::PINNED_MTP.size,
+            crate::qwen38_plan::MTP_DATA_OFFSET,
+            &crate::qwen38_plan::MTP_TENSOR_PLAN,
+            "MTP",
         )?;
-        let pair =
-            Self::open_from_directories(root, &root.join(SELECTED_MTP_DIRECTORY), target, mtp)?;
-        validate_selected_set(
-            &pair.target,
-            866,
-            17_548_181_504,
-            &[
-                (0, 360),
-                (8, 110),
-                (11, 3),
-                (12, 69),
-                (13, 191),
-                (14, 56),
-                (20, 6),
-                (21, 1),
-                (23, 70),
-            ],
-        )?;
-        validate_selected_set(
-            &pair.mtp,
-            18,
-            1_358_645_248,
-            &[(0, 8), (11, 2), (12, 4), (14, 4)],
-        )?;
-        validate_selected_metadata(&pair.target, &pair.mtp)?;
-        Ok(pair)
+        validate_pinned_metadata(&target, &mtp)?;
+        Ok(Self { target, mtp })
     }
 }
 
-fn validate_selected_inventory(root: &Path) -> Result<()> {
-    validate_directory(root)?;
-    let target = root.join(SELECTED_TARGET_FILE.0);
-    let mtp_dir = root.join(SELECTED_MTP_DIRECTORY);
-    validate_directory(&mtp_dir)?;
-    let mtp = mtp_dir.join(SELECTED_MTP_FILE.0);
-    for (path, expected) in [(target, SELECTED_TARGET_FILE.1), (mtp, SELECTED_MTP_FILE.1)] {
-        validate_local_file(&path)?;
-        let actual = symlink_metadata(&path)
-            .with_context(|| format!("failed to stat selected GGUF {}", path.display()))?
-            .len();
-        ensure!(
-            actual == expected,
-            "selected GGUF {} has {actual} bytes; expected {expected}",
-            path.display()
-        );
-    }
-    Ok(())
-}
-
-fn validate_selected_set(
-    set: &GgufShardSet,
-    tensor_count: usize,
-    payload_bytes: u64,
-    histogram: &[(u32, usize)],
+fn validate_plan(
+    file: &GgufFile,
+    expected_file_len: u64,
+    expected_data_offset: u64,
+    plan: &[crate::qwen38_plan::PinnedTensorDescriptor],
+    role: &str,
 ) -> Result<()> {
     ensure!(
-        set.tensor_count() == tensor_count,
-        "selected GGUF tensor count {} does not match {tensor_count}",
-        set.tensor_count()
+        file.file_len == expected_file_len,
+        "pinned {role} file size does not match its manifest"
     );
     ensure!(
-        set.payload_bytes()? == payload_bytes,
-        "selected GGUF tensor payload byte count does not match the pinned inventory"
-    );
-    let expected = histogram.iter().copied().collect::<BTreeMap<_, _>>();
-    ensure!(
-        set.type_histogram() == expected,
-        "selected GGUF tensor type histogram does not match the pinned inventory"
+        file.alignment == 32 && file.data_offset == expected_data_offset,
+        "pinned {role} GGUF header geometry does not match the exact plan"
     );
     ensure!(
-        expected
-            .keys()
-            .all(|tensor_type| SELECTED_GGML_TYPES.contains(tensor_type)),
-        "selected GGUF contains an unsupported packed tensor type"
+        file.tensors.len() == plan.len(),
+        "pinned {role} tensor count {} does not match exact plan {}",
+        file.tensors.len(),
+        plan.len()
     );
+    for (slot, (actual, expected)) in file.tensors.iter().zip(plan).enumerate() {
+        ensure!(
+            actual.name == expected.name,
+            "pinned {role} tensor slot {slot} name {:?} does not match {:?}",
+            actual.name,
+            expected.name
+        );
+        ensure!(
+            actual.dimensions == expected.dimensions,
+            "pinned {role} tensor slot {slot} dimensions do not match the exact plan"
+        );
+        ensure!(
+            actual.tensor_type.id() == expected.qtype
+                && crate::qwen38_plan::PINNED_QTYPES.contains(&expected.qtype),
+            "pinned {role} tensor slot {slot} qtype does not match the closed plan"
+        );
+        ensure!(
+            actual.relative_offset == expected.relative_offset
+                && actual.byte_len == expected.byte_len
+                && actual.absolute_offset == expected.data_offset,
+            "pinned {role} tensor slot {slot} byte range does not match the exact plan"
+        );
+    }
     Ok(())
 }
 
-fn validate_selected_metadata(target: &GgufShardSet, mtp: &GgufShardSet) -> Result<()> {
-    const REQUIRED: &[(&str, u64)] = &[
+fn validate_pinned_metadata(target: &GgufFile, mtp: &GgufFile) -> Result<()> {
+    const INTEGERS: &[(&str, u64)] = &[
+        ("general.sampling.top_k", 20),
+        ("general.base_model.count", 1),
         ("qwen35.block_count", 65),
         ("qwen35.context_length", 262_144),
         ("qwen35.embedding_length", 5_120),
@@ -743,135 +464,82 @@ fn validate_selected_metadata(target: &GgufShardSet, mtp: &GgufShardSet) -> Resu
         ("qwen35.ssm.inner_size", 6_144),
         ("qwen35.full_attention_interval", 4),
         ("qwen35.rope.dimension_count", 64),
+        ("tokenizer.ggml.eos_token_id", 248_046),
+        ("tokenizer.ggml.padding_token_id", 248_055),
+        ("tokenizer.ggml.bos_token_id", 248_044),
+        ("general.quantization_version", 2),
     ];
-    for metadata in [target.metadata(), mtp.metadata()] {
+    for (role, file, file_type, template_len) in
+        [("target", target, 15, 9_993), ("MTP", mtp, 14, 8_945)]
+    {
+        let metadata = &file.metadata;
         ensure!(
-            metadata
-                .get("general.architecture")
-                .and_then(MetadataValue::as_str)
-                == Some("qwen35"),
-            "selected GGUF architecture is not qwen35"
+            metadata.len() == 50,
+            "pinned {role} metadata count does not match the exact contract"
         );
-        for (key, expected) in REQUIRED {
+        for (key, expected) in [
+            ("general.architecture", "qwen35"),
+            ("general.type", "model"),
+            ("general.name", "Qwen3.8-27B"),
+            ("general.basename", "Qwen3.8-27B"),
+            ("general.size_label", "27B"),
+            ("general.license", "apache-2.0"),
+            ("tokenizer.ggml.model", "gpt2"),
+            ("tokenizer.ggml.pre", "qwen35"),
+        ] {
+            ensure!(
+                metadata.get(key).and_then(MetadataValue::as_str) == Some(expected),
+                "pinned {role} metadata {key} does not match"
+            );
+        }
+        for (key, expected) in INTEGERS {
             ensure!(
                 metadata.get(*key).and_then(MetadataValue::as_u64) == Some(*expected),
-                "selected GGUF metadata {key} does not match the pinned architecture"
+                "pinned {role} metadata {key} does not match"
             );
         }
-    }
-    Ok(())
-}
-
-#[derive(Debug, Clone)]
-struct SplitFilename {
-    base: String,
-    count: usize,
-    entry_index: usize,
-    split: bool,
-}
-
-impl SplitFilename {
-    fn parse(filename: &str, max_shards: usize) -> Result<Self> {
-        validate_gguf_filename(filename)?;
-        let stem = filename
-            .strip_suffix(".gguf")
-            .expect("validated GGUF suffix");
-        if stem.len() >= 15 {
-            let suffix = &stem[stem.len() - 15..];
-            let bytes = suffix.as_bytes();
-            if bytes[0] == b'-' && &bytes[6..10] == b"-of-" {
-                ensure!(
-                    bytes[1..6].iter().all(u8::is_ascii_digit)
-                        && bytes[10..15].iter().all(u8::is_ascii_digit),
-                    "malformed GGUF split suffix"
-                );
-                let entry_index = suffix[1..6].parse::<usize>()?;
-                let count = suffix[10..15].parse::<usize>()?;
-                ensure!(
-                    (1..=count).contains(&entry_index),
-                    "GGUF split index is outside its shard count"
-                );
-                ensure!(count <= max_shards, "GGUF split count exceeds limit");
-                let base = &stem[..stem.len() - 15];
-                ensure!(!base.is_empty(), "GGUF split filename has an empty base");
-                return Ok(Self {
-                    base: base.to_owned(),
-                    count,
-                    entry_index,
-                    split: true,
-                });
-            }
-        }
-        Ok(Self {
-            base: stem.to_owned(),
-            count: 1,
-            entry_index: 1,
-            split: false,
-        })
-    }
-
-    fn filenames(&self) -> Vec<String> {
-        if self.split {
-            (1..=self.count)
-                .map(|index| format!("{}-{index:05}-of-{:05}.gguf", self.base, self.count))
-                .collect()
-        } else {
-            vec![format!("{}.gguf", self.base)]
-        }
-    }
-}
-
-fn validate_split_metadata(shards: &[GgufFile], split: &SplitFilename) -> Result<()> {
-    ensure!(
-        shards.len() == split.count,
-        "GGUF split discovery returned the wrong number of shards"
-    );
-    if !split.split {
-        for key in ["split.no", "split.count", "split.tensors.count"] {
+        ensure!(
+            metadata
+                .get("general.file_type")
+                .and_then(MetadataValue::as_u64)
+                == Some(file_type),
+            "pinned {role} general.file_type does not match"
+        );
+        for (key, expected_len) in [
+            ("tokenizer.ggml.tokens", 248_320),
+            ("tokenizer.ggml.token_type", 248_320),
+            ("tokenizer.ggml.merges", 247_587),
+        ] {
             ensure!(
-                !shards[0].metadata.contains_key(key),
-                "unsplit GGUF must not contain {key}"
+                metadata
+                    .get(key)
+                    .and_then(MetadataValue::as_array)
+                    .is_some_and(|values| values.len() == expected_len),
+                "pinned {role} metadata {key} length does not match"
             );
         }
-        return Ok(());
-    }
-
-    let total_tensors = shards
-        .iter()
-        .try_fold(0_u64, |total, shard| {
-            total.checked_add(shard.tensors.len() as u64)
-        })
-        .context("GGUF split tensor count overflow")?;
-    for (index, shard) in shards.iter().enumerate() {
-        let split_no = required_integer_metadata(shard, "split.no")?;
-        let split_count = required_integer_metadata(shard, "split.count")?;
-        let split_tensors = required_integer_metadata(shard, "split.tensors.count")?;
         ensure!(
-            split_no == index as u64,
-            "GGUF shard has incorrect split.no"
-        );
-        ensure!(
-            split_count == split.count as u64,
-            "GGUF shard has incorrect split.count"
-        );
-        ensure!(
-            split_tensors == total_tensors,
-            "GGUF shard has incorrect split.tensors.count"
+            metadata
+                .get("tokenizer.chat_template")
+                .and_then(MetadataValue::as_str)
+                .is_some_and(|template| template.len() == template_len),
+            "pinned {role} chat template length does not match"
         );
     }
+    let sections = target
+        .metadata
+        .get("qwen35.rope.dimension_sections")
+        .and_then(MetadataValue::as_array)
+        .context("pinned target is missing RoPE dimension sections")?;
     ensure!(
-        split.entry_index <= split.count,
-        "GGUF entry shard is outside the discovered set"
+        sections
+            .iter()
+            .map(MetadataValue::as_u64)
+            .collect::<Option<Vec<_>>>()
+            == Some(vec![11, 11, 10, 0]),
+        "pinned target RoPE dimension sections do not match"
     );
     Ok(())
-}
-
-fn required_integer_metadata(file: &GgufFile, key: &str) -> Result<u64> {
-    file.metadata
-        .get(key)
-        .with_context(|| format!("GGUF shard {} is missing {key}", file.path.display()))?
-        .as_u64()
-        .with_context(|| format!("GGUF shard {} has non-integer {key}", file.path.display()))
 }
 
 fn read_metadata_value(
@@ -959,16 +627,6 @@ fn validate_local_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn validate_directory(path: &Path) -> Result<()> {
-    let metadata = symlink_metadata(path)
-        .with_context(|| format!("failed to stat model directory {}", path.display()))?;
-    ensure!(
-        metadata.file_type().is_dir() && !metadata.file_type().is_symlink(),
-        "model directory must be a real directory"
-    );
-    Ok(())
-}
-
 fn validate_gguf_filename(filename: &str) -> Result<()> {
     ensure!(
         !filename.is_empty() && filename.len() <= 255,
@@ -1032,40 +690,14 @@ struct TypeLayout {
 fn type_layout(raw: u32) -> Option<TypeLayout> {
     let (name, block_elements, block_bytes) = match raw {
         0 => ("F32", 1, 4),
-        1 => ("F16", 1, 2),
-        2 => ("Q4_0", 32, 18),
-        3 => ("Q4_1", 32, 20),
-        6 => ("Q5_0", 32, 22),
-        7 => ("Q5_1", 32, 24),
         8 => ("Q8_0", 32, 34),
-        9 => ("Q8_1", 32, 36),
-        10 => ("Q2_K", 256, 84),
         11 => ("Q3_K", 256, 110),
         12 => ("Q4_K", 256, 144),
         13 => ("Q5_K", 256, 176),
         14 => ("Q6_K", 256, 210),
-        15 => ("Q8_K", 256, 292),
-        16 => ("IQ2_XXS", 256, 66),
-        17 => ("IQ2_XS", 256, 74),
-        18 => ("IQ3_XXS", 256, 98),
-        19 => ("IQ1_S", 256, 50),
         20 => ("IQ4_NL", 32, 18),
         21 => ("IQ3_S", 256, 110),
-        22 => ("IQ2_S", 256, 82),
         23 => ("IQ4_XS", 256, 136),
-        24 => ("I8", 1, 1),
-        25 => ("I16", 1, 2),
-        26 => ("I32", 1, 4),
-        27 => ("I64", 1, 8),
-        28 => ("F64", 1, 8),
-        29 => ("IQ1_M", 256, 56),
-        30 => ("BF16", 1, 2),
-        34 => ("TQ1_0", 256, 54),
-        35 => ("TQ2_0", 256, 66),
-        39 => ("MXFP4", 32, 17),
-        40 => ("NVFP4", 64, 36),
-        41 => ("Q1_0", 128, 18),
-        42 => ("Q2_0", 64, 18),
         _ => return None,
     };
     Some(TypeLayout {
@@ -1198,17 +830,6 @@ mod tests {
         bytes.extend_from_slice(value.as_bytes());
     }
 
-    fn metadata_u16(bytes: &mut Vec<u8>, key: &str, value: u16) {
-        string(bytes, key);
-        bytes.extend_from_slice(&(MetadataType::Uint16 as u32).to_le_bytes());
-        bytes.extend_from_slice(&value.to_le_bytes());
-    }
-
-    fn metadata_i32(bytes: &mut Vec<u8>, key: &str, value: i32) {
-        string(bytes, key);
-        bytes.extend_from_slice(&(MetadataType::Int32 as u32).to_le_bytes());
-        bytes.extend_from_slice(&value.to_le_bytes());
-    }
 
     fn build_gguf(metadata: &[(&str, MetadataValue)], tensors: &[TestTensor<'_>]) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -1268,9 +889,9 @@ mod tests {
         let tensor = TestTensor {
             name,
             dimensions: &[32],
-            tensor_type: 2,
+            tensor_type: 8,
             offset: 0,
-            data: vec![0; 18],
+            data: vec![0; 34],
         };
         fs::write(
             path,
@@ -1294,14 +915,15 @@ mod tests {
         let path = directory.join("model.gguf");
         write_valid_file(&path, "blk.0.attn_q.weight");
         let file = GgufFile::open(&path).unwrap();
-        assert_eq!(file.alignment(), 32);
-        assert_eq!(file.tensors().len(), 1);
-        let tensor = file.tensor("blk.0.attn_q.weight").unwrap();
+        assert_eq!(file.alignment, 32);
+        assert_eq!(file.tensors.len(), 1);
+        let tensor = &file.tensors[0];
+        assert_eq!(tensor.name, "blk.0.attn_q.weight");
         assert_eq!(tensor.dimensions, [32]);
-        assert_eq!(tensor.tensor_type.name(), "Q4_0");
-        assert_eq!(tensor.byte_len, 18);
-        assert_eq!(tensor.absolute_offset, file.data_offset());
-        assert_eq!(file.file_len(), file.data_offset() + 18);
+        assert_eq!(tensor.tensor_type.id(), 8);
+        assert_eq!(tensor.byte_len, 34);
+        assert_eq!(tensor.absolute_offset, file.data_offset);
+        assert_eq!(file.file_len, file.data_offset + 34);
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -1424,9 +1046,9 @@ mod tests {
         let bad_block = TestTensor {
             name: "bad_block",
             dimensions: &[31],
-            tensor_type: 2,
+            tensor_type: 8,
             offset: 0,
-            data: vec![0; 18],
+            data: vec![0; 34],
         };
         fs::write(&path, build_gguf(&base_metadata, &[bad_block])).unwrap();
         assert!(
@@ -1505,174 +1127,73 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
-    fn split_file(path: &Path, split_no: u16, tensor_name: &str, total_tensors: i32) {
-        let metadata = [
-            ("general.alignment", MetadataValue::Uint32(32)),
-            ("split.no", MetadataValue::Uint16(split_no)),
-            ("split.count", MetadataValue::Uint16(2)),
-            ("split.tensors.count", MetadataValue::Int32(total_tensors)),
-        ];
-        let tensor = TestTensor {
-            name: tensor_name,
-            dimensions: &[1],
-            tensor_type: 0,
-            offset: 0,
-            data: vec![0; 4],
+    #[test]
+    fn exact_plan_rejects_each_descriptor_mismatch_class() {
+        let directory = temp_dir("plan-mismatch");
+        let path = directory.join("model.gguf");
+        write_valid_file(&path, "tensor.weight");
+        let file = GgufFile::open(&path).expect("parse fixture");
+        let actual = &file.tensors[0];
+        let exact = crate::qwen38_plan::PinnedTensorDescriptor {
+            name: "tensor.weight",
+            dimensions: &[32],
+            qtype: 8,
+            relative_offset: actual.relative_offset,
+            byte_len: actual.byte_len,
+            data_offset: actual.absolute_offset,
         };
-        fs::write(path, build_gguf(&metadata, &[tensor])).unwrap();
-    }
-
-    fn identity(filename: &str, kind: GgufArtifactKind) -> ImmutableGgufIdentity {
-        ImmutableGgufIdentity::new(
-            SELECTED_GGUF_REPOSITORY,
-            "0123456789abcdef0123456789abcdef01234567",
-            filename,
-            kind,
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn discovers_complete_split_and_indexes_tensors_across_shards() {
-        let directory = temp_dir("split");
-        split_file(
-            &directory.join("model-00001-of-00002.gguf"),
-            0,
-            "token_embd.weight",
-            2,
-        );
-        split_file(
-            &directory.join("model-00002-of-00002.gguf"),
-            1,
-            "output.weight",
-            2,
-        );
-        let set = GgufShardSet::open(
-            &directory,
-            identity("model-00002-of-00002.gguf", GgufArtifactKind::Target),
-        )
-        .unwrap();
-        assert_eq!(set.shards().len(), 2);
-        assert_eq!(set.tensor_count(), 2);
-        assert_eq!(set.tensor("output.weight").unwrap().shard, 1);
+        validate_plan(&file, file.file_len, file.data_offset, &[exact], "fixture")
+            .expect("exact descriptor");
+        for (descriptor, message) in [
+            (
+                crate::qwen38_plan::PinnedTensorDescriptor {
+                    name: "other.weight",
+                    ..exact
+                },
+                "name",
+            ),
+            (
+                crate::qwen38_plan::PinnedTensorDescriptor {
+                    dimensions: &[64],
+                    ..exact
+                },
+                "dimensions",
+            ),
+            (
+                crate::qwen38_plan::PinnedTensorDescriptor { qtype: 12, ..exact },
+                "qtype",
+            ),
+            (
+                crate::qwen38_plan::PinnedTensorDescriptor {
+                    byte_len: exact.byte_len + 1,
+                    ..exact
+                },
+                "byte range",
+            ),
+        ] {
+            let error = validate_plan(
+                &file,
+                file.file_len,
+                file.data_offset,
+                &[descriptor],
+                "fixture",
+            )
+            .expect_err("mismatch must fail")
+            .to_string();
+            assert!(error.contains(message), "{error}");
+        }
         fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn rejects_missing_split_wrong_index_and_duplicate_cross_shard_tensor() {
-        let directory = temp_dir("split-bad");
-        split_file(
-            &directory.join("model-00001-of-00002.gguf"),
-            0,
-            "same.weight",
-            2,
-        );
-        let id = identity("model-00001-of-00002.gguf", GgufArtifactKind::Target);
-        assert!(
-            GgufShardSet::open(&directory, id.clone())
-                .unwrap_err()
-                .to_string()
-                .contains("shard")
-        );
-
-        split_file(
-            &directory.join("model-00002-of-00002.gguf"),
-            0,
-            "other.weight",
-            2,
-        );
-        assert!(
-            GgufShardSet::open(&directory, id.clone())
-                .unwrap_err()
-                .to_string()
-                .contains("split.no")
-        );
-
-        split_file(
-            &directory.join("model-00002-of-00002.gguf"),
-            1,
-            "same.weight",
-            2,
-        );
-        assert!(
-            GgufShardSet::open(&directory, id)
-                .unwrap_err()
-                .to_string()
-                .contains("duplicate tensor")
-        );
-        fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn immutable_identity_rejects_paths_mutable_revisions_and_vision() {
-        assert!(
-            ImmutableGgufIdentity::new(
-                SELECTED_GGUF_REPOSITORY,
-                "main",
-                "model.gguf",
-                GgufArtifactKind::Target,
-            )
-            .is_err()
-        );
-        assert!(
-            ImmutableGgufIdentity::new(
-                SELECTED_GGUF_REPOSITORY,
-                "0123456789abcdef0123456789abcdef01234567",
-                "../model.gguf",
-                GgufArtifactKind::Target,
-            )
-            .is_err()
-        );
-        assert!(
-            ImmutableGgufIdentity::new(
-                SELECTED_GGUF_REPOSITORY,
-                "0123456789abcdef0123456789abcdef01234567",
-                "mmproj-model.gguf",
-                GgufArtifactKind::Target,
-            )
-            .is_err()
-        );
-        assert!(
-            ImmutableGgufIdentity::new(
-                SELECTED_GGUF_REPOSITORY,
-                "0123456789abcdef0123456789abcdef01234567",
-                "model.gguf",
-                GgufArtifactKind::Mtp,
-            )
-            .is_err()
-        );
     }
 
     #[test]
     #[ignore = "requires the complete pinned Qwen3.8 27B GGUF pair"]
-    fn real_selected_pair_matches_exact_inventory_and_mtp_geometry() {
-        let root = crate::resolve_model_path(None).expect("resolve selected GGUF cache");
-        let pair = GgufModelPair::open_selected(&root).expect("open selected GGUF pair");
-        for set in [&pair.target, &pair.mtp] {
-            assert_eq!(
-                set.tensor("token_embd.weight").unwrap().tensor.dimensions,
-                [5_120, 248_320]
-            );
-            assert_eq!(
-                set.tensor("output.weight").unwrap().tensor.dimensions,
-                [5_120, 248_320]
-            );
-        }
-        assert_eq!(
-            pair.mtp
-                .tensor("blk.64.nextn.eh_proj.weight")
-                .unwrap()
-                .tensor
-                .dimensions,
-            [10_240, 5_120]
-        );
-        assert_eq!(
-            pair.mtp
-                .tensor("blk.64.attn_q.weight")
-                .unwrap()
-                .tensor
-                .dimensions,
-            [5_120, 12_288]
-        );
+    fn real_pinned_pair_matches_exact_inventory_and_mtp_geometry() {
+        let pair = PinnedGgufPair::open().expect("open pinned GGUF pair");
+        assert_eq!(pair.target.tensors.len(), 866);
+        assert_eq!(pair.mtp.tensors.len(), 18);
+        assert_eq!(pair.target.tensors[2].dimensions, [5_120, 248_320]);
+        assert_eq!(pair.target.tensors[0].dimensions, [5_120, 248_320]);
+        assert_eq!(pair.mtp.tensors[13].dimensions, [10_240, 5_120]);
+        assert_eq!(pair.mtp.tensors[7].dimensions, [5_120, 12_288]);
     }
 }

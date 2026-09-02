@@ -44,7 +44,7 @@ use tracing::debug;
 
 use crate::qwen_vl_position::decode_rope_positions;
 use crate::qwen3_5::{Qwen35Config, Qwen35DecoderLayer, Qwen35Model};
-use crate::qwen3_5_weights::{Qwen35Linear, Qwen35WeightSource};
+use crate::qwen3_5_weights::{ModelRole, Qwen35Linear, Qwen35WeightSource, TensorSlot};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MtpGenerationStats {
@@ -295,16 +295,17 @@ impl Qwen35MtpDraftModel {
         weights: &dyn Qwen35WeightSource,
         config: &Qwen35Config,
     ) -> Result<Self, String> {
-        let embedding_norm = weights.tensor("mtp.pre_fc_norm_embedding.weight")?;
-        let hidden_norm = weights.tensor("mtp.pre_fc_norm_hidden.weight")?;
-        let norm = weights.tensor("mtp.norm.weight")?;
+        let embedding_norm = weights.tensor(TensorSlot::MtpEmbeddingNorm)?;
+        let hidden_norm = weights.tensor(TensorSlot::MtpHiddenNorm)?;
+        let norm = weights.tensor(TensorSlot::MtpHeadNorm)?;
         let (fc_group_size, fc_bits) = config.quant_params("mtp.fc");
-        let fc = weights.linear("mtp.fc", fc_group_size, fc_bits)?;
-        let layer = Qwen35DecoderLayer::from_weights_at_prefix(
+        let fc = weights.linear(TensorSlot::MtpProjection, fc_group_size, fc_bits)?;
+        let layer = Qwen35DecoderLayer::from_weights_for_role(
             weights,
             config,
             &config.to_qwen3next_config(),
-            "mtp.layers.0",
+            ModelRole::Mtp,
+            0,
             false,
         )?;
 

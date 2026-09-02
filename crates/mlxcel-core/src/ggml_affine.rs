@@ -111,20 +111,13 @@ pub struct GgmlAffineMatrix {
 }
 
 impl GgmlAffineMatrix {
-
     pub fn from_ggml_bytes(
         bytes: &[u8],
         qtype: GgmlQType,
         in_features: usize,
         out_features: usize,
     ) -> Result<Self, GgmlAffineError> {
-        Self::from_ggml_bytes_with_progress(
-            bytes,
-            qtype,
-            in_features,
-            out_features,
-            |_| {},
-        )
+        Self::from_ggml_bytes_with_progress(bytes, qtype, in_features, out_features, |_| {})
     }
 
     pub fn from_ggml_bytes_with_progress(
@@ -171,7 +164,11 @@ impl GgmlAffineMatrix {
             .checked_mul(4)
             .ok_or(GgmlAffineError::Overflow)?;
         let resident_bytes = weight_bytes
-            .checked_add(sidecar_bytes.checked_mul(2).ok_or(GgmlAffineError::Overflow)?)
+            .checked_add(
+                sidecar_bytes
+                    .checked_mul(2)
+                    .ok_or(GgmlAffineError::Overflow)?,
+            )
             .ok_or(GgmlAffineError::Overflow)?;
 
         let mut weight = Vec::new();
@@ -206,11 +203,16 @@ impl GgmlAffineMatrix {
         }
 
         let rows = i32::try_from(out_features).map_err(|_| GgmlAffineError::Overflow)?;
-        let packed_width = i32::try_from(packed_row_bytes / 4)
-            .map_err(|_| GgmlAffineError::Overflow)?;
+        let packed_width =
+            i32::try_from(packed_row_bytes / 4).map_err(|_| GgmlAffineError::Overflow)?;
         let groups = i32::try_from(groups_per_row).map_err(|_| GgmlAffineError::Overflow)?;
         let weight_array = crate::from_bytes(&weight, &[rows, packed_width], dtype::UINT32);
-        validate_plane(&weight_array, dtype::UINT32, &[rows, packed_width], weight_bytes)?;
+        validate_plane(
+            &weight_array,
+            dtype::UINT32,
+            &[rows, packed_width],
+            weight_bytes,
+        )?;
         crate::eval(weight_array.as_ref().ok_or(GgmlAffineError::InvalidPlane)?);
         drop(weight);
         let scale_array = crate::from_slice_f32(&scales, &[rows, groups]);
@@ -243,15 +245,13 @@ impl GgmlAffineMatrix {
                 packed_width,
                 groups,
             },
-            in_features: i32::try_from(in_features)
-                .map_err(|_| GgmlAffineError::Overflow)?,
+            in_features: i32::try_from(in_features).map_err(|_| GgmlAffineError::Overflow)?,
             out_features: rows,
             bits: bits as i32,
             resident_row_bytes: packed_row_bytes + groups_per_row * 8,
             stats,
         })
     }
-
 
     pub const fn in_features(&self) -> usize {
         self.in_features as usize
@@ -260,7 +260,6 @@ impl GgmlAffineMatrix {
     pub const fn out_features(&self) -> usize {
         self.out_features as usize
     }
-
 
     pub const fn transcode_stats(&self) -> GgmlAffineTranscodeStats {
         self.stats
@@ -282,10 +281,7 @@ impl GgmlAffineMatrix {
         Ok(affine_matmul(input, &self.planes, self.bits))
     }
 
-    pub fn select_rows(
-        &self,
-        ranges: &[Range<usize>],
-    ) -> Result<GgmlAffineRows, GgmlAffineError> {
+    pub fn select_rows(&self, ranges: &[Range<usize>]) -> Result<GgmlAffineRows, GgmlAffineError> {
         if ranges.is_empty() || ranges.len() > 3 {
             return Err(GgmlAffineError::InvalidRowSelection);
         }
@@ -304,16 +300,12 @@ impl GgmlAffineMatrix {
             planes,
             in_features: self.in_features,
             bits: self.bits,
-            selected_rows: i32::try_from(selected_rows)
-                .map_err(|_| GgmlAffineError::Overflow)?,
+            selected_rows: i32::try_from(selected_rows).map_err(|_| GgmlAffineError::Overflow)?,
             resident_row_bytes: self.resident_row_bytes,
         })
     }
 
-    pub fn dispatch_stats(
-        &self,
-        input_rows: usize,
-    ) -> Result<GgmlDispatchStats, GgmlAffineError> {
+    pub fn dispatch_stats(&self, input_rows: usize) -> Result<GgmlDispatchStats, GgmlAffineError> {
         affine_dispatch_stats(
             input_rows,
             self.in_features(),
@@ -332,7 +324,6 @@ pub struct GgmlAffineRows {
 }
 
 impl GgmlAffineRows {
-
     pub const fn selected_rows(&self) -> usize {
         self.selected_rows as usize
     }
@@ -354,10 +345,7 @@ impl GgmlAffineRows {
         Ok(output)
     }
 
-    pub fn dispatch_stats(
-        &self,
-        input_rows: usize,
-    ) -> Result<GgmlDispatchStats, GgmlAffineError> {
+    pub fn dispatch_stats(&self, input_rows: usize) -> Result<GgmlDispatchStats, GgmlAffineError> {
         affine_dispatch_stats(
             input_rows,
             self.in_features as usize,
@@ -379,12 +367,7 @@ impl GgmlAffineEmbedding {
         vocab_size: usize,
     ) -> Result<Self, GgmlAffineError> {
         Ok(Self {
-            matrix: GgmlAffineMatrix::from_ggml_bytes(
-                bytes,
-                qtype,
-                embedding_dim,
-                vocab_size,
-            )?,
+            matrix: GgmlAffineMatrix::from_ggml_bytes(bytes, qtype, embedding_dim, vocab_size)?,
         })
     }
 
@@ -426,16 +409,26 @@ impl GgmlAffineEmbedding {
 
     pub fn forward(&self, indices: &MlxArray) -> Result<UniquePtr<MlxArray>, GgmlAffineError> {
         let dtype_code = crate::array_dtype(indices);
-        if crate::array_size(indices) == 0
-            || !matches!(dtype_code, dtype::INT32 | dtype::UINT32)
-        {
+        if crate::array_size(indices) == 0 || !matches!(dtype_code, dtype::INT32 | dtype::UINT32) {
             return Err(GgmlAffineError::InvalidInput);
         }
         Ok(unsafe {
             crate::quantized_embedding(
-                self.matrix.planes.weight.as_ref().ok_or(GgmlAffineError::InvalidPlane)?,
-                self.matrix.planes.scales.as_ref().ok_or(GgmlAffineError::InvalidPlane)?,
-                self.matrix.planes.biases.as_ref().ok_or(GgmlAffineError::InvalidPlane)?,
+                self.matrix
+                    .planes
+                    .weight
+                    .as_ref()
+                    .ok_or(GgmlAffineError::InvalidPlane)?,
+                self.matrix
+                    .planes
+                    .scales
+                    .as_ref()
+                    .ok_or(GgmlAffineError::InvalidPlane)?,
+                self.matrix
+                    .planes
+                    .biases
+                    .as_ref()
+                    .ok_or(GgmlAffineError::InvalidPlane)?,
                 indices,
                 GROUP_SIZE as i32,
                 self.matrix.bits,
@@ -447,7 +440,6 @@ impl GgmlAffineEmbedding {
     pub fn as_linear(&self, input: &MlxArray) -> Result<UniquePtr<MlxArray>, GgmlAffineError> {
         self.matrix.forward(input)
     }
-
 }
 
 fn affine_bits(qtype: GgmlQType) -> Option<usize> {
@@ -542,8 +534,12 @@ fn transcode_q5_k(
             } else {
                 packed >> 4
             };
-            codes[column] =
-                low + if block[16 + column] & (1 << group) != 0 { 16 } else { 0 };
+            codes[column] = low
+                + if block[16 + column] & (1 << group) != 0 {
+                    16
+                } else {
+                    0
+                };
         }
         pack_codes(&codes, 5, weight);
         scales.push(d * f32::from(scale));
@@ -568,8 +564,7 @@ fn transcode_q3_k(
             } else {
                 block[88 + group16] >> 4
             };
-            let scale_high =
-                (block[104 + group16 % 4] >> (2 * (group16 / 4))) & 3;
+            let scale_high = (block[104 + group16 % 4] >> (2 * (group16 / 4))) & 3;
             let scale = i16::from(scale_low | (scale_high << 4)) - 32;
             let packed = block[32 + (column / 128) * 32 + column % 32];
             let low = (packed >> (2 * ((column / 32) % 4))) & 3;
@@ -626,12 +621,10 @@ fn transcode_iq3_s(
         for column in 0..32 {
             let subblock = column / 8;
             let lane = column % 8;
-            let high = (block[66 + group]
-                >> (2 * subblock + usize::from(lane >= 4)))
-                & 1;
-            let grid_index = usize::from(
-                block[2 + group * 8 + subblock * 2 + usize::from(lane >= 4)],
-            ) | (usize::from(high) << 8);
+            let high = (block[66 + group] >> (2 * subblock + usize::from(lane >= 4))) & 1;
+            let grid_index =
+                usize::from(block[2 + group * 8 + subblock * 2 + usize::from(lane >= 4)])
+                    | (usize::from(high) << 8);
             let grid = crate::ggml::IQ3S_GRID[grid_index];
             let magnitude = ((grid >> ((lane & 3) * 8)) & 255) as i16;
             let signed = if block[74 + group * 4 + subblock] & (1 << lane) != 0 {
@@ -663,7 +656,11 @@ fn transcode_iq4_xs(
         let mut codes = [0u8; 32];
         for column in 0..32 {
             let packed = block[8 + group * 16 + column % 16];
-            let index = if column < 16 { packed & 15 } else { packed >> 4 };
+            let index = if column < 16 {
+                packed & 15
+            } else {
+                packed >> 4
+            };
             codes[column] = (IQ4_VALUES[index as usize] + 127) as u8;
         }
         pack_codes(&codes, 8, weight);
@@ -713,11 +710,7 @@ fn affine_matmul(input: &MlxArray, planes: &AffinePlanes, bits: i32) -> UniquePt
     crate::reshape(output.as_ref().unwrap(), &output_shape)
 }
 
-fn affine_matmul_raw(
-    input: &MlxArray,
-    planes: &AffinePlanes,
-    bits: i32,
-) -> UniquePtr<MlxArray> {
+fn affine_matmul_raw(input: &MlxArray, planes: &AffinePlanes, bits: i32) -> UniquePtr<MlxArray> {
     unsafe {
         crate::quantized_matmul(
             input,
@@ -737,7 +730,10 @@ fn validate_input(input: &MlxArray, in_features: i32) -> Result<(), GgmlAffineEr
     let dtype_code = crate::array_dtype(input);
     if shape.is_empty()
         || shape.last().copied() != Some(in_features)
-        || !matches!(dtype_code, dtype::FLOAT16 | dtype::FLOAT32 | dtype::BFLOAT16)
+        || !matches!(
+            dtype_code,
+            dtype::FLOAT16 | dtype::FLOAT32 | dtype::BFLOAT16
+        )
     {
         return Err(GgmlAffineError::InvalidInput);
     }
@@ -920,21 +916,30 @@ mod tests {
         q8[33] = 127;
         let (weight, scales, biases) = transcode_block(GgmlQType::Q8_0, &q8);
         let codes = unpack_codes(&weight, 8, 32);
-        assert_eq!((codes[0], codes[31], scales[0], biases[0]), (0, 255, 1.0, -128.0));
+        assert_eq!(
+            (codes[0], codes[31], scales[0], biases[0]),
+            (0, 255, 1.0, -128.0)
+        );
 
         let mut iq4 = vec![0u8; 18];
         put_half(&mut iq4, 0, 0x3c00);
         iq4[2] = 0xf0;
         let (weight, scales, biases) = transcode_block(GgmlQType::Iq4Nl, &iq4);
         let codes = unpack_codes(&weight, 8, 32);
-        assert_eq!((codes[0], codes[16], scales[0], biases[0]), (0, 240, 1.0, -127.0));
+        assert_eq!(
+            (codes[0], codes[16], scales[0], biases[0]),
+            (0, 240, 1.0, -127.0)
+        );
 
         let mut iq3 = vec![0u8; 110];
         put_half(&mut iq3, 0, 0x3c00);
         iq3[74] = 1;
         let (weight, scales, biases) = transcode_block(GgmlQType::Iq3S, &iq3);
         let codes = unpack_codes(&weight, 5, 256);
-        assert_eq!((codes[0], codes[1], scales[0], biases[0]), (14, 16, 1.0, -15.0));
+        assert_eq!(
+            (codes[0], codes[1], scales[0], biases[0]),
+            (14, 16, 1.0, -15.0)
+        );
 
         let mut iq4xs = vec![0u8; 136];
         put_half(&mut iq4xs, 0, 0x3c00);
@@ -943,7 +948,10 @@ mod tests {
         iq4xs[8] = 0xf0;
         let (weight, scales, biases) = transcode_block(GgmlQType::Iq4Xs, &iq4xs);
         let codes = unpack_codes(&weight, 8, 256);
-        assert_eq!((codes[0], codes[16], scales[0], biases[0]), (0, 240, 1.0, -127.0));
+        assert_eq!(
+            (codes[0], codes[16], scales[0], biases[0]),
+            (0, 240, 1.0, -127.0)
+        );
     }
 
     #[test]
