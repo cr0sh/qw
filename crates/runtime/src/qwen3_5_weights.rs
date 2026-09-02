@@ -10,7 +10,9 @@ use mlxcel_core::layers::{FusedQKVLinear, Linear, UnifiedEmbedding, UnifiedLinea
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{
     GgmlAffineEmbedding, GgmlAffineMatrix, GgmlAffineRows, GgmlAffineTranscodeStats,
-    GgmlQuantizedEmbedding, GgmlQuantizedMatrix, GgmlQuantizedRows, MlxArray, UniquePtr, dtype,
+    GgmlQType, GgmlQuantizedEmbedding, GgmlQuantizedMatrix, GgmlQuantizedRows,
+    MlxArray, Qwen38Q6DualMatrix, Qwen38Q6Shape, Qwen38Q6TranscodeStats, UniquePtr,
+    dtype,
 };
 
 use crate::gguf::{GgufModelPair, GgufShardSet, GgufTensorInfo, MetadataValue};
@@ -20,6 +22,7 @@ pub(crate) enum Qwen35Linear {
     Legacy(UnifiedLinear),
     Affine(GgmlAffineMatrix),
     AffineRows(GgmlAffineRows),
+    Q6Dual(Qwen38Q6DualMatrix),
     Gguf(GgmlQuantizedMatrix),
     GgufRows(GgmlQuantizedRows),
 }
@@ -38,6 +41,9 @@ impl Qwen35Linear {
             Self::AffineRows(linear) => linear
                 .forward(input)
                 .expect("validated GGML affine row projection must succeed"),
+            Self::Q6Dual(linear) => linear
+                .forward(input)
+                .expect("validated pinned Q6_K dual execution must succeed"),
             Self::Gguf(linear) => linear
                 .forward(input)
                 .expect("validated GGML matrix execution must succeed"),
@@ -50,7 +56,11 @@ impl Qwen35Linear {
     pub(crate) fn legacy_ref(&self) -> Option<&UnifiedLinear> {
         match self {
             Self::Legacy(linear) => Some(linear),
-            Self::Affine(_) | Self::AffineRows(_) | Self::Gguf(_) | Self::GgufRows(_) => None,
+            Self::Affine(_)
+            | Self::AffineRows(_)
+            | Self::Q6Dual(_)
+            | Self::Gguf(_)
+            | Self::GgufRows(_) => None,
         }
     }
 
@@ -61,7 +71,7 @@ impl Qwen35Linear {
         match self {
             Self::Affine(linear) => linear.select_rows(ranges).ok().map(Self::AffineRows),
             Self::Gguf(linear) => linear.select_rows(ranges).ok().map(Self::GgufRows),
-            Self::Legacy(_) | Self::AffineRows(_) | Self::GgufRows(_) => None,
+            Self::Legacy(_) | Self::AffineRows(_) | Self::Q6Dual(_) | Self::GgufRows(_) => None,
         }
     }
 }
@@ -230,6 +240,87 @@ impl Qwen35WeightSource for WeightMap {
     }
 }
 
+fn pinned_affine_qtype(type_id: u32) -> bool {
+    matches!(type_id, 8 | 11 | 12 | 13 | 20 | 21 | 23)
+}
+
+fn pinned_q6_shape(tensor: &GgufTensorInfo) -> Result<Option<Qwen38Q6Shape>> {
+    if tensor.tensor_type.id() != 14 {
+        return Ok(None);
+    }
+    let shape = match tensor.name.as_str() {
+        "output.weight" => {
+            ensure!(tensor.dimensions == [5120, 248_320], "pinned Q6 output shape changed");
+            return Ok(None);
+        }
+        "blk.11.attn_k.weight"
+        | "blk.15.attn_k.weight"
+        | "blk.19.attn_k.weight"
+        | "blk.19.attn_v.weight"
+        | "blk.27.attn_k.weight"
+        | "blk.35.attn_k.weight"
+        | "blk.39.attn_k.weight"
+        | "blk.39.attn_v.weight"
+        | "blk.43.attn_k.weight"
+        | "blk.43.attn_v.weight"
+        | "blk.47.attn_k.weight"
+        | "blk.51.attn_k.weight"
+        | "blk.55.attn_k.weight"
+        | "blk.59.attn_k.weight"
+        | "blk.63.attn_k.weight"
+        | "blk.64.attn_k.weight"
+        | "blk.64.attn_v.weight" => Qwen38Q6Shape::K5120N1024,
+        "blk.28.attn_gate.weight" => Qwen38Q6Shape::K5120N6144,
+        "blk.6.attn_qkv.weight" => Qwen38Q6Shape::K5120N10240,
+        "blk.64.attn_q.weight" => Qwen38Q6Shape::K5120N12288,
+        "blk.58.ffn_gate.weight"
+        | "blk.59.ffn_gate.weight"
+        | "blk.59.ffn_up.weight"
+        | "blk.60.ffn_gate.weight"
+        | "blk.63.ffn_gate.weight"
+        | "blk.63.ffn_up.weight"
+        | "blk.64.ffn_gate.weight"
+        | "blk.64.ffn_up.weight" => Qwen38Q6Shape::K5120N17408,
+        "blk.1.ssm_out.weight"
+        | "blk.2.ssm_out.weight"
+        | "blk.3.attn_output.weight"
+        | "blk.6.ssm_out.weight"
+        | "blk.21.ssm_out.weight"
+        | "blk.22.ssm_out.weight"
+        | "blk.23.attn_output.weight"
+        | "blk.24.ssm_out.weight"
+        | "blk.25.ssm_out.weight"
+        | "blk.27.attn_output.weight"
+        | "blk.31.attn_output.weight"
+        | "blk.35.attn_output.weight"
+        | "blk.43.attn_output.weight"
+        | "blk.50.ssm_out.weight"
+        | "blk.51.attn_output.weight"
+        | "blk.52.ssm_out.weight"
+        | "blk.56.ssm_out.weight"
+        | "blk.57.ssm_out.weight"
+        | "blk.58.ssm_out.weight"
+        | "blk.62.ssm_out.weight"
+        | "blk.63.attn_output.weight"
+        | "blk.64.attn_output.weight" => Qwen38Q6Shape::K6144N5120,
+        "blk.64.nextn.eh_proj.weight" => Qwen38Q6Shape::K10240N5120,
+        "blk.56.ffn_down.weight"
+        | "blk.57.ffn_down.weight"
+        | "blk.58.ffn_down.weight"
+        | "blk.59.ffn_down.weight"
+        | "blk.63.ffn_down.weight"
+        | "blk.64.ffn_down.weight" => Qwen38Q6Shape::K17408N5120,
+        other => anyhow::bail!("unexpected pinned Q6_K tensor {other}"),
+    };
+    let (input, output) = shape.dimensions();
+    ensure!(
+        tensor.dimensions == [input as u64, output as u64],
+        "pinned Q6_K tensor {} shape changed",
+        tensor.name
+    );
+    Ok(Some(shape))
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct GgufAffineLoadStats {
     pub tensors: usize,
@@ -237,6 +328,11 @@ pub(crate) struct GgufAffineLoadStats {
     pub resident_bytes: usize,
     pub peak_active_bytes: usize,
     pub elapsed: Duration,
+    pub q6_tensors: usize,
+    pub q6_source_bytes: usize,
+    pub q6_dense_bytes: usize,
+    pub q6_peak_active_bytes: usize,
+    pub q6_elapsed: Duration,
 }
 
 #[derive(Clone, Copy)]
@@ -278,6 +374,16 @@ impl GgufWeightSource {
         stats.resident_bytes += transcode.resident_bytes;
         stats.peak_active_bytes = stats.peak_active_bytes.max(transcode.peak_active_bytes);
         stats.elapsed += transcode.elapsed;
+    }
+
+    fn record_q6(&self, transcode: Qwen38Q6TranscodeStats) {
+        let mut stats = self.affine_stats.borrow_mut();
+        stats.q6_tensors += 1;
+        stats.q6_source_bytes += transcode.source_bytes;
+        stats.q6_dense_bytes += transcode.dense_bytes;
+        stats.q6_peak_active_bytes =
+            stats.q6_peak_active_bytes.max(transcode.peak_active_bytes);
+        stats.q6_elapsed += transcode.elapsed;
     }
 
     pub(crate) fn target(&self) -> &GgufShardSet {
@@ -463,15 +569,26 @@ impl GgufWeightSource {
             .transpose()
             .context("linear output exceeds usize")?
             .unwrap_or(1);
+        let q6_shape = pinned_q6_shape(tensor)?;
+        let qtype = GgmlQType::try_from(tensor.tensor_type.id())
+            .context("pinned GGML qtype escaped parser validation")?;
         let result = if tensor.tensor_type.id() == 0 {
             let array =
                 mlxcel_core::from_bytes(bytes, &[output as i32, input as i32], dtype::FLOAT32);
             mlxcel_core::eval(array.as_ref().unwrap());
             Qwen35Linear::Legacy(UnifiedLinear::Regular(Linear::new(array, None)))
-        } else if GgmlAffineMatrix::is_representable(tensor.tensor_type.id()) {
+        } else if let Some(shape) = q6_shape {
+            let dual = Qwen38Q6DualMatrix::from_pinned_bytes_with_progress(
+                bytes,
+                shape,
+                |range| self.discard_tensor_byte_range(canonical, range),
+            )?;
+            self.record_q6(dual.transcode_stats());
+            Qwen35Linear::Q6Dual(dual)
+        } else if pinned_affine_qtype(tensor.tensor_type.id()) {
             let affine = GgmlAffineMatrix::from_ggml_bytes_with_progress(
                 bytes,
-                tensor.tensor_type.id(),
+                qtype,
                 input,
                 output,
                 |range| self.discard_tensor_byte_range(canonical, range),
@@ -481,7 +598,7 @@ impl GgufWeightSource {
         } else {
             Qwen35Linear::Gguf(GgmlQuantizedMatrix::from_bytes(
                 bytes,
-                tensor.tensor_type.id(),
+                qtype,
                 input,
                 output,
             )?)
@@ -498,10 +615,12 @@ impl GgufWeightSource {
         );
         let embedding_dim = usize::try_from(tensor.dimensions[0])?;
         let vocab_size = usize::try_from(tensor.dimensions[1])?;
-        let result = if GgmlAffineMatrix::is_representable(tensor.tensor_type.id()) {
+        let qtype = GgmlQType::try_from(tensor.tensor_type.id())
+            .context("pinned GGML embedding qtype escaped parser validation")?;
+        let result = if pinned_affine_qtype(tensor.tensor_type.id()) {
             let affine = GgmlAffineEmbedding::from_ggml_bytes_with_progress(
                 bytes,
-                tensor.tensor_type.id(),
+                qtype,
                 embedding_dim,
                 vocab_size,
                 |range| self.discard_tensor_byte_range(canonical, range),
@@ -511,7 +630,7 @@ impl GgufWeightSource {
         } else {
             Qwen35Embedding::Gguf(GgmlQuantizedEmbedding::from_bytes(
                 bytes,
-                tensor.tensor_type.id(),
+                qtype,
                 embedding_dim,
                 vocab_size,
             )?)
@@ -769,7 +888,7 @@ mod tests {
             row[2..].fill(quant);
         }
         let embedding =
-            Qwen35Embedding::Gguf(GgmlQuantizedEmbedding::from_bytes(&bytes, 8, 32, 2).unwrap());
+            Qwen35Embedding::Gguf(GgmlQuantizedEmbedding::from_bytes(&bytes, GgmlQType::Q8_0, 32, 2).unwrap());
         let indices = mlxcel_core::from_slice_i64(&[1], &[1]);
         let output = embedding.forward(&indices);
         mlxcel_core::eval(&output);
