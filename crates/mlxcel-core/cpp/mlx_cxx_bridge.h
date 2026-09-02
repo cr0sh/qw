@@ -2264,6 +2264,24 @@ void fused_rope_qk_append(
 // (issue #905). False on a CPU-only build.
 bool fused_rope_qk_append_available();
 
+// Direct Metal execution over original GGUF block bytes. These entry points
+// are fallible at the Rust bridge so backend exceptions never cross the FFI.
+std::unique_ptr<MlxArray> ggml_packed_matmul(
+    const MlxArray& x,
+    const MlxArray& packed,
+    const MlxArray& iq3_grid,
+    int32_t qtype,
+    int32_t in_features,
+    int32_t out_features,
+    int32_t input_rows);
+std::unique_ptr<MlxArray> ggml_packed_embedding(
+    const MlxArray& indices,
+    const MlxArray& packed,
+    const MlxArray& iq3_grid,
+    int32_t qtype,
+    int32_t embedding_dim,
+    int32_t vocab_size);
+
 // Opaque holder for weights loaded via MLX's native load_safetensors().
 // Arrays are lazy — MLX manages the mmap internally, no eager copy needed.
 struct MlxLoadedWeights {

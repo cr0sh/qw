@@ -63,6 +63,7 @@ fn main() {
         // kernels, the NemotronH full-forward path, and safetensors loading +
         // Metal 4 / turbo / paged attention launchers.
         .file("cpp/mlx_cxx_kernels.cpp")
+        .file("cpp/mlx_cxx_ggml.cpp")
         .file("cpp/mlx_cxx_nemotron.cpp")
         .file("cpp/mlx_cxx_ext.cpp")
         // Fused Sparse-V SDPA kernel launcher. Lives under
@@ -201,6 +202,7 @@ fn main() {
     println!("cargo:rerun-if-changed=cpp/mlx_cxx_internal.h");
     println!("cargo:rerun-if-changed=cpp/mlx_cxx_bridge.cpp");
     println!("cargo:rerun-if-changed=cpp/mlx_cxx_kernels.cpp");
+    println!("cargo:rerun-if-changed=cpp/mlx_cxx_ggml.cpp");
     println!("cargo:rerun-if-changed=cpp/mlx_cxx_nemotron.cpp");
     println!("cargo:rerun-if-changed=cpp/mlx_cxx_ext.cpp");
     println!("cargo:rerun-if-changed=metal/fused_attention_metal4.metal");

@@ -1803,6 +1803,27 @@ mod ffi {
         /// Check if GatedDeltaNet Metal kernel is available
         fn gated_delta_kernel_available() -> bool;
 
+        /// Direct Metal matmul over original GGUF block bytes.
+        fn ggml_packed_matmul(
+            x: &MlxArray,
+            packed: &MlxArray,
+            iq3_grid: &MlxArray,
+            qtype: i32,
+            in_features: i32,
+            out_features: i32,
+            input_rows: i32,
+        ) -> Result<UniquePtr<MlxArray>>;
+
+        /// Direct Metal embedding lookup over original GGUF block bytes.
+        fn ggml_packed_embedding(
+            indices: &MlxArray,
+            packed: &MlxArray,
+            iq3_grid: &MlxArray,
+            qtype: i32,
+            embedding_dim: i32,
+            vocab_size: i32,
+        ) -> Result<UniquePtr<MlxArray>>;
+
         /// Start a Metal GPU trace capture. `path` must be an absolute
         /// path ending in `.gputrace` and must not already exist. The
         /// process must have been launched with `MTL_CAPTURE_ENABLED=1`;
@@ -3256,6 +3277,11 @@ pub mod cache;
 
 // Pure-Rust wrappers around frequently used FFI entry points.
 mod ops;
+pub mod ggml;
+pub use ggml::{
+    GgmlDispatchStats, GgmlKernelPath, GgmlQType, GgmlQuantError,
+    GgmlQuantizedEmbedding, GgmlQuantizedMatrix,
+};
 
 // Common utility functions
 pub mod utils;
