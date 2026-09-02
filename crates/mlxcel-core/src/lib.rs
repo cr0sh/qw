@@ -3279,8 +3279,9 @@ pub mod cache;
 
 // Pure-Rust wrappers around frequently used FFI entry points.
 mod ops;
-pub mod ggml;
-pub mod ggml_affine;
+mod ggml;
+mod ggml_affine;
+mod qwen38_q6;
 pub use ggml::{
     GgmlDispatchStats, GgmlKernelPath, GgmlQType, GgmlQuantError,
     GgmlQuantizedEmbedding, GgmlQuantizedMatrix, GgmlQuantizedRows,
@@ -3288,6 +3289,9 @@ pub use ggml::{
 pub use ggml_affine::{
     GgmlAffineEmbedding, GgmlAffineError, GgmlAffineMatrix, GgmlAffineRows,
     GgmlAffineTranscodeStats,
+};
+pub use qwen38_q6::{
+    Qwen38Q6DualMatrix, Qwen38Q6Error, Qwen38Q6Shape, Qwen38Q6TranscodeStats,
 };
 
 // Common utility functions

@@ -134,6 +134,7 @@ pub enum GgmlKernelPath {
     TiledQmm32x8,
     AffineQmv,
     AffineQmm,
+    Qwen38Q6DenseF16,
     Embedding,
 }
 
@@ -164,12 +165,10 @@ pub struct GgmlQuantizedMatrix {
 impl GgmlQuantizedMatrix {
     pub fn from_bytes(
         bytes: &[u8],
-        qtype_id: u32,
+        qtype: GgmlQType,
         in_features: usize,
         out_features: usize,
     ) -> Result<Self, GgmlQuantError> {
-        // Unsupported types fail before any MLX/FFI array construction.
-        let qtype = GgmlQType::try_from(qtype_id)?;
         if in_features == 0 || out_features == 0 {
             return Err(GgmlQuantError::EmptyShape);
         }
@@ -233,9 +232,6 @@ impl GgmlQuantizedMatrix {
         })
     }
 
-    pub const fn qtype(&self) -> GgmlQType {
-        self.qtype
-    }
 
     pub const fn in_features(&self) -> usize {
         self.in_features as usize
@@ -345,9 +341,6 @@ pub struct GgmlQuantizedRows {
 }
 
 impl GgmlQuantizedRows {
-    pub const fn qtype(&self) -> GgmlQType {
-        self.qtype
-    }
 
     pub const fn in_features(&self) -> usize {
         self.in_features as usize
@@ -393,23 +386,20 @@ pub struct GgmlQuantizedEmbedding {
 impl GgmlQuantizedEmbedding {
     pub fn from_bytes(
         bytes: &[u8],
-        qtype_id: u32,
+        qtype: GgmlQType,
         embedding_dim: usize,
         vocab_size: usize,
     ) -> Result<Self, GgmlQuantError> {
         Ok(Self {
             matrix: GgmlQuantizedMatrix::from_bytes(
                 bytes,
-                qtype_id,
+                qtype,
                 embedding_dim,
                 vocab_size,
             )?,
         })
     }
 
-    pub const fn qtype(&self) -> GgmlQType {
-        self.matrix.qtype()
-    }
 
     pub const fn embedding_dim(&self) -> usize {
         self.matrix.in_features()
@@ -445,7 +435,7 @@ impl GgmlQuantizedEmbedding {
                 .iq3_grid
                 .as_ref()
                 .ok_or(GgmlQuantError::InvalidTable)?,
-            self.qtype().id() as i32,
+            self.matrix.qtype.id() as i32,
             self.matrix.in_features,
             self.matrix.out_features,
         )
@@ -456,13 +446,6 @@ impl GgmlQuantizedEmbedding {
         self.matrix.forward(input)
     }
 
-    /// Build a zero-copy linear projection over ordered vocabulary row ranges.
-    pub fn select_linear_rows(
-        &self,
-        ranges: &[std::ops::Range<usize>],
-    ) -> Result<GgmlQuantizedRows, GgmlQuantError> {
-        self.matrix.select_rows(ranges)
-    }
 
     pub fn dispatch_stats(&self, selected_rows: usize) -> Result<GgmlDispatchStats, GgmlQuantError> {
         if selected_rows == 0 {

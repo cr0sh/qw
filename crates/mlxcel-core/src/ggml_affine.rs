@@ -103,7 +103,6 @@ impl AffinePlanes {
 
 pub struct GgmlAffineMatrix {
     planes: AffinePlanes,
-    qtype: GgmlQType,
     in_features: i32,
     out_features: i32,
     bits: i32,
@@ -112,20 +111,16 @@ pub struct GgmlAffineMatrix {
 }
 
 impl GgmlAffineMatrix {
-    pub fn is_representable(qtype_id: u32) -> bool {
-        GgmlQType::try_from(qtype_id)
-            .is_ok_and(|qtype| affine_bits(qtype).is_some())
-    }
 
     pub fn from_ggml_bytes(
         bytes: &[u8],
-        qtype_id: u32,
+        qtype: GgmlQType,
         in_features: usize,
         out_features: usize,
     ) -> Result<Self, GgmlAffineError> {
         Self::from_ggml_bytes_with_progress(
             bytes,
-            qtype_id,
+            qtype,
             in_features,
             out_features,
             |_| {},
@@ -134,13 +129,12 @@ impl GgmlAffineMatrix {
 
     pub fn from_ggml_bytes_with_progress(
         bytes: &[u8],
-        qtype_id: u32,
+        qtype: GgmlQType,
         in_features: usize,
         out_features: usize,
         mut release_source: impl FnMut(Range<usize>),
     ) -> Result<Self, GgmlAffineError> {
         let started = Instant::now();
-        let qtype = GgmlQType::try_from(qtype_id)?;
         let bits = affine_bits(qtype).ok_or(GgmlAffineError::NotRepresentable(qtype))?;
         if in_features == 0
             || out_features == 0
@@ -249,7 +243,6 @@ impl GgmlAffineMatrix {
                 packed_width,
                 groups,
             },
-            qtype,
             in_features: i32::try_from(in_features)
                 .map_err(|_| GgmlAffineError::Overflow)?,
             out_features: rows,
@@ -259,9 +252,6 @@ impl GgmlAffineMatrix {
         })
     }
 
-    pub const fn qtype(&self) -> GgmlQType {
-        self.qtype
-    }
 
     pub const fn in_features(&self) -> usize {
         self.in_features as usize
@@ -271,9 +261,6 @@ impl GgmlAffineMatrix {
         self.out_features as usize
     }
 
-    pub const fn bits(&self) -> i32 {
-        self.bits
-    }
 
     pub const fn transcode_stats(&self) -> GgmlAffineTranscodeStats {
         self.stats
@@ -282,7 +269,6 @@ impl GgmlAffineMatrix {
     pub fn clone_shared(&self) -> Self {
         Self {
             planes: self.planes.clone_shared(),
-            qtype: self.qtype,
             in_features: self.in_features,
             out_features: self.out_features,
             bits: self.bits,
@@ -316,7 +302,6 @@ impl GgmlAffineMatrix {
         }
         Ok(GgmlAffineRows {
             planes,
-            qtype: self.qtype,
             in_features: self.in_features,
             bits: self.bits,
             selected_rows: i32::try_from(selected_rows)
@@ -340,7 +325,6 @@ impl GgmlAffineMatrix {
 
 pub struct GgmlAffineRows {
     planes: Vec<AffinePlanes>,
-    qtype: GgmlQType,
     in_features: i32,
     bits: i32,
     selected_rows: i32,
@@ -348,9 +332,6 @@ pub struct GgmlAffineRows {
 }
 
 impl GgmlAffineRows {
-    pub const fn qtype(&self) -> GgmlQType {
-        self.qtype
-    }
 
     pub const fn selected_rows(&self) -> usize {
         self.selected_rows as usize
@@ -393,14 +374,14 @@ pub struct GgmlAffineEmbedding {
 impl GgmlAffineEmbedding {
     pub fn from_ggml_bytes(
         bytes: &[u8],
-        qtype_id: u32,
+        qtype: GgmlQType,
         embedding_dim: usize,
         vocab_size: usize,
     ) -> Result<Self, GgmlAffineError> {
         Ok(Self {
             matrix: GgmlAffineMatrix::from_ggml_bytes(
                 bytes,
-                qtype_id,
+                qtype,
                 embedding_dim,
                 vocab_size,
             )?,
@@ -409,7 +390,7 @@ impl GgmlAffineEmbedding {
 
     pub fn from_ggml_bytes_with_progress(
         bytes: &[u8],
-        qtype_id: u32,
+        qtype: GgmlQType,
         embedding_dim: usize,
         vocab_size: usize,
         release_source: impl FnMut(Range<usize>),
@@ -417,7 +398,7 @@ impl GgmlAffineEmbedding {
         Ok(Self {
             matrix: GgmlAffineMatrix::from_ggml_bytes_with_progress(
                 bytes,
-                qtype_id,
+                qtype,
                 embedding_dim,
                 vocab_size,
                 release_source,
@@ -467,12 +448,6 @@ impl GgmlAffineEmbedding {
         self.matrix.forward(input)
     }
 
-    pub fn select_linear_rows(
-        &self,
-        ranges: &[Range<usize>],
-    ) -> Result<GgmlAffineRows, GgmlAffineError> {
-        self.matrix.select_rows(ranges)
-    }
 }
 
 fn affine_bits(qtype: GgmlQType) -> Option<usize> {
@@ -976,25 +951,25 @@ mod tests {
         let minimum = -32i32 * 127;
         let maximum = -32i32 * -128;
         assert!(maximum - minimum > 255);
-        assert!(!GgmlAffineMatrix::is_representable(GgmlQType::Q6K.id()));
-        assert!(GgmlAffineMatrix::is_representable(GgmlQType::Q5K.id()));
+        assert!(affine_bits(GgmlQType::Q6K).is_none());
+        assert_eq!(affine_bits(GgmlQType::Q5K), Some(5));
     }
 
     #[test]
     fn affine_load_boundary_rejects_fallback_lengths_and_overflow() {
         assert!(matches!(
-            GgmlAffineMatrix::from_ggml_bytes(&[], GgmlQType::Q6K.id(), 256, 1),
+            GgmlAffineMatrix::from_ggml_bytes(&[], GgmlQType::Q6K, 256, 1),
             Err(GgmlAffineError::NotRepresentable(GgmlQType::Q6K))
         ));
         assert!(matches!(
-            GgmlAffineMatrix::from_ggml_bytes(&[0; 175], GgmlQType::Q5K.id(), 256, 1),
+            GgmlAffineMatrix::from_ggml_bytes(&[0; 175], GgmlQType::Q5K, 256, 1),
             Err(GgmlAffineError::ByteLength {
                 expected: 176,
                 actual: 175
             })
         ));
         assert!(matches!(
-            GgmlAffineMatrix::from_ggml_bytes(&[], GgmlQType::Q5K.id(), usize::MAX, 2),
+            GgmlAffineMatrix::from_ggml_bytes(&[], GgmlQType::Q5K, usize::MAX, 2),
             Err(GgmlAffineError::Overflow)
         ));
     }
