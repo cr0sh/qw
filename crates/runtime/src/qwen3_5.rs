@@ -17,18 +17,21 @@
 //! Reference: https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/qwen3_5.py
 
 use crate::gated_delta::{
-    GatedDeltaCache, RMSNormGated, gated_delta_update, scaled_fast_rms_norm_no_weight,
+    GatedDeltaCache, RMSNormGated, gated_delta_update, gated_delta_update_coefficient,
+    scaled_fast_rms_norm_no_weight,
 };
+use crate::gguf_tokenizer::GgufTextAssets;
 use crate::model_owned::ModelOwnedSequenceState;
 use crate::qwen_mrope_state::MRopeState;
 use crate::qwen_vl_position::decode_rope_positions;
 use crate::qwen3_5_mtp::Qwen35MtpDraftModel;
+use crate::qwen3_5_weights::{GgufWeightSource, Qwen35Embedding, Qwen35Linear, Qwen35WeightSource};
 use crate::qwen3_next::{Mlp, Quantization, Qwen3NextAttention, Qwen3NextCache, Qwen3NextConfig};
 use crate::qwen3_vl_vision::{Qwen3VLVisionConfig, Qwen3VLVisionEncoder};
 use anyhow::{Context, Result, ensure};
 use mlxcel_core::cache::{KVCacheMode, SequenceId, Turbo4SnapshotTensors};
 use mlxcel_core::generate::{LanguageModel, ModelStateSnapshot};
-use mlxcel_core::layers::{KVCache, QuantizedWeight, RMSNorm, UnifiedEmbedding, UnifiedLinear};
+use mlxcel_core::layers::{KVCache, QuantizedWeight, RMSNorm, UnifiedLinear};
 use mlxcel_core::utils::silu;
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr, concatenate};
@@ -63,28 +66,30 @@ fn compact_rows(array: &MlxArray, prefix_len: i32, padded_len: i32) -> UniquePtr
 }
 
 fn compact_head(
-    head: &UnifiedLinear,
+    head: &Qwen35Linear,
     vocab_size: usize,
     prefix_len: i32,
     padded_len: i32,
-) -> Option<UnifiedLinear> {
-    let UnifiedLinear::Quantized { weight, bias: None } = head else {
+) -> Option<Qwen35Linear> {
+    let UnifiedLinear::Quantized { weight, bias: None } = head.legacy_ref()? else {
         return None;
     };
-    (vocab_size == 248_320).then(|| UnifiedLinear::Quantized {
-        weight: QuantizedWeight {
-            weight: compact_rows(&weight.weight, prefix_len, padded_len),
-            scales: compact_rows(&weight.scales, prefix_len, padded_len),
-            biases: weight
-                .biases
-                .as_ref()
-                .map(|x| compact_rows(x, prefix_len, padded_len)),
-            group_size: weight.group_size,
-            bits: weight.bits,
-            mode: weight.mode.clone(),
-            global_scale: weight.global_scale.as_ref().map(|x| mlxcel_core::copy(x)),
-        },
-        bias: None,
+    (vocab_size == 248_320).then(|| {
+        Qwen35Linear::legacy(UnifiedLinear::Quantized {
+            weight: QuantizedWeight {
+                weight: compact_rows(&weight.weight, prefix_len, padded_len),
+                scales: compact_rows(&weight.scales, prefix_len, padded_len),
+                biases: weight
+                    .biases
+                    .as_ref()
+                    .map(|x| compact_rows(x, prefix_len, padded_len)),
+                group_size: weight.group_size,
+                bits: weight.bits,
+                mode: weight.mode.clone(),
+                global_scale: weight.global_scale.as_ref().map(|x| mlxcel_core::copy(x)),
+            },
+            bias: None,
+        })
     })
 }
 
@@ -336,28 +341,30 @@ pub(crate) fn rollback_plan(
 
 enum Qwen35GatedAuxProjections {
     Separate {
-        z: UnifiedLinear,
-        b: UnifiedLinear,
-        a: UnifiedLinear,
+        z: Qwen35Linear,
+        b: Qwen35Linear,
+        a: Qwen35Linear,
     },
-    Fused(UnifiedLinear),
+    Fused(Qwen35Linear),
 }
 
 fn fuse_gated_aux_projections(
-    weights: &WeightMap,
+    weights: Option<&WeightMap>,
     prefixes: [&str; 3],
-    z: UnifiedLinear,
-    b: UnifiedLinear,
-    a: UnifiedLinear,
+    z: Qwen35Linear,
+    b: Qwen35Linear,
+    a: Qwen35Linear,
 ) -> Qwen35GatedAuxProjections {
-    let can_drop_linear_biases = prefixes
-        .iter()
-        .all(|prefix| !weights.contains_key(&format!("{prefix}.bias")));
+    let can_drop_linear_biases = weights.is_some_and(|weights| {
+        prefixes
+            .iter()
+            .all(|prefix| !weights.contains_key(&format!("{prefix}.bias")))
+    });
     let fused = (|| {
         let (z_weight, b_weight, a_weight) = (
-            z.quantized_weight()?,
-            b.quantized_weight()?,
-            a.quantized_weight()?,
+            z.legacy_ref()?.quantized_weight()?,
+            b.legacy_ref()?.quantized_weight()?,
+            a.legacy_ref()?.quantized_weight()?,
         );
         if !can_drop_linear_biases
             || z_weight.group_size != b_weight.group_size
@@ -388,10 +395,10 @@ fn fuse_gated_aux_projections(
             0,
         );
         let biases = concatenate(&concatenate(biases[0], biases[1], 0), biases[2], 0);
-        Some(UnifiedLinear::new(
+        Some(Qwen35Linear::legacy(UnifiedLinear::new(
             QuantizedWeight::new(weight, scales, biases, z_weight.group_size, z_weight.bits),
             None,
-        ))
+        )))
     })();
 
     fused.map_or(
@@ -415,12 +422,13 @@ pub(crate) struct Qwen35GatedDeltaNet {
     conv_dim: usize,
 
     conv1d_weight: UniquePtr<MlxArray>,
-    in_proj_qkv: UnifiedLinear,
+    in_proj_qkv: Qwen35Linear,
     aux_projections: Qwen35GatedAuxProjections,
     dt_bias: UniquePtr<MlxArray>,
     a_log: UniquePtr<MlxArray>,
+    ssm_a_is_coefficient: bool,
     norm: RMSNormGated,
-    out_proj: UnifiedLinear,
+    out_proj: Qwen35Linear,
 }
 
 impl Qwen35GatedDeltaNet {
@@ -620,13 +628,17 @@ impl Qwen35GatedDeltaNet {
         }
 
         // Run gated delta update (use guarded_mask which is None if batch dims mismatch)
-        let (out, new_state) = gated_delta_update(
+        let update = if self.ssm_a_is_coefficient {
+            gated_delta_update_coefficient
+        } else {
+            gated_delta_update
+        };
+        let (out, new_state) = update(
             (&q, &k, &v),
             (&a, &b_proj, &self.a_log, &self.dt_bias),
             state.as_deref(),
             guarded_mask,
         );
-
         // Update cache state
         if let Some(c) = cache {
             c.state_cache = Some(new_state);
@@ -639,7 +651,7 @@ impl Qwen35GatedDeltaNet {
     }
 
     fn from_weights(
-        weights: &WeightMap,
+        weights: &dyn Qwen35WeightSource,
         config: &Qwen35Config,
         prefix: &str,
     ) -> Result<Self, String> {
@@ -663,48 +675,36 @@ impl Qwen35GatedDeltaNet {
         let (a_group_size, a_bits) = config.quant_params(&a_prefix);
         let (out_group_size, out_bits) = config.quant_params(&out_prefix);
 
-        let conv1d_weight = weights
-            .get(&format!("{}.conv1d.weight", prefix))
-            .map(|w| {
-                let shape = mlxcel_core::array_shape(w);
-                if shape.len() >= 3 && shape[shape.len() - 1] != 1 {
-                    mlxcel_core::swap_axes(w, -1, -2)
-                } else {
-                    mlxcel_core::copy(w)
-                }
-            })
-            .ok_or_else(|| format!("Missing conv1d weight: {}", prefix))?;
+        let conv1d_weight = {
+            let weight = weights.tensor(&format!("{}.conv1d.weight", prefix))?;
+            let shape = mlxcel_core::array_shape(&weight);
+            if shape.len() == 2 {
+                mlxcel_core::expand_dims(&weight, -1)
+            } else if shape.len() >= 3 && shape[shape.len() - 1] != 1 {
+                mlxcel_core::swap_axes(&weight, -1, -2)
+            } else {
+                weight
+            }
+        };
 
         // Qwen3.5 uses separate projections instead of combined projections.
-        let in_proj_qkv =
-            UnifiedLinear::from_weights(weights, &qkv_prefix, qkv_group_size, qkv_bits)?;
-        let in_proj_z = UnifiedLinear::from_weights(weights, &z_prefix, z_group_size, z_bits)?;
-        let in_proj_b = UnifiedLinear::from_weights(weights, &b_prefix, b_group_size, b_bits)?;
-        let in_proj_a = UnifiedLinear::from_weights(weights, &a_prefix, a_group_size, a_bits)?;
+        let in_proj_qkv = weights.linear(&qkv_prefix, qkv_group_size, qkv_bits)?;
+        let in_proj_z = weights.linear(&z_prefix, z_group_size, z_bits)?;
+        let in_proj_b = weights.linear(&b_prefix, b_group_size, b_bits)?;
+        let in_proj_a = weights.linear(&a_prefix, a_group_size, a_bits)?;
         let aux_projections = fuse_gated_aux_projections(
-            weights,
+            weights.legacy_weights(),
             [&z_prefix, &b_prefix, &a_prefix],
             in_proj_z,
             in_proj_b,
             in_proj_a,
         );
 
-        let dt_bias = weights
-            .get(&format!("{}.dt_bias", prefix))
-            .map(|w| mlxcel_core::copy(w))
-            .ok_or_else(|| format!("Missing dt_bias: {}", prefix))?;
+        let dt_bias = weights.tensor(&format!("{}.dt_bias", prefix))?;
+        let a_log = weights.tensor(&format!("{}.A_log", prefix))?;
+        let norm_weight = weights.tensor(&format!("{}.norm.weight", prefix))?;
 
-        let a_log = weights
-            .get(&format!("{}.A_log", prefix))
-            .map(|w| mlxcel_core::copy(w))
-            .ok_or_else(|| format!("Missing A_log: {}", prefix))?;
-
-        let norm_weight = weights
-            .get(&format!("{}.norm.weight", prefix))
-            .map(|w| mlxcel_core::copy(w))
-            .ok_or_else(|| format!("Missing norm weight: {}", prefix))?;
-
-        let out_proj = UnifiedLinear::from_weights(weights, &out_prefix, out_group_size, out_bits)?;
+        let out_proj = weights.linear(&out_prefix, out_group_size, out_bits)?;
 
         Ok(Self {
             hidden_size,
@@ -721,6 +721,7 @@ impl Qwen35GatedDeltaNet {
             aux_projections,
             dt_bias,
             a_log,
+            ssm_a_is_coefficient: weights.gguf_ssm_a_is_coefficient(),
             norm: RMSNormGated::new(norm_weight, config.rms_norm_eps),
             out_proj,
         })
@@ -859,7 +860,7 @@ impl Qwen35DecoderLayer {
     }
 
     fn from_weights(
-        weights: &WeightMap,
+        weights: &dyn Qwen35WeightSource,
         config: &Qwen35Config,
         qn_config: &Qwen3NextConfig,
         layer_idx: usize,
@@ -874,7 +875,7 @@ impl Qwen35DecoderLayer {
     }
 
     pub(crate) fn from_weights_at_prefix(
-        weights: &WeightMap,
+        weights: &dyn Qwen35WeightSource,
         config: &Qwen35Config,
         qn_config: &Qwen3NextConfig,
         prefix: &str,
@@ -896,15 +897,9 @@ impl Qwen35DecoderLayer {
 
         let mlp = Mlp::from_weights(weights, qn_config, &format!("{}.mlp", prefix))?;
 
-        let input_norm_weight = weights
-            .get(&format!("{}.input_layernorm.weight", prefix))
-            .map(|w| mlxcel_core::copy(w))
-            .ok_or_else(|| format!("Missing input_layernorm: {}", prefix))?;
-
-        let post_norm_weight = weights
-            .get(&format!("{}.post_attention_layernorm.weight", prefix))
-            .map(|w| mlxcel_core::copy(w))
-            .ok_or_else(|| format!("Missing post_attention_layernorm: {}", prefix))?;
+        let input_norm_weight = weights.tensor(&format!("{}.input_layernorm.weight", prefix))?;
+        let post_norm_weight =
+            weights.tensor(&format!("{}.post_attention_layernorm.weight", prefix))?;
 
         Ok(Self {
             is_linear,
@@ -977,12 +972,12 @@ fn prepare_attention_forward(
 }
 
 pub struct Qwen35Model {
-    pub(crate) embed_tokens: UnifiedEmbedding,
+    pub(crate) embed_tokens: Qwen35Embedding,
     pub(crate) layers: Vec<Qwen35DecoderLayer>,
     pub(crate) norm: RMSNorm,
-    pub(crate) lm_head: Option<UnifiedLinear>,
-    compact_draft_head: Option<UnifiedLinear>,
-    compact_dflash_verify_head: Option<UnifiedLinear>,
+    pub(crate) lm_head: Option<Qwen35Linear>,
+    compact_draft_head: Option<Qwen35Linear>,
+    compact_dflash_verify_head: Option<Qwen35Linear>,
     pub(crate) config: Qwen35Config,
     mtp: Option<Qwen35MtpDraftModel>,
     kv_cache_mode: KVCacheMode,
@@ -1047,7 +1042,7 @@ impl Qwen35Model {
     fn project_compact_logits(
         &self,
         hidden: &MlxArray,
-        head: &Option<UnifiedLinear>,
+        head: &Option<Qwen35Linear>,
         prefix_len: i32,
     ) -> UniquePtr<MlxArray> {
         head.as_ref().map_or_else(
@@ -1072,7 +1067,6 @@ impl Qwen35Model {
         self.compact_draft_head.is_some()
     }
 
-    #[cfg(any(feature = "dflash2", test))]
     pub(crate) fn has_compact_dflash_verify_head(&self) -> bool {
         self.compact_dflash_verify_head.is_some()
     }
@@ -1624,7 +1618,12 @@ impl Qwen35Model {
                     &[0, 0, 0],
                     &[batch, replay_len, layer.num_v_heads as i32],
                 );
-                let (_, replayed_state) = gated_delta_update(
+                let update = if layer.ssm_a_is_coefficient {
+                    gated_delta_update_coefficient
+                } else {
+                    gated_delta_update
+                };
+                let (_, replayed_state) = update(
                     (&q, &k, &v),
                     (&a, &b, &layer.a_log, &layer.dt_bias),
                     snapshot.init_state.as_deref(),
@@ -1873,6 +1872,46 @@ impl Qwen35Model {
             );
         }
         Ok(())
+    }
+
+    pub(crate) fn load_gguf(
+        model_dir: &Path,
+        kv_cache_mode: KVCacheMode,
+    ) -> Result<(Self, GgufTextAssets)> {
+        let weights = GgufWeightSource::open(model_dir).with_context(|| {
+            format!(
+                "failed to open selected GGUF pair in {}",
+                model_dir.display()
+            )
+        })?;
+        let assets = GgufTextAssets::load(weights.target())?;
+        let config = weights.config()?;
+        let target_cache_mode = mtp_target_cache_mode(true, kv_cache_mode);
+        tracing::info!(
+            requested_cache_mode = ?kv_cache_mode,
+            effective_target_cache_mode = ?target_cache_mode,
+            "selected Qwen3.5 GGUF target cache policy"
+        );
+        let mut model = Self::from_weights(&weights, &config, target_cache_mode)
+            .map_err(anyhow::Error::msg)
+            .with_context(|| {
+                format!(
+                    "failed to construct Qwen3.5 target from selected GGUF in {}",
+                    model_dir.display()
+                )
+            })?;
+        model.mtp = Some(
+            Qwen35MtpDraftModel::from_weights(&weights, &config)
+                .map_err(anyhow::Error::msg)
+                .with_context(|| {
+                    format!(
+                        "failed to construct separate Qwen3.5 MTP head from selected GGUF in {}",
+                        model_dir.display()
+                    )
+                })?,
+        );
+        weights.finish()?;
+        Ok((model, assets))
     }
 
     pub fn load(model_dir: &Path, kv_cache_mode: KVCacheMode) -> Result<Self> {
@@ -2180,18 +2219,13 @@ impl Qwen35Model {
     }
 
     pub(crate) fn from_weights(
-        weights: &WeightMap,
+        weights: &dyn Qwen35WeightSource,
         config: &Qwen35Config,
         kv_cache_mode: KVCacheMode,
     ) -> std::result::Result<Self, String> {
         let qn_config = config.to_qwen3next_config();
         let (embed_group_size, embed_bits) = config.quant_params("model.embed_tokens");
-        let embed_tokens = UnifiedEmbedding::from_weights(
-            weights,
-            "model.embed_tokens",
-            embed_group_size,
-            embed_bits,
-        )?;
+        let embed_tokens = weights.embedding("model.embed_tokens", embed_group_size, embed_bits)?;
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers);
         for layer_idx in 0..config.num_hidden_layers {
@@ -2200,17 +2234,12 @@ impl Qwen35Model {
             )?);
         }
 
-        let norm_weight = weights
-            .get("model.norm.weight")
-            .map(|weight| mlxcel_core::copy(weight))
-            .ok_or_else(|| "missing required tensor model.norm.weight".to_string())?;
+        let norm_weight = weights.tensor("model.norm.weight")?;
         let lm_head = if config.tie_word_embeddings {
             None
         } else {
             let (group_size, bits) = config.quant_params("lm_head");
-            Some(UnifiedLinear::from_weights(
-                weights, "lm_head", group_size, bits,
-            )?)
+            Some(weights.linear("lm_head", group_size, bits)?)
         };
         let compact_draft_head = lm_head.as_ref().and_then(|head| {
             compact_head(head, config.vocab_size, MTP_DRAFT_PREFIX, MTP_DRAFT_PADDED)
@@ -2571,10 +2600,7 @@ fn push_turbo4_attention_snapshot(
 ) -> bool {
     // A donated snapshot and the live continuation must use identical cache
     // storage; packing only the snapshot can eventually change greedy output.
-    if cache.mode == KVCacheMode::Fp16
-        && cache.offset > 0
-        && !cache.demote_fp16_to_turbo4()
-    {
+    if cache.mode == KVCacheMode::Fp16 && cache.offset > 0 && !cache.demote_fp16_to_turbo4() {
         return false;
     }
     let Some(tensors) = cache.turbo4_snapshot_tensors() else {
@@ -3667,13 +3693,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the real dense Qwen3.5 checkpoint at QW_MODEL_PATH or the default model cache path"]
+    #[ignore = "requires the complete pinned Qwen3.8 27B GGUF pair"]
     fn restored_turbo4_target_snapshot_matches_uninterrupted_next_token_and_text() {
-        let model_dir = crate::resolve_model_path(None)
-            .expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
-        let tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
-            .expect("load tokenizer");
-        let model = Qwen35Model::load(&model_dir, KVCacheMode::Turbo4).expect("load Qwen3.5 model");
+        let model_dir = crate::resolve_model_path(None).expect("resolve selected GGUF cache");
+        let (model, assets) =
+            Qwen35Model::load_gguf(&model_dir, KVCacheMode::Turbo4).expect("load Qwen3.8 GGUF");
+        let tokenizer = assets.tokenizer;
         let prompt = tokenizer
             .encode("Snapshot restore invariant", true)
             .expect("encode prompt");
@@ -3731,5 +3756,48 @@ mod tests {
         assert_eq!(restored_text, uninterrupted_text);
         assert!(model.layers.iter().any(|layer| layer.is_linear));
         assert!(model.layers.iter().any(|layer| !layer.is_linear));
+    }
+
+    #[test]
+    #[ignore = "requires the complete pinned Qwen3.8 27B GGUF pair"]
+    fn real_gguf_target_verify_logits_stay_within_one_ulp() {
+        let model_dir = crate::resolve_model_path(None).expect("resolve selected GGUF cache");
+        let (model, _) =
+            Qwen35Model::load_gguf(&model_dir, KVCacheMode::Fp16).expect("load Qwen3.8 GGUF");
+        let token_ids = [9_707_i32, 11, 1_879];
+        let all = mlxcel_core::from_slice_i32(&token_ids, &[1, token_ids.len() as i32]);
+        let direct = model
+            .forward_mtp_prefill_chunks(&all, None, None, None, |_, _, _| {})
+            .expect("direct target prefill")
+            .first_logits;
+        let prefix = mlxcel_core::from_slice_i32(&token_ids[..2], &[1, 2]);
+        model
+            .forward_mtp_prefill_chunks(&prefix, None, None, None, |_, _, _| {})
+            .expect("target prefix");
+        let final_token = mlxcel_core::from_slice_i32(&token_ids[2..], &[1, 1]);
+        let verified = model.forward_mtp_verify(&final_token).logits;
+        mlxcel_core::eval(&direct);
+        mlxcel_core::eval(&verified);
+        let direct = mlxcel_core::array_to_raw_bytes(&direct);
+        let verified = mlxcel_core::array_to_raw_bytes(&verified);
+        assert_eq!(direct.len(), verified.len());
+        let ordered = |value: f32| {
+            let bits = value.to_bits() as i32;
+            if bits < 0 { i32::MIN - bits } else { bits }
+        };
+        let max_ulp = direct
+            .chunks_exact(4)
+            .zip(verified.chunks_exact(4))
+            .map(|(left, right)| {
+                let left = f32::from_le_bytes(left.try_into().unwrap());
+                let right = f32::from_le_bytes(right.try_into().unwrap());
+                ordered(left).abs_diff(ordered(right))
+            })
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_ulp <= 1,
+            "target verification logits differ by {max_ulp} ULP"
+        );
     }
 }

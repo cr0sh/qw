@@ -55,7 +55,6 @@ impl GatedDeltaCache {
     pub fn advance(&mut self, step: i32) {
         self.offset += step;
     }
-
 }
 
 impl Default for GatedDeltaCache {
@@ -630,6 +629,21 @@ pub fn gated_delta_update(
     gated_delta_ops(q, k, v, &g, &beta, state, mask)
 }
 
+/// GGUF stores the transformed negative decay coefficient `-exp(A_log)`.
+/// Consume it directly rather than round-tripping through `log` and `exp`.
+pub fn gated_delta_update_coefficient(
+    (q, k, v): (&MlxArray, &MlxArray, &MlxArray),
+    (a, b, coefficient, dt_bias): (&MlxArray, &MlxArray, &MlxArray, &MlxArray),
+    state: Option<&MlxArray>,
+    mask: Option<&MlxArray>,
+) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+    let beta = mlxcel_core::sigmoid(b);
+    let step = mlxcel_core::softplus(&mlxcel_core::add(a, dt_bias));
+    let coefficient = mlxcel_core::astype(coefficient, mlxcel_core::dtype::FLOAT32);
+    let g = mlxcel_core::exp(&mlxcel_core::multiply(&coefficient, &step));
+    gated_delta_ops(q, k, v, &g, &beta, state, mask)
+}
+
 /// Fast RMS normalization without a learned scale, followed by scalar scaling.
 ///
 /// Mirrors mlx-lm's `mx.fast.rms_norm(x, None, eps) * scale` path for linear
@@ -691,4 +705,3 @@ fn precise_swiglu_gate(x: &MlxArray, gate: &MlxArray, target_dtype: i32) -> Uniq
     let product = mlxcel_core::multiply(&gate_silu, &x_f32);
     restore_dtype(product, target_dtype)
 }
-

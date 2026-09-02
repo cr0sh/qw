@@ -5,10 +5,9 @@ use anyhow::{Result, bail};
 /// Fixed default identifier for checkpoints that `qw generate`, `qw serve`,
 /// and the runtime benchmarks use when neither `--model` nor `QW_MODEL_PATH`
 /// is given. Users override the *path* to a checkpoint, never this identifier.
-pub const DEFAULT_MODEL_IDENTIFIER: &str = "Jundot/Qwen3.8-27B-oQ4e-fp16-mtp";
+pub const DEFAULT_MODEL_IDENTIFIER: &str = crate::gguf::SELECTED_GGUF_REPOSITORY;
 #[cfg(any(feature = "specprefill", test))]
-pub const DEFAULT_SPECPREFILL_DRAFT_MODEL_IDENTIFIER: &str =
-    "mlx-community/Qwen3.5-0.8B-MLX-8bit";
+pub const DEFAULT_SPECPREFILL_DRAFT_MODEL_IDENTIFIER: &str = "mlx-community/Qwen3.5-0.8B-MLX-8bit";
 
 /// Split a Hugging Face model identifier into the namespace and model
 /// components that form the cache subdirectory. Rejects identifiers that could
@@ -139,8 +138,12 @@ mod tests {
     #[test]
     fn resolve_model_dir_precedence() {
         assert_eq!(
-            resolve_model_dir(Some(Path::new("/cli")), Some(Path::new("/env")), Some(Path::new("/home")))
-                .expect("cli override"),
+            resolve_model_dir(
+                Some(Path::new("/cli")),
+                Some(Path::new("/env")),
+                Some(Path::new("/home"))
+            )
+            .expect("cli override"),
             Path::new("/cli")
         );
         assert_eq!(
@@ -149,15 +152,17 @@ mod tests {
             Path::new("/env")
         );
         assert_eq!(
-            resolve_model_dir(None, None, Some(Path::new("/home")))
-                .expect("default cache"),
-            Path::new("/home/.cache/qw/models/Jundot/Qwen3.8-27B-oQ4e-fp16-mtp")
+            resolve_model_dir(None, None, Some(Path::new("/home"))).expect("default cache"),
+            Path::new("/home/.cache/qw/models/unsloth/Qwen3.8-27B-GGUF")
         );
     }
 
     #[test]
     fn resolve_model_dir_requires_home_only_when_unoverridden() {
-        assert!(resolve_model_dir(None, None, None).is_err(), "HOME required without overrides");
+        assert!(
+            resolve_model_dir(None, None, None).is_err(),
+            "HOME required without overrides"
+        );
         assert_eq!(
             resolve_model_dir(Some(Path::new("/cli")), None, None)
                 .expect("cli override needs no HOME"),
@@ -170,7 +175,7 @@ mod tests {
         assert_eq!(
             model_cache_path(Path::new("/home/user"), DEFAULT_MODEL_IDENTIFIER)
                 .expect("default identifier is valid"),
-            Path::new("/home/user/.cache/qw/models/Jundot/Qwen3.8-27B-oQ4e-fp16-mtp")
+            Path::new("/home/user/.cache/qw/models/unsloth/Qwen3.8-27B-GGUF")
         );
     }
 

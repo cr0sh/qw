@@ -53,13 +53,14 @@ use std::time::{Duration, Instant};
 use mlxcel_core::cache::SequenceId;
 use mlxcel_core::generate::{LanguageModel, ModelStateSnapshot};
 use mlxcel_core::layers::{
-    KVCache, QuantizedWeight, RMSNorm, RotatingKVCache, UnifiedEmbedding, UnifiedLinear,
+    KVCache, QuantizedWeight, RMSNorm, RotatingKVCache, UnifiedLinear,
 };
 use mlxcel_core::weights::{WeightMap, load_weights_from_dir};
 use mlxcel_core::{MlxArray, UniquePtr, concatenate, multiply_scalar};
 use serde_json::Value;
 
 use crate::qwen3_5::Qwen35Model;
+use crate::qwen3_5_weights::Qwen35Embedding;
 use crate::portable_snapshot::{
     PortableArray, PortablePromptSnapshot, array_from_portable, array_to_portable,
     portable_model_state,
@@ -1137,7 +1138,7 @@ pub struct DFlash2DraftModel {
     hidden_norm: RMSNorm,
     layers: Vec<DFlash2DecoderLayer>,
     norm: RMSNorm,
-    embed_tokens: UnifiedEmbedding, // bound from the target at load
+    embed_tokens: Qwen35Embedding, // bound from the target at load
     candidate_selector: CandidateSelector,
     output_multiplier: f32,
     final_logit_softcapping: Option<f32>,
@@ -1147,7 +1148,7 @@ impl DFlash2DraftModel {
     pub fn from_weights(
         weights: &WeightMap,
         config: DFlash2Config,
-        embed_tokens: UnifiedEmbedding,
+        embed_tokens: Qwen35Embedding,
     ) -> Result<Self, String> {
         let fc = quantized_draft_linear(weights, "fc")?;
         let hidden_norm_w = weights

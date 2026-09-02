@@ -397,28 +397,48 @@ impl Qwen35Provider {
             model_dir.display()
         );
 
-        let tokenizer_path = model_dir.join("tokenizer.json");
-        ensure!(
-            tokenizer_path.is_file(),
-            "missing tokenizer {}",
-            tokenizer_path.display()
-        );
-        let tokenizer = Tokenizer::from_file(&tokenizer_path)
-            .map_err(anyhow::Error::msg)
-            .with_context(|| format!("failed to load tokenizer {}", tokenizer_path.display()))?;
-        let chat_template = ChatTemplateProcessor::from_model_path(model_dir)?;
-        let defaults = load_generation_defaults(model_dir)?;
-        let model = Qwen35Model::load(model_dir, kv_cache_mode)?;
-        if model.has_vision() {
+        let selected_gguf = model_dir.join(crate::SELECTED_TARGET_FILE.0).is_file();
+        let (model, tokenizer, chat_template, defaults, vision_processor) = if selected_gguf {
+            let (model, assets) = Qwen35Model::load_gguf(model_dir, kv_cache_mode)?;
+            let chat_template = ChatTemplateProcessor::from_template(
+                assets.chat_template,
+                assets.bos_token,
+                assets.eos_token,
+            )?;
+            let defaults = GenerationDefaults {
+                stop_token_ids: vec![248_046],
+                temperature: assets.temperature,
+                top_k: i32::try_from(assets.top_k).context("GGUF sampling top_k exceeds i32")?,
+                top_p: assets.top_p,
+            };
+            (model, assets.tokenizer, chat_template, defaults, None)
+        } else {
+            let tokenizer_path = model_dir.join("tokenizer.json");
             ensure!(
-                chat_template.supports_image_content(),
-                "unsupported Qwen3.5-VL chat template: expected image/vision marker behavior"
+                tokenizer_path.is_file(),
+                "missing tokenizer {}",
+                tokenizer_path.display()
             );
-        }
-        let vision_processor = model
-            .vision_config()
-            .map(|vision| load_vision_processor(model_dir, vision))
-            .transpose()?;
+            let tokenizer = Tokenizer::from_file(&tokenizer_path)
+                .map_err(anyhow::Error::msg)
+                .with_context(|| {
+                    format!("failed to load tokenizer {}", tokenizer_path.display())
+                })?;
+            let chat_template = ChatTemplateProcessor::from_model_path(model_dir)?;
+            let defaults = load_generation_defaults(model_dir)?;
+            let model = Qwen35Model::load(model_dir, kv_cache_mode)?;
+            if model.has_vision() {
+                ensure!(
+                    chat_template.supports_image_content(),
+                    "unsupported Qwen3.5-VL chat template: expected image/vision marker behavior"
+                );
+            }
+            let vision_processor = model
+                .vision_config()
+                .map(|vision| load_vision_processor(model_dir, vision))
+                .transpose()?;
+            (model, tokenizer, chat_template, defaults, vision_processor)
+        };
         let generator = CxxGenerator::new_with_kv_mode(model.num_layers(), kv_cache_mode);
         let mtp_generator = model.has_mtp().then(Qwen35MtpGenerator::new);
 
@@ -1638,10 +1658,8 @@ fn configure_metal_wired_limit_with(
         );
     }
 
-    let wired_limit_bytes = mlxcel_core::memory::recommended_wired_limit(
-        system_memory_bytes,
-        metal_recommended_bytes,
-    );
+    let wired_limit_bytes =
+        mlxcel_core::memory::recommended_wired_limit(system_memory_bytes, metal_recommended_bytes);
     if wired_limit_bytes == 0 {
         return Err("wired-memory policy computed a zero-byte limit".to_string());
     }
@@ -1828,9 +1846,11 @@ mod tests {
             "{error}"
         );
 
-        let error = configure_metal_wired_limit_with(|| Some(1024), || 1024, |_| {
-            Err("backend rejected limit".to_string())
-        })
+        let error = configure_metal_wired_limit_with(
+            || Some(1024),
+            || 1024,
+            |_| Err("backend rejected limit".to_string()),
+        )
         .expect_err("setter failure must abort initialization");
         assert!(error.contains("failed to configure"), "{error}");
         assert!(error.contains("backend rejected limit"), "{error}");
@@ -1939,12 +1959,11 @@ mod tests {
         assert_eq!(emitted, "Hello, world!");
     }
     #[test]
-    #[ignore = "requires the real bundled-MTP checkpoint at QW_MODEL_PATH or the default model cache path"]
+    #[ignore = "requires the complete pinned Qwen3.8 27B GGUF pair"]
     fn real_model_baseline_and_mtp_greedy_outputs_match() {
-        let model_dir = crate::resolve_model_path(None)
-            .expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
-        let mut provider =
-            Qwen35Provider::load(&model_dir, KVCacheMode::Fp16).expect("load real Qwen checkpoint");
+        let model_dir = crate::resolve_model_path(None).expect("resolve selected GGUF cache");
+        let mut provider = Qwen35Provider::load(&model_dir, KVCacheMode::Fp16)
+            .expect("load selected Qwen3.8 GGUF pair");
         let request = GenerationRequest {
             prompt: "Continue counting upward from one, writing each integer on its own line without stopping."
                 .to_string(),
@@ -1978,8 +1997,8 @@ mod tests {
     #[ignore = "requires real target and SpecPrefill draft checkpoints at their configured or default cache paths"]
     fn real_model_dense_specprefill_dense_has_no_position_state_leakage() {
         let model_dir = crate::resolve_model_path(None).expect("resolve target checkpoint");
-        let draft_dir =
-            crate::resolve_specprefill_draft_path(None).expect("resolve SpecPrefill draft checkpoint");
+        let draft_dir = crate::resolve_specprefill_draft_path(None)
+            .expect("resolve SpecPrefill draft checkpoint");
         let mut provider =
             Qwen35Provider::load_with_specprefill_draft(model_dir, draft_dir, KVCacheMode::Fp16)
                 .expect("load target and SpecPrefill draft");

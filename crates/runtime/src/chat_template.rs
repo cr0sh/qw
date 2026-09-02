@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use minijinja::value::{Value, ValueKind, from_args};
 use minijinja::{Environment, Error, ErrorKind, context};
 use serde::Serialize;
@@ -239,6 +239,27 @@ impl ChatTemplateProcessor {
             template,
             bos_token: extract_token(&tokenizer_config, "bos_token"),
             eos_token: extract_token(&tokenizer_config, "eos_token"),
+        })
+    }
+
+    pub(crate) fn from_template(
+        template: String,
+        bos_token: String,
+        eos_token: String,
+    ) -> Result<Self> {
+        ensure!(
+            !template.trim().is_empty(),
+            "GGUF chat template must not be empty"
+        );
+        let mut environment = Environment::new();
+        configure_environment(&mut environment);
+        environment
+            .add_template("chat", &template)
+            .context("failed to parse GGUF chat template metadata")?;
+        Ok(Self {
+            template,
+            bos_token,
+            eos_token,
         })
     }
 

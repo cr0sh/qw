@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::io::{Error, ErrorKind, Write as _};
@@ -9,15 +8,16 @@ use std::thread;
 use clap::Parser as _;
 use clap_derive::{Args, Parser, Subcommand};
 use qw_runtime::{
-    DEFAULT_MODEL_IDENTIFIER, GenerationRequest, KVCacheMode, Qwen35Provider, model_cache_path,
-    resolve_model_path, validate_identifier,
+    DEFAULT_MODEL_IDENTIFIER, DEFAULT_MODEL_REVISION, GenerationRequest, KVCacheMode,
+    Qwen35Provider, SELECTED_MTP_DIRECTORY, SELECTED_MTP_FILE, SELECTED_TARGET_FILE,
+    model_cache_path, resolve_model_path, sha256_file,
 };
 use qw_server::serve;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "qw",
-    about = "Local dense Qwen3.5 inference",
+    about = "Local Qwen3.8 27B GGUF inference",
     disable_help_subcommand = true
 )]
 struct Cli {
@@ -38,10 +38,7 @@ enum Command {
 }
 
 #[derive(Debug, Args)]
-struct DownloadArgs {
-    /// Hugging Face model identifier, such as Qwen/Qwen3.5-0.8B; defaults to the resolver model.
-    identifier: Option<String>,
-}
+struct DownloadArgs {}
 
 #[derive(Debug, Args)]
 struct GenerateArgs {
@@ -87,9 +84,6 @@ impl GenerateArgs {
     }
 }
 
-fn invalid_input(message: impl Into<String>) -> Error {
-    Error::new(ErrorKind::InvalidInput, message.into())
-}
 fn cache_usage(path: &Path) -> Result<(u64, u64), Error> {
     let entries = match std::fs::read_dir(path) {
         Ok(entries) => entries,
@@ -171,21 +165,6 @@ fn stats_report() -> Result<String, Box<dyn std::error::Error>> {
     Ok(report)
 }
 
-fn sibling_path(destination: &Path, filename: &str) -> Result<PathBuf, Error> {
-    if filename.is_empty()
-        || filename.starts_with('/')
-        || filename.contains('\\')
-        || filename
-            .split('/')
-            .any(|component| component.is_empty() || component == "." || component == "..")
-    {
-        return Err(invalid_input(format!(
-            "model API returned unsafe filename `{filename}`"
-        )));
-    }
-    Ok(destination.join(filename))
-}
-
 fn encode_url_path(path: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     let mut encoded = String::with_capacity(path.len());
@@ -209,10 +188,33 @@ fn add_hf_token(command: &mut ProcessCommand) {
     }
 }
 
-const MAX_CONCURRENT_DOWNLOADS: usize = 4;
+const MAX_CONCURRENT_DOWNLOADS: usize = 2;
+
+#[derive(Clone, Copy)]
+struct SelectedFile {
+    source: &'static str,
+    relative: &'static str,
+    size: u64,
+    sha256: &'static str,
+}
+
+const SELECTED_FILES: [SelectedFile; 2] = [
+    SelectedFile {
+        source: "Qwen3.8-27B-UD-Q4_K_XL.gguf",
+        relative: "Qwen3.8-27B-UD-Q4_K_XL.gguf",
+        size: 17_559_178_144,
+        sha256: "3f227079003add2511437e5b1e94812e363385225bf6a9b47b0054a72bc8b01e",
+    },
+    SelectedFile {
+        source: "MTP/mtp-Qwen3.8-27B-Q4_0.gguf",
+        relative: "MTP/mtp-Qwen3.8-27B-Q4_0.gguf",
+        size: 1_369_590_656,
+        sha256: "50d9ce5a6da381bbcfb31061cf73df94a90e6faf8efeddee379a9cb8f1501c6e",
+    },
+];
 
 struct DownloadJob {
-    filename: String,
+    selected: SelectedFile,
     file_path: PathBuf,
     partial_path: PathBuf,
 }
@@ -244,21 +246,37 @@ where
     Ok(())
 }
 
-fn download_sibling(identifier: &str, job: &DownloadJob) -> Result<(), Error> {
+fn download_selected_file(job: &DownloadJob) -> Result<(), Error> {
     let file_url = format!(
-        "https://huggingface.co/{}/resolve/main/{}",
-        encode_url_path(identifier),
-        encode_url_path(&job.filename)
+        "https://huggingface.co/{}/resolve/{}/{}",
+        encode_url_path(DEFAULT_MODEL_IDENTIFIER),
+        DEFAULT_MODEL_REVISION,
+        encode_url_path(job.selected.source),
     );
-    eprintln!("Downloading {}", job.filename);
+    eprintln!("Downloading {}", job.selected.relative);
     let mut command = ProcessCommand::new("curl");
     command.args(["--fail", "--location", "--show-error"]);
-    if job
-        .partial_path
-        .metadata()
-        .map(|metadata| metadata.len() > 0)
-        .unwrap_or(false)
-    {
+    let resume = match std::fs::symlink_metadata(&job.partial_path) {
+        Ok(metadata) => {
+            if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+                return Err(Error::other(format!(
+                    "partial download path is not a regular file: {}",
+                    job.partial_path.display()
+                )));
+            }
+            if metadata.len() > job.selected.size {
+                return Err(Error::other(format!(
+                    "partial download {} exceeds pinned size {}",
+                    job.partial_path.display(),
+                    job.selected.size
+                )));
+            }
+            metadata.len() > 0
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => false,
+        Err(error) => return Err(error),
+    };
+    if resume {
         command.args(["--continue-at", "-"]);
     }
     add_hf_token(&mut command);
@@ -272,114 +290,138 @@ fn download_sibling(identifier: &str, job: &DownloadJob) -> Result<(), Error> {
                 error.kind(),
                 format!(
                     "failed to run curl while downloading `{}`: {error}",
-                    job.filename
+                    job.selected.relative
                 ),
             )
         })?;
     if !status.success() {
         return Err(Error::other(format!(
             "curl failed while downloading `{}` ({status})",
-            job.filename
+            job.selected.relative
         )));
+    }
+    if let Err(error) = verify_selected_file(&job.partial_path, job.selected) {
+        let _ = std::fs::remove_file(&job.partial_path);
+        return Err(error);
     }
     std::fs::rename(&job.partial_path, &job.file_path)
 }
 
-fn download_snapshot(identifier: &str) -> Result<(), Box<dyn std::error::Error>> {
-    validate_identifier(identifier)?;
+fn verify_selected_file(path: &Path, selected: SelectedFile) -> Result<(), Error> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(Error::other(format!(
+            "selected download path is not a regular file: {}",
+            path.display()
+        )));
+    }
+    if metadata.len() != selected.size {
+        return Err(Error::other(format!(
+            "{} has {} bytes; expected {}",
+            path.display(),
+            metadata.len(),
+            selected.size
+        )));
+    }
+    let digest = sha256_file(path)?;
+    if digest != selected.sha256 {
+        return Err(Error::other(format!(
+            "{} SHA-256 {digest} does not match pinned {}",
+            path.display(),
+            selected.sha256
+        )));
+    }
+    Ok(())
+}
+
+fn download_selected_snapshot() -> Result<(), Box<dyn std::error::Error>> {
+    debug_assert_eq!(SELECTED_TARGET_FILE.0, SELECTED_FILES[0].relative);
+    debug_assert_eq!(SELECTED_TARGET_FILE.1, SELECTED_FILES[0].size);
+    debug_assert_eq!(SELECTED_TARGET_FILE.2, SELECTED_FILES[0].sha256);
+    debug_assert_eq!(
+        format!("{SELECTED_MTP_DIRECTORY}/{}", SELECTED_MTP_FILE.0),
+        SELECTED_FILES[1].relative
+    );
+    debug_assert_eq!(SELECTED_MTP_FILE.1, SELECTED_FILES[1].size);
+    debug_assert_eq!(SELECTED_MTP_FILE.2, SELECTED_FILES[1].sha256);
     let home = std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
         .ok_or_else(|| Error::new(ErrorKind::NotFound, "HOME is not set"))?;
-    let destination = model_cache_path(Path::new(&home), identifier)?;
+    let destination = model_cache_path(Path::new(&home), DEFAULT_MODEL_IDENTIFIER)?;
     std::fs::create_dir_all(&destination)?;
-
-    eprintln!("Fetching file list for {identifier}");
-    let api_url = format!(
-        "https://huggingface.co/api/models/{}",
-        encode_url_path(identifier)
-    );
-    let mut api_command = ProcessCommand::new("curl");
-    api_command.args(["--fail", "--silent", "--show-error", "--location"]);
-    add_hf_token(&mut api_command);
-    let output = api_command.arg(&api_url).output().map_err(|error| {
-        Error::new(
-            error.kind(),
-            format!("failed to run curl for Hugging Face model API: {error}"),
-        )
-    })?;
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr);
-        return Err(Error::other(format!(
-            "Hugging Face model API request failed ({}): {}",
-            output.status,
-            detail.trim()
-        ))
-        .into());
-    }
-
-    let response: serde_json::Value = serde_json::from_slice(&output.stdout)?;
-    let siblings = response
-        .get("siblings")
-        .and_then(serde_json::Value::as_array)
-        .ok_or_else(|| {
-            Error::other("Hugging Face model API response did not contain `siblings`")
-        })?;
-
-    let mut jobs = Vec::with_capacity(siblings.len());
-    let mut seen = HashSet::with_capacity(siblings.len());
-    for sibling in siblings {
-        let filename = sibling
-            .get("rfilename")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                Error::other("Hugging Face model API returned a sibling without `rfilename`")
-            })?;
-        let file_path = sibling_path(&destination, filename)?;
-        if !seen.insert(file_path.clone()) {
-            continue;
-        }
-        if file_path.is_file() {
-            eprintln!("Already downloaded {filename}");
-            continue;
-        }
+    let mut jobs = Vec::new();
+    for selected in SELECTED_FILES {
+        let file_path = destination.join(selected.relative);
         if let Some(parent) = file_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-
+        if file_path.exists() {
+            verify_selected_file(&file_path, selected)?;
+            eprintln!("Verified {}", selected.relative);
+            continue;
+        }
         let mut partial_name = file_path
             .file_name()
-            .expect("validated sibling path has a filename")
+            .expect("fixed selected path has a filename")
             .to_os_string();
         partial_name.push(".qw-part");
         let partial_path = file_path.with_file_name(partial_name);
         jobs.push(DownloadJob {
-            filename: filename.to_owned(),
+            selected,
             file_path,
             partial_path,
         });
     }
-
-    run_bounded(&jobs, MAX_CONCURRENT_DOWNLOADS, &|job| {
-        download_sibling(identifier, job)
-    })?;
-
-    eprintln!("Downloaded {identifier} to {}", destination.display());
+    run_bounded(&jobs, MAX_CONCURRENT_DOWNLOADS, &download_selected_file)?;
+    for selected in SELECTED_FILES {
+        verify_selected_file(&destination.join(selected.relative), selected)?;
+    }
+    write_selected_provenance(&destination)?;
+    eprintln!(
+        "Downloaded {}@{} to {}",
+        DEFAULT_MODEL_IDENTIFIER,
+        DEFAULT_MODEL_REVISION,
+        destination.display()
+    );
     Ok(())
 }
 
-fn resolve_download_identifier(identifier: Option<&str>) -> &str {
-    identifier.unwrap_or(DEFAULT_MODEL_IDENTIFIER)
-}
-
-fn download_model(identifier: &str) -> Result<(), Box<dyn std::error::Error>> {
-    validate_identifier(identifier)?;
-    download_snapshot(identifier)
+fn write_selected_provenance(destination: &Path) -> Result<(), Error> {
+    let files = SELECTED_FILES
+        .iter()
+        .map(|file| {
+            serde_json::json!({
+                "repository": DEFAULT_MODEL_IDENTIFIER,
+                "revision": DEFAULT_MODEL_REVISION,
+                "source": file.source,
+                "relative": file.relative,
+                "size": file.size,
+                "sha256": file.sha256,
+            })
+        })
+        .collect::<Vec<_>>();
+    let provenance = serde_json::json!({
+        "schema": "qwr.gguf.selection.v1",
+        "repository": DEFAULT_MODEL_IDENTIFIER,
+        "revision": DEFAULT_MODEL_REVISION,
+        "files": files,
+    });
+    let bytes = serde_json::to_vec_pretty(&provenance).map_err(Error::other)?;
+    let partial = destination.join(format!(".provenance-{}.qw-part", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&partial)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(partial, destination.join("provenance.json"))
 }
 
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
-        Command::Download(args) => {
-            download_model(resolve_download_identifier(args.identifier.as_deref()))?;
+        Command::Download(_) => {
+            download_selected_snapshot()?;
         }
         Command::Stats => {
             print!("{}", stats_report()?);
@@ -468,50 +510,46 @@ mod tests {
     }
 
     #[test]
-    fn download_defaults_to_resolver_model() {
+    fn download_is_fixed_to_the_pinned_gguf_pair() {
         let cli = Cli::try_parse_from(["qw", "download"]).expect("parse download command");
-        let Command::Download(args) = cli.command else {
-            panic!("expected download command");
-        };
-        assert_eq!(args.identifier, None);
+        assert!(matches!(cli.command, Command::Download(_)));
+        assert!(
+            Cli::try_parse_from(["qw", "download", "Qwen/Qwen3.5-0.8B"]).is_err(),
+            "the unreleased checkpoint contract has no identifier override"
+        );
+        assert_eq!(SELECTED_FILES[0].relative, SELECTED_TARGET_FILE.0);
         assert_eq!(
-            resolve_download_identifier(args.identifier.as_deref()),
-            DEFAULT_MODEL_IDENTIFIER
+            SELECTED_FILES[1].relative,
+            format!("{SELECTED_MTP_DIRECTORY}/{}", SELECTED_MTP_FILE.0)
         );
     }
 
     #[test]
-    fn download_accepts_explicit_identifier_override() {
-        let cli = Cli::try_parse_from(["qw", "download", "Qwen/Qwen3.5-0.8B"])
-            .expect("parse download command");
-        let Command::Download(args) = cli.command else {
-            panic!("expected download command");
+    fn selected_file_verification_enforces_size_and_sha256() {
+        let directory = std::env::temp_dir().join(format!(
+            "qw-selected-download-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("create fixture directory");
+        let path = directory.join("fixture.gguf");
+        std::fs::write(&path, b"abc").expect("write fixture");
+        let valid = SelectedFile {
+            source: "fixture.gguf",
+            relative: "fixture.gguf",
+            size: 3,
+            sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
         };
-        assert_eq!(args.identifier.as_deref(), Some("Qwen/Qwen3.5-0.8B"));
-        assert_eq!(
-            resolve_download_identifier(args.identifier.as_deref()),
-            "Qwen/Qwen3.5-0.8B"
-        );
-    }
-    #[test]
-    fn sibling_paths_cannot_escape_destination() {
-        let destination = Path::new("/home/user/.cache/qw/models/Qwen/model");
-        assert_eq!(
-            sibling_path(destination, "weights/model.safetensors").expect("safe sibling"),
-            destination.join("weights/model.safetensors")
-        );
-        for filename in [
-            "",
-            "/etc/passwd",
-            "../token",
-            "weights/../../token",
-            r"..\token",
-        ] {
-            assert!(
-                sibling_path(destination, filename).is_err(),
-                "{filename:?} should be rejected"
-            );
-        }
+        verify_selected_file(&path, valid).expect("valid selected file");
+        let wrong_size = SelectedFile { size: 4, ..valid };
+        assert!(verify_selected_file(&path, wrong_size).is_err());
+        let wrong_hash = SelectedFile {
+            sha256: "0000000000000000000000000000000000000000000000000000000000000000",
+            ..valid
+        };
+        assert!(verify_selected_file(&path, wrong_hash).is_err());
+        std::fs::remove_dir_all(directory).expect("remove fixture directory");
     }
 
     #[test]
