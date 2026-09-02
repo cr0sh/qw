@@ -1860,7 +1860,6 @@ mod ffi {
             down_s: &MlxArray,
             down_b: &MlxArray,
             down_bits: i32,
-            paired_rows: bool,
         ) -> Result<UniquePtr<MlxArray>>;
 
         /// M>=4 all-affine GDN ingress for the exact pinned Qwen3.8 artifact.
@@ -1883,7 +1882,6 @@ mod ffi {
             alpha_s: &MlxArray,
             alpha_b: &MlxArray,
             alpha_bits: i32,
-            paired_rows: bool,
         ) -> Result<UniquePtr<Qwen38GdnIngressOutputs>>;
         fn qwen38_gdn_take_qkv(outputs: Pin<&mut Qwen38GdnIngressOutputs>) -> UniquePtr<MlxArray>;
         fn qwen38_gdn_take_z(outputs: Pin<&mut Qwen38GdnIngressOutputs>) -> UniquePtr<MlxArray>;

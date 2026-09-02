@@ -449,30 +449,6 @@ impl Qwen38AffineMlpFusion {
                 self.down_m23,
             );
         }
-        self.forward_fused(input, false)
-    }
-
-    #[doc(hidden)]
-    pub fn forward_paired_rows_for_benchmark(
-        &self,
-        input: &MlxArray,
-    ) -> Result<UniquePtr<MlxArray>, GgmlAffineError> {
-        validate_input(input, 5120)?;
-        let rows = affine_input_rows(input)?;
-        if !matches!(rows, 288 | 2048)
-            || crate::array_dtype(input) != dtype::FLOAT32
-            || !crate::ffi::array_is_row_contiguous(input)
-        {
-            return Err(GgmlAffineError::InvalidInput);
-        }
-        self.forward_fused(input, true)
-    }
-
-    fn forward_fused(
-        &self,
-        input: &MlxArray,
-        paired_rows: bool,
-    ) -> Result<UniquePtr<MlxArray>, GgmlAffineError> {
         crate::qwen38_affine_mlp_fused(
             input,
             self.gate
@@ -523,7 +499,6 @@ impl Qwen38AffineMlpFusion {
                 .as_ref()
                 .ok_or(GgmlAffineError::InvalidPlane)?,
             self.down.bits,
-            paired_rows,
         )
         .map_err(|error| GgmlAffineError::Backend(error.to_string()))
     }
@@ -571,28 +546,6 @@ impl Qwen38AffineMlpFusion {
             intermediate_bytes_avoided: gate_up_bytes
                 .checked_add(down_workspace)
                 .ok_or(GgmlAffineError::Overflow)?,
-            workspace_bytes: 0,
-            hidden_copy_bytes: 0,
-        })
-    }
-
-    #[doc(hidden)]
-    pub fn paired_dispatch_stats_for_benchmark(
-        &self,
-        input_rows: usize,
-    ) -> Result<Qwen38FusionStats, GgmlAffineError> {
-        if !matches!(input_rows, 288 | 2048) || qwen38_split_k(input_rows, 17_408, 5120) != 1 {
-            return Err(GgmlAffineError::InvalidInput);
-        }
-        let matrix_bytes_read = self.dispatch_stats(33)?.matrix_bytes_read;
-        let intermediate_bytes_avoided = input_rows
-            .checked_mul(17_408)
-            .and_then(|n| n.checked_mul(8))
-            .ok_or(GgmlAffineError::Overflow)?;
-        Ok(Qwen38FusionStats {
-            physical_dispatches: 2,
-            matrix_bytes_read,
-            intermediate_bytes_avoided,
             workspace_bytes: 0,
             hidden_copy_bytes: 0,
         })
@@ -660,30 +613,6 @@ impl Qwen38AffineGdnIngressFusion {
                 alpha: forward(&self.alpha, self.m23[3])?,
             });
         }
-        self.forward_fused(input, false)
-    }
-
-    #[doc(hidden)]
-    pub fn forward_paired_rows_for_benchmark(
-        &self,
-        input: &MlxArray,
-    ) -> Result<Qwen38GdnIngressOutput, GgmlAffineError> {
-        validate_input(input, 5120)?;
-        let rows = affine_input_rows(input)?;
-        if !matches!(rows, 288 | 2048)
-            || crate::array_dtype(input) != dtype::FLOAT32
-            || !crate::ffi::array_is_row_contiguous(input)
-        {
-            return Err(GgmlAffineError::InvalidInput);
-        }
-        self.forward_fused(input, true)
-    }
-
-    fn forward_fused(
-        &self,
-        input: &MlxArray,
-        paired_rows: bool,
-    ) -> Result<Qwen38GdnIngressOutput, GgmlAffineError> {
         let mut outputs = crate::qwen38_affine_gdn_ingress_fused(
             input,
             self.qkv
@@ -750,7 +679,6 @@ impl Qwen38AffineGdnIngressFusion {
                 .as_ref()
                 .ok_or(GgmlAffineError::InvalidPlane)?,
             self.alpha.bits,
-            paired_rows,
         )
         .map_err(|error| GgmlAffineError::Backend(error.to_string()))?;
         let output = outputs.pin_mut();
@@ -791,43 +719,6 @@ impl Qwen38AffineGdnIngressFusion {
                 hidden_copy_bytes: 0,
             });
         }
-        let splits = [
-            qwen38_split_k(input_rows, 5120, 10_240),
-            qwen38_split_k(input_rows, 5120, 6144),
-            qwen38_split_k(input_rows, 5120, 48),
-            qwen38_split_k(input_rows, 5120, 48),
-        ];
-        let widths = [10_240usize, 6144, 48, 48];
-        let workspace_bytes = splits
-            .into_iter()
-            .zip(widths)
-            .filter(|(split, _)| *split > 1)
-            .try_fold(0usize, |total, (split, width)| {
-                split
-                    .checked_mul(input_rows)
-                    .and_then(|n| n.checked_mul(width))
-                    .and_then(|n| n.checked_mul(4))
-                    .and_then(|bytes| total.checked_add(bytes))
-                    .ok_or(GgmlAffineError::Overflow)
-            })?;
-        Ok(Qwen38FusionStats {
-            physical_dispatches: if workspace_bytes == 0 { 2 } else { 3 },
-            matrix_bytes_read,
-            intermediate_bytes_avoided: 0,
-            workspace_bytes,
-            hidden_copy_bytes: 0,
-        })
-    }
-
-    #[doc(hidden)]
-    pub fn paired_dispatch_stats_for_benchmark(
-        &self,
-        input_rows: usize,
-    ) -> Result<Qwen38FusionStats, GgmlAffineError> {
-        if !matches!(input_rows, 288 | 2048) {
-            return Err(GgmlAffineError::InvalidInput);
-        }
-        let matrix_bytes_read = self.dispatch_stats(33)?.matrix_bytes_read;
         let splits = [
             qwen38_split_k(input_rows, 5120, 10_240),
             qwen38_split_k(input_rows, 5120, 6144),
