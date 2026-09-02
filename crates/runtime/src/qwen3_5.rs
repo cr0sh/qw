@@ -1915,6 +1915,24 @@ impl Qwen35Model {
                 })?,
         );
         weights.finish()?;
+        let affine = weights.affine_stats();
+        tracing::info!(
+            tensors = affine.tensors,
+            source_bytes = affine.source_bytes,
+            resident_bytes = affine.resident_bytes,
+            peak_active_tensor_bytes = affine.peak_active_bytes,
+            elapsed_seconds = affine.elapsed.as_secs_f64(),
+            "transcoded exact GGML affine planes"
+        );
+        #[cfg(test)]
+        eprintln!(
+            "GGUF affine transcode tensors={} source={} resident={} peak_active_tensor={} elapsed={:?}",
+            affine.tensors,
+            affine.source_bytes,
+            affine.resident_bytes,
+            affine.peak_active_bytes,
+            affine.elapsed,
+        );
         Ok((model, assets))
     }
 

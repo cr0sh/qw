@@ -2,12 +2,14 @@ use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use memmap2::{Advice, Mmap, MmapOptions, UncheckedAdvice};
 use mlxcel_core::layers::{FusedQKVLinear, Linear, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{
+    GgmlAffineEmbedding, GgmlAffineMatrix, GgmlAffineRows, GgmlAffineTranscodeStats,
     GgmlQuantizedEmbedding, GgmlQuantizedMatrix, GgmlQuantizedRows, MlxArray, UniquePtr, dtype,
 };
 
@@ -16,6 +18,8 @@ use crate::qwen3_5::Qwen35Config;
 
 pub(crate) enum Qwen35Linear {
     Legacy(UnifiedLinear),
+    Affine(GgmlAffineMatrix),
+    AffineRows(GgmlAffineRows),
     Gguf(GgmlQuantizedMatrix),
     GgufRows(GgmlQuantizedRows),
 }
@@ -28,6 +32,12 @@ impl Qwen35Linear {
     pub(crate) fn forward(&self, input: &MlxArray) -> UniquePtr<MlxArray> {
         match self {
             Self::Legacy(linear) => linear.forward(input),
+            Self::Affine(linear) => linear
+                .forward(input)
+                .expect("validated GGML affine matrix execution must succeed"),
+            Self::AffineRows(linear) => linear
+                .forward(input)
+                .expect("validated GGML affine row projection must succeed"),
             Self::Gguf(linear) => linear
                 .forward(input)
                 .expect("validated GGML matrix execution must succeed"),
@@ -40,7 +50,7 @@ impl Qwen35Linear {
     pub(crate) fn legacy_ref(&self) -> Option<&UnifiedLinear> {
         match self {
             Self::Legacy(linear) => Some(linear),
-            Self::Gguf(_) | Self::GgufRows(_) => None,
+            Self::Affine(_) | Self::AffineRows(_) | Self::Gguf(_) | Self::GgufRows(_) => None,
         }
     }
 
@@ -49,14 +59,16 @@ impl Qwen35Linear {
         ranges: &[std::ops::Range<usize>],
     ) -> Option<Self> {
         match self {
+            Self::Affine(linear) => linear.select_rows(ranges).ok().map(Self::AffineRows),
             Self::Gguf(linear) => linear.select_rows(ranges).ok().map(Self::GgufRows),
-            Self::Legacy(_) | Self::GgufRows(_) => None,
+            Self::Legacy(_) | Self::AffineRows(_) | Self::GgufRows(_) => None,
         }
     }
 }
 
 pub(crate) enum Qwen35Embedding {
     Legacy(UnifiedEmbedding),
+    Affine(GgmlAffineEmbedding),
     Gguf(GgmlQuantizedEmbedding),
 }
 
@@ -64,6 +76,7 @@ impl Qwen35Embedding {
     pub(crate) fn clone_shared(&self) -> Self {
         match self {
             Self::Legacy(embedding) => Self::Legacy(embedding.clone_shared()),
+            Self::Affine(embedding) => Self::Affine(embedding.clone_shared()),
             Self::Gguf(embedding) => Self::Gguf(embedding.clone_shared()),
         }
     }
@@ -71,6 +84,13 @@ impl Qwen35Embedding {
     pub(crate) fn forward(&self, indices: &MlxArray) -> UniquePtr<MlxArray> {
         match self {
             Self::Legacy(embedding) => embedding.forward(indices),
+            Self::Affine(embedding) => {
+                let converted = (mlxcel_core::array_dtype(indices) == dtype::INT64)
+                    .then(|| mlxcel_core::astype(indices, dtype::INT32));
+                embedding
+                    .forward(converted.as_deref().unwrap_or(indices))
+                    .expect("validated GGML affine embedding execution must succeed")
+            }
             Self::Gguf(embedding) => {
                 let converted = (mlxcel_core::array_dtype(indices) == dtype::INT64)
                     .then(|| mlxcel_core::astype(indices, dtype::INT32));
@@ -84,6 +104,9 @@ impl Qwen35Embedding {
     pub(crate) fn as_linear(&self, input: &MlxArray) -> UniquePtr<MlxArray> {
         match self {
             Self::Legacy(embedding) => embedding.as_linear(input),
+            Self::Affine(embedding) => embedding
+                .as_linear(input)
+                .expect("validated GGML affine embedding projection must succeed"),
             Self::Gguf(embedding) => embedding
                 .as_linear(input)
                 .expect("validated GGML embedding projection must succeed"),
@@ -207,6 +230,15 @@ impl Qwen35WeightSource for WeightMap {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct GgufAffineLoadStats {
+    pub tensors: usize,
+    pub source_bytes: usize,
+    pub resident_bytes: usize,
+    pub peak_active_bytes: usize,
+    pub elapsed: Duration,
+}
+
 #[derive(Clone, Copy)]
 enum Artifact {
     Target,
@@ -218,6 +250,7 @@ pub(crate) struct GgufWeightSource {
     target_maps: Vec<Mmap>,
     mtp_maps: Vec<Mmap>,
     used: RefCell<BTreeSet<(u8, String)>>,
+    affine_stats: RefCell<GgufAffineLoadStats>,
 }
 
 impl GgufWeightSource {
@@ -230,7 +263,21 @@ impl GgufWeightSource {
             target_maps,
             mtp_maps,
             used: RefCell::new(BTreeSet::new()),
+            affine_stats: RefCell::new(GgufAffineLoadStats::default()),
         })
+    }
+
+    pub(crate) fn affine_stats(&self) -> GgufAffineLoadStats {
+        *self.affine_stats.borrow()
+    }
+
+    fn record_affine(&self, transcode: GgmlAffineTranscodeStats) {
+        let mut stats = self.affine_stats.borrow_mut();
+        stats.tensors += 1;
+        stats.source_bytes += transcode.source_bytes;
+        stats.resident_bytes += transcode.resident_bytes;
+        stats.peak_active_bytes = stats.peak_active_bytes.max(transcode.peak_active_bytes);
+        stats.elapsed += transcode.elapsed;
     }
 
     pub(crate) fn target(&self) -> &GgufShardSet {
@@ -343,6 +390,44 @@ impl GgufWeightSource {
         };
     }
 
+    fn discard_tensor_byte_range(&self, canonical: &str, relative: std::ops::Range<usize>) {
+        let Ok((artifact, actual)) = map_canonical_name(canonical) else {
+            return;
+        };
+        let (set, maps) = match artifact {
+            Artifact::Target => (&self.pair.target, &self.target_maps),
+            Artifact::Mtp => (&self.pair.mtp, &self.mtp_maps),
+        };
+        let Some(location) = set.tensor(&actual) else {
+            return;
+        };
+        let Ok(tensor_start) = usize::try_from(location.tensor.absolute_offset) else {
+            return;
+        };
+        let Ok(tensor_len) = usize::try_from(location.tensor.byte_len) else {
+            return;
+        };
+        if relative.start > relative.end || relative.end > tensor_len {
+            return;
+        }
+        let absolute_start = tensor_start.saturating_add(relative.start);
+        let absolute_end = tensor_start.saturating_add(relative.end);
+        let page_start = absolute_start.div_ceil(4096).saturating_mul(4096);
+        let page_end = absolute_end / 4096 * 4096;
+        if page_start >= page_end || page_end > maps[location.shard].len() {
+            return;
+        }
+        // SAFETY: the callback fires only after consuming this immutable range.
+        // A future access faults discarded pages back in.
+        let _ = unsafe {
+            maps[location.shard].unchecked_advise_range(
+                UncheckedAdvice::DontNeed,
+                page_start,
+                page_end - page_start,
+            )
+        };
+    }
+
     fn load_native(&self, canonical: &str) -> Result<UniquePtr<MlxArray>> {
         let (tensor, bytes) = self.lookup(canonical)?;
         ensure!(
@@ -383,6 +468,16 @@ impl GgufWeightSource {
                 mlxcel_core::from_bytes(bytes, &[output as i32, input as i32], dtype::FLOAT32);
             mlxcel_core::eval(array.as_ref().unwrap());
             Qwen35Linear::Legacy(UnifiedLinear::Regular(Linear::new(array, None)))
+        } else if GgmlAffineMatrix::is_representable(tensor.tensor_type.id()) {
+            let affine = GgmlAffineMatrix::from_ggml_bytes_with_progress(
+                bytes,
+                tensor.tensor_type.id(),
+                input,
+                output,
+                |range| self.discard_tensor_byte_range(canonical, range),
+            )?;
+            self.record_affine(affine.transcode_stats());
+            Qwen35Linear::Affine(affine)
         } else {
             Qwen35Linear::Gguf(GgmlQuantizedMatrix::from_bytes(
                 bytes,
@@ -403,12 +498,24 @@ impl GgufWeightSource {
         );
         let embedding_dim = usize::try_from(tensor.dimensions[0])?;
         let vocab_size = usize::try_from(tensor.dimensions[1])?;
-        let result = Qwen35Embedding::Gguf(GgmlQuantizedEmbedding::from_bytes(
-            bytes,
-            tensor.tensor_type.id(),
-            embedding_dim,
-            vocab_size,
-        )?);
+        let result = if GgmlAffineMatrix::is_representable(tensor.tensor_type.id()) {
+            let affine = GgmlAffineEmbedding::from_ggml_bytes_with_progress(
+                bytes,
+                tensor.tensor_type.id(),
+                embedding_dim,
+                vocab_size,
+                |range| self.discard_tensor_byte_range(canonical, range),
+            )?;
+            self.record_affine(affine.transcode_stats());
+            Qwen35Embedding::Affine(affine)
+        } else {
+            Qwen35Embedding::Gguf(GgmlQuantizedEmbedding::from_bytes(
+                bytes,
+                tensor.tensor_type.id(),
+                embedding_dim,
+                vocab_size,
+            )?)
+        };
         self.discard_tensor_pages(canonical);
         Ok(result)
     }
