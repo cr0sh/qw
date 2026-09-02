@@ -57,25 +57,6 @@ impl Qwen35Linear {
         }
     }
 
-    pub(crate) fn affine_ref_for_experiment(&self) -> Option<&GgmlAffineMatrix> {
-        match self {
-            Self::Affine(matrix) | Self::PinnedM23Affine(matrix) => Some(matrix),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn forward_geometry_for_experiment(
-        &self,
-        input: &MlxArray,
-        block_m: usize,
-        block_n: usize,
-    ) -> UniquePtr<MlxArray> {
-        self.affine_ref_for_experiment()
-            .expect("geometry experiment requires an affine matrix")
-            .forward_geometry_for_experiment(input, block_m, block_n)
-            .expect("validated geometry experiment must execute")
-    }
-
     pub(crate) fn is_affine(&self) -> bool {
         matches!(self, Self::Affine(_) | Self::PinnedM23Affine(_))
     }

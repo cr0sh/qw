@@ -1844,19 +1844,6 @@ mod ffi {
             require_pinned_shape: bool,
         ) -> Result<UniquePtr<MlxArray>>;
 
-        /// Temporary fixed-artifact BlockMMA geometry experiment.
-        fn qwen38_affine_geometry_qmm_experiment(
-            x: &MlxArray,
-            weight: &MlxArray,
-            scales: &MlxArray,
-            biases: &MlxArray,
-            bits: i32,
-            in_features: i32,
-            out_features: i32,
-            block_m: i32,
-            block_n: i32,
-        ) -> Result<UniquePtr<MlxArray>>;
-
         /// M>=4 all-affine MLP for the exact pinned Qwen3.8 artifact.
         #[allow(clippy::too_many_arguments)]
         fn qwen38_affine_mlp_fused(

@@ -102,63 +102,6 @@ METAL_FUNC void qwen38_qmm_accumulate(
     }
 }
 
-template <int Bits, int BM, int BN, int WM, int WN, int TGPSize>
-METAL_FUNC void qwen38_qmm_accumulate_geometry(
-    const device uint32_t* w,
-    const device float* scales,
-    const device float* biases,
-    const device float* x,
-    int K,
-    int N,
-    int M,
-    uint3 tid,
-    ushort simd_gid,
-    ushort simd_lid,
-    threadgroup float* Xs,
-    threadgroup float* Ws,
-    thread mlx::steel::BlockMMA<
-        float, float, BM, BN, 32, WM, WN, false, true, 36, 36>& mma_op
-) {
-    constexpr int pack_factor = get_pack_factor<Bits, 8>();
-    constexpr int bytes_per_pack = get_bytes_per_pack<Bits>();
-    using loader_x_t = mlx::steel::BlockLoader<float, BM, 32, 36, 1, TGPSize>;
-    using loader_w_t = QuantizedBlockLoader<
-        float, BN, 32, 36, 1, TGPSize, 32, Bits>;
-
-    const int K_w = K * bytes_per_pack / pack_factor;
-    const int K_g = K / 32;
-    const int y_row = tid.y * BM;
-    const int y_col = tid.x * BN;
-    auto wl = reinterpret_cast<const device uint8_t*>(w);
-    x += y_row * static_cast<int64_t>(K);
-    wl += y_col * K_w;
-    scales += y_col * K_g;
-    biases += y_col * K_g;
-
-    const short num_els = min(BM, M - y_row);
-    const short num_outs = min(BN, N - y_col);
-    loader_x_t loader_x(x, K, Xs, simd_gid, simd_lid);
-    loader_w_t loader_w(wl, scales, biases, K, Ws, simd_gid, simd_lid);
-
-    for (int k = 0; k < K; k += 32) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (num_els < BM) {
-            loader_x.load_safe(short2(32, num_els));
-        } else {
-            loader_x.load_unsafe();
-        }
-        if (num_outs < BN) {
-            loader_w.load_safe(short2(32, num_outs));
-        } else {
-            loader_w.load_unsafe();
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        mma_op.mma(Xs, Ws);
-        loader_x.next();
-        loader_w.next();
-    }
-}
-
 template <typename Mma>
 METAL_FUNC void qwen38_store_tile(
     thread Mma& mma,
@@ -252,35 +195,6 @@ METAL_FUNC void qwen38_reduce_looped(
         }
     }
 }
-)";
-
-static const char* QWEN38_GEOMETRY_QMM_SOURCE = R"(
-    constexpr int BM = BlockM;
-    constexpr int BN = BlockN;
-    constexpr int WM = BlockM / 16;
-    constexpr int WN = BlockN / 16;
-    constexpr int TGPSize = WM * WN * 32;
-    threadgroup float Xs[BM * 36];
-    threadgroup float Ws[BN * 36];
-    uint3 tid(threadgroup_position_in_grid.x, threadgroup_position_in_grid.y, 0);
-    mlx::steel::BlockMMA<
-        float, float, BM, BN, 32, WM, WN, false, true, 36, 36> mma(
-            simdgroup_index_in_threadgroup, thread_index_in_simdgroup);
-    qwen38_qmm_accumulate_geometry<Bits, BM, BN, WM, WN, TGPSize>(
-        weight, scales, biases, x, KDim, NDim, MRows, tid,
-        simdgroup_index_in_threadgroup, thread_index_in_simdgroup,
-        Xs, Ws, mma);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const int y_row = threadgroup_position_in_grid.y * BM;
-    const int y_col = threadgroup_position_in_grid.x * BN;
-    const short num_rows = min(BM, MRows - y_row);
-    const short num_cols = min(BN, NDim - y_col);
-    device float* dst = out + y_row * NDim + y_col;
-    if (num_rows < BM || num_cols < BN) {
-        mma.store_result_safe(dst, NDim, short2(num_cols, num_rows));
-    } else {
-        mma.store_result(dst, NDim);
-    }
 )";
 
 static const char* QWEN38_MLP_GATE_UP_SOURCE = R"(
@@ -580,7 +494,6 @@ static const char* QWEN38_GDN_REDUCE_BA_SOURCE = R"(
 )";
 
 struct Qwen38FusionKernelHolder {
-    std::optional<mlx::core::fast::CustomKernelFunction> geometry_qmm;
     std::optional<mlx::core::fast::CustomKernelFunction> mlp_gate_up;
     std::optional<mlx::core::fast::CustomKernelFunction> mlp_down;
     std::optional<mlx::core::fast::CustomKernelFunction> gdn_qz;
@@ -593,10 +506,6 @@ struct Qwen38FusionKernelHolder {
         std::call_once(initialize_once, [this] {
             std::string header = QWEN38_QUANTIZED_METAL;
             header += QWEN38_QMM_FUSION_HEADER;
-            geometry_qmm = mlx::core::fast::metal_kernel(
-                "qw_qwen38_affine_geometry_qmm_experiment",
-                {"x", "weight", "scales", "biases"},
-                {"out"}, QWEN38_GEOMETRY_QMM_SOURCE, header, false);
             mlp_gate_up = mlx::core::fast::metal_kernel(
                 "qw_qwen38_affine_mlp_gu_qmm_v2",
                 {"x", "gate_w", "gate_s", "gate_b", "up_w", "up_s", "up_b"},
@@ -687,54 +596,6 @@ std::vector<std::pair<std::string, TemplateArg>> args(
 }
 
 } // namespace
-
-std::unique_ptr<MlxArray> qwen38_affine_geometry_qmm_experiment(
-    const MlxArray& x,
-    const MlxArray& weight,
-    const MlxArray& scales,
-    const MlxArray& biases,
-    int32_t bits,
-    int32_t in_features,
-    int32_t out_features,
-    int32_t block_m,
-    int32_t block_n) {
-#ifndef __APPLE__
-    throw std::invalid_argument("Qwen3.8 geometry experiment requires Metal");
-#else
-    using namespace mlx::core;
-    if (!metal::is_available()) {
-        throw std::invalid_argument("Qwen3.8 geometry experiment requires Metal");
-    }
-    int m = qwen38_input_rows(x.inner, in_features);
-    validate_plane(weight.inner, scales.inner, biases.inner, bits, in_features, out_features);
-    auto valid_block = [](int block) { return block == 16 || block == 32 || block == 64; };
-    if (!valid_block(block_m) || !valid_block(block_n)) {
-        throw std::invalid_argument("Qwen3.8 geometry experiment block is invalid");
-    }
-    int simdgroups = (block_m / 16) * (block_n / 16);
-    array input = reshape(x.inner, {m, in_features});
-    auto output = (*qwen38_fusion_kernels().geometry_qmm)(
-        {input, weight.inner, scales.inner, biases.inner},
-        {Shape{m, out_features}}, {float32},
-        std::make_tuple(
-            ((out_features + block_n - 1) / block_n) * 32,
-            ((m + block_m - 1) / block_m) * simdgroups,
-            1),
-        std::make_tuple(32, simdgroups, 1),
-        args({
-            {"Bits", bits},
-            {"MRows", m},
-            {"KDim", in_features},
-            {"NDim", out_features},
-            {"BlockM", block_m},
-            {"BlockN", block_n},
-        }),
-        std::nullopt, false, {});
-    Shape shape(x.inner.shape().begin(), x.inner.shape().end() - 1);
-    shape.push_back(out_features);
-    return std::make_unique<MlxArray>(reshape(output[0], shape));
-#endif
-}
 
 std::unique_ptr<MlxArray> qwen38_affine_mlp_fused(
     const MlxArray& x,

@@ -473,25 +473,6 @@ impl Mlp {
         }
     }
 
-    pub(crate) fn forward_geometry_for_experiment(
-        &self,
-        x: &MlxArray,
-        block_m: usize,
-        block_n: usize,
-    ) -> UniquePtr<MlxArray> {
-        let MlpExecution::Separate {
-            input_projections: MlpInputProjections::Separate { gate, up },
-            down_proj,
-        } = &self.execution
-        else {
-            panic!("geometry experiment requires separate affine MLP projections");
-        };
-        let gate = gate.forward_geometry_for_experiment(x, block_m, block_n);
-        let up = up.forward_geometry_for_experiment(x, block_m, block_n);
-        let gated = mlxcel_core::compiled_swiglu_activation(&gate, &up);
-        down_proj.forward_geometry_for_experiment(&gated, block_m, block_n)
-    }
-
     #[cfg(test)]
     pub(crate) fn fusion_stats(&self, input_rows: usize) -> Option<mlxcel_core::Qwen38FusionStats> {
         match &self.execution {
