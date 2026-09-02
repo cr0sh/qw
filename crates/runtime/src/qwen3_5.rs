@@ -537,6 +537,25 @@ impl Qwen35GdnIngress {
             }
         }
     }
+
+    #[cfg(test)]
+    fn forward_paired_rows(
+        &self,
+        inputs: &MlxArray,
+    ) -> (
+        UniquePtr<MlxArray>,
+        UniquePtr<MlxArray>,
+        UniquePtr<MlxArray>,
+        UniquePtr<MlxArray>,
+    ) {
+        let Self::PinnedAffine(fusion) = self else {
+            panic!("paired-row benchmark requires pinned affine GDN");
+        };
+        let outputs = fusion
+            .forward_paired_rows_for_benchmark(inputs)
+            .expect("validated paired-row GDN benchmark must succeed");
+        (outputs.qkv, outputs.z, outputs.beta, outputs.alpha)
+    }
 }
 
 // GatedDeltaNet - Qwen3.5 variant with separately stored projections.
@@ -3955,7 +3974,7 @@ mod tests {
         }
 
         fn capture(model: &Qwen35Model) -> Vec<(usize, usize, Vec<u8>)> {
-            [(4, 1), (5, 1), (33, 1), (128, 1), (288, 3)]
+            [(4, 1), (5, 1), (33, 1), (128, 1), (288, 3), (2048, 1)]
                 .into_iter()
                 .flat_map(|(rows, repetitions)| {
                     (0..repetitions).map(move |repetition| {
@@ -4162,6 +4181,242 @@ mod tests {
                 gdn_stats.intermediate_bytes_avoided,
                 gdn_stats.workspace_bytes,
             );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the complete pinned Qwen3.8 27B GGUF pair"]
+    fn real_gguf_paired_row_affine_exactness_and_alternating_timing() {
+        const TRIALS: usize = 3;
+        const WARMUPS_PER_PATH: usize = 5;
+        const SAMPLES_PER_PATH: usize = 15;
+
+        fn load_focused(fused: bool) -> (Mlp, Qwen35GatedDeltaNet) {
+            let weights = if fused {
+                GgufWeightSource::open()
+            } else {
+                GgufWeightSource::open_without_fusion()
+            }
+            .expect("open pinned GGUF pair");
+            let config = weights.config().expect("load pinned config");
+            let next_config = config.to_qwen3next_config();
+            let mlp = Mlp::from_weights(&weights, &next_config, ModelRole::Target, 3)
+                .expect("load representative A4/A5 MLP");
+            let gdn = Qwen35GatedDeltaNet::from_weights(&weights, &config, ModelRole::Target, 0)
+                .expect("load representative A5/A8 GDN");
+            (mlp, gdn)
+        }
+
+        fn input(rows: usize) -> UniquePtr<MlxArray> {
+            let values = (0..rows * 5120)
+                .map(|index| {
+                    let row = index / 5120;
+                    let column = index % 5120;
+                    (column as i32 % 37 - 18) as f32 * 0.00390625 + row as f32 * 0.000_000_953_674_3
+                })
+                .collect::<Vec<_>>();
+            mlxcel_core::from_slice_f32(&values, &[1, rows as i32, 5120])
+        }
+
+        fn bytes(array: UniquePtr<MlxArray>) -> Vec<u8> {
+            mlxcel_core::eval(&array);
+            mlxcel_core::synchronize_default();
+            mlxcel_core::array_to_raw_bytes(&array)
+        }
+
+        fn ingress_bytes(
+            gdn: &Qwen35GatedDeltaNet,
+            input: &MlxArray,
+            rows: usize,
+            paired_rows: bool,
+        ) -> [Vec<u8>; 4] {
+            let (qkv, z, beta, alpha) = if paired_rows {
+                gdn.ingress.forward_paired_rows(input)
+            } else {
+                gdn.ingress
+                    .forward(input, 1, rows as i32, gdn.value_dim, gdn.num_v_heads)
+            };
+            [bytes(qkv), bytes(z), bytes(beta), bytes(alpha)]
+        }
+
+        fn sync_mlp(mlp: &Mlp, input: &MlxArray, paired_rows: bool) {
+            let output = if paired_rows {
+                mlp.forward_paired_rows(input)
+            } else {
+                mlp.forward(input)
+            };
+            mlxcel_core::eval(&output);
+            mlxcel_core::synchronize_default();
+        }
+
+        fn sync_ingress(
+            gdn: &Qwen35GatedDeltaNet,
+            input: &MlxArray,
+            rows: usize,
+            paired_rows: bool,
+        ) {
+            let (qkv, z, beta, alpha) = if paired_rows {
+                gdn.ingress.forward_paired_rows(input)
+            } else {
+                gdn.ingress
+                    .forward(input, 1, rows as i32, gdn.value_dim, gdn.num_v_heads)
+            };
+            for output in [&qkv, &z, &beta, &alpha] {
+                mlxcel_core::eval(output);
+            }
+            mlxcel_core::synchronize_default();
+        }
+
+        fn alternating_samples(
+            mut old: impl FnMut(),
+            mut paired: impl FnMut(),
+        ) -> (Vec<std::time::Duration>, Vec<std::time::Duration>) {
+            for index in 0..WARMUPS_PER_PATH * 2 {
+                if index % 2 == 0 {
+                    old();
+                } else {
+                    paired();
+                }
+            }
+            let mut old_samples = Vec::with_capacity(SAMPLES_PER_PATH);
+            let mut paired_samples = Vec::with_capacity(SAMPLES_PER_PATH);
+            for index in 0..SAMPLES_PER_PATH * 2 {
+                let started = std::time::Instant::now();
+                if index % 2 == 0 {
+                    old();
+                    old_samples.push(started.elapsed());
+                } else {
+                    paired();
+                    paired_samples.push(started.elapsed());
+                }
+            }
+            (old_samples, paired_samples)
+        }
+
+        fn report(
+            rows: usize,
+            trial: usize,
+            component: &str,
+            old: &[std::time::Duration],
+            paired: &[std::time::Duration],
+        ) {
+            fn distribution(
+                samples: &[std::time::Duration],
+            ) -> (f64, f64, f64, f64, f64, f64, Vec<f64>) {
+                let mut values = samples
+                    .iter()
+                    .map(|sample| sample.as_secs_f64() * 1000.0)
+                    .collect::<Vec<_>>();
+                values.sort_by(f64::total_cmp);
+                let mean = values.iter().sum::<f64>() / values.len() as f64;
+                let variance = values
+                    .iter()
+                    .map(|value| {
+                        let delta = value - mean;
+                        delta * delta
+                    })
+                    .sum::<f64>()
+                    / values.len() as f64;
+                (
+                    values[0],
+                    values[values.len() / 4],
+                    values[values.len() / 2],
+                    values[values.len() * 3 / 4],
+                    values[values.len() - 1],
+                    variance.sqrt(),
+                    values,
+                )
+            }
+            let (old_min, old_p25, old_median, old_p75, old_max, old_stddev, old_values) =
+                distribution(old);
+            let (
+                paired_min,
+                paired_p25,
+                paired_median,
+                paired_p75,
+                paired_max,
+                paired_stddev,
+                paired_values,
+            ) = distribution(paired);
+            eprintln!(
+                "QWEN38_PAIRED_TIMING M={rows} trial={trial} component={component} \
+                 old_ms[min={old_min:.6},p25={old_p25:.6},median={old_median:.6},p75={old_p75:.6},max={old_max:.6},stddev={old_stddev:.6},samples={old_values:?}] \
+                 paired_ms[min={paired_min:.6},p25={paired_p25:.6},median={paired_median:.6},p75={paired_p75:.6},max={paired_max:.6},stddev={paired_stddev:.6},samples={paired_values:?}] \
+                 speedup={:.6}",
+                old_median / paired_median,
+            );
+        }
+
+        let (old_mlp, old_gdn) = load_focused(false);
+        let (paired_mlp, paired_gdn) = load_focused(true);
+        let paired_gdn_stats = match &paired_gdn.ingress {
+            Qwen35GdnIngress::PinnedAffine(fusion) => fusion,
+            Qwen35GdnIngress::Separate { .. } => panic!("expected paired GDN ingress"),
+        };
+        for (rows, expected_mlp_avoided, expected_gdn_workspace) in
+            [(288, 40_108_032, 2_211_840), (2048, 285_212_672, 3_145_728)]
+        {
+            let input = input(rows);
+            assert_eq!(
+                bytes(paired_mlp.forward_paired_rows(&input)),
+                bytes(old_mlp.forward(&input)),
+                "paired MLP final output differs at M={rows}",
+            );
+            let old_outputs = ingress_bytes(&old_gdn, &input, rows, false);
+            let paired_outputs = ingress_bytes(&paired_gdn, &input, rows, true);
+            for (name, (paired, old)) in ["qkv", "z", "beta", "alpha"]
+                .into_iter()
+                .zip(paired_outputs.into_iter().zip(old_outputs))
+            {
+                assert_eq!(
+                    paired, old,
+                    "paired GDN {name} standalone output differs at M={rows}",
+                );
+            }
+
+            let mlp_stats = paired_mlp.fusion_stats(rows).expect("paired MLP stats");
+            assert_eq!(mlp_stats.physical_dispatches, 4);
+            assert_eq!(mlp_stats.intermediate_bytes_avoided, 0);
+            assert_eq!(mlp_stats.workspace_bytes, 0);
+            assert_eq!(mlp_stats.hidden_copy_bytes, 0);
+            let paired_mlp_stats = paired_mlp
+                .paired_fusion_stats(rows)
+                .expect("paired MLP candidate stats");
+            assert_eq!(paired_mlp_stats.physical_dispatches, 2);
+            assert_eq!(
+                paired_mlp_stats.intermediate_bytes_avoided,
+                expected_mlp_avoided,
+            );
+            assert_eq!(paired_mlp_stats.workspace_bytes, 0);
+            assert_eq!(paired_mlp_stats.hidden_copy_bytes, 0);
+            let gdn_stats = paired_gdn_stats
+                .dispatch_stats(rows)
+                .expect("paired GDN stats");
+            assert_eq!(gdn_stats.physical_dispatches, 4);
+            assert_eq!(gdn_stats.workspace_bytes, 0);
+            assert_eq!(gdn_stats.hidden_copy_bytes, 0);
+            let paired_gdn_candidate_stats = paired_gdn_stats
+                .paired_dispatch_stats_for_benchmark(rows)
+                .expect("paired GDN candidate stats");
+            assert_eq!(paired_gdn_candidate_stats.physical_dispatches, 3);
+            assert_eq!(
+                paired_gdn_candidate_stats.workspace_bytes,
+                expected_gdn_workspace,
+            );
+            assert_eq!(paired_gdn_candidate_stats.hidden_copy_bytes, 0);
+
+            for trial in 1..=TRIALS {
+                let (old_samples, paired_samples) = alternating_samples(
+                    || sync_mlp(&old_mlp, &input, false),
+                    || sync_mlp(&paired_mlp, &input, true),
+                );
+                report(rows, trial, "MLP", &old_samples, &paired_samples);
+                let (old_samples, paired_samples) = alternating_samples(
+                    || sync_ingress(&old_gdn, &input, rows, false),
+                    || sync_ingress(&paired_gdn, &input, rows, true),
+                );
+                report(rows, trial, "GDN", &old_samples, &paired_samples);
+            }
         }
     }
 }
