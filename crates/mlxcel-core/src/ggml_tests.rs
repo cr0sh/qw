@@ -202,6 +202,7 @@ fn median_forward(mut launch: impl FnMut() -> UniquePtr<MlxArray>) -> std::time:
     samples[2]
 }
 
+
 #[test]
 fn fixed_qtype_table_matches_parsed_target_contract() {
     let actual = GgmlQType::TARGET_TYPES.map(|qtype| (qtype.id(), qtype.block_elements(), qtype.block_bytes()));
@@ -686,4 +687,323 @@ fn actual_q6_lm_head_row_range_microbench() {
     );
     assert!(draft_m1 < full_m1);
     assert!(verify_m3 < full_m3);
+}
+
+#[test]
+#[ignore = "requires verified local target GGUF artifact"]
+fn prototype_actual_q5_k_affine_repack() {
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
+
+    if !crate::metal_is_available() {
+        return;
+    }
+    let structure: serde_json::Value = serde_json::from_reader(
+        File::open(std::env::var("QWR_GGUF_STRUCTURE_PATH").unwrap()).unwrap(),
+    )
+    .unwrap();
+    let model = &structure["target"];
+    let tensor = model["tensor_infos_enriched"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tensor| {
+            tensor["type"].as_u64() == Some(13)
+                && tensor["shape"][0].as_u64() == Some(5120)
+                && tensor["shape"][1].as_u64().is_some_and(|rows| rows >= 1024)
+        })
+        .unwrap();
+    let width = 5120usize;
+    let rows = 1024usize;
+    let row_bytes = width / 256 * 176;
+    let mut source = vec![0u8; rows * row_bytes];
+    let mut file =
+        File::open(std::env::var("QWR_TARGET_GGUF_SMOKE_PATH").unwrap()).unwrap();
+    file.seek(SeekFrom::Start(
+        model["data_start"].as_u64().unwrap() + tensor["offset"].as_u64().unwrap(),
+    ))
+    .unwrap();
+    file.read_exact(&mut source).unwrap();
+    let direct =
+        GgmlQuantizedMatrix::from_bytes(&source, GgmlQType::Q5K.id(), width, rows).unwrap();
+    let affine =
+        crate::GgmlAffineMatrix::from_ggml_bytes(&source, GgmlQType::Q5K.id(), width, rows)
+            .unwrap();
+    let transcode = affine.transcode_stats();
+    eprintln!(
+        "Q5_K affine prototype transcode={:?} source={} resident={} peak_active={}",
+        transcode.elapsed,
+        transcode.source_bytes,
+        transcode.resident_bytes,
+        transcode.peak_active_bytes,
+    );
+
+    for m in [1usize, 3] {
+        let values: Vec<f32> = (0..m * width)
+            .map(|index| (index as i32 % 31 - 15) as f32 * 0.00390625)
+            .collect();
+        let input = crate::from_slice_f32(&values, &[m as i32, width as i32]);
+        let custom = raw_f32(direct.forward(input.as_ref().unwrap()).unwrap().as_ref().unwrap());
+        let upstream =
+            raw_f32(affine.forward(input.as_ref().unwrap()).unwrap().as_ref().unwrap());
+        let max_ulp = custom
+            .iter()
+            .zip(&upstream)
+            .map(|(&left, &right)| ulp_distance(left, right))
+            .max()
+            .unwrap();
+        let max_abs = custom
+            .iter()
+            .zip(&upstream)
+            .map(|(&left, &right)| (left - right).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!("Q5_K affine parity M={m} max_ulp={max_ulp} max_abs={max_abs}");
+    }
+
+    for m in [1usize, 3, 288, 2048] {
+        let values: Vec<f32> = (0..m * width)
+            .map(|index| (index as i32 % 31 - 15) as f32 * 0.00390625)
+            .collect();
+        let input = crate::from_slice_f32(&values, &[m as i32, width as i32]);
+        crate::eval(input.as_ref().unwrap());
+        let custom = median_forward(|| direct.forward(input.as_ref().unwrap()).unwrap());
+        let upstream = median_forward(|| affine.forward(input.as_ref().unwrap()).unwrap());
+        let stats = affine.dispatch_stats(m).unwrap();
+        let flops = stats.floating_point_operations as f64;
+        let gbytes =
+            (stats.packed_bytes_read + stats.activation_bytes_read) as f64 / 1e9;
+        eprintln!(
+            "Q5_K affine prototype M={m} custom={custom:?} {:.3}TF upstream={upstream:?} {:.3}TF {:.3}GB/s speedup={:.3}x",
+            flops / custom.as_secs_f64() / 1e12,
+            flops / upstream.as_secs_f64() / 1e12,
+            gbytes / upstream.as_secs_f64(),
+            custom.as_secs_f64() / upstream.as_secs_f64(),
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires verified local target and MTP GGUF artifacts"]
+fn actual_affine_repack_matches_reference_for_supported_qtypes() {
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
+
+    if !crate::metal_is_available() {
+        return;
+    }
+    let structure: serde_json::Value = serde_json::from_reader(
+        File::open(std::env::var("QWR_GGUF_STRUCTURE_PATH").unwrap()).unwrap(),
+    )
+    .unwrap();
+    let supported = [
+        GgmlQType::Q8_0,
+        GgmlQType::Q3K,
+        GgmlQType::Q4K,
+        GgmlQType::Q5K,
+        GgmlQType::Iq4Nl,
+        GgmlQType::Iq3S,
+        GgmlQType::Iq4Xs,
+    ];
+    for (model_key, path_variable) in [
+        ("target", "QWR_TARGET_GGUF_SMOKE_PATH"),
+        ("mtp", "QWR_MTP_GGUF_SMOKE_PATH"),
+    ] {
+        let model = &structure[model_key];
+        let mut file = File::open(std::env::var(path_variable).unwrap()).unwrap();
+        for &qtype in &supported {
+            let Some(tensor) = model["tensor_infos_enriched"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tensor| {
+                    tensor["type"].as_u64() == Some(u64::from(qtype.id()))
+                        && tensor["shape"].as_array().is_some_and(|shape| shape.len() == 2)
+                        && tensor["shape"][1].as_u64().is_some_and(|rows| rows >= 3)
+                })
+            else {
+                continue;
+            };
+            let width = tensor["shape"][0].as_u64().unwrap() as usize;
+            let rows = 3usize;
+            let row_bytes = width / qtype.block_elements() * qtype.block_bytes();
+            let mut source = vec![0u8; row_bytes * rows];
+            file.seek(SeekFrom::Start(
+                model["data_start"].as_u64().unwrap() + tensor["offset"].as_u64().unwrap(),
+            ))
+            .unwrap();
+            file.read_exact(&mut source).unwrap();
+            let direct =
+                GgmlQuantizedMatrix::from_bytes(&source, qtype.id(), width, rows).unwrap();
+            let mut released = Vec::new();
+            let affine = crate::GgmlAffineMatrix::from_ggml_bytes_with_progress(
+                &source,
+                qtype.id(),
+                width,
+                rows,
+                |range| released.push(range),
+            )
+            .unwrap();
+            assert_eq!(released, [0..source.len()]);
+            let weights: Vec<Vec<f32>> = (0..rows)
+                .map(|row| {
+                    decode_row(
+                        qtype,
+                        &source[row * row_bytes..(row + 1) * row_bytes],
+                        width,
+                    )
+                })
+                .collect();
+            let activation: Vec<f32> = (0..width)
+                .map(|column| (column as i32 % 29 - 14) as f32 * 0.00390625)
+                .collect();
+            let input_m1 = crate::from_slice_f32(&activation, &[1, width as i32]);
+            let direct_m1 =
+                raw_f32(direct.forward(input_m1.as_ref().unwrap()).unwrap().as_ref().unwrap());
+            let affine_m1 =
+                raw_f32(affine.forward(input_m1.as_ref().unwrap()).unwrap().as_ref().unwrap());
+            for output in 0..rows {
+                let expected = activation
+                    .iter()
+                    .zip(&weights[output])
+                    .map(|(input, weight)| input * weight)
+                    .sum::<f32>();
+                let tolerance = 0.003 + expected.abs() * 0.00005;
+                assert!((direct_m1[output] - expected).abs() <= tolerance);
+                assert!((affine_m1[output] - expected).abs() <= tolerance);
+            }
+            let mut verify_values = Vec::with_capacity(3 * width);
+            for row in 0..3 {
+                verify_values.extend(
+                    activation
+                        .iter()
+                        .map(|value| value + row as f32 * 0.0009765625),
+                );
+            }
+            let input_m3 = crate::from_slice_f32(&verify_values, &[3, width as i32]);
+            let affine_m3 =
+                raw_f32(affine.forward(input_m3.as_ref().unwrap()).unwrap().as_ref().unwrap());
+            let corresponding_ulp = affine_m1
+                .iter()
+                .zip(&affine_m3[..rows])
+                .map(|(&left, &right)| ulp_distance(left, right))
+                .max()
+                .unwrap();
+            eprintln!(
+                "actual affine {model_key} {qtype:?} width={width} direct_affine_max_ulp={} corresponding_ulp={corresponding_ulp} resident={} source={}",
+                direct_m1
+                    .iter()
+                    .zip(&affine_m1)
+                    .map(|(&left, &right)| ulp_distance(left, right))
+                    .max()
+                    .unwrap(),
+                affine.transcode_stats().resident_bytes,
+                source.len(),
+            );
+            assert!(corresponding_ulp <= 1);
+
+            let selected = affine.select_rows(&[2..3, 0..1]).unwrap();
+            let selected_values = raw_f32(
+                selected
+                    .forward(input_m3.as_ref().unwrap())
+                    .unwrap()
+                    .as_ref()
+                    .unwrap(),
+            );
+            for input_row in 0..3 {
+                assert!(
+                    ulp_distance(selected_values[input_row * 2], affine_m3[input_row * 3 + 2])
+                        <= 1
+                );
+                assert!(
+                    ulp_distance(
+                        selected_values[input_row * 2 + 1],
+                        affine_m3[input_row * 3],
+                    ) <= 1
+                );
+            }
+            let embedding = crate::GgmlAffineEmbedding::from_ggml_bytes(
+                &source,
+                qtype.id(),
+                width,
+                rows,
+            )
+            .unwrap();
+            let indices = crate::from_slice_i32(&[2, 0, 1], &[3]);
+            let embedded =
+                raw_f32(embedding.forward(indices.as_ref().unwrap()).unwrap().as_ref().unwrap());
+            for (selected_row, source_row) in [2usize, 0, 1].into_iter().enumerate() {
+                for column in 0..width {
+                    assert!(
+                        ulp_distance(
+                            embedded[selected_row * width + column],
+                            weights[source_row][column],
+                        ) <= 1
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires verified local target GGUF artifact"]
+fn actual_q6_k_contains_non_affine_group32() {
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
+
+    let structure: serde_json::Value = serde_json::from_reader(
+        File::open(std::env::var("QWR_GGUF_STRUCTURE_PATH").unwrap()).unwrap(),
+    )
+    .unwrap();
+    let model = &structure["target"];
+    let tensor = model["tensor_infos_enriched"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tensor| {
+            tensor["type"].as_u64() == Some(14)
+                && tensor["shape"][0].as_u64() == Some(5120)
+        })
+        .unwrap();
+    let row_bytes = 5120 / 256 * 210;
+    let mut source = vec![0u8; row_bytes * 8];
+    let mut file =
+        File::open(std::env::var("QWR_TARGET_GGUF_SMOKE_PATH").unwrap()).unwrap();
+    file.seek(SeekFrom::Start(
+        model["data_start"].as_u64().unwrap() + tensor["offset"].as_u64().unwrap(),
+    ))
+    .unwrap();
+    file.read_exact(&mut source).unwrap();
+    let mut widest = 0i32;
+    for block in source.chunks_exact(210) {
+        for group32 in 0..8 {
+            let mut minimum = i32::MAX;
+            let mut maximum = i32::MIN;
+            for group_column in 0..32 {
+                let column = group32 * 32 + group_column;
+                let half = column / 128;
+                let quadrant = (column % 128) / 32;
+                let lane = column % 32;
+                let low_packed = block[half * 64 + lane + (quadrant & 1) * 32];
+                let low = if quadrant < 2 {
+                    low_packed & 15
+                } else {
+                    low_packed >> 4
+                };
+                let high = (block[128 + half * 32 + lane] >> (2 * quadrant)) & 3;
+                let quant = i32::from(low | (high << 4)) - 32;
+                let scale =
+                    block[192 + half * 8 + lane / 16 + quadrant * 2] as i8 as i32;
+                let coefficient = scale * quant;
+                minimum = minimum.min(coefficient);
+                maximum = maximum.max(coefficient);
+            }
+            widest = widest.max(maximum - minimum);
+        }
+    }
+    eprintln!("actual Q6_K widest group32 integer span={widest}");
+    assert!(
+        widest > 255,
+        "actual Q6_K unexpectedly fits an UINT8 affine group"
+    );
 }
