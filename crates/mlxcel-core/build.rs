@@ -16,7 +16,7 @@
 // This builds the MLX C++ library and the cxx bridge
 
 use cmake::Config;
-use std::{env, path::PathBuf};
+use std::{env, fs, path::PathBuf, process::Command};
 
 // Single-source-of-truth resolution and verification of the pinned MLX commit.
 // Shared by path (not by dependency) with `mlxcel-mlx-pin`, which unit-tests it
@@ -53,6 +53,22 @@ fn main() {
     mark_mlx_cache_valid(&out_dir, &mlx_commit);
     let mlx_include = mlx_dst.join("build/include");
     let mlx_lib = mlx_dst.join("build/lib");
+    let quantized_metal = qwen38_quantized_metal_preamble(
+        &out_dir,
+        &mlx_dst,
+        &[
+            ("steel/gemm/gemm", "gemm.cpp"),
+            ("quantized_utils", "quantized_utils.cpp"),
+            ("quantized", "quantized.cpp"),
+        ],
+    );
+    fs::write(
+        out_dir.join("qwen38_quantized_metal.h"),
+        format!(
+            "#pragma once\nstatic constexpr const char* QWEN38_QUANTIZED_METAL = R\"QWRMLX(\n{quantized_metal}\n)QWRMLX\";\n"
+        ),
+    )
+    .expect("write embedded pinned MLX quantized Metal preamble");
 
     // Build the cxx bridge with optimization flags
     let mut bridge = cxx_build::bridge("src/lib.rs");
@@ -65,6 +81,7 @@ fn main() {
         .file("cpp/mlx_cxx_kernels.cpp")
         .file("cpp/mlx_cxx_ggml.cpp")
         .file("cpp/mlx_cxx_qwen38.cpp")
+        .file("cpp/mlx_cxx_qwen38_fusion.cpp")
         .file("cpp/mlx_cxx_nemotron.cpp")
         .file("cpp/mlx_cxx_ext.cpp")
         // Fused Sparse-V SDPA kernel launcher. Lives under
@@ -109,6 +126,7 @@ fn main() {
         .file("../mlx-cpp/turbo/fused_norm.cpp")
         .file("../mlx-cpp/turbo/fused_rope_append.cpp")
         .include(&mlx_include)
+        .include(&out_dir)
         .include("cpp")
         .include("../mlx-cpp/turbo")
         .flag_if_supported("-std=c++20")
@@ -205,6 +223,7 @@ fn main() {
     println!("cargo:rerun-if-changed=cpp/mlx_cxx_kernels.cpp");
     println!("cargo:rerun-if-changed=cpp/mlx_cxx_ggml.cpp");
     println!("cargo:rerun-if-changed=cpp/mlx_cxx_qwen38.cpp");
+    println!("cargo:rerun-if-changed=cpp/mlx_cxx_qwen38_fusion.cpp");
     println!("cargo:rerun-if-changed=cpp/mlx_cxx_nemotron.cpp");
     println!("cargo:rerun-if-changed=cpp/mlx_cxx_ext.cpp");
     println!("cargo:rerun-if-changed=metal/fused_attention_metal4.metal");
@@ -421,6 +440,49 @@ fn detect_cuda_arch() -> Option<String> {
     }
 }
 
+fn qwen38_quantized_metal_preamble(
+    out_dir: &PathBuf,
+    mlx_dst: &PathBuf,
+    sources: &[(&str, &str)],
+) -> String {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
+        return String::new();
+    }
+
+    let mlx_source = mlx_dst.join("build/_deps/mlx-src");
+    let script = mlx_source.join("mlx/backend/metal/make_compiled_preamble.sh");
+    let generated_dir = out_dir.join("qwen38_metal_jit");
+    let compiler = env::var("CC").unwrap_or_else(|_| "cc".to_owned());
+    let mut preamble = String::new();
+
+    for &(source, generated) in sources {
+        let status = Command::new("bash")
+            .arg(&script)
+            .arg(&generated_dir)
+            .arg(&compiler)
+            .arg(&mlx_source)
+            .arg(source)
+            .status()
+            .unwrap_or_else(|err| panic!("generate pinned MLX {source} Metal preamble: {err}"));
+        assert!(
+            status.success(),
+            "pinned MLX Metal preamble generation failed for {source}"
+        );
+
+        let generated = fs::read_to_string(generated_dir.join(generated))
+            .unwrap_or_else(|err| panic!("read generated pinned MLX {source} preamble: {err}"));
+        let (_, source) = generated
+            .split_once("return R\"preamble(\n")
+            .unwrap_or_else(|| panic!("missing preamble start in generated MLX {source} source"));
+        let (source, _) = source
+            .split_once("\n)preamble\";")
+            .unwrap_or_else(|| panic!("missing preamble end in generated MLX {source} source"));
+        preamble.push_str(source);
+        preamble.push('\n');
+    }
+
+    preamble
+}
 /// Append CUDA's architecture-specific `a` suffix for SM >= 90, mirroring MLX's
 /// own CMake logic (`MLX_CUDA_ARCHITECTURES GREATER_EQUAL 90` -> append `a`).
 ///
@@ -429,6 +491,7 @@ fn detect_cuda_arch() -> Option<String> {
 /// "90a" (not "90"). SM < 90 (e.g. Ampere sm_80/sm_86) has no `a` variant and is
 /// returned unchanged.
 #[cfg(feature = "cuda")]
+
 fn sm_arch_with_suffix(sm: &str) -> String {
     match sm.parse::<u32>() {
         Ok(n) if n >= 90 => format!("{sm}a"),

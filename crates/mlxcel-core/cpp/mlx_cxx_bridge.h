@@ -164,6 +164,7 @@ std::unique_ptr<MlxArray> from_bytes_f16(rust::Slice<const uint8_t> data, rust::
 // Array property accessors.
 rust::Vec<int32_t> array_shape(const MlxArray& arr);
 int32_t array_dtype(const MlxArray& arr);
+bool array_is_row_contiguous(const MlxArray& arr);
 size_t array_size(const MlxArray& arr);
 size_t array_ndim(const MlxArray& arr);
 size_t array_itemsize(const MlxArray& arr);
@@ -2295,6 +2296,52 @@ std::unique_ptr<MlxArray> qwen38_affine_m23_matmul(
     int32_t out_features,
     int32_t input_rows,
     bool require_pinned_shape);
+
+// M>=4 all-affine fusion for the exact pinned Qwen3.8 artifact.
+std::unique_ptr<MlxArray> qwen38_affine_mlp_fused(
+    const MlxArray& x,
+    const MlxArray& gate_w,
+    const MlxArray& gate_s,
+    const MlxArray& gate_b,
+    int32_t gate_bits,
+    const MlxArray& up_w,
+    const MlxArray& up_s,
+    const MlxArray& up_b,
+    int32_t up_bits,
+    const MlxArray& down_w,
+    const MlxArray& down_s,
+    const MlxArray& down_b,
+    int32_t down_bits);
+
+struct Qwen38GdnIngressOutputs {
+    std::unique_ptr<MlxArray> qkv;
+    std::unique_ptr<MlxArray> z;
+    std::unique_ptr<MlxArray> beta;
+    std::unique_ptr<MlxArray> alpha;
+};
+
+std::unique_ptr<Qwen38GdnIngressOutputs> qwen38_affine_gdn_ingress_fused(
+    const MlxArray& x,
+    const MlxArray& qkv_w,
+    const MlxArray& qkv_s,
+    const MlxArray& qkv_b,
+    int32_t qkv_bits,
+    const MlxArray& z_w,
+    const MlxArray& z_s,
+    const MlxArray& z_b,
+    int32_t z_bits,
+    const MlxArray& beta_w,
+    const MlxArray& beta_s,
+    const MlxArray& beta_b,
+    int32_t beta_bits,
+    const MlxArray& alpha_w,
+    const MlxArray& alpha_s,
+    const MlxArray& alpha_b,
+    int32_t alpha_bits);
+std::unique_ptr<MlxArray> qwen38_gdn_take_qkv(Qwen38GdnIngressOutputs& outputs);
+std::unique_ptr<MlxArray> qwen38_gdn_take_z(Qwen38GdnIngressOutputs& outputs);
+std::unique_ptr<MlxArray> qwen38_gdn_take_beta(Qwen38GdnIngressOutputs& outputs);
+std::unique_ptr<MlxArray> qwen38_gdn_take_alpha(Qwen38GdnIngressOutputs& outputs);
 
 // Opaque holder for weights loaded via MLX's native load_safetensors().
 // Arrays are lazy — MLX manages the mmap internally, no eager copy needed.

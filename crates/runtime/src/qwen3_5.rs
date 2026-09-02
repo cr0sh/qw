@@ -31,6 +31,7 @@ use crate::qwen3_5_weights::{
 };
 use crate::qwen3_next::{Mlp, Quantization, Qwen3NextAttention, Qwen3NextCache, Qwen3NextConfig};
 use crate::qwen3_vl_vision::{Qwen3VLVisionConfig, Qwen3VLVisionEncoder};
+use crate::qwen38_plan::QWEN38_GDN_FUSION_PLAN;
 use anyhow::{Context, Result, ensure};
 use mlxcel_core::cache::{KVCacheMode, SequenceId, Turbo4SnapshotTensors};
 use mlxcel_core::generate::{LanguageModel, ModelStateSnapshot};
@@ -476,6 +477,68 @@ fn fuse_gated_aux_projections(
     Qwen35GatedAuxProjections::Separate { z, b, a }
 }
 
+enum Qwen35GdnIngress {
+    Separate {
+        qkv: Qwen35Linear,
+        aux: Qwen35GatedAuxProjections,
+    },
+    PinnedAffine(mlxcel_core::Qwen38AffineGdnIngressFusion),
+}
+
+impl Qwen35GdnIngress {
+    fn forward(
+        &self,
+        inputs: &MlxArray,
+        _batch: i32,
+        _sequence: i32,
+        _value_dim: usize,
+        _num_v_heads: usize,
+    ) -> (
+        UniquePtr<MlxArray>,
+        UniquePtr<MlxArray>,
+        UniquePtr<MlxArray>,
+        UniquePtr<MlxArray>,
+    ) {
+        match self {
+            Self::Separate { qkv, aux } => {
+                let qkv = qkv.forward(inputs);
+                let (z, beta, alpha) = match aux {
+                    Qwen35GatedAuxProjections::Separate { z, b, a } => {
+                        (z.forward(inputs), b.forward(inputs), a.forward(inputs))
+                    }
+                    #[cfg(any(feature = "specprefill", test))]
+                    Qwen35GatedAuxProjections::Fused(projection) => {
+                        let projected = projection.forward(inputs);
+                        let z_end = _value_dim as i32;
+                        let beta_end = z_end + _num_v_heads as i32;
+                        let alpha_end = beta_end + _num_v_heads as i32;
+                        (
+                            mlxcel_core::slice(&projected, &[0, 0, 0], &[_batch, _sequence, z_end]),
+                            mlxcel_core::slice(
+                                &projected,
+                                &[0, 0, z_end],
+                                &[_batch, _sequence, beta_end],
+                            ),
+                            mlxcel_core::slice(
+                                &projected,
+                                &[0, 0, beta_end],
+                                &[_batch, _sequence, alpha_end],
+                            ),
+                        )
+                    }
+                };
+                (qkv, z, beta, alpha)
+            }
+            Self::PinnedAffine(fusion) => {
+                let outputs = fusion
+                    .forward(inputs)
+                    .expect("validated pinned Qwen3.8 GDN ingress fusion must succeed");
+                (outputs.qkv, outputs.z, outputs.beta, outputs.alpha)
+            }
+        }
+    }
+}
+
 // GatedDeltaNet - Qwen3.5 variant with separately stored projections.
 /// Fuses compatible z, beta, and decay projections at load time.
 #[allow(dead_code)]
@@ -491,8 +554,7 @@ pub(crate) struct Qwen35GatedDeltaNet {
     conv_dim: usize,
 
     conv1d_weight: UniquePtr<MlxArray>,
-    in_proj_qkv: Qwen35Linear,
-    aux_projections: Qwen35GatedAuxProjections,
+    ingress: Qwen35GdnIngress,
     dt_bias: UniquePtr<MlxArray>,
     a_log: UniquePtr<MlxArray>,
     ssm_a_is_coefficient: bool,
@@ -536,24 +598,9 @@ impl Qwen35GatedDeltaNet {
 
         let effective_mask = mask;
 
-        let qkv = self.in_proj_qkv.forward(inputs);
-        let (z, b_proj, a) = match &self.aux_projections {
-            Qwen35GatedAuxProjections::Separate { z, b, a } => {
-                (z.forward(inputs), b.forward(inputs), a.forward(inputs))
-            }
-            #[cfg(any(feature = "specprefill", test))]
-            Qwen35GatedAuxProjections::Fused(projection) => {
-                let projected = projection.forward(inputs);
-                let z_end = self.value_dim as i32;
-                let b_end = z_end + self.num_v_heads as i32;
-                let a_end = b_end + self.num_v_heads as i32;
-                (
-                    mlxcel_core::slice(&projected, &[0, 0, 0], &[b, s, z_end]),
-                    mlxcel_core::slice(&projected, &[0, 0, z_end], &[b, s, b_end]),
-                    mlxcel_core::slice(&projected, &[0, 0, b_end], &[b, s, a_end]),
-                )
-            }
-        };
+        let (qkv, z, b_proj, a) =
+            self.ingress
+                .forward(inputs, b, s, self.value_dim, self.num_v_heads);
         let z = mlxcel_core::reshape(&z, &[b, s, self.num_v_heads as i32, self.head_v_dim as i32]);
 
         // Get conv state from cache
@@ -770,13 +817,42 @@ impl Qwen35GatedDeltaNet {
         let in_proj_z = weights.linear(slot(LayerTensor::LinearGate), z_group_size, z_bits)?;
         let in_proj_b = weights.linear(slot(LayerTensor::LinearBeta), b_group_size, b_bits)?;
         let in_proj_a = weights.linear(slot(LayerTensor::LinearAlpha), a_group_size, a_bits)?;
-        let aux_projections = fuse_gated_aux_projections(
-            weights.legacy_weights(),
-            [&z_prefix, &b_prefix, &a_prefix],
-            in_proj_z,
-            in_proj_b,
-            in_proj_a,
-        );
+        let descriptor = QWEN38_GDN_FUSION_PLAN
+            .iter()
+            .find(|descriptor| role == ModelRole::Target && descriptor.layer == layer);
+        let ingress = if weights.qwen38_fusion_enabled()
+            && descriptor.is_some_and(|descriptor| descriptor.all_affine())
+            && in_proj_qkv.is_affine()
+            && in_proj_z.is_affine()
+            && in_proj_b.is_affine()
+            && in_proj_a.is_affine()
+        {
+            let (qkv, qkv_m23) = in_proj_qkv.into_affine().expect("checked affine qkv");
+            let (z, z_m23) = in_proj_z.into_affine().expect("checked affine z");
+            let (beta, beta_m23) = in_proj_b.into_affine().expect("checked affine beta");
+            let (alpha, alpha_m23) = in_proj_a.into_affine().expect("checked affine alpha");
+            Qwen35GdnIngress::PinnedAffine(
+                mlxcel_core::Qwen38AffineGdnIngressFusion::new(
+                    qkv,
+                    z,
+                    beta,
+                    alpha,
+                    [qkv_m23, z_m23, beta_m23, alpha_m23],
+                )
+                .map_err(|error| error.to_string())?,
+            )
+        } else {
+            Qwen35GdnIngress::Separate {
+                qkv: in_proj_qkv,
+                aux: fuse_gated_aux_projections(
+                    weights.legacy_weights(),
+                    [&z_prefix, &b_prefix, &a_prefix],
+                    in_proj_z,
+                    in_proj_b,
+                    in_proj_a,
+                ),
+            }
+        };
         let dt_bias = weights.tensor(slot(LayerTensor::LinearDtBias))?;
         let a_log = weights.tensor(slot(LayerTensor::LinearA))?;
         let norm_weight = weights.tensor(slot(LayerTensor::LinearNorm))?;
@@ -793,8 +869,7 @@ impl Qwen35GatedDeltaNet {
             conv_kernel_size,
             conv_dim,
             conv1d_weight,
-            in_proj_qkv,
-            aux_projections,
+            ingress,
             dt_bias,
             a_log,
             ssm_a_is_coefficient: weights.gguf_ssm_a_is_coefficient(),
@@ -1957,6 +2032,13 @@ impl Qwen35Model {
     fn load_pinned_without_m23(kv_cache_mode: KVCacheMode) -> Result<(Self, GgufTextAssets)> {
         let weights =
             GgufWeightSource::open_without_m23().context("failed to open pinned GGUF pair")?;
+        Self::load_pinned_from_weight_source(weights, kv_cache_mode)
+    }
+
+    #[cfg(test)]
+    fn load_pinned_without_fusion(kv_cache_mode: KVCacheMode) -> Result<(Self, GgufTextAssets)> {
+        let weights =
+            GgufWeightSource::open_without_fusion().context("failed to open pinned GGUF pair")?;
         Self::load_pinned_from_weight_source(weights, kv_cache_mode)
     }
 
@@ -3845,6 +3927,241 @@ mod tests {
                     "target M={input_rows} verification row {row} differs by {max_ulp} ULP"
                 );
             }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the complete pinned Qwen3.8 27B GGUF pair"]
+    fn real_gguf_fused_target_logits_stay_within_one_ulp() {
+        fn verify_last_row(model: &Qwen35Model, rows: usize, repetition: usize) -> Vec<u8> {
+            model.reset_runtime_state();
+            let prefix = mlxcel_core::from_slice_i32(&[9_707, 11], &[1, 2]);
+            model
+                .forward_mtp_prefill_chunks(&prefix, None, None, None, |_, _, _| {})
+                .expect("target prefix");
+            let tokens = (0..rows)
+                .map(|index| 1 + ((index * 7_919 + repetition * 104_729 + 1_879) % 200_000) as i32)
+                .collect::<Vec<_>>();
+            let block = mlxcel_core::from_slice_i32(&tokens, &[1, rows as i32]);
+            let logits = model.forward_mtp_verify(&block).logits;
+            let shape = mlxcel_core::array_shape(&logits);
+            let mut start = vec![0; shape.len()];
+            let mut end = shape.clone();
+            start[shape.len() - 2] = rows as i32 - 1;
+            end[shape.len() - 2] = rows as i32;
+            let last_row = mlxcel_core::slice(&logits, &start, &end);
+            mlxcel_core::eval(&last_row);
+            mlxcel_core::array_to_raw_bytes(&last_row)
+        }
+
+        fn capture(model: &Qwen35Model) -> Vec<(usize, usize, Vec<u8>)> {
+            [(4, 1), (5, 1), (33, 1), (128, 1), (288, 3)]
+                .into_iter()
+                .flat_map(|(rows, repetitions)| {
+                    (0..repetitions).map(move |repetition| {
+                        (rows, repetition, verify_last_row(model, rows, repetition))
+                    })
+                })
+                .collect()
+        }
+
+        let unfused = {
+            let (model, _) = Qwen35Model::load_pinned_without_fusion(KVCacheMode::Fp16)
+                .expect("load unfused Qwen3.8 GGUF");
+            capture(&model)
+        };
+        let fused = {
+            let (model, _) =
+                Qwen35Model::load_pinned(KVCacheMode::Fp16).expect("load fused Qwen3.8 GGUF");
+            capture(&model)
+        };
+
+        let ordered = |value: f32| {
+            let bits = value.to_bits() as i32;
+            if bits < 0 { i32::MIN - bits } else { bits }
+        };
+        for ((rows, repetition, left), (right_rows, right_repetition, right)) in
+            unfused.iter().zip(&fused)
+        {
+            assert_eq!((rows, repetition), (right_rows, right_repetition));
+            assert_eq!(left.len(), right.len());
+            let max_ulp = left
+                .chunks_exact(4)
+                .zip(right.chunks_exact(4))
+                .map(|(left, right)| {
+                    let left = f32::from_le_bytes(left.try_into().unwrap());
+                    let right = f32::from_le_bytes(right.try_into().unwrap());
+                    ordered(left).abs_diff(ordered(right))
+                })
+                .max()
+                .unwrap_or(0);
+            assert!(
+                max_ulp <= 1,
+                "target M={rows} repetition {repetition} differs by {max_ulp} ULP"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the complete pinned Qwen3.8 27B GGUF pair"]
+    fn real_gguf_affine_fusion_exactness_and_timing() {
+        fn load_focused(fused: bool) -> (Mlp, Qwen35GatedDeltaNet) {
+            let weights = if fused {
+                GgufWeightSource::open()
+            } else {
+                GgufWeightSource::open_without_fusion()
+            }
+            .expect("open pinned GGUF pair");
+            let config = weights.config().expect("load pinned config");
+            let next_config = config.to_qwen3next_config();
+            let mlp = Mlp::from_weights(&weights, &next_config, ModelRole::Target, 3)
+                .expect("load representative A4/A5 MLP");
+            let gdn = Qwen35GatedDeltaNet::from_weights(&weights, &config, ModelRole::Target, 0)
+                .expect("load representative A5/A8 GDN");
+            (mlp, gdn)
+        }
+
+        fn input(rows: usize) -> UniquePtr<MlxArray> {
+            let values = (0..rows * 5120)
+                .map(|index| {
+                    let row = index / 5120;
+                    let column = index % 5120;
+                    (column as i32 % 37 - 18) as f32 * 0.00390625 + row as f32 * 0.000_000_953_674_3
+                })
+                .collect::<Vec<_>>();
+            mlxcel_core::from_slice_f32(&values, &[1, rows as i32, 5120])
+        }
+
+        fn bytes(array: UniquePtr<MlxArray>) -> Vec<u8> {
+            mlxcel_core::eval(&array);
+            mlxcel_core::array_to_raw_bytes(&array)
+        }
+
+        fn ingress_bytes(gdn: &Qwen35GatedDeltaNet, input: &MlxArray, rows: usize) -> [Vec<u8>; 4] {
+            let (qkv, z, beta, alpha) =
+                gdn.ingress
+                    .forward(input, 1, rows as i32, gdn.value_dim, gdn.num_v_heads);
+            [bytes(qkv), bytes(z), bytes(beta), bytes(alpha)]
+        }
+
+        fn median(mut samples: Vec<std::time::Duration>) -> std::time::Duration {
+            samples.sort_unstable();
+            samples[samples.len() / 2]
+        }
+
+        fn time_mlp(mlp: &Mlp, input: &MlxArray) -> std::time::Duration {
+            bytes(mlp.forward(input));
+            median(
+                (0..3)
+                    .map(|_| {
+                        let started = std::time::Instant::now();
+                        bytes(mlp.forward(input));
+                        started.elapsed()
+                    })
+                    .collect(),
+            )
+        }
+
+        fn time_ingress(
+            gdn: &Qwen35GatedDeltaNet,
+            input: &MlxArray,
+            rows: usize,
+        ) -> std::time::Duration {
+            ingress_bytes(gdn, input, rows);
+            median(
+                (0..3)
+                    .map(|_| {
+                        let started = std::time::Instant::now();
+                        ingress_bytes(gdn, input, rows);
+                        started.elapsed()
+                    })
+                    .collect(),
+            )
+        }
+
+        let (unfused_mlp, unfused_gdn) = load_focused(false);
+        let (fused_mlp, fused_gdn) = load_focused(true);
+        for rows in [4, 5, 32, 33, 64, 128, 256, 288, 2048] {
+            let input = input(rows);
+            let unfused = bytes(unfused_mlp.forward(&input));
+            let fused = bytes(fused_mlp.forward(&input));
+            assert!(fused == unfused, "MLP output differs at M={rows}");
+
+            let unfused = ingress_bytes(&unfused_gdn, &input, rows);
+            let fused = ingress_bytes(&fused_gdn, &input, rows);
+            for (name, (fused, unfused)) in ["qkv", "z", "beta", "alpha"]
+                .into_iter()
+                .zip(fused.into_iter().zip(unfused))
+            {
+                assert!(fused == unfused, "GDN {name} output differs at M={rows}");
+            }
+        }
+        let f16_source = input(32);
+        let f16_input = mlxcel_core::astype(&f16_source, mlxcel_core::dtype::FLOAT16);
+        let strided_values = (0..32 * 5120)
+            .map(|index| (index as i32 % 29 - 14) as f32 * 0.0078125)
+            .collect::<Vec<_>>();
+        let strided_source = mlxcel_core::from_slice_f32(&strided_values, &[1, 5120, 32]);
+        let strided_input = mlxcel_core::transpose_axes(&strided_source, &[0, 2, 1]);
+        for (name, input) in [("float16", f16_input), ("strided", strided_input)] {
+            assert_eq!(
+                bytes(fused_mlp.forward(&input)),
+                bytes(unfused_mlp.forward(&input)),
+                "MLP fallback differs for {name} input",
+            );
+            let fused = ingress_bytes(&fused_gdn, &input, 32);
+            let unfused = ingress_bytes(&unfused_gdn, &input, 32);
+            assert_eq!(fused, unfused, "GDN fallback differs for {name} input");
+        }
+
+        let fused_gdn_stats = match &fused_gdn.ingress {
+            Qwen35GdnIngress::PinnedAffine(fusion) => fusion,
+            Qwen35GdnIngress::Separate { .. } => panic!("expected fused GDN ingress"),
+        };
+        for (
+            rows,
+            expected_mlp_avoided,
+            expected_mlp_dispatches,
+            expected_gdn_workspace,
+            expected_gdn_dispatches,
+        ) in [
+            (4, 0, 4, 0, 4),
+            (5, 0, 4, 0, 4),
+            (32, 0, 4, 0, 4),
+            (33, 4_595_712, 2, 1_013_760, 3),
+            (64, 0, 4, 0, 4),
+            (128, 0, 4, 1_966_080, 3),
+            (256, 0, 4, 0, 4),
+            (288, 0, 4, 0, 4),
+            (2048, 0, 4, 0, 4),
+        ] {
+            let input = input(rows);
+            let unfused_mlp_time = time_mlp(&unfused_mlp, &input);
+            let fused_mlp_time = time_mlp(&fused_mlp, &input);
+            let unfused_gdn_time = time_ingress(&unfused_gdn, &input, rows);
+            let fused_gdn_time = time_ingress(&fused_gdn, &input, rows);
+            let mlp_stats = fused_mlp.fusion_stats(rows).expect("fused MLP stats");
+            let gdn_stats = fused_gdn_stats
+                .dispatch_stats(rows)
+                .expect("fused GDN stats");
+            assert_eq!(mlp_stats.physical_dispatches, expected_mlp_dispatches);
+            assert_eq!(mlp_stats.intermediate_bytes_avoided, expected_mlp_avoided);
+            assert_eq!(mlp_stats.workspace_bytes, 0);
+            assert_eq!(mlp_stats.hidden_copy_bytes, 0);
+            assert_eq!(gdn_stats.physical_dispatches, expected_gdn_dispatches);
+            assert_eq!(gdn_stats.workspace_bytes, expected_gdn_workspace);
+            assert_eq!(gdn_stats.hidden_copy_bytes, 0);
+            eprintln!(
+                "Qwen3.8 affine fusion M={rows}: MLP unfused={unfused_mlp_time:?} fused={fused_mlp_time:?} dispatches={} matrix_bytes={} avoided={} workspace={}; GDN unfused={unfused_gdn_time:?} fused={fused_gdn_time:?} dispatches={} matrix_bytes={} avoided={} workspace={}",
+                mlp_stats.physical_dispatches,
+                mlp_stats.matrix_bytes_read,
+                mlp_stats.intermediate_bytes_avoided,
+                mlp_stats.workspace_bytes,
+                gdn_stats.physical_dispatches,
+                gdn_stats.matrix_bytes_read,
+                gdn_stats.intermediate_bytes_avoided,
+                gdn_stats.workspace_bytes,
+            );
         }
     }
 }

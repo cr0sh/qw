@@ -381,6 +381,373 @@ impl GgmlAffineMatrix {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Qwen38FusionStats {
+    pub physical_dispatches: usize,
+    pub matrix_bytes_read: usize,
+    pub intermediate_bytes_avoided: usize,
+    pub workspace_bytes: usize,
+    pub hidden_copy_bytes: usize,
+}
+
+pub struct Qwen38AffineMlpFusion {
+    gate: GgmlAffineMatrix,
+    up: GgmlAffineMatrix,
+    down: GgmlAffineMatrix,
+    gate_m23: bool,
+    up_m23: bool,
+    down_m23: bool,
+}
+
+impl Qwen38AffineMlpFusion {
+    pub fn new(
+        gate: GgmlAffineMatrix,
+        up: GgmlAffineMatrix,
+        down: GgmlAffineMatrix,
+        m23: [bool; 3],
+    ) -> Result<Self, GgmlAffineError> {
+        if (gate.in_features(), gate.out_features()) != (5120, 17_408)
+            || (up.in_features(), up.out_features()) != (5120, 17_408)
+            || (down.in_features(), down.out_features()) != (17_408, 5120)
+        {
+            return Err(GgmlAffineError::InvalidPlane);
+        }
+        Ok(Self {
+            gate,
+            up,
+            down,
+            gate_m23: m23[0],
+            up_m23: m23[1],
+            down_m23: m23[2],
+        })
+    }
+
+    pub fn forward(&self, input: &MlxArray) -> Result<UniquePtr<MlxArray>, GgmlAffineError> {
+        validate_input(input, 5120)?;
+        let rows = affine_input_rows(input)?;
+        // Only the pinned M=33 BlockMMA shape beats ordinary MLX.
+        if rows != 33
+            || crate::array_dtype(input) != dtype::FLOAT32
+            || !crate::ffi::array_is_row_contiguous(input)
+        {
+            let forward = |matrix: &GgmlAffineMatrix, input: &MlxArray, m23| {
+                if matches!(rows, 2 | 3) && m23 {
+                    matrix.forward_qwen38_m23(input)
+                } else {
+                    matrix.forward(input)
+                }
+            };
+            let gate = forward(&self.gate, input, self.gate_m23)?;
+            let up = forward(&self.up, input, self.up_m23)?;
+            let activated = crate::compiled_swiglu_activation(
+                gate.as_ref().ok_or(GgmlAffineError::InvalidPlane)?,
+                up.as_ref().ok_or(GgmlAffineError::InvalidPlane)?,
+            );
+            return forward(
+                &self.down,
+                activated.as_ref().ok_or(GgmlAffineError::InvalidPlane)?,
+                self.down_m23,
+            );
+        }
+        crate::qwen38_affine_mlp_fused(
+            input,
+            self.gate
+                .planes
+                .weight
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?,
+            self.gate
+                .planes
+                .scales
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?,
+            self.gate
+                .planes
+                .biases
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?,
+            self.gate.bits,
+            self.up
+                .planes
+                .weight
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?,
+            self.up
+                .planes
+                .scales
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?,
+            self.up
+                .planes
+                .biases
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?,
+            self.up.bits,
+            self.down
+                .planes
+                .weight
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?,
+            self.down
+                .planes
+                .scales
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?,
+            self.down
+                .planes
+                .biases
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?,
+            self.down.bits,
+        )
+        .map_err(|error| GgmlAffineError::Backend(error.to_string()))
+    }
+
+    pub fn dispatch_stats(&self, input_rows: usize) -> Result<Qwen38FusionStats, GgmlAffineError> {
+        if input_rows == 0 {
+            return Err(GgmlAffineError::InvalidInput);
+        }
+        let matrix_bytes_read =
+            [&self.gate, &self.up, &self.down]
+                .into_iter()
+                .try_fold(0usize, |total, matrix| {
+                    matrix
+                        .resident_row_bytes
+                        .checked_mul(matrix.out_features())
+                        .and_then(|bytes| total.checked_add(bytes))
+                        .ok_or(GgmlAffineError::Overflow)
+                })?;
+        if input_rows != 33 {
+            return Ok(Qwen38FusionStats {
+                physical_dispatches: 4,
+                matrix_bytes_read,
+                intermediate_bytes_avoided: 0,
+                workspace_bytes: 0,
+                hidden_copy_bytes: 0,
+            });
+        }
+        let split = qwen38_split_k(input_rows, 17_408, 5120);
+        let down_workspace = if split > 1 {
+            split
+                .checked_mul(input_rows)
+                .and_then(|n| n.checked_mul(5120))
+                .and_then(|n| n.checked_mul(4))
+                .ok_or(GgmlAffineError::Overflow)?
+        } else {
+            0
+        };
+        let gate_up_bytes = input_rows
+            .checked_mul(17_408)
+            .and_then(|n| n.checked_mul(8))
+            .ok_or(GgmlAffineError::Overflow)?;
+        Ok(Qwen38FusionStats {
+            physical_dispatches: 2,
+            matrix_bytes_read,
+            intermediate_bytes_avoided: gate_up_bytes
+                .checked_add(down_workspace)
+                .ok_or(GgmlAffineError::Overflow)?,
+            workspace_bytes: 0,
+            hidden_copy_bytes: 0,
+        })
+    }
+}
+
+pub struct Qwen38GdnIngressOutput {
+    pub qkv: UniquePtr<MlxArray>,
+    pub z: UniquePtr<MlxArray>,
+    pub beta: UniquePtr<MlxArray>,
+    pub alpha: UniquePtr<MlxArray>,
+}
+
+pub struct Qwen38AffineGdnIngressFusion {
+    qkv: GgmlAffineMatrix,
+    z: GgmlAffineMatrix,
+    beta: GgmlAffineMatrix,
+    alpha: GgmlAffineMatrix,
+    m23: [bool; 4],
+}
+
+impl Qwen38AffineGdnIngressFusion {
+    pub fn new(
+        qkv: GgmlAffineMatrix,
+        z: GgmlAffineMatrix,
+        beta: GgmlAffineMatrix,
+        alpha: GgmlAffineMatrix,
+        m23: [bool; 4],
+    ) -> Result<Self, GgmlAffineError> {
+        if (qkv.in_features(), qkv.out_features()) != (5120, 10_240)
+            || (z.in_features(), z.out_features()) != (5120, 6144)
+            || (beta.in_features(), beta.out_features()) != (5120, 48)
+            || (alpha.in_features(), alpha.out_features()) != (5120, 48)
+        {
+            return Err(GgmlAffineError::InvalidPlane);
+        }
+        Ok(Self {
+            qkv,
+            z,
+            beta,
+            alpha,
+            m23,
+        })
+    }
+
+    pub fn forward(&self, input: &MlxArray) -> Result<Qwen38GdnIngressOutput, GgmlAffineError> {
+        validate_input(input, 5120)?;
+        let rows = affine_input_rows(input)?;
+        // Only the pinned M=33 and M=128 BlockMMA shapes beat ordinary MLX.
+        if !matches!(rows, 33 | 128)
+            || crate::array_dtype(input) != dtype::FLOAT32
+            || !crate::ffi::array_is_row_contiguous(input)
+        {
+            let forward = |matrix: &GgmlAffineMatrix, m23| {
+                if matches!(rows, 2 | 3) && m23 {
+                    matrix.forward_qwen38_m23(input)
+                } else {
+                    matrix.forward(input)
+                }
+            };
+            return Ok(Qwen38GdnIngressOutput {
+                qkv: forward(&self.qkv, self.m23[0])?,
+                z: forward(&self.z, self.m23[1])?,
+                beta: forward(&self.beta, self.m23[2])?,
+                alpha: forward(&self.alpha, self.m23[3])?,
+            });
+        }
+        let mut outputs = crate::qwen38_affine_gdn_ingress_fused(
+            input,
+            self.qkv
+                .planes
+                .weight
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?,
+            self.qkv
+                .planes
+                .scales
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?,
+            self.qkv
+                .planes
+                .biases
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?,
+            self.qkv.bits,
+            self.z
+                .planes
+                .weight
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?,
+            self.z
+                .planes
+                .scales
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?,
+            self.z
+                .planes
+                .biases
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?,
+            self.z.bits,
+            self.beta
+                .planes
+                .weight
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?,
+            self.beta
+                .planes
+                .scales
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?,
+            self.beta
+                .planes
+                .biases
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?,
+            self.beta.bits,
+            self.alpha
+                .planes
+                .weight
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?,
+            self.alpha
+                .planes
+                .scales
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?,
+            self.alpha
+                .planes
+                .biases
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?,
+            self.alpha.bits,
+        )
+        .map_err(|error| GgmlAffineError::Backend(error.to_string()))?;
+        let output = outputs.pin_mut();
+        let qkv = crate::qwen38_gdn_take_qkv(output);
+        let output = outputs.pin_mut();
+        let z = crate::qwen38_gdn_take_z(output);
+        let output = outputs.pin_mut();
+        let beta = crate::qwen38_gdn_take_beta(output);
+        let output = outputs.pin_mut();
+        let alpha = crate::qwen38_gdn_take_alpha(output);
+        Ok(Qwen38GdnIngressOutput {
+            qkv,
+            z,
+            beta,
+            alpha,
+        })
+    }
+
+    pub fn dispatch_stats(&self, input_rows: usize) -> Result<Qwen38FusionStats, GgmlAffineError> {
+        if input_rows == 0 {
+            return Err(GgmlAffineError::InvalidInput);
+        }
+        let matrix_bytes_read = [&self.qkv, &self.z, &self.beta, &self.alpha]
+            .into_iter()
+            .try_fold(0usize, |total, matrix| {
+                matrix
+                    .resident_row_bytes
+                    .checked_mul(matrix.out_features())
+                    .and_then(|bytes| total.checked_add(bytes))
+                    .ok_or(GgmlAffineError::Overflow)
+            })?;
+        if !matches!(input_rows, 33 | 128) {
+            return Ok(Qwen38FusionStats {
+                physical_dispatches: 4,
+                matrix_bytes_read,
+                intermediate_bytes_avoided: 0,
+                workspace_bytes: 0,
+                hidden_copy_bytes: 0,
+            });
+        }
+        let splits = [
+            qwen38_split_k(input_rows, 5120, 10_240),
+            qwen38_split_k(input_rows, 5120, 6144),
+            qwen38_split_k(input_rows, 5120, 48),
+            qwen38_split_k(input_rows, 5120, 48),
+        ];
+        let widths = [10_240usize, 6144, 48, 48];
+        let workspace_bytes = splits
+            .into_iter()
+            .zip(widths)
+            .filter(|(split, _)| *split > 1)
+            .try_fold(0usize, |total, (split, width)| {
+                split
+                    .checked_mul(input_rows)
+                    .and_then(|n| n.checked_mul(width))
+                    .and_then(|n| n.checked_mul(4))
+                    .and_then(|bytes| total.checked_add(bytes))
+                    .ok_or(GgmlAffineError::Overflow)
+            })?;
+        Ok(Qwen38FusionStats {
+            physical_dispatches: if workspace_bytes == 0 { 2 } else { 3 },
+            matrix_bytes_read,
+            intermediate_bytes_avoided: 0,
+            workspace_bytes,
+            hidden_copy_bytes: 0,
+        })
+    }
+}
+
 pub struct GgmlAffineRows {
     planes: Vec<AffinePlanes>,
     in_features: i32,
@@ -767,6 +1134,16 @@ fn qwen38_m23_shape(in_features: i32, out_features: i32) -> bool {
         (in_features, out_features),
         (5120, 17408) | (17408, 5120) | (5120, 10240) | (5120, 6144) | (6144, 5120) | (5120, 12288)
     )
+}
+
+fn qwen38_split_k(input_rows: usize, in_features: usize, out_features: usize) -> usize {
+    let m_tiles = input_rows.div_ceil(32);
+    let n_tiles = out_features.div_ceil(32);
+    let mut split = (512 / (m_tiles * n_tiles)).max(1).min(in_features / 32);
+    while split > 1 && !in_features.is_multiple_of(split * 32) {
+        split -= 1;
+    }
+    split
 }
 
 fn qwen38_affine_m23_matmul(
