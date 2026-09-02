@@ -1159,6 +1159,148 @@ fn layer_slot_offset(full: bool, tensor: LayerTensor) -> std::result::Result<usi
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::time::{Duration, Instant};
+
+    #[derive(Default)]
+    struct OldFp32Diagnostics {
+        elements: usize,
+        rows: usize,
+        squared_error: f64,
+        reference_squared: f64,
+        candidate_squared: f64,
+        dot: f64,
+        kl: f64,
+        max_abs: f32,
+        top8_overlap: usize,
+    }
+
+    fn f32_values(bytes: &[u8]) -> Vec<f32> {
+        bytes
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect()
+    }
+
+    fn max_ulp_bytes(left: &[u8], right: &[u8]) -> u32 {
+        assert_eq!(left.len(), right.len());
+        let ordered = |value: f32| {
+            let bits = value.to_bits() as i32;
+            if bits < 0 { i32::MIN - bits } else { bits }
+        };
+        left.chunks_exact(4)
+            .zip(right.chunks_exact(4))
+            .map(|(left, right)| {
+                let left = ordered(f32::from_le_bytes(left.try_into().unwrap()));
+                let right = ordered(f32::from_le_bytes(right.try_into().unwrap()));
+                left.abs_diff(right)
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    fn top_indices(values: &[f32], count: usize) -> Vec<usize> {
+        let mut indices = (0..values.len()).collect::<Vec<_>>();
+        indices.sort_unstable_by(|left, right| values[*right].total_cmp(&values[*left]));
+        indices.truncate(count.min(indices.len()));
+        indices
+    }
+
+    fn record_old_fp32_diagnostics(
+        diagnostics: &mut OldFp32Diagnostics,
+        old: &[u8],
+        candidate: &[u8],
+        output_width: usize,
+    ) {
+        let old = f32_values(old);
+        let candidate = f32_values(candidate);
+        assert_eq!(old.len(), candidate.len());
+        assert!(old.iter().all(|value| value.is_finite()));
+        assert!(candidate.iter().all(|value| value.is_finite()));
+        diagnostics.elements += old.len();
+        diagnostics.rows += old.len() / output_width;
+        for (&reference, &mixed) in old.iter().zip(&candidate) {
+            let error = reference - mixed;
+            diagnostics.squared_error += f64::from(error) * f64::from(error);
+            diagnostics.reference_squared += f64::from(reference) * f64::from(reference);
+            diagnostics.candidate_squared += f64::from(mixed) * f64::from(mixed);
+            diagnostics.dot += f64::from(reference) * f64::from(mixed);
+            diagnostics.max_abs = diagnostics.max_abs.max(error.abs());
+        }
+        for (reference, mixed) in old.chunks_exact(output_width).zip(candidate.chunks_exact(output_width))
+        {
+            let reference_top = top_indices(reference, 8);
+            let mixed_top = top_indices(mixed, 8);
+            diagnostics.top8_overlap += reference_top
+                .iter()
+                .filter(|index| mixed_top.contains(index))
+                .count();
+
+            let reference_max = reference.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mixed_max = mixed.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let reference_sum = reference
+                .iter()
+                .map(|value| f64::from(*value - reference_max).exp())
+                .sum::<f64>();
+            let mixed_sum = mixed
+                .iter()
+                .map(|value| f64::from(*value - mixed_max).exp())
+                .sum::<f64>();
+            for (&reference, &mixed) in reference.iter().zip(mixed) {
+                let log_p = f64::from(reference - reference_max) - reference_sum.ln();
+                let log_q = f64::from(mixed - mixed_max) - mixed_sum.ln();
+                diagnostics.kl += log_p.exp() * (log_p - log_q);
+            }
+        }
+    }
+
+    fn timed_q5_projection(
+        matrix: &GgmlAffineMatrix,
+        input: &MlxArray,
+        mixed: bool,
+    ) -> Duration {
+        let start = Instant::now();
+        let output = matrix
+            .forward_qwen38_q5_experiment(input, mixed)
+            .expect("run pinned Q5 experiment");
+        mlxcel_core::eval(output.as_ref().unwrap());
+        let elapsed = start.elapsed();
+        assert!(
+            f32_values(&mlxcel_core::array_to_raw_bytes(output.as_ref().unwrap()))
+                .iter()
+                .all(|value| value.is_finite())
+        );
+        elapsed
+    }
+
+    fn alternating_q5_medians(
+        matrix: &GgmlAffineMatrix,
+        input: &MlxArray,
+    ) -> (Duration, Duration) {
+        for repetition in 0..5 {
+            if repetition % 2 == 0 {
+                let _ = timed_q5_projection(matrix, input, false);
+                let _ = timed_q5_projection(matrix, input, true);
+            } else {
+                let _ = timed_q5_projection(matrix, input, true);
+                let _ = timed_q5_projection(matrix, input, false);
+            }
+        }
+        let mut old = Vec::with_capacity(15);
+        let mut mixed = Vec::with_capacity(15);
+        for repetition in 0..15 {
+            if repetition % 2 == 0 {
+                old.push(timed_q5_projection(matrix, input, false));
+                mixed.push(timed_q5_projection(matrix, input, true));
+            } else {
+                mixed.push(timed_q5_projection(matrix, input, true));
+                old.push(timed_q5_projection(matrix, input, false));
+            }
+        }
+        old.sort_unstable();
+        mixed.sort_unstable();
+        (old[old.len() / 2], mixed[mixed.len() / 2])
+    }
 
     fn max_ulp(left: &MlxArray, right: &MlxArray) -> u32 {
         let ordered = |value: f32| {
@@ -1688,7 +1830,15 @@ mod tests {
                     assert_eq!(selected_stats, split_stats);
                 }
                 let split = matrix.forward(input.as_ref().unwrap()).unwrap();
-                let one_pass = matrix.forward_qwen38_m23(input.as_ref().unwrap()).unwrap();
+                let one_pass = if matches!(signature.qtype, 13 | 21)
+                    && matches!(input_rows, 1 | 3 | 4)
+                {
+                    matrix
+                        .forward_qwen38_q5_experiment(input.as_ref().unwrap(), false)
+                        .unwrap()
+                } else {
+                    matrix.forward_qwen38_m23(input.as_ref().unwrap()).unwrap()
+                };
                 mlxcel_core::eval(split.as_ref().unwrap());
                 mlxcel_core::eval(one_pass.as_ref().unwrap());
                 let split = mlxcel_core::array_to_raw_bytes(split.as_ref().unwrap());
@@ -1716,6 +1866,213 @@ mod tests {
                     max_ulp
                 );
             }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the complete pinned Qwen3.8 target GGUF and exclusive Metal access"]
+    fn real_pinned_mixed_q5_all_descriptors_parity_diagnostics_and_timing() {
+        if !mlxcel_core::metal_is_available() {
+            return;
+        }
+        const TENSORS: [LayerTensor; 7] = [
+            LayerTensor::AttentionQuery,
+            LayerTensor::MlpGate,
+            LayerTensor::MlpUp,
+            LayerTensor::MlpDown,
+            LayerTensor::LinearQkv,
+            LayerTensor::LinearGate,
+            LayerTensor::LinearOutput,
+        ];
+        let mut signatures = Vec::new();
+        for layer in 0..64 {
+            for tensor in TENSORS {
+                let slot = TensorSlot::Layer {
+                    role: ModelRole::Target,
+                    layer,
+                    tensor,
+                };
+                if let Some(signature) = pinned_m23_affine_signature(slot)
+                    && matches!(signature.qtype, 13 | 21)
+                {
+                    signatures.push((slot, signature));
+                }
+            }
+        }
+        assert_eq!(signatures.len(), 180);
+        assert_eq!(
+            signatures
+                .iter()
+                .filter(|(_, signature)| signature.qtype == 13)
+                .count(),
+            179
+        );
+        assert_eq!(
+            signatures
+                .iter()
+                .filter(|(_, signature)| signature.qtype == 21)
+                .count(),
+            1
+        );
+
+        let weights = GgufWeightSource::open().expect("open pinned GGUF pair");
+        let mut timed_shapes = BTreeSet::new();
+        let mut diagnostics = BTreeMap::<(u32, [u64; 2]), OldFp32Diagnostics>::new();
+        for (slot, signature) in signatures {
+            let linear = weights
+                .load_linear(
+                    slot,
+                    PinnedSlot::Target(signature.target_slot),
+                    "mixed Q5 experiment",
+                )
+                .expect("load pinned Q5 descriptor");
+            let Qwen35Linear::PinnedM23Affine(matrix) = linear else {
+                panic!("slot {} did not receive pinned affine storage", signature.target_slot);
+            };
+            let width = matrix.in_features();
+            let output_width = matrix.out_features();
+            let resident_before = matrix.transcode_stats();
+            let values = (0..4 * width)
+                .map(|index| {
+                    let row = index / width;
+                    let column = index % width;
+                    let centered = ((column * 17 + row * 13) % 257) as i32 - 128;
+                    centered as f32 * 0.001901 + row as f32 * 0.000173
+                })
+                .collect::<Vec<_>>();
+            let input_m3 = mlxcel_core::from_slice_f32(&values[..3 * width], &[1, 3, width as i32]);
+            let input_m4 = mlxcel_core::from_slice_f32(&values, &[1, 4, width as i32]);
+            let mixed_m3 = matrix
+                .forward_qwen38_q5_experiment(input_m3.as_ref().unwrap(), true)
+                .expect("mixed M3");
+            let mixed_m3_repeat = matrix
+                .forward_qwen38_q5_experiment(input_m3.as_ref().unwrap(), true)
+                .expect("mixed M3 repeat");
+            let mixed_m4 = matrix
+                .forward_qwen38_q5_experiment(input_m4.as_ref().unwrap(), true)
+                .expect("mixed M4");
+            let old_m4 = matrix
+                .forward_qwen38_q5_experiment(input_m4.as_ref().unwrap(), false)
+                .expect("old FP32 M4 diagnostic");
+            for output in [&mixed_m3, &mixed_m3_repeat, &mixed_m4, &old_m4] {
+                mlxcel_core::eval(output.as_ref().unwrap());
+            }
+            assert_eq!(
+                mlxcel_core::array_shape(mixed_m3.as_ref().unwrap()),
+                [1, 3, output_width as i32]
+            );
+            assert_eq!(
+                mlxcel_core::array_shape(mixed_m4.as_ref().unwrap()),
+                [1, 4, output_width as i32]
+            );
+            let mixed_m3 = mlxcel_core::array_to_raw_bytes(mixed_m3.as_ref().unwrap());
+            let mixed_m3_repeat =
+                mlxcel_core::array_to_raw_bytes(mixed_m3_repeat.as_ref().unwrap());
+            let mixed_m4 = mlxcel_core::array_to_raw_bytes(mixed_m4.as_ref().unwrap());
+            let old_m4 = mlxcel_core::array_to_raw_bytes(old_m4.as_ref().unwrap());
+            assert_eq!(
+                mixed_m3, mixed_m3_repeat,
+                "slot {} mixed M3 is not repeat deterministic",
+                signature.target_slot
+            );
+            assert!(f32_values(&mixed_m4).iter().all(|value| value.is_finite()));
+
+            for row in 0..4 {
+                let input_m1 = mlxcel_core::from_slice_f32(
+                    &values[row * width..(row + 1) * width],
+                    &[1, 1, width as i32],
+                );
+                let mixed_m1 = matrix
+                    .forward_qwen38_q5_experiment(input_m1.as_ref().unwrap(), true)
+                    .expect("mixed M1");
+                mlxcel_core::eval(mixed_m1.as_ref().unwrap());
+                let mixed_m1 = mlxcel_core::array_to_raw_bytes(mixed_m1.as_ref().unwrap());
+                let row_bytes = output_width * 4;
+                let m4_range = row * row_bytes..(row + 1) * row_bytes;
+                let m4_ulp = max_ulp_bytes(&mixed_m1, &mixed_m4[m4_range]);
+                assert!(
+                    m4_ulp <= 1,
+                    "slot {} qtype {} mixed M1 row {row} vs M4 differs by {m4_ulp} ULP",
+                    signature.target_slot,
+                    signature.qtype,
+                );
+                if row < 3 {
+                    let m3_range = row * row_bytes..(row + 1) * row_bytes;
+                    let m3_ulp = max_ulp_bytes(&mixed_m1, &mixed_m3[m3_range]);
+                    assert!(
+                        m3_ulp <= 1,
+                        "slot {} qtype {} mixed M1 row {row} vs M3 differs by {m3_ulp} ULP",
+                        signature.target_slot,
+                        signature.qtype,
+                    );
+                }
+            }
+
+            record_old_fp32_diagnostics(
+                diagnostics.entry((signature.qtype, signature.dimensions)).or_default(),
+                &old_m4,
+                &mixed_m4,
+                output_width,
+            );
+            if timed_shapes.insert((signature.qtype, signature.dimensions)) {
+                for (rows, input) in [
+                    (
+                        1usize,
+                        mlxcel_core::from_slice_f32(&values[..width], &[1, 1, width as i32]),
+                    ),
+                    (
+                        3,
+                        mlxcel_core::from_slice_f32(
+                            &values[..3 * width],
+                            &[1, 3, width as i32],
+                        ),
+                    ),
+                    (
+                        4,
+                        mlxcel_core::from_slice_f32(&values, &[1, 4, width as i32]),
+                    ),
+                ] {
+                    let (old, mixed) =
+                        alternating_q5_medians(&matrix, input.as_ref().unwrap());
+                    println!(
+                        "QWEN38_MIXED_Q5_TIMING qtype={} shape={}x{} M={} warmups=5 samples=15 old_median_us={} mixed_median_us={} speedup={:.4}",
+                        signature.qtype,
+                        width,
+                        output_width,
+                        rows,
+                        old.as_micros(),
+                        mixed.as_micros(),
+                        old.as_secs_f64() / mixed.as_secs_f64(),
+                    );
+                }
+            }
+            assert_eq!(
+                matrix.transcode_stats(),
+                resident_before,
+                "slot {} changed resident affine storage during dispatch",
+                signature.target_slot,
+            );
+            drop(matrix);
+            mlxcel_core::memory::clear_cache();
+        }
+
+        for ((qtype, dimensions), diagnostic) in diagnostics {
+            let rmse = (diagnostic.squared_error / diagnostic.elements as f64).sqrt();
+            let cosine = diagnostic.dot
+                / (diagnostic.reference_squared * diagnostic.candidate_squared).sqrt();
+            println!(
+                "QWEN38_MIXED_Q5_OLD_FP32_DIAGNOSTIC qtype={} shape={}x{} elements={} max_abs={} rmse={} cosine={} mean_kl={} top8_overlap={}/{}",
+                qtype,
+                dimensions[0],
+                dimensions[1],
+                diagnostic.elements,
+                diagnostic.max_abs,
+                rmse,
+                cosine,
+                diagnostic.kl / diagnostic.rows as f64,
+                diagnostic.top8_overlap,
+                diagnostic.rows * 8,
+            );
         }
     }
 

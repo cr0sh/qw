@@ -18,7 +18,7 @@ use qw_runtime::{GenerationRequest, Qwen35Provider};
 use support::{
     DECODE_MAX_TOKENS, LONG_CONTEXT_64K_MIN_TOKENS, LONG_CONTEXT_MIN_TOKENS,
     LongConversationFixture, prepare_decode_fixture, prepare_long_conversation_fixture,
-    prompt_token_ids,
+    prompt_token_ids, qwen38_mixed_q5_enabled,
 };
 
 const TIMED_REPETITIONS: u64 = 3;
@@ -293,6 +293,7 @@ fn long_mtp_sample(
     provider: &mut Qwen35Provider,
     fixture: &LongConversationFixture,
     sampling: &SamplingConfig,
+    print_quality_sample: bool,
 ) -> Duration {
     let (output, stats) = provider
         .benchmark_cached_streaming_in_mode(
@@ -313,10 +314,34 @@ fn long_mtp_sample(
         "deterministic cached bundled-MTP output changed"
     );
     let stats = stats.expect("explicit MTP mode must return MTP statistics");
+    assert_eq!(
+        (
+            stats.accepted_draft_tokens,
+            stats.proposed_draft_tokens,
+            stats.target_forward_calls,
+        ),
+        (
+            fixture.mtp_accepted_draft_tokens,
+            fixture.mtp_proposed_draft_tokens,
+            fixture.mtp_target_forward_calls,
+        ),
+        "deterministic cached bundled-MTP acceptance changed",
+    );
     assert!(
         stats.proposed_draft_tokens > 0,
         "cached bundled-MTP must propose draft tokens"
     );
+    if print_quality_sample {
+        println!(
+            "BENCHMARK_QUALITY_SAMPLE arithmetic={} text={:?}",
+            if qwen38_mixed_q5_enabled() {
+                "mixed_q5"
+            } else {
+                "old_fp32"
+            },
+            output.text,
+        );
+    }
     let elapsed = stats.decode_time;
     black_box(output);
     elapsed
@@ -331,6 +356,14 @@ fn main() {
     println!(
         "BENCHMARK_CONFIG speculative_engine={speculative_engine} warmup_repetitions=1 \
          timed_repetitions={TIMED_REPETITIONS}"
+    );
+    println!(
+        "BENCHMARK_ARITHMETIC mode={}",
+        if qwen38_mixed_q5_enabled() {
+            "mixed_q5"
+        } else {
+            "old_fp32"
+        }
     );
 
     let mut provider = support::load_provider();
@@ -486,7 +519,7 @@ fn main() {
         if selection.includes(LONG_10K_SPECULATIVE) {
             let fixture = long_10k.as_ref().expect("10k fixture was prepared");
             let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
-            black_box(long_mtp_sample(&mut provider, fixture, &sampling));
+            black_box(long_mtp_sample(&mut provider, fixture, &sampling, true));
             println!(
                 "BENCHMARK_MTP_STATS context_tokens={} decode_tokens={} accepted_draft_tokens={} proposed_draft_tokens={} target_forward_calls={} cache_parity=verified token_parity=verified",
                 fixture.prefix_tokens,
@@ -499,19 +532,19 @@ fn main() {
                 LONG_10K_SPECULATIVE,
                 fixture.prefix_tokens,
                 fixture.mtp_decode_tokens.saturating_sub(1),
-                || long_mtp_sample(&mut provider, fixture, &sampling),
+                || long_mtp_sample(&mut provider, fixture, &sampling, false),
             );
         }
 
         if selection.includes(LONG_64K_SPECULATIVE) {
             let fixture = long_64k.as_ref().expect("64k fixture was prepared");
             let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
-            black_box(long_mtp_sample(&mut provider, fixture, &sampling));
+            black_box(long_mtp_sample(&mut provider, fixture, &sampling, false));
             measure(
                 LONG_64K_SPECULATIVE,
                 fixture.prefix_tokens,
                 fixture.mtp_decode_tokens.saturating_sub(1),
-                || long_mtp_sample(&mut provider, fixture, &sampling),
+                || long_mtp_sample(&mut provider, fixture, &sampling, false),
             );
         }
     }

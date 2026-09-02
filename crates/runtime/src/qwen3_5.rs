@@ -3883,44 +3883,63 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the complete pinned Qwen3.8 27B GGUF pair"]
-    fn real_gguf_target_m23_verify_logit_rows_stay_within_one_ulp() {
-        fn verify_logits(model: &Qwen35Model, input_rows: usize) -> Vec<u8> {
-            let token_ids = [9_707_i32, 11, 1_879, 42, 123];
-            let prefix = mlxcel_core::from_slice_i32(&token_ids[..2], &[1, 2]);
+    #[ignore = "requires the complete pinned Qwen3.8 GGUF pair and exclusive Metal access"]
+    fn real_gguf_mixed_m1_logits_match_m3_m4_and_log_old_fp32_diagnostics() {
+        struct Capture {
+            sequential: Vec<Vec<u8>>,
+            m3: Vec<u8>,
+            m4: Vec<u8>,
+        }
+
+        fn prefill(model: &Qwen35Model) {
+            let prefix = mlxcel_core::from_slice_i32(&[9_707_i32, 11], &[1, 2]);
             model
                 .forward_mtp_prefill_chunks(&prefix, None, None, None, |_, _, _| {})
                 .expect("target prefix");
-            let block =
-                mlxcel_core::from_slice_i32(&token_ids[2..2 + input_rows], &[1, input_rows as i32]);
-            let logits = model.forward_mtp_verify(&block).logits;
-            mlxcel_core::eval(&logits);
-            mlxcel_core::array_to_raw_bytes(&logits)
         }
 
-        let split = {
-            let (model, _) = Qwen35Model::load_pinned_without_m23(KVCacheMode::Fp16)
-                .expect("load split-QMV Qwen3.8 GGUF");
-            [verify_logits(&model, 2), verify_logits(&model, 3)]
-        };
-        let one_pass = {
-            let (model, _) =
-                Qwen35Model::load_pinned(KVCacheMode::Fp16).expect("load one-pass Qwen3.8 GGUF");
-            [verify_logits(&model, 2), verify_logits(&model, 3)]
-        };
-        let ordered = |value: f32| {
+        fn capture(model: &Qwen35Model) -> Capture {
+            let tokens = [1_879_i32, 42, 123, 104_729];
+            model.reset_runtime_state();
+            prefill(model);
+            let sequential = tokens
+                .iter()
+                .map(|token| {
+                    let token = mlxcel_core::from_slice_i32(&[*token], &[1, 1]);
+                    let logits = model.forward_last_logits(&token, &mut [], None, 0);
+                    mlxcel_core::eval(&logits);
+                    mlxcel_core::array_to_raw_bytes(&logits)
+                })
+                .collect::<Vec<_>>();
+
+            let batched = |rows: usize| {
+                model.reset_runtime_state();
+                prefill(model);
+                let block = mlxcel_core::from_slice_i32(&tokens[..rows], &[1, rows as i32]);
+                let logits = model.forward_mtp_verify(&block).logits;
+                mlxcel_core::eval(&logits);
+                mlxcel_core::array_to_raw_bytes(&logits)
+            };
+            Capture {
+                sequential,
+                m3: batched(3),
+                m4: batched(4),
+            }
+        }
+
+        fn ordered(value: f32) -> i32 {
             let bits = value.to_bits() as i32;
             if bits < 0 { i32::MIN - bits } else { bits }
-        };
-        for (index, (split, one_pass)) in split.iter().zip(&one_pass).enumerate() {
-            let input_rows = index + 2;
-            assert_eq!(split.len(), one_pass.len());
-            let row_bytes = split.len() / input_rows;
-            for row in 0..input_rows {
+        }
+
+        fn assert_corresponding(sequential: &[Vec<u8>], batched: &[u8], rows: usize) {
+            let row_bytes = batched.len() / rows;
+            for row in 0..rows {
                 let range = row * row_bytes..(row + 1) * row_bytes;
-                let max_ulp = split[range.clone()]
+                assert_eq!(sequential[row].len(), row_bytes);
+                let max_ulp = sequential[row]
                     .chunks_exact(4)
-                    .zip(one_pass[range].chunks_exact(4))
+                    .zip(batched[range].chunks_exact(4))
                     .map(|(left, right)| {
                         let left = f32::from_le_bytes(left.try_into().unwrap());
                         let right = f32::from_le_bytes(right.try_into().unwrap());
@@ -3930,10 +3949,119 @@ mod tests {
                     .unwrap_or(0);
                 assert!(
                     max_ulp <= 1,
-                    "target M={input_rows} verification row {row} differs by {max_ulp} ULP"
+                    "mixed M1 sequential logit row {row} vs mixed M{rows} differs by {max_ulp} ULP"
                 );
             }
         }
+
+        fn values(bytes: &[u8]) -> Vec<f32> {
+            bytes
+                .chunks_exact(4)
+                .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect()
+        }
+
+        fn top8(values: &[f32]) -> Vec<(usize, f32)> {
+            let mut indices = (0..values.len()).collect::<Vec<_>>();
+            indices.sort_unstable_by(|left, right| values[*right].total_cmp(&values[*left]));
+            indices.truncate(8);
+            indices
+                .into_iter()
+                .map(|index| (index, values[index]))
+                .collect()
+        }
+
+        assert!(
+            matches!(
+                std::env::var("MLXCEL_EXPERIMENTAL_QWEN38_MIXED_Q5")
+                    .ok()
+                    .as_deref(),
+                Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+            ),
+            "set MLXCEL_EXPERIMENTAL_QWEN38_MIXED_Q5=1 for this experiment"
+        );
+        let old = {
+            let (model, _) = Qwen35Model::load_pinned_without_m23(KVCacheMode::Fp16)
+                .expect("load old FP32 Qwen3.8 GGUF");
+            capture(&model)
+        };
+        mlxcel_core::memory::clear_cache();
+        let (mixed, mixed_repeat) = {
+            let (model, _) =
+                Qwen35Model::load_pinned(KVCacheMode::Fp16).expect("load mixed Qwen3.8 GGUF");
+            (capture(&model), capture(&model))
+        };
+
+        assert_corresponding(&mixed.sequential, &mixed.m3, 3);
+        assert_corresponding(&mixed.sequential, &mixed.m4, 4);
+        assert_eq!(mixed.m3, mixed_repeat.m3, "mixed M3 logits are not deterministic");
+        assert_eq!(mixed.m4, mixed_repeat.m4, "mixed M4 logits are not deterministic");
+        assert_eq!(
+            mixed.sequential, mixed_repeat.sequential,
+            "mixed M1 sequential logits are not deterministic"
+        );
+
+        let old = values(&old.m4);
+        let mixed = values(&mixed.m4);
+        assert_eq!(old.len(), mixed.len());
+        assert!(old.iter().all(|value| value.is_finite()));
+        assert!(mixed.iter().all(|value| value.is_finite()));
+        let mut squared_error = 0.0f64;
+        let mut old_squared = 0.0f64;
+        let mut mixed_squared = 0.0f64;
+        let mut dot = 0.0f64;
+        let mut max_abs = 0.0f32;
+        for (&old, &mixed) in old.iter().zip(&mixed) {
+            let error = old - mixed;
+            squared_error += f64::from(error) * f64::from(error);
+            old_squared += f64::from(old) * f64::from(old);
+            mixed_squared += f64::from(mixed) * f64::from(mixed);
+            dot += f64::from(old) * f64::from(mixed);
+            max_abs = max_abs.max(error.abs());
+        }
+        let row_width = mixed.len() / 4;
+        let mut kl = 0.0f64;
+        let mut top8_overlap = 0usize;
+        for (row, (old_row, mixed_row)) in old
+            .chunks_exact(row_width)
+            .zip(mixed.chunks_exact(row_width))
+            .enumerate()
+        {
+            let old_top = top8(old_row);
+            let mixed_top = top8(mixed_row);
+            top8_overlap += old_top
+                .iter()
+                .filter(|(token, _)| mixed_top.iter().any(|(mixed, _)| mixed == token))
+                .count();
+            let old_max = old_row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mixed_max = mixed_row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let old_sum = old_row
+                .iter()
+                .map(|value| f64::from(*value - old_max).exp())
+                .sum::<f64>();
+            let mixed_sum = mixed_row
+                .iter()
+                .map(|value| f64::from(*value - mixed_max).exp())
+                .sum::<f64>();
+            for (&old, &mixed) in old_row.iter().zip(mixed_row) {
+                let log_p = f64::from(old - old_max) - old_sum.ln();
+                let log_q = f64::from(mixed - mixed_max) - mixed_sum.ln();
+                kl += log_p.exp() * (log_p - log_q);
+            }
+            println!(
+                "QWEN38_MIXED_Q5_QUALITY_SAMPLE row={} old_fp32_top8={:?} mixed_top8={:?}",
+                row, old_top, mixed_top
+            );
+        }
+        println!(
+            "QWEN38_MIXED_Q5_LOGIT_DIAGNOSTIC elements={} max_abs={} rmse={} cosine={} mean_kl={} top8_overlap={}/32",
+            old.len(),
+            max_abs,
+            (squared_error / old.len() as f64).sqrt(),
+            dot / (old_squared * mixed_squared).sqrt(),
+            kl / 4.0,
+            top8_overlap,
+        );
     }
 
     #[test]

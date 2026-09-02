@@ -101,6 +101,62 @@ inline float qwen38_qdot(
     }
     return scale * accum + sum * bias;
 }
+
+template <int rows>
+inline void qwen38_mixed_q5_update(
+    const device float* x,
+    int row_stride,
+    int column,
+    half w_dq,
+    thread float* accum
+) {
+    for (int row = 0; row < rows; ++row) {
+        half activation = static_cast<half>(x[row * row_stride + column]);
+        half product = activation * w_dq;
+        accum[row] += static_cast<float>(product);
+    }
+}
+
+template <int rows>
+inline void qwen38_mixed_q5_pack(
+    const device float* x,
+    int row_stride,
+    const device uchar* packed,
+    float scale,
+    float bias,
+    thread float* accum
+) {
+    uchar b0 = packed[0];
+    uchar b1 = packed[1];
+    uchar b2 = packed[2];
+    uchar b3 = packed[3];
+    uchar b4 = packed[4];
+
+    ushort code = b0 & 0x1fu;
+    qwen38_mixed_q5_update<rows>(
+        x, row_stride, 0, static_cast<half>(scale * static_cast<float>(code) + bias), accum);
+    code = (b0 >> 5u) | ((b1 & 0x03u) << 3u);
+    qwen38_mixed_q5_update<rows>(
+        x, row_stride, 1, static_cast<half>(scale * static_cast<float>(code) + bias), accum);
+    code = (b1 >> 2u) & 0x1fu;
+    qwen38_mixed_q5_update<rows>(
+        x, row_stride, 2, static_cast<half>(scale * static_cast<float>(code) + bias), accum);
+    code = (b1 >> 7u) | ((b2 & 0x0fu) << 1u);
+    qwen38_mixed_q5_update<rows>(
+        x, row_stride, 3, static_cast<half>(scale * static_cast<float>(code) + bias), accum);
+    code = (b2 >> 4u) | ((b3 & 0x01u) << 4u);
+    qwen38_mixed_q5_update<rows>(
+        x, row_stride, 4, static_cast<half>(scale * static_cast<float>(code) + bias), accum);
+    code = (b3 >> 1u) & 0x1fu;
+    qwen38_mixed_q5_update<rows>(
+        x, row_stride, 5, static_cast<half>(scale * static_cast<float>(code) + bias), accum);
+    code = (b3 >> 6u) | ((b4 & 0x07u) << 2u);
+    qwen38_mixed_q5_update<rows>(
+        x, row_stride, 6, static_cast<half>(scale * static_cast<float>(code) + bias), accum);
+    code = b4 >> 3u;
+    qwen38_mixed_q5_update<rows>(
+        x, row_stride, 7, static_cast<half>(scale * static_cast<float>(code) + bias), accum);
+}
 )";
 
 static const char* QWEN38_AFFINE_M23_METAL_SOURCE = R"(
@@ -179,8 +235,64 @@ static const char* QWEN38_AFFINE_M23_METAL_SOURCE = R"(
     }
 )";
 
+static const char* QWEN38_AFFINE_MIXED_Q5_METAL_SOURCE = R"(
+    constexpr int packs_per_thread = 2;
+    constexpr int values_per_thread = 16;
+    constexpr int block_size = values_per_thread * 32;
+    constexpr int outputs_per_simd = MRows == 3 ? 1 : 4;
+    constexpr int outputs_per_threadgroup = outputs_per_simd * 2;
+
+    uint simdgroup = simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    int output_base = (int)threadgroup_position_in_grid.y * outputs_per_threadgroup
+        + (int)simdgroup * outputs_per_simd;
+    int width = (int)x_shape[1];
+    int output_rows = (int)weight_shape[0];
+    int packed_row_bytes = width * 5 / 8;
+    int groups_per_row = width / 32;
+
+    float results[MRows][outputs_per_simd] = {};
+    for (int k = 0; k < width; k += block_size) {
+        for (int output = 0; output < outputs_per_simd; ++output) {
+            int output_row = output_base + output;
+            if (output_row >= output_rows) {
+                continue;
+            }
+            int byte_offset = output_row * packed_row_bytes + k * 5 / 8
+                + (int)lane * 10;
+            const device uchar* source =
+                reinterpret_cast<const device uchar*>(weight) + byte_offset;
+            int group_offset = output_row * groups_per_row + k / 32
+                + (int)lane / 2;
+            float scale = scales[group_offset];
+            float bias = biases[group_offset];
+            float accum[MRows] = {};
+            const device float* activation = x + k
+                + (int)lane * values_per_thread;
+            qwen38_mixed_q5_pack<MRows>(
+                activation, width, source, scale, bias, accum);
+            qwen38_mixed_q5_pack<MRows>(
+                activation + 8, width, source + 5, scale, bias, accum);
+            for (int input_row = 0; input_row < MRows; ++input_row) {
+                results[input_row][output] += accum[input_row];
+            }
+        }
+    }
+
+    for (int input_row = 0; input_row < MRows; ++input_row) {
+        for (int output = 0; output < outputs_per_simd; ++output) {
+            float total = simd_sum(results[input_row][output]);
+            int output_row = output_base + output;
+            if (lane == 0u && output_row < output_rows) {
+                out[input_row * output_rows + output_row] = total;
+            }
+        }
+    }
+)";
+
 struct Qwen38KernelHolder {
     std::optional<mlx::core::fast::CustomKernelFunction> affine_m23;
+    std::optional<mlx::core::fast::CustomKernelFunction> affine_mixed_q5;
     std::once_flag initialize_once;
 
     void initialize() {
@@ -190,6 +302,13 @@ struct Qwen38KernelHolder {
                 {"x", "weight", "scales", "biases"},
                 {"out"},
                 QWEN38_AFFINE_M23_METAL_SOURCE,
+                QWEN38_AFFINE_M23_METAL_HEADER,
+                false);
+            affine_mixed_q5 = mlx::core::fast::metal_kernel(
+                "qw_qwen38_affine_mixed_q5_v1",
+                {"x", "weight", "scales", "biases"},
+                {"out"},
+                QWEN38_AFFINE_MIXED_Q5_METAL_SOURCE,
                 QWEN38_AFFINE_M23_METAL_HEADER,
                 false);
         });
@@ -249,23 +368,29 @@ std::unique_ptr<MlxArray> qwen38_affine_m23_matmul(
     int32_t in_features,
     int32_t out_features,
     int32_t input_rows,
-    bool require_pinned_shape
+    bool require_pinned_shape,
+    bool use_mixed_q5
 ) {
 #ifndef __APPLE__
-    throw std::invalid_argument("pinned affine M2/M3 execution requires Metal");
+    throw std::invalid_argument("pinned affine execution requires Metal");
 #else
     using namespace mlx::core;
     if (!metal::is_available()) {
-        throw std::invalid_argument("pinned affine M2/M3 execution requires Metal");
+        throw std::invalid_argument("pinned affine execution requires Metal");
     }
+    const bool mixed_q5 = use_mixed_q5
+        && bits == 5
+        && (input_rows == 1 || input_rows == 3 || input_rows == 4)
+        && qwen38_affine_shape(in_features, out_features);
     if ((require_pinned_shape && !qwen38_affine_shape(in_features, out_features))
-            || (input_rows != 2 && input_rows != 3)
+            || (use_mixed_q5 && !mixed_q5)
+            || (!mixed_q5 && input_rows != 2 && input_rows != 3)
             || x.inner.dtype() != float32
             || x.inner.size() != static_cast<size_t>(input_rows)
                 * static_cast<size_t>(in_features)
             || x.inner.shape().empty()
             || x.inner.shape().back() != in_features) {
-        throw std::invalid_argument("pinned affine M2/M3 activation is invalid");
+        throw std::invalid_argument("pinned affine activation is invalid");
     }
     validate_affine_planes(
         weight.inner,
@@ -276,18 +401,38 @@ std::unique_ptr<MlxArray> qwen38_affine_m23_matmul(
         out_features);
 
     auto input = contiguous(reshape(x.inner, {input_rows, in_features}));
-    const auto args = std::vector<std::pair<std::string, fast::TemplateArg>>{
-        {"Bits", bits}, {"MRows", input_rows}};
-    auto results = (*qwen38_kernels().affine_m23)(
-        {input, weight.inner, scales.inner, biases.inner},
-        {Shape{input_rows, out_features}},
-        {float32},
-        std::make_tuple(32, ((out_features + 7) / 8) * 2, 1),
-        std::make_tuple(32, 2, 1),
-        args,
-        std::nullopt,
-        false,
-        {});
+    const auto args = mixed_q5
+        ? std::vector<std::pair<std::string, fast::TemplateArg>>{
+              {"MRows", input_rows}}
+        : std::vector<std::pair<std::string, fast::TemplateArg>>{
+              {"Bits", bits}, {"MRows", input_rows}};
+    const int32_t output_rows_per_threadgroup =
+        mixed_q5 && input_rows == 3 ? 2 : 8;
+    auto results = mixed_q5
+        ? (*qwen38_kernels().affine_mixed_q5)(
+              {input, weight.inner, scales.inner, biases.inner},
+              {Shape{input_rows, out_features}},
+              {float32},
+              std::make_tuple(
+                  32,
+                  ((out_features + output_rows_per_threadgroup - 1)
+                   / output_rows_per_threadgroup) * 2,
+                  1),
+              std::make_tuple(32, 2, 1),
+              args,
+              std::nullopt,
+              false,
+              {})
+        : (*qwen38_kernels().affine_m23)(
+              {input, weight.inner, scales.inner, biases.inner},
+              {Shape{input_rows, out_features}},
+              {float32},
+              std::make_tuple(32, ((out_features + 7) / 8) * 2, 1),
+              std::make_tuple(32, 2, 1),
+              args,
+              std::nullopt,
+              false,
+              {});
     Shape output_shape(x.inner.shape().begin(), x.inner.shape().end() - 1);
     output_shape.push_back(out_features);
     return std::make_unique<MlxArray>(reshape(results[0], output_shape));

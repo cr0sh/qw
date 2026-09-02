@@ -22,6 +22,14 @@ pub const LONG_CONTEXT_64K_MIN_TOKENS: usize = 64_000;
 /// Environment variable pointing at the DFlash2 drafter checkpoint directory.
 pub const DRAFT_MODEL_ENV: &str = "QW_BENCH_DRAFT_MODEL";
 const DFLASH2_DRAFT_CACHE_RELATIVE_DIR: &str = ".cache/qw/models/incoai/Qwen3.8-27B-DFlash2";
+const QWEN38_MIXED_Q5_ENV: &str = "MLXCEL_EXPERIMENTAL_QWEN38_MIXED_Q5";
+
+pub fn qwen38_mixed_q5_enabled() -> bool {
+    matches!(
+        std::env::var(QWEN38_MIXED_Q5_ENV).ok().as_deref(),
+        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+    )
+}
 pub const PROMPT: &str = concat!(
     "You are the on-call support operations analyst for Acme Commerce. ",
     "Review this incident and return only one compact JSON object with keys ",
@@ -114,6 +122,14 @@ fn long_context_cache_identity(context_label: &str, min_prefix_tokens: usize) ->
     ] {
         hash_bytes(&mut hash, bytes);
     }
+    hash_bytes(
+        &mut hash,
+        if qwen38_mixed_q5_enabled() {
+            b"qwen38-mixed-q5-on"
+        } else {
+            b"qwen38-mixed-q5-off"
+        },
+    );
     hash_bytes(&mut hash, model_dir.as_os_str().as_encoded_bytes());
 
     for bytes in [
@@ -126,6 +142,10 @@ fn long_context_cache_identity(context_label: &str, min_prefix_tokens: usize) ->
         include_bytes!("../../src/gguf.rs").as_slice(),
         include_bytes!("../../src/qwen38_plan.rs").as_slice(),
         include_bytes!("../../src/qwen3_5_weights.rs").as_slice(),
+        include_bytes!("../../src/qwen3_5.rs").as_slice(),
+        include_bytes!("../../../mlxcel-core/src/ggml_affine.rs").as_slice(),
+        include_bytes!("../../../mlxcel-core/cpp/mlx_cxx_qwen38.cpp").as_slice(),
+        include_bytes!("../../../mlxcel-core/cpp/mlx_cxx_qwen38_fusion.cpp").as_slice(),
     ] {
         hash_bytes(&mut hash, bytes);
     }
@@ -166,9 +186,16 @@ fn long_context_cache_identity(context_label: &str, min_prefix_tokens: usize) ->
 }
 
 fn long_context_cache_path(context_label: &str) -> PathBuf {
+    let arithmetic = if qwen38_mixed_q5_enabled() {
+        "_q5mixed"
+    } else {
+        ""
+    };
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/qw-bench-fixtures")
-        .join(format!("long_{context_label}_mtp_k{MTP_BLOCK_SIZE}.bin"))
+        .join(format!(
+            "long_{context_label}_mtp_k{MTP_BLOCK_SIZE}{arithmetic}.bin"
+        ))
 }
 
 fn write_u8(writer: &mut impl Write, value: u8) -> io::Result<()> {

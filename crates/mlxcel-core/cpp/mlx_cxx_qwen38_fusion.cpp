@@ -300,6 +300,119 @@ METAL_FUNC float qwen38_qkv_qdot(
     return scale * accum + sum * bias;
 }
 
+template <int rows>
+METAL_FUNC void qwen38_qkv_mixed_q5_update(
+    const device float* x,
+    int row_stride,
+    int column,
+    half w_dq,
+    thread float* accum
+) {
+    for (int row = 0; row < rows; ++row) {
+        half activation = static_cast<half>(x[row * row_stride + column]);
+        half product = activation * w_dq;
+        accum[row] += static_cast<float>(product);
+    }
+}
+
+template <int rows>
+METAL_FUNC void qwen38_qkv_mixed_q5_pack(
+    const device float* x,
+    int row_stride,
+    const device uchar* packed,
+    float scale,
+    float bias,
+    thread float* accum
+) {
+    uchar b0 = packed[0];
+    uchar b1 = packed[1];
+    uchar b2 = packed[2];
+    uchar b3 = packed[3];
+    uchar b4 = packed[4];
+
+    ushort code = b0 & 0x1fu;
+    qwen38_qkv_mixed_q5_update<rows>(
+        x, row_stride, 0, static_cast<half>(scale * static_cast<float>(code) + bias), accum);
+    code = (b0 >> 5u) | ((b1 & 0x03u) << 3u);
+    qwen38_qkv_mixed_q5_update<rows>(
+        x, row_stride, 1, static_cast<half>(scale * static_cast<float>(code) + bias), accum);
+    code = (b1 >> 2u) & 0x1fu;
+    qwen38_qkv_mixed_q5_update<rows>(
+        x, row_stride, 2, static_cast<half>(scale * static_cast<float>(code) + bias), accum);
+    code = (b1 >> 7u) | ((b2 & 0x0fu) << 1u);
+    qwen38_qkv_mixed_q5_update<rows>(
+        x, row_stride, 3, static_cast<half>(scale * static_cast<float>(code) + bias), accum);
+    code = (b2 >> 4u) | ((b3 & 0x01u) << 4u);
+    qwen38_qkv_mixed_q5_update<rows>(
+        x, row_stride, 4, static_cast<half>(scale * static_cast<float>(code) + bias), accum);
+    code = (b3 >> 1u) & 0x1fu;
+    qwen38_qkv_mixed_q5_update<rows>(
+        x, row_stride, 5, static_cast<half>(scale * static_cast<float>(code) + bias), accum);
+    code = (b3 >> 6u) | ((b4 & 0x07u) << 2u);
+    qwen38_qkv_mixed_q5_update<rows>(
+        x, row_stride, 6, static_cast<half>(scale * static_cast<float>(code) + bias), accum);
+    code = b4 >> 3u;
+    qwen38_qkv_mixed_q5_update<rows>(
+        x, row_stride, 7, static_cast<half>(scale * static_cast<float>(code) + bias), accum);
+}
+
+template <int MRows>
+METAL_FUNC void qwen38_qkv_mixed_q5_project(
+    const device float* x,
+    const device uint32_t* weight,
+    const device float* scales,
+    const device float* biases,
+    device float* out,
+    int width,
+    int output_rows,
+    int work,
+    ushort simd_gid,
+    ushort lane
+) {
+    constexpr int values_per_thread = 16;
+    constexpr int block_size = values_per_thread * 32;
+    constexpr int outputs_per_simd = MRows == 3 ? 1 : 4;
+    constexpr int outputs_per_workgroup = outputs_per_simd * 4;
+    const int output_base =
+        work * outputs_per_workgroup + (int)simd_gid * outputs_per_simd;
+    const int packed_row_bytes = width * 5 / 8;
+    const int groups_per_row = width / 32;
+    float results[MRows][outputs_per_simd] = {};
+    for (int k = 0; k < width; k += block_size) {
+        for (int output = 0; output < outputs_per_simd; ++output) {
+            int output_row = output_base + output;
+            if (output_row >= output_rows) continue;
+            int byte_offset = output_row * packed_row_bytes + k * 5 / 8
+                + (int)lane * 10;
+            const device uchar* source =
+                reinterpret_cast<const device uchar*>(weight) + byte_offset;
+            int group_offset = output_row * groups_per_row + k / 32
+                + (int)lane / 2;
+            float scale = scales[group_offset];
+            float bias = biases[group_offset];
+            float accum[MRows] = {};
+            const device float* activation =
+                x + k + (int)lane * values_per_thread;
+            qwen38_qkv_mixed_q5_pack<MRows>(
+                activation, width, source, scale, bias, accum);
+            qwen38_qkv_mixed_q5_pack<MRows>(
+                activation + 8, width, source + 5, scale, bias, accum);
+            for (int input_row = 0; input_row < MRows; ++input_row) {
+                results[input_row][output] += accum[input_row];
+            }
+        }
+    }
+    for (int input_row = 0; input_row < MRows; ++input_row) {
+        for (int output = 0; output < outputs_per_simd; ++output) {
+            float total = simd_sum(results[input_row][output]);
+            int output_row = output_base + output;
+            if (lane == 0u && output_row < output_rows) {
+                out[input_row * output_rows + output_row] = total;
+            }
+        }
+    }
+}
+
 template <int Bits, int MRows>
 METAL_FUNC void qwen38_qkv_qdot_project(
     const device float* x,
@@ -542,7 +655,8 @@ static const char* QWEN38_MIXED_QKV_SOURCE = R"(
     constexpr int K = 5120;
     constexpr int Nq = 12288;
     constexpr int Nkv = 1024;
-    constexpr int QGroups = Nq / 16;
+    constexpr int QGroups =
+        MixedQ5 && MRows == 3 ? Nq / 4 : Nq / 16;
     constexpr int KGroups = KCode == 14 ? Nkv / 4 : Nkv / 16;
     constexpr int VGroups = VCode == 14 ? Nkv / 4 : Nkv / 16;
     const int work = threadgroup_position_in_grid.x;
@@ -550,7 +664,10 @@ static const char* QWEN38_MIXED_QKV_SOURCE = R"(
     const ushort lane = thread_index_in_simdgroup;
 
     if (work < QGroups) {
-        if constexpr (MRows == 3) {
+        if constexpr (MixedQ5) {
+            qwen38_qkv_mixed_q5_project<MRows>(
+                x, q_w, q_s, q_b, q_out, K, Nq, work, sgid, lane);
+        } else if constexpr (MRows == 3) {
             qwen38_qkv_qdot_project<QBits, MRows>(
                 x, q_w, q_s, q_b, q_out, K, Nq, work, sgid, lane);
         } else {
@@ -833,7 +950,7 @@ struct Qwen38FusionKernelHolder {
                 {"x", "weight", "scales", "biases"},
                 {"out"}, QWEN38_MLP_DOWN_SOURCE, header, false);
             mixed_qkv = mlx::core::fast::metal_kernel(
-                "qw_qwen38_mixed_qkv_v1",
+                "qw_qwen38_mixed_qkv_v2",
                 {"x", "q_w", "q_s", "q_b",
                  "k_w", "k_s", "k_b", "k_packed",
                  "v_w", "v_s", "v_b", "v_packed"},
@@ -938,7 +1055,8 @@ std::unique_ptr<Qwen38GgmlQkvOutputs> qwen38_mixed_qkv_bundle(
     const MlxArray& v_b,
     const MlxArray& v_packed,
     int32_t v_code,
-    int32_t input_rows
+    int32_t input_rows,
+    bool use_mixed_q5
 ) {
 #ifndef __APPLE__
     throw std::invalid_argument("pinned Qwen3.8 mixed QKV requires Metal");
@@ -949,6 +1067,11 @@ std::unique_ptr<Qwen38GgmlQkvOutputs> qwen38_mixed_qkv_bundle(
     constexpr int32_t kv_rows = 1024;
     if (!metal::is_available()) {
         throw std::invalid_argument("pinned Qwen3.8 mixed QKV requires Metal");
+    }
+    const bool mixed_q5 = use_mixed_q5 && q_bits == 5;
+    if (use_mixed_q5 && !mixed_q5) {
+        throw std::invalid_argument(
+            "pinned Qwen3.8 mixed QKV experiment requires a Q5 query");
     }
     validate_plane(q_w.inner, q_s.inner, q_b.inner,
                    q_bits, width, query_rows);
@@ -983,8 +1106,10 @@ std::unique_ptr<Qwen38GgmlQkvOutputs> qwen38_mixed_qkv_bundle(
     const auto kv_groups = [](int32_t code) {
         return code == 14 ? kv_rows / 4 : kv_rows / 16;
     };
+    const int32_t query_groups =
+        mixed_q5 && input_rows == 3 ? query_rows / 4 : query_rows / 16;
     const int32_t workgroups =
-        query_rows / 16 + kv_groups(k_code) + kv_groups(v_code);
+        query_groups + kv_groups(k_code) + kv_groups(v_code);
     auto output = (*qwen38_fusion_kernels().mixed_qkv)(
         {input, q_w.inner, q_s.inner, q_b.inner,
          k_w.inner, k_s.inner, k_b.inner, k_packed.inner,
@@ -996,7 +1121,8 @@ std::unique_ptr<Qwen38GgmlQkvOutputs> qwen38_mixed_qkv_bundle(
         std::make_tuple(workgroups * 128, 1, 1),
         std::make_tuple(128, 1, 1),
         args({{"QBits", q_bits}, {"KCode", k_code},
-              {"VCode", v_code}, {"MRows", input_rows}}),
+              {"VCode", v_code}, {"MRows", input_rows},
+              {"MixedQ5", mixed_q5 ? 1 : 0}}),
         std::nullopt,
         false,
         {});

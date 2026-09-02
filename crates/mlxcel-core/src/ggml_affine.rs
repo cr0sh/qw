@@ -10,6 +10,7 @@
 //! represented by MLX's smallest supported affine group (32 elements).
 
 use std::ops::Range;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use cxx::UniquePtr;
@@ -21,6 +22,17 @@ use crate::{MlxArray, Qwen38Q6DualMatrix, dtype};
 const GROUP_SIZE: usize = 32;
 const F16_PREFILL_MIN_ROWS: i32 = 128;
 const RELEASE_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+const QWEN38_MIXED_Q5_ENV: &str = "MLXCEL_EXPERIMENTAL_QWEN38_MIXED_Q5";
+
+fn qwen38_mixed_q5_enabled() -> bool {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        matches!(
+            std::env::var(QWEN38_MIXED_Q5_ENV).ok().as_deref(),
+            Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+        )
+    });
+    *ENABLED
+}
 const IQ4_VALUES: [i16; 16] = [
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 ];
@@ -359,22 +371,59 @@ impl GgmlAffineMatrix {
         Ok(affine_matmul(input, &self.planes, self.bits))
     }
 
-    /// Runs the exact pinned Qwen3.8 target shapes through one affine weight
-    /// pass for M2/M3. Every other shape, dtype, or row count keeps the
-    /// ordinary affine dispatcher.
+    /// Runs exact pinned Qwen3.8 target shapes through the selected small-row
+    /// kernel. The mixed Q5 experiment is opt-in and covers only M1/M3/M4;
+    /// every other case retains the existing M2/M3 or ordinary affine path.
     pub fn forward_qwen38_m23(
         &self,
         input: &MlxArray,
     ) -> Result<UniquePtr<MlxArray>, GgmlAffineError> {
         validate_input(input, self.in_features)?;
         let input_rows = affine_input_rows(input)?;
+        let pinned = qwen38_m23_shape(self.in_features, self.out_features);
+        if qwen38_mixed_q5_enabled()
+            && self.bits == 5
+            && matches!(input_rows, 1 | 3 | 4)
+            && pinned
+        {
+            return qwen38_affine_m23_matmul(input, self, input_rows, true, true);
+        }
         if !(2..=3).contains(&input_rows)
             || crate::array_dtype(input) != dtype::FLOAT32
-            || !qwen38_m23_shape(self.in_features, self.out_features)
+            || !pinned
         {
             return self.forward(input);
         }
-        qwen38_affine_m23_matmul(input, self, input_rows, true)
+        qwen38_affine_m23_matmul(input, self, input_rows, true, false)
+    }
+
+    /// Direct A/B entry point for the disposable pinned mixed-Q5 experiment.
+    ///
+    /// `use_mixed_precision=false` selects the current production path for the
+    /// same row count. The method intentionally rejects every non-Q5, non-pinned,
+    /// or non-M1/M3/M4 input instead of broadening the experiment gate.
+    #[doc(hidden)]
+    pub fn forward_qwen38_q5_experiment(
+        &self,
+        input: &MlxArray,
+        use_mixed_precision: bool,
+    ) -> Result<UniquePtr<MlxArray>, GgmlAffineError> {
+        validate_input(input, self.in_features)?;
+        let input_rows = affine_input_rows(input)?;
+        if self.bits != 5
+            || !matches!(input_rows, 1 | 3 | 4)
+            || crate::array_dtype(input) != dtype::FLOAT32
+            || !qwen38_m23_shape(self.in_features, self.out_features)
+        {
+            return Err(GgmlAffineError::InvalidInput);
+        }
+        if use_mixed_precision {
+            qwen38_affine_m23_matmul(input, self, input_rows, true, true)
+        } else if input_rows == 3 {
+            qwen38_affine_m23_matmul(input, self, input_rows, true, false)
+        } else {
+            Ok(affine_matmul(input, &self.planes, self.bits))
+        }
     }
 
     /// Runs the exact pinned Qwen3.8 MTP shapes through one affine weight pass
@@ -392,7 +441,7 @@ impl GgmlAffineMatrix {
         {
             return self.forward(input);
         }
-        qwen38_affine_m23_matmul(input, self, input_rows, true)
+        qwen38_affine_m23_matmul(input, self, input_rows, true, false)
     }
 
     #[cfg(test)]
@@ -407,7 +456,7 @@ impl GgmlAffineMatrix {
         {
             return self.forward(input);
         }
-        qwen38_affine_m23_matmul(input, self, input_rows, false)
+        qwen38_affine_m23_matmul(input, self, input_rows, false, false)
     }
 
     pub fn select_rows(&self, ranges: &[Range<usize>]) -> Result<GgmlAffineRows, GgmlAffineError> {
@@ -656,6 +705,7 @@ impl Qwen38MixedQkvBundle {
             value_packed,
             value_code,
             input_rows,
+            qwen38_mixed_q5_enabled() && self.query.bits == 5,
         )
         .map_err(|error| GgmlAffineError::Backend(error.what().to_owned()))?;
         let output = outputs.pin_mut();
@@ -740,7 +790,7 @@ impl Qwen38AffineMlpFusion {
             let forward = |matrix: &GgmlAffineMatrix, input: &MlxArray, m23| {
                 if rows == 2 && self.m2_only {
                     matrix.forward_qwen38_m2(input)
-                } else if matches!(rows, 2 | 3) && m23 {
+                } else if m23 {
                     matrix.forward_qwen38_m23(input)
                 } else {
                     matrix.forward(input)
@@ -909,7 +959,7 @@ impl Qwen38AffineGdnIngressFusion {
             || !crate::ffi::array_is_row_contiguous(input)
         {
             let forward = |matrix: &GgmlAffineMatrix, m23| {
-                if matches!(rows, 2 | 3) && m23 {
+                if m23 {
                     matrix.forward_qwen38_m23(input)
                 } else {
                     matrix.forward(input)
@@ -1472,6 +1522,7 @@ fn qwen38_affine_m23_matmul(
     matrix: &GgmlAffineMatrix,
     input_rows: i32,
     require_pinned_shape: bool,
+    use_mixed_q5: bool,
 ) -> Result<UniquePtr<MlxArray>, GgmlAffineError> {
     crate::ffi::qwen38_affine_m23_matmul(
         input,
@@ -1495,6 +1546,7 @@ fn qwen38_affine_m23_matmul(
         matrix.out_features,
         input_rows,
         require_pinned_shape,
+        use_mixed_q5,
     )
     .map_err(|error| GgmlAffineError::Backend(error.to_string()))
 }

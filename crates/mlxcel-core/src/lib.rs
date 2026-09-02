@@ -1854,6 +1854,7 @@ mod ffi {
             v_packed: &MlxArray,
             v_code: i32,
             input_rows: i32,
+            use_mixed_q5: bool,
         ) -> Result<UniquePtr<Qwen38GgmlQkvOutputs>>;
         fn qwen38_ggml_qkv_take_query(
             outputs: Pin<&mut Qwen38GgmlQkvOutputs>,
@@ -1875,6 +1876,7 @@ mod ffi {
             out_features: i32,
             input_rows: i32,
             require_pinned_shape: bool,
+            use_mixed_q5: bool,
         ) -> Result<UniquePtr<MlxArray>>;
 
         /// M>=4 all-affine MLP for the exact pinned Qwen3.8 artifact.
