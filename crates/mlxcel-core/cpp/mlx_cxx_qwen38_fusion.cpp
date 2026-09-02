@@ -111,76 +111,6 @@ METAL_FUNC void qwen38_store_tile(
         tile + mma.sm * 32 + mma.sn);
 }
 
-template <int Bits, int VecsPerTg>
-METAL_FUNC void qwen38_qmv_wide_accumulate(
-    const device uint32_t* w,
-    const device float* scales,
-    const device float* biases,
-    const device float* x,
-    int K,
-    int N,
-    int M,
-    uint3 tid,
-    ushort simd_gid,
-    ushort simd_lid,
-    threadgroup float* tile
-) {
-    constexpr int K_lanes = 8;
-    constexpr int ResultsPerSimdgroup = 4;
-    constexpr int Sub = 8;
-    const short k_lane = simd_lid % K_lanes;
-    const short sg_row = simd_lid / K_lanes;
-    const int out_row =
-        tid.y * (ResultsPerSimdgroup * 2) + ResultsPerSimdgroup * simd_gid + sg_row;
-    const int vec0 = tid.x * VecsPerTg;
-    const int row = min(out_row, N - 1);
-    const int weight_row_bytes = K * Bits / 8;
-    const int groups = K / 32;
-    const device uint8_t* wrow =
-        reinterpret_cast<const device uint8_t*>(w) + row * weight_row_bytes;
-    const device float* srow = scales + row * groups;
-    const device float* brow = biases + row * groups;
-    const device float* xv[VecsPerTg];
-    for (int v = 0; v < VecsPerTg; ++v) {
-        xv[v] = x + min(vec0 + v, M - 1) * K;
-    }
-    float result[VecsPerTg] = {0};
-    for (int g = k_lane; g < groups; g += K_lanes) {
-        float scale = srow[g];
-        float bias = brow[g];
-#pragma unroll
-        for (int sc = 0; sc < 4; ++sc) {
-            const int k0 = g * 32 + sc * Sub;
-            const device uint8_t* wc = wrow + k0 * Bits / 8;
-            float w_dq[Sub];
-            dequantize<float, Sub, Bits>(wc, scale, bias, w_dq);
-#pragma unroll
-            for (int v = 0; v < VecsPerTg; ++v) {
-                const device float* xc = xv[v] + k0;
-                float acc = 0;
-#pragma unroll
-                for (int i = 0; i < Sub; ++i) {
-                    acc += xc[i] * w_dq[i];
-                }
-                result[v] += acc;
-            }
-        }
-    }
-    for (int v = 0; v < VecsPerTg; ++v) {
-        result[v] += simd_shuffle_down(result[v], 4);
-        result[v] += simd_shuffle_down(result[v], 2);
-        result[v] += simd_shuffle_down(result[v], 1);
-    }
-    if (k_lane == 0 && out_row < N) {
-        const int local_row = ResultsPerSimdgroup * simd_gid + sg_row;
-        for (int v = 0; v < VecsPerTg; ++v) {
-            if (vec0 + v < M) {
-                tile[v * 8 + local_row] = result[v];
-            }
-        }
-    }
-}
-
 METAL_FUNC float qwen38_sigmoid(float x) {
     auto y = 1 / (1 + metal::exp(metal::abs(x)));
     return (x < 0) ? y : 1 - y;
@@ -265,67 +195,6 @@ METAL_FUNC void qwen38_reduce_looped(
         }
     }
 }
-)";
-
-static const char* QWEN38_GDN_QMV_SOURCE = R"(
-    constexpr int K = 5120;
-    constexpr int Nq = 10240;
-    constexpr int Nz = 6144;
-    constexpr int Ns = 48;
-    constexpr int Tq = Nq / 8;
-    constexpr int Tz = Nz / 8;
-    constexpr int Ts = Ns / 8;
-    const int work = threadgroup_position_in_grid.y;
-    int output_tile;
-    int n;
-    int bits_kind;
-    const device uint32_t* w;
-    const device float* s;
-    const device float* b;
-    device float* y;
-    if (work < Tq) {
-        output_tile = work; n = Nq; bits_kind = 0;
-        w = qkv_w; s = qkv_s; b = qkv_b; y = qkv_out;
-    } else if (work < Tq + Tz) {
-        output_tile = work - Tq; n = Nz; bits_kind = 1;
-        w = z_w; s = z_s; b = z_b; y = z_out;
-    } else if (work < Tq + Tz + Ts) {
-        output_tile = work - Tq - Tz; n = Ns; bits_kind = 2;
-        w = beta_w; s = beta_s; b = beta_b; y = beta_out;
-    } else {
-        output_tile = work - Tq - Tz - Ts; n = Ns; bits_kind = 3;
-        w = alpha_w; s = alpha_s; b = alpha_b; y = alpha_out;
-    }
-    threadgroup float tile[5 * 8];
-    uint3 tid(threadgroup_position_in_grid.x, output_tile, 0);
-    if (bits_kind == 0) {
-        qwen38_qmv_wide_accumulate<QkvBits, VecsPerTg>(
-            w, s, b, x, K, n, MRows, tid,
-            simdgroup_index_in_threadgroup, thread_index_in_simdgroup, tile);
-    } else if (bits_kind == 1) {
-        qwen38_qmv_wide_accumulate<ZBits, VecsPerTg>(
-            w, s, b, x, K, n, MRows, tid,
-            simdgroup_index_in_threadgroup, thread_index_in_simdgroup, tile);
-    } else if (bits_kind == 2) {
-        qwen38_qmv_wide_accumulate<BetaBits, VecsPerTg>(
-            w, s, b, x, K, n, MRows, tid,
-            simdgroup_index_in_threadgroup, thread_index_in_simdgroup, tile);
-    } else {
-        qwen38_qmv_wide_accumulate<AlphaBits, VecsPerTg>(
-            w, s, b, x, K, n, MRows, tid,
-            simdgroup_index_in_threadgroup, thread_index_in_simdgroup, tile);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const int local = thread_index_in_threadgroup;
-    for (int index = local; index < VecsPerTg * 8; index += 64) {
-        const int row = index / 8;
-        const int col = index % 8;
-        const int output_row = threadgroup_position_in_grid.x * VecsPerTg + row;
-        const int output_col = output_tile * 8 + col;
-        if (output_row < MRows && output_col < n) {
-            y[output_row * n + output_col] = tile[index];
-        }
-    }
 )";
 
 static const char* QWEN38_MLP_GATE_UP_SOURCE = R"(
@@ -629,7 +498,6 @@ struct Qwen38FusionKernelHolder {
     std::optional<mlx::core::fast::CustomKernelFunction> mlp_down;
     std::optional<mlx::core::fast::CustomKernelFunction> gdn_qz;
     std::optional<mlx::core::fast::CustomKernelFunction> gdn_ba;
-    std::optional<mlx::core::fast::CustomKernelFunction> gdn_qmv;
     std::optional<mlx::core::fast::CustomKernelFunction> gdn_reduce_zba;
     std::optional<mlx::core::fast::CustomKernelFunction> gdn_reduce_ba;
     std::once_flag initialize_once;
@@ -638,12 +506,6 @@ struct Qwen38FusionKernelHolder {
         std::call_once(initialize_once, [this] {
             std::string header = QWEN38_QUANTIZED_METAL;
             header += QWEN38_QMM_FUSION_HEADER;
-            gdn_qmv = mlx::core::fast::metal_kernel(
-                "qw_qwen38_affine_gdn_qmv_v1",
-                {"x", "qkv_w", "qkv_s", "qkv_b", "z_w", "z_s", "z_b",
-                 "beta_w", "beta_s", "beta_b", "alpha_w", "alpha_s", "alpha_b"},
-                {"qkv_out", "z_out", "beta_out", "alpha_out"},
-                QWEN38_GDN_QMV_SOURCE, header, false);
             mlp_gate_up = mlx::core::fast::metal_kernel(
                 "qw_qwen38_affine_mlp_gu_qmm_v2",
                 {"x", "gate_w", "gate_s", "gate_b", "up_w", "up_s", "up_b"},
@@ -830,73 +692,54 @@ std::unique_ptr<Qwen38GdnIngressOutputs> qwen38_affine_gdn_ingress_fused(
     }
     array input = reshape(x.inner, {m, 5120});
     std::vector<array> final_outputs;
-    if (m < 13) {
-        constexpr int work = 10240 / 8 + 6144 / 8 + 2 * (48 / 8);
-        int vec_tiles = (m + 4) / 5;
-        int vecs_per_tg = (m + vec_tiles - 1) / vec_tiles;
-        auto qmv = (*qwen38_fusion_kernels().gdn_qmv)(
-            {input, qkv_w.inner, qkv_s.inner, qkv_b.inner,
-             z_w.inner, z_s.inner, z_b.inner,
-             beta_w.inner, beta_s.inner, beta_b.inner,
-             alpha_w.inner, alpha_s.inner, alpha_b.inner},
-            {Shape{m, 10240}, Shape{m, 6144}, Shape{m, 48}, Shape{m, 48}},
-            {float32, float32, float32, float32},
-            std::make_tuple(((m + vecs_per_tg - 1) / vecs_per_tg) * 32,
-                            work * 2, 1),
-            std::make_tuple(32, 2, 1),
-            args({{"QkvBits", qkv_bits}, {"ZBits", z_bits},
-                  {"BetaBits", beta_bits}, {"AlphaBits", alpha_bits},
-                  {"VecsPerTg", vecs_per_tg}, {"MRows", m}}),
-            std::nullopt, false, {});
-        final_outputs = {qmv[0], qmv[1], qmv[2], qmv[3]};
+    int qz_work = 10240 / 32 + (6144 / 32) * sz;
+    auto qz = (*qwen38_fusion_kernels().gdn_qz)(
+        {input, qkv_w.inner, qkv_s.inner, qkv_b.inner, z_w.inner, z_s.inner,
+         z_b.inner},
+        {Shape{m, 10240}, Shape{sz, m, 6144}}, {float32, float32},
+        std::make_tuple(qz_work * 32, ((m + 31) / 32) * 4, 1),
+        std::make_tuple(32, 4, 1),
+        args({{"QkvBits", qkv_bits},
+              {"ZBits", z_bits},
+              {"SplitZ", sz},
+              {"MRows", m}}),
+        std::nullopt, false, {});
+    int ba_work = 2 * sb + 2 * sa;
+    auto ba = (*qwen38_fusion_kernels().gdn_ba)(
+        {input, beta_w.inner, beta_s.inner, beta_b.inner, alpha_w.inner,
+         alpha_s.inner, alpha_b.inner},
+        {Shape{sb, m, 48}, Shape{sa, m, 48}}, {float32, float32},
+        std::make_tuple(ba_work * 32, ((m + 31) / 32) * 4, 1),
+        std::make_tuple(32, 4, 1),
+        args({{"BetaBits", beta_bits},
+              {"AlphaBits", alpha_bits},
+              {"SplitB", sb},
+              {"SplitA", sa},
+              {"MRows", m}}),
+        std::nullopt, false, {});
+    if (sz == 1 && sb == 1) {
+      final_outputs = {qz[0], qz[1], ba[0], ba[1]};
+    } else if (sz == 1) {
+      int block_width = sb < 32 ? 128 : 32;
+      int blocks = (m * 48 + block_width - 1) / block_width;
+      auto reduced = (*qwen38_fusion_kernels().gdn_reduce_ba)(
+          {ba[0], ba[1]}, {Shape{m, 48}, Shape{m, 48}}, {float32, float32},
+          std::make_tuple(blocks * 2 * 32, 8, 1), std::make_tuple(32, 8, 1),
+          args({{"SplitB", sb}, {"SplitA", sa}, {"MRows", m}}), std::nullopt,
+          false, {});
+      final_outputs = {qz[0], qz[1], reduced[0], reduced[1]};
     } else {
-        int qz_work = 10240 / 32 + (6144 / 32) * sz;
-        auto qz = (*qwen38_fusion_kernels().gdn_qz)(
-            {input, qkv_w.inner, qkv_s.inner, qkv_b.inner,
-             z_w.inner, z_s.inner, z_b.inner},
-            {Shape{m, 10240}, Shape{sz, m, 6144}}, {float32, float32},
-            std::make_tuple(qz_work * 32, ((m + 31) / 32) * 4, 1),
-            std::make_tuple(32, 4, 1),
-            args({{"QkvBits", qkv_bits}, {"ZBits", z_bits},
-                  {"SplitZ", sz}, {"MRows", m}}),
-            std::nullopt, false, {});
-        int ba_work = 2 * sb + 2 * sa;
-        auto ba = (*qwen38_fusion_kernels().gdn_ba)(
-            {input, beta_w.inner, beta_s.inner, beta_b.inner,
-             alpha_w.inner, alpha_s.inner, alpha_b.inner},
-            {Shape{sb, m, 48}, Shape{sa, m, 48}}, {float32, float32},
-            std::make_tuple(ba_work * 32, ((m + 31) / 32) * 4, 1),
-            std::make_tuple(32, 4, 1),
-            args({{"BetaBits", beta_bits}, {"AlphaBits", alpha_bits},
-                  {"SplitB", sb}, {"SplitA", sa}, {"MRows", m}}),
-            std::nullopt, false, {});
-        if (sz == 1 && sb == 1) {
-            final_outputs = {qz[0], qz[1], ba[0], ba[1]};
-        } else if (sz == 1) {
-            int block_width = sb < 32 ? 128 : 32;
-            int blocks = (m * 48 + block_width - 1) / block_width;
-            auto reduced = (*qwen38_fusion_kernels().gdn_reduce_ba)(
-                {ba[0], ba[1]}, {Shape{m, 48}, Shape{m, 48}}, {float32, float32},
-                std::make_tuple(blocks * 2 * 32, 8, 1),
-                std::make_tuple(32, 8, 1),
-                args({{"SplitB", sb}, {"SplitA", sa}, {"MRows", m}}),
-                std::nullopt, false, {});
-            final_outputs = {qz[0], qz[1], reduced[0], reduced[1]};
-        } else {
-            int z_blocks = (m * 6144 + 127) / 128;
-            int block_width = sb < 32 ? 128 : 32;
-            int b_blocks = (m * 48 + block_width - 1) / block_width;
-            auto reduced = (*qwen38_fusion_kernels().gdn_reduce_zba)(
-                {qz[1], ba[0], ba[1]},
-                {Shape{m, 6144}, Shape{m, 48}, Shape{m, 48}},
-                {float32, float32, float32},
-                std::make_tuple((z_blocks + 2 * b_blocks) * 32, 8, 1),
-                std::make_tuple(32, 8, 1),
-                args({{"SplitZ", sz}, {"SplitB", sb},
-                      {"SplitA", sa}, {"MRows", m}}),
-                std::nullopt, false, {});
-            final_outputs = {qz[0], reduced[0], reduced[1], reduced[2]};
-        }
+      int z_blocks = (m * 6144 + 127) / 128;
+      int block_width = sb < 32 ? 128 : 32;
+      int b_blocks = (m * 48 + block_width - 1) / block_width;
+      auto reduced = (*qwen38_fusion_kernels().gdn_reduce_zba)(
+          {qz[1], ba[0], ba[1]}, {Shape{m, 6144}, Shape{m, 48}, Shape{m, 48}},
+          {float32, float32, float32},
+          std::make_tuple((z_blocks + 2 * b_blocks) * 32, 8, 1),
+          std::make_tuple(32, 8, 1),
+          args({{"SplitZ", sz}, {"SplitB", sb}, {"SplitA", sa}, {"MRows", m}}),
+          std::nullopt, false, {});
+      final_outputs = {qz[0], reduced[0], reduced[1], reduced[2]};
     }
     array qkv = final_outputs[0];
     array z = final_outputs[1];

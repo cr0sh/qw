@@ -489,10 +489,10 @@ impl Qwen35GdnIngress {
     fn forward(
         &self,
         inputs: &MlxArray,
-        batch: i32,
-        sequence: i32,
-        value_dim: usize,
-        num_v_heads: usize,
+        _batch: i32,
+        _sequence: i32,
+        _value_dim: usize,
+        _num_v_heads: usize,
     ) -> (
         UniquePtr<MlxArray>,
         UniquePtr<MlxArray>,
@@ -509,20 +509,20 @@ impl Qwen35GdnIngress {
                     #[cfg(any(feature = "specprefill", test))]
                     Qwen35GatedAuxProjections::Fused(projection) => {
                         let projected = projection.forward(inputs);
-                        let z_end = value_dim as i32;
-                        let beta_end = z_end + num_v_heads as i32;
-                        let alpha_end = beta_end + num_v_heads as i32;
+                        let z_end = _value_dim as i32;
+                        let beta_end = z_end + _num_v_heads as i32;
+                        let alpha_end = beta_end + _num_v_heads as i32;
                         (
-                            mlxcel_core::slice(&projected, &[0, 0, 0], &[batch, sequence, z_end]),
+                            mlxcel_core::slice(&projected, &[0, 0, 0], &[_batch, _sequence, z_end]),
                             mlxcel_core::slice(
                                 &projected,
                                 &[0, 0, z_end],
-                                &[batch, sequence, beta_end],
+                                &[_batch, _sequence, beta_end],
                             ),
                             mlxcel_core::slice(
                                 &projected,
                                 &[0, 0, beta_end],
-                                &[batch, sequence, alpha_end],
+                                &[_batch, _sequence, alpha_end],
                             ),
                         )
                     }
@@ -3955,7 +3955,7 @@ mod tests {
         }
 
         fn capture(model: &Qwen35Model) -> Vec<(usize, usize, Vec<u8>)> {
-            [(4, 1), (5, 1), (288, 3)]
+            [(4, 1), (5, 1), (33, 1), (128, 1), (288, 3)]
                 .into_iter()
                 .flat_map(|(rows, repetitions)| {
                     (0..repetitions).map(move |repetition| {
@@ -4125,9 +4125,15 @@ mod tests {
             expected_gdn_workspace,
             expected_gdn_dispatches,
         ) in [
-            (4, 0, 4, 0, 1),
-            (288, 40_108_032, 2, 2_211_840, 3),
-            (2048, 285_212_672, 2, 3_145_728, 3),
+            (4, 0, 4, 0, 4),
+            (5, 0, 4, 0, 4),
+            (32, 0, 4, 0, 4),
+            (33, 4_595_712, 2, 1_013_760, 3),
+            (64, 0, 4, 0, 4),
+            (128, 0, 4, 1_966_080, 3),
+            (256, 0, 4, 0, 4),
+            (288, 0, 4, 0, 4),
+            (2048, 0, 4, 0, 4),
         ] {
             let input = input(rows);
             let unfused_mlp_time = time_mlp(&unfused_mlp, &input);

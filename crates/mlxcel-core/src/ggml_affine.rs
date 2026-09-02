@@ -425,32 +425,29 @@ impl Qwen38AffineMlpFusion {
     pub fn forward(&self, input: &MlxArray) -> Result<UniquePtr<MlxArray>, GgmlAffineError> {
         validate_input(input, 5120)?;
         let rows = affine_input_rows(input)?;
-        // Pinned MLX's qmv_wide path is faster below its 13-row cutoff.
-        if rows < 13
+        // Only the pinned M=33 BlockMMA shape beats ordinary MLX.
+        if rows != 33
             || crate::array_dtype(input) != dtype::FLOAT32
             || !crate::ffi::array_is_row_contiguous(input)
         {
-            let gate = if self.gate_m23 {
-                self.gate.forward_qwen38_m23(input)?
-            } else {
-                self.gate.forward(input)?
+            let forward = |matrix: &GgmlAffineMatrix, input: &MlxArray, m23| {
+                if matches!(rows, 2 | 3) && m23 {
+                    matrix.forward_qwen38_m23(input)
+                } else {
+                    matrix.forward(input)
+                }
             };
-            let up = if self.up_m23 {
-                self.up.forward_qwen38_m23(input)?
-            } else {
-                self.up.forward(input)?
-            };
+            let gate = forward(&self.gate, input, self.gate_m23)?;
+            let up = forward(&self.up, input, self.up_m23)?;
             let activated = crate::compiled_swiglu_activation(
                 gate.as_ref().ok_or(GgmlAffineError::InvalidPlane)?,
                 up.as_ref().ok_or(GgmlAffineError::InvalidPlane)?,
             );
-            return if self.down_m23 {
-                self.down
-                    .forward_qwen38_m23(activated.as_ref().ok_or(GgmlAffineError::InvalidPlane)?)
-            } else {
-                self.down
-                    .forward(activated.as_ref().ok_or(GgmlAffineError::InvalidPlane)?)
-            };
+            return forward(
+                &self.down,
+                activated.as_ref().ok_or(GgmlAffineError::InvalidPlane)?,
+                self.down_m23,
+            );
         }
         crate::qwen38_affine_mlp_fused(
             input,
@@ -520,7 +517,7 @@ impl Qwen38AffineMlpFusion {
                         .and_then(|bytes| total.checked_add(bytes))
                         .ok_or(GgmlAffineError::Overflow)
                 })?;
-        if input_rows < 13 {
+        if input_rows != 33 {
             return Ok(Qwen38FusionStats {
                 physical_dispatches: 4,
                 matrix_bytes_read,
@@ -597,12 +594,13 @@ impl Qwen38AffineGdnIngressFusion {
     pub fn forward(&self, input: &MlxArray) -> Result<Qwen38GdnIngressOutput, GgmlAffineError> {
         validate_input(input, 5120)?;
         let rows = affine_input_rows(input)?;
-        if rows < 4
+        // Only the pinned M=33 and M=128 BlockMMA shapes beat ordinary MLX.
+        if !matches!(rows, 33 | 128)
             || crate::array_dtype(input) != dtype::FLOAT32
             || !crate::ffi::array_is_row_contiguous(input)
         {
             let forward = |matrix: &GgmlAffineMatrix, m23| {
-                if m23 {
+                if matches!(rows, 2 | 3) && m23 {
                     matrix.forward_qwen38_m23(input)
                 } else {
                     matrix.forward(input)
@@ -712,18 +710,9 @@ impl Qwen38AffineGdnIngressFusion {
                     .and_then(|bytes| total.checked_add(bytes))
                     .ok_or(GgmlAffineError::Overflow)
             })?;
-        if input_rows < 4 {
+        if !matches!(input_rows, 33 | 128) {
             return Ok(Qwen38FusionStats {
                 physical_dispatches: 4,
-                matrix_bytes_read,
-                intermediate_bytes_avoided: 0,
-                workspace_bytes: 0,
-                hidden_copy_bytes: 0,
-            });
-        }
-        if input_rows < 13 {
-            return Ok(Qwen38FusionStats {
-                physical_dispatches: 1,
                 matrix_bytes_read,
                 intermediate_bytes_avoided: 0,
                 workspace_bytes: 0,
