@@ -474,6 +474,29 @@ impl Mlp {
     }
 
     #[cfg(test)]
+    pub(crate) fn forward_paired_rows(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
+        let MlpExecution::PinnedAffine(fusion) = &self.execution else {
+            panic!("paired-row benchmark requires pinned affine MLP");
+        };
+        fusion
+            .forward_paired_rows_for_benchmark(x)
+            .expect("validated paired-row MLP benchmark must succeed")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn paired_fusion_stats(
+        &self,
+        input_rows: usize,
+    ) -> Option<mlxcel_core::Qwen38FusionStats> {
+        match &self.execution {
+            MlpExecution::PinnedAffine(fusion) => {
+                fusion.paired_dispatch_stats_for_benchmark(input_rows).ok()
+            }
+            MlpExecution::Separate { .. } => None,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn fusion_stats(&self, input_rows: usize) -> Option<mlxcel_core::Qwen38FusionStats> {
         match &self.execution {
             MlpExecution::PinnedAffine(fusion) => fusion.dispatch_stats(input_rows).ok(),
