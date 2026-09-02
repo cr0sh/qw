@@ -261,6 +261,14 @@ impl GgmlQuantizedMatrix {
         self.row_bytes * self.out_features as usize
     }
 
+    pub(crate) fn packed_ref(&self) -> Result<&MlxArray, GgmlQuantError> {
+        self.packed.as_ref().ok_or(GgmlQuantError::InvalidTable)
+    }
+
+    pub(crate) const fn qtype(&self) -> GgmlQType {
+        self.qtype
+    }
+
     /// Produce an independent handle over the same resident packed bytes and
     /// immutable lookup table. `copy` adds lazy MLX array aliases; it does not
     /// duplicate either payload.

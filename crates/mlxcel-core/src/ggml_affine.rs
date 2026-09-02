@@ -16,7 +16,7 @@ use cxx::UniquePtr;
 use thiserror::Error;
 
 use crate::ggml::{GgmlDispatchStats, GgmlKernelPath, GgmlQType, GgmlQuantError};
-use crate::{MlxArray, dtype};
+use crate::{MlxArray, Qwen38Q6DualMatrix, dtype};
 
 const GROUP_SIZE: usize = 32;
 const RELEASE_CHUNK_BYTES: usize = 8 * 1024 * 1024;
@@ -414,6 +414,178 @@ impl GgmlAffineMatrix {
             1,
             GgmlKernelPath::Qwen38AffineM23,
         )
+    }
+}
+
+pub enum Qwen38QkvMatrix {
+    Affine(GgmlAffineMatrix),
+    Q6(Qwen38Q6DualMatrix),
+}
+
+pub struct Qwen38MixedQkvOutput {
+    pub query: UniquePtr<MlxArray>,
+    pub key: UniquePtr<MlxArray>,
+    pub value: UniquePtr<MlxArray>,
+}
+
+pub struct Qwen38MixedQkvBundle {
+    query: GgmlAffineMatrix,
+    key: Qwen38QkvMatrix,
+    value: Qwen38QkvMatrix,
+}
+
+impl Qwen38MixedQkvBundle {
+    pub fn new(
+        query: GgmlAffineMatrix,
+        key: Qwen38QkvMatrix,
+        value: Qwen38QkvMatrix,
+    ) -> Result<Self, GgmlAffineError> {
+        if (query.in_features, query.out_features) != (5120, 12_288)
+            || !matches!(query.bits, 4 | 5 | 8)
+            || !Self::valid_kv(&key)
+            || !Self::valid_kv(&value)
+        {
+            return Err(GgmlAffineError::InvalidPlane);
+        }
+        Ok(Self { query, key, value })
+    }
+
+    pub const fn uses_bundled_dispatch(input_rows: i32) -> bool {
+        matches!(input_rows, 3 | 4)
+    }
+
+    fn valid_kv(matrix: &Qwen38QkvMatrix) -> bool {
+        match matrix {
+            Qwen38QkvMatrix::Affine(matrix) => {
+                (matrix.in_features, matrix.out_features) == (5120, 1024)
+                    && matches!(matrix.bits, 4 | 5 | 8)
+            }
+            Qwen38QkvMatrix::Q6(matrix) => {
+                let packed = matrix.packed_ref();
+                packed.qtype() == GgmlQType::Q6K
+                    && (packed.in_features(), packed.out_features()) == (5120, 1024)
+            }
+        }
+    }
+
+    fn projection_parts<'a>(
+        &'a self,
+        matrix: &'a Qwen38QkvMatrix,
+    ) -> Result<(&'a MlxArray, &'a MlxArray, &'a MlxArray, &'a MlxArray, i32), GgmlAffineError>
+    {
+        let fallback_weight = self
+            .query
+            .planes
+            .weight
+            .as_ref()
+            .ok_or(GgmlAffineError::InvalidPlane)?;
+        let fallback_scale = self
+            .query
+            .planes
+            .scales
+            .as_ref()
+            .ok_or(GgmlAffineError::InvalidPlane)?;
+        match matrix {
+            Qwen38QkvMatrix::Affine(matrix) => {
+                let weight = matrix
+                    .planes
+                    .weight
+                    .as_ref()
+                    .ok_or(GgmlAffineError::InvalidPlane)?;
+                Ok((
+                    weight,
+                    matrix
+                        .planes
+                        .scales
+                        .as_ref()
+                        .ok_or(GgmlAffineError::InvalidPlane)?,
+                    matrix
+                        .planes
+                        .biases
+                        .as_ref()
+                        .ok_or(GgmlAffineError::InvalidPlane)?,
+                    weight,
+                    matrix.bits,
+                ))
+            }
+            Qwen38QkvMatrix::Q6(matrix) => Ok((
+                fallback_weight,
+                fallback_scale,
+                fallback_scale,
+                matrix.packed_ref().packed_ref()?,
+                14,
+            )),
+        }
+    }
+
+    pub fn forward(&self, input: &MlxArray) -> Result<Qwen38MixedQkvOutput, GgmlAffineError> {
+        validate_input(input, 5120)?;
+        let input_rows = affine_input_rows(input)?;
+        if crate::array_dtype(input) != dtype::FLOAT32 {
+            return Err(GgmlAffineError::InvalidInput);
+        }
+        if !Self::uses_bundled_dispatch(input_rows) {
+            let forward = |matrix: &Qwen38QkvMatrix| match matrix {
+                Qwen38QkvMatrix::Affine(matrix) => matrix.forward(input),
+                Qwen38QkvMatrix::Q6(matrix) => matrix
+                    .forward(input)
+                    .map_err(|error| GgmlAffineError::Backend(error.to_string())),
+            };
+            return Ok(Qwen38MixedQkvOutput {
+                query: self.query.forward_qwen38_m23(input)?,
+                key: forward(&self.key)?,
+                value: forward(&self.value)?,
+            });
+        }
+
+        let query_weight = self
+            .query
+            .planes
+            .weight
+            .as_ref()
+            .ok_or(GgmlAffineError::InvalidPlane)?;
+        let query_scales = self
+            .query
+            .planes
+            .scales
+            .as_ref()
+            .ok_or(GgmlAffineError::InvalidPlane)?;
+        let query_biases = self
+            .query
+            .planes
+            .biases
+            .as_ref()
+            .ok_or(GgmlAffineError::InvalidPlane)?;
+        let (key_weight, key_scales, key_biases, key_packed, key_code) =
+            self.projection_parts(&self.key)?;
+        let (value_weight, value_scales, value_biases, value_packed, value_code) =
+            self.projection_parts(&self.value)?;
+        let mut outputs = crate::qwen38_mixed_qkv_bundle(
+            input,
+            query_weight,
+            query_scales,
+            query_biases,
+            self.query.bits,
+            key_weight,
+            key_scales,
+            key_biases,
+            key_packed,
+            key_code,
+            value_weight,
+            value_scales,
+            value_biases,
+            value_packed,
+            value_code,
+            input_rows,
+        )
+        .map_err(|error| GgmlAffineError::Backend(error.what().to_owned()))?;
+        let output = outputs.pin_mut();
+        let query = crate::qwen38_ggml_qkv_take_query(output);
+        let output = outputs.pin_mut();
+        let key = crate::qwen38_ggml_qkv_take_key(output);
+        let output = outputs.pin_mut();
+        let value = crate::qwen38_ggml_qkv_take_value(output);
+        Ok(Qwen38MixedQkvOutput { query, key, value })
     }
 }
 
@@ -1408,6 +1580,16 @@ fn f16_to_f32(bits: u16) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mixed_qkv_dispatch_is_exclusive_to_m3_and_m4() {
+        for input_rows in 0..=8 {
+            assert_eq!(
+                Qwen38MixedQkvBundle::uses_bundled_dispatch(input_rows),
+                matches!(input_rows, 3 | 4),
+            );
+        }
+    }
 
     fn put_half(block: &mut [u8], offset: usize, bits: u16) {
         block[offset..offset + 2].copy_from_slice(&bits.to_le_bytes());

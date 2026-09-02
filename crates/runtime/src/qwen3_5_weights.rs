@@ -8,8 +8,8 @@ use mlxcel_core::layers::{FusedQKVLinear, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{
     GgmlAffineEmbedding, GgmlAffineMatrix, GgmlAffineRows, GgmlAffineTranscodeStats, GgmlQType,
-    GgmlQuantizedEmbedding, GgmlQuantizedMatrix, GgmlQuantizedRows, MlxArray, Qwen38Q6DualMatrix,
-    Qwen38Q6Shape, Qwen38Q6TranscodeStats, UniquePtr, dtype,
+    GgmlQuantizedEmbedding, GgmlQuantizedMatrix, GgmlQuantizedRows, MlxArray, Qwen38MixedQkvBundle,
+    Qwen38Q6DualMatrix, Qwen38Q6Shape, Qwen38Q6TranscodeStats, Qwen38QkvMatrix, UniquePtr, dtype,
 };
 
 use crate::gguf::{GgufFile, GgufTensorInfo, PinnedGgufPair};
@@ -172,6 +172,7 @@ pub(crate) enum Qwen35QkvProjection {
         key: Qwen35Linear,
         value: Qwen35Linear,
     },
+    Bundled(Qwen38MixedQkvBundle),
 }
 
 impl Qwen35QkvProjection {
@@ -191,6 +192,12 @@ impl Qwen35QkvProjection {
                 key.forward(input),
                 value.forward(input),
             ),
+            Self::Bundled(projection) => {
+                let output = projection
+                    .forward(input)
+                    .expect("validated pinned full-attention QKV bundle must succeed");
+                (output.query, output.key, output.value)
+            }
         }
     }
 }
@@ -446,6 +453,65 @@ fn pinned_m23_affine_signature(slot: TensorSlot) -> Option<PinnedM23AffineSignat
         qtype: descriptor.qtype,
         dimensions,
     })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PinnedQkvBundleSignature {
+    key_slot: usize,
+    query_slot: usize,
+    value_slot: usize,
+    query_qtype: u32,
+    key_qtype: u32,
+    value_qtype: u32,
+}
+
+const PINNED_QKV_QTYPES: [(u32, u32, u32); 16] = [
+    (13, 12, 13),
+    (12, 13, 13),
+    (13, 14, 8),
+    (12, 14, 8),
+    (12, 14, 14),
+    (12, 13, 8),
+    (23, 14, 8),
+    (13, 8, 8),
+    (13, 14, 8),
+    (12, 14, 14),
+    (13, 14, 14),
+    (23, 14, 13),
+    (13, 14, 8),
+    (12, 14, 8),
+    (13, 14, 8),
+    (13, 14, 8),
+];
+
+fn pinned_qkv_bundle_signature(role: ModelRole, layer: usize) -> Option<PinnedQkvBundleSignature> {
+    if role != ModelRole::Target || layer >= 64 || !(layer + 1).is_multiple_of(4) {
+        return None;
+    }
+    let index = layer / 4;
+    let (query_qtype, key_qtype, value_qtype) = PINNED_QKV_QTYPES[index];
+    let base = 3 + layer * 14 - (layer / 4) * 3;
+    let signature = PinnedQkvBundleSignature {
+        key_slot: base,
+        query_slot: base + 4,
+        value_slot: base + 6,
+        query_qtype,
+        key_qtype,
+        value_qtype,
+    };
+    let key = crate::qwen38_plan::TARGET_TENSOR_PLAN.get(signature.key_slot)?;
+    let query = crate::qwen38_plan::TARGET_TENSOR_PLAN.get(signature.query_slot)?;
+    let value = crate::qwen38_plan::TARGET_TENSOR_PLAN.get(signature.value_slot)?;
+    if key.qtype != key_qtype
+        || key.dimensions != [5120, 1024]
+        || query.qtype != query_qtype
+        || query.dimensions != [5120, 12_288]
+        || value.qtype != value_qtype
+        || value.dimensions != [5120, 1024]
+    {
+        return None;
+    }
+    Some(signature)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -797,6 +863,82 @@ impl GgufWeightSource {
         Ok(result)
     }
 
+    fn load_qkv_affine(
+        &self,
+        typed_slot: TensorSlot,
+        expected_slot: usize,
+        expected_qtype: u32,
+        expected_output: u64,
+    ) -> Result<GgmlAffineMatrix> {
+        let slot = pinned_slot(typed_slot).map_err(anyhow::Error::msg)?;
+        ensure!(
+            slot == PinnedSlot::Target(expected_slot),
+            "pinned QKV affine slot changed"
+        );
+        let (tensor, bytes) = self.lookup(slot)?;
+        ensure!(
+            tensor.dimensions == [5120, expected_output]
+                && tensor.tensor_type.id() == expected_qtype
+                && matches!(expected_qtype, 8 | 12 | 13 | 23),
+            "pinned QKV affine descriptor changed"
+        );
+        let qtype = GgmlQType::try_from(expected_qtype)
+            .context("pinned QKV affine qtype escaped allowlist")?;
+        let matrix = GgmlAffineMatrix::from_ggml_bytes_with_progress(
+            bytes,
+            qtype,
+            5120,
+            usize::try_from(expected_output)?,
+            |range| self.discard_tensor_byte_range(slot, range),
+        )?;
+        self.record_affine(matrix.transcode_stats());
+        self.discard_tensor_pages(slot);
+        Ok(matrix)
+    }
+
+    fn load_qkv_kv(
+        &self,
+        typed_slot: TensorSlot,
+        expected_slot: usize,
+        expected_qtype: u32,
+    ) -> Result<Qwen38QkvMatrix> {
+        let slot = pinned_slot(typed_slot).map_err(anyhow::Error::msg)?;
+        ensure!(
+            slot == PinnedSlot::Target(expected_slot),
+            "pinned QKV KV slot changed"
+        );
+        let (tensor, bytes) = self.lookup(slot)?;
+        ensure!(
+            tensor.dimensions == [5120, 1024]
+                && tensor.tensor_type.id() == expected_qtype
+                && matches!(expected_qtype, 8 | 12 | 13 | 14 | 23),
+            "pinned QKV KV descriptor changed"
+        );
+        let qtype =
+            GgmlQType::try_from(expected_qtype).context("pinned QKV KV qtype escaped allowlist")?;
+        let matrix = if qtype == GgmlQType::Q6K {
+            let dual = Qwen38Q6DualMatrix::from_pinned_bytes_with_progress(
+                bytes,
+                Qwen38Q6Shape::K5120N1024,
+                |range| self.discard_tensor_byte_range(slot, range),
+            )?;
+            self.record_q6(dual.transcode_stats());
+            Qwen38QkvMatrix::Q6(dual)
+        } else {
+            let affine = GgmlAffineMatrix::from_ggml_bytes_with_progress(
+                bytes,
+                qtype,
+                5120,
+                1024,
+                |range| self.discard_tensor_byte_range(slot, range),
+            )?;
+            self.record_affine(affine.transcode_stats());
+            Qwen38QkvMatrix::Affine(affine)
+        };
+        self.discard_tensor_pages(slot);
+        Ok(matrix)
+    }
+
     fn load_embedding(&self, slot: PinnedSlot, label: &str) -> Result<Qwen35Embedding> {
         let (tensor, bytes) = self.lookup(slot)?;
         ensure!(
@@ -874,6 +1016,36 @@ impl Qwen35WeightSource for GgufWeightSource {
             layer,
             tensor,
         };
+        if self.enable_fusion
+            && cfg!(target_os = "macos")
+            && let Some(signature) = pinned_qkv_bundle_signature(role, layer)
+        {
+            let query = self
+                .load_qkv_affine(
+                    slot(LayerTensor::AttentionQuery),
+                    signature.query_slot,
+                    signature.query_qtype,
+                    12_288,
+                )
+                .map_err(|error| error.to_string())?;
+            let key = self
+                .load_qkv_kv(
+                    slot(LayerTensor::AttentionKey),
+                    signature.key_slot,
+                    signature.key_qtype,
+                )
+                .map_err(|error| error.to_string())?;
+            let value = self
+                .load_qkv_kv(
+                    slot(LayerTensor::AttentionValue),
+                    signature.value_slot,
+                    signature.value_qtype,
+                )
+                .map_err(|error| error.to_string())?;
+            return Qwen38MixedQkvBundle::new(query, key, value)
+                .map(Qwen35QkvProjection::Bundled)
+                .map_err(|error| error.to_string());
+        }
         Ok(Qwen35QkvProjection::Separate {
             query: self.linear(slot(LayerTensor::AttentionQuery), group_size, bits)?,
             key: self.linear(slot(LayerTensor::AttentionKey), group_size, bits)?,
@@ -979,6 +1151,62 @@ fn layer_slot_offset(full: bool, tensor: LayerTensor) -> std::result::Result<usi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn max_ulp(left: &MlxArray, right: &MlxArray) -> u32 {
+        let ordered = |value: f32| {
+            let bits = value.to_bits() as i32;
+            if bits < 0 { i32::MIN - bits } else { bits }
+        };
+        mlxcel_core::array_to_raw_bytes(left)
+            .chunks_exact(4)
+            .zip(mlxcel_core::array_to_raw_bytes(right).chunks_exact(4))
+            .map(|(left, right)| {
+                let left = ordered(f32::from_le_bytes(left.try_into().unwrap()));
+                let right = ordered(f32::from_le_bytes(right.try_into().unwrap()));
+                left.abs_diff(right)
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn pinned_qkv_bundle_gate_is_exactly_the_16_full_attention_descriptors() {
+        let expected_layers = [
+            3usize, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47, 51, 55, 59, 63,
+        ];
+        for layer in 0..=64 {
+            let signature = pinned_qkv_bundle_signature(ModelRole::Target, layer);
+            if let Some(index) = expected_layers
+                .iter()
+                .position(|expected| *expected == layer)
+            {
+                let signature = signature.expect("pinned full-attention layer must be bundled");
+                let base = 3 + layer * 14 - (layer / 4) * 3;
+                assert_eq!(
+                    (
+                        signature.key_slot,
+                        signature.query_slot,
+                        signature.value_slot,
+                    ),
+                    (base, base + 4, base + 6),
+                );
+                assert_eq!(
+                    (
+                        signature.query_qtype,
+                        signature.key_qtype,
+                        signature.value_qtype,
+                    ),
+                    PINNED_QKV_QTYPES[index],
+                );
+            } else {
+                assert!(
+                    signature.is_none(),
+                    "unexpected QKV bundle at layer {layer}"
+                );
+            }
+            assert!(pinned_qkv_bundle_signature(ModelRole::Mtp, layer).is_none());
+        }
+    }
 
     #[test]
     fn exact_typed_mapping_covers_target_and_mtp_topology() {
@@ -1479,6 +1707,74 @@ mod tests {
                     input_rows,
                     max_ulp
                 );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the complete pinned Qwen3.8 target and MTP GGUF pair"]
+    fn real_pinned_qkv_bundle_is_bit_exact_for_all_layers_and_rows() {
+        if !mlxcel_core::metal_is_available() {
+            return;
+        }
+        let baseline_weights =
+            GgufWeightSource::open_without_fusion().expect("open baseline pinned GGUF pair");
+        let bundled_weights = GgufWeightSource::open().expect("open bundled pinned GGUF pair");
+        for layer in [
+            3usize, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47, 51, 55, 59, 63,
+        ] {
+            let baseline = baseline_weights
+                .qkv(ModelRole::Target, layer, 32, 4, 96, 8, 128)
+                .expect("load baseline full-attention QKV");
+            assert!(matches!(&baseline, Qwen35QkvProjection::Separate { .. }));
+            let bundled = bundled_weights
+                .qkv(ModelRole::Target, layer, 32, 4, 96, 8, 128)
+                .expect("load bundled full-attention QKV");
+            assert!(matches!(&bundled, Qwen35QkvProjection::Bundled(_)));
+
+            for input_rows in [1usize, 3, 4] {
+                let values = (0..input_rows * 5120)
+                    .map(|index| {
+                        let row = index / 5120;
+                        let column = index % 5120;
+                        (column as i32 % 43 - 21) as f32 * 0.001953125 + row as f32 * 0.00048828125
+                    })
+                    .collect::<Vec<_>>();
+                let input = mlxcel_core::from_slice_f32(&values, &[1, input_rows as i32, 5120]);
+                let (baseline_q, baseline_k, baseline_v) =
+                    baseline.forward(input.as_ref().unwrap());
+                let (bundled_q, bundled_k, bundled_v) = bundled.forward(input.as_ref().unwrap());
+                for (name, baseline, bundled, output_rows) in [
+                    (
+                        "Q",
+                        baseline_q.as_ref().unwrap(),
+                        bundled_q.as_ref().unwrap(),
+                        12_288,
+                    ),
+                    (
+                        "K",
+                        baseline_k.as_ref().unwrap(),
+                        bundled_k.as_ref().unwrap(),
+                        1024,
+                    ),
+                    (
+                        "V",
+                        baseline_v.as_ref().unwrap(),
+                        bundled_v.as_ref().unwrap(),
+                        1024,
+                    ),
+                ] {
+                    mlxcel_core::eval(baseline);
+                    mlxcel_core::eval(bundled);
+                    let expected_shape = [1, input_rows as i32, output_rows];
+                    assert_eq!(mlxcel_core::array_shape(baseline), expected_shape);
+                    assert_eq!(mlxcel_core::array_shape(bundled), expected_shape);
+                    assert_eq!(
+                        max_ulp(baseline, bundled),
+                        0,
+                        "layer {layer} {name} M={input_rows} changed",
+                    );
+                }
             }
         }
     }
