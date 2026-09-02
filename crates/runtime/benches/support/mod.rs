@@ -107,7 +107,7 @@ fn long_context_cache_identity(context_label: &str, min_prefix_tokens: usize) ->
         std::env::consts::OS.as_bytes(),
         std::env::consts::ARCH.as_bytes(),
         b"alternating-user-assistant-history-v1".as_slice(),
-        b"bounded-mtp-fp16-65536-v1".as_slice(),
+        b"qwen38-27b-gguf-mtp-v1".as_slice(),
         PROMPT.as_bytes(),
         include_bytes!("../../src/portable_snapshot.rs").as_slice(),
         include_bytes!("../../src/qwen3_5_mtp.rs").as_slice(),
@@ -118,32 +118,21 @@ fn long_context_cache_identity(context_label: &str, min_prefix_tokens: usize) ->
     }
     hash_bytes(&mut hash, model_dir.as_os_str().as_encoded_bytes());
 
-    let mut model_files = fs::read_dir(&model_dir)?
-        .map(|entry| entry.map(|entry| entry.path()))
-        .collect::<io::Result<Vec<_>>>()?;
-    model_files.sort();
-    for path in model_files {
-        if !path.is_file() {
-            continue;
-        }
-        let extension = path.extension().and_then(|value| value.to_str());
-        if !matches!(extension, Some("json" | "safetensors")) {
-            continue;
-        }
-        hash_bytes(&mut hash, path.as_os_str().as_encoded_bytes());
-        if extension == Some("json") {
-            hash_bytes(&mut hash, &fs::read(&path)?);
-            continue;
-        }
-        let metadata = path.metadata()?;
-        hash_bytes(&mut hash, &metadata.len().to_le_bytes());
-        let modified = metadata
-            .modified()?
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        hash_bytes(&mut hash, &modified.to_le_bytes());
+    for bytes in [
+        qw_runtime::DEFAULT_MODEL_IDENTIFIER.as_bytes(),
+        qw_runtime::DEFAULT_MODEL_REVISION.as_bytes(),
+        qw_runtime::SELECTED_TARGET_FILE.0.as_bytes(),
+        qw_runtime::SELECTED_TARGET_FILE.2.as_bytes(),
+        qw_runtime::SELECTED_MTP_DIRECTORY.as_bytes(),
+        qw_runtime::SELECTED_MTP_FILE.0.as_bytes(),
+        qw_runtime::SELECTED_MTP_FILE.2.as_bytes(),
+        include_bytes!("../../src/gguf.rs").as_slice(),
+        include_bytes!("../../src/qwen3_5_weights.rs").as_slice(),
+    ] {
+        hash_bytes(&mut hash, bytes);
     }
+    hash_bytes(&mut hash, &qw_runtime::SELECTED_TARGET_FILE.1.to_le_bytes());
+    hash_bytes(&mut hash, &qw_runtime::SELECTED_MTP_FILE.1.to_le_bytes());
     #[cfg(feature = "dflash2")]
     {
         let draft_dir = draft_model_dir().canonicalize()?;
