@@ -458,6 +458,65 @@ fn packed_row_ranges_preserve_order_bounds_and_arithmetic() {
         }
     }
 }
+#[test]
+fn qwen38_q6_verify_head_gate_selects_only_exact_m3_m4() {
+    let verify_ranges = [0..80_896, 248_044..248_070];
+    assert!(is_qwen38_q6_verify_head_selection(
+        GgmlQType::Q6K,
+        5_120,
+        248_320,
+        &verify_ranges,
+    ));
+    assert!(!is_qwen38_q6_verify_head_selection(
+        GgmlQType::Q6K,
+        5_120,
+        248_320,
+        &[0..65_536, 248_044..248_070],
+    ));
+    assert!(!is_qwen38_q6_verify_head_selection(
+        GgmlQType::Q5K,
+        5_120,
+        248_320,
+        &verify_ranges,
+    ));
+    assert!(!is_qwen38_q6_verify_head_selection(
+        GgmlQType::Q6K,
+        5_120,
+        248_320,
+        &[0..80_896, 248_045..248_071],
+    ));
+    assert!(!is_qwen38_q6_verify_head_selection(
+        GgmlQType::Q6K,
+        5_120,
+        248_319,
+        &verify_ranges,
+    ));
+
+    assert_eq!(
+        packed_dispatch_stats(1, 5_120, 80_922, 4_200, true)
+            .unwrap()
+            .path,
+        GgmlKernelPath::DecodeM1,
+    );
+    assert_eq!(
+        packed_dispatch_stats(2, 5_120, 80_922, 4_200, true)
+            .unwrap()
+            .path,
+        GgmlKernelPath::VerifyM2To4,
+    );
+    for rows in [3, 4] {
+        let stats = packed_dispatch_stats(rows, 5_120, 80_922, 4_200, true).unwrap();
+        assert_eq!(stats.path, GgmlKernelPath::Qwen38Q6HeadVerifyR8);
+        assert_eq!(stats.packed_bytes_read, 339_872_400);
+        assert_eq!(stats.workspace_bytes, 0);
+    }
+    assert_eq!(
+        packed_dispatch_stats(3, 5_120, 80_922, 4_200, false)
+            .unwrap()
+            .path,
+        GgmlKernelPath::VerifyM2To4,
+    );
+}
 
 #[test]
 fn metal_matrix_and_embedding_match_reference_for_every_target_qtype() {
@@ -815,78 +874,141 @@ fn actual_q5k_qmm_microbench() {
 }
 
 #[test]
-#[ignore = "requires verified local target GGUF artifact and 1.1 GB packed allocation"]
-fn actual_q6_lm_head_row_range_microbench() {
+#[ignore = "requires the exact pinned target GGUF and 1.1 GB packed allocation"]
+fn actual_q6_lm_head_selected_logits_and_ids_are_exact() {
     use std::fs::File;
     use std::io::{Read, Seek, SeekFrom};
+
+    fn compact_reference(full: &MlxArray, prefix_rows: i32) -> UniquePtr<MlxArray> {
+        let shape = crate::array_shape(full);
+        let axis = shape.len() - 1;
+        let start = vec![0; shape.len()];
+        let mut end = shape.clone();
+        end[axis] = prefix_rows;
+        let prefix = crate::slice(full, &start, &end);
+        let mut control_start = vec![0; shape.len()];
+        let mut control_end = shape;
+        control_start[axis] = 248_044;
+        control_end[axis] = 248_070;
+        let controls = crate::slice(full, &control_start, &control_end);
+        crate::concatenate(prefix.as_ref().unwrap(), controls.as_ref().unwrap(), -1)
+    }
+
+    fn evaluated_bytes(array: &MlxArray) -> Vec<u8> {
+        crate::eval(array);
+        crate::array_to_raw_bytes(array)
+    }
+
+    fn assert_case(
+        label: &str,
+        matrix: &GgmlQuantizedMatrix,
+        selected: &GgmlQuantizedRows,
+        input: &MlxArray,
+        prefix_rows: i32,
+        rows: usize,
+        expected_selected_path: GgmlKernelPath,
+    ) {
+        assert_eq!(
+            matrix.dispatch_stats(rows).unwrap().path,
+            if rows == 1 {
+                GgmlKernelPath::DecodeM1
+            } else {
+                GgmlKernelPath::VerifyM2To4
+            },
+        );
+        assert_eq!(
+            selected.dispatch_stats(rows).unwrap().path,
+            expected_selected_path,
+        );
+        let full = matrix.forward(input).unwrap();
+        let expected = compact_reference(full.as_ref().unwrap(), prefix_rows);
+        let actual = selected.forward(input).unwrap();
+        let expected_bytes = evaluated_bytes(expected.as_ref().unwrap());
+        let actual_bytes = evaluated_bytes(actual.as_ref().unwrap());
+        let max_ulp = expected_bytes
+            .chunks_exact(4)
+            .zip(actual_bytes.chunks_exact(4))
+            .map(|(left, right)| {
+                ulp_distance(
+                    f32::from_le_bytes(left.try_into().unwrap()),
+                    f32::from_le_bytes(right.try_into().unwrap()),
+                )
+            })
+            .max()
+            .unwrap_or(0);
+        assert!(
+            expected_bytes == actual_bytes,
+            "{label} selected logits differ (max ULP {max_ulp})",
+        );
+        assert_eq!(max_ulp, 0, "{label} selected logits are not exact");
+
+        let expected_ids = crate::argmax_last_axis(expected.as_ref().unwrap());
+        let actual_ids = crate::argmax_last_axis(actual.as_ref().unwrap());
+        assert_eq!(
+            evaluated_bytes(expected_ids.as_ref().unwrap()),
+            evaluated_bytes(actual_ids.as_ref().unwrap()),
+            "{label} selected argmax IDs differ",
+        );
+    }
 
     if !crate::metal_is_available() {
         return;
     }
-    let structure: serde_json::Value = serde_json::from_reader(
-        File::open(std::env::var("QWR_GGUF_STRUCTURE_PATH").unwrap()).unwrap(),
-    )
-    .unwrap();
-    let model = &structure["target"];
-    let tensor = model["tensor_infos_enriched"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|tensor| tensor["name"].as_str() == Some("output.weight"))
-        .unwrap();
-    assert_eq!(tensor["type"].as_u64(), Some(14));
     let qtype = GgmlQType::Q6K;
-    let width = 5120usize;
+    let width = 5_120usize;
     let output_rows = 248_320usize;
     let row_bytes = width / qtype.block_elements() * qtype.block_bytes();
+    assert_eq!(row_bytes, 4_200);
+    let path = std::env::var_os("QWR_TARGET_GGUF_SMOKE_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(std::env::var_os("HOME").unwrap())
+                .join(".cache/qw/models/unsloth/Qwen3.8-27B-GGUF")
+                .join("Qwen3.8-27B-UD-Q4_K_XL.gguf")
+        });
     let mut packed = vec![0u8; row_bytes * output_rows];
-    let mut file = File::open(std::env::var("QWR_TARGET_GGUF_SMOKE_PATH").unwrap()).unwrap();
-    file.seek(SeekFrom::Start(
-        model["data_start"].as_u64().unwrap() + tensor["offset"].as_u64().unwrap(),
-    ))
-    .unwrap();
+    let mut file = File::open(path).unwrap();
+    file.seek(SeekFrom::Start(10_996_640)).unwrap();
     file.read_exact(&mut packed).unwrap();
     let matrix = GgmlQuantizedMatrix::from_bytes(&packed, qtype, width, output_rows).unwrap();
     drop(packed);
-    let draft = matrix.select_rows(&[0..65_536, 248_044..248_070]).unwrap();
-    let verify = matrix.select_rows(&[0..80_896, 248_044..248_070]).unwrap();
-    let decode_values: Vec<f32> = (0..width)
-        .map(|index| (index as i32 % 31 - 15) as f32 * 0.00390625)
-        .collect();
-    let verify_values: Vec<f32> = (0..3 * width)
-        .map(|index| (index as i32 % 31 - 15) as f32 * 0.00390625)
-        .collect();
-    let decode_input = crate::from_slice_f32(&decode_values, &[1, width as i32]);
-    let verify_input = crate::from_slice_f32(&verify_values, &[3, width as i32]);
-    crate::eval(decode_input.as_ref().unwrap());
-    crate::eval(verify_input.as_ref().unwrap());
 
-    let full_m1 = median_forward(|| matrix.forward(decode_input.as_ref().unwrap()).unwrap());
-    let draft_m1 = median_forward(|| draft.forward(decode_input.as_ref().unwrap()).unwrap());
-    let full_m3 = median_forward(|| matrix.forward(verify_input.as_ref().unwrap()).unwrap());
-    let verify_m3 = median_forward(|| verify.forward(verify_input.as_ref().unwrap()).unwrap());
-    let full_m1_stats = matrix.dispatch_stats(1).unwrap();
-    let draft_m1_stats = draft.dispatch_stats(1).unwrap();
-    let full_m3_stats = matrix.dispatch_stats(3).unwrap();
-    let verify_m3_stats = verify.dispatch_stats(3).unwrap();
-    eprintln!(
-        "actual Q6_K LM head M=1 full={full_m1:?} draft_rows={} compact={draft_m1:?} speedup={:.3}x full_packed={:.3}GB/s compact_packed={:.3}GB/s",
-        draft.selected_rows(),
-        full_m1.as_secs_f64() / draft_m1.as_secs_f64(),
-        full_m1_stats.packed_bytes_read as f64 / full_m1.as_secs_f64() / 1e9,
-        draft_m1_stats.packed_bytes_read as f64 / draft_m1.as_secs_f64() / 1e9,
+    let draft = matrix.select_rows(&[0..65_536, 248_044..248_070]).unwrap();
+    let draft_input = crate::from_slice_f32(
+        &(0..width)
+            .map(|index| (index as i32 % 31 - 15) as f32 * 0.00390625)
+            .collect::<Vec<_>>(),
+        &[1, 1, width as i32],
     );
-    eprintln!(
-        "actual Q6_K LM head M=3 full={full_m3:?} verify_rows={} compact={verify_m3:?} speedup={:.3}x full_packed={:.3}GB/s compact_packed={:.3}GB/s workspace={}B threadgroup={}B",
-        verify.selected_rows(),
-        full_m3.as_secs_f64() / verify_m3.as_secs_f64(),
-        full_m3_stats.packed_bytes_read as f64 / full_m3.as_secs_f64() / 1e9,
-        verify_m3_stats.packed_bytes_read as f64 / verify_m3.as_secs_f64() / 1e9,
-        verify_m3_stats.workspace_bytes,
-        verify_m3_stats.threadgroup_bytes,
+    assert_case(
+        "draft M1",
+        &matrix,
+        &draft,
+        draft_input.as_ref().unwrap(),
+        65_536,
+        1,
+        GgmlKernelPath::DecodeM1,
     );
-    assert!(draft_m1 < full_m1);
-    assert!(verify_m3 < full_m3);
+    drop(draft);
+
+    let verify = matrix.select_rows(&[0..80_896, 248_044..248_070]).unwrap();
+    for rows in [3usize, 4] {
+        let input = crate::from_slice_f32(
+            &(0..rows * width)
+                .map(|index| (index as i32 % 31 - 15) as f32 * 0.00390625)
+                .collect::<Vec<_>>(),
+            &[1, rows as i32, width as i32],
+        );
+        assert_case(
+            &format!("verify M{rows}"),
+            &matrix,
+            &verify,
+            input.as_ref().unwrap(),
+            80_896,
+            rows,
+            GgmlKernelPath::Qwen38Q6HeadVerifyR8,
+        );
+    }
 }
 
 #[test]

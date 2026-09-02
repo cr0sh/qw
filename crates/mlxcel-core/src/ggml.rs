@@ -86,6 +86,24 @@ impl TryFrom<u32> for GgmlQType {
         }
     }
 }
+const QWEN38_Q6_HEAD_WIDTH: usize = 5_120;
+const QWEN38_Q6_HEAD_ROWS: usize = 248_320;
+const QWEN38_Q6_VERIFY_PREFIX_ROWS: usize = 80_896;
+const QWEN38_Q6_CONTROL_ROWS: std::ops::Range<usize> = 248_044..248_070;
+
+fn is_qwen38_q6_verify_head_selection(
+    qtype: GgmlQType,
+    in_features: usize,
+    out_features: usize,
+    ranges: &[std::ops::Range<usize>],
+) -> bool {
+    qtype == GgmlQType::Q6K
+        && in_features == QWEN38_Q6_HEAD_WIDTH
+        && out_features == QWEN38_Q6_HEAD_ROWS
+        && ranges.len() == 2
+        && ranges[0] == (0..QWEN38_Q6_VERIFY_PREFIX_ROWS)
+        && ranges[1] == QWEN38_Q6_CONTROL_ROWS
+}
 
 #[derive(Debug, Error)]
 pub enum GgmlQuantError {
@@ -132,6 +150,7 @@ pub enum GgmlQuantError {
 pub enum GgmlKernelPath {
     DecodeM1,
     VerifyM2To4,
+    Qwen38Q6HeadVerifyR8,
     TiledQmm16x8,
     TiledQmm32x8,
     AffineQmv,
@@ -281,6 +300,7 @@ impl GgmlQuantizedMatrix {
             self.in_features,
             self.out_features,
             self.out_features,
+            false,
         )
     }
 
@@ -290,6 +310,12 @@ impl GgmlQuantizedMatrix {
         &self,
         ranges: &[std::ops::Range<usize>],
     ) -> Result<GgmlQuantizedRows, GgmlQuantError> {
+        let qwen38_q6_head_verify_r8 = is_qwen38_q6_verify_head_selection(
+            self.qtype,
+            self.in_features(),
+            self.out_features(),
+            ranges,
+        );
         let (row_ranges, selected_rows) = make_row_ranges(ranges, self.out_features())?;
         Ok(GgmlQuantizedRows {
             packed: crate::copy(
@@ -308,6 +334,7 @@ impl GgmlQuantizedMatrix {
             out_features: self.out_features,
             selected_rows,
             row_bytes: self.row_bytes,
+            qwen38_q6_head_verify_r8,
         })
     }
 
@@ -317,6 +344,7 @@ impl GgmlQuantizedMatrix {
             self.in_features(),
             self.out_features(),
             self.row_bytes,
+            false,
         )
     }
 }
@@ -331,6 +359,7 @@ pub struct GgmlQuantizedRows {
     out_features: i32,
     selected_rows: i32,
     row_bytes: usize,
+    qwen38_q6_head_verify_r8: bool,
 }
 
 impl GgmlQuantizedRows {
@@ -354,6 +383,7 @@ impl GgmlQuantizedRows {
             self.in_features,
             self.out_features,
             self.selected_rows,
+            self.qwen38_q6_head_verify_r8,
         )
     }
 
@@ -363,6 +393,7 @@ impl GgmlQuantizedRows {
             self.in_features(),
             self.selected_rows(),
             self.row_bytes,
+            self.qwen38_q6_head_verify_r8,
         )
     }
 }
@@ -464,6 +495,7 @@ fn launch_matmul(
     in_features: i32,
     out_features: i32,
     selected_rows: i32,
+    qwen38_q6_head_verify_r8: bool,
 ) -> Result<UniquePtr<MlxArray>, GgmlQuantError> {
     let shape = crate::array_shape(input);
     if shape.is_empty() || shape.last().copied() != Some(in_features) {
@@ -503,6 +535,7 @@ fn launch_matmul(
         out_features,
         selected_rows,
         input_rows,
+        qwen38_q6_head_verify_r8,
     )
     .map_err(|error| GgmlQuantError::Backend(error.what().to_owned()))
 }
@@ -550,29 +583,38 @@ fn packed_dispatch_stats(
     in_features: usize,
     selected_rows: usize,
     row_bytes: usize,
+    qwen38_q6_head_verify_r8: bool,
 ) -> Result<GgmlDispatchStats, GgmlQuantError> {
     if input_rows == 0 || selected_rows == 0 {
         return Err(GgmlQuantError::EmptyShape);
     }
-    let (path, m_tiles, n_tiles, threadgroup_bytes) = if input_rows == 1 {
-        (GgmlKernelPath::DecodeM1, 1usize, selected_rows, 0usize)
-    } else if input_rows <= 4 {
-        (GgmlKernelPath::VerifyM2To4, 1usize, selected_rows, 0usize)
-    } else if input_rows <= 512 {
-        (
-            GgmlKernelPath::TiledQmm16x8,
-            input_rows.div_ceil(16),
-            selected_rows.div_ceil(8),
-            16 * 256 * 4,
-        )
-    } else {
-        (
-            GgmlKernelPath::TiledQmm32x8,
-            input_rows.div_ceil(32),
-            selected_rows.div_ceil(8),
-            32 * 256 * 4,
-        )
-    };
+    let (path, m_tiles, n_tiles, threadgroup_bytes) =
+        if qwen38_q6_head_verify_r8 && matches!(input_rows, 3 | 4) {
+            (
+                GgmlKernelPath::Qwen38Q6HeadVerifyR8,
+                1usize,
+                selected_rows,
+                0usize,
+            )
+        } else if input_rows == 1 {
+            (GgmlKernelPath::DecodeM1, 1usize, selected_rows, 0usize)
+        } else if input_rows <= 4 {
+            (GgmlKernelPath::VerifyM2To4, 1usize, selected_rows, 0usize)
+        } else if input_rows <= 512 {
+            (
+                GgmlKernelPath::TiledQmm16x8,
+                input_rows.div_ceil(16),
+                selected_rows.div_ceil(8),
+                16 * 256 * 4,
+            )
+        } else {
+            (
+                GgmlKernelPath::TiledQmm32x8,
+                input_rows.div_ceil(32),
+                selected_rows.div_ceil(8),
+                32 * 256 * 4,
+            )
+        };
     let packed_bytes_read = row_bytes
         .checked_mul(selected_rows)
         .and_then(|bytes| bytes.checked_mul(m_tiles))

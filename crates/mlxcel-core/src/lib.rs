@@ -1819,6 +1819,7 @@ mod ffi {
             out_features: i32,
             selected_rows: i32,
             input_rows: i32,
+            qwen38_q6_head_verify_r8: bool,
         ) -> Result<UniquePtr<MlxArray>>;
 
         /// Direct Metal embedding lookup over original GGUF block bytes.
