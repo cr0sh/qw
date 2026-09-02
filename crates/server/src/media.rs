@@ -93,9 +93,9 @@ pub fn decode_data_image(url: &str, param: &str) -> Result<DecodedImage, Request
         ));
     }
 
-    let bytes = STANDARD.decode(payload.as_bytes()).map_err(|_| {
-        RequestError::at("image data URI contains malformed base64", param)
-    })?;
+    let bytes = STANDARD
+        .decode(payload.as_bytes())
+        .map_err(|_| RequestError::at("image data URI contains malformed base64", param))?;
     if bytes.len() > MAX_SOURCE_BYTES {
         return Err(RequestError::at(
             format!("decoded image source must not exceed {MAX_SOURCE_BYTES} bytes"),
@@ -103,9 +103,8 @@ pub fn decode_data_image(url: &str, param: &str) -> Result<DecodedImage, Request
         ));
     }
 
-    let detected = image::guess_format(&bytes).map_err(|_| {
-        RequestError::at("image data does not contain a supported image", param)
-    })?;
+    let detected = image::guess_format(&bytes)
+        .map_err(|_| RequestError::at("image data does not contain a supported image", param))?;
     if detected != format.image_format() {
         return Err(RequestError::at(
             "image MIME type does not match the decoded image format",
@@ -119,19 +118,13 @@ pub fn decode_data_image(url: &str, param: &str) -> Result<DecodedImage, Request
     limits.max_alloc = Some(MAX_DECODER_ALLOCATION);
     let mut reader = ImageReader::with_format(Cursor::new(&bytes), detected);
     reader.limits(limits);
-    let image = reader.decode().map_err(|error| {
-        RequestError::at(format!("failed to decode image: {error}"), param)
-    })?;
+    let image = reader
+        .decode()
+        .map_err(|error| RequestError::at(format!("failed to decode image: {error}"), param))?;
     let (width, height) = image.dimensions();
-    if width == 0
-        || height == 0
-        || width > MAX_IMAGE_DIMENSION
-        || height > MAX_IMAGE_DIMENSION
-    {
+    if width == 0 || height == 0 || width > MAX_IMAGE_DIMENSION || height > MAX_IMAGE_DIMENSION {
         return Err(RequestError::at(
-            format!(
-                "image dimensions must be between 1 and {MAX_IMAGE_DIMENSION} pixels per axis"
-            ),
+            format!("image dimensions must be between 1 and {MAX_IMAGE_DIMENSION} pixels per axis"),
             param,
         ));
     }
@@ -141,9 +134,7 @@ pub fn decode_data_image(url: &str, param: &str) -> Result<DecodedImage, Request
         .ok_or_else(|| RequestError::at("image allocation size overflow", param))?;
     if rgb_allocation > MAX_DECODER_ALLOCATION {
         return Err(RequestError::at(
-            format!(
-                "decoded image allocation must not exceed {MAX_DECODER_ALLOCATION} bytes"
-            ),
+            format!("decoded image allocation must not exceed {MAX_DECODER_ALLOCATION} bytes"),
             param,
         ));
     }
@@ -218,10 +209,12 @@ mod tests {
             RgbImage::from_pixel(1, 1, Rgb([0, 0, 0])),
         );
         let mismatch = jpeg.replacen("image/jpeg", "image/png", 1);
-        assert!(decode_data_image(&mismatch, "p")
-            .unwrap_err()
-            .message
-            .contains("MIME"));
+        assert!(
+            decode_data_image(&mismatch, "p")
+                .unwrap_err()
+                .message
+                .contains("MIME")
+        );
     }
 
     #[test]
@@ -231,10 +224,12 @@ mod tests {
             "data:image/png;base64,{}",
             "A".repeat(MAX_ENCODED_BYTES + 1)
         );
-        assert!(decode_data_image(&oversized, "p")
-            .unwrap_err()
-            .message
-            .contains("must not exceed"));
+        assert!(
+            decode_data_image(&oversized, "p")
+                .unwrap_err()
+                .message
+                .contains("must not exceed")
+        );
 
         let at_boundary = data_uri(
             ImageFormat::Png,

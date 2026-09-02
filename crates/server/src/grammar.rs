@@ -7,9 +7,7 @@ use llguidance::{Constraint, ParserFactory, token_bytes_from_tokenizer_json};
 use mlxcel_core::generate::{ConstraintCommit, ConstraintMask, TokenConstraint};
 use serde_json::{Map, Value};
 use tokenizers::Tokenizer;
-use toktrie::{
-    InferenceCapabilities, TokEnv, TokRxInfo, TokTrie, TokenId, TokenizerEnv,
-};
+use toktrie::{InferenceCapabilities, TokEnv, TokRxInfo, TokTrie, TokenId, TokenizerEnv};
 
 use crate::protocol::OutputFormat;
 
@@ -74,8 +72,7 @@ impl GrammarFactory {
             tok_end_of_turn: None,
         };
         let tokenizer = Tokenizer::from_bytes(
-            serde_json::to_vec(tokenizer_json)
-                .context("failed to serialize tokenizer.json")?,
+            serde_json::to_vec(tokenizer_json).context("failed to serialize tokenizer.json")?,
         )
         .map_err(anyhow::Error::msg)
         .context("failed to initialize canonical structured-output tokenizer")?;
@@ -209,10 +206,7 @@ impl TokenConstraint for GuidanceConstraint {
         guidance_commit(result, accepting).map(ConstraintMask::Splice)
     }
 
-    fn commit_token(
-        &mut self,
-        token_id: i32,
-    ) -> std::result::Result<ConstraintCommit, String> {
+    fn commit_token(&mut self, token_id: i32) -> std::result::Result<ConstraintCommit, String> {
         let token = u32::try_from(token_id)
             .map_err(|_| "structured-output grammar received a negative token".to_string())?;
         let active = self.active();
@@ -246,19 +240,65 @@ fn validate_schema_node(value: &mut Value, property_map: bool) -> Result<()> {
     }
 
     const KEYWORDS: &[&str] = &[
-        "$schema", "$id", "$ref", "$defs", "definitions", "title", "description",
-        "default", "examples", "deprecated", "readOnly", "writeOnly", "type", "enum",
-        "const", "multipleOf", "maximum", "exclusiveMaximum", "minimum",
-        "exclusiveMinimum", "maxLength", "minLength", "pattern", "format", "contentEncoding",
-        "contentMediaType", "maxItems", "minItems", "uniqueItems", "maxContains",
-        "minContains", "items", "prefixItems", "contains", "maxProperties", "minProperties",
-        "required", "properties", "patternProperties", "additionalProperties", "propertyNames",
-        "dependentRequired", "dependentSchemas", "allOf", "anyOf", "oneOf", "not", "if",
-        "then", "else", "unevaluatedItems", "unevaluatedProperties",
+        "$schema",
+        "$id",
+        "$ref",
+        "$defs",
+        "definitions",
+        "title",
+        "description",
+        "default",
+        "examples",
+        "deprecated",
+        "readOnly",
+        "writeOnly",
+        "type",
+        "enum",
+        "const",
+        "multipleOf",
+        "maximum",
+        "exclusiveMaximum",
+        "minimum",
+        "exclusiveMinimum",
+        "maxLength",
+        "minLength",
+        "pattern",
+        "format",
+        "contentEncoding",
+        "contentMediaType",
+        "maxItems",
+        "minItems",
+        "uniqueItems",
+        "maxContains",
+        "minContains",
+        "items",
+        "prefixItems",
+        "contains",
+        "maxProperties",
+        "minProperties",
+        "required",
+        "properties",
+        "patternProperties",
+        "additionalProperties",
+        "propertyNames",
+        "dependentRequired",
+        "dependentSchemas",
+        "allOf",
+        "anyOf",
+        "oneOf",
+        "not",
+        "if",
+        "then",
+        "else",
+        "unevaluatedItems",
+        "unevaluatedProperties",
     ];
     let known: BTreeSet<&str> = KEYWORDS.iter().copied().collect();
     for key in object.keys() {
-        ensure!(known.contains(key.as_str()), "unknown JSON Schema keyword {key:?}");
+        ensure!(
+            known.contains(key.as_str()),
+            "unknown JSON Schema keyword {key:?}"
+        );
     }
 
     if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
@@ -271,8 +311,16 @@ fn validate_schema_node(value: &mut Value, property_map: bool) -> Result<()> {
         ensure!(
             matches!(
                 format,
-                "date-time" | "time" | "date" | "duration" | "email" | "hostname"
-                    | "ipv4" | "ipv6" | "uuid" | "uri"
+                "date-time"
+                    | "time"
+                    | "date"
+                    | "duration"
+                    | "email"
+                    | "hostname"
+                    | "ipv4"
+                    | "ipv6"
+                    | "uuid"
+                    | "uri"
             ),
             "unsupported JSON Schema format {format:?}"
         );
@@ -284,7 +332,9 @@ fn validate_schema_node(value: &mut Value, property_map: bool) -> Result<()> {
         .get("additionalProperties")
         .is_some_and(|value| value.is_object())
     {
-        bail!("schema-valued additionalProperties requires property-name uniqueness that cannot be enforced");
+        bail!(
+            "schema-valued additionalProperties requires property-name uniqueness that cannot be enforced"
+        );
     }
     if object
         .get("patternProperties")
@@ -298,9 +348,7 @@ fn validate_schema_node(value: &mut Value, property_map: bool) -> Result<()> {
     }
 
     if let Some(one_of) = object.remove("oneOf") {
-        let branches = one_of
-            .as_array()
-            .context("oneOf must contain an array")?;
+        let branches = one_of.as_array().context("oneOf must contain an array")?;
         ensure!(!branches.is_empty(), "oneOf must not be empty");
         let mut types = BTreeSet::new();
         for branch in branches {
@@ -328,8 +376,16 @@ fn validate_schema_node(value: &mut Value, property_map: bool) -> Result<()> {
         }
     }
     for key in [
-        "items", "contains", "additionalProperties", "propertyNames", "not", "if", "then",
-        "else", "unevaluatedItems", "unevaluatedProperties",
+        "items",
+        "contains",
+        "additionalProperties",
+        "propertyNames",
+        "not",
+        "if",
+        "then",
+        "else",
+        "unevaluatedItems",
+        "unevaluatedProperties",
     ] {
         if let Some(child) = object.get_mut(key) {
             validate_schema_node(child, false)?;

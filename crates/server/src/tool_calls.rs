@@ -66,7 +66,10 @@ pub fn parse_assistant_output(
             "tool call is missing a function opener"
         );
         let (name, after_name) = parse_name(&remaining[FUNCTION_OPEN.len()..], "function")?;
-        ensure!(declared.contains(name.as_str()), "undeclared function {name:?}");
+        ensure!(
+            declared.contains(name.as_str()),
+            "undeclared function {name:?}"
+        );
         remaining = after_name;
 
         let mut arguments = Map::new();
@@ -231,7 +234,11 @@ impl ToolCallGate {
 fn longest_marker_prefix_suffix(value: &str) -> usize {
     (1..TOOL_CALL_OPEN.len())
         .rev()
-        .find(|&length| value.as_bytes().ends_with(&TOOL_CALL_OPEN.as_bytes()[..length]))
+        .find(|&length| {
+            value
+                .as_bytes()
+                .ends_with(&TOOL_CALL_OPEN.as_bytes()[..length])
+        })
         .unwrap_or(0)
 }
 
@@ -248,12 +255,17 @@ mod tests {
 
     #[test]
     fn marker_split_at_every_byte_boundary_never_leaks_xml() {
-        let xml = "<tool_call><function=weather><parameter=city>Paris</parameter></function></tool_call>";
+        let xml =
+            "<tool_call><function=weather><parameter=city>Paris</parameter></function></tool_call>";
         for boundary in 0..=TOOL_CALL_OPEN.len() {
             let mut gate = ToolCallGate::default();
             let mut released = String::new();
             let first = format!("Before{}", &TOOL_CALL_OPEN[..boundary]);
-            let second = format!("{}{}", &TOOL_CALL_OPEN[boundary..], &xml[TOOL_CALL_OPEN.len()..]);
+            let second = format!(
+                "{}{}",
+                &TOOL_CALL_OPEN[boundary..],
+                &xml[TOOL_CALL_OPEN.len()..]
+            );
             for fragment in [&first, &second] {
                 if let Some(value) = gate.feed(fragment) {
                     released.push_str(&value);
@@ -338,20 +350,33 @@ mod tests {
     fn rejects_undeclared_and_all_bounds() {
         assert!(parse("<tool_call><function=other></function></tool_call>").is_err());
         let long_name = "x".repeat(MAX_NAME_BYTES + 1);
-        assert!(parse(&format!("<tool_call><function={long_name}></function></tool_call>")).is_err());
+        assert!(
+            parse(&format!(
+                "<tool_call><function={long_name}></function></tool_call>"
+            ))
+            .is_err()
+        );
         let calls = "<tool_call><function=empty></function></tool_call>".repeat(MAX_CALLS + 1);
         assert!(parse(&calls).is_err());
         let params = (0..=MAX_PARAMETERS)
             .map(|index| format!("<parameter=p{index}>x</parameter>"))
             .collect::<String>();
-        assert!(parse(&format!("<tool_call><function=search>{params}</function></tool_call>")).is_err());
+        assert!(
+            parse(&format!(
+                "<tool_call><function=search>{params}</function></tool_call>"
+            ))
+            .is_err()
+        );
         assert!(parse_assistant_output("text", WEATHER, 9, 8).is_err());
     }
 
     #[test]
     fn rejects_duplicate_and_empty_parameter_names() {
         assert!(parse("<tool_call><function=search><parameter=x>1</parameter><parameter=x>2</parameter></function></tool_call>").is_err());
-        assert!(parse("<tool_call><function=search><parameter=>1</parameter></function></tool_call>").is_err());
+        assert!(
+            parse("<tool_call><function=search><parameter=>1</parameter></function></tool_call>")
+                .is_err()
+        );
     }
 
     #[test]

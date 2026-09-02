@@ -102,10 +102,7 @@ impl MRopeState {
         self.fallback.borrow().rope_deltas
     }
 
-    pub(crate) fn with_position_ids<R>(
-        &self,
-        f: impl FnOnce(Option<&MlxArray>) -> R,
-    ) -> R {
+    pub(crate) fn with_position_ids<R>(&self, f: impl FnOnce(Option<&MlxArray>) -> R) -> R {
         let entry = self.fallback.borrow();
         f(entry.position_ids.as_deref())
     }
@@ -129,4 +126,3 @@ impl Default for MRopeState {
         Self::new()
     }
 }
-
