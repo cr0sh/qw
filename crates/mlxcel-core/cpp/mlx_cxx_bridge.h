@@ -2297,6 +2297,18 @@ std::unique_ptr<MlxArray> qwen38_affine_m23_matmul(
     int32_t input_rows,
     bool require_pinned_shape);
 
+// Temporary fixed-artifact BlockMMA geometry experiment.
+std::unique_ptr<MlxArray> qwen38_affine_geometry_qmm_experiment(
+    const MlxArray& x,
+    const MlxArray& weight,
+    const MlxArray& scales,
+    const MlxArray& biases,
+    int32_t bits,
+    int32_t in_features,
+    int32_t out_features,
+    int32_t block_m,
+    int32_t block_n);
+
 // M>=4 all-affine fusion for the exact pinned Qwen3.8 artifact.
 std::unique_ptr<MlxArray> qwen38_affine_mlp_fused(
     const MlxArray& x,

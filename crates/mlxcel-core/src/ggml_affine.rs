@@ -283,6 +283,70 @@ impl GgmlAffineMatrix {
         Ok(affine_matmul(input, &self.planes, self.bits))
     }
 
+    #[doc(hidden)]
+    pub fn forward_geometry_for_experiment(
+        &self,
+        input: &MlxArray,
+        block_m: usize,
+        block_n: usize,
+    ) -> Result<UniquePtr<MlxArray>, GgmlAffineError> {
+        validate_input(input, self.in_features)?;
+        crate::ffi::qwen38_affine_geometry_qmm_experiment(
+            input,
+            self.planes
+                .weight
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?,
+            self.planes
+                .scales
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?,
+            self.planes
+                .biases
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?,
+            self.bits,
+            self.in_features,
+            self.out_features,
+            i32::try_from(block_m).map_err(|_| GgmlAffineError::Overflow)?,
+            i32::try_from(block_n).map_err(|_| GgmlAffineError::Overflow)?,
+        )
+        .map_err(|error| GgmlAffineError::Backend(error.to_string()))
+    }
+
+    #[doc(hidden)]
+    pub fn dense_f16_for_experiment(&self) -> Result<UniquePtr<MlxArray>, GgmlAffineError> {
+        let dense = unsafe {
+            crate::ffi::dequantize(
+                self.planes
+                    .weight
+                    .as_ref()
+                    .ok_or(GgmlAffineError::InvalidPlane)?,
+                self.planes
+                    .scales
+                    .as_ref()
+                    .ok_or(GgmlAffineError::InvalidPlane)?,
+                self.planes
+                    .biases
+                    .as_ref()
+                    .ok_or(GgmlAffineError::InvalidPlane)?
+                    as *const MlxArray,
+                GROUP_SIZE as i32,
+                self.bits,
+                "affine",
+            )
+        };
+        Ok(crate::astype(
+            dense.as_ref().ok_or(GgmlAffineError::InvalidPlane)?,
+            dtype::FLOAT16,
+        ))
+    }
+
+    #[doc(hidden)]
+    pub const fn affine_bits_for_experiment(&self) -> i32 {
+        self.bits
+    }
+
     /// Runs the exact pinned Qwen3.8 target shapes through one affine weight
     /// pass for M2/M3. Every other shape, dtype, or row count keeps the
     /// ordinary affine dispatcher.
