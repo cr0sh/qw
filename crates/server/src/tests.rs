@@ -6,7 +6,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
 use futures_util::StreamExt;
 use qw_prefix_cache::CacheConfig;
-use qw_runtime::{KVCacheMode, resolve_model_path};
+use qw_runtime::KVCacheMode;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 use tower::ServiceExt;
@@ -439,12 +439,9 @@ async fn read_responses_sse(app: Router, body: Value) -> Result<ResponsesSseMeas
 }
 
 #[tokio::test]
-#[ignore = "requires the resolver's default bundled-MTP checkpoint"]
+#[ignore = "requires the complete pinned Qwen3.8 27B GGUF pair"]
 async fn real_responses_sse_latency_stays_bounded_across_cold_fork_and_continuation() {
-    let model_dir = resolve_model_path(None)
-        .expect("resolver's default bundled-MTP checkpoint must be available");
     let engine = Engine::start_qwen(
-        model_dir,
         Some(MODEL.to_string()),
         CacheConfig {
             directory: None,

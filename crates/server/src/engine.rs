@@ -1,5 +1,4 @@
 use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc as std_mpsc};
 use std::thread;
@@ -13,9 +12,12 @@ use qw_prefix_cache::{
 };
 #[cfg(test)]
 use qw_runtime::ChatContentRef;
-use qw_runtime::{KVCacheMode, MtpPrefixReuse, PromptSnapshot, Qwen35Provider};
 #[cfg(any(feature = "specprefill", test))]
 use qw_runtime::ChatMessage;
+use qw_runtime::{
+    KVCacheMode, MtpPrefixReuse, PINNED_MTP, PINNED_REPOSITORY, PINNED_REVISION, PINNED_TARGET,
+    PromptSnapshot, Qwen35Provider,
+};
 #[cfg(feature = "specprefill")]
 use qw_runtime::{PrefillMode, SpecPrefillConfig};
 use serde_json::Value;
@@ -169,7 +171,10 @@ struct CurrentTurnPolicy {
 
 #[cfg(feature = "specprefill")]
 fn messages_before_model_input_turn(messages: &[ChatMessage]) -> Option<&[ChatMessage]> {
-    let boundary = if messages.last().is_some_and(|message| message.role == "tool") {
+    let boundary = if messages
+        .last()
+        .is_some_and(|message| message.role == "tool")
+    {
         messages
             .iter()
             .rposition(|message| message.role != "tool")
@@ -228,8 +233,7 @@ enum QwenGenerationRoute {
 fn qwen_generation_route(
     has_mtp: bool,
     has_images: bool,
-    #[cfg(feature = "specprefill")]
-    use_specprefill: bool,
+    #[cfg(feature = "specprefill")] use_specprefill: bool,
 ) -> QwenGenerationRoute {
     #[cfg(feature = "specprefill")]
     if use_specprefill && !has_images {
@@ -253,10 +257,8 @@ fn cache_snapshot_route(route: QwenGenerationRoute) -> Option<CacheSnapshotRoute
 
 fn cache_lookup_route(
     route: QwenGenerationRoute,
-    #[cfg(feature = "specprefill")]
-    mtp_available: bool,
-    #[cfg(feature = "specprefill")]
-    specprefill_active: bool,
+    #[cfg(feature = "specprefill")] mtp_available: bool,
+    #[cfg(feature = "specprefill")] specprefill_active: bool,
 ) -> Option<CacheSnapshotRoute> {
     #[cfg(feature = "specprefill")]
     if route == QwenGenerationRoute::BaselineText && mtp_available && specprefill_active {
@@ -676,14 +678,12 @@ pub struct Engine {
 
 impl Engine {
     pub fn start_qwen(
-        model_path: PathBuf,
         model_id: Option<String>,
         cache_config: CacheConfig,
         prefix_cache_enabled: bool,
         mtp_k: usize,
         kv_cache_mode: KVCacheMode,
-        #[cfg(feature = "specprefill")]
-        specprefill_policy: SpecPrefillPolicyConfig,
+        #[cfg(feature = "specprefill")] specprefill_policy: SpecPrefillPolicyConfig,
     ) -> Result<Self> {
         cache_config.validate().map_err(anyhow::Error::msg)?;
         validate_mtp_k(mtp_k)?;
@@ -695,7 +695,6 @@ impl Engine {
             .name("qw-generation".to_string())
             .spawn(move || {
                 match QwenWorker::load(
-                    &model_path,
                     cache_config,
                     prefix_cache_enabled,
                     mtp_k,
@@ -1168,10 +1167,7 @@ fn collect_job_batch_with_wait<T>(
     batch
 }
 
-fn enqueue_cache_maintenance(
-    maintenance: &mut VecDeque<CacheMaintenance>,
-    work: CacheMaintenance,
-) {
+fn enqueue_cache_maintenance(maintenance: &mut VecDeque<CacheMaintenance>, work: CacheMaintenance) {
     if maintenance.len() == CACHE_MAINTENANCE_CAPACITY {
         warn!(
             event = "cache.maintenance_dropped",
@@ -1186,28 +1182,27 @@ fn enqueue_cache_maintenance(
 
 impl QwenWorker {
     fn load(
-        model_path: &Path,
         cache_config: CacheConfig,
         prefix_cache_enabled: bool,
         mtp_k: usize,
         kv_cache_mode: KVCacheMode,
-        #[cfg(feature = "specprefill")]
-        specprefill_policy: SpecPrefillPolicyConfig,
+        #[cfg(feature = "specprefill")] specprefill_policy: SpecPrefillPolicyConfig,
     ) -> Result<Self> {
         validate_mtp_k(mtp_k)?;
         #[cfg(feature = "specprefill")]
         specprefill_policy.validate()?;
-        let provider = Qwen35Provider::load(model_path, kv_cache_mode)?;
+        let provider = Qwen35Provider::load(kv_cache_mode)?;
         ensure!(
             provider.supports_qwen35_tool_calls(),
-            "unsupported Qwen3.5 chat template: expected <tool_call>, <function=, and <parameter= literals"
+            "unsupported Qwen3.8 chat template: expected tool-call literals"
         );
-        let tokenizer_json_path = model_path.join("tokenizer.json");
-        let tokenizer_json: Value = serde_json::from_slice(
-            &std::fs::read(&tokenizer_json_path)
-                .with_context(|| format!("failed to read {}", tokenizer_json_path.display()))?,
-        )
-        .with_context(|| format!("failed to parse {}", tokenizer_json_path.display()))?;
+        let tokenizer_json_text = provider
+            .tokenizer()
+            .to_string(true)
+            .map_err(anyhow::Error::msg)
+            .context("failed to serialize pinned tokenizer for grammar")?;
+        let tokenizer_json: Value = serde_json::from_str(&tokenizer_json_text)
+            .context("failed to parse serialized pinned tokenizer")?;
         let tokenizer_vocab_size = provider.tokenizer().get_vocab_size(true);
         let grammar = GrammarFactory::from_tokenizer_json(
             &tokenizer_json,
@@ -1215,32 +1210,13 @@ impl QwenWorker {
             provider.logits_vocab_size(),
             provider.eos_token_id(),
         )?;
-        let config_bytes = std::fs::read(model_path.join("config.json"))
-            .context("failed to read model config for prefix cache namespace")?;
-        let tokenizer_bytes = std::fs::read(model_path.join("tokenizer.json"))
-            .context("failed to read tokenizer for prefix cache namespace")?;
-        let tokenizer_config_bytes = std::fs::read(model_path.join("tokenizer_config.json"))
-            .context("failed to read tokenizer config for prefix cache namespace")?;
-        let tokenizer_config: Value = serde_json::from_slice(&tokenizer_config_bytes)
-            .context("failed to parse tokenizer config for prefix cache namespace")?;
-        let standalone_template = std::fs::read_to_string(model_path.join("chat_template.jinja"))
-            .ok()
-            .filter(|template| !template.trim().is_empty())
-            .map(String::into_bytes);
-        let selected_template = standalone_template.or_else(|| {
-            tokenizer_config
-                .get("chat_template")
-                .and_then(Value::as_str)
-                .map(|template| template.as_bytes().to_vec())
-        });
-        let selected_template =
-            selected_template.context("loaded provider has no selected chat template")?;
         let cache_mode = format!("{kv_cache_mode:?}");
         let namespace_parts = |route: &'static [u8]| {
             namespace_hash(&[
-                &config_bytes,
-                &tokenizer_bytes,
-                &selected_template,
+                PINNED_REPOSITORY.as_bytes(),
+                PINNED_REVISION.as_bytes(),
+                PINNED_TARGET.sha256.as_bytes(),
+                PINNED_MTP.sha256.as_bytes(),
                 cache_mode.as_bytes(),
                 route,
             ])
@@ -1467,16 +1443,12 @@ impl QwenWorker {
         let specprefill_policy = current_turn_policy(
             &prompt_ids,
             preceding_ids.as_deref(),
-            !has_images
-                && constraint.is_none()
-                && job.request.resume_response_id.is_none(),
+            !has_images && constraint.is_none() && job.request.resume_response_id.is_none(),
             self.specprefill_policy,
         );
         #[cfg(feature = "specprefill")]
-        let specprefill_active = matches!(
-            specprefill_policy.prefill_mode,
-            PrefillMode::SpecPrefill(_)
-        );
+        let specprefill_active =
+            matches!(specprefill_policy.prefill_mode, PrefillMode::SpecPrefill(_));
         #[cfg(feature = "specprefill")]
         debug!(
             phase = "specprefill.policy",
@@ -1634,8 +1606,7 @@ impl QwenWorker {
             );
         }
         let hit = if resume_entry.is_none() {
-            lookup_cache_route
-                .and_then(|route| cache.lookup(&generation_prompt_ids, route))
+            lookup_cache_route.and_then(|route| cache.lookup(&generation_prompt_ids, route))
         } else {
             None
         };
@@ -2114,8 +2085,6 @@ fn publish_completion(events: &mpsc::Sender<WorkerEvent>, record: CompletionReco
     }
 }
 
-
-
 fn send_failure(job: &Job, kind: FailureKind, message: String, param: Option<String>) {
     error!(
         phase = "generation.failed",
@@ -2161,13 +2130,7 @@ mod tests {
 
     #[test]
     fn generation_metrics_account_for_cache_totals_and_zero_durations() {
-        let metrics = generation_metrics(
-            100,
-            40,
-            25,
-            Duration::from_secs(3),
-            Duration::ZERO,
-        );
+        let metrics = generation_metrics(100, 40, 25, Duration::from_secs(3), Duration::ZERO);
 
         assert_eq!(
             metrics,
@@ -2180,14 +2143,8 @@ mod tests {
             }
         );
         assert_eq!(
-            generation_metrics(
-                usize::MAX,
-                1,
-                usize::MAX,
-                Duration::ZERO,
-                Duration::ZERO,
-            )
-            .total_tokens,
+            generation_metrics(usize::MAX, 1, usize::MAX, Duration::ZERO, Duration::ZERO,)
+                .total_tokens,
             usize::MAX,
         );
     }
@@ -2451,8 +2408,7 @@ mod tests {
         for current_turn_tokens in [512, 513, 580, 1_948] {
             let mut prompt_ids = preceding_ids.clone();
             prompt_ids.resize(preceding_ids.len() + current_turn_tokens, 20);
-            let policy =
-                current_turn_policy(&prompt_ids, Some(&preceding_ids), true, config);
+            let policy = current_turn_policy(&prompt_ids, Some(&preceding_ids), true, config);
             assert_eq!(policy.current_turn_tokens, Some(current_turn_tokens));
             if current_turn_tokens == 512 {
                 assert_eq!(policy.prefill_mode, PrefillMode::Dense);
@@ -2560,8 +2516,9 @@ mod tests {
             let expected_route = match route {
                 QwenGenerationRoute::BaselineText => Some(CacheSnapshotRoute::Baseline),
                 QwenGenerationRoute::MtpText => Some(CacheSnapshotRoute::Mtp),
-                QwenGenerationRoute::BaselineMultimodal
-                | QwenGenerationRoute::MtpMultimodal => None,
+                QwenGenerationRoute::BaselineMultimodal | QwenGenerationRoute::MtpMultimodal => {
+                    None
+                }
             };
             assert_eq!(behavior.snapshot_route, expected_route);
             assert_eq!(behavior.lookup_route, expected_route);
@@ -2607,10 +2564,7 @@ mod tests {
         let sparse_route = qwen_generation_route(true, false, true);
         assert_eq!(sparse_route, QwenGenerationRoute::BaselineText);
         let sparse_behavior = cache_behavior(sparse_route, true, true, true);
-        assert_eq!(
-            sparse_behavior.lookup_route,
-            Some(CacheSnapshotRoute::Mtp)
-        );
+        assert_eq!(sparse_behavior.lookup_route, Some(CacheSnapshotRoute::Mtp));
         assert_eq!(
             sparse_behavior.snapshot_route,
             Some(CacheSnapshotRoute::Baseline)
@@ -2626,13 +2580,7 @@ mod tests {
             Some(CacheSnapshotRoute::Baseline)
         );
         assert_eq!(
-            cache_behavior(
-                QwenGenerationRoute::BaselineMultimodal,
-                true,
-                true,
-                true
-            )
-            .lookup_route,
+            cache_behavior(QwenGenerationRoute::BaselineMultimodal, true, true, true).lookup_route,
             None
         );
     }

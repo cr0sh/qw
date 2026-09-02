@@ -7,7 +7,7 @@ use crate::{Engine, router};
 use anyhow::{Context, Result, ensure};
 use clap_derive::{Args as DeriveArgs, ValueEnum};
 use qw_prefix_cache::CacheConfig;
-use qw_runtime::{KVCacheMode, resolve_model_path};
+use qw_runtime::KVCacheMode;
 use tracing::info;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::Layer as _;
@@ -89,10 +89,6 @@ fn parse_si_bytes(value: &str) -> Result<u64, String> {
 
 #[derive(Debug, DeriveArgs)]
 pub struct ServerArgs {
-    /// Checkpoint directory or HF identifier; defaults to the qw model cache unless QW_MODEL_PATH is set.
-    #[arg(long)]
-    model: Option<PathBuf>,
-
     /// Only accept requests for this exact model ID.
     #[arg(long)]
     model_id: Option<String>,
@@ -311,10 +307,8 @@ pub async fn serve(cli: ServerArgs) -> Result<()> {
     let kv_cache_mode = cli.kv_cache_mode();
     #[cfg(feature = "specprefill")]
     let specprefill_policy = cli.specprefill_policy();
-    let model = resolve_model_path(cli.model.as_deref())?;
     let prefix_cache_directory = resolve_prefix_cache_directory(cli.prefix_cache_directory)?;
     let engine = Engine::start_qwen(
-        model,
         cli.model_id,
         CacheConfig {
             memory_bytes: cli.prefix_cache_memory_bytes,
@@ -403,25 +397,12 @@ mod tests {
     }
 
     #[test]
-    fn cli_model_is_optional() {
-        let cli = TestCli::try_parse_from(["qw-server"]).expect("CLI");
-        assert_eq!(cli.args.model, None);
-    }
-
-    #[test]
     fn cli_exposes_optional_model_id() {
-        let unrestricted =
-            TestCli::try_parse_from(["qw-server", "--model", "/tmp/checkpoint"]).expect("CLI");
+        let unrestricted = TestCli::try_parse_from(["qw-server"]).expect("CLI");
         assert_eq!(unrestricted.args.model_id, None);
 
-        let configured = TestCli::try_parse_from([
-            "qw-server",
-            "--model",
-            "/tmp/checkpoint",
-            "--model-id",
-            "served-model",
-        ])
-        .expect("CLI");
+        let configured =
+            TestCli::try_parse_from(["qw-server", "--model-id", "served-model"]).expect("CLI");
         assert_eq!(configured.args.model_id.as_deref(), Some("served-model"));
 
         let help = TestCli::command().render_long_help().to_string();
@@ -485,8 +466,9 @@ mod tests {
 
     #[test]
     fn persistent_log_filter_defaults_and_preserves_precedence() {
-        let default_output =
-            capture_persistent_log_filter_events(resolve_persistent_log_filter(None, None).unwrap());
+        let default_output = capture_persistent_log_filter_events(
+            resolve_persistent_log_filter(None, None).unwrap(),
+        );
         for message in [
             "qw_server trace",
             "qw_runtime trace",
@@ -502,14 +484,9 @@ mod tests {
             assert!(!default_output.contains(message), "{default_output}");
         }
 
-        let cli = TestCli::try_parse_from([
-            "qw-server",
-            "--model",
-            "/tmp/checkpoint",
-            "--persistent-log-filter",
-            "qw_server=info",
-        ])
-        .expect("CLI");
+        let cli =
+            TestCli::try_parse_from(["qw-server", "--persistent-log-filter", "qw_server=info"])
+                .expect("CLI");
         let cli_output = capture_persistent_log_filter_events(
             resolve_persistent_log_filter(
                 cli.args.persistent_log_filter.as_deref(),
@@ -552,19 +529,12 @@ mod tests {
 
     #[test]
     fn cli_parses_output_format_and_documents_values() {
-        let default =
-            TestCli::try_parse_from(["qw-server", "--model", "/tmp/checkpoint"]).expect("CLI");
+        let default = TestCli::try_parse_from(["qw-server"]).expect("CLI");
         assert_eq!(default.args.output_format, OutputFormat::Human);
 
         for (value, expected) in [("human", OutputFormat::Human), ("json", OutputFormat::Json)] {
-            let cli = TestCli::try_parse_from([
-                "qw-server",
-                "--model",
-                "/tmp/checkpoint",
-                "--output-format",
-                value,
-            ])
-            .expect("CLI");
+            let cli =
+                TestCli::try_parse_from(["qw-server", "--output-format", value]).expect("CLI");
             assert_eq!(cli.args.output_format, expected);
         }
 
@@ -576,17 +546,11 @@ mod tests {
 
     #[test]
     fn turbo4_kv_quantization_is_default_with_explicit_opt_out() {
-        let default =
-            TestCli::try_parse_from(["qw-server", "--model", "/tmp/checkpoint"]).expect("CLI");
+        let default = TestCli::try_parse_from(["qw-server"]).expect("CLI");
         assert_eq!(default.args.kv_cache_mode(), KVCacheMode::Turbo4);
 
-        let unquantized = TestCli::try_parse_from([
-            "qw-server",
-            "--model",
-            "/tmp/checkpoint",
-            "--no-kv-quantization",
-        ])
-        .expect("CLI");
+        let unquantized =
+            TestCli::try_parse_from(["qw-server", "--no-kv-quantization"]).expect("CLI");
         assert_eq!(unquantized.args.kv_cache_mode(), KVCacheMode::Fp16);
 
         let help = TestCli::command().render_long_help().to_string();
@@ -596,8 +560,7 @@ mod tests {
 
     #[test]
     fn cli_configures_memory_and_filesystem_cache_tiers() {
-        let defaults =
-            TestCli::try_parse_from(["qw-server", "--model", "/tmp/checkpoint"]).expect("CLI");
+        let defaults = TestCli::try_parse_from(["qw-server"]).expect("CLI");
         assert_eq!(
             defaults.args.prefix_cache_memory_bytes,
             2 * 1024 * 1024 * 1024
@@ -616,8 +579,6 @@ mod tests {
 
         let configured = TestCli::try_parse_from([
             "qw-server",
-            "--model",
-            "/tmp/checkpoint",
             "--prefix-cache-memory-bytes",
             "4096",
             "--prefix-cache-directory",
@@ -634,27 +595,17 @@ mod tests {
         assert_eq!(configured.args.prefix_cache_filesystem_bytes, 8192);
         validate_cli(&configured.args).expect("configured cache tiers");
 
-        let invalid_memory = TestCli::try_parse_from([
-            "qw-server",
-            "--model",
-            "/tmp/checkpoint",
-            "--prefix-cache-memory-bytes",
-            "0",
-        ])
-        .expect("CLI");
+        let invalid_memory =
+            TestCli::try_parse_from(["qw-server", "--prefix-cache-memory-bytes", "0"])
+                .expect("CLI");
         assert_eq!(
             validate_cli(&invalid_memory.args).unwrap_err().to_string(),
             "--prefix-cache-memory-bytes must be greater than zero"
         );
 
-        let invalid_filesystem = TestCli::try_parse_from([
-            "qw-server",
-            "--model",
-            "/tmp/checkpoint",
-            "--prefix-cache-filesystem-bytes",
-            "0",
-        ])
-        .expect("CLI");
+        let invalid_filesystem =
+            TestCli::try_parse_from(["qw-server", "--prefix-cache-filesystem-bytes", "0"])
+                .expect("CLI");
         assert_eq!(
             validate_cli(&invalid_filesystem.args)
                 .unwrap_err()
@@ -673,8 +624,6 @@ mod tests {
     fn cli_parses_decimal_si_cache_byte_capacities() {
         let parsed = TestCli::try_parse_from([
             "qw-server",
-            "--model",
-            "/tmp/checkpoint",
             "--prefix-cache-memory-bytes",
             "1.25KB",
             "--prefix-cache-filesystem-bytes",
@@ -701,27 +650,17 @@ mod tests {
             "19E",
             "18446744073709551616",
         ] {
-            let error = TestCli::try_parse_from([
-                "qw-server",
-                "--model",
-                "/tmp/checkpoint",
-                "--prefix-cache-memory-bytes",
-                value,
-            ])
-            .expect_err("invalid byte capacity");
+            let error =
+                TestCli::try_parse_from(["qw-server", "--prefix-cache-memory-bytes", value])
+                    .expect_err("invalid byte capacity");
             assert!(
                 error.to_string().contains("invalid value"),
                 "{value}: {error}"
             );
         }
 
-        let negative = TestCli::try_parse_from([
-            "qw-server",
-            "--model",
-            "/tmp/checkpoint",
-            "--prefix-cache-memory-bytes=-1",
-        ])
-        .expect_err("negative byte capacity");
+        let negative = TestCli::try_parse_from(["qw-server", "--prefix-cache-memory-bytes=-1"])
+            .expect_err("negative byte capacity");
         assert!(
             negative.to_string().contains("invalid byte size '-1'"),
             "{negative}"
@@ -738,8 +677,7 @@ mod tests {
     #[cfg(feature = "specprefill")]
     #[test]
     fn cli_configures_specprefill_policy() {
-        let defaults =
-            TestCli::try_parse_from(["qw-server", "--model", "/tmp/checkpoint"]).expect("CLI");
+        let defaults = TestCli::try_parse_from(["qw-server"]).expect("CLI");
         let policy = defaults.args.specprefill_policy();
         assert_eq!(policy.min_turn_tokens, 8_000);
         assert_eq!(policy.keep_rate, 0.25);
@@ -749,8 +687,6 @@ mod tests {
 
         let custom = TestCli::try_parse_from([
             "qw-server",
-            "--model",
-            "/tmp/checkpoint",
             "--specprefill-min-turn-tokens",
             "12000",
             "--specprefill-keep-rate",
@@ -793,14 +729,13 @@ mod tests {
 
     #[test]
     fn cli_parses_and_validates_mtp_k() {
-        let default =
-            TestCli::try_parse_from(["qw-server", "--model", "/tmp/checkpoint"]).expect("CLI");
+        let default = TestCli::try_parse_from(["qw-server"]).expect("CLI");
         assert_eq!(default.args.mtp_k, 3);
         validate_cli(&default.args).expect("default MTP K");
 
         for args in [
-            vec!["qw-server", "--model", "/tmp/checkpoint", "--mtp-k=5"],
-            vec!["qw-server", "--model", "/tmp/checkpoint", "--mtp-k", "5"],
+            vec!["qw-server", "--mtp-k=5"],
+            vec!["qw-server", "--mtp-k", "5"],
         ] {
             let cli = TestCli::try_parse_from(args).expect("CLI");
             assert_eq!(cli.args.mtp_k, 5);
@@ -808,14 +743,8 @@ mod tests {
         }
 
         for invalid in [0, 1] {
-            let cli = TestCli::try_parse_from([
-                "qw-server",
-                "--model",
-                "/tmp/checkpoint",
-                "--mtp-k",
-                &invalid.to_string(),
-            ])
-            .expect("CLI parsing reaches startup validation");
+            let cli = TestCli::try_parse_from(["qw-server", "--mtp-k", &invalid.to_string()])
+                .expect("CLI parsing reaches startup validation");
             assert_eq!(
                 validate_cli(&cli.args)
                     .expect_err("invalid MTP K")
