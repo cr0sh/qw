@@ -1,24 +1,23 @@
 use std::cell::RefCell;
-use std::collections::BTreeSet;
 use std::fs::File;
-use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use memmap2::{Advice, Mmap, MmapOptions, UncheckedAdvice};
-use mlxcel_core::layers::{FusedQKVLinear, Linear, UnifiedEmbedding, UnifiedLinear};
+#[cfg(any(feature = "specprefill", test))]
+use mlxcel_core::layers::{FusedQKVLinear, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{
-    GgmlAffineEmbedding, GgmlAffineMatrix, GgmlAffineRows, GgmlAffineTranscodeStats,
-    GgmlQType, GgmlQuantizedEmbedding, GgmlQuantizedMatrix, GgmlQuantizedRows,
-    MlxArray, Qwen38Q6DualMatrix, Qwen38Q6Shape, Qwen38Q6TranscodeStats, UniquePtr,
-    dtype,
+    GgmlAffineEmbedding, GgmlAffineMatrix, GgmlAffineRows, GgmlAffineTranscodeStats, GgmlQType,
+    GgmlQuantizedEmbedding, GgmlQuantizedMatrix, GgmlQuantizedRows, MlxArray, Qwen38Q6DualMatrix,
+    Qwen38Q6Shape, Qwen38Q6TranscodeStats, UniquePtr, dtype,
 };
 
-use crate::gguf::{GgufModelPair, GgufShardSet, GgufTensorInfo, MetadataValue};
+use crate::gguf::{GgufFile, GgufTensorInfo, PinnedGgufPair};
 use crate::qwen3_5::Qwen35Config;
 
 pub(crate) enum Qwen35Linear {
+    #[cfg(any(feature = "specprefill", test))]
     Legacy(UnifiedLinear),
     Affine(GgmlAffineMatrix),
     AffineRows(GgmlAffineRows),
@@ -28,12 +27,14 @@ pub(crate) enum Qwen35Linear {
 }
 
 impl Qwen35Linear {
+    #[cfg(any(feature = "specprefill", test))]
     pub(crate) fn legacy(linear: UnifiedLinear) -> Self {
         Self::Legacy(linear)
     }
 
     pub(crate) fn forward(&self, input: &MlxArray) -> UniquePtr<MlxArray> {
         match self {
+            #[cfg(any(feature = "specprefill", test))]
             Self::Legacy(linear) => linear.forward(input),
             Self::Affine(linear) => linear
                 .forward(input)
@@ -53,6 +54,7 @@ impl Qwen35Linear {
         }
     }
 
+    #[cfg(any(feature = "specprefill", test))]
     pub(crate) fn legacy_ref(&self) -> Option<&UnifiedLinear> {
         match self {
             Self::Legacy(linear) => Some(linear),
@@ -64,27 +66,29 @@ impl Qwen35Linear {
         }
     }
 
-    pub(crate) fn select_gguf_rows(
-        &self,
-        ranges: &[std::ops::Range<usize>],
-    ) -> Option<Self> {
+    pub(crate) fn select_gguf_rows(&self, ranges: &[std::ops::Range<usize>]) -> Option<Self> {
         match self {
             Self::Affine(linear) => linear.select_rows(ranges).ok().map(Self::AffineRows),
             Self::Gguf(linear) => linear.select_rows(ranges).ok().map(Self::GgufRows),
-            Self::Legacy(_) | Self::AffineRows(_) | Self::Q6Dual(_) | Self::GgufRows(_) => None,
+            #[cfg(any(feature = "specprefill", test))]
+            Self::Legacy(_) => None,
+            Self::AffineRows(_) | Self::Q6Dual(_) | Self::GgufRows(_) => None,
         }
     }
 }
 
 pub(crate) enum Qwen35Embedding {
+    #[cfg(any(feature = "specprefill", test))]
     Legacy(UnifiedEmbedding),
     Affine(GgmlAffineEmbedding),
     Gguf(GgmlQuantizedEmbedding),
 }
 
 impl Qwen35Embedding {
+    #[cfg(any(feature = "dflash2", test))]
     pub(crate) fn clone_shared(&self) -> Self {
         match self {
+            #[cfg(any(feature = "specprefill", test))]
             Self::Legacy(embedding) => Self::Legacy(embedding.clone_shared()),
             Self::Affine(embedding) => Self::Affine(embedding.clone_shared()),
             Self::Gguf(embedding) => Self::Gguf(embedding.clone_shared()),
@@ -93,6 +97,7 @@ impl Qwen35Embedding {
 
     pub(crate) fn forward(&self, indices: &MlxArray) -> UniquePtr<MlxArray> {
         match self {
+            #[cfg(any(feature = "specprefill", test))]
             Self::Legacy(embedding) => embedding.forward(indices),
             Self::Affine(embedding) => {
                 let converted = (mlxcel_core::array_dtype(indices) == dtype::INT64)
@@ -113,6 +118,7 @@ impl Qwen35Embedding {
 
     pub(crate) fn as_linear(&self, input: &MlxArray) -> UniquePtr<MlxArray> {
         match self {
+            #[cfg(any(feature = "specprefill", test))]
             Self::Legacy(embedding) => embedding.as_linear(input),
             Self::Affine(embedding) => embedding
                 .as_linear(input)
@@ -125,6 +131,7 @@ impl Qwen35Embedding {
 }
 
 pub(crate) enum Qwen35QkvProjection {
+    #[cfg(any(feature = "specprefill", test))]
     Legacy(FusedQKVLinear),
     Separate {
         query: Qwen35Linear,
@@ -143,6 +150,7 @@ impl Qwen35QkvProjection {
         UniquePtr<MlxArray>,
     ) {
         match self {
+            #[cfg(any(feature = "specprefill", test))]
             Self::Legacy(projection) => projection.forward(input),
             Self::Separate { query, key, value } => (
                 query.forward(input),
@@ -153,26 +161,120 @@ impl Qwen35QkvProjection {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ModelRole {
+    Target,
+    Mtp,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LayerTensor {
+    InputNorm,
+    PostAttentionNorm,
+    AttentionQuery,
+    AttentionKey,
+    AttentionValue,
+    AttentionOutput,
+    AttentionQueryNorm,
+    AttentionKeyNorm,
+    MlpGate,
+    MlpUp,
+    MlpDown,
+    LinearQkv,
+    LinearGate,
+    LinearBeta,
+    LinearAlpha,
+    LinearConv,
+    LinearDtBias,
+    LinearA,
+    LinearNorm,
+    LinearOutput,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TensorSlot {
+    TokenEmbedding,
+    Output,
+    OutputNorm,
+    Layer {
+        role: ModelRole,
+        layer: usize,
+        tensor: LayerTensor,
+    },
+    MtpEmbeddingNorm,
+    MtpHiddenNorm,
+    MtpProjection,
+    MtpHeadNorm,
+}
+
+impl TensorSlot {
+    fn canonical_name(self) -> String {
+        match self {
+            Self::TokenEmbedding => "model.embed_tokens.weight".to_owned(),
+            Self::Output => "lm_head.weight".to_owned(),
+            Self::OutputNorm => "model.norm.weight".to_owned(),
+            Self::MtpEmbeddingNorm => "mtp.pre_fc_norm_embedding.weight".to_owned(),
+            Self::MtpHiddenNorm => "mtp.pre_fc_norm_hidden.weight".to_owned(),
+            Self::MtpProjection => "mtp.fc.weight".to_owned(),
+            Self::MtpHeadNorm => "mtp.norm.weight".to_owned(),
+            Self::Layer {
+                role,
+                layer,
+                tensor,
+            } => {
+                let prefix = match role {
+                    ModelRole::Target => format!("model.layers.{layer}"),
+                    ModelRole::Mtp => format!("mtp.layers.{layer}"),
+                };
+                let suffix = match tensor {
+                    LayerTensor::InputNorm => "input_layernorm.weight",
+                    LayerTensor::PostAttentionNorm => "post_attention_layernorm.weight",
+                    LayerTensor::AttentionQuery => "self_attn.q_proj.weight",
+                    LayerTensor::AttentionKey => "self_attn.k_proj.weight",
+                    LayerTensor::AttentionValue => "self_attn.v_proj.weight",
+                    LayerTensor::AttentionOutput => "self_attn.o_proj.weight",
+                    LayerTensor::AttentionQueryNorm => "self_attn.q_norm.weight",
+                    LayerTensor::AttentionKeyNorm => "self_attn.k_norm.weight",
+                    LayerTensor::MlpGate => "mlp.gate_proj.weight",
+                    LayerTensor::MlpUp => "mlp.up_proj.weight",
+                    LayerTensor::MlpDown => "mlp.down_proj.weight",
+                    LayerTensor::LinearQkv => "linear_attn.in_proj_qkv.weight",
+                    LayerTensor::LinearGate => "linear_attn.in_proj_z.weight",
+                    LayerTensor::LinearBeta => "linear_attn.in_proj_b.weight",
+                    LayerTensor::LinearAlpha => "linear_attn.in_proj_a.weight",
+                    LayerTensor::LinearConv => "linear_attn.conv1d.weight",
+                    LayerTensor::LinearDtBias => "linear_attn.dt_bias",
+                    LayerTensor::LinearA => "linear_attn.A_log",
+                    LayerTensor::LinearNorm => "linear_attn.norm.weight",
+                    LayerTensor::LinearOutput => "linear_attn.out_proj.weight",
+                };
+                format!("{prefix}.{suffix}")
+            }
+        }
+    }
+}
+
 pub(crate) trait Qwen35WeightSource {
     fn linear(
         &self,
-        name: &str,
+        slot: TensorSlot,
         group_size: i32,
         bits: i32,
     ) -> std::result::Result<Qwen35Linear, String>;
 
-    fn tensor(&self, name: &str) -> std::result::Result<UniquePtr<MlxArray>, String>;
+    fn tensor(&self, slot: TensorSlot) -> std::result::Result<UniquePtr<MlxArray>, String>;
 
     fn embedding(
         &self,
-        name: &str,
+        slot: TensorSlot,
         group_size: i32,
         bits: i32,
     ) -> std::result::Result<Qwen35Embedding, String>;
 
     fn qkv(
         &self,
-        prefix: &str,
+        role: ModelRole,
+        layer: usize,
         group_size: i32,
         bits: i32,
         query_heads: i32,
@@ -189,43 +291,54 @@ pub(crate) trait Qwen35WeightSource {
     }
 }
 
+#[cfg(any(feature = "specprefill", test))]
 impl Qwen35WeightSource for WeightMap {
     fn linear(
         &self,
-        name: &str,
+        slot: TensorSlot,
         group_size: i32,
         bits: i32,
     ) -> std::result::Result<Qwen35Linear, String> {
-        UnifiedLinear::from_weights(self, name, group_size, bits).map(Qwen35Linear::Legacy)
+        let name = slot.canonical_name();
+        let prefix = name.strip_suffix(".weight").unwrap_or(&name);
+        UnifiedLinear::from_weights(self, prefix, group_size, bits).map(Qwen35Linear::Legacy)
     }
 
-    fn tensor(&self, name: &str) -> std::result::Result<UniquePtr<MlxArray>, String> {
-        self.get(name)
+    fn tensor(&self, slot: TensorSlot) -> std::result::Result<UniquePtr<MlxArray>, String> {
+        let name = slot.canonical_name();
+        self.get(&name)
             .map(|tensor| mlxcel_core::copy(tensor))
             .ok_or_else(|| format!("missing required tensor {name}"))
     }
 
     fn embedding(
         &self,
-        name: &str,
+        slot: TensorSlot,
         group_size: i32,
         bits: i32,
     ) -> std::result::Result<Qwen35Embedding, String> {
-        UnifiedEmbedding::from_weights(self, name, group_size, bits).map(Qwen35Embedding::Legacy)
+        let name = slot.canonical_name();
+        let prefix = name.strip_suffix(".weight").unwrap_or(&name);
+        UnifiedEmbedding::from_weights(self, prefix, group_size, bits).map(Qwen35Embedding::Legacy)
     }
 
     fn qkv(
         &self,
-        prefix: &str,
+        role: ModelRole,
+        layer: usize,
         group_size: i32,
         bits: i32,
         query_heads: i32,
         kv_heads: i32,
         head_dim: i32,
     ) -> std::result::Result<Qwen35QkvProjection, String> {
+        let prefix = match role {
+            ModelRole::Target => format!("model.layers.{layer}.self_attn"),
+            ModelRole::Mtp => format!("mtp.layers.{layer}.self_attn"),
+        };
         FusedQKVLinear::from_weights_separate(
             self,
-            prefix,
+            &prefix,
             group_size,
             bits,
             query_heads,
@@ -244,80 +357,34 @@ fn pinned_affine_qtype(type_id: u32) -> bool {
     matches!(type_id, 8 | 11 | 12 | 13 | 20 | 21 | 23)
 }
 
-fn pinned_q6_shape(tensor: &GgufTensorInfo) -> Result<Option<Qwen38Q6Shape>> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PinnedSlot {
+    Target(usize),
+    Mtp(usize),
+}
+
+fn pinned_q6_shape(slot: PinnedSlot, tensor: &GgufTensorInfo) -> Result<Option<Qwen38Q6Shape>> {
     if tensor.tensor_type.id() != 14 {
         return Ok(None);
     }
-    let shape = match tensor.name.as_str() {
-        "output.weight" => {
-            ensure!(tensor.dimensions == [5120, 248_320], "pinned Q6 output shape changed");
-            return Ok(None);
-        }
-        "blk.11.attn_k.weight"
-        | "blk.15.attn_k.weight"
-        | "blk.19.attn_k.weight"
-        | "blk.19.attn_v.weight"
-        | "blk.27.attn_k.weight"
-        | "blk.35.attn_k.weight"
-        | "blk.39.attn_k.weight"
-        | "blk.39.attn_v.weight"
-        | "blk.43.attn_k.weight"
-        | "blk.43.attn_v.weight"
-        | "blk.47.attn_k.weight"
-        | "blk.51.attn_k.weight"
-        | "blk.55.attn_k.weight"
-        | "blk.59.attn_k.weight"
-        | "blk.63.attn_k.weight"
-        | "blk.64.attn_k.weight"
-        | "blk.64.attn_v.weight" => Qwen38Q6Shape::K5120N1024,
-        "blk.28.attn_gate.weight" => Qwen38Q6Shape::K5120N6144,
-        "blk.6.attn_qkv.weight" => Qwen38Q6Shape::K5120N10240,
-        "blk.64.attn_q.weight" => Qwen38Q6Shape::K5120N12288,
-        "blk.58.ffn_gate.weight"
-        | "blk.59.ffn_gate.weight"
-        | "blk.59.ffn_up.weight"
-        | "blk.60.ffn_gate.weight"
-        | "blk.63.ffn_gate.weight"
-        | "blk.63.ffn_up.weight"
-        | "blk.64.ffn_gate.weight"
-        | "blk.64.ffn_up.weight" => Qwen38Q6Shape::K5120N17408,
-        "blk.1.ssm_out.weight"
-        | "blk.2.ssm_out.weight"
-        | "blk.3.attn_output.weight"
-        | "blk.6.ssm_out.weight"
-        | "blk.21.ssm_out.weight"
-        | "blk.22.ssm_out.weight"
-        | "blk.23.attn_output.weight"
-        | "blk.24.ssm_out.weight"
-        | "blk.25.ssm_out.weight"
-        | "blk.27.attn_output.weight"
-        | "blk.31.attn_output.weight"
-        | "blk.35.attn_output.weight"
-        | "blk.43.attn_output.weight"
-        | "blk.50.ssm_out.weight"
-        | "blk.51.attn_output.weight"
-        | "blk.52.ssm_out.weight"
-        | "blk.56.ssm_out.weight"
-        | "blk.57.ssm_out.weight"
-        | "blk.58.ssm_out.weight"
-        | "blk.62.ssm_out.weight"
-        | "blk.63.attn_output.weight"
-        | "blk.64.attn_output.weight" => Qwen38Q6Shape::K6144N5120,
-        "blk.64.nextn.eh_proj.weight" => Qwen38Q6Shape::K10240N5120,
-        "blk.56.ffn_down.weight"
-        | "blk.57.ffn_down.weight"
-        | "blk.58.ffn_down.weight"
-        | "blk.59.ffn_down.weight"
-        | "blk.63.ffn_down.weight"
-        | "blk.64.ffn_down.weight" => Qwen38Q6Shape::K17408N5120,
-        other => anyhow::bail!("unexpected pinned Q6_K tensor {other}"),
+    if slot == PinnedSlot::Target(0) {
+        ensure!(
+            tensor.dimensions == [5120, 248_320],
+            "pinned direct Q6 output shape changed"
+        );
+        return Ok(None);
+    }
+    let shape = match tensor.dimensions.as_slice() {
+        [5120, 1024] => Qwen38Q6Shape::K5120N1024,
+        [5120, 6144] => Qwen38Q6Shape::K5120N6144,
+        [5120, 10240] => Qwen38Q6Shape::K5120N10240,
+        [5120, 12288] => Qwen38Q6Shape::K5120N12288,
+        [5120, 17408] => Qwen38Q6Shape::K5120N17408,
+        [6144, 5120] => Qwen38Q6Shape::K6144N5120,
+        [10240, 5120] => Qwen38Q6Shape::K10240N5120,
+        [17408, 5120] => Qwen38Q6Shape::K17408N5120,
+        dimensions => anyhow::bail!("unexpected pinned Q6_K dimensions {dimensions:?}"),
     };
-    let (input, output) = shape.dimensions();
-    ensure!(
-        tensor.dimensions == [input as u64, output as u64],
-        "pinned Q6_K tensor {} shape changed",
-        tensor.name
-    );
     Ok(Some(shape))
 }
 
@@ -335,30 +402,27 @@ pub(crate) struct GgufAffineLoadStats {
     pub q6_elapsed: Duration,
 }
 
-#[derive(Clone, Copy)]
-enum Artifact {
-    Target,
-    Mtp,
-}
-
 pub(crate) struct GgufWeightSource {
-    pair: GgufModelPair,
-    target_maps: Vec<Mmap>,
-    mtp_maps: Vec<Mmap>,
-    used: RefCell<BTreeSet<(u8, String)>>,
+    pair: PinnedGgufPair,
+    target_map: Mmap,
+    mtp_map: Mmap,
+    target_used: RefCell<[bool; 866]>,
+    mtp_used: RefCell<[bool; 18]>,
     affine_stats: RefCell<GgufAffineLoadStats>,
 }
 
 impl GgufWeightSource {
-    pub(crate) fn open(root: &Path) -> Result<Self> {
-        let pair = GgufModelPair::open_selected(root)?;
-        let target_maps = map_shards(&pair.target)?;
-        let mtp_maps = map_shards(&pair.mtp)?;
+    pub(crate) fn open() -> Result<Self> {
+        let pair = PinnedGgufPair::open()?;
+        // PinnedGgufPair verifies both payload hashes and exact plans first.
+        let target_map = map_file(&pair.target)?;
+        let mtp_map = map_file(&pair.mtp)?;
         Ok(Self {
             pair,
-            target_maps,
-            mtp_maps,
-            used: RefCell::new(BTreeSet::new()),
+            target_map,
+            mtp_map,
+            target_used: RefCell::new([false; 866]),
+            mtp_used: RefCell::new([false; 18]),
             affine_stats: RefCell::new(GgufAffineLoadStats::default()),
         })
     }
@@ -381,102 +445,83 @@ impl GgufWeightSource {
         stats.q6_tensors += 1;
         stats.q6_source_bytes += transcode.source_bytes;
         stats.q6_dense_bytes += transcode.dense_bytes;
-        stats.q6_peak_active_bytes =
-            stats.q6_peak_active_bytes.max(transcode.peak_active_bytes);
+        stats.q6_peak_active_bytes = stats.q6_peak_active_bytes.max(transcode.peak_active_bytes);
         stats.q6_elapsed += transcode.elapsed;
     }
 
-    pub(crate) fn target(&self) -> &GgufShardSet {
+    pub(crate) fn target(&self) -> &GgufFile {
         &self.pair.target
     }
 
     pub(crate) fn config(&self) -> Result<Qwen35Config> {
-        config_from_metadata(self.pair.target.metadata())
+        Ok(Qwen35Config::pinned())
     }
 
     pub(crate) fn finish(&self) -> Result<()> {
-        let used = self.used.borrow();
+        let target = self.target_used.borrow();
+        let mtp = self.mtp_used.borrow();
         let mut missing = Vec::new();
-        for (artifact, set) in [
-            (Artifact::Target, &self.pair.target),
-            (Artifact::Mtp, &self.pair.mtp),
-        ] {
-            for shard in set.shards() {
-                for tensor in shard.tensors() {
-                    let intentionally_shared_or_embedded = match artifact {
-                        Artifact::Target => tensor.name.starts_with("blk.64."),
-                        Artifact::Mtp => matches!(
-                            tensor.name.as_str(),
-                            "output.weight" | "output_norm.weight" | "token_embd.weight"
-                        ),
-                    };
-                    if intentionally_shared_or_embedded {
-                        continue;
-                    }
-                    let key = (artifact_tag(artifact), tensor.name.clone());
-                    if !used.contains(&key) {
-                        missing.push(format!(
-                            "{}:{}",
-                            if matches!(artifact, Artifact::Target) {
-                                "target"
-                            } else {
-                                "mtp"
-                            },
-                            tensor.name
-                        ));
-                    }
-                }
+        for slot in 0..target.len() {
+            if !target[slot] && !crate::qwen38_plan::TARGET_NONRESIDENT_SLOTS.contains(&slot) {
+                missing.push(format!("target:{slot}"));
+            }
+        }
+        for slot in 0..mtp.len() {
+            if !mtp[slot] && !crate::qwen38_plan::MTP_NONRESIDENT_SLOTS.contains(&slot) {
+                missing.push(format!("mtp:{slot}"));
             }
         }
         ensure!(
             missing.is_empty(),
-            "unmapped selected GGUF tensors: {}",
+            "unmapped pinned GGUF plan slots: {}",
             missing.into_iter().take(16).collect::<Vec<_>>().join(", ")
         );
         Ok(())
     }
 
-    fn lookup(&self, canonical: &str) -> Result<(&GgufTensorInfo, &[u8])> {
-        let (artifact, actual) = map_canonical_name(canonical)?;
-        let (set, maps) = match artifact {
-            Artifact::Target => (&self.pair.target, &self.target_maps),
-            Artifact::Mtp => (&self.pair.mtp, &self.mtp_maps),
+    fn slot_parts(&self, slot: PinnedSlot) -> (&GgufTensorInfo, &Mmap) {
+        match slot {
+            PinnedSlot::Target(index) => (&self.pair.target.tensors()[index], &self.target_map),
+            PinnedSlot::Mtp(index) => (&self.pair.mtp.tensors()[index], &self.mtp_map),
+        }
+    }
+
+    fn lookup(&self, slot: PinnedSlot) -> Result<(&GgufTensorInfo, &[u8])> {
+        let first_use = match slot {
+            PinnedSlot::Target(index) => {
+                let mut used = self.target_used.borrow_mut();
+                let first = !used[index];
+                used[index] = true;
+                first
+            }
+            PinnedSlot::Mtp(index) => {
+                let mut used = self.mtp_used.borrow_mut();
+                let first = !used[index];
+                used[index] = true;
+                first
+            }
         };
-        let location = set.tensor(&actual).with_context(|| {
-            format!("selected GGUF is missing mapped tensor {actual} for {canonical}")
-        })?;
         ensure!(
-            self.used
-                .borrow_mut()
-                .insert((artifact_tag(artifact), actual.clone())),
-            "selected GGUF tensor {actual} was consumed more than once"
+            first_use,
+            "pinned GGUF plan slot {slot:?} was consumed more than once"
         );
-        let tensor = location.tensor;
+        let (tensor, map) = self.slot_parts(slot);
         let start =
             usize::try_from(tensor.absolute_offset).context("tensor offset exceeds usize")?;
         let len = usize::try_from(tensor.byte_len).context("tensor byte length exceeds usize")?;
         let end = start.checked_add(len).context("tensor slice overflow")?;
-        let bytes = maps[location.shard]
+        let bytes = map
             .get(start..end)
-            .with_context(|| format!("mapped tensor {actual} exceeds its GGUF file"))?;
+            .with_context(|| format!("pinned tensor slot {slot:?} exceeds its GGUF file"))?;
         Ok((tensor, bytes))
     }
 
-    fn discard_tensor_pages(&self, canonical: &str) {
-        let Ok((artifact, actual)) = map_canonical_name(canonical) else {
+    fn discard_tensor_pages(&self, slot: PinnedSlot) {
+        let (tensor, map) = self.slot_parts(slot);
+        let Ok(start) = usize::try_from(tensor.absolute_offset) else {
             return;
         };
-        let (set, maps) = match artifact {
-            Artifact::Target => (&self.pair.target, &self.target_maps),
-            Artifact::Mtp => (&self.pair.mtp, &self.mtp_maps),
-        };
-        let Some(location) = set.tensor(&actual) else {
-            return;
-        };
-        let Ok(start) = usize::try_from(location.tensor.absolute_offset) else {
-            return;
-        };
-        let Ok(len) = usize::try_from(location.tensor.byte_len) else {
+        let Ok(len) = usize::try_from(tensor.byte_len) else {
             return;
         };
         let page_start = start / 4096 * 4096;
@@ -484,33 +529,20 @@ impl GgufWeightSource {
             .saturating_add(len)
             .div_ceil(4096)
             .saturating_mul(4096)
-            .min(maps[location.shard].len());
-        // SAFETY: packed/native constructors have been evaluated before this
-        // call and no borrowed GGUF slice survives. The mapping is immutable.
+            .min(map.len());
+        // SAFETY: constructors have evaluated before this call and no borrowed
+        // GGUF slice survives. The mapping is immutable.
         let _ = unsafe {
-            maps[location.shard].unchecked_advise_range(
-                UncheckedAdvice::DontNeed,
-                page_start,
-                page_end - page_start,
-            )
+            map.unchecked_advise_range(UncheckedAdvice::DontNeed, page_start, page_end - page_start)
         };
     }
 
-    fn discard_tensor_byte_range(&self, canonical: &str, relative: std::ops::Range<usize>) {
-        let Ok((artifact, actual)) = map_canonical_name(canonical) else {
+    fn discard_tensor_byte_range(&self, slot: PinnedSlot, relative: std::ops::Range<usize>) {
+        let (tensor, map) = self.slot_parts(slot);
+        let Ok(tensor_start) = usize::try_from(tensor.absolute_offset) else {
             return;
         };
-        let (set, maps) = match artifact {
-            Artifact::Target => (&self.pair.target, &self.target_maps),
-            Artifact::Mtp => (&self.pair.mtp, &self.mtp_maps),
-        };
-        let Some(location) = set.tensor(&actual) else {
-            return;
-        };
-        let Ok(tensor_start) = usize::try_from(location.tensor.absolute_offset) else {
-            return;
-        };
-        let Ok(tensor_len) = usize::try_from(location.tensor.byte_len) else {
+        let Ok(tensor_len) = usize::try_from(tensor.byte_len) else {
             return;
         };
         if relative.start > relative.end || relative.end > tensor_len {
@@ -520,26 +552,20 @@ impl GgufWeightSource {
         let absolute_end = tensor_start.saturating_add(relative.end);
         let page_start = absolute_start.div_ceil(4096).saturating_mul(4096);
         let page_end = absolute_end / 4096 * 4096;
-        if page_start >= page_end || page_end > maps[location.shard].len() {
+        if page_start >= page_end || page_end > map.len() {
             return;
         }
         // SAFETY: the callback fires only after consuming this immutable range.
-        // A future access faults discarded pages back in.
         let _ = unsafe {
-            maps[location.shard].unchecked_advise_range(
-                UncheckedAdvice::DontNeed,
-                page_start,
-                page_end - page_start,
-            )
+            map.unchecked_advise_range(UncheckedAdvice::DontNeed, page_start, page_end - page_start)
         };
     }
 
-    fn load_native(&self, canonical: &str) -> Result<UniquePtr<MlxArray>> {
-        let (tensor, bytes) = self.lookup(canonical)?;
+    fn load_native(&self, slot: PinnedSlot, label: &str) -> Result<UniquePtr<MlxArray>> {
+        let (tensor, bytes) = self.lookup(slot)?;
         ensure!(
             tensor.tensor_type.id() == 0,
-            "native tensor {canonical} must use F32, got {}",
-            tensor.tensor_type.name()
+            "native tensor {label} must use pinned F32"
         );
         let shape = tensor
             .dimensions
@@ -549,40 +575,27 @@ impl GgufWeightSource {
             .collect::<Result<Vec<_>>>()?;
         let array = mlxcel_core::from_bytes(bytes, &shape, dtype::FLOAT32);
         mlxcel_core::eval(array.as_ref().unwrap());
-        self.discard_tensor_pages(canonical);
+        self.discard_tensor_pages(slot);
         Ok(array)
     }
 
-    fn load_linear(&self, canonical: &str) -> Result<Qwen35Linear> {
-        let (tensor, bytes) = self.lookup(canonical)?;
+    fn load_linear(&self, slot: PinnedSlot, label: &str) -> Result<Qwen35Linear> {
+        let (tensor, bytes) = self.lookup(slot)?;
         ensure!(
-            (1..=2).contains(&tensor.dimensions.len()),
-            "linear tensor {canonical} has rank {}",
-            tensor.dimensions.len()
+            tensor.dimensions.len() == 2 && tensor.tensor_type.id() != 0,
+            "linear tensor {label} escaped the exact packed plan"
         );
         let input = usize::try_from(tensor.dimensions[0]).context("linear input exceeds usize")?;
-        let output = tensor
-            .dimensions
-            .get(1)
-            .copied()
-            .map(usize::try_from)
-            .transpose()
-            .context("linear output exceeds usize")?
-            .unwrap_or(1);
-        let q6_shape = pinned_q6_shape(tensor)?;
+        let output =
+            usize::try_from(tensor.dimensions[1]).context("linear output exceeds usize")?;
+        let q6_shape = pinned_q6_shape(slot, tensor)?;
         let qtype = GgmlQType::try_from(tensor.tensor_type.id())
-            .context("pinned GGML qtype escaped parser validation")?;
-        let result = if tensor.tensor_type.id() == 0 {
-            let array =
-                mlxcel_core::from_bytes(bytes, &[output as i32, input as i32], dtype::FLOAT32);
-            mlxcel_core::eval(array.as_ref().unwrap());
-            Qwen35Linear::Legacy(UnifiedLinear::Regular(Linear::new(array, None)))
-        } else if let Some(shape) = q6_shape {
-            let dual = Qwen38Q6DualMatrix::from_pinned_bytes_with_progress(
-                bytes,
-                shape,
-                |range| self.discard_tensor_byte_range(canonical, range),
-            )?;
+            .context("pinned GGML qtype escaped plan validation")?;
+        let result = if let Some(shape) = q6_shape {
+            let dual =
+                Qwen38Q6DualMatrix::from_pinned_bytes_with_progress(bytes, shape, |range| {
+                    self.discard_tensor_byte_range(slot, range)
+                })?;
             self.record_q6(dual.transcode_stats());
             Qwen35Linear::Q6Dual(dual)
         } else if pinned_affine_qtype(tensor.tensor_type.id()) {
@@ -591,39 +604,40 @@ impl GgufWeightSource {
                 qtype,
                 input,
                 output,
-                |range| self.discard_tensor_byte_range(canonical, range),
+                |range| self.discard_tensor_byte_range(slot, range),
             )?;
             self.record_affine(affine.transcode_stats());
             Qwen35Linear::Affine(affine)
         } else {
+            ensure!(
+                slot == PinnedSlot::Target(0) && tensor.tensor_type.id() == 14,
+                "linear tensor {label} has no pinned resident representation"
+            );
             Qwen35Linear::Gguf(GgmlQuantizedMatrix::from_bytes(
-                bytes,
-                qtype,
-                input,
-                output,
+                bytes, qtype, input, output,
             )?)
         };
-        self.discard_tensor_pages(canonical);
+        self.discard_tensor_pages(slot);
         Ok(result)
     }
 
-    fn load_embedding(&self, canonical: &str) -> Result<Qwen35Embedding> {
-        let (tensor, bytes) = self.lookup(canonical)?;
+    fn load_embedding(&self, slot: PinnedSlot, label: &str) -> Result<Qwen35Embedding> {
+        let (tensor, bytes) = self.lookup(slot)?;
         ensure!(
             tensor.dimensions.len() == 2,
-            "embedding tensor {canonical} must have rank two"
+            "embedding tensor {label} must have rank two"
         );
         let embedding_dim = usize::try_from(tensor.dimensions[0])?;
         let vocab_size = usize::try_from(tensor.dimensions[1])?;
         let qtype = GgmlQType::try_from(tensor.tensor_type.id())
-            .context("pinned GGML embedding qtype escaped parser validation")?;
+            .context("pinned embedding qtype escaped plan validation")?;
         let result = if pinned_affine_qtype(tensor.tensor_type.id()) {
             let affine = GgmlAffineEmbedding::from_ggml_bytes_with_progress(
                 bytes,
                 qtype,
                 embedding_dim,
                 vocab_size,
-                |range| self.discard_tensor_byte_range(canonical, range),
+                |range| self.discard_tensor_byte_range(slot, range),
             )?;
             self.record_affine(affine.transcode_stats());
             Qwen35Embedding::Affine(affine)
@@ -635,7 +649,7 @@ impl GgufWeightSource {
                 vocab_size,
             )?)
         };
-        self.discard_tensor_pages(canonical);
+        self.discard_tensor_pages(slot);
         Ok(result)
     }
 }
@@ -643,41 +657,51 @@ impl GgufWeightSource {
 impl Qwen35WeightSource for GgufWeightSource {
     fn linear(
         &self,
-        name: &str,
+        slot: TensorSlot,
         _group_size: i32,
         _bits: i32,
     ) -> std::result::Result<Qwen35Linear, String> {
-        self.load_linear(&format!("{name}.weight"))
+        let label = slot.canonical_name();
+        self.load_linear(pinned_slot(slot)?, &label)
             .map_err(|error| error.to_string())
     }
 
-    fn tensor(&self, name: &str) -> std::result::Result<UniquePtr<MlxArray>, String> {
-        self.load_native(name).map_err(|error| error.to_string())
+    fn tensor(&self, slot: TensorSlot) -> std::result::Result<UniquePtr<MlxArray>, String> {
+        let label = slot.canonical_name();
+        self.load_native(pinned_slot(slot)?, &label)
+            .map_err(|error| error.to_string())
     }
 
     fn embedding(
         &self,
-        name: &str,
+        slot: TensorSlot,
         _group_size: i32,
         _bits: i32,
     ) -> std::result::Result<Qwen35Embedding, String> {
-        self.load_embedding(&format!("{name}.weight"))
+        let label = slot.canonical_name();
+        self.load_embedding(pinned_slot(slot)?, &label)
             .map_err(|error| error.to_string())
     }
 
     fn qkv(
         &self,
-        prefix: &str,
+        role: ModelRole,
+        layer: usize,
         group_size: i32,
         bits: i32,
         _query_heads: i32,
         _kv_heads: i32,
         _head_dim: i32,
     ) -> std::result::Result<Qwen35QkvProjection, String> {
+        let slot = |tensor| TensorSlot::Layer {
+            role,
+            layer,
+            tensor,
+        };
         Ok(Qwen35QkvProjection::Separate {
-            query: self.linear(&format!("{prefix}.q_proj"), group_size, bits)?,
-            key: self.linear(&format!("{prefix}.k_proj"), group_size, bits)?,
-            value: self.linear(&format!("{prefix}.v_proj"), group_size, bits)?,
+            query: self.linear(slot(LayerTensor::AttentionQuery), group_size, bits)?,
+            key: self.linear(slot(LayerTensor::AttentionKey), group_size, bits)?,
+            value: self.linear(slot(LayerTensor::AttentionValue), group_size, bits)?,
         })
     }
 
@@ -686,164 +710,87 @@ impl Qwen35WeightSource for GgufWeightSource {
     }
 }
 
-fn map_shards(set: &GgufShardSet) -> Result<Vec<Mmap>> {
-    set.shards()
-        .iter()
-        .map(|shard| {
-            let file = File::open(shard.path())
-                .with_context(|| format!("failed to open GGUF {}", shard.path().display()))?;
-            let map = unsafe { MmapOptions::new().map(&file) }
-                .with_context(|| format!("failed to mmap GGUF {}", shard.path().display()))?;
-            map.advise(Advice::Sequential).with_context(|| {
-                format!("failed to mark GGUF {} sequential", shard.path().display())
-            })?;
-            Ok(map)
-        })
-        .collect()
+fn map_file(file: &GgufFile) -> Result<Mmap> {
+    let handle = File::open(file.path())
+        .with_context(|| format!("failed to open GGUF {}", file.path().display()))?;
+    let map = unsafe { MmapOptions::new().map(&handle) }
+        .with_context(|| format!("failed to mmap GGUF {}", file.path().display()))?;
+    map.advise(Advice::Sequential)
+        .with_context(|| format!("failed to mark GGUF {} sequential", file.path().display()))?;
+    Ok(map)
 }
 
-fn artifact_tag(artifact: Artifact) -> u8 {
-    match artifact {
-        Artifact::Target => 0,
-        Artifact::Mtp => 1,
+fn pinned_slot(slot: TensorSlot) -> std::result::Result<PinnedSlot, String> {
+    match slot {
+        TensorSlot::TokenEmbedding => Ok(PinnedSlot::Target(2)),
+        TensorSlot::Output => Ok(PinnedSlot::Target(0)),
+        TensorSlot::OutputNorm => Ok(PinnedSlot::Target(1)),
+        TensorSlot::MtpEmbeddingNorm => Ok(PinnedSlot::Mtp(14)),
+        TensorSlot::MtpHiddenNorm => Ok(PinnedSlot::Mtp(15)),
+        TensorSlot::MtpProjection => Ok(PinnedSlot::Mtp(13)),
+        TensorSlot::MtpHeadNorm => Ok(PinnedSlot::Mtp(16)),
+        TensorSlot::Layer {
+            role,
+            layer,
+            tensor,
+        } => {
+            let (base, full) = match role {
+                ModelRole::Target if layer < 64 => (
+                    3 + layer * 14 - (layer / 4) * 3,
+                    (layer + 1).is_multiple_of(4),
+                ),
+                ModelRole::Mtp if layer == 0 => (3, true),
+                _ => {
+                    return Err(format!(
+                        "layer slot is outside the pinned topology: {slot:?}"
+                    ));
+                }
+            };
+            let offset = layer_slot_offset(full, tensor)?;
+            Ok(match role {
+                ModelRole::Target => PinnedSlot::Target(base + offset),
+                ModelRole::Mtp => PinnedSlot::Mtp(base + offset),
+            })
+        }
     }
 }
 
-fn map_canonical_name(canonical: &str) -> Result<(Artifact, String)> {
-    let global = match canonical {
-        "model.embed_tokens.weight" => Some((Artifact::Target, "token_embd.weight")),
-        "lm_head.weight" => Some((Artifact::Target, "output.weight")),
-        "model.norm.weight" => Some((Artifact::Target, "output_norm.weight")),
-        "mtp.pre_fc_norm_embedding.weight" => Some((Artifact::Mtp, "blk.64.nextn.enorm.weight")),
-        "mtp.pre_fc_norm_hidden.weight" => Some((Artifact::Mtp, "blk.64.nextn.hnorm.weight")),
-        "mtp.fc.weight" => Some((Artifact::Mtp, "blk.64.nextn.eh_proj.weight")),
-        "mtp.norm.weight" => Some((Artifact::Mtp, "blk.64.nextn.shared_head_norm.weight")),
-        _ => None,
+fn layer_slot_offset(full: bool, tensor: LayerTensor) -> std::result::Result<usize, String> {
+    let offset = if full {
+        match tensor {
+            LayerTensor::AttentionKey => 0,
+            LayerTensor::AttentionKeyNorm => 1,
+            LayerTensor::InputNorm => 2,
+            LayerTensor::AttentionOutput => 3,
+            LayerTensor::AttentionQuery => 4,
+            LayerTensor::AttentionQueryNorm => 5,
+            LayerTensor::AttentionValue => 6,
+            LayerTensor::MlpDown => 7,
+            LayerTensor::MlpGate => 8,
+            LayerTensor::MlpUp => 9,
+            LayerTensor::PostAttentionNorm => 10,
+            _ => return Err(format!("{tensor:?} is not a full-attention tensor")),
+        }
+    } else {
+        match tensor {
+            LayerTensor::LinearGate => 0,
+            LayerTensor::InputNorm => 1,
+            LayerTensor::LinearQkv => 2,
+            LayerTensor::MlpDown => 3,
+            LayerTensor::MlpGate => 4,
+            LayerTensor::MlpUp => 5,
+            LayerTensor::PostAttentionNorm => 6,
+            LayerTensor::LinearA => 7,
+            LayerTensor::LinearAlpha => 8,
+            LayerTensor::LinearBeta => 9,
+            LayerTensor::LinearConv => 10,
+            LayerTensor::LinearDtBias => 11,
+            LayerTensor::LinearNorm => 12,
+            LayerTensor::LinearOutput => 13,
+            _ => return Err(format!("{tensor:?} is not a linear-attention tensor")),
+        }
     };
-    if let Some((artifact, actual)) = global {
-        return Ok((artifact, actual.to_owned()));
-    }
-
-    if let Some(rest) = canonical.strip_prefix("model.layers.") {
-        let (layer, suffix) = rest
-            .split_once('.')
-            .with_context(|| format!("invalid target layer tensor {canonical}"))?;
-        let layer = layer
-            .parse::<usize>()
-            .context("invalid target layer index")?;
-        ensure!(layer < 64, "target layer index is outside 0..64");
-        return Ok((
-            Artifact::Target,
-            format!("blk.{layer}.{}", map_layer_suffix(suffix)?),
-        ));
-    }
-    if let Some(suffix) = canonical.strip_prefix("mtp.layers.0.") {
-        return Ok((
-            Artifact::Mtp,
-            format!("blk.64.{}", map_layer_suffix(suffix)?),
-        ));
-    }
-    anyhow::bail!("no selected GGUF mapping for canonical tensor {canonical}")
-}
-
-fn map_layer_suffix(suffix: &str) -> Result<&'static str> {
-    Ok(match suffix {
-        "linear_attn.in_proj_qkv.weight" => "attn_qkv.weight",
-        "linear_attn.in_proj_z.weight" => "attn_gate.weight",
-        "linear_attn.in_proj_b.weight" => "ssm_beta.weight",
-        "linear_attn.in_proj_a.weight" => "ssm_alpha.weight",
-        "linear_attn.conv1d.weight" => "ssm_conv1d.weight",
-        "linear_attn.dt_bias" => "ssm_dt.bias",
-        "linear_attn.A_log" => "ssm_a",
-        "linear_attn.norm.weight" => "ssm_norm.weight",
-        "linear_attn.out_proj.weight" => "ssm_out.weight",
-        "self_attn.q_proj.weight" => "attn_q.weight",
-        "self_attn.k_proj.weight" => "attn_k.weight",
-        "self_attn.v_proj.weight" => "attn_v.weight",
-        "self_attn.o_proj.weight" => "attn_output.weight",
-        "self_attn.q_norm.weight" => "attn_q_norm.weight",
-        "self_attn.k_norm.weight" => "attn_k_norm.weight",
-        "mlp.gate_proj.weight" => "ffn_gate.weight",
-        "mlp.up_proj.weight" => "ffn_up.weight",
-        "mlp.down_proj.weight" => "ffn_down.weight",
-        "input_layernorm.weight" => "attn_norm.weight",
-        "post_attention_layernorm.weight" => "post_attention_norm.weight",
-        _ => anyhow::bail!("no selected GGUF layer mapping for {suffix}"),
-    })
-}
-
-fn config_from_metadata(
-    metadata: &std::collections::BTreeMap<String, MetadataValue>,
-) -> Result<Qwen35Config> {
-    let integer = |key: &str| -> Result<usize> {
-        metadata
-            .get(key)
-            .and_then(MetadataValue::as_u64)
-            .and_then(|value| usize::try_from(value).ok())
-            .with_context(|| format!("selected GGUF metadata {key} is missing or invalid"))
-    };
-    let number = |key: &str| -> Result<f32> {
-        metadata
-            .get(key)
-            .and_then(MetadataValue::as_f64)
-            .map(|value| value as f32)
-            .with_context(|| format!("selected GGUF metadata {key} is missing or invalid"))
-    };
-    let blocks = integer("qwen35.block_count")?;
-    let nextn = integer("qwen35.nextn_predict_layers")?;
-    ensure!(blocks > nextn, "selected GGUF has no target decoder layers");
-    let sections = metadata
-        .get("qwen35.rope.dimension_sections")
-        .and_then(MetadataValue::as_array)
-        .context("selected GGUF is missing qwen35.rope.dimension_sections")?;
-    let sections = sections
-        .iter()
-        .take(3)
-        .map(|value| {
-            value
-                .as_u64()
-                .and_then(|value| i32::try_from(value).ok())
-                .context("selected GGUF has invalid RoPE dimension sections")
-        })
-        .collect::<Result<Vec<_>>>()?;
-    ensure!(
-        sections.len() == 3,
-        "selected GGUF must contain three text RoPE sections"
-    );
-    let head_dim = integer("qwen35.attention.key_length")?;
-    let rope_dim = integer("qwen35.rope.dimension_count")?;
-    Ok(Qwen35Config {
-        model_type: "qwen3_5_text".to_owned(),
-        hidden_size: integer("qwen35.embedding_length")?,
-        num_hidden_layers: blocks - nextn,
-        intermediate_size: integer("qwen35.feed_forward_length")?,
-        num_attention_heads: integer("qwen35.attention.head_count")?,
-        num_key_value_heads: integer("qwen35.attention.head_count_kv")?,
-        head_dim: Some(head_dim),
-        linear_num_value_heads: integer("qwen35.ssm.inner_size")?
-            / integer("qwen35.ssm.state_size")?,
-        linear_num_key_heads: integer("qwen35.ssm.group_count")?,
-        linear_key_head_dim: integer("qwen35.ssm.state_size")?,
-        linear_value_head_dim: integer("qwen35.ssm.state_size")?,
-        linear_conv_kernel_dim: integer("qwen35.ssm.conv_kernel")?,
-        rope_parameters: Some(serde_json::json!({
-            "rope_theta": number("qwen35.rope.freq_base")?,
-            "partial_rotary_factor": rope_dim as f32 / head_dim as f32,
-            "mrope_section": sections,
-        })),
-        full_attention_interval: integer("qwen35.full_attention_interval")?,
-        rms_norm_eps: number("qwen35.attention.layer_norm_rms_epsilon")?,
-        tie_word_embeddings: false,
-        vocab_size: 248_320,
-        max_position_embeddings: integer("qwen35.context_length")?,
-        quantization: None,
-        mtp_num_hidden_layers: Some(nextn),
-        mtp_use_dedicated_embeddings: Some(false),
-        vision_config: None,
-        image_token_id: None,
-        video_token_id: None,
-        vision_start_token_id: None,
-    })
+    Ok(offset)
 }
 
 #[cfg(test)]
@@ -851,30 +798,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exact_mapping_covers_target_and_separate_mtp_head() {
+    fn exact_typed_mapping_covers_target_and_mtp_topology() {
         assert_eq!(
-            map_canonical_name("model.layers.63.self_attn.o_proj.weight")
-                .unwrap()
-                .1,
-            "blk.63.attn_output.weight"
+            pinned_slot(TensorSlot::Layer {
+                role: ModelRole::Target,
+                layer: 63,
+                tensor: LayerTensor::AttentionOutput,
+            }),
+            Ok(PinnedSlot::Target(843))
         );
         assert_eq!(
-            map_canonical_name("model.layers.62.linear_attn.in_proj_qkv.weight")
-                .unwrap()
-                .1,
-            "blk.62.attn_qkv.weight"
+            pinned_slot(TensorSlot::Layer {
+                role: ModelRole::Target,
+                layer: 62,
+                tensor: LayerTensor::LinearQkv,
+            }),
+            Ok(PinnedSlot::Target(828))
         );
         assert_eq!(
-            map_canonical_name("mtp.layers.0.mlp.down_proj.weight")
-                .unwrap()
-                .1,
-            "blk.64.ffn_down.weight"
+            pinned_slot(TensorSlot::Layer {
+                role: ModelRole::Mtp,
+                layer: 0,
+                tensor: LayerTensor::MlpDown,
+            }),
+            Ok(PinnedSlot::Mtp(10))
         );
         assert_eq!(
-            map_canonical_name("mtp.fc.weight").unwrap().1,
-            "blk.64.nextn.eh_proj.weight"
+            pinned_slot(TensorSlot::MtpProjection),
+            Ok(PinnedSlot::Mtp(13))
         );
-        assert!(map_canonical_name("model.layers.64.mlp.down_proj.weight").is_err());
+        assert!(
+            pinned_slot(TensorSlot::Layer {
+                role: ModelRole::Target,
+                layer: 64,
+                tensor: LayerTensor::MlpDown,
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -887,8 +847,9 @@ mod tests {
             row[..2].copy_from_slice(&0x3c00_u16.to_le_bytes());
             row[2..].fill(quant);
         }
-        let embedding =
-            Qwen35Embedding::Gguf(GgmlQuantizedEmbedding::from_bytes(&bytes, GgmlQType::Q8_0, 32, 2).unwrap());
+        let embedding = Qwen35Embedding::Gguf(
+            GgmlQuantizedEmbedding::from_bytes(&bytes, GgmlQType::Q8_0, 32, 2).unwrap(),
+        );
         let indices = mlxcel_core::from_slice_i64(&[1], &[1]);
         let output = embedding.forward(&indices);
         mlxcel_core::eval(&output);

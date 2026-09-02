@@ -1,4 +1,5 @@
-use std::path::{Path, PathBuf};
+#[cfg(any(feature = "specprefill", test))]
+use std::path::Path;
 use std::sync::LazyLock;
 use std::time::Duration;
 #[cfg(any(feature = "specprefill", test))]
@@ -21,7 +22,6 @@ use mlxcel_core::sampling::{
     SamplerState, sample_token_optimized, sample_token_optimized_with_state,
 };
 use mlxcel_core::{MlxArray, UniquePtr};
-use serde::Deserialize;
 use tokenizers::Tokenizer;
 use tracing::{debug, info};
 
@@ -345,25 +345,6 @@ pub struct Qwen35Provider {
     vision_processor: Option<QwenVLProcessor>,
 }
 
-#[derive(Debug, Deserialize)]
-struct GenerationConfig {
-    #[serde(default)]
-    eos_token_id: Option<TokenIds>,
-    #[serde(default)]
-    temperature: Option<f32>,
-    #[serde(default)]
-    top_k: Option<i32>,
-    #[serde(default)]
-    top_p: Option<f32>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum TokenIds {
-    One(i32),
-    Many(Vec<i32>),
-}
-
 struct GenerationDefaults {
     stop_token_ids: Vec<i32>,
     temperature: f32,
@@ -372,79 +353,35 @@ struct GenerationDefaults {
 }
 
 impl Qwen35Provider {
-    pub fn load(model_dir: impl AsRef<Path>, kv_cache_mode: KVCacheMode) -> Result<Self> {
+    pub fn load(kv_cache_mode: KVCacheMode) -> Result<Self> {
         #[cfg(feature = "specprefill")]
         {
-            let draft_model_dir = crate::resolve_specprefill_draft_path(None)?;
-            return Self::load_with_specprefill_draft(model_dir, &draft_model_dir, kv_cache_mode)
-                .with_context(|| {
-                    format!(
-                        "failed to load required SpecPrefill draft at {}; rerun `qw download {}`",
-                        draft_model_dir.display(),
-                        crate::DEFAULT_MODEL_IDENTIFIER
-                    )
-                });
+            let draft_model_dir = crate::model_resolver::resolve_specprefill_draft_path(None)?;
+            return Self::load_with_specprefill_draft(&draft_model_dir, kv_cache_mode);
         }
         #[cfg(not(feature = "specprefill"))]
-        Self::load_target_only(model_dir.as_ref(), kv_cache_mode)
+        Self::load_target_only(kv_cache_mode)
     }
 
-    fn load_target_only(model_dir: &Path, kv_cache_mode: KVCacheMode) -> Result<Self> {
+    fn load_target_only(kv_cache_mode: KVCacheMode) -> Result<Self> {
         initialize_runtime()?;
-        ensure!(
-            model_dir.is_dir(),
-            "model directory does not exist or is not a directory: {}",
-            model_dir.display()
-        );
-
-        let selected_gguf = model_dir.join(crate::SELECTED_TARGET_FILE.0).is_file();
-        let (model, tokenizer, chat_template, defaults, vision_processor) = if selected_gguf {
-            let (model, assets) = Qwen35Model::load_gguf(model_dir, kv_cache_mode)?;
-            let chat_template = ChatTemplateProcessor::from_template(
-                assets.chat_template,
-                assets.bos_token,
-                assets.eos_token,
-            )?;
-            let defaults = GenerationDefaults {
-                stop_token_ids: vec![248_046],
-                temperature: assets.temperature,
-                top_k: i32::try_from(assets.top_k).context("GGUF sampling top_k exceeds i32")?,
-                top_p: assets.top_p,
-            };
-            (model, assets.tokenizer, chat_template, defaults, None)
-        } else {
-            let tokenizer_path = model_dir.join("tokenizer.json");
-            ensure!(
-                tokenizer_path.is_file(),
-                "missing tokenizer {}",
-                tokenizer_path.display()
-            );
-            let tokenizer = Tokenizer::from_file(&tokenizer_path)
-                .map_err(anyhow::Error::msg)
-                .with_context(|| {
-                    format!("failed to load tokenizer {}", tokenizer_path.display())
-                })?;
-            let chat_template = ChatTemplateProcessor::from_model_path(model_dir)?;
-            let defaults = load_generation_defaults(model_dir)?;
-            let model = Qwen35Model::load(model_dir, kv_cache_mode)?;
-            if model.has_vision() {
-                ensure!(
-                    chat_template.supports_image_content(),
-                    "unsupported Qwen3.5-VL chat template: expected image/vision marker behavior"
-                );
-            }
-            let vision_processor = model
-                .vision_config()
-                .map(|vision| load_vision_processor(model_dir, vision))
-                .transpose()?;
-            (model, tokenizer, chat_template, defaults, vision_processor)
+        let (model, assets) = Qwen35Model::load_pinned(kv_cache_mode)?;
+        let chat_template = ChatTemplateProcessor::from_template(
+            assets.chat_template,
+            assets.bos_token,
+            assets.eos_token,
+        )?;
+        let defaults = GenerationDefaults {
+            stop_token_ids: vec![248_046],
+            temperature: assets.temperature,
+            top_k: i32::try_from(assets.top_k).context("GGUF sampling top_k exceeds i32")?,
+            top_p: assets.top_p,
         };
         let generator = CxxGenerator::new_with_kv_mode(model.num_layers(), kv_cache_mode);
-        let mtp_generator = model.has_mtp().then(Qwen35MtpGenerator::new);
-
+        let mtp_generator = Some(Qwen35MtpGenerator::new());
         Ok(Self {
             model,
-            tokenizer,
+            tokenizer: assets.tokenizer,
             chat_template,
             defaults,
             generator,
@@ -453,17 +390,16 @@ impl Qwen35Provider {
             mtp_generator,
             #[cfg(any(feature = "dflash2", test))]
             dflash2_generator: None,
-            vision_processor,
+            vision_processor: None,
         })
     }
 
     #[cfg(any(feature = "specprefill", test))]
     pub fn load_with_specprefill_draft(
-        model_dir: impl AsRef<Path>,
         draft_model_dir: impl AsRef<Path>,
         kv_cache_mode: KVCacheMode,
     ) -> Result<Self> {
-        let mut provider = Self::load_target_only(model_dir.as_ref(), kv_cache_mode)?;
+        let mut provider = Self::load_target_only(kv_cache_mode)?;
         let draft_model_dir = draft_model_dir.as_ref();
         let draft_tokenizer_path = draft_model_dir.join("tokenizer.json");
         ensure!(
@@ -1698,83 +1634,9 @@ fn initialize_runtime() -> Result<()> {
     (*INITIALIZED).clone().map_err(anyhow::Error::msg)
 }
 
-fn load_vision_processor(
-    model_dir: &Path,
-    config: &crate::qwen3_vl_vision::Qwen3VLVisionConfig,
-) -> Result<QwenVLProcessor> {
-    let factor = config.patch_size * config.spatial_merge_size;
-    let default_min = 4 * factor * factor;
-    let default_max = 16_384 * factor * factor;
-    let path = model_dir.join("preprocessor_config.json");
-    let value = match std::fs::read_to_string(&path) {
-        Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
-            .with_context(|| format!("failed to parse {}", path.display()))?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            serde_json::Value::Object(Default::default())
-        }
-        Err(error) => {
-            return Err(error).with_context(|| format!("failed to read {}", path.display()));
-        }
-    };
-    let min_pixels = value
-        .get("min_pixels")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|value| usize::try_from(value).ok())
-        .unwrap_or(default_min);
-    let max_pixels = value
-        .get("max_pixels")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|value| usize::try_from(value).ok())
-        .unwrap_or(default_max);
-    QwenVLProcessor::new(
-        config.patch_size,
-        config.temporal_patch_size,
-        config.spatial_merge_size,
-        min_pixels,
-        max_pixels,
-    )
-}
-
-fn load_generation_defaults(model_dir: &Path) -> Result<GenerationDefaults> {
-    let path: PathBuf = model_dir.join("generation_config.json");
-    let config = if path.exists() {
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
-        serde_json::from_str::<GenerationConfig>(&text)
-            .with_context(|| format!("failed to parse {}", path.display()))?
-    } else {
-        GenerationConfig {
-            eos_token_id: None,
-            temperature: None,
-            top_k: None,
-            top_p: None,
-        }
-    };
-    let mut stop_token_ids = match config.eos_token_id {
-        Some(TokenIds::One(token)) => vec![token],
-        Some(TokenIds::Many(tokens)) => tokens,
-        None => vec![248046, 248044],
-    };
-    stop_token_ids.sort_unstable();
-    stop_token_ids.dedup();
-    ensure!(
-        !stop_token_ids.is_empty(),
-        "{} contains an empty eos_token_id list",
-        path.display()
-    );
-
-    Ok(GenerationDefaults {
-        stop_token_ids,
-        temperature: config.temperature.unwrap_or(1.0),
-        top_k: config.top_k.unwrap_or(20),
-        top_p: config.top_p.unwrap_or(0.95),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Instant;
 
     #[test]
@@ -1856,78 +1718,6 @@ mod tests {
         assert!(error.contains("backend rejected limit"), "{error}");
     }
 
-    struct TestDir(PathBuf);
-
-    impl TestDir {
-        fn new(name: &str) -> Self {
-            static NEXT: AtomicU64 = AtomicU64::new(0);
-            let path = std::env::temp_dir().join(format!(
-                "qw-provider-{name}-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            std::fs::create_dir(&path).expect("create test directory");
-            Self(path)
-        }
-    }
-
-    impl Drop for TestDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    #[test]
-    fn generation_defaults_match_checkpoint_contract() {
-        let fixture = TestDir::new("generation-defaults");
-        let fallback = load_generation_defaults(&fixture.0).expect("fallback defaults");
-        assert_eq!(fallback.stop_token_ids, vec![248044, 248046]);
-        assert_eq!(fallback.temperature, 1.0);
-        assert_eq!(fallback.top_k, 20);
-        assert_eq!(fallback.top_p, 0.95);
-
-        std::fs::write(
-            fixture.0.join("generation_config.json"),
-            br#"{"eos_token_id":[9,7],"temperature":0.7,"top_k":11,"top_p":0.8}"#,
-        )
-        .expect("write generation config");
-        let loaded = load_generation_defaults(&fixture.0).expect("checkpoint defaults");
-        assert_eq!(loaded.stop_token_ids, vec![7, 9]);
-        assert_eq!(loaded.temperature, 0.7);
-        assert_eq!(loaded.top_k, 11);
-        assert_eq!(loaded.top_p, 0.8);
-    }
-
-    #[test]
-    fn provider_rejects_absent_chat_template_with_paths() {
-        let fixture = TestDir::new("missing-chat-template");
-        std::fs::write(
-            fixture.0.join("tokenizer.json"),
-            br#"{
-                "version":"1.0",
-                "truncation":null,
-                "padding":null,
-                "added_tokens":[],
-                "normalizer":null,
-                "pre_tokenizer":null,
-                "post_processor":null,
-                "decoder":null,
-                "model":{"type":"WordLevel","vocab":{"[UNK]":0},"unk_token":"[UNK]"}
-            }"#,
-        )
-        .expect("write tokenizer");
-        std::fs::write(fixture.0.join("tokenizer_config.json"), b"{}")
-            .expect("write tokenizer config");
-
-        let error = match Qwen35Provider::load_target_only(&fixture.0, KVCacheMode::Fp16) {
-            Ok(_) => panic!("provider load must reject an absent chat template"),
-            Err(error) => error.to_string(),
-        };
-        assert!(error.contains("missing chat template"), "{error}");
-        assert!(error.contains("chat_template.jinja"), "{error}");
-        assert!(error.contains("tokenizer_config.json"), "{error}");
-    }
-
     #[test]
     fn incremental_decoder_withholds_split_utf8_replacement_text() {
         let mut emitted = String::new();
@@ -1961,9 +1751,8 @@ mod tests {
     #[test]
     #[ignore = "requires the complete pinned Qwen3.8 27B GGUF pair"]
     fn real_model_baseline_and_mtp_greedy_outputs_match() {
-        let model_dir = crate::resolve_model_path(None).expect("resolve selected GGUF cache");
-        let mut provider = Qwen35Provider::load(&model_dir, KVCacheMode::Fp16)
-            .expect("load selected Qwen3.8 GGUF pair");
+        let mut provider =
+            Qwen35Provider::load(KVCacheMode::Fp16).expect("load selected Qwen3.8 GGUF pair");
         let request = GenerationRequest {
             prompt: "Continue counting upward from one, writing each integer on its own line without stopping."
                 .to_string(),
@@ -1996,12 +1785,11 @@ mod tests {
     #[test]
     #[ignore = "requires real target and SpecPrefill draft checkpoints at their configured or default cache paths"]
     fn real_model_dense_specprefill_dense_has_no_position_state_leakage() {
-        let model_dir = crate::resolve_model_path(None).expect("resolve target checkpoint");
-        let draft_dir = crate::resolve_specprefill_draft_path(None)
+        let draft_dir = crate::model_resolver::resolve_specprefill_draft_path(None)
             .expect("resolve SpecPrefill draft checkpoint");
         let mut provider =
-            Qwen35Provider::load_with_specprefill_draft(model_dir, draft_dir, KVCacheMode::Fp16)
-                .expect("load target and SpecPrefill draft");
+            Qwen35Provider::load_with_specprefill_draft(draft_dir, KVCacheMode::Fp16)
+                .expect("load pinned target and SpecPrefill draft");
         let prompt = provider
             .tokenizer
             .encode(
@@ -2059,12 +1847,10 @@ mod tests {
         assert_eq!(dense_before.token_ids, dense_after.token_ids);
     }
     #[test]
-    #[ignore = "requires the real bundled-MTP checkpoint at QW_MODEL_PATH or the default model cache path"]
+    #[ignore = "requires the complete pinned Qwen3.8 27B GGUF pair"]
     fn real_model_mtp_prefix_reuse_matches_cold_and_reduces_ttft() {
-        let model_dir = crate::resolve_model_path(None)
-            .expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
-        let mut provider = Qwen35Provider::load(&model_dir, KVCacheMode::Turbo4)
-            .expect("load real bundled-MTP checkpoint");
+        let mut provider =
+            Qwen35Provider::load(KVCacheMode::Turbo4).expect("load real bundled-MTP checkpoint");
         let base = provider
             .tokenizer
             .encode(
@@ -2214,12 +2000,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the real bundled-MTP checkpoint at QW_MODEL_PATH or the default model cache path"]
+    #[ignore = "requires the complete pinned Qwen3.8 27B GGUF pair"]
     fn real_model_mtp_prefix_reuse_covers_reasoning_and_plain_history() {
-        let model_dir = crate::resolve_model_path(None)
-            .expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
-        let mut provider = Qwen35Provider::load(&model_dir, KVCacheMode::Turbo4)
-            .expect("load real bundled-MTP checkpoint");
+        let mut provider =
+            Qwen35Provider::load(KVCacheMode::Turbo4).expect("load real bundled-MTP checkpoint");
         let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
         let user = |content: &str| ChatMessage {
             role: "user".to_string(),
@@ -2337,12 +2121,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the real bundled-MTP checkpoint at QW_MODEL_PATH or the default model cache path"]
+    #[ignore = "requires the complete pinned Qwen3.8 27B GGUF pair"]
     fn real_model_mtp_max_output_has_bounded_terminal_tail() {
-        let model_dir = crate::resolve_model_path(None)
-            .expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
-        let mut provider = Qwen35Provider::load(&model_dir, KVCacheMode::Turbo4)
-            .expect("load real bundled-MTP checkpoint");
+        let mut provider =
+            Qwen35Provider::load(KVCacheMode::Turbo4).expect("load real bundled-MTP checkpoint");
         let prompt = provider
             .tokenizer
             .encode(
@@ -2395,12 +2177,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the real bundled-MTP checkpoint at QW_MODEL_PATH or the default model cache path"]
+    #[ignore = "requires the complete pinned Qwen3.8 27B GGUF pair"]
     fn real_model_mtp_eos_has_bounded_terminal_tail_and_resumable_snapshot() {
-        let model_dir = crate::resolve_model_path(None)
-            .expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
-        let mut provider = Qwen35Provider::load(&model_dir, KVCacheMode::Turbo4)
-            .expect("load real MTP checkpoint");
+        let mut provider =
+            Qwen35Provider::load(KVCacheMode::Turbo4).expect("load real MTP checkpoint");
         let prompt = provider
             .tokenizer
             .encode(
@@ -2539,12 +2319,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the real bundled-MTP checkpoint at QW_MODEL_PATH or the default model cache path"]
+    #[ignore = "requires the complete pinned Qwen3.8 27B GGUF pair"]
     fn real_model_cancelled_mtp_snapshot_portable_resume_matches_uninterrupted_greedy() {
-        let model_dir = crate::resolve_model_path(None)
-            .expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
-        let mut provider = Qwen35Provider::load(&model_dir, KVCacheMode::Turbo4)
-            .expect("load real bundled-MTP checkpoint");
+        let mut provider =
+            Qwen35Provider::load(KVCacheMode::Turbo4).expect("load real bundled-MTP checkpoint");
         let messages = vec![
             ChatMessage {
                 role: "user".to_string(),

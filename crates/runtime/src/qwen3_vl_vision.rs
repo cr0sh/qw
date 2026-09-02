@@ -27,6 +27,7 @@
 
 use crate::qwen_vision_rope::{VisionRotaryEmbedding, apply_rotary_pos_emb_vision, concat_many};
 use mlxcel_core::layers::{LayerNorm, UnifiedLinear};
+#[cfg(any(feature = "specprefill", test))]
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
@@ -34,67 +35,89 @@ use serde::Deserialize;
 /// Qwen3-VL vision encoder configuration
 #[derive(Debug, Clone, Deserialize)]
 pub struct Qwen3VLVisionConfig {
+    #[cfg(any(feature = "specprefill", test))]
     #[serde(default = "default_depth")]
     pub depth: usize,
+    #[cfg(any(feature = "specprefill", test))]
     pub hidden_size: usize,
+    #[cfg(any(feature = "specprefill", test))]
     #[serde(default = "default_out_hidden_size")]
     pub out_hidden_size: usize,
+    #[cfg(any(feature = "specprefill", test))]
     #[serde(default = "default_num_heads")]
     pub num_heads: usize,
+    #[cfg(any(feature = "specprefill", test))]
     #[serde(default = "default_patch_size")]
     pub patch_size: usize,
     #[serde(default = "default_spatial_merge_size")]
     pub spatial_merge_size: usize,
+    #[cfg(any(feature = "specprefill", test))]
     #[serde(default = "default_temporal_patch_size")]
     pub temporal_patch_size: usize,
+    #[cfg(any(feature = "specprefill", test))]
     #[serde(alias = "in_chans", default = "default_in_channels")]
     pub in_channels: usize,
+    #[cfg(any(feature = "specprefill", test))]
     #[serde(default = "default_num_position_embeddings")]
     pub num_position_embeddings: usize,
+    #[cfg(any(feature = "specprefill", test))]
     #[serde(default)]
     pub deepstack_visual_indexes: Vec<usize>,
+    #[cfg(any(feature = "specprefill", test))]
     #[serde(default)]
     pub quantization_config: Option<crate::qwen3_next::Quantization>,
     /// Quantization group_size (inherited from top-level config)
+    #[cfg(any(feature = "specprefill", test))]
     #[serde(default = "default_quant_group_size")]
     pub quant_group_size: i32,
     /// Quantization bits inherited from vision or top-level configuration.
+    #[cfg(any(feature = "specprefill", test))]
     #[serde(default = "default_quant_bits")]
     pub quant_bits: i32,
 }
 
+#[cfg(any(feature = "specprefill", test))]
 fn default_depth() -> usize {
     32
 }
+#[cfg(any(feature = "specprefill", test))]
 fn default_out_hidden_size() -> usize {
     1536
 }
+#[cfg(any(feature = "specprefill", test))]
 fn default_num_heads() -> usize {
     16
 }
+#[cfg(any(feature = "specprefill", test))]
 fn default_patch_size() -> usize {
     14
 }
 fn default_spatial_merge_size() -> usize {
     2
 }
+#[cfg(any(feature = "specprefill", test))]
 fn default_temporal_patch_size() -> usize {
     2
 }
+#[cfg(any(feature = "specprefill", test))]
 fn default_in_channels() -> usize {
     3
 }
+#[cfg(any(feature = "specprefill", test))]
 fn default_num_position_embeddings() -> usize {
     2304
 }
+#[cfg(any(feature = "specprefill", test))]
 fn default_quant_group_size() -> i32 {
     64
 }
+#[cfg(any(feature = "specprefill", test))]
 fn default_quant_bits() -> i32 {
     4
 }
 
 // Helper: load LayerNorm from weights.
+#[cfg(any(feature = "specprefill", test))]
 fn load_layer_norm(weights: &WeightMap, prefix: &str, eps: f32) -> Result<LayerNorm, String> {
     let weight_key = format!("{}.weight", prefix);
     let bias_key = format!("{}.bias", prefix);
@@ -118,6 +141,7 @@ struct PatchEmbed {
 }
 
 impl PatchEmbed {
+    #[cfg(any(feature = "specprefill", test))]
     fn from_weights(
         weights: &WeightMap,
         config: &Qwen3VLVisionConfig,
@@ -189,6 +213,7 @@ struct PositionEmbedding {
 }
 
 impl PositionEmbedding {
+    #[cfg(any(feature = "specprefill", test))]
     fn from_weights(
         weights: &WeightMap,
         prefix: &str,
@@ -406,6 +431,7 @@ struct VisionAttention {
 }
 
 impl VisionAttention {
+    #[cfg(any(feature = "specprefill", test))]
     fn from_weights(
         weights: &WeightMap,
         config: &Qwen3VLVisionConfig,
@@ -520,6 +546,7 @@ struct VisionMLP {
 }
 
 impl VisionMLP {
+    #[cfg(any(feature = "specprefill", test))]
     fn from_weights(weights: &WeightMap, prefix: &str, gs: i32, bits: i32) -> Result<Self, String> {
         Ok(Self {
             linear_fc1: UnifiedLinear::from_weights(
@@ -553,6 +580,7 @@ struct VisionBlock {
 }
 
 impl VisionBlock {
+    #[cfg(any(feature = "specprefill", test))]
     fn from_weights(
         weights: &WeightMap,
         config: &Qwen3VLVisionConfig,
@@ -597,6 +625,7 @@ struct PatchMerger {
 }
 
 impl PatchMerger {
+    #[cfg(any(feature = "specprefill", test))]
     fn from_weights(
         weights: &WeightMap,
         prefix: &str,
@@ -668,6 +697,7 @@ pub struct Qwen3VLVisionEncoder {
 }
 
 impl Qwen3VLVisionEncoder {
+    #[cfg(any(feature = "specprefill", test))]
     pub fn from_weights(
         weights: &WeightMap,
         config: &Qwen3VLVisionConfig,
