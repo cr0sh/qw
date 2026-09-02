@@ -30,6 +30,9 @@ mod ffi {
         /// Four lazy outputs from the fixed Qwen3.8 GDN ingress fusion.
         type Qwen38GdnIngressOutputs;
 
+        /// Three lazy outputs from the pinned full-attention QKV bundle.
+        type Qwen38GgmlQkvOutputs;
+
         /// Opaque wrapper for one MLX quantize() result triple.
         type MlxQuantizedWeights;
 
@@ -1832,6 +1835,35 @@ mod ffi {
             vocab_size: i32,
         ) -> Result<UniquePtr<MlxArray>>;
 
+        /// One-dispatch M3/M4 QKV projection for pinned full-attention descriptors.
+        #[allow(clippy::too_many_arguments)]
+        fn qwen38_mixed_qkv_bundle(
+            x: &MlxArray,
+            q_w: &MlxArray,
+            q_s: &MlxArray,
+            q_b: &MlxArray,
+            q_bits: i32,
+            k_w: &MlxArray,
+            k_s: &MlxArray,
+            k_b: &MlxArray,
+            k_packed: &MlxArray,
+            k_code: i32,
+            v_w: &MlxArray,
+            v_s: &MlxArray,
+            v_b: &MlxArray,
+            v_packed: &MlxArray,
+            v_code: i32,
+            input_rows: i32,
+        ) -> Result<UniquePtr<Qwen38GgmlQkvOutputs>>;
+        fn qwen38_ggml_qkv_take_query(
+            outputs: Pin<&mut Qwen38GgmlQkvOutputs>,
+        ) -> UniquePtr<MlxArray>;
+        fn qwen38_ggml_qkv_take_key(outputs: Pin<&mut Qwen38GgmlQkvOutputs>)
+        -> UniquePtr<MlxArray>;
+        fn qwen38_ggml_qkv_take_value(
+            outputs: Pin<&mut Qwen38GgmlQkvOutputs>,
+        ) -> UniquePtr<MlxArray>;
+
         /// One-pass affine M2/M3 projection for the exact pinned Qwen3.8 target.
         fn qwen38_affine_m23_matmul(
             x: &MlxArray,
@@ -3353,7 +3385,8 @@ pub use ggml::{
 pub use ggml_affine::{
     GgmlAffineEmbedding, GgmlAffineError, GgmlAffineMatrix, GgmlAffineRows,
     GgmlAffineTranscodeStats, Qwen38AffineGdnIngressFusion, Qwen38AffineMlpFusion,
-    Qwen38FusionStats, Qwen38GdnIngressOutput,
+    Qwen38FusionStats, Qwen38GdnIngressOutput, Qwen38MixedQkvBundle, Qwen38MixedQkvOutput,
+    Qwen38QkvMatrix,
 };
 pub use qwen38_q6::{Qwen38Q6DualMatrix, Qwen38Q6Error, Qwen38Q6Shape, Qwen38Q6TranscodeStats};
 

@@ -2286,6 +2286,35 @@ std::unique_ptr<MlxArray> ggml_packed_embedding(
     int32_t embedding_dim,
     int32_t vocab_size);
 
+struct Qwen38GgmlQkvOutputs {
+    std::unique_ptr<MlxArray> query;
+    std::unique_ptr<MlxArray> key;
+    std::unique_ptr<MlxArray> value;
+};
+std::unique_ptr<Qwen38GgmlQkvOutputs> qwen38_mixed_qkv_bundle(
+    const MlxArray& x,
+    const MlxArray& q_w,
+    const MlxArray& q_s,
+    const MlxArray& q_b,
+    int32_t q_bits,
+    const MlxArray& k_w,
+    const MlxArray& k_s,
+    const MlxArray& k_b,
+    const MlxArray& k_packed,
+    int32_t k_code,
+    const MlxArray& v_w,
+    const MlxArray& v_s,
+    const MlxArray& v_b,
+    const MlxArray& v_packed,
+    int32_t v_code,
+    int32_t input_rows);
+std::unique_ptr<MlxArray> qwen38_ggml_qkv_take_query(
+    Qwen38GgmlQkvOutputs& outputs);
+std::unique_ptr<MlxArray> qwen38_ggml_qkv_take_key(
+    Qwen38GgmlQkvOutputs& outputs);
+std::unique_ptr<MlxArray> qwen38_ggml_qkv_take_value(
+    Qwen38GgmlQkvOutputs& outputs);
+
 // One-pass affine M2/M3 projection for the exact pinned Qwen3.8 target.
 std::unique_ptr<MlxArray> qwen38_affine_m23_matmul(
     const MlxArray& x,

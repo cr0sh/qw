@@ -157,6 +157,10 @@ impl Qwen38Q6DualMatrix {
         self.stats
     }
 
+    pub(crate) const fn packed_ref(&self) -> &GgmlQuantizedMatrix {
+        &self.packed
+    }
+
     pub fn forward(&self, input: &MlxArray) -> Result<UniquePtr<MlxArray>, Qwen38Q6Error> {
         let input_rows = validate_input(input, self.shape)?;
         if input_rows < 5 {
