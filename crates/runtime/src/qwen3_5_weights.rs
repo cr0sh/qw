@@ -730,6 +730,11 @@ fn pinned_slot(slot: TensorSlot) -> std::result::Result<PinnedSlot, String> {
         TensorSlot::MtpProjection => Ok(PinnedSlot::Mtp(13)),
         TensorSlot::MtpHeadNorm => Ok(PinnedSlot::Mtp(16)),
         TensorSlot::Layer {
+            role: ModelRole::Mtp,
+            layer: 0,
+            tensor: LayerTensor::PostAttentionNorm,
+        } => Ok(PinnedSlot::Mtp(17)),
+        TensorSlot::Layer {
             role,
             layer,
             tensor,
@@ -822,6 +827,14 @@ mod tests {
                 tensor: LayerTensor::MlpDown,
             }),
             Ok(PinnedSlot::Mtp(10))
+        );
+        assert_eq!(
+            pinned_slot(TensorSlot::Layer {
+                role: ModelRole::Mtp,
+                layer: 0,
+                tensor: LayerTensor::PostAttentionNorm,
+            }),
+            Ok(PinnedSlot::Mtp(17))
         );
         assert_eq!(
             pinned_slot(TensorSlot::MtpProjection),
