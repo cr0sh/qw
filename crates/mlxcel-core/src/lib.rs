@@ -1826,6 +1826,19 @@ mod ffi {
             vocab_size: i32,
         ) -> Result<UniquePtr<MlxArray>>;
 
+        /// One-pass affine M2/M3 projection for the exact pinned Qwen3.8 target.
+        fn qwen38_affine_m23_matmul(
+            x: &MlxArray,
+            weight: &MlxArray,
+            scales: &MlxArray,
+            biases: &MlxArray,
+            bits: i32,
+            in_features: i32,
+            out_features: i32,
+            input_rows: i32,
+            require_pinned_shape: bool,
+        ) -> Result<UniquePtr<MlxArray>>;
+
         /// Start a Metal GPU trace capture. `path` must be an absolute
         /// path ending in `.gputrace` and must not already exist. The
         /// process must have been launched with `MTL_CAPTURE_ENABLED=1`;

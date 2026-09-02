@@ -2284,6 +2284,18 @@ std::unique_ptr<MlxArray> ggml_packed_embedding(
     int32_t embedding_dim,
     int32_t vocab_size);
 
+// One-pass affine M2/M3 projection for the exact pinned Qwen3.8 target.
+std::unique_ptr<MlxArray> qwen38_affine_m23_matmul(
+    const MlxArray& x,
+    const MlxArray& weight,
+    const MlxArray& scales,
+    const MlxArray& biases,
+    int32_t bits,
+    int32_t in_features,
+    int32_t out_features,
+    int32_t input_rows,
+    bool require_pinned_shape);
+
 // Opaque holder for weights loaded via MLX's native load_safetensors().
 // Arrays are lazy — MLX manages the mmap internally, no eager copy needed.
 struct MlxLoadedWeights {

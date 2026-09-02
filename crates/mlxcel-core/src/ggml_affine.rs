@@ -42,6 +42,8 @@ pub enum GgmlAffineError {
     InvalidRowSelection,
     #[error("GGML affine input shape or dtype is invalid")]
     InvalidInput,
+    #[error("pinned Qwen3.8 affine M2/M3 Metal launch failed: {0}")]
+    Backend(String),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -281,6 +283,37 @@ impl GgmlAffineMatrix {
         Ok(affine_matmul(input, &self.planes, self.bits))
     }
 
+    /// Runs the exact pinned Qwen3.8 target shapes through one affine weight
+    /// pass for M2/M3. Every other shape, dtype, or row count keeps the
+    /// ordinary affine dispatcher.
+    pub fn forward_qwen38_m23(
+        &self,
+        input: &MlxArray,
+    ) -> Result<UniquePtr<MlxArray>, GgmlAffineError> {
+        validate_input(input, self.in_features)?;
+        let input_rows = affine_input_rows(input)?;
+        if !(2..=3).contains(&input_rows)
+            || crate::array_dtype(input) != dtype::FLOAT32
+            || !qwen38_m23_shape(self.in_features, self.out_features)
+        {
+            return Ok(affine_matmul(input, &self.planes, self.bits));
+        }
+        qwen38_affine_m23_matmul(input, self, input_rows, true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn forward_m23_test_only(
+        &self,
+        input: &MlxArray,
+    ) -> Result<UniquePtr<MlxArray>, GgmlAffineError> {
+        validate_input(input, self.in_features)?;
+        let input_rows = affine_input_rows(input)?;
+        if !(2..=3).contains(&input_rows) || crate::array_dtype(input) != dtype::FLOAT32 {
+            return Ok(affine_matmul(input, &self.planes, self.bits));
+        }
+        qwen38_affine_m23_matmul(input, self, input_rows, false)
+    }
+
     pub fn select_rows(&self, ranges: &[Range<usize>]) -> Result<GgmlAffineRows, GgmlAffineError> {
         if ranges.is_empty() || ranges.len() > 3 {
             return Err(GgmlAffineError::InvalidRowSelection);
@@ -311,6 +344,39 @@ impl GgmlAffineMatrix {
             self.in_features(),
             self.out_features(),
             self.resident_row_bytes,
+        )
+    }
+
+    pub fn qwen38_m23_dispatch_stats(
+        &self,
+        input_rows: usize,
+    ) -> Result<GgmlDispatchStats, GgmlAffineError> {
+        if (2..=3).contains(&input_rows) && qwen38_m23_shape(self.in_features, self.out_features) {
+            affine_dispatch_stats_with(
+                input_rows,
+                self.in_features(),
+                self.out_features(),
+                self.resident_row_bytes,
+                1,
+                GgmlKernelPath::Qwen38AffineM23,
+            )
+        } else {
+            self.dispatch_stats(input_rows)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn m23_dispatch_stats_test_only(
+        &self,
+        input_rows: usize,
+    ) -> Result<GgmlDispatchStats, GgmlAffineError> {
+        affine_dispatch_stats_with(
+            input_rows,
+            self.in_features(),
+            self.out_features(),
+            self.resident_row_bytes,
+            1,
+            GgmlKernelPath::Qwen38AffineM23,
         )
     }
 }
@@ -687,6 +753,53 @@ fn pack_codes(codes: &[u8], bits: usize, output: &mut Vec<u8>) {
     }
 }
 
+fn affine_input_rows(input: &MlxArray) -> Result<i32, GgmlAffineError> {
+    crate::array_shape(input)[..crate::array_ndim(input) - 1]
+        .iter()
+        .try_fold(1i32, |rows, dimension| {
+            rows.checked_mul(*dimension)
+                .ok_or(GgmlAffineError::Overflow)
+        })
+}
+
+fn qwen38_m23_shape(in_features: i32, out_features: i32) -> bool {
+    matches!(
+        (in_features, out_features),
+        (5120, 17408) | (17408, 5120) | (5120, 10240) | (5120, 6144) | (6144, 5120) | (5120, 12288)
+    )
+}
+
+fn qwen38_affine_m23_matmul(
+    input: &MlxArray,
+    matrix: &GgmlAffineMatrix,
+    input_rows: i32,
+    require_pinned_shape: bool,
+) -> Result<UniquePtr<MlxArray>, GgmlAffineError> {
+    crate::ffi::qwen38_affine_m23_matmul(
+        input,
+        matrix
+            .planes
+            .weight
+            .as_ref()
+            .ok_or(GgmlAffineError::InvalidPlane)?,
+        matrix
+            .planes
+            .scales
+            .as_ref()
+            .ok_or(GgmlAffineError::InvalidPlane)?,
+        matrix
+            .planes
+            .biases
+            .as_ref()
+            .ok_or(GgmlAffineError::InvalidPlane)?,
+        matrix.bits,
+        matrix.in_features,
+        matrix.out_features,
+        input_rows,
+        require_pinned_shape,
+    )
+    .map_err(|error| GgmlAffineError::Backend(error.to_string()))
+}
 fn affine_matmul(input: &MlxArray, planes: &AffinePlanes, bits: i32) -> UniquePtr<MlxArray> {
     let shape = crate::array_shape(input);
     let input_rows = shape[..shape.len() - 1]
@@ -762,23 +875,42 @@ fn affine_dispatch_stats(
     output_rows: usize,
     resident_row_bytes: usize,
 ) -> Result<GgmlDispatchStats, GgmlAffineError> {
-    if input_rows == 0 || output_rows == 0 {
-        return Err(GgmlAffineError::InvalidInput);
-    }
     let qmv_passes = if (2..=3).contains(&input_rows) {
         input_rows
     } else {
         1
     };
+    let path = if input_rows < 4 {
+        GgmlKernelPath::AffineQmv
+    } else {
+        GgmlKernelPath::AffineQmm
+    };
+    affine_dispatch_stats_with(
+        input_rows,
+        in_features,
+        output_rows,
+        resident_row_bytes,
+        qmv_passes,
+        path,
+    )
+}
+
+fn affine_dispatch_stats_with(
+    input_rows: usize,
+    in_features: usize,
+    output_rows: usize,
+    resident_row_bytes: usize,
+    weight_passes: usize,
+    path: GgmlKernelPath,
+) -> Result<GgmlDispatchStats, GgmlAffineError> {
+    if input_rows == 0 || output_rows == 0 {
+        return Err(GgmlAffineError::InvalidInput);
+    }
     Ok(GgmlDispatchStats {
-        path: if input_rows < 4 {
-            GgmlKernelPath::AffineQmv
-        } else {
-            GgmlKernelPath::AffineQmm
-        },
+        path,
         packed_bytes_read: resident_row_bytes
             .checked_mul(output_rows)
-            .and_then(|bytes| bytes.checked_mul(qmv_passes))
+            .and_then(|bytes| bytes.checked_mul(weight_passes))
             .ok_or(GgmlAffineError::Overflow)?,
         activation_bytes_read: input_rows
             .checked_mul(in_features)
