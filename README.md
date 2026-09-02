@@ -24,7 +24,7 @@ QW aims to be explicitly "focused", to achieve these goals below:
     enabled by default.
   - Fixed model: Qwen3.8 27B (dense model) only. No generalization across
     different model structures.
-    - QW serves [Jundot/Qwen3.8-27B-oQ4e-fp16-mtp](https://huggingface.co/Jundot/Qwen3.8-27B-oQ4e-fp16-mtp) as the default model.
+    - QW serves [unsloth/Qwen3.8-27B-GGUF](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF) at revision `4ca720788d1e01f1bff70c033e0d0028fd02e502`, using `Qwen3.8-27B-UD-Q4_K_XL.gguf` with the matching `MTP/mtp-Qwen3.8-27B-Q4_0.gguf` head.
     - If a better model with similar requirements is released, this project
       may migrate to the new model, but it will never support more than one
       model at a time.
@@ -49,11 +49,16 @@ Or, compile from the source. Prerequisites:
 cargo install --locked --git https://github.com/cr0sh/qw [--tag TAG] qw-cli
 ```
 
-Download the model from Hugging Face(model ID unset means the default preferred model `Jundot/Qwen3.8-27B-oQ4e-fp16-mtp`):
+Download and verify the fixed target and MTP GGUF artifacts:
 
 ```bash
 qw download
 ```
+
+The files are stored under
+`~/.cache/qw/models/unsloth/Qwen3.8-27B-GGUF/`, preserving the `MTP/`
+subdirectory. Downloads resume into `.qw-part` files and are accepted only
+after the pinned byte length and SHA-256 digest match.
 
 
 Run the server:
@@ -96,8 +101,7 @@ default. See `crates/runtime/Cargo.toml`.
 Any configuration other than the default is considered experimental and out
 of scope for testing by the maintainer. The default is:
 
-- Model checkpoint (`Jundot/Qwen3.8-27B-oQ4e-fp16-mtp` on HuggingFace) and its
-  quantization method
+- Model checkpoint (`unsloth/Qwen3.8-27B-GGUF` at revision `4ca720788d1e01f1bff70c033e0d0028fd02e502`) with the fixed UD-Q4_K_XL target and matching MTP head
 - MTP with depth $k=3$
 - KV cache is 4-bit quantized with TurboQuant
 - The above configuration is tested on an M4 Max 40-core GPU with 64 GB of
