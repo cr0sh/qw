@@ -93,7 +93,9 @@ pub enum GgmlQuantError {
     UnsupportedQType(u32),
     #[error("packed GGML dimensions must be positive")]
     EmptyShape,
-    #[error("packed GGML input width {width} is not aligned to qtype {qtype:?} block size {block_elements}")]
+    #[error(
+        "packed GGML input width {width} is not aligned to qtype {qtype:?} block size {block_elements}"
+    )]
     UnalignedWidth {
         qtype: GgmlQType,
         width: usize,
@@ -201,14 +203,9 @@ impl GgmlQuantizedMatrix {
         } else {
             &[0; 8]
         };
-        let packed = crate::from_bytes(
-            bytes,
-            &[out_features_i32, row_bytes_i32],
-            dtype::UINT8,
-        );
+        let packed = crate::from_bytes(bytes, &[out_features_i32, row_bytes_i32], dtype::UINT8);
         let iq3_grid = crate::from_slice_u32(table_values, &[table_values.len() as i32]);
-        let (row_ranges, selected_rows) =
-            make_row_ranges(&[0..out_features], out_features)?;
+        let (row_ranges, selected_rows) = make_row_ranges(&[0..out_features], out_features)?;
         debug_assert_eq!(selected_rows, out_features_i32);
         validate_device_buffers(
             &packed,
@@ -231,7 +228,6 @@ impl GgmlQuantizedMatrix {
             row_bytes,
         })
     }
-
 
     pub const fn in_features(&self) -> usize {
         self.in_features as usize
@@ -293,8 +289,7 @@ impl GgmlQuantizedMatrix {
         &self,
         ranges: &[std::ops::Range<usize>],
     ) -> Result<GgmlQuantizedRows, GgmlQuantError> {
-        let (row_ranges, selected_rows) =
-            make_row_ranges(ranges, self.out_features())?;
+        let (row_ranges, selected_rows) = make_row_ranges(ranges, self.out_features())?;
         Ok(GgmlQuantizedRows {
             packed: crate::copy(
                 self.packed
@@ -315,10 +310,7 @@ impl GgmlQuantizedMatrix {
         })
     }
 
-    pub fn dispatch_stats(
-        &self,
-        input_rows: usize,
-    ) -> Result<GgmlDispatchStats, GgmlQuantError> {
+    pub fn dispatch_stats(&self, input_rows: usize) -> Result<GgmlDispatchStats, GgmlQuantError> {
         packed_dispatch_stats(
             input_rows,
             self.in_features(),
@@ -341,7 +333,6 @@ pub struct GgmlQuantizedRows {
 }
 
 impl GgmlQuantizedRows {
-
     pub const fn in_features(&self) -> usize {
         self.in_features as usize
     }
@@ -365,10 +356,7 @@ impl GgmlQuantizedRows {
         )
     }
 
-    pub fn dispatch_stats(
-        &self,
-        input_rows: usize,
-    ) -> Result<GgmlDispatchStats, GgmlQuantError> {
+    pub fn dispatch_stats(&self, input_rows: usize) -> Result<GgmlDispatchStats, GgmlQuantError> {
         packed_dispatch_stats(
             input_rows,
             self.in_features(),
@@ -391,15 +379,9 @@ impl GgmlQuantizedEmbedding {
         vocab_size: usize,
     ) -> Result<Self, GgmlQuantError> {
         Ok(Self {
-            matrix: GgmlQuantizedMatrix::from_bytes(
-                bytes,
-                qtype,
-                embedding_dim,
-                vocab_size,
-            )?,
+            matrix: GgmlQuantizedMatrix::from_bytes(bytes, qtype, embedding_dim, vocab_size)?,
         })
     }
-
 
     pub const fn embedding_dim(&self) -> usize {
         self.matrix.in_features()
@@ -446,8 +428,10 @@ impl GgmlQuantizedEmbedding {
         self.matrix.forward(input)
     }
 
-
-    pub fn dispatch_stats(&self, selected_rows: usize) -> Result<GgmlDispatchStats, GgmlQuantError> {
+    pub fn dispatch_stats(
+        &self,
+        selected_rows: usize,
+    ) -> Result<GgmlDispatchStats, GgmlQuantError> {
         if selected_rows == 0 {
             return Err(GgmlQuantError::EmptyIndices);
         }
@@ -502,7 +486,10 @@ fn launch_matmul(
     }
     let input_rows = i32::try_from(input_rows).map_err(|_| GgmlQuantError::Overflow)?;
     let input_dtype = crate::array_dtype(input);
-    if !matches!(input_dtype, dtype::FLOAT16 | dtype::FLOAT32 | dtype::BFLOAT16) {
+    if !matches!(
+        input_dtype,
+        dtype::FLOAT16 | dtype::FLOAT32 | dtype::BFLOAT16
+    ) {
         return Err(GgmlQuantError::InputDType(input_dtype));
     }
     crate::ggml_packed_matmul(
@@ -569,12 +556,7 @@ fn packed_dispatch_stats(
     let (path, m_tiles, n_tiles, threadgroup_bytes) = if input_rows == 1 {
         (GgmlKernelPath::DecodeM1, 1usize, selected_rows, 0usize)
     } else if input_rows <= 4 {
-        (
-            GgmlKernelPath::VerifyM2To4,
-            1usize,
-            selected_rows,
-            0usize,
-        )
+        (GgmlKernelPath::VerifyM2To4, 1usize, selected_rows, 0usize)
     } else if input_rows <= 512 {
         (
             GgmlKernelPath::TiledQmm16x8,

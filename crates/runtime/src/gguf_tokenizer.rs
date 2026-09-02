@@ -2,7 +2,7 @@ use anyhow::{Context, Result, ensure};
 use serde_json::{Map, Value, json};
 use tokenizers::Tokenizer;
 
-use crate::gguf::{GgufShardSet, MetadataValue};
+use crate::gguf::{GgufFile, MetadataValue};
 
 const QWEN35_SPLIT_REGEX: &str = "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+";
 
@@ -17,7 +17,7 @@ pub(crate) struct GgufTextAssets {
 }
 
 impl GgufTextAssets {
-    pub(crate) fn load(target: &GgufShardSet) -> Result<Self> {
+    pub(crate) fn load(target: &GgufFile) -> Result<Self> {
         let metadata = target.metadata();
         let value = |key: &str| {
             metadata
@@ -209,9 +209,7 @@ mod tests {
     #[test]
     #[ignore = "requires the complete pinned Qwen3.8 27B GGUF pair"]
     fn real_selected_metadata_builds_qwen35_tokenizer_and_chat_assets() {
-        let root = crate::resolve_model_path(None).expect("resolve selected GGUF cache");
-        let pair =
-            crate::gguf::GgufModelPair::open_selected(&root).expect("open selected GGUF pair");
+        let pair = crate::gguf::PinnedGgufPair::open().expect("open pinned GGUF pair");
         let assets = GgufTextAssets::load(&pair.target).expect("load GGUF text assets");
         let encoded = assets
             .tokenizer

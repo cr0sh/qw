@@ -4,6 +4,8 @@ pub(crate) mod gguf;
 mod gguf_tokenizer;
 mod model_owned;
 mod model_resolver;
+mod pinned_model;
+mod qwen38_plan;
 mod qwen3_5;
 #[cfg(any(feature = "dflash2", test))]
 mod qwen3_5_dflash;
@@ -25,18 +27,11 @@ mod specprefill;
 mod portable_snapshot;
 pub mod provider;
 
-pub use gguf::{
-    SELECTED_GGUF_REVISION as DEFAULT_MODEL_REVISION, SELECTED_MTP_DIRECTORY, SELECTED_MTP_FILE,
-    SELECTED_TARGET_FILE,
-};
 pub use mlxcel_core::cache::KVCacheMode;
-pub use model_resolver::{
-    DEFAULT_MODEL_IDENTIFIER, model_cache_path, resolve_model_dir, resolve_model_path,
-    validate_identifier,
-};
-#[cfg(any(feature = "specprefill", test))]
-pub use model_resolver::{
-    DEFAULT_SPECPREFILL_DRAFT_MODEL_IDENTIFIER, resolve_specprefill_draft_path,
+pub use pinned_model::{
+    PINNED_ARTIFACTS, PINNED_MTP, PINNED_REPOSITORY, PINNED_REVISION, PINNED_TARGET,
+    PinnedArtifact, PinnedArtifactRole, io_verify_artifact_file, pinned_model_dir,
+    resolve_pinned_model_dir, verify_artifact_file, verify_mtp_file, verify_target_file,
 };
 pub use portable_snapshot::{
     PortableArray, PortableModelState, PortablePage, PortablePagedTensor, PortablePromptSnapshot,
