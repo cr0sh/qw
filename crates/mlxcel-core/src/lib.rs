@@ -27,6 +27,9 @@ mod ffi {
         /// Opaque wrapper for mlx::core::array
         type MlxArray;
 
+        /// Four lazy outputs from the fixed Qwen3.8 GDN ingress fusion.
+        type Qwen38GdnIngressOutputs;
+
         /// Opaque wrapper for one MLX quantize() result triple.
         type MlxQuantizedWeights;
 
@@ -146,6 +149,8 @@ mod ffi {
 
         /// Get the dtype of an array (as integer code)
         fn array_dtype(arr: &MlxArray) -> i32;
+        /// Whether the last dimension has unit stride and rows are contiguous
+        fn array_is_row_contiguous(arr: &MlxArray) -> bool;
 
         /// Get the number of elements in an array
         fn array_size(arr: &MlxArray) -> usize;
@@ -1839,6 +1844,51 @@ mod ffi {
             require_pinned_shape: bool,
         ) -> Result<UniquePtr<MlxArray>>;
 
+        /// M>=4 all-affine MLP for the exact pinned Qwen3.8 artifact.
+        #[allow(clippy::too_many_arguments)]
+        fn qwen38_affine_mlp_fused(
+            x: &MlxArray,
+            gate_w: &MlxArray,
+            gate_s: &MlxArray,
+            gate_b: &MlxArray,
+            gate_bits: i32,
+            up_w: &MlxArray,
+            up_s: &MlxArray,
+            up_b: &MlxArray,
+            up_bits: i32,
+            down_w: &MlxArray,
+            down_s: &MlxArray,
+            down_b: &MlxArray,
+            down_bits: i32,
+        ) -> Result<UniquePtr<MlxArray>>;
+
+        /// M>=4 all-affine GDN ingress for the exact pinned Qwen3.8 artifact.
+        #[allow(clippy::too_many_arguments)]
+        fn qwen38_affine_gdn_ingress_fused(
+            x: &MlxArray,
+            qkv_w: &MlxArray,
+            qkv_s: &MlxArray,
+            qkv_b: &MlxArray,
+            qkv_bits: i32,
+            z_w: &MlxArray,
+            z_s: &MlxArray,
+            z_b: &MlxArray,
+            z_bits: i32,
+            beta_w: &MlxArray,
+            beta_s: &MlxArray,
+            beta_b: &MlxArray,
+            beta_bits: i32,
+            alpha_w: &MlxArray,
+            alpha_s: &MlxArray,
+            alpha_b: &MlxArray,
+            alpha_bits: i32,
+        ) -> Result<UniquePtr<Qwen38GdnIngressOutputs>>;
+        fn qwen38_gdn_take_qkv(outputs: Pin<&mut Qwen38GdnIngressOutputs>) -> UniquePtr<MlxArray>;
+        fn qwen38_gdn_take_z(outputs: Pin<&mut Qwen38GdnIngressOutputs>) -> UniquePtr<MlxArray>;
+        fn qwen38_gdn_take_beta(outputs: Pin<&mut Qwen38GdnIngressOutputs>) -> UniquePtr<MlxArray>;
+        fn qwen38_gdn_take_alpha(outputs: Pin<&mut Qwen38GdnIngressOutputs>)
+        -> UniquePtr<MlxArray>;
+
         /// Start a Metal GPU trace capture. `path` must be an absolute
         /// path ending in `.gputrace` and must not already exist. The
         /// process must have been launched with `MTL_CAPTURE_ENABLED=1`;
@@ -3301,7 +3351,8 @@ pub use ggml::{
 };
 pub use ggml_affine::{
     GgmlAffineEmbedding, GgmlAffineError, GgmlAffineMatrix, GgmlAffineRows,
-    GgmlAffineTranscodeStats,
+    GgmlAffineTranscodeStats, Qwen38AffineGdnIngressFusion, Qwen38AffineMlpFusion,
+    Qwen38FusionStats, Qwen38GdnIngressOutput,
 };
 pub use qwen38_q6::{Qwen38Q6DualMatrix, Qwen38Q6Error, Qwen38Q6Shape, Qwen38Q6TranscodeStats};
 

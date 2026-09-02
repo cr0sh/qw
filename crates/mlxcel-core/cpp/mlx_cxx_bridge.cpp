@@ -309,6 +309,9 @@ rust::Vec<int32_t> array_shape(const MlxArray& arr) {
 int32_t array_dtype(const MlxArray& arr) {
     return from_dtype(arr.inner.dtype());
 }
+bool array_is_row_contiguous(const MlxArray& arr) {
+    return arr.inner.flags().row_contiguous;
+}
 
 size_t array_size(const MlxArray& arr) {
     return arr.inner.size();
