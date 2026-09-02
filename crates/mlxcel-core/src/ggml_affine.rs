@@ -301,6 +301,24 @@ impl GgmlAffineMatrix {
         qwen38_affine_m23_matmul(input, self, input_rows, true)
     }
 
+    /// Runs the exact pinned Qwen3.8 MTP shapes through one affine weight pass
+    /// only for M2. Every other shape, dtype, or row count keeps the ordinary
+    /// affine dispatcher.
+    pub fn forward_qwen38_m2(
+        &self,
+        input: &MlxArray,
+    ) -> Result<UniquePtr<MlxArray>, GgmlAffineError> {
+        validate_input(input, self.in_features)?;
+        let input_rows = affine_input_rows(input)?;
+        if input_rows != 2
+            || crate::array_dtype(input) != dtype::FLOAT32
+            || !qwen38_m2_shape(self.in_features, self.out_features)
+        {
+            return Ok(affine_matmul(input, &self.planes, self.bits));
+        }
+        qwen38_affine_m23_matmul(input, self, input_rows, true)
+    }
+
     #[cfg(test)]
     pub(crate) fn forward_m23_test_only(
         &self,
@@ -365,6 +383,24 @@ impl GgmlAffineMatrix {
         }
     }
 
+    pub fn qwen38_m2_dispatch_stats(
+        &self,
+        input_rows: usize,
+    ) -> Result<GgmlDispatchStats, GgmlAffineError> {
+        if input_rows == 2 && qwen38_m2_shape(self.in_features, self.out_features) {
+            affine_dispatch_stats_with(
+                input_rows,
+                self.in_features(),
+                self.out_features(),
+                self.resident_row_bytes,
+                1,
+                GgmlKernelPath::Qwen38AffineM23,
+            )
+        } else {
+            self.dispatch_stats(input_rows)
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn m23_dispatch_stats_test_only(
         &self,
@@ -397,6 +433,7 @@ pub struct Qwen38AffineMlpFusion {
     gate_m23: bool,
     up_m23: bool,
     down_m23: bool,
+    m2_only: bool,
 }
 
 impl Qwen38AffineMlpFusion {
@@ -405,6 +442,24 @@ impl Qwen38AffineMlpFusion {
         up: GgmlAffineMatrix,
         down: GgmlAffineMatrix,
         m23: [bool; 3],
+    ) -> Result<Self, GgmlAffineError> {
+        Self::with_small_row_paths(gate, up, down, m23, false)
+    }
+
+    pub fn new_m2(
+        gate: GgmlAffineMatrix,
+        up: GgmlAffineMatrix,
+        down: GgmlAffineMatrix,
+    ) -> Result<Self, GgmlAffineError> {
+        Self::with_small_row_paths(gate, up, down, [false; 3], true)
+    }
+
+    fn with_small_row_paths(
+        gate: GgmlAffineMatrix,
+        up: GgmlAffineMatrix,
+        down: GgmlAffineMatrix,
+        m23: [bool; 3],
+        m2_only: bool,
     ) -> Result<Self, GgmlAffineError> {
         if (gate.in_features(), gate.out_features()) != (5120, 17_408)
             || (up.in_features(), up.out_features()) != (5120, 17_408)
@@ -419,6 +474,7 @@ impl Qwen38AffineMlpFusion {
             gate_m23: m23[0],
             up_m23: m23[1],
             down_m23: m23[2],
+            m2_only,
         })
     }
 
@@ -431,7 +487,9 @@ impl Qwen38AffineMlpFusion {
             || !crate::ffi::array_is_row_contiguous(input)
         {
             let forward = |matrix: &GgmlAffineMatrix, input: &MlxArray, m23| {
-                if matches!(rows, 2 | 3) && m23 {
+                if rows == 2 && self.m2_only {
+                    matrix.forward_qwen38_m2(input)
+                } else if matches!(rows, 2 | 3) && m23 {
                     matrix.forward_qwen38_m23(input)
                 } else {
                     matrix.forward(input)
@@ -1134,6 +1192,10 @@ fn qwen38_m23_shape(in_features: i32, out_features: i32) -> bool {
         (in_features, out_features),
         (5120, 17408) | (17408, 5120) | (5120, 10240) | (5120, 6144) | (6144, 5120) | (5120, 12288)
     )
+}
+
+fn qwen38_m2_shape(in_features: i32, out_features: i32) -> bool {
+    qwen38_m23_shape(in_features, out_features) || (in_features, out_features) == (10_240, 5120)
 }
 
 fn qwen38_split_k(input_rows: usize, in_features: usize, out_features: usize) -> usize {

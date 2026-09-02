@@ -208,7 +208,8 @@ bool qwen38_affine_shape(int32_t in_features, int32_t out_features) {
         || (in_features == 5120 && out_features == 10240)
         || (in_features == 5120 && out_features == 6144)
         || (in_features == 6144 && out_features == 5120)
-        || (in_features == 5120 && out_features == 12288);
+        || (in_features == 5120 && out_features == 12288)
+        || (in_features == 10240 && out_features == 5120);
 }
 
 void validate_affine_planes(
