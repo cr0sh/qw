@@ -1924,6 +1924,14 @@ impl Qwen35Model {
             elapsed_seconds = affine.elapsed.as_secs_f64(),
             "transcoded exact GGML affine planes"
         );
+        tracing::info!(
+            tensors = affine.q6_tensors,
+            source_bytes = affine.q6_source_bytes,
+            dense_bytes = affine.q6_dense_bytes,
+            peak_active_tensor_bytes = affine.q6_peak_active_bytes,
+            elapsed_seconds = affine.q6_elapsed.as_secs_f64(),
+            "transcoded pinned non-head Q6_K F16 planes"
+        );
         #[cfg(test)]
         eprintln!(
             "GGUF affine transcode tensors={} source={} resident={} peak_active_tensor={} elapsed={:?}",
@@ -1932,6 +1940,15 @@ impl Qwen35Model {
             affine.resident_bytes,
             affine.peak_active_bytes,
             affine.elapsed,
+        );
+        #[cfg(test)]
+        eprintln!(
+            "Q6 dual transcode tensors={} source={} dense={} peak_active_tensor={} elapsed={:?}",
+            affine.q6_tensors,
+            affine.q6_source_bytes,
+            affine.q6_dense_bytes,
+            affine.q6_peak_active_bytes,
+            affine.q6_elapsed,
         );
         Ok((model, assets))
     }

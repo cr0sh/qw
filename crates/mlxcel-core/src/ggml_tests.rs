@@ -213,10 +213,9 @@ fn fixed_qtype_table_matches_parsed_target_contract() {
 
 #[test]
 fn load_boundary_rejects_invalid_qtypes_shapes_lengths_and_overflow() {
-    assert!(matches!(GgmlQuantizedMatrix::from_bytes(&[], 2, 256, 1), Err(GgmlQuantError::UnsupportedQType(2))));
-    assert!(matches!(GgmlQuantizedMatrix::from_bytes(&[], 11, 255, 1), Err(GgmlQuantError::UnalignedWidth { .. })));
-    assert!(matches!(GgmlQuantizedMatrix::from_bytes(&[0; 109], 11, 256, 1), Err(GgmlQuantError::ByteLength { expected: 110, actual: 109 })));
-    assert!(matches!(GgmlQuantizedMatrix::from_bytes(&[], 0, usize::MAX, 2), Err(GgmlQuantError::Overflow)));
+    assert!(matches!(GgmlQuantizedMatrix::from_bytes(&[], GgmlQType::Q3K, 255, 1), Err(GgmlQuantError::UnalignedWidth { .. })));
+    assert!(matches!(GgmlQuantizedMatrix::from_bytes(&[0; 109], GgmlQType::Q3K, 256, 1), Err(GgmlQuantError::ByteLength { expected: 110, actual: 109 })));
+    assert!(matches!(GgmlQuantizedMatrix::from_bytes(&[], GgmlQType::F32, usize::MAX, 2), Err(GgmlQuantError::Overflow)));
 }
 
 #[test]
@@ -251,13 +250,12 @@ fn reference_layouts_pin_nibbles_high_bits_signs_and_table_indices() {
 #[test]
 fn dispatch_stats_record_zero_workspace_and_shape_selected_traffic() {
     let qtype = GgmlQType::Q4K; let width = 512; let rows = 3; let packed = fixture_matrix(qtype, width, rows);
-    let matrix = GgmlQuantizedMatrix::from_bytes(&packed, qtype.id(), width, rows).unwrap();
+    let matrix = GgmlQuantizedMatrix::from_bytes(&packed, qtype, width, rows).unwrap();
     let decode = matrix.dispatch_stats(1).unwrap(); assert_eq!(decode.path, GgmlKernelPath::DecodeM1); assert_eq!(decode.packed_bytes_read, packed.len()); assert_eq!(decode.workspace_bytes, 0);
     let prefill = matrix.dispatch_stats(33).unwrap(); assert_eq!(prefill.path, GgmlKernelPath::TiledQmm16x8); assert_eq!(prefill.packed_bytes_read, packed.len() * 3); assert_eq!(prefill.activation_bytes_read, 33 * width * 4); assert_eq!(prefill.threadgroup_bytes, 16 * 256 * 4); assert_eq!(prefill.workspace_bytes, 0);
-    let embedding = GgmlQuantizedEmbedding::from_bytes(&packed, qtype.id(), width, rows).unwrap();
+    let embedding = GgmlQuantizedEmbedding::from_bytes(&packed, qtype, width, rows).unwrap();
     let lookup = embedding.dispatch_stats(2).unwrap(); assert_eq!(lookup.path, GgmlKernelPath::Embedding); assert_eq!(lookup.packed_bytes_read, packed.len() / rows * 2); assert_eq!(lookup.workspace_bytes, 0);
     let cloned = embedding.clone_shared();
-    assert_eq!(cloned.qtype(), embedding.qtype());
     assert_eq!(cloned.embedding_dim(), embedding.embedding_dim());
     assert_eq!(cloned.vocab_size(), embedding.vocab_size());
     assert_eq!(cloned.dispatch_stats(2).unwrap(), lookup);
@@ -270,7 +268,7 @@ fn packed_row_ranges_preserve_order_bounds_and_arithmetic() {
     let output_rows = 16usize;
     let packed = fixture_matrix(qtype, width, output_rows);
     let matrix =
-        GgmlQuantizedMatrix::from_bytes(&packed, qtype.id(), width, output_rows).unwrap();
+        GgmlQuantizedMatrix::from_bytes(&packed, qtype, width, output_rows).unwrap();
     assert!(matches!(
         matrix.select_rows(&[]),
         Err(GgmlQuantError::InvalidRowSelection)
@@ -322,7 +320,7 @@ fn metal_matrix_and_embedding_match_reference_for_every_target_qtype() {
     for qtype in GgmlQType::TARGET_TYPES {
         let width = if qtype == GgmlQType::F32 { 33 } else { qtype.block_elements() * 2 };
         let output_rows = 3; let packed = fixture_matrix(qtype, width, output_rows);
-        let matrix = GgmlQuantizedMatrix::from_bytes(&packed, qtype.id(), width, output_rows).unwrap();
+        let matrix = GgmlQuantizedMatrix::from_bytes(&packed, qtype, width, output_rows).unwrap();
         let weights: Vec<Vec<f32>> = (0..output_rows).map(|row| { let rb = matrix.row_bytes; decode_row(qtype, &packed[row * rb..(row + 1) * rb], width) }).collect();
         let activation: Vec<f32> = (0..width).map(|column| (column as i32 % 23 - 11) as f32 * 0.015625).collect();
         let input = crate::from_slice_f32(&activation, &[1, width as i32]);
@@ -342,7 +340,7 @@ fn metal_matrix_and_embedding_match_reference_for_every_target_qtype() {
             let actual = verify_values[input_row * output_rows + output]; let tolerance = 0.002 + expected.abs() * 0.00002;
             assert!((actual - expected).abs() <= tolerance, "{qtype:?} verify input {input_row} output {output}: actual {actual}, expected {expected}");
         }}
-        let embedding = GgmlQuantizedEmbedding::from_bytes(&packed, qtype.id(), width, output_rows).unwrap();
+        let embedding = GgmlQuantizedEmbedding::from_bytes(&packed, qtype, width, output_rows).unwrap();
         let indices = crate::from_slice_i32(&[2, 0, 1], &[3]); let selected = embedding.forward(indices.as_ref().unwrap()).unwrap(); let selected = raw_f32(selected.as_ref().unwrap());
         for (selected_row, source_row) in [2usize, 0, 1].into_iter().enumerate() { for column in 0..width {
             let actual = selected[selected_row * width + column]; let expected = weights[source_row][column];
@@ -410,7 +408,7 @@ fn actual_gguf_blocks_match_reference_on_metal() {
                 .map(|column| (column as i32 % 29 - 14) as f32 * 0.00390625)
                 .collect();
             let matrix =
-                GgmlQuantizedMatrix::from_bytes(&packed, qtype.id(), width, 1).unwrap();
+                GgmlQuantizedMatrix::from_bytes(&packed, qtype, width, 1).unwrap();
             let input = crate::from_slice_f32(&activation, &[1, width as i32]);
             let cold = matrix.forward(input.as_ref().unwrap()).unwrap();
             let _ = raw_f32(cold.as_ref().unwrap());
@@ -465,7 +463,7 @@ fn actual_gguf_blocks_match_reference_on_metal() {
             }
 
             let embedding =
-                GgmlQuantizedEmbedding::from_bytes(&packed, qtype.id(), width, 1).unwrap();
+                GgmlQuantizedEmbedding::from_bytes(&packed, qtype, width, 1).unwrap();
             let index = crate::from_slice_i32(&[0], &[1]);
             let selected = embedding.forward(index.as_ref().unwrap()).unwrap();
             let selected = raw_f32(selected.as_ref().unwrap());
@@ -519,7 +517,7 @@ fn actual_q5k_row_ranges_match_full_projection() {
     .unwrap();
     file.read_exact(&mut packed).unwrap();
     let matrix =
-        GgmlQuantizedMatrix::from_bytes(&packed, qtype.id(), width, output_rows).unwrap();
+        GgmlQuantizedMatrix::from_bytes(&packed, qtype, width, output_rows).unwrap();
     let selected = matrix.select_rows(&[0..7, 40..47, 60..64]).unwrap();
     let input_values: Vec<f32> = (0..3 * width)
         .map(|index| (index as i32 % 23 - 11) as f32 * 0.00390625)
@@ -579,7 +577,7 @@ fn actual_q5k_qmm_microbench() {
     file.seek(SeekFrom::Start(offset)).unwrap();
     file.read_exact(&mut packed).unwrap();
     let matrix =
-        GgmlQuantizedMatrix::from_bytes(&packed, qtype.id(), width, output_rows).unwrap();
+        GgmlQuantizedMatrix::from_bytes(&packed, qtype, width, output_rows).unwrap();
 
     for rows in [1usize, 3, 245, 288, 2048] {
         let input_values: Vec<f32> = (0..rows * width)
@@ -646,7 +644,7 @@ fn actual_q6_lm_head_row_range_microbench() {
     .unwrap();
     file.read_exact(&mut packed).unwrap();
     let matrix =
-        GgmlQuantizedMatrix::from_bytes(&packed, qtype.id(), width, output_rows).unwrap();
+        GgmlQuantizedMatrix::from_bytes(&packed, qtype, width, output_rows).unwrap();
     drop(packed);
     let draft = matrix.select_rows(&[0..65_536, 248_044..248_070]).unwrap();
     let verify = matrix.select_rows(&[0..80_896, 248_044..248_070]).unwrap();
@@ -725,9 +723,9 @@ fn prototype_actual_q5_k_affine_repack() {
     .unwrap();
     file.read_exact(&mut source).unwrap();
     let direct =
-        GgmlQuantizedMatrix::from_bytes(&source, GgmlQType::Q5K.id(), width, rows).unwrap();
+        GgmlQuantizedMatrix::from_bytes(&source, GgmlQType::Q5K, width, rows).unwrap();
     let affine =
-        crate::GgmlAffineMatrix::from_ggml_bytes(&source, GgmlQType::Q5K.id(), width, rows)
+        crate::GgmlAffineMatrix::from_ggml_bytes(&source, GgmlQType::Q5K, width, rows)
             .unwrap();
     let transcode = affine.transcode_stats();
     eprintln!(
@@ -833,11 +831,11 @@ fn actual_affine_repack_matches_reference_for_supported_qtypes() {
             .unwrap();
             file.read_exact(&mut source).unwrap();
             let direct =
-                GgmlQuantizedMatrix::from_bytes(&source, qtype.id(), width, rows).unwrap();
+                GgmlQuantizedMatrix::from_bytes(&source, qtype, width, rows).unwrap();
             let mut released = Vec::new();
             let affine = crate::GgmlAffineMatrix::from_ggml_bytes_with_progress(
                 &source,
-                qtype.id(),
+                qtype,
                 width,
                 rows,
                 |range| released.push(range),
@@ -923,7 +921,7 @@ fn actual_affine_repack_matches_reference_for_supported_qtypes() {
             }
             let embedding = crate::GgmlAffineEmbedding::from_ggml_bytes(
                 &source,
-                qtype.id(),
+                qtype,
                 width,
                 rows,
             )
@@ -1006,4 +1004,277 @@ fn actual_q6_k_contains_non_affine_group32() {
         widest > 255,
         "actual Q6_K unexpectedly fits an UINT8 affine group"
     );
+}
+
+fn f32_to_f16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let magnitude = bits & 0x7fff_ffff;
+    if magnitude >= 0x7f80_0000 {
+        return sign | if magnitude == 0x7f80_0000 { 0x7c00 } else { 0x7e00 };
+    }
+    let exponent = ((magnitude >> 23) as i32) - 127;
+    let mantissa = magnitude & 0x7f_ffff;
+    if exponent > 15 {
+        return sign | 0x7c00;
+    }
+    if exponent >= -14 {
+        let mut half_exp = (exponent + 15) as u16;
+        let rounded = mantissa + 0x0fff + ((mantissa >> 13) & 1);
+        if rounded & 0x80_0000 != 0 {
+            half_exp += 1;
+            if half_exp >= 31 {
+                return sign | 0x7c00;
+            }
+        }
+        return sign | (half_exp << 10) | ((rounded >> 13) as u16 & 0x03ff);
+    }
+    if exponent < -24 {
+        return sign;
+    }
+    let significand = mantissa | 0x80_0000;
+    let shift = (-exponent - 14 + 13) as u32;
+    let rounded =
+        significand + ((1u32 << (shift - 1)) - 1) + ((significand >> shift) & 1);
+    sign | (rounded >> shift) as u16
+}
+
+fn f32_to_bf16_bits(value: f32) -> u16 {
+    let bits = value.to_bits();
+    ((bits + 0x7fff + ((bits >> 16) & 1)) >> 16) as u16
+}
+
+fn dense_q6_bytes(source: &[u8], width: usize, rows: usize, bf16: bool) -> Vec<u8> {
+    let source_row_bytes = width / 256 * 210;
+    assert_eq!(source.len(), source_row_bytes * rows);
+    let mut output = Vec::with_capacity(rows * width * 2);
+    for row in source.chunks_exact(source_row_bytes) {
+        for block in row.chunks_exact(210) {
+            for value in decode_block(GgmlQType::Q6K, block) {
+                let bits = if bf16 {
+                    f32_to_bf16_bits(value)
+                } else {
+                    f32_to_f16_bits(value)
+                };
+                output.extend_from_slice(&bits.to_le_bytes());
+            }
+        }
+    }
+    output
+}
+
+#[test]
+#[ignore = "requires verified local target GGUF artifact"]
+fn prototype_fixed_q6_ssm_out_dense_prefill() {
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
+    use std::time::Instant;
+
+    if !crate::metal_is_available() {
+        return;
+    }
+    let structure: serde_json::Value = serde_json::from_reader(
+        File::open(std::env::var("QWR_GGUF_STRUCTURE_PATH").unwrap()).unwrap(),
+    )
+    .unwrap();
+    let model = &structure["target"];
+    let tensor = model["tensor_infos_enriched"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tensor| tensor["name"].as_str() == Some("blk.1.ssm_out.weight"))
+        .unwrap();
+    assert_eq!(tensor["type"].as_u64(), Some(14));
+    assert_eq!(tensor["shape"], serde_json::json!([6144, 5120]));
+    let width = 6144usize;
+    let rows = 1024usize;
+    let source_row_bytes = width / 256 * 210;
+    let mut source = vec![0u8; source_row_bytes * rows];
+    let mut file =
+        File::open(std::env::var("QWR_TARGET_GGUF_SMOKE_PATH").unwrap()).unwrap();
+    file.seek(SeekFrom::Start(
+        model["data_start"].as_u64().unwrap() + tensor["offset"].as_u64().unwrap(),
+    ))
+    .unwrap();
+    file.read_exact(&mut source).unwrap();
+    let direct =
+        GgmlQuantizedMatrix::from_bytes(&source, GgmlQType::Q6K, width, rows).unwrap();
+
+    let started = Instant::now();
+    let f16_bytes = dense_q6_bytes(&source, width, rows, false);
+    let f16_time = started.elapsed();
+    let started = Instant::now();
+    let bf16_bytes = dense_q6_bytes(&source, width, rows, true);
+    let bf16_time = started.elapsed();
+    let f16 = crate::from_bytes_f16(&f16_bytes, &[rows as i32, width as i32], false);
+    let bf16 = crate::from_bytes_f16(&bf16_bytes, &[rows as i32, width as i32], true);
+    crate::eval(f16.as_ref().unwrap());
+    crate::eval(bf16.as_ref().unwrap());
+    eprintln!(
+        "fixed Q6 dense transcode F16={f16_time:?} BF16={bf16_time:?} source={} dense={}",
+        source.len(),
+        f16_bytes.len(),
+    );
+
+    let original = decode_row(GgmlQType::Q6K, &source[..source_row_bytes], width);
+    let f16_row: Vec<f32> = f16_bytes[..width * 2]
+        .chunks_exact(2)
+        .map(|bytes| half_to_f32(u16::from_le_bytes(bytes.try_into().unwrap())))
+        .collect();
+    let bf16_row: Vec<f32> = bf16_bytes[..width * 2]
+        .chunks_exact(2)
+        .map(|bytes| {
+            f32::from_bits((u16::from_le_bytes(bytes.try_into().unwrap()) as u32) << 16)
+        })
+        .collect();
+    for (name, dense) in [("F16", &f16_row), ("BF16", &bf16_row)] {
+        let max_abs = original
+            .iter()
+            .zip(dense)
+            .map(|(&left, &right)| (left - right).abs())
+            .fold(0.0f32, f32::max);
+        let rms = (original
+            .iter()
+            .zip(dense)
+            .map(|(&left, &right)| (left - right).powi(2))
+            .sum::<f32>()
+            / width as f32)
+            .sqrt();
+        eprintln!("fixed Q6 dense {name} weight max_abs={max_abs} rms={rms}");
+    }
+
+    for m in [1usize, 3] {
+        let values: Vec<f32> = (0..m * width)
+            .map(|index| (index as i32 % 31 - 15) as f32 * 0.00390625)
+            .collect();
+        let input = crate::from_slice_f32(&values, &[m as i32, width as i32]);
+        let direct_values =
+            raw_f32(direct.forward(input.as_ref().unwrap()).unwrap().as_ref().unwrap());
+        for (name, dense) in [("F16", &f16), ("BF16", &bf16)] {
+            let transposed = crate::transpose(dense.as_ref().unwrap());
+            let output = crate::matmul(input.as_ref().unwrap(), transposed.as_ref().unwrap());
+            let output = raw_f32(output.as_ref().unwrap());
+            let max_abs = direct_values
+                .iter()
+                .zip(&output)
+                .map(|(&left, &right)| (left - right).abs())
+                .fold(0.0f32, f32::max);
+            eprintln!("fixed Q6 dense {name} output M={m} max_abs={max_abs}");
+        }
+    }
+
+    for m in [1usize, 3, 245, 288, 2048] {
+        let values: Vec<f32> = (0..m * width)
+            .map(|index| (index as i32 % 31 - 15) as f32 * 0.00390625)
+            .collect();
+        let input = crate::from_slice_f32(&values, &[m as i32, width as i32]);
+        crate::eval(input.as_ref().unwrap());
+        let custom = median_forward(|| direct.forward(input.as_ref().unwrap()).unwrap());
+        let flops = 2.0 * m as f64 * rows as f64 * width as f64;
+        for (name, dense) in [("F16", &f16), ("BF16", &bf16)] {
+            let dense_time = median_forward(|| {
+                let transposed = crate::transpose(dense.as_ref().unwrap());
+                crate::matmul(input.as_ref().unwrap(), transposed.as_ref().unwrap())
+            });
+            eprintln!(
+                "fixed Q6 dense {name} M={m} custom={custom:?} {:.3}TF dense={dense_time:?} {:.3}TF speedup={:.3}x",
+                flops / custom.as_secs_f64() / 1e12,
+                flops / dense_time.as_secs_f64() / 1e12,
+                custom.as_secs_f64() / dense_time.as_secs_f64(),
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires verified local target GGUF artifact"]
+fn actual_fixed_q6_dual_dispatch_is_bounded_and_deterministic() {
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
+
+    if !crate::metal_is_available() {
+        return;
+    }
+    let structure: serde_json::Value = serde_json::from_reader(
+        File::open(std::env::var("QWR_GGUF_STRUCTURE_PATH").unwrap()).unwrap(),
+    )
+    .unwrap();
+    let model = &structure["target"];
+    let tensor = model["tensor_infos_enriched"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tensor| tensor["name"].as_str() == Some("blk.1.ssm_out.weight"))
+        .unwrap();
+    let width = 6144usize;
+    let rows = 5120usize;
+    let source_row_bytes = width / 256 * 210;
+    let mut source = vec![0u8; source_row_bytes * rows];
+    let mut file =
+        File::open(std::env::var("QWR_TARGET_GGUF_SMOKE_PATH").unwrap()).unwrap();
+    file.seek(SeekFrom::Start(
+        model["data_start"].as_u64().unwrap() + tensor["offset"].as_u64().unwrap(),
+    ))
+    .unwrap();
+    file.read_exact(&mut source).unwrap();
+    let direct =
+        GgmlQuantizedMatrix::from_bytes(&source, GgmlQType::Q6K, width, rows).unwrap();
+    let mut released = Vec::new();
+    let dual = crate::Qwen38Q6DualMatrix::from_pinned_bytes_with_progress(
+        &source,
+        crate::Qwen38Q6Shape::K6144N5120,
+        |range| released.push(range),
+    )
+    .unwrap();
+    assert_eq!(released.first().unwrap().start, 0);
+    assert_eq!(released.last().unwrap().end, source.len());
+    assert!(released.windows(2).all(|pair| pair[0].end == pair[1].start));
+    let stats = dual.transcode_stats();
+    assert_eq!(stats.source_bytes, source.len());
+    assert_eq!(stats.dense_bytes, rows * width * 2);
+    assert_eq!(stats.resident_bytes, stats.source_bytes + stats.dense_bytes);
+    assert!(stats.peak_active_bytes < 500 * 1024 * 1024);
+
+    for m in [1usize, 3] {
+        let values: Vec<f32> = (0..m * width)
+            .map(|index| (index as i32 % 31 - 15) as f32 * 0.00390625)
+            .collect();
+        let input = crate::from_slice_f32(&values, &[m as i32, width as i32]);
+        let expected = raw_f32(direct.forward(input.as_ref().unwrap()).unwrap().as_ref().unwrap());
+        let actual = raw_f32(dual.forward(input.as_ref().unwrap()).unwrap().as_ref().unwrap());
+        assert_eq!(actual, expected);
+    }
+
+    let values: Vec<f32> = (0..245 * width)
+        .map(|index| (index as i32 % 31 - 15) as f32 * 0.00390625)
+        .collect();
+    let input = crate::from_slice_f32(&values, &[245, width as i32]);
+    let expected = raw_f32(direct.forward(input.as_ref().unwrap()).unwrap().as_ref().unwrap());
+    let first = raw_f32(dual.forward(input.as_ref().unwrap()).unwrap().as_ref().unwrap());
+    let second = raw_f32(dual.forward(input.as_ref().unwrap()).unwrap().as_ref().unwrap());
+    assert_eq!(first, second);
+    let max_abs = expected
+        .iter()
+        .zip(&first)
+        .map(|(&left, &right)| (left - right).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!("fixed Q6 dual full-shape M=245 max_abs={max_abs}");
+    assert!(max_abs <= 0.0005);
+
+    for m in [245usize, 288, 2048] {
+        let values: Vec<f32> = (0..m * width)
+            .map(|index| (index as i32 % 31 - 15) as f32 * 0.00390625)
+            .collect();
+        let input = crate::from_slice_f32(&values, &[m as i32, width as i32]);
+        crate::eval(input.as_ref().unwrap());
+        let direct_time = median_forward(|| direct.forward(input.as_ref().unwrap()).unwrap());
+        let dual_time = median_forward(|| dual.forward(input.as_ref().unwrap()).unwrap());
+        let flops = dual.dispatch_stats(m).unwrap().floating_point_operations as f64;
+        eprintln!(
+            "fixed Q6 dual M={m} direct={direct_time:?} {:.3}TF F16={dual_time:?} {:.3}TF speedup={:.3}x",
+            flops / direct_time.as_secs_f64() / 1e12,
+            flops / dual_time.as_secs_f64() / 1e12,
+            direct_time.as_secs_f64() / dual_time.as_secs_f64(),
+        );
+    }
 }
