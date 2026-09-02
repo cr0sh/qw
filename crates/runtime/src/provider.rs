@@ -1,4 +1,4 @@
-#[cfg(any(feature = "specprefill", test))]
+#[cfg(any(feature = "dflash2", feature = "specprefill", test))]
 use std::path::Path;
 use std::sync::LazyLock;
 use std::time::Duration;

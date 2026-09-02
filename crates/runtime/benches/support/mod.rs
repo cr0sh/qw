@@ -19,11 +19,9 @@ pub const PREFILL_MIN_TOKENS: usize = 4_096;
 pub const PREFILL_MAX_TOKENS: usize = 6_000;
 pub const LONG_CONTEXT_MIN_TOKENS: usize = 10_000;
 pub const LONG_CONTEXT_64K_MIN_TOKENS: usize = 64_000;
-/// Environment variable pointing at the DFlash2 drafter checkpoint
-/// directory (optional; defaults to the model cache path below).
+/// Environment variable pointing at the DFlash2 drafter checkpoint directory.
 pub const DRAFT_MODEL_ENV: &str = "QW_BENCH_DRAFT_MODEL";
-/// Default DFlash2 drafter identifier resolved through the model cache.
-pub const DEFAULT_DRAFT_MODEL_IDENTIFIER: &str = "incoai/Qwen3.8-27B-DFlash2";
+const DFLASH2_DRAFT_CACHE_RELATIVE_DIR: &str = ".cache/qw/models/incoai/Qwen3.8-27B-DFlash2";
 pub const PROMPT: &str = concat!(
     "You are the on-call support operations analyst for Acme Commerce. ",
     "Review this incident and return only one compact JSON object with keys ",
@@ -748,9 +746,10 @@ pub fn prompt_token_ids(provider: &Qwen35Provider) -> Vec<i32> {
     panic!("single-user prefill prompt did not reach {PREFILL_MIN_TOKENS} tokens");
 }
 
-/// Resolve the DFlash2 drafter directory: `QW_BENCH_DRAFT_MODEL` when set,
-/// else the model cache path for the default identifier (mirrors the model
-/// resolution `qw generate` / `qw serve` use).
+fn default_draft_model_dir(home: &Path) -> PathBuf {
+    home.join(DFLASH2_DRAFT_CACHE_RELATIVE_DIR)
+}
+
 #[allow(dead_code)]
 pub fn draft_model_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os(DRAFT_MODEL_ENV).filter(|value| !value.is_empty()) {
@@ -758,9 +757,19 @@ pub fn draft_model_dir() -> PathBuf {
     }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
-        .expect("HOME must be set to resolve the default drafter cache path");
-    qw_runtime::model_cache_path(&home, DEFAULT_DRAFT_MODEL_IDENTIFIER)
-        .expect("default DFlash2 drafter identifier is valid")
+        .expect("HOME must be set to resolve the default DFlash2 drafter path");
+    default_draft_model_dir(&home)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn default_dflash2_draft_path_is_benchmark_local_and_fixed() {
+        assert_eq!(
+            super::default_draft_model_dir(std::path::Path::new("/home/test")),
+            std::path::Path::new("/home/test/.cache/qw/models/incoai/Qwen3.8-27B-DFlash2",)
+        );
+    }
 }
 
 pub fn prepare_decode_fixture(provider: &mut Qwen35Provider) -> DecodeFixture {
