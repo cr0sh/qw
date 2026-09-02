@@ -19,6 +19,7 @@ use crate::qwen_mrope::{InterleavedMRoPE, apply_multimodal_rotary_pos_emb};
 use crate::qwen3_5_weights::{
     LayerTensor, ModelRole, Qwen35Linear, Qwen35QkvProjection, Qwen35WeightSource, TensorSlot,
 };
+use crate::qwen38_plan::{QWEN38_MLP_FUSION_PLAN, Qwen38PlanRole};
 use mlxcel_core::cache::KVCacheMode;
 #[cfg(any(feature = "specprefill", test))]
 use mlxcel_core::concatenate;
@@ -422,41 +423,62 @@ fn fuse_mlp_input_projections(
 
 /// Dense MLP layer
 pub(crate) struct Mlp {
-    input_projections: MlpInputProjections,
-    down_proj: Qwen35Linear,
+    execution: MlpExecution,
+}
+
+enum MlpExecution {
+    Separate {
+        input_projections: MlpInputProjections,
+        down_proj: Qwen35Linear,
+    },
+    PinnedAffine(mlxcel_core::Qwen38AffineMlpFusion),
 }
 
 impl Mlp {
     pub(crate) fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
-        let gated = self.forward_hidden(x);
-        self.down_proj.forward(&gated)
+        match &self.execution {
+            MlpExecution::Separate {
+                input_projections,
+                down_proj,
+            } => {
+                let (gate, up) = match input_projections {
+                    MlpInputProjections::Separate { gate, up } => (gate.forward(x), up.forward(x)),
+                    #[cfg(any(feature = "specprefill", test))]
+                    MlpInputProjections::Fused {
+                        projection,
+                        intermediate_size,
+                    } => {
+                        let projected = projection.forward(x);
+                        let shape = mlxcel_core::array_shape(&projected);
+                        (
+                            mlxcel_core::slice(
+                                &projected,
+                                &[0, 0, 0],
+                                &[shape[0], shape[1], *intermediate_size],
+                            ),
+                            mlxcel_core::slice(
+                                &projected,
+                                &[0, 0, *intermediate_size],
+                                &[shape[0], shape[1], *intermediate_size * 2],
+                            ),
+                        )
+                    }
+                };
+                let gated = mlxcel_core::compiled_swiglu_activation(&gate, &up);
+                down_proj.forward(&gated)
+            }
+            MlpExecution::PinnedAffine(fusion) => fusion
+                .forward(x)
+                .expect("validated pinned Qwen3.8 MLP fusion must succeed"),
+        }
     }
 
-    pub(crate) fn forward_hidden(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
-        let (gate, up) = match &self.input_projections {
-            MlpInputProjections::Separate { gate, up } => (gate.forward(x), up.forward(x)),
-            #[cfg(any(feature = "specprefill", test))]
-            MlpInputProjections::Fused {
-                projection,
-                intermediate_size,
-            } => {
-                let projected = projection.forward(x);
-                let shape = mlxcel_core::array_shape(&projected);
-                (
-                    mlxcel_core::slice(
-                        &projected,
-                        &[0, 0, 0],
-                        &[shape[0], shape[1], *intermediate_size],
-                    ),
-                    mlxcel_core::slice(
-                        &projected,
-                        &[0, 0, *intermediate_size],
-                        &[shape[0], shape[1], *intermediate_size * 2],
-                    ),
-                )
-            }
-        };
-        mlxcel_core::compiled_swiglu_activation(&gate, &up)
+    #[cfg(test)]
+    pub(crate) fn fusion_stats(&self, input_rows: usize) -> Option<mlxcel_core::Qwen38FusionStats> {
+        match &self.execution {
+            MlpExecution::PinnedAffine(fusion) => fusion.dispatch_stats(input_rows).ok(),
+            MlpExecution::Separate { .. } => None,
+        }
     }
 
     pub(crate) fn from_weights(
@@ -482,16 +504,51 @@ impl Mlp {
         };
         let gate = weights.linear(slot(LayerTensor::MlpGate), gate_group_size, gate_bits)?;
         let up = weights.linear(slot(LayerTensor::MlpUp), up_group_size, up_bits)?;
-
-        Ok(Self {
-            input_projections: fuse_mlp_input_projections(
-                weights.legacy_weights(),
-                &gate_prefix,
-                &up_prefix,
+        let down = weights.linear(slot(LayerTensor::MlpDown), down_group_size, down_bits)?;
+        let descriptor = QWEN38_MLP_FUSION_PLAN.iter().find(|descriptor| {
+            descriptor.layer
+                == match role {
+                    ModelRole::Target => layer,
+                    ModelRole::Mtp => 64,
+                }
+                && descriptor.role
+                    == match role {
+                        ModelRole::Target => Qwen38PlanRole::Target,
+                        ModelRole::Mtp => Qwen38PlanRole::Mtp,
+                    }
+        });
+        if weights.qwen38_fusion_enabled()
+            && descriptor.is_some_and(|descriptor| descriptor.all_affine())
+            && gate.is_affine()
+            && up.is_affine()
+            && down.is_affine()
+        {
+            let (gate, gate_m23) = gate.into_affine().expect("checked affine gate");
+            let (up, up_m23) = up.into_affine().expect("checked affine up");
+            let (down, down_m23) = down.into_affine().expect("checked affine down");
+            return mlxcel_core::Qwen38AffineMlpFusion::new(
                 gate,
                 up,
-            ),
-            down_proj: weights.linear(slot(LayerTensor::MlpDown), down_group_size, down_bits)?,
+                down,
+                [gate_m23, up_m23, down_m23],
+            )
+            .map(|fusion| Self {
+                execution: MlpExecution::PinnedAffine(fusion),
+            })
+            .map_err(|error| error.to_string());
+        }
+
+        Ok(Self {
+            execution: MlpExecution::Separate {
+                input_projections: fuse_mlp_input_projections(
+                    weights.legacy_weights(),
+                    &gate_prefix,
+                    &up_prefix,
+                    gate,
+                    up,
+                ),
+                down_proj: down,
+            },
         })
     }
 }

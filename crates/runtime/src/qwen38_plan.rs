@@ -7096,6 +7096,187 @@ pub(crate) static MTP_TENSOR_PLAN: [PinnedTensorDescriptor; 18] = [
     },
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Qwen38PlanRole {
+    Target,
+    Mtp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Qwen38MlpFusionDescriptor {
+    pub role: Qwen38PlanRole,
+    pub layer: usize,
+    pub slots: [usize; 3],
+    pub qtypes: [u32; 3],
+}
+
+impl Qwen38MlpFusionDescriptor {
+    pub const fn all_affine(self) -> bool {
+        self.qtypes[0] != 14 && self.qtypes[1] != 14 && self.qtypes[2] != 14
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Qwen38GdnFusionDescriptor {
+    pub layer: usize,
+    pub slots: [usize; 4],
+    pub qtypes: [u32; 4],
+}
+
+impl Qwen38GdnFusionDescriptor {
+    pub const fn all_affine(self) -> bool {
+        self.qtypes[0] != 14 && self.qtypes[1] != 14 && self.qtypes[2] != 14 && self.qtypes[3] != 14
+    }
+}
+
+const fn target_mlp(layer: usize, qtypes: [u32; 3]) -> Qwen38MlpFusionDescriptor {
+    let base = 3 + layer * 14 - (layer / 4) * 3;
+    let slots = if (layer + 1) % 4 == 0 {
+        [base + 8, base + 9, base + 7]
+    } else {
+        [base + 4, base + 5, base + 3]
+    };
+    Qwen38MlpFusionDescriptor {
+        role: Qwen38PlanRole::Target,
+        layer,
+        slots,
+        qtypes,
+    }
+}
+
+const fn target_gdn(layer: usize, qtypes: [u32; 4]) -> Qwen38GdnFusionDescriptor {
+    let base = 3 + layer * 14 - (layer / 4) * 3;
+    Qwen38GdnFusionDescriptor {
+        layer,
+        slots: [base + 2, base, base + 9, base + 8],
+        qtypes,
+    }
+}
+
+pub(crate) static QWEN38_MLP_FUSION_PLAN: [Qwen38MlpFusionDescriptor; 65] = [
+    target_mlp(0, [23, 11, 23]),
+    target_mlp(1, [23, 23, 20]),
+    target_mlp(2, [23, 23, 20]),
+    target_mlp(3, [12, 13, 13]),
+    target_mlp(4, [23, 12, 13]),
+    target_mlp(5, [23, 23, 13]),
+    target_mlp(6, [12, 13, 12]),
+    target_mlp(7, [23, 13, 23]),
+    target_mlp(8, [23, 23, 12]),
+    target_mlp(9, [23, 23, 23]),
+    target_mlp(10, [12, 23, 23]),
+    target_mlp(11, [23, 23, 23]),
+    target_mlp(12, [23, 23, 23]),
+    target_mlp(13, [11, 23, 12]),
+    target_mlp(14, [23, 11, 21]),
+    target_mlp(15, [23, 23, 23]),
+    target_mlp(16, [23, 23, 12]),
+    target_mlp(17, [20, 23, 12]),
+    target_mlp(18, [23, 23, 23]),
+    target_mlp(19, [23, 23, 23]),
+    target_mlp(20, [12, 13, 13]),
+    target_mlp(21, [12, 12, 13]),
+    target_mlp(22, [23, 13, 13]),
+    target_mlp(23, [13, 13, 13]),
+    target_mlp(24, [13, 13, 13]),
+    target_mlp(25, [13, 13, 13]),
+    target_mlp(26, [13, 13, 13]),
+    target_mlp(27, [20, 13, 13]),
+    target_mlp(28, [13, 20, 13]),
+    target_mlp(29, [23, 23, 23]),
+    target_mlp(30, [12, 23, 13]),
+    target_mlp(31, [23, 23, 23]),
+    target_mlp(32, [23, 12, 23]),
+    target_mlp(33, [23, 23, 23]),
+    target_mlp(34, [23, 12, 13]),
+    target_mlp(35, [12, 12, 13]),
+    target_mlp(36, [12, 13, 13]),
+    target_mlp(37, [12, 13, 13]),
+    target_mlp(38, [12, 13, 13]),
+    target_mlp(39, [13, 13, 13]),
+    target_mlp(40, [13, 13, 13]),
+    target_mlp(41, [13, 13, 13]),
+    target_mlp(42, [13, 13, 13]),
+    target_mlp(43, [12, 13, 13]),
+    target_mlp(44, [23, 23, 23]),
+    target_mlp(45, [23, 23, 13]),
+    target_mlp(46, [12, 23, 23]),
+    target_mlp(47, [12, 12, 23]),
+    target_mlp(48, [23, 13, 13]),
+    target_mlp(49, [23, 13, 13]),
+    target_mlp(50, [13, 13, 13]),
+    target_mlp(51, [13, 13, 13]),
+    target_mlp(52, [13, 13, 13]),
+    target_mlp(53, [13, 13, 13]),
+    target_mlp(54, [13, 13, 13]),
+    target_mlp(55, [13, 13, 13]),
+    target_mlp(56, [13, 13, 14]),
+    target_mlp(57, [13, 13, 14]),
+    target_mlp(58, [14, 13, 14]),
+    target_mlp(59, [14, 14, 14]),
+    target_mlp(60, [14, 13, 13]),
+    target_mlp(61, [13, 13, 13]),
+    target_mlp(62, [13, 13, 13]),
+    target_mlp(63, [14, 14, 14]),
+    Qwen38MlpFusionDescriptor {
+        role: Qwen38PlanRole::Mtp,
+        layer: 64,
+        slots: [11, 12, 10],
+        qtypes: [12, 12, 12],
+    },
+];
+
+pub(crate) static QWEN38_GDN_FUSION_PLAN: [Qwen38GdnFusionDescriptor; 48] = [
+    target_gdn(0, [13, 13, 8, 8]),
+    target_gdn(1, [12, 12, 8, 8]),
+    target_gdn(2, [12, 13, 8, 8]),
+    target_gdn(4, [12, 13, 8, 8]),
+    target_gdn(5, [13, 13, 8, 8]),
+    target_gdn(6, [14, 12, 8, 8]),
+    target_gdn(8, [12, 13, 8, 8]),
+    target_gdn(9, [12, 12, 8, 8]),
+    target_gdn(10, [12, 13, 8, 8]),
+    target_gdn(12, [12, 13, 8, 8]),
+    target_gdn(13, [12, 12, 8, 8]),
+    target_gdn(14, [12, 12, 8, 8]),
+    target_gdn(16, [12, 12, 8, 8]),
+    target_gdn(17, [13, 23, 8, 8]),
+    target_gdn(18, [12, 12, 8, 8]),
+    target_gdn(20, [12, 13, 8, 8]),
+    target_gdn(21, [20, 13, 8, 8]),
+    target_gdn(22, [12, 13, 8, 8]),
+    target_gdn(24, [13, 13, 8, 8]),
+    target_gdn(25, [13, 13, 8, 8]),
+    target_gdn(26, [13, 13, 8, 8]),
+    target_gdn(28, [13, 14, 8, 8]),
+    target_gdn(29, [12, 12, 8, 8]),
+    target_gdn(30, [13, 12, 8, 8]),
+    target_gdn(32, [13, 13, 8, 8]),
+    target_gdn(33, [13, 12, 8, 8]),
+    target_gdn(34, [13, 13, 8, 8]),
+    target_gdn(36, [12, 13, 8, 8]),
+    target_gdn(37, [23, 13, 8, 8]),
+    target_gdn(38, [12, 13, 8, 8]),
+    target_gdn(40, [23, 13, 8, 8]),
+    target_gdn(41, [12, 13, 8, 8]),
+    target_gdn(42, [12, 13, 8, 8]),
+    target_gdn(44, [12, 12, 8, 8]),
+    target_gdn(45, [12, 23, 8, 8]),
+    target_gdn(46, [13, 12, 8, 8]),
+    target_gdn(48, [13, 13, 8, 8]),
+    target_gdn(49, [13, 23, 8, 8]),
+    target_gdn(50, [13, 12, 8, 8]),
+    target_gdn(52, [12, 13, 8, 8]),
+    target_gdn(53, [12, 13, 8, 8]),
+    target_gdn(54, [12, 13, 8, 8]),
+    target_gdn(56, [13, 13, 8, 8]),
+    target_gdn(57, [13, 13, 8, 8]),
+    target_gdn(58, [13, 13, 8, 8]),
+    target_gdn(60, [13, 13, 8, 8]),
+    target_gdn(61, [13, 13, 8, 8]),
+    target_gdn(62, [13, 13, 8, 8]),
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -7153,5 +7334,83 @@ mod tests {
                 assert_eq!(descriptor.relative_offset % 32, 0);
             }
         }
+    }
+
+    #[test]
+    fn fusion_descriptors_match_pinned_tensor_plans_exactly() {
+        assert_eq!(QWEN38_MLP_FUSION_PLAN.len(), 65);
+        for descriptor in QWEN38_MLP_FUSION_PLAN {
+            let plan = match descriptor.role {
+                Qwen38PlanRole::Target => TARGET_TENSOR_PLAN.as_slice(),
+                Qwen38PlanRole::Mtp => MTP_TENSOR_PLAN.as_slice(),
+            };
+            let names = [
+                format!("blk.{}.ffn_gate.weight", descriptor.layer),
+                format!("blk.{}.ffn_up.weight", descriptor.layer),
+                format!("blk.{}.ffn_down.weight", descriptor.layer),
+            ];
+            for (index, slot) in descriptor.slots.into_iter().enumerate() {
+                let tensor = &plan[slot];
+                assert_eq!(tensor.name, names[index]);
+                assert_eq!(tensor.qtype, descriptor.qtypes[index]);
+                assert_eq!(
+                    tensor.dimensions,
+                    if index == 2 {
+                        &[17_408, 5120]
+                    } else {
+                        &[5120, 17_408]
+                    }
+                );
+            }
+        }
+
+        assert_eq!(QWEN38_GDN_FUSION_PLAN.len(), 48);
+        for descriptor in QWEN38_GDN_FUSION_PLAN {
+            let names = [
+                format!("blk.{}.attn_qkv.weight", descriptor.layer),
+                format!("blk.{}.attn_gate.weight", descriptor.layer),
+                format!("blk.{}.ssm_beta.weight", descriptor.layer),
+                format!("blk.{}.ssm_alpha.weight", descriptor.layer),
+            ];
+            let dimensions: [&[u64]; 4] =
+                [&[5120, 10_240], &[5120, 6144], &[5120, 48], &[5120, 48]];
+            for (index, slot) in descriptor.slots.into_iter().enumerate() {
+                let tensor = &TARGET_TENSOR_PLAN[slot];
+                assert_eq!(tensor.name, names[index]);
+                assert_eq!(tensor.qtype, descriptor.qtypes[index]);
+                assert_eq!(tensor.dimensions, dimensions[index]);
+            }
+        }
+    }
+
+    #[test]
+    fn fusion_plan_excludes_only_q6_projection_groups() {
+        let excluded_mlp = QWEN38_MLP_FUSION_PLAN
+            .iter()
+            .filter(|descriptor| !descriptor.all_affine())
+            .map(|descriptor| descriptor.layer)
+            .collect::<Vec<_>>();
+        assert_eq!(excluded_mlp, [56, 57, 58, 59, 60, 63]);
+        assert_eq!(
+            QWEN38_MLP_FUSION_PLAN
+                .iter()
+                .filter(|descriptor| descriptor.all_affine())
+                .count(),
+            59
+        );
+
+        let excluded_gdn = QWEN38_GDN_FUSION_PLAN
+            .iter()
+            .filter(|descriptor| !descriptor.all_affine())
+            .map(|descriptor| descriptor.layer)
+            .collect::<Vec<_>>();
+        assert_eq!(excluded_gdn, [6, 28]);
+        assert_eq!(
+            QWEN38_GDN_FUSION_PLAN
+                .iter()
+                .filter(|descriptor| descriptor.all_affine())
+                .count(),
+            46
+        );
     }
 }

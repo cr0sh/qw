@@ -57,6 +57,18 @@ impl Qwen35Linear {
         }
     }
 
+    pub(crate) fn is_affine(&self) -> bool {
+        matches!(self, Self::Affine(_) | Self::PinnedM23Affine(_))
+    }
+
+    pub(crate) fn into_affine(self) -> Option<(GgmlAffineMatrix, bool)> {
+        match self {
+            Self::Affine(matrix) => Some((matrix, false)),
+            Self::PinnedM23Affine(matrix) => Some((matrix, true)),
+            _ => None,
+        }
+    }
+
     #[cfg(any(feature = "specprefill", test))]
     pub(crate) fn legacy_ref(&self) -> Option<&UnifiedLinear> {
         match self {
@@ -294,6 +306,10 @@ pub(crate) trait Qwen35WeightSource {
     fn gguf_ssm_a_is_coefficient(&self) -> bool {
         false
     }
+
+    fn qwen38_fusion_enabled(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(any(feature = "specprefill", test))]
@@ -462,19 +478,25 @@ pub(crate) struct GgufWeightSource {
     mtp_used: RefCell<[bool; 18]>,
     affine_stats: RefCell<GgufAffineLoadStats>,
     enable_m23: bool,
+    enable_fusion: bool,
 }
 
 impl GgufWeightSource {
     pub(crate) fn open() -> Result<Self> {
-        Self::open_with_m23(true)
+        Self::open_with_features(true, true)
     }
 
     #[cfg(test)]
     pub(crate) fn open_without_m23() -> Result<Self> {
-        Self::open_with_m23(false)
+        Self::open_with_features(false, true)
     }
 
-    fn open_with_m23(enable_m23: bool) -> Result<Self> {
+    #[cfg(test)]
+    pub(crate) fn open_without_fusion() -> Result<Self> {
+        Self::open_with_features(true, false)
+    }
+
+    fn open_with_features(enable_m23: bool, enable_fusion: bool) -> Result<Self> {
         let pair = PinnedGgufPair::open()?;
         // PinnedGgufPair verifies both payload hashes and exact plans first.
         let target_map = map_file(&pair.target)?;
@@ -487,6 +509,7 @@ impl GgufWeightSource {
             mtp_used: RefCell::new([false; 18]),
             affine_stats: RefCell::new(GgufAffineLoadStats::default()),
             enable_m23,
+            enable_fusion,
         })
     }
 
@@ -793,6 +816,10 @@ impl Qwen35WeightSource for GgufWeightSource {
 
     fn gguf_ssm_a_is_coefficient(&self) -> bool {
         true
+    }
+
+    fn qwen38_fusion_enabled(&self) -> bool {
+        self.enable_fusion && cfg!(target_os = "macos")
     }
 }
 

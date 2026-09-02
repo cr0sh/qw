@@ -487,6 +487,14 @@ fn main() {
             let fixture = long_10k.as_ref().expect("10k fixture was prepared");
             let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
             black_box(long_mtp_sample(&mut provider, fixture, &sampling));
+            println!(
+                "BENCHMARK_MTP_STATS context_tokens={} decode_tokens={} accepted_draft_tokens={} proposed_draft_tokens={} target_forward_calls={} cache_parity=verified token_parity=verified",
+                fixture.prefix_tokens,
+                fixture.mtp_decode_tokens,
+                fixture.mtp_accepted_draft_tokens,
+                fixture.mtp_proposed_draft_tokens,
+                fixture.mtp_target_forward_calls,
+            );
             measure(
                 LONG_10K_SPECULATIVE,
                 fixture.prefix_tokens,
