@@ -1132,6 +1132,7 @@ pub struct Qwen35Model {
     pub(crate) config: Qwen35Config,
     mtp: Option<Qwen35MtpDraftModel>,
     kv_cache_mode: KVCacheMode,
+    retain_qwen38_64k_dense_prefix: bool,
     vision: Option<Qwen3VLVisionEncoder>,
     /// Model-owned heterogeneous cache state used by one synchronous sequence.
     sequence_state: ModelOwnedSequenceState<Qwen3NextCache>,
@@ -2384,6 +2385,8 @@ impl Qwen35Model {
             compact_dflash_verify_head,
             config: config.clone(),
             kv_cache_mode,
+            retain_qwen38_64k_dense_prefix: weights.is_pinned_qwen38_gguf()
+                && cfg!(target_os = "macos"),
             mtp: None,
             vision: None,
             sequence_state: ModelOwnedSequenceState::new(internal_caches),
@@ -3080,6 +3083,9 @@ impl LanguageModel for Qwen35Model {
                     tensor("v_norms")?,
                     tensor("v_rescale")?,
                 )?;
+                if self.retain_qwen38_64k_dense_prefix {
+                    cache.prepare_qwen38_64k_dense_prefix();
+                }
                 restored.push(Qwen3NextCache::Attention(Box::new(cache)));
             } else {
                 let keys = snapshot

@@ -648,6 +648,55 @@ impl KVCache {
         Ok(())
     }
 
+    /// Retain the exact Qwen3.8 64K Turbo4 prefix in rotated FP16 form.
+    ///
+    /// The packed snapshot remains authoritative and is still updated in
+    /// lockstep. This sidecar only avoids rebuilding the same long rotated
+    /// prefix inside each continuation attention graph. The exact token and
+    /// tensor geometry gate keeps the additional memory off every other path.
+    pub fn prepare_qwen38_64k_dense_prefix(&mut self) {
+        const PREFIX_TOKENS: i32 = 64_297;
+        const CONTINUATION_TOKENS: i32 = 288;
+        if self.mode != KVCacheMode::Turbo4 || self.offset != PREFIX_TOKENS {
+            return;
+        }
+        let (Some(kp), Some(kr), Some(vp), Some(vn), Some(vr)) = (
+            self.k_packed.as_deref(),
+            self.k_rescale.as_deref(),
+            self.v_packed.as_deref(),
+            self.v_norms.as_deref(),
+            self.v_rescale.as_deref(),
+        ) else {
+            return;
+        };
+        let packed_shape = [1, 4, PREFIX_TOKENS, 128];
+        let sidecar_shape = [1, 4, PREFIX_TOKENS, 1];
+        if ffi::array_shape(kp) != packed_shape
+            || ffi::array_shape(kr) != sidecar_shape
+            || ffi::array_shape(vp) != packed_shape
+            || ffi::array_shape(vn) != sidecar_shape
+            || ffi::array_shape(vr) != sidecar_shape
+        {
+            return;
+        }
+
+        let params = turbo::TurboQuantParams::new(256, self.turbo_seed);
+        let k_rot =
+            turbo::sparse_v::dequantize_turbo4_rotated_for_sdpa(kp, kr, &params);
+        let v_rot =
+            turbo::sparse_v::dequantize_turbo4_rotated_for_sdpa(vp, vr, &params);
+        let headroom =
+            ffi::zeros(&[1, 4, CONTINUATION_TOKENS, 256], dtype::FLOAT16);
+        let k_rot = concatenate(&k_rot, &headroom, 2);
+        let v_rot = concatenate(&v_rot, &headroom, 2);
+        ffi::eval(&k_rot);
+        ffi::eval(&v_rot);
+        ffi::synchronize_default();
+        self.keys = Some(k_rot);
+        self.values = Some(v_rot);
+        self.turbo_params = Some(params);
+    }
+
     /// Create a transparently pool-backed empty KV cache for one layer.
     ///
     /// The returned cache is `KVCacheMode::Fp16` with default step size, but
@@ -920,10 +969,13 @@ impl KVCache {
 
     /// Get the allocated buffer size (sequence dimension)
     fn buffer_seq_len(&self) -> i32 {
-        // In symmetric Turbo4 mode the `keys` field stays None and the
-        // step-grown buffer lives in `k_packed`; consult that instead. All
-        // other modes (Fp16, Int8, Turbo4Asym) keep the buffer in `keys`.
-        let buf = self.keys.as_ref().or(self.k_packed.as_ref());
+        // Symmetric Turbo4 capacity is defined by its packed storage. A retained
+        // dense rotated sidecar must not mask packed growth.
+        let buf = if self.mode == KVCacheMode::Turbo4 {
+            self.k_packed.as_ref().or(self.keys.as_ref())
+        } else {
+            self.keys.as_ref().or(self.k_packed.as_ref())
+        };
         match buf {
             Some(k) => {
                 let shape = ffi::array_shape(k);
@@ -1449,9 +1501,9 @@ impl KVCache {
     /// - `v_packed`: `[B, H, capacity, V_dim/2]` UINT8 (V-side nibble-packed indices).
     /// - `v_norms`:  `[B, H, capacity, 1]` FP16 (per-token L2 of original V).
     ///
-    /// Both `keys` and `values` stay `None` in this mode — the FP16 K/V
-    /// tensors are reconstructed lazily on `update_and_fetch` via
-    /// [`turbo::quant::dequantize_k_turbo4`] / [`turbo::quant::dequantize_v_turbo4`].
+    /// Normally both `keys` and `values` stay `None` in this mode and FP16 K/V
+    /// are reconstructed lazily. The pinned Qwen3.8 64K continuation path may
+    /// retain rotated FP16 sidecars while keeping these packed buffers authoritative.
     ///
     /// **Safety**: callers must consult [`turbo::is_symmetric_turbo_allowed`]
     /// before constructing a cache in this mode for an arbitrary model — see
@@ -1466,6 +1518,7 @@ impl KVCache {
         // Cast incoming K/V to FP16 to match the cache contract.
         let new_keys_f16 = ffi::astype(&new_keys, dtype::FLOAT16);
         let new_values_f16 = ffi::astype(&new_values, dtype::FLOAT16);
+        let retain_rotated_prefix = self.keys.is_some() && self.values.is_some();
 
         // Lazy-init TurboQuantParams once we know the V head_dim. Both K and
         // V must share the same head_dim because attention requires Q·Kᵀ to
@@ -1617,6 +1670,49 @@ impl KVCache {
             &[0, 0, prev, 0],
             &[vr_shape[0], vr_shape[1], self.offset, 1],
         ));
+
+        if retain_rotated_prefix {
+            let dense_capacity = self
+                .keys
+                .as_deref()
+                .map(ffi::array_shape)
+                .map_or(0, |shape| shape[2]);
+            if self.offset <= dense_capacity {
+                let params = self
+                    .turbo_params
+                    .as_ref()
+                    .expect("Turbo4 params accompany the rotated prefix");
+                let k_rot = turbo::sparse_v::dequantize_turbo4_rotated_for_sdpa(
+                    &k_packed_new,
+                    &k_rescale_new,
+                    params,
+                );
+                let v_rot = turbo::sparse_v::dequantize_turbo4_rotated_for_sdpa(
+                    &v_packed_new,
+                    &v_rescale_new,
+                    params,
+                );
+                let keys = self.keys.take().expect("rotated K prefix");
+                let values = self.values.take().expect("rotated V prefix");
+                let key_shape = ffi::array_shape(&keys);
+                let value_shape = ffi::array_shape(&values);
+                self.keys = Some(ffi::slice_update(
+                    &keys,
+                    &k_rot,
+                    &[0, 0, prev, 0],
+                    &[key_shape[0], key_shape[1], self.offset, key_shape[3]],
+                ));
+                self.values = Some(ffi::slice_update(
+                    &values,
+                    &v_rot,
+                    &[0, 0, prev, 0],
+                    &[value_shape[0], value_shape[1], self.offset, value_shape[3]],
+                ));
+            } else {
+                self.keys = None;
+                self.values = None;
+            }
+        }
     }
 
     /// Turbo4Delegated update path — V-only hot/cold split with unified K
@@ -3641,6 +3737,26 @@ impl KVCache {
         let kr_shape = ffi::array_shape(kr);
         let vp_shape = ffi::array_shape(vp);
         let vr_shape = ffi::array_shape(vr);
+        if let (Some(k_rot), Some(v_rot)) = (self.keys.as_deref(), self.values.as_deref()) {
+            let k_shape = ffi::array_shape(k_rot);
+            let v_shape = ffi::array_shape(v_rot);
+            if k_shape.len() == 4 && v_shape == k_shape && prefix_len <= k_shape[2] {
+                let k_slice = ffi::slice(
+                    k_rot,
+                    &[0, 0, 0, 0],
+                    &[k_shape[0], k_shape[1], prefix_len, k_shape[3]],
+                );
+                let v_slice = ffi::slice(
+                    v_rot,
+                    &[0, 0, 0, 0],
+                    &[v_shape[0], v_shape[1], prefix_len, v_shape[3]],
+                );
+                return turbo::sparse_v::attention_turbo4_rotated_sdpa(
+                    q, &k_slice, &v_slice, params, scale, mask, causal,
+                );
+            }
+        }
+
         let kp_slice = ffi::slice(
             kp,
             &[0, 0, 0, 0],

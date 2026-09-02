@@ -1843,7 +1843,7 @@ impl CxxGenerator {
         let requested_cached_tokens = prefix_reuse.as_ref().map_or(0, |reuse| reuse.cached_tokens);
         let mut cached_tokens = 0;
         let mut cached_logits = None;
-        if let Some(reuse) = prefix_reuse
+        if let Some(reuse) = prefix_reuse.as_ref()
             && reuse.cached_tokens > 0
             && reuse.cached_tokens <= prompt_tokens.len()
             && reuse.snapshot.token_len() == reuse.cached_tokens
@@ -2058,13 +2058,42 @@ impl CxxGenerator {
                 aligned_tokens.extend_from_slice(&accepted_tokens[..accepted_tokens.len() - 1]);
                 self.reset_with_model(model);
                 self.generated_tokens = accepted_tokens;
-                let input = ffi::from_slice_i32(&aligned_tokens, &[1, aligned_tokens.len() as i32]);
-                logits = model.forward_last_logits(
-                    &input,
-                    &mut self.caches,
-                    None,
-                    aligned_tokens.len().saturating_sub(1),
-                );
+                let replay_start = if cached_tokens > 0 {
+                    let reuse = prefix_reuse
+                        .as_ref()
+                        .expect("validated cached tokens require prefix reuse");
+                    model.restore_sequence_state(sequence_id, reuse.snapshot)?;
+                    cached_tokens
+                } else {
+                    0
+                };
+                logits = if replay_start == aligned_tokens.len() {
+                    prefix_reuse
+                        .as_ref()
+                        .and_then(|reuse| reuse.snapshot.continuation_logits())
+                        .map(ffi::copy)
+                        .ok_or_else(|| {
+                            "final alignment prefix is missing continuation logits".to_string()
+                        })?
+                } else {
+                    let replay_tokens = &aligned_tokens[replay_start..];
+                    if let Some(chunk) = effective_prefill_chunk(
+                        prefill_chunk_len(),
+                        model.supports_chunked_prefill(),
+                        replay_tokens.len(),
+                    ) {
+                        chunked_prefill_last_logits(model, &mut self.caches, replay_tokens, chunk)
+                    } else {
+                        let input =
+                            ffi::from_slice_i32(replay_tokens, &[1, replay_tokens.len() as i32]);
+                        model.forward_last_logits(
+                            &input,
+                            &mut self.caches,
+                            None,
+                            replay_tokens.len().saturating_sub(1),
+                        )
+                    }
+                };
                 ffi::eval(&logits);
                 aligned_token_len = final_token_len;
             }
@@ -3639,6 +3668,76 @@ mod tests {
         }
     }
 
+    struct AlignmentReplayStubModel {
+        forward_lengths: std::cell::RefCell<Vec<usize>>,
+        restored_lengths: std::cell::RefCell<Vec<usize>>,
+    }
+
+    impl AlignmentReplayStubModel {
+        fn new() -> Self {
+            Self {
+                forward_lengths: std::cell::RefCell::new(Vec::new()),
+                restored_lengths: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl LanguageModel for AlignmentReplayStubModel {
+        fn forward(
+            &self,
+            input_ids: &MlxArray,
+            _caches: &mut [KVCache],
+            _mask: Option<&MlxArray>,
+        ) -> UniquePtr<MlxArray> {
+            let len = ffi::array_shape(input_ids)[1] as usize;
+            let call_index = self.forward_lengths.borrow().len();
+            self.forward_lengths.borrow_mut().push(len);
+            let winner = if call_index == 1 { 3 } else { 1 };
+            let mut logits = vec![0.0_f32; len * 4];
+            for row in logits.chunks_exact_mut(4) {
+                row[winner] = 10.0;
+            }
+            ffi::from_slice_f32(&logits, &[1, len as i32, 4])
+        }
+
+        fn make_caches(&self) -> Vec<KVCache> {
+            vec![KVCache::new()]
+        }
+
+        fn num_layers(&self) -> usize {
+            1
+        }
+
+        fn eos_token_ids(&self) -> Vec<i32> {
+            vec![3]
+        }
+
+        fn supports_snapshot_reuse(&self) -> bool {
+            true
+        }
+
+        fn snapshot_sequence_state(
+            &self,
+            _seq_id: SequenceId,
+            token_len: usize,
+            _previous: Option<&ModelStateSnapshot>,
+        ) -> Option<ModelStateSnapshot> {
+            Some(ModelStateSnapshot::new("alignment-replay-stub", token_len))
+        }
+
+        fn restore_sequence_state(
+            &self,
+            _seq_id: SequenceId,
+            snapshot: &ModelStateSnapshot,
+        ) -> Result<(), String> {
+            if snapshot.family() != "alignment-replay-stub" {
+                return Err("unexpected alignment replay snapshot family".to_string());
+            }
+            self.restored_lengths.borrow_mut().push(snapshot.token_len());
+            Ok(())
+        }
+    }
+
     /// The chunk gate applies only when configured, supported, and useful.
     #[test]
     fn effective_prefill_chunk_gates_correctly() {
@@ -4583,6 +4682,44 @@ mod tests {
             )
             .expect("cold divergent generation");
         assert_eq!(divergent.token_ids, cold.token_ids);
+    }
+
+    #[test]
+    fn controlled_generation_final_alignment_reuses_cached_prefix() {
+        let model = AlignmentReplayStubModel::new();
+        let prefix = ModelStateSnapshot::new("alignment-replay-stub", 4);
+        let result = CxxGenerator::new(1)
+            .generate_streaming_controlled(
+                &model,
+                &[10, 11, 12, 13, 14, 15],
+                Some(PrefixReuse {
+                    snapshot: &prefix,
+                    cached_tokens: 4,
+                }),
+                4,
+                &SamplingConfig::greedy(),
+                None,
+                &[],
+                |_| true,
+            )
+            .expect("cached generation with EOS alignment");
+
+        assert_eq!(result.token_ids, vec![1]);
+        assert_eq!(result.stop_reason, GenerationStopReason::Eos);
+        assert_eq!(result.cached_tokens, 4);
+        assert_eq!(
+            result
+                .final_snapshot
+                .as_ref()
+                .map(ModelStateSnapshot::token_len),
+            Some(6)
+        );
+        assert_eq!(*model.restored_lengths.borrow(), vec![4, 4]);
+        assert_eq!(
+            *model.forward_lengths.borrow(),
+            vec![2, 1, 2],
+            "final alignment must replay only the uncached suffix, not the full prompt",
+        );
     }
 
     #[test]

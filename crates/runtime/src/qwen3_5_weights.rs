@@ -334,6 +334,10 @@ pub(crate) trait Qwen35WeightSource {
     fn qwen38_fusion_enabled(&self) -> bool {
         false
     }
+
+    fn is_pinned_qwen38_gguf(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(any(feature = "specprefill", test))]
@@ -1059,6 +1063,10 @@ impl Qwen35WeightSource for GgufWeightSource {
 
     fn qwen38_fusion_enabled(&self) -> bool {
         self.enable_fusion && cfg!(target_os = "macos")
+    }
+
+    fn is_pinned_qwen38_gguf(&self) -> bool {
+        true
     }
 }
 
