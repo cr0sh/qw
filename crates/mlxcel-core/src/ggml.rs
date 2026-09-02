@@ -132,6 +132,8 @@ pub enum GgmlKernelPath {
     VerifyM2To4,
     TiledQmm16x8,
     TiledQmm32x8,
+    AffineQmv,
+    AffineQmm,
     Embedding,
 }
 
@@ -677,7 +679,7 @@ fn validate_iq3_grid() -> Result<(), GgmlQuantError> {
 }
 
 // Canonical ggml IQ3_S codebook (ggml-common.h `iq3s_grid`).
-const IQ3S_GRID: [u32; 512] = [
+pub(crate) const IQ3S_GRID: [u32; 512] = [
     0x01010101, 0x01010103, 0x01010105, 0x0101010b, 0x0101010f, 0x01010301, 0x01010303, 0x01010305,
     0x01010309, 0x0101030d, 0x01010501, 0x01010503, 0x0101050b, 0x01010707, 0x01010901, 0x01010905,
     0x0101090b, 0x0101090f, 0x01010b03, 0x01010b07, 0x01010d01, 0x01010d05, 0x01010f03, 0x01010f09,

@@ -3280,9 +3280,14 @@ pub mod cache;
 // Pure-Rust wrappers around frequently used FFI entry points.
 mod ops;
 pub mod ggml;
+pub mod ggml_affine;
 pub use ggml::{
     GgmlDispatchStats, GgmlKernelPath, GgmlQType, GgmlQuantError,
     GgmlQuantizedEmbedding, GgmlQuantizedMatrix, GgmlQuantizedRows,
+};
+pub use ggml_affine::{
+    GgmlAffineEmbedding, GgmlAffineError, GgmlAffineMatrix, GgmlAffineRows,
+    GgmlAffineTranscodeStats,
 };
 
 // Common utility functions
