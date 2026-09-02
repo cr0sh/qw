@@ -12,13 +12,7 @@ fi
 
 # shellcheck source=/dev/null
 source "$ENV_FILE"
-MODEL_DIR=${QW_BENCH_MODEL:?QW_BENCH_MODEL is not set in .autoresearch.env}
 DRAFT_MODEL_DIR=${QW_BENCH_DRAFT_MODEL:?QW_BENCH_DRAFT_MODEL is not set in .autoresearch.env}
-
-if [[ ! -f "$MODEL_DIR/config.json" ]]; then
-    printf 'missing target checkpoint: %s\n' "$MODEL_DIR" >&2
-    exit 1
-fi
 
 if [[ ! -f "$DRAFT_MODEL_DIR/config.json" ]]; then
     printf 'missing DFlash2 checkpoint: %s\n' "$DRAFT_MODEL_DIR" >&2
@@ -28,7 +22,6 @@ fi
 rm -f "$RESULT_FILE"
 
 CARGO_TERM_COLOR=never \
-QW_MODEL_PATH="$MODEL_DIR" \
 QW_BENCH_DRAFT_MODEL="$DRAFT_MODEL_DIR" \
     cargo bench --offline -p qw-runtime --bench single_user_throughput \
     --features dflash2 -- single_user_decode/long_64k_dflash2 |
