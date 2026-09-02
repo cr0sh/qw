@@ -1,7 +1,15 @@
-use std::io::{Error, ErrorKind};
+use std::fs::{File, OpenOptions};
+use std::io::{Error, ErrorKind, Seek};
 use std::path::{Path, PathBuf};
 
+#[cfg(target_os = "macos")]
+use std::os::unix::fs::OpenOptionsExt;
+
 use anyhow::{Context, Result, ensure};
+
+// Darwin's O_NOFOLLOW_ANY rejects symlinks in every pathname component.
+#[cfg(target_os = "macos")]
+const O_NOFOLLOW_ANY: i32 = 0x2000_0000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PinnedArtifactRole {
@@ -40,6 +48,18 @@ pub const PINNED_MTP: PinnedArtifact = PinnedArtifact {
 
 pub const PINNED_ARTIFACTS: [PinnedArtifact; 2] = [PINNED_TARGET, PINNED_MTP];
 
+#[derive(Debug)]
+pub(crate) struct VerifiedArtifactFile {
+    path: PathBuf,
+    file: File,
+}
+
+impl VerifiedArtifactFile {
+    pub(crate) fn into_parts(self) -> (PathBuf, File) {
+        (self.path, self.file)
+    }
+}
+
 pub fn pinned_model_dir(home: &Path) -> PathBuf {
     home.join(PINNED_CACHE_RELATIVE_DIR)
 }
@@ -60,33 +80,80 @@ pub fn verify_mtp_file(path: &Path) -> Result<()> {
     verify_artifact_file(path, PINNED_MTP)
 }
 
-pub fn verify_artifact_file(path: &Path, artifact: PinnedArtifact) -> Result<()> {
-    let metadata = std::fs::symlink_metadata(path)
+fn open_verified_artifact_file(
+    path: &Path,
+    artifact: PinnedArtifact,
+) -> Result<VerifiedArtifactFile> {
+    open_verified_file(path, artifact.size, artifact.sha256)
+}
+
+fn open_verified_file(
+    path: &Path,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> Result<VerifiedArtifactFile> {
+    let path_metadata = std::fs::symlink_metadata(path)
         .with_context(|| format!("failed to stat pinned artifact {}", path.display()))?;
     ensure!(
-        metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
+        path_metadata.file_type().is_file() && !path_metadata.file_type().is_symlink(),
         "pinned artifact is not a regular non-symlink file: {}",
         path.display()
     );
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "macos")]
+    options.custom_flags(O_NOFOLLOW_ANY);
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("failed to open pinned artifact {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to stat opened pinned artifact {}", path.display()))?;
     ensure!(
-        metadata.len() == artifact.size,
+        metadata.file_type().is_file(),
+        "opened pinned artifact is not a regular file: {}",
+        path.display()
+    );
+    ensure!(
+        metadata.len() == expected_size,
         "pinned artifact {} has {} bytes; expected {}",
         path.display(),
         metadata.len(),
-        artifact.size
+        expected_size
     );
-    let digest = crate::sha256::sha256_file(path)
+    let digest = crate::sha256::sha256_reader(&mut file)
         .with_context(|| format!("failed to hash pinned artifact {}", path.display()))?;
     ensure!(
-        digest == artifact.sha256,
+        digest == expected_sha256,
         "pinned artifact {} SHA-256 {digest} does not match {}",
         path.display(),
-        artifact.sha256
+        expected_sha256
     );
-    Ok(())
+    file.rewind()
+        .with_context(|| format!("failed to rewind pinned artifact {}", path.display()))?;
+    Ok(VerifiedArtifactFile {
+        path: path.to_owned(),
+        file,
+    })
 }
 
-pub(crate) fn verify_pair_directory(root: &Path) -> Result<(PathBuf, PathBuf)> {
+#[cfg(test)]
+pub(crate) fn open_verified_test_file(
+    path: &Path,
+    expected_size: u64,
+    expected_sha256: &str,
+) -> Result<VerifiedArtifactFile> {
+    open_verified_file(path, expected_size, expected_sha256)
+}
+
+pub fn verify_artifact_file(path: &Path, artifact: PinnedArtifact) -> Result<()> {
+    open_verified_artifact_file(path, artifact).map(drop)
+}
+
+pub(crate) fn verify_pair_directory(
+    root: &Path,
+) -> Result<(VerifiedArtifactFile, VerifiedArtifactFile)> {
     let metadata = std::fs::symlink_metadata(root)
         .with_context(|| format!("failed to stat pinned model directory {}", root.display()))?;
     ensure!(
@@ -94,10 +161,9 @@ pub(crate) fn verify_pair_directory(root: &Path) -> Result<(PathBuf, PathBuf)> {
         "pinned model path is not a non-symlink directory: {}",
         root.display()
     );
-    let target = root.join(PINNED_TARGET.relative_path);
-    let mtp = root.join(PINNED_MTP.relative_path);
-    verify_target_file(&target)?;
-    verify_mtp_file(&mtp)?;
+    let target =
+        open_verified_artifact_file(&root.join(PINNED_TARGET.relative_path), PINNED_TARGET)?;
+    let mtp = open_verified_artifact_file(&root.join(PINNED_MTP.relative_path), PINNED_MTP)?;
     Ok((target, mtp))
 }
 
@@ -108,6 +174,12 @@ pub fn io_verify_artifact_file(path: &Path, artifact: PinnedArtifact) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_path(label: &str) -> PathBuf {
+        std::fs::canonicalize(std::env::temp_dir())
+            .expect("canonical temp directory")
+            .join(format!("qw-pinned-{label}-{}", std::process::id()))
+    }
 
     #[test]
     fn fixed_resolver_has_no_cli_or_environment_precedence() {
@@ -128,11 +200,7 @@ mod tests {
 
     #[test]
     fn payload_mutation_is_rejected_by_sha_verification() {
-        let path = std::env::temp_dir().join(format!(
-            "qw-pinned-sha-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
+        let path = temp_path("sha");
         std::fs::write(&path, b"abc").expect("write fixture");
         let artifact = PinnedArtifact {
             role: PinnedArtifactRole::Target,
@@ -148,5 +216,39 @@ mod tests {
             .to_string();
         assert!(error.contains("SHA-256"), "{error}");
         std::fs::remove_file(path).expect("remove fixture");
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn darwin_rejects_symlinks_in_every_artifact_path_component() {
+        use std::os::unix::fs::symlink;
+
+        let base = temp_path("nofollow-any");
+        let real = base.join("real");
+        let root = base.join("root");
+        std::fs::create_dir_all(&real).expect("create real directory");
+        std::fs::create_dir_all(&root).expect("create model root");
+        std::fs::write(real.join("fixture.gguf"), b"abc").expect("write fixture");
+        let artifact = PinnedArtifact {
+            role: PinnedArtifactRole::Target,
+            source_path: "fixture.gguf",
+            relative_path: "fixture.gguf",
+            size: 3,
+            sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        };
+
+        let root_link = base.join("root-link");
+        symlink(&real, &root_link).expect("link model root");
+        verify_artifact_file(&root_link.join("fixture.gguf"), artifact)
+            .expect_err("symlinked model root must be rejected");
+
+        symlink(&real, root.join("MTP")).expect("link MTP directory");
+        verify_artifact_file(&root.join("MTP/fixture.gguf"), artifact)
+            .expect_err("symlinked MTP directory must be rejected");
+
+        symlink(real.join("fixture.gguf"), root.join("fixture.gguf")).expect("link artifact leaf");
+        verify_artifact_file(&root.join("fixture.gguf"), artifact)
+            .expect_err("symlinked artifact leaf must be rejected");
+
+        std::fs::remove_dir_all(base).expect("remove fixtures");
     }
 }

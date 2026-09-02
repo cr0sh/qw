@@ -1,5 +1,4 @@
 use std::cell::RefCell;
-use std::fs::File;
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
@@ -74,9 +73,7 @@ impl Qwen35Linear {
     pub(crate) fn select_gguf_rows(&self, ranges: &[std::ops::Range<usize>]) -> Option<Self> {
         match self {
             Self::Affine(linear) => linear.select_rows(ranges).ok().map(Self::AffineRows),
-            Self::PinnedM23Affine(linear) => {
-                linear.select_rows(ranges).ok().map(Self::AffineRows)
-            }
+            Self::PinnedM23Affine(linear) => linear.select_rows(ranges).ok().map(Self::AffineRows),
             Self::Gguf(linear) => linear.select_rows(ranges).ok().map(Self::GgufRows),
             #[cfg(any(feature = "specprefill", test))]
             Self::Legacy(_) => None,
@@ -800,9 +797,7 @@ impl Qwen35WeightSource for GgufWeightSource {
 }
 
 fn map_file(file: &GgufFile) -> Result<Mmap> {
-    let handle = File::open(file.path())
-        .with_context(|| format!("failed to open GGUF {}", file.path().display()))?;
-    let map = unsafe { MmapOptions::new().map(&handle) }
+    let map = unsafe { MmapOptions::new().map(file.handle()) }
         .with_context(|| format!("failed to mmap GGUF {}", file.path().display()))?;
     map.advise(Advice::Sequential)
         .with_context(|| format!("failed to mark GGUF {} sequential", file.path().display()))?;
@@ -951,9 +946,9 @@ mod tests {
             LayerTensor::LinearOutput,
         ];
         const EXPECTED_LAYERS: [usize; 64] = [
-            6, 5, 5, 4, 6, 6, 4, 4, 6, 6, 6, 4, 6, 6, 6, 4, 6, 6, 6, 4, 6, 5, 5, 4, 5,
-            5, 6, 4, 5, 6, 6, 4, 6, 6, 6, 4, 6, 6, 6, 4, 6, 6, 6, 4, 6, 6, 6, 4, 6, 6,
-            5, 4, 5, 6, 6, 4, 4, 4, 3, 1, 5, 6, 5, 1,
+            6, 5, 5, 4, 6, 6, 4, 4, 6, 6, 6, 4, 6, 6, 6, 4, 6, 6, 6, 4, 6, 5, 5, 4, 5, 5, 6, 4, 5,
+            6, 6, 4, 6, 6, 6, 4, 6, 6, 6, 4, 6, 6, 6, 4, 6, 6, 6, 4, 6, 6, 5, 4, 5, 6, 6, 4, 4, 4,
+            3, 1, 5, 6, 5, 1,
         ];
 
         let mut signatures = Vec::new();
@@ -969,8 +964,7 @@ mod tests {
                         pinned_slot(slot),
                         Ok(PinnedSlot::Target(signature.target_slot))
                     );
-                    let descriptor =
-                        &crate::qwen38_plan::TARGET_TENSOR_PLAN[signature.target_slot];
+                    let descriptor = &crate::qwen38_plan::TARGET_TENSOR_PLAN[signature.target_slot];
                     assert_eq!(descriptor.qtype, signature.qtype);
                     assert_eq!(descriptor.dimensions, signature.dimensions);
                     signatures.push(signature);
@@ -1106,8 +1100,7 @@ mod tests {
                     .map(|index| {
                         let row = index / width;
                         let column = index % width;
-                        (column as i32 % 43 - 21) as f32 * 0.001953125
-                            + row as f32 * 0.00048828125
+                        (column as i32 % 43 - 21) as f32 * 0.001953125 + row as f32 * 0.00048828125
                     })
                     .collect::<Vec<_>>();
                 let input =
@@ -1127,9 +1120,7 @@ mod tests {
                     assert_eq!(selected_stats, split_stats);
                 }
                 let split = matrix.forward(input.as_ref().unwrap()).unwrap();
-                let one_pass = matrix
-                    .forward_qwen38_m23(input.as_ref().unwrap())
-                    .unwrap();
+                let one_pass = matrix.forward_qwen38_m23(input.as_ref().unwrap()).unwrap();
                 mlxcel_core::eval(split.as_ref().unwrap());
                 mlxcel_core::eval(one_pass.as_ref().unwrap());
                 let split = mlxcel_core::array_to_raw_bytes(split.as_ref().unwrap());

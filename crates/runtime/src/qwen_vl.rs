@@ -13,7 +13,10 @@ pub fn insert_qwen_vl_image_tokens(
     vision_start_token_id: i32,
     image_token_id: i32,
 ) -> Result<ExpandedImageTokens> {
-    ensure!(!prompt_tokens.is_empty(), "image prompt token sequence is empty");
+    ensure!(
+        !prompt_tokens.is_empty(),
+        "image prompt token sequence is empty"
+    );
     ensure!(!grid_thw.is_empty(), "image grid list is empty");
     ensure!(spatial_merge_size > 0, "spatial merge size must be nonzero");
     let merge = i32::try_from(spatial_merge_size)
@@ -59,9 +62,8 @@ pub fn insert_qwen_vl_image_tokens(
     }
 
     let total_image_tokens: usize = counts.iter().sum();
-    let mut expanded = Vec::with_capacity(
-        prompt_tokens.len() + total_image_tokens.saturating_sub(grid_thw.len()),
-    );
+    let mut expanded =
+        Vec::with_capacity(prompt_tokens.len() + total_image_tokens.saturating_sub(grid_thw.len()));
     let mut image_index = 0;
     for &token in prompt_tokens.iter() {
         if token == image_token_id {
@@ -94,14 +96,8 @@ mod tests {
     #[test]
     fn expands_multiple_images_in_declared_order() {
         let mut tokens = vec![100, 103, 101, 9, 100, 103, 101];
-        let stats = insert_qwen_vl_image_tokens(
-            &mut tokens,
-            &[(1, 4, 4), (1, 2, 4)],
-            2,
-            100,
-            103,
-        )
-        .expect("expand image tokens");
+        let stats = insert_qwen_vl_image_tokens(&mut tokens, &[(1, 4, 4), (1, 2, 4)], 2, 100, 103)
+            .expect("expand image tokens");
         assert_eq!(stats.total_image_tokens, 6);
         assert_eq!(tokens.iter().filter(|&&token| token == 103).count(), 6);
         assert_eq!(&tokens[..6], &[100, 103, 103, 103, 103, 101]);
@@ -123,16 +119,10 @@ mod tests {
     #[test]
     fn rejects_unframed_and_nondivisible_image_grids() {
         let mut unframed = vec![1, 103, 2];
-        assert!(insert_qwen_vl_image_tokens(&mut unframed, &[(1, 4, 4)], 2, 100, 103)
-            .is_err());
+        assert!(insert_qwen_vl_image_tokens(&mut unframed, &[(1, 4, 4)], 2, 100, 103).is_err());
         let mut nondivisible = vec![100, 103, 101];
-        assert!(insert_qwen_vl_image_tokens(
-            &mut nondivisible,
-            &[(1, 3, 4)],
-            2,
-            100,
-            103,
-        )
-        .is_err());
+        assert!(
+            insert_qwen_vl_image_tokens(&mut nondivisible, &[(1, 3, 4)], 2, 100, 103,).is_err()
+        );
     }
 }

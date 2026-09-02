@@ -52,26 +52,21 @@ use std::time::{Duration, Instant};
 
 use mlxcel_core::cache::SequenceId;
 use mlxcel_core::generate::{LanguageModel, ModelStateSnapshot};
-use mlxcel_core::layers::{
-    KVCache, QuantizedWeight, RMSNorm, RotatingKVCache, UnifiedLinear,
-};
+use mlxcel_core::layers::{KVCache, QuantizedWeight, RMSNorm, RotatingKVCache, UnifiedLinear};
 use mlxcel_core::weights::{WeightMap, load_weights_from_dir};
 use mlxcel_core::{MlxArray, UniquePtr, concatenate, multiply_scalar};
 use serde_json::Value;
 
-use crate::qwen3_5::Qwen35Model;
-use crate::qwen3_5_weights::Qwen35Embedding;
 use crate::portable_snapshot::{
     PortableArray, PortablePromptSnapshot, array_from_portable, array_to_portable,
     portable_model_state,
 };
+use crate::qwen3_5::Qwen35Model;
+use crate::qwen3_5_weights::Qwen35Embedding;
 const DRAFT_QUANT_GROUP_SIZE: i32 = 128;
 const DRAFT_QUANT_BITS: i32 = 4;
 
-fn quantized_draft_linear(
-    weights: &WeightMap,
-    prefix: &str,
-) -> Result<UnifiedLinear, String> {
+fn quantized_draft_linear(weights: &WeightMap, prefix: &str) -> Result<UnifiedLinear, String> {
     let weight_name = format!("{prefix}.weight");
     let dense = weights
         .get(&weight_name)
@@ -85,12 +80,13 @@ fn quantized_draft_linear(
             DRAFT_QUANT_BITS,
         );
     }
-    let quantized =
-        mlxcel_core::quantize_weights(dense, DRAFT_QUANT_GROUP_SIZE, DRAFT_QUANT_BITS);
+    let quantized = mlxcel_core::quantize_weights(dense, DRAFT_QUANT_GROUP_SIZE, DRAFT_QUANT_BITS);
     let weight = mlxcel_core::quantized_weights_w(&quantized);
     let scales = mlxcel_core::quantized_weights_scales(&quantized);
     if !mlxcel_core::quantized_weights_has_biases(&quantized) {
-        return Err(format!("Affine quantization produced no biases for {prefix}"));
+        return Err(format!(
+            "Affine quantization produced no biases for {prefix}"
+        ));
     }
     let biases = mlxcel_core::quantized_weights_biases(&quantized);
     mlxcel_core::eval(&weight);
@@ -110,7 +106,6 @@ fn quantized_draft_linear(
         bias,
     ))
 }
-
 
 // ---------------------------------------------------------------------------
 // # 1. DFlash2 config
@@ -325,11 +320,7 @@ impl DFlash2Config {
                         .ok_or("layer_types must be strings")
                 })
                 .collect::<Result<_, _>>()?,
-            _ => {
-                return Err(
-                    "config layer_types is required for the DFlash2 drafter".to_owned()
-                )
-            }
+            _ => return Err("config layer_types is required for the DFlash2 drafter".to_owned()),
         };
         if layer_types.len() != num_hidden_layers {
             return Err(format!(
@@ -339,11 +330,9 @@ impl DFlash2Config {
             ));
         }
         let sliding_window = match get("sliding_window") {
-            Some(value) => Some(
-                value
-                    .as_u64()
-                    .ok_or("sliding_window must be an integer")? as usize,
-            ),
+            Some(value) => {
+                Some(value.as_u64().ok_or("sliding_window must be an integer")? as usize)
+            }
             None => None,
         };
         if layer_types.iter().any(|t| t == "sliding_attention") && sliding_window.is_none() {
@@ -363,11 +352,7 @@ impl DFlash2Config {
             ));
         }
         let is_causal = match get("is_causal") {
-            Some(value) => Some(
-                value
-                    .as_bool()
-                    .ok_or("is_causal must be a boolean")?,
-            ),
+            Some(value) => Some(value.as_bool().ok_or("is_causal must be a boolean")?),
             None => None,
         };
 
@@ -472,35 +457,22 @@ impl DFlash2GroupedConv {
             &[0, 0, 1, 0, 0],
             &[shape[0], shape[1], 2, self.taps, self.num_groups],
         );
-        let side0 = mlxcel_core::reshape(
-            &side0,
-            &[shape[0], shape[1], self.taps, self.num_groups],
-        );
-        let side1 = mlxcel_core::reshape(
-            &side1,
-            &[shape[0], shape[1], self.taps, self.num_groups],
-        );
+        let side0 = mlxcel_core::reshape(&side0, &[shape[0], shape[1], self.taps, self.num_groups]);
+        let side1 = mlxcel_core::reshape(&side1, &[shape[0], shape[1], self.taps, self.num_groups]);
         let base_shape = mlxcel_core::array_shape(&self.base_kernel);
         let base0 = mlxcel_core::slice(
             &self.base_kernel,
             &[0, 0, 0],
             &[1, self.taps, base_shape[2]],
         );
-        (
-            self.convolve(hidden, &side0, &base0),
-            side1,
-        )
+        (self.convolve(hidden, &side0, &base0), side1)
     }
 
     /// `DFlashGroupedConv.finish`: convolve `hidden` with the kernel returned
     /// by [`Self::prepare`].
     pub fn finish(&self, hidden: &MlxArray, dynamic: &MlxArray) -> UniquePtr<MlxArray> {
         let shape = mlxcel_core::array_shape(hidden);
-        let base1 = mlxcel_core::slice(
-            &self.base_kernel,
-            &[1, 0, 0],
-            &[2, self.taps, shape[2]],
-        );
+        let base1 = mlxcel_core::slice(&self.base_kernel, &[1, 0, 0], &[2, self.taps, shape[2]]);
         self.convolve(hidden, dynamic, &base1)
     }
 
@@ -544,13 +516,9 @@ impl DFlash2GroupedConv {
                 // SGLang `F.pad(blocks[:-tap], (0, 0, 0, 0, tap, 0))`:
                 // prepend `tap` zero rows to blocks[0 : L - tap], so row `j`
                 // sees row `j - tap`.
-                let tail = mlxcel_core::slice(
-                    &blocks,
-                    &[0, 0, 0, 0],
-                    &[batch, length - tap, groups, gs],
-                );
-                let zero_block =
-                    mlxcel_core::zeros(&[batch, tap, groups, gs], hidden_dtype);
+                let tail =
+                    mlxcel_core::slice(&blocks, &[0, 0, 0, 0], &[batch, length - tap, groups, gs]);
+                let zero_block = mlxcel_core::zeros(&[batch, tap, groups, gs], hidden_dtype);
                 mlxcel_core::concatenate(&zero_block, &tail, 1)
             };
             let mut values = values;
@@ -574,22 +542,12 @@ impl DFlash2GroupedConv {
             // singleton broadcasts the per-group kernel over the group_size
             // channels (SGLang `delta.unsqueeze(-1)` against
             // `base.view(1, taps, groups, group_size)`).
-            let delta_tap = mlxcel_core::slice(
-                dynamic,
-                &[0, 0, tap, 0],
-                &[batch, length, tap + 1, groups],
-            );
-            let delta_tap = mlxcel_core::reshape(
-                &delta_tap,
-                &[batch, length, groups, 1],
-            );
+            let delta_tap =
+                mlxcel_core::slice(dynamic, &[0, 0, tap, 0], &[batch, length, tap + 1, groups]);
+            let delta_tap = mlxcel_core::reshape(&delta_tap, &[batch, length, groups, 1]);
             let delta_tap = mlxcel_core::astype(&delta_tap, hidden_dtype);
             // base_tap [1, 1, groups, gs]
-            let base_tap = mlxcel_core::slice(
-                &base,
-                &[0, tap, 0, 0],
-                &[1, tap + 1, groups, gs],
-            );
+            let base_tap = mlxcel_core::slice(&base, &[0, tap, 0, 0], &[1, tap + 1, groups, gs]);
             let base_tap = mlxcel_core::reshape(&base_tap, &[1, 1, groups, gs]);
             // coefficients = base_tap + delta_tap, broadcast [B, L, groups, gs]
             let coefficients = mlxcel_core::add(&base_tap, &delta_tap);
@@ -844,12 +802,7 @@ impl DFlash2Attention {
     /// Additive `[1, 1, L, total]` f32 mask (0.0 = attend, -inf = block),
     /// or `None` when no key needs masking. `keys_combined` is
     /// `[B, H, total, D]`; `S` is the context length after trimming.
-    fn build_mask(
-        &self,
-        l: i32,
-        s: i32,
-        keys_combined: &MlxArray,
-    ) -> Option<UniquePtr<MlxArray>> {
+    fn build_mask(&self, l: i32, s: i32, keys_combined: &MlxArray) -> Option<UniquePtr<MlxArray>> {
         let total = mlxcel_core::array_shape(keys_combined)[2];
         let need_mask = self.is_causal || (self.is_sliding && s + l > self.sliding_window);
         if !need_mask {
@@ -1078,13 +1031,9 @@ impl CandidateSelector {
         let mut path_rows = Vec::with_capacity(npos as usize);
         for position in 0..npos {
             let pred_emb = mlxcel_core::embedding(&self.predecessor_codebook, &predecessor); // [B, rank]
-            let candidate_slice = mlxcel_core::slice(
-                candidates,
-                &[0, position, 0],
-                &[batch, position + 1, k],
-            );
-            let succ_emb =
-                mlxcel_core::embedding(&self.successor_codebook, &candidate_slice); // [B, K, rank]
+            let candidate_slice =
+                mlxcel_core::slice(candidates, &[0, position, 0], &[batch, position + 1, k]);
+            let succ_emb = mlxcel_core::embedding(&self.successor_codebook, &candidate_slice); // [B, K, rank]
             let hidden_row = mlxcel_core::slice(
                 &hidden_proj,
                 &[0, position, 0],
@@ -1101,18 +1050,11 @@ impl CandidateSelector {
                 -1,
                 false,
             ); // [B, K]
-            let unary_row = mlxcel_core::slice(
-                unary,
-                &[0, position, 0],
-                &[batch, position + 1, k],
-            );
+            let unary_row = mlxcel_core::slice(unary, &[0, position, 0], &[batch, position + 1, k]);
             let scores = mlxcel_core::add(&unary_row, &edges); // [B, K]
             let selected = mlxcel_core::argmax(&scores, -1, false); // [B]
-            let candidate_row = mlxcel_core::slice(
-                candidates,
-                &[0, position, 0],
-                &[batch, position + 1, k],
-            );
+            let candidate_row =
+                mlxcel_core::slice(candidates, &[0, position, 0], &[batch, position + 1, k]);
             let selected_emb = mlxcel_core::expand_dims(&selected, -1); // [B, 1]
             let selected_id = mlxcel_core::take_along_axis(&candidate_row, &selected_emb, -1); // [B, 1]
             predecessor = mlxcel_core::reshape(&selected_id, &[batch]); // [B]
@@ -1265,11 +1207,8 @@ impl DFlash2DraftModel {
             &[logits_shape[0], logits_shape[1], vocab],
         );
         let candidates = mlxcel_core::contiguous(&candidates, false);
-        let unary = self.transform_unary_logits(&mlxcel_core::take_along_axis(
-            &logits,
-            &candidates,
-            -1,
-        ));
+        let unary =
+            self.transform_unary_logits(&mlxcel_core::take_along_axis(&logits, &candidates, -1));
         Ok((candidates, unary))
     }
 
@@ -1355,7 +1294,6 @@ impl Dflash2PromptSnapshot {
             + mlxcel_core::array_nbytes(&self.continuation_logits);
         summary
     }
-
 
     pub(crate) fn to_portable(&self) -> PortablePromptSnapshot {
         PortablePromptSnapshot::Dflash2 {
@@ -1513,7 +1451,6 @@ impl Qwen35Dflash2Generator {
         })
     }
 
-
     /// Generate greedily with DFlash2 draft verification.
     pub fn generate_streaming<F: FnMut(i32) -> bool>(
         &mut self,
@@ -1643,8 +1580,7 @@ impl Qwen35Dflash2Generator {
 
             // Reuse the host block buffer; only the staged anchor changes.
             draft_block[0] = bonus;
-            let inputs =
-                mlxcel_core::from_slice_i32(&draft_block[..bs], &[1, bs as i32]);
+            let inputs = mlxcel_core::from_slice_i32(&draft_block[..bs], &[1, bs as i32]);
             let out = self
                 .model
                 .propose(&inputs, &hidden_concat, &mut self.caches, target)?;
@@ -1700,8 +1636,7 @@ impl Qwen35Dflash2Generator {
 
             // Concatenate only committed rows; rejected verify rows never feed
             // the next draft round.
-            hidden_concat =
-                concatenate_hiddens(&verify.hidden_by_layer, walk.accepted + 1);
+            hidden_concat = concatenate_hiddens(&verify.hidden_by_layer, walk.accepted + 1);
             bonus = *walk
                 .new_tokens
                 .last()
@@ -1748,30 +1683,18 @@ fn merge_hidden_context(
         return combined;
     }
     let start = shape[1] - i32::try_from(hidden_limit).unwrap_or(i32::MAX);
-    mlxcel_core::slice(
-        &combined,
-        &[0, start, 0],
-        &[shape[0], shape[1], shape[2]],
-    )
+    mlxcel_core::slice(&combined, &[0, start, 0], &[shape[0], shape[1], shape[2]])
 }
 
-
 /// Concatenate a `[1, L, H]` per-target-layer hidden list along `-1`.
-fn concatenate_hiddens(
-    hiddens: &[UniquePtr<MlxArray>],
-    prefix_len: usize,
-) -> UniquePtr<MlxArray> {
+fn concatenate_hiddens(hiddens: &[UniquePtr<MlxArray>], prefix_len: usize) -> UniquePtr<MlxArray> {
     debug_assert!(
         !hiddens.is_empty(),
         "DFlash2 verify must capture hidden states"
     );
     let prefix = |hidden: &MlxArray| {
         let shape = mlxcel_core::array_shape(hidden);
-        mlxcel_core::slice(
-            hidden,
-            &[0, 0, 0],
-            &[shape[0], prefix_len as i32, shape[2]],
-        )
+        mlxcel_core::slice(hidden, &[0, 0, 0], &[shape[0], prefix_len as i32, shape[2]])
     };
     let mut acc = prefix(hiddens[0].as_ref().expect("captured hidden"));
     for hidden in &hiddens[1..] {
@@ -1916,7 +1839,11 @@ mod tests {
             let pos = mlxcel_core::slice(
                 &out,
                 &[0, (i / out_shape[2]) as i32, (i % out_shape[2]) as i32],
-                &[1, (i / out_shape[2]) as i32 + 1, (i % out_shape[2]) as i32 + 1],
+                &[
+                    1,
+                    (i / out_shape[2]) as i32 + 1,
+                    (i % out_shape[2]) as i32 + 1,
+                ],
             );
             got.push(mlxcel_core::item_f32(&pos));
         }

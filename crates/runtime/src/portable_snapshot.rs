@@ -5,9 +5,9 @@ use mlxcel_core::generate::{ModelStateSnapshot, SnapshotPage};
 use mlxcel_core::{MlxArray, UniquePtr};
 
 use crate::provider::PromptSnapshot;
-use crate::qwen3_5_mtp::MtpPromptSnapshot;
 #[cfg(any(feature = "dflash2", test))]
 use crate::qwen3_5_dflash::Dflash2PromptSnapshot;
+use crate::qwen3_5_mtp::MtpPromptSnapshot;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortablePage {

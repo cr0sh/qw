@@ -1,6 +1,6 @@
 use anyhow::{Result, ensure};
-use image::imageops::{FilterType, resize};
 use image::RgbImage;
+use image::imageops::{FilterType, resize};
 use mlxcel_core::{MlxArray, UniquePtr};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -13,10 +13,7 @@ pub struct PreparedImage {
 impl PreparedImage {
     pub(crate) fn to_mlx(&self) -> UniquePtr<MlxArray> {
         let rows = self.patches.len() / self.row_width;
-        mlxcel_core::from_slice_f32(
-            &self.patches,
-            &[rows as i32, self.row_width as i32],
-        )
+        mlxcel_core::from_slice_f32(&self.patches, &[rows as i32, self.row_width as i32])
     }
 }
 
@@ -72,8 +69,7 @@ impl QwenVLProcessor {
             width = ((width as f64 * scale / factor as f64).round() as u32).max(1) * factor;
         }
         if height as usize * width as usize > self.max_pixels {
-            let scale =
-                (self.max_pixels as f64 / (height as usize * width as usize) as f64).sqrt();
+            let scale = (self.max_pixels as f64 / (height as usize * width as usize) as f64).sqrt();
             height = ((height as f64 * scale / factor as f64).floor() as u32).max(1) * factor;
             width = ((width as f64 * scale / factor as f64).floor() as u32).max(1) * factor;
         }
@@ -98,8 +94,9 @@ impl QwenVLProcessor {
         height: u32,
         rgb: Vec<u8>,
     ) -> Result<PreparedImage> {
-        let image = RgbImage::from_raw(width, height, rgb)
-            .ok_or_else(|| anyhow::anyhow!("decoded RGB image dimensions do not match its buffer"))?;
+        let image = RgbImage::from_raw(width, height, rgb).ok_or_else(|| {
+            anyhow::anyhow!("decoded RGB image dimensions do not match its buffer")
+        })?;
         Ok(self.prepare_rgb(&image))
     }
 
@@ -120,12 +117,8 @@ impl QwenVLProcessor {
             }
         }
 
-        let mut patches = Vec::with_capacity(
-            h_patches
-                * w_patches
-                * self.temporal_patch_size
-                * row_width,
-        );
+        let mut patches =
+            Vec::with_capacity(h_patches * w_patches * self.temporal_patch_size * row_width);
         for block_y in 0..h_patches / self.spatial_merge_size {
             for block_x in 0..w_patches / self.spatial_merge_size {
                 for inner_y in 0..self.spatial_merge_size {
@@ -167,14 +160,12 @@ mod tests {
     use super::*;
 
     fn processor() -> QwenVLProcessor {
-        QwenVLProcessor::new(14, 2, 2, 4 * 28 * 28, 16_384 * 28 * 28)
-            .expect("processor")
+        QwenVLProcessor::new(14, 2, 2, 4 * 28 * 28, 16_384 * 28 * 28).expect("processor")
     }
 
     #[test]
     fn smart_resize_honors_exact_factor_and_pixel_boundaries() {
-        let processor = QwenVLProcessor::new(14, 2, 2, 28 * 28, 56 * 56)
-            .expect("processor");
+        let processor = QwenVLProcessor::new(14, 2, 2, 28 * 28, 56 * 56).expect("processor");
         assert_eq!(processor.smart_resize(1, 1), (28, 28));
         assert_eq!(processor.smart_resize(56, 56), (56, 56));
         let (height, width) = processor.smart_resize(500, 500);

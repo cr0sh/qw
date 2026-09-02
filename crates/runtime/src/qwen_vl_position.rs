@@ -13,11 +13,7 @@ impl QwenRopePositions {
         let temporal = mlxcel_core::from_slice_i32(&self.axes[0], &[1, 1, sequence]);
         let height = mlxcel_core::from_slice_i32(&self.axes[1], &[1, 1, sequence]);
         let width = mlxcel_core::from_slice_i32(&self.axes[2], &[1, 1, sequence]);
-        mlxcel_core::concatenate(
-            &mlxcel_core::concatenate(&temporal, &height, 0),
-            &width,
-            0,
-        )
+        mlxcel_core::concatenate(&mlxcel_core::concatenate(&temporal, &height, 0), &width, 0)
     }
 }
 
@@ -54,9 +50,9 @@ pub(crate) fn compute_rope_index(
             }
         }
         current_position += (vision_start - segment_start) as i32;
-        let &(temporal, height, width) = grids.get(image_index).ok_or_else(|| {
-            anyhow::anyhow!("image token run count exceeds image grid count")
-        })?;
+        let &(temporal, height, width) = grids
+            .get(image_index)
+            .ok_or_else(|| anyhow::anyhow!("image token run count exceeds image grid count"))?;
         ensure!(
             height % merge == 0 && width % merge == 0,
             "image grid is not divisible by spatial merge size"

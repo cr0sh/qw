@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, symlink_metadata};
-use std::io::Read;
+use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -159,6 +159,7 @@ pub(crate) struct GgufTensorInfo {
 #[derive(Debug)]
 pub(crate) struct GgufFile {
     path: PathBuf,
+    file: File,
     file_len: u64,
     data_offset: u64,
     alignment: u32,
@@ -173,18 +174,34 @@ impl GgufFile {
 
     pub(crate) fn open_with_limits(path: &Path, limits: GgufLimits) -> Result<Self> {
         validate_local_file(path)?;
-        let file_len = symlink_metadata(path)
-            .with_context(|| format!("failed to stat GGUF {}", path.display()))?
-            .len();
+        let file =
+            File::open(path).with_context(|| format!("failed to open GGUF {}", path.display()))?;
+        Self::from_open_file(path.to_owned(), file, limits)
+    }
+
+    fn from_verified(file: crate::pinned_model::VerifiedArtifactFile) -> Result<Self> {
+        let (path, file) = file.into_parts();
+        Self::from_open_file(path, file, GgufLimits::default())
+    }
+
+    fn from_open_file(path: PathBuf, mut file: File, limits: GgufLimits) -> Result<Self> {
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("failed to stat GGUF {}", path.display()))?;
+        ensure!(
+            metadata.file_type().is_file(),
+            "GGUF path must be a regular file"
+        );
+        let file_len = metadata.len();
         ensure!(
             file_len <= limits.max_file_bytes,
             "GGUF file exceeds byte limit"
         );
         ensure!(file_len >= 24, "GGUF file is shorter than its fixed header");
 
-        let file =
-            File::open(path).with_context(|| format!("failed to open GGUF {}", path.display()))?;
-        let mut reader = BoundedReader::new(file, file_len, limits.max_header_bytes);
+        file.rewind()
+            .with_context(|| format!("failed to rewind GGUF {}", path.display()))?;
+        let mut reader = BoundedReader::new(&mut file, file_len, limits.max_header_bytes);
         ensure!(reader.bytes::<4>()? == GGUF_MAGIC, "invalid GGUF magic");
         let version = reader.u32()?;
         ensure!(
@@ -339,7 +356,8 @@ impl GgufFile {
         }
 
         Ok(Self {
-            path: path.to_owned(),
+            path,
+            file,
             file_len,
             data_offset,
             alignment,
@@ -350,6 +368,9 @@ impl GgufFile {
 
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+    pub(crate) fn handle(&self) -> &File {
+        &self.file
     }
 
     pub(crate) fn metadata(&self) -> &BTreeMap<String, MetadataValue> {
@@ -375,9 +396,10 @@ impl PinnedGgufPair {
 
     fn open_in(root: &Path) -> Result<Self> {
         // Payload integrity is established before parsing, mmap, MLX, or FFI.
-        let (target_path, mtp_path) = crate::pinned_model::verify_pair_directory(root)?;
-        let target = GgufFile::open(&target_path).context("failed to parse pinned target GGUF")?;
-        let mtp = GgufFile::open(&mtp_path).context("failed to parse pinned MTP GGUF")?;
+        let (target_file, mtp_file) = crate::pinned_model::verify_pair_directory(root)?;
+        let target =
+            GgufFile::from_verified(target_file).context("failed to parse pinned target GGUF")?;
+        let mtp = GgufFile::from_verified(mtp_file).context("failed to parse pinned MTP GGUF")?;
         validate_plan(
             &target,
             crate::pinned_model::PINNED_TARGET.size,
@@ -720,15 +742,15 @@ fn align_up(value: u64, alignment: u64) -> Option<u64> {
         .map(|value| value / alignment * alignment)
 }
 
-struct BoundedReader {
-    file: File,
+struct BoundedReader<'a> {
+    file: &'a mut File,
     position: u64,
     file_len: u64,
     max_position: u64,
 }
 
-impl BoundedReader {
-    fn new(file: File, file_len: u64, max_position: u64) -> Self {
+impl<'a> BoundedReader<'a> {
+    fn new(file: &'a mut File, file_len: u64, max_position: u64) -> Self {
         Self {
             file,
             position: 0,
@@ -801,6 +823,7 @@ impl BoundedReader {
 
 #[cfg(test)]
 mod tests {
+    use memmap2::MmapOptions;
     use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -822,14 +845,13 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("qw-gguf-{label}-{}-{id}", std::process::id()));
         fs::create_dir_all(&path).unwrap();
-        path
+        fs::canonicalize(path).unwrap()
     }
 
     fn string(bytes: &mut Vec<u8>, value: &str) {
         bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
         bytes.extend_from_slice(value.as_bytes());
     }
-
 
     fn build_gguf(metadata: &[(&str, MetadataValue)], tensors: &[TestTensor<'_>]) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -885,28 +907,28 @@ mod tests {
         bytes
     }
 
-    fn write_valid_file(path: &Path, name: &str) {
+    fn valid_file_bytes(name: &str, fill: u8) -> Vec<u8> {
         let tensor = TestTensor {
             name,
             dimensions: &[32],
             tensor_type: 8,
             offset: 0,
-            data: vec![0; 34],
+            data: vec![fill; 34],
         };
-        fs::write(
-            path,
-            build_gguf(
-                &[
-                    ("general.alignment", MetadataValue::Uint32(32)),
-                    (
-                        "general.architecture",
-                        MetadataValue::String("qwen3next".into()),
-                    ),
-                ],
-                &[tensor],
-            ),
+        build_gguf(
+            &[
+                ("general.alignment", MetadataValue::Uint32(32)),
+                (
+                    "general.architecture",
+                    MetadataValue::String("qwen3next".into()),
+                ),
+            ],
+            &[tensor],
         )
-        .unwrap();
+    }
+
+    fn write_valid_file(path: &Path, name: &str) {
+        fs::write(path, valid_file_bytes(name, 0)).unwrap();
     }
 
     #[test]
@@ -924,6 +946,36 @@ mod tests {
         assert_eq!(tensor.byte_len, 34);
         assert_eq!(tensor.absolute_offset, file.data_offset);
         assert_eq!(file.file_len, file.data_offset + 34);
+        fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn verified_handle_pins_parser_and_mmap_identity_after_path_replacement() {
+        let directory = temp_dir("verified-identity");
+        let path = directory.join("model.gguf");
+        let replacement_path = directory.join("replacement.gguf");
+        let original = valid_file_bytes("original.weight", 0x11);
+        let replacement = valid_file_bytes("replaced.weight", 0x22);
+        assert_eq!(original.len(), replacement.len());
+        fs::write(&path, &original).expect("write original GGUF");
+        fs::write(&replacement_path, &replacement).expect("write replacement GGUF");
+
+        let digest = crate::sha256::sha256_file(&path).expect("hash original GGUF");
+        let verified =
+            crate::pinned_model::open_verified_test_file(&path, original.len() as u64, &digest)
+                .expect("verify original GGUF");
+        fs::rename(&replacement_path, &path).expect("replace verified GGUF path");
+
+        let file = GgufFile::from_verified(verified).expect("parse verified handle");
+        assert_eq!(file.tensors[0].name, "original.weight");
+        let map = unsafe { MmapOptions::new().map(file.handle()) }.expect("mmap verified handle");
+        let tensor = &file.tensors[0];
+        let start = usize::try_from(tensor.absolute_offset).expect("tensor start");
+        let end = start + usize::try_from(tensor.byte_len).expect("tensor length");
+        assert!(map[start..end].iter().all(|byte| *byte == 0x11));
+        assert_eq!(fs::read(&path).expect("read replacement path"), replacement);
+
+        drop(map);
+        drop(file);
         fs::remove_dir_all(directory).unwrap();
     }
 

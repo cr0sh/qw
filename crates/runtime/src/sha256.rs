@@ -2,11 +2,17 @@ use std::io::{Read, Result};
 use std::path::Path;
 
 pub fn sha256_file(path: &Path) -> Result<String> {
-    let mut file = std::io::BufReader::with_capacity(1024 * 1024, std::fs::File::open(path)?);
+    sha256_reader(std::io::BufReader::with_capacity(
+        1024 * 1024,
+        std::fs::File::open(path)?,
+    ))
+}
+
+pub(crate) fn sha256_reader(mut reader: impl Read) -> Result<String> {
     let mut hasher = Sha256::new();
     let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
-        let read = file.read(&mut buffer)?;
+        let read = reader.read(&mut buffer)?;
         if read == 0 {
             break;
         }
