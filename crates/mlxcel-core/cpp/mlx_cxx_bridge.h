@@ -2311,8 +2311,7 @@ std::unique_ptr<MlxArray> qwen38_affine_mlp_fused(
     const MlxArray& down_w,
     const MlxArray& down_s,
     const MlxArray& down_b,
-    int32_t down_bits,
-    bool paired_rows);
+    int32_t down_bits);
 
 struct Qwen38GdnIngressOutputs {
     std::unique_ptr<MlxArray> qkv;
@@ -2338,8 +2337,7 @@ std::unique_ptr<Qwen38GdnIngressOutputs> qwen38_affine_gdn_ingress_fused(
     const MlxArray& alpha_w,
     const MlxArray& alpha_s,
     const MlxArray& alpha_b,
-    int32_t alpha_bits,
-    bool paired_rows);
+    int32_t alpha_bits);
 std::unique_ptr<MlxArray> qwen38_gdn_take_qkv(Qwen38GdnIngressOutputs& outputs);
 std::unique_ptr<MlxArray> qwen38_gdn_take_z(Qwen38GdnIngressOutputs& outputs);
 std::unique_ptr<MlxArray> qwen38_gdn_take_beta(Qwen38GdnIngressOutputs& outputs);

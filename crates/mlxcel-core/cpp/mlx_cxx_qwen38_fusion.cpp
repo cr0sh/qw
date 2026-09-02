@@ -102,70 +102,6 @@ METAL_FUNC void qwen38_qmm_accumulate(
     }
 }
 
-template <int Bits, bool AlignedN>
-METAL_FUNC void qwen38_qmm_accumulate_paired_rows(
-    const device uint32_t* w,
-    const device float* scales,
-    const device float* biases,
-    const device float* x,
-    int K,
-    int N,
-    int M,
-    int K_eff,
-    uint3 tid,
-    ushort row_team,
-    ushort local_gid,
-    ushort simd_lid,
-    threadgroup float* Xs,
-    threadgroup float* Ws,
-    thread mlx::steel::BlockMMA<
-        float, float, 32, 32, 32, 2, 2, false, true, 36, 36>& mma_op
-) {
-    constexpr int pack_factor = get_pack_factor<Bits, 8>();
-    constexpr int bytes_per_pack = get_bytes_per_pack<Bits>();
-    using loader_x_t = mlx::steel::BlockLoader<float, 32, 32, 36, 1, 128>;
-    using loader_w_t = QuantizedBlockLoader<
-        float, 32, 32, 36, 1, 128, 32, Bits>;
-
-    const int K_w = K * bytes_per_pack / pack_factor;
-    const int K_g = K / 32;
-    const int y_row = tid.y * 32;
-    const int y_col = tid.x * 32;
-    const short num_els = y_row < M ? min(32, M - y_row) : 0;
-    const short num_outs = min(32, N - y_col);
-    auto wl = reinterpret_cast<const device uint8_t*>(w);
-    x += (num_els > 0 ? y_row : 0) * static_cast<int64_t>(K);
-    wl += y_col * K_w;
-    scales += y_col * K_g;
-    biases += y_col * K_g;
-
-    loader_x_t loader_x(x, K, Xs, local_gid, simd_lid);
-    loader_w_t loader_w(wl, scales, biases, K, Ws, local_gid, simd_lid);
-    for (int k = 0; k < K_eff; k += 32) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (num_els == 32) {
-            loader_x.load_unsafe();
-        } else if (num_els > 0) {
-            loader_x.load_safe(short2(32, num_els));
-        }
-        if (row_team == 0) {
-            if (!AlignedN && num_outs < 32) {
-                loader_w.load_safe(short2(32, num_outs));
-            } else {
-                loader_w.load_unsafe();
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (num_els > 0) {
-            mma_op.mma(Xs, Ws);
-            loader_x.next();
-        }
-        if (row_team == 0) {
-            loader_w.next();
-        }
-    }
-}
-
 template <typename Mma>
 METAL_FUNC void qwen38_store_tile(
     thread Mma& mma,
@@ -371,101 +307,6 @@ static const char* QWEN38_MLP_DOWN_SOURCE = R"(
     }
 )";
 
-static const char* QWEN38_MLP_GATE_UP_PAIRED_SOURCE = R"(
-    constexpr int BM = 32;
-    constexpr int BN = 32;
-    constexpr int K = 5120;
-    constexpr int N = 17408;
-    threadgroup float Xs[2 * BM * 36];
-    threadgroup float Ws[BN * 36];
-    threadgroup float up_values[2 * BM * BN];
-    const ushort row_team = simdgroup_index_in_threadgroup / 4;
-    const ushort local_gid = simdgroup_index_in_threadgroup % 4;
-    const int mtile = threadgroup_position_in_grid.y * 2 + row_team;
-    const int y_row = mtile * BM;
-    const int y_col = threadgroup_position_in_grid.x * BN;
-    const bool valid = y_row < MRows;
-    uint3 tid(threadgroup_position_in_grid.x, mtile, 0);
-
-    mlx::steel::BlockMMA<
-        float, float, BM, BN, 32, 2, 2, false, true, 36, 36> gate_mma(
-            local_gid, thread_index_in_simdgroup);
-    qwen38_qmm_accumulate_paired_rows<GateBits, true>(
-        gate_w, gate_s, gate_b, x, K, N, MRows, K, tid,
-        row_team, local_gid, thread_index_in_simdgroup,
-        Xs + row_team * BM * 36, Ws, gate_mma);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (valid) {
-        const short num_rows = min(BM, MRows - y_row);
-        device float* gate_out = out + y_row * N + y_col;
-        if (num_rows < BM) {
-            gate_mma.store_result_safe(gate_out, N, short2(BN, num_rows));
-        } else {
-            gate_mma.store_result(gate_out, N);
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_device);
-
-    mlx::steel::BlockMMA<
-        float, float, BM, BN, 32, 2, 2, false, true, 36, 36> up_mma(
-            local_gid, thread_index_in_simdgroup);
-    qwen38_qmm_accumulate_paired_rows<UpBits, true>(
-        up_w, up_s, up_b, x, K, N, MRows, K, tid,
-        row_team, local_gid, thread_index_in_simdgroup,
-        Xs + row_team * BM * 36, Ws, up_mma);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    qwen38_store_tile(up_mma, up_values + row_team * BM * BN);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    const int linear_lid = thread_index_in_threadgroup;
-    for (int index = linear_lid; index < 2 * BM * BN; index += 256) {
-        const int output_team = index / (BM * BN);
-        const int local_index = index % (BM * BN);
-        const int row = local_index / BN;
-        const int col = local_index % BN;
-        const int output_row = (threadgroup_position_in_grid.y * 2 + output_team) * BM + row;
-        if (output_row < MRows) {
-            const int output_index = output_row * N + y_col + col;
-            float gate = out[output_index];
-            float up = up_values[index];
-            out[output_index] = (gate * qwen38_sigmoid(gate)) * up;
-        }
-    }
-)";
-
-static const char* QWEN38_MLP_DOWN_PAIRED_SOURCE = R"(
-    constexpr int BM = 32;
-    constexpr int BN = 32;
-    constexpr int K = 17408;
-    constexpr int N = 5120;
-    threadgroup float Xs[2 * BM * 36];
-    threadgroup float Ws[BN * 36];
-    const ushort row_team = simdgroup_index_in_threadgroup / 4;
-    const ushort local_gid = simdgroup_index_in_threadgroup % 4;
-    const int mtile = threadgroup_position_in_grid.y * 2 + row_team;
-    const int y_row = mtile * BM;
-    const int y_col = threadgroup_position_in_grid.x * BN;
-    const bool valid = y_row < MRows;
-    uint3 qtid(threadgroup_position_in_grid.x, mtile, 0);
-    mlx::steel::BlockMMA<
-        float, float, BM, BN, 32, 2, 2, false, true, 36, 36> mma(
-            local_gid, thread_index_in_simdgroup);
-    qwen38_qmm_accumulate_paired_rows<Bits, true>(
-        weight, scales, biases, x, K, N, MRows, K, qtid,
-        row_team, local_gid, thread_index_in_simdgroup,
-        Xs + row_team * BM * 36, Ws, mma);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (valid) {
-        const short num_rows = min(BM, MRows - y_row);
-        device float* dst = out + y_row * N + y_col;
-        if (num_rows < BM) {
-            mma.store_result_safe(dst, N, short2(BN, num_rows));
-        } else {
-            mma.store_result(dst, N);
-        }
-    }
-)";
-
 static const char* QWEN38_GDN_OLD_QZ_SOURCE = R"(
     constexpr int K = 5120;
     constexpr int Nq = 10240;
@@ -577,123 +418,6 @@ static const char* QWEN38_GDN_OLD_BA_SOURCE = R"(
     }
 )";
 
-static const char* QWEN38_GDN_PAIRED_QZ_SOURCE = R"(
-    constexpr int K = 5120;
-    constexpr int Nq = 10240;
-    constexpr int Nz = 6144;
-    constexpr int Tq = Nq / 32;
-    constexpr int Tz = Nz / 32;
-    constexpr int Wq = Tq;
-    threadgroup float Xs[2 * 32 * 36];
-    threadgroup float Ws[32 * 36];
-    const ushort row_team = simdgroup_index_in_threadgroup / 4;
-    const ushort local_gid = simdgroup_index_in_threadgroup % 4;
-    const int work = threadgroup_position_in_grid.x;
-    const int mtile = threadgroup_position_in_grid.y * 2 + row_team;
-    const bool is_qkv = work < Wq;
-    const int local = is_qkv ? work : work - Wq;
-    const int split = is_qkv ? 1 : SplitZ;
-    const int n = is_qkv ? Nq : Nz;
-    const int tiles = is_qkv ? Tq : Tz;
-    const int part = local / tiles;
-    const int tile = local % tiles;
-    const int partition = K / split;
-    const int k_start = part * partition;
-    const device uint32_t* w = is_qkv ? qkv_w : z_w;
-    const device float* s = is_qkv ? qkv_s : z_s;
-    const device float* b = is_qkv ? qkv_b : z_b;
-    device float* y = is_qkv ? qkv_part : z_part;
-    uint3 qtid(tile, mtile, part);
-    mlx::steel::BlockMMA<
-        float, float, 32, 32, 32, 2, 2, false, true, 36, 36> mma(
-            local_gid, thread_index_in_simdgroup);
-#define QWEN38_GDN_PAIRED_QZ_ACCUM(BITS) \
-    constexpr int pf = get_pack_factor<BITS, 8>(); \
-    constexpr int bp = get_bytes_per_pack<BITS>(); \
-    const device uint8_t* wb = reinterpret_cast<const device uint8_t*>(w); \
-    wb += k_start * bp / pf; \
-    qwen38_qmm_accumulate_paired_rows<BITS, true>( \
-        reinterpret_cast<const device uint32_t*>(wb), \
-        s + k_start / 32, b + k_start / 32, x + k_start, \
-        K, n, MRows, partition, qtid, row_team, local_gid, \
-        thread_index_in_simdgroup, Xs + row_team * 32 * 36, Ws, mma)
-    if (is_qkv) {
-        QWEN38_GDN_PAIRED_QZ_ACCUM(QkvBits);
-    } else {
-        QWEN38_GDN_PAIRED_QZ_ACCUM(ZBits);
-    }
-#undef QWEN38_GDN_PAIRED_QZ_ACCUM
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const int y_row = mtile * 32;
-    if (y_row < MRows) {
-        const int y_col = tile * 32;
-        const short num_rows = min(32, MRows - y_row);
-        device float* dst = y + part * MRows * n + y_row * n + y_col;
-        if (num_rows < 32) {
-            mma.store_result_safe(dst, n, short2(32, num_rows));
-        } else {
-            mma.store_result(dst, n);
-        }
-    }
-)";
-
-static const char* QWEN38_GDN_PAIRED_BA_SOURCE = R"(
-    constexpr int K = 5120;
-    constexpr int N = 48;
-    constexpr int Tiles = 2;
-    constexpr int Wb = Tiles * SplitB;
-    threadgroup float Xs[2 * 32 * 36];
-    threadgroup float Ws[32 * 36];
-    const ushort row_team = simdgroup_index_in_threadgroup / 4;
-    const ushort local_gid = simdgroup_index_in_threadgroup % 4;
-    const int work = threadgroup_position_in_grid.x;
-    const int mtile = threadgroup_position_in_grid.y * 2 + row_team;
-    const bool is_beta = work < Wb;
-    const int local = is_beta ? work : work - Wb;
-    const int split = is_beta ? SplitB : SplitA;
-    const int part = local / Tiles;
-    const int tile = local % Tiles;
-    const int partition = K / split;
-    const int k_start = part * partition;
-    const device uint32_t* w = is_beta ? beta_w : alpha_w;
-    const device float* s = is_beta ? beta_s : alpha_s;
-    const device float* b = is_beta ? beta_b : alpha_b;
-    device float* y = is_beta ? beta_part : alpha_part;
-    uint3 qtid(tile, mtile, part);
-    mlx::steel::BlockMMA<
-        float, float, 32, 32, 32, 2, 2, false, true, 36, 36> mma(
-            local_gid, thread_index_in_simdgroup);
-#define QWEN38_GDN_PAIRED_BA_ACCUM(BITS) \
-    constexpr int pf = get_pack_factor<BITS, 8>(); \
-    constexpr int bp = get_bytes_per_pack<BITS>(); \
-    const device uint8_t* wb = reinterpret_cast<const device uint8_t*>(w); \
-    wb += k_start * bp / pf; \
-    qwen38_qmm_accumulate_paired_rows<BITS, false>( \
-        reinterpret_cast<const device uint32_t*>(wb), \
-        s + k_start / 32, b + k_start / 32, x + k_start, \
-        K, N, MRows, partition, qtid, row_team, local_gid, \
-        thread_index_in_simdgroup, Xs + row_team * 32 * 36, Ws, mma)
-    if (is_beta) {
-        QWEN38_GDN_PAIRED_BA_ACCUM(BetaBits);
-    } else {
-        QWEN38_GDN_PAIRED_BA_ACCUM(AlphaBits);
-    }
-#undef QWEN38_GDN_PAIRED_BA_ACCUM
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const int y_row = mtile * 32;
-    if (y_row < MRows) {
-        const int y_col = tile * 32;
-        const short num_rows = min(32, MRows - y_row);
-        const short num_cols = min(32, N - y_col);
-        device float* dst = y + part * MRows * N + y_row * N + y_col;
-        if (num_rows < 32 || num_cols < 32) {
-            mma.store_result_safe(dst, N, short2(num_cols, num_rows));
-        } else {
-            mma.store_result(dst, N);
-        }
-    }
-)";
-
 static const char* QWEN38_GDN_REDUCE_ZBA_SOURCE = R"(
     constexpr int Nz = 6144;
     constexpr int Ns = 48;
@@ -772,12 +496,8 @@ static const char* QWEN38_GDN_REDUCE_BA_SOURCE = R"(
 struct Qwen38FusionKernelHolder {
     std::optional<mlx::core::fast::CustomKernelFunction> mlp_gate_up;
     std::optional<mlx::core::fast::CustomKernelFunction> mlp_down;
-    std::optional<mlx::core::fast::CustomKernelFunction> mlp_gate_up_paired;
-    std::optional<mlx::core::fast::CustomKernelFunction> mlp_down_paired;
     std::optional<mlx::core::fast::CustomKernelFunction> gdn_qz;
     std::optional<mlx::core::fast::CustomKernelFunction> gdn_ba;
-    std::optional<mlx::core::fast::CustomKernelFunction> gdn_qz_paired;
-    std::optional<mlx::core::fast::CustomKernelFunction> gdn_ba_paired;
     std::optional<mlx::core::fast::CustomKernelFunction> gdn_reduce_zba;
     std::optional<mlx::core::fast::CustomKernelFunction> gdn_reduce_ba;
     std::once_flag initialize_once;
@@ -794,14 +514,6 @@ struct Qwen38FusionKernelHolder {
                 "qw_qwen38_affine_mlp_down_v1",
                 {"x", "weight", "scales", "biases"},
                 {"out"}, QWEN38_MLP_DOWN_SOURCE, header, false);
-            mlp_gate_up_paired = mlx::core::fast::metal_kernel(
-                "qw_qwen38_affine_mlp_gu_pair_rows_v1",
-                {"x", "gate_w", "gate_s", "gate_b", "up_w", "up_s", "up_b"},
-                {"out"}, QWEN38_MLP_GATE_UP_PAIRED_SOURCE, header, false);
-            mlp_down_paired = mlx::core::fast::metal_kernel(
-                "qw_qwen38_affine_mlp_down_pair_rows_v1",
-                {"x", "weight", "scales", "biases"},
-                {"out"}, QWEN38_MLP_DOWN_PAIRED_SOURCE, header, false);
             gdn_qz = mlx::core::fast::metal_kernel(
                 "qw_qwen38_affine_gdn_qz_v2",
                 {"x", "qkv_w", "qkv_s", "qkv_b", "z_w", "z_s", "z_b"},
@@ -810,14 +522,6 @@ struct Qwen38FusionKernelHolder {
                 "qw_qwen38_affine_gdn_ba_v2",
                 {"x", "beta_w", "beta_s", "beta_b", "alpha_w", "alpha_s", "alpha_b"},
                 {"beta_part", "alpha_part"}, QWEN38_GDN_OLD_BA_SOURCE, header, false);
-            gdn_qz_paired = mlx::core::fast::metal_kernel(
-                "qw_qwen38_affine_gdn_qz_pair_rows_v1",
-                {"x", "qkv_w", "qkv_s", "qkv_b", "z_w", "z_s", "z_b"},
-                {"qkv_part", "z_part"}, QWEN38_GDN_PAIRED_QZ_SOURCE, header, false);
-            gdn_ba_paired = mlx::core::fast::metal_kernel(
-                "qw_qwen38_affine_gdn_ba_pair_rows_v1",
-                {"x", "beta_w", "beta_s", "beta_b", "alpha_w", "alpha_s", "alpha_b"},
-                {"beta_part", "alpha_part"}, QWEN38_GDN_PAIRED_BA_SOURCE, header, false);
             gdn_reduce_zba = mlx::core::fast::metal_kernel(
                 "qw_qwen38_affine_gdn_reduce_zba_v2",
                 {"z_part", "beta_part", "alpha_part"},
@@ -881,10 +585,6 @@ int qwen38_split_k(int m, int k, int n) {
     return split;
 }
 
-bool qwen38_pair_rows(int m) {
-    return m == 288 || m == 2048;
-}
-
 std::vector<std::pair<std::string, TemplateArg>> args(
     std::initializer_list<std::pair<std::string, int>> values) {
     std::vector<std::pair<std::string, TemplateArg>> result;
@@ -910,8 +610,7 @@ std::unique_ptr<MlxArray> qwen38_affine_mlp_fused(
     const MlxArray& down_w,
     const MlxArray& down_s,
     const MlxArray& down_b,
-    int32_t down_bits,
-    bool paired_rows) {
+    int32_t down_bits) {
 #ifndef __APPLE__
     throw std::invalid_argument("pinned Qwen3.8 affine fusion requires Metal");
 #else
@@ -923,19 +622,12 @@ std::unique_ptr<MlxArray> qwen38_affine_mlp_fused(
     validate_plane(gate_w.inner, gate_s.inner, gate_b.inner, gate_bits, 5120, 17408);
     validate_plane(up_w.inner, up_s.inner, up_b.inner, up_bits, 5120, 17408);
     array input = reshape(x.inner, {m, 5120});
-    if (paired_rows && !qwen38_pair_rows(m)) {
-        throw std::invalid_argument("paired Qwen3.8 MLP row count is invalid");
-    }
-    auto& kernels = qwen38_fusion_kernels();
-    auto& gate_up_kernel = paired_rows ? kernels.mlp_gate_up_paired : kernels.mlp_gate_up;
-    int row_simdgroups = paired_rows ? 8 : 4;
-    int row_groups = paired_rows ? (m + 63) / 64 : (m + 31) / 32;
-    auto gated = (*gate_up_kernel)(
+    auto gated = (*qwen38_fusion_kernels().mlp_gate_up)(
         {input, gate_w.inner, gate_s.inner, gate_b.inner,
          up_w.inner, up_s.inner, up_b.inner},
         {Shape{m, 17408}}, {float32},
-        std::make_tuple(((17408 + 31) / 32) * 32, row_groups * row_simdgroups, 1),
-        std::make_tuple(32, row_simdgroups, 1),
+        std::make_tuple(((17408 + 31) / 32) * 32, ((m + 31) / 32) * 4, 1),
+        std::make_tuple(32, 4, 1),
         args({{"GateBits", gate_bits}, {"UpBits", up_bits}, {"MRows", m}}),
         std::nullopt, false, {});
     validate_plane(down_w.inner, down_s.inner, down_b.inner, down_bits, 17408, 5120);
@@ -943,16 +635,12 @@ std::unique_ptr<MlxArray> qwen38_affine_mlp_fused(
     if (split != 1 && split != 2) {
         throw std::invalid_argument("pinned Qwen3.8 MLP down split changed");
     }
-    if (paired_rows && split != 1) {
-        throw std::invalid_argument("pinned Qwen3.8 paired MLP down split changed");
-    }
-    int simdgroups = paired_rows ? 8 : 4 * split;
-    auto& down_kernel = paired_rows ? kernels.mlp_down_paired : kernels.mlp_down;
-    auto output = (*down_kernel)(
+    int simdgroups = 4 * split;
+    auto output = (*qwen38_fusion_kernels().mlp_down)(
         {gated[0], down_w.inner, down_s.inner, down_b.inner},
         {Shape{m, 5120}}, {float32},
         std::make_tuple(((5120 + 31) / 32) * 32,
-                        row_groups * simdgroups, 1),
+                        ((m + 31) / 32) * simdgroups, 1),
         std::make_tuple(32, simdgroups, 1),
         args({{"Bits", down_bits}, {"SplitK", split}, {"MRows", m}}),
         std::nullopt, false, {});
@@ -979,8 +667,7 @@ std::unique_ptr<Qwen38GdnIngressOutputs> qwen38_affine_gdn_ingress_fused(
     const MlxArray& alpha_w,
     const MlxArray& alpha_s,
     const MlxArray& alpha_b,
-    int32_t alpha_bits,
-    bool paired_rows) {
+    int32_t alpha_bits) {
 #ifndef __APPLE__
     throw std::invalid_argument("pinned Qwen3.8 affine fusion requires Metal");
 #else
@@ -1003,35 +690,27 @@ std::unique_ptr<Qwen38GdnIngressOutputs> qwen38_affine_gdn_ingress_fused(
                 && sb != 80 && sb != 160)) {
         throw std::invalid_argument("pinned Qwen3.8 GDN split changed");
     }
-    if (paired_rows && !qwen38_pair_rows(m)) {
-        throw std::invalid_argument("paired Qwen3.8 GDN row count is invalid");
-    }
-    auto& kernels = qwen38_fusion_kernels();
-    int row_simdgroups = paired_rows ? 8 : 4;
-    int row_groups = paired_rows ? (m + 63) / 64 : (m + 31) / 32;
     array input = reshape(x.inner, {m, 5120});
     std::vector<array> final_outputs;
     int qz_work = 10240 / 32 + (6144 / 32) * sz;
-    auto& qz_kernel = paired_rows ? kernels.gdn_qz_paired : kernels.gdn_qz;
-    auto qz = (*qz_kernel)(
+    auto qz = (*qwen38_fusion_kernels().gdn_qz)(
         {input, qkv_w.inner, qkv_s.inner, qkv_b.inner, z_w.inner, z_s.inner,
          z_b.inner},
         {Shape{m, 10240}, Shape{sz, m, 6144}}, {float32, float32},
-        std::make_tuple(qz_work * 32, row_groups * row_simdgroups, 1),
-        std::make_tuple(32, row_simdgroups, 1),
+        std::make_tuple(qz_work * 32, ((m + 31) / 32) * 4, 1),
+        std::make_tuple(32, 4, 1),
         args({{"QkvBits", qkv_bits},
               {"ZBits", z_bits},
               {"SplitZ", sz},
               {"MRows", m}}),
         std::nullopt, false, {});
     int ba_work = 2 * sb + 2 * sa;
-    auto& ba_kernel = paired_rows ? kernels.gdn_ba_paired : kernels.gdn_ba;
-    auto ba = (*ba_kernel)(
+    auto ba = (*qwen38_fusion_kernels().gdn_ba)(
         {input, beta_w.inner, beta_s.inner, beta_b.inner, alpha_w.inner,
          alpha_s.inner, alpha_b.inner},
         {Shape{sb, m, 48}, Shape{sa, m, 48}}, {float32, float32},
-        std::make_tuple(ba_work * 32, row_groups * row_simdgroups, 1),
-        std::make_tuple(32, row_simdgroups, 1),
+        std::make_tuple(ba_work * 32, ((m + 31) / 32) * 4, 1),
+        std::make_tuple(32, 4, 1),
         args({{"BetaBits", beta_bits},
               {"AlphaBits", alpha_bits},
               {"SplitB", sb},
@@ -1043,11 +722,9 @@ std::unique_ptr<Qwen38GdnIngressOutputs> qwen38_affine_gdn_ingress_fused(
     } else if (sz == 1) {
       int block_width = sb < 32 ? 128 : 32;
       int blocks = (m * 48 + block_width - 1) / block_width;
-      int reducer_rows = m == 2048 && sb == 4 ? 4 : 8;
-      auto reduced = (*kernels.gdn_reduce_ba)(
+      auto reduced = (*qwen38_fusion_kernels().gdn_reduce_ba)(
           {ba[0], ba[1]}, {Shape{m, 48}, Shape{m, 48}}, {float32, float32},
-          std::make_tuple(blocks * 2 * 32, reducer_rows, 1),
-          std::make_tuple(32, reducer_rows, 1),
+          std::make_tuple(blocks * 2 * 32, 8, 1), std::make_tuple(32, 8, 1),
           args({{"SplitB", sb}, {"SplitA", sa}, {"MRows", m}}), std::nullopt,
           false, {});
       final_outputs = {qz[0], qz[1], reduced[0], reduced[1]};
@@ -1055,12 +732,11 @@ std::unique_ptr<Qwen38GdnIngressOutputs> qwen38_affine_gdn_ingress_fused(
       int z_blocks = (m * 6144 + 127) / 128;
       int block_width = sb < 32 ? 128 : 32;
       int b_blocks = (m * 48 + block_width - 1) / block_width;
-      int reducer_rows = m == 2048 && sb == 4 ? 4 : 8;
-      auto reduced = (*kernels.gdn_reduce_zba)(
+      auto reduced = (*qwen38_fusion_kernels().gdn_reduce_zba)(
           {qz[1], ba[0], ba[1]}, {Shape{m, 6144}, Shape{m, 48}, Shape{m, 48}},
           {float32, float32, float32},
-          std::make_tuple((z_blocks + 2 * b_blocks) * 32, reducer_rows, 1),
-          std::make_tuple(32, reducer_rows, 1),
+          std::make_tuple((z_blocks + 2 * b_blocks) * 32, 8, 1),
+          std::make_tuple(32, 8, 1),
           args({{"SplitZ", sz}, {"SplitB", sb}, {"SplitA", sa}, {"MRows", m}}),
           std::nullopt, false, {});
       final_outputs = {qz[0], reduced[0], reduced[1], reduced[2]};
