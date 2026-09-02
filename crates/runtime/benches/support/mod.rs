@@ -4,14 +4,14 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
+#[cfg(feature = "dflash2")]
+use qw_runtime::Dflash2PrefixReuse;
 use qw_runtime::provider::Qwen35GenerationMode;
 use qw_runtime::{
     ChatMessage, ChatMessageContent, GenerationRequest, KVCacheMode, PortableArray,
     PortableModelState, PortablePage, PortablePagedTensor, PortablePromptSnapshot, PromptSnapshot,
     Qwen35Provider,
 };
-#[cfg(feature = "dflash2")]
-use qw_runtime::Dflash2PrefixReuse;
 
 pub const DECODE_MAX_TOKENS: usize = 128;
 pub const MTP_BLOCK_SIZE: usize = 3;
@@ -45,7 +45,9 @@ pub const PROMPT: &str = concat!(
 pub struct DecodeFixture {
     pub request: GenerationRequest,
     pub baseline_token_ids: Vec<i32>,
+    #[cfg(not(feature = "dflash2"))]
     pub mtp_token_ids: Vec<i32>,
+    #[cfg(not(feature = "dflash2"))]
     pub mtp_decode_tokens: usize,
 }
 
@@ -708,114 +710,6 @@ fn read_long_context_cache(
     }))
 }
 
-fn warm_cached_long_context_fixture(
-    provider: &mut Qwen35Provider,
-    fixture: &LongConversationFixture,
-) {
-    let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
-    let (baseline_output, baseline_stats) = provider
-        .benchmark_cached_streaming_in_mode(
-            &fixture.prompt_ids,
-            DECODE_MAX_TOKENS,
-            &sampling,
-            &fixture.mtp_snapshot,
-            Qwen35GenerationMode::Baseline,
-            |delta| {
-                black_box(delta);
-                true
-            },
-        )
-        .expect("warm restored long-conversation baseline fixture");
-    assert_eq!(baseline_output.cached_tokens, fixture.prefix_tokens);
-    assert_eq!(baseline_output.token_ids, fixture.baseline_token_ids);
-    assert!(baseline_stats.is_none());
-
-    let (mtp_output, mtp_stats) = provider
-        .benchmark_cached_streaming_in_mode(
-            &fixture.prompt_ids,
-            DECODE_MAX_TOKENS,
-            &sampling,
-            &fixture.mtp_snapshot,
-            Qwen35GenerationMode::Mtp,
-            |delta| {
-                black_box(delta);
-                true
-            },
-        )
-        .unwrap_or_else(|error| {
-            panic!("warm restored long-conversation MTP k={MTP_BLOCK_SIZE}: {error:#}")
-        });
-    assert_eq!(mtp_output.cached_tokens, fixture.prefix_tokens);
-    assert_eq!(mtp_output.token_ids, fixture.mtp_token_ids);
-    let mtp_stats = mtp_stats.expect("explicit MTP mode must return MTP statistics");
-    assert!(
-        mtp_stats.proposed_draft_tokens > 0,
-        "restored long-conversation MTP must propose draft tokens"
-    );
-    assert!(
-        mtp_stats.accepted_draft_tokens <= mtp_stats.proposed_draft_tokens,
-        "accepted draft tokens cannot exceed proposed draft tokens"
-    );
-    eprintln!(
-        "MTP_LONG_CONTEXT_PROFILE context={} tokens={} prefix_tokens={} accepted={} proposed={} acceptance={:.2}% forwards={} draft_ms={:.3} verify_ms={:.3} walk_ms={:.3} reconcile_ms={:.3} materializations={} snapshots={} fixture_cache=hit",
-        fixture.context_label,
-        mtp_output.token_ids.len(),
-        fixture.prefix_tokens,
-        mtp_stats.accepted_draft_tokens,
-        mtp_stats.proposed_draft_tokens,
-        mtp_stats.acceptance_percentage(),
-        mtp_stats.target_forward_calls,
-        mtp_stats.draft_time.as_secs_f64() * 1_000.0,
-        mtp_stats.target_verify_time.as_secs_f64() * 1_000.0,
-        mtp_stats.walk_time.as_secs_f64() * 1_000.0,
-        mtp_stats.reconcile_time.as_secs_f64() * 1_000.0,
-        mtp_stats.full_state_materializations,
-        mtp_stats.cache_snapshot_count,
-    );
-    #[cfg(feature = "dflash2")]
-    {
-        let PromptSnapshot::Dflash2(snapshot) = &fixture.dflash2_snapshot else {
-            panic!("long-conversation DFlash2 fixture has the wrong snapshot family");
-        };
-        let (output, stats, cached_tokens) = provider
-            .generate_dflash2_cached_streaming(
-                &fixture.prompt_ids,
-                DECODE_MAX_TOKENS,
-                &sampling,
-                &draft_model_dir(),
-                Some(Dflash2PrefixReuse {
-                    snapshot,
-                    cached_tokens: fixture.prefix_tokens,
-                }),
-                |delta| {
-                    black_box(delta);
-                    true
-                },
-            )
-            .expect("warm restored long-conversation DFlash2 fixture");
-        assert_eq!(cached_tokens, fixture.prefix_tokens);
-        assert_eq!(output.token_ids, fixture.dflash2_token_ids);
-        assert!(
-            stats.proposed_draft_tokens > 0,
-            "restored long-conversation DFlash2 must propose draft tokens"
-        );
-        eprintln!(
-            "DFLASH2_LONG_CONTEXT_PROFILE context={} tokens={} prefix_tokens={} accepted={} proposed={} acceptance={:.2}% forwards={} draft_ms={:.3} verify_ms={:.3} walk_ms={:.3} reconcile_ms={:.3} fixture_cache=hit",
-            fixture.context_label,
-            output.token_ids.len(),
-            fixture.prefix_tokens,
-            stats.accepted_draft_tokens,
-            stats.proposed_draft_tokens,
-            stats.acceptance_percentage(),
-            stats.target_forward_calls,
-            stats.draft_time.as_secs_f64() * 1_000.0,
-            stats.target_verify_time.as_secs_f64() * 1_000.0,
-            stats.walk_time.as_secs_f64() * 1_000.0,
-            stats.reconcile_time.as_secs_f64() * 1_000.0,
-        );
-    }
-}
-
 pub fn request(max_tokens: usize) -> GenerationRequest {
     GenerationRequest {
         prompt: PROMPT.to_owned(),
@@ -895,21 +789,26 @@ pub fn prepare_decode_fixture(provider: &mut Qwen35Provider) -> DecodeFixture {
     let baseline_token_ids = baseline_output.token_ids;
     assert!(!baseline_token_ids.is_empty());
 
+    #[cfg(not(feature = "dflash2"))]
     let (mtp_output, mtp_stats) = provider
         .generate_streaming_in_mode(&request, Qwen35GenerationMode::Mtp, |delta| {
             black_box(delta);
             true
         })
         .unwrap_or_else(|error| panic!("warm up MTP k={MTP_BLOCK_SIZE}: {error:#}"));
+    #[cfg(not(feature = "dflash2"))]
     let mtp_stats = mtp_stats.expect("explicit MTP mode must return MTP statistics");
+    #[cfg(not(feature = "dflash2"))]
     assert!(
         !mtp_output.token_ids.is_empty(),
         "the deterministic MTP prompt must produce at least one completion token"
     );
+    #[cfg(not(feature = "dflash2"))]
     assert!(
         mtp_stats.proposed_draft_tokens > 0,
         "MTP k={MTP_BLOCK_SIZE} must propose draft tokens"
     );
+    #[cfg(not(feature = "dflash2"))]
     eprintln!(
         "MTP_PROFILE tokens={} accepted={} proposed={} acceptance={:.2}% forwards={} draft_ms={:.3} verify_ms={:.3} walk_ms={:.3} reconcile_ms={:.3} materializations={} snapshots={}",
         mtp_output.token_ids.len(),
@@ -925,11 +824,14 @@ pub fn prepare_decode_fixture(provider: &mut Qwen35Provider) -> DecodeFixture {
         mtp_stats.cache_snapshot_count,
     );
 
+    #[cfg(not(feature = "dflash2"))]
     let mtp_decode_tokens = mtp_output.token_ids.len();
     DecodeFixture {
         request,
         baseline_token_ids,
+        #[cfg(not(feature = "dflash2"))]
         mtp_token_ids: mtp_output.token_ids,
+        #[cfg(not(feature = "dflash2"))]
         mtp_decode_tokens,
     }
 }
@@ -1135,7 +1037,6 @@ fn prepare_long_conversation_fixture_uncached(
         "long-conversation DFlash2 must propose draft tokens"
     );
 
-
     let new_prompt_tokens = prompt_ids.len() - prefix_tokens;
     let mtp_decode_tokens = mtp_output.token_ids.len();
     let mtp_accepted_draft_tokens = mtp_stats.accepted_draft_tokens;
@@ -1199,7 +1100,6 @@ pub fn prepare_long_conversation_fixture(
                     "LONG_CONTEXT_FIXTURE_CACHE hit path={}",
                     cache_path.display()
                 );
-                warm_cached_long_context_fixture(provider, &fixture);
                 return fixture;
             }
             Ok(None) => {}

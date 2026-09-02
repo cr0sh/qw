@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 ENV_FILE="$ROOT_DIR/.autoresearch.env"
-RESULT_DIR="$ROOT_DIR/target/criterion/single_user_decode/long_64k_dflash2/new"
+RESULT_FILE="$ROOT_DIR/target/autoresearch-single-user-throughput.txt"
 
 if [[ ! -f "$ENV_FILE" ]]; then
     printf 'missing benchmark environment: %s\n' "$ENV_FILE" >&2
@@ -25,49 +25,50 @@ if [[ ! -f "$DRAFT_MODEL_DIR/config.json" ]]; then
     exit 1
 fi
 
-rm -rf "$RESULT_DIR"
+rm -f "$RESULT_FILE"
 
 CARGO_TERM_COLOR=never \
 QW_MODEL_PATH="$MODEL_DIR" \
 QW_BENCH_DRAFT_MODEL="$DRAFT_MODEL_DIR" \
     cargo bench --offline -p qw-runtime --bench single_user_throughput \
-    --features dflash2 -- single_user_decode/long_64k_dflash2
+    --features dflash2 -- single_user_decode/long_64k_dflash2 |
+    tee "$RESULT_FILE"
 
-python3 - "$RESULT_DIR" <<'PY'
-import json
+python3 - "$RESULT_FILE" <<'PY'
 import math
 import pathlib
 import sys
 
-result_dir = pathlib.Path(sys.argv[1])
-with (result_dir / "benchmark.json").open(encoding="utf-8") as file:
-    benchmark = json.load(file)
-with (result_dir / "estimates.json").open(encoding="utf-8") as file:
-    estimates = json.load(file)
-
+result_file = pathlib.Path(sys.argv[1])
 benchmark_id = "single_user_decode/long_64k_dflash2"
-if benchmark.get("full_id") != benchmark_id:
-    raise SystemExit(
-        f"expected benchmark {benchmark_id!r}, got {benchmark.get('full_id')!r}"
-    )
+row = None
+for line in result_file.read_text(encoding="utf-8").splitlines():
+    if not line.startswith("BENCHMARK_RESULT "):
+        continue
+    fields = dict(field.split("=", 1) for field in line.split()[1:])
+    if fields.get("label") == benchmark_id:
+        row = fields
+        break
 
-throughput = benchmark.get("throughput")
-if not isinstance(throughput, dict) or set(throughput) != {"Elements"}:
-    raise SystemExit(f"expected element throughput metadata, got {throughput!r}")
-tokens = throughput["Elements"]
-median_ns = estimates["median"]["point_estimate"]
-stddev_ns = estimates["std_dev"]["point_estimate"]
+if row is None:
+    raise SystemExit(f"missing benchmark result for {benchmark_id!r}")
+
+decode_tokens = int(row["tokens_per_repetition"])
+mean_seconds = float(row["mean_seconds"])
+stddev_seconds = float(row["stddev_seconds"])
+tokens_per_second = float(row["tokens_per_second"])
 for name, value in (
-    ("decode_tokens", tokens),
-    ("median_ns", median_ns),
-    ("stddev_ns", stddev_ns),
+    ("decode_tokens", decode_tokens),
+    ("mean_seconds", mean_seconds),
+    ("tokens_per_second", tokens_per_second),
 ):
-    if not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+    if not math.isfinite(value) or value <= 0:
         raise SystemExit(f"invalid {name}: {value!r}")
+if not math.isfinite(stddev_seconds) or stddev_seconds < 0:
+    raise SystemExit(f"invalid stddev_seconds: {stddev_seconds!r}")
 
-tokens_per_second = tokens * 1_000_000_000.0 / median_ns
 print(f"METRIC dflash2_tokens_per_second={tokens_per_second:.6f}")
-print(f"METRIC dflash2_decode_latency_ms={median_ns / 1_000_000.0:.6f}")
-print(f"METRIC dflash2_decode_stddev_ms={stddev_ns / 1_000_000.0:.6f}")
-print(f"METRIC dflash2_decode_tokens={tokens}")
+print(f"METRIC dflash2_decode_latency_ms={mean_seconds * 1_000.0:.6f}")
+print(f"METRIC dflash2_decode_stddev_ms={stddev_seconds * 1_000.0:.6f}")
+print(f"METRIC dflash2_decode_tokens={decode_tokens}")
 PY
