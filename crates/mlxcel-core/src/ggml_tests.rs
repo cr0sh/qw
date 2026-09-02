@@ -188,6 +188,20 @@ fn ulp_distance(left: f32, right: f32) -> u32 {
     ordered(left).abs_diff(ordered(right))
 }
 
+fn median_forward(mut launch: impl FnMut() -> UniquePtr<MlxArray>) -> std::time::Duration {
+    let warm = launch();
+    crate::eval(warm.as_ref().unwrap());
+    let mut samples = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let started = std::time::Instant::now();
+        let output = launch();
+        crate::eval(output.as_ref().unwrap());
+        samples.push(started.elapsed());
+    }
+    samples.sort_unstable();
+    samples[2]
+}
+
 #[test]
 fn fixed_qtype_table_matches_parsed_target_contract() {
     let actual = GgmlQType::TARGET_TYPES.map(|qtype| (qtype.id(), qtype.block_elements(), qtype.block_bytes()));
@@ -238,7 +252,7 @@ fn dispatch_stats_record_zero_workspace_and_shape_selected_traffic() {
     let qtype = GgmlQType::Q4K; let width = 512; let rows = 3; let packed = fixture_matrix(qtype, width, rows);
     let matrix = GgmlQuantizedMatrix::from_bytes(&packed, qtype.id(), width, rows).unwrap();
     let decode = matrix.dispatch_stats(1).unwrap(); assert_eq!(decode.path, GgmlKernelPath::DecodeM1); assert_eq!(decode.packed_bytes_read, packed.len()); assert_eq!(decode.workspace_bytes, 0);
-    let prefill = matrix.dispatch_stats(5).unwrap(); assert_eq!(prefill.path, GgmlKernelPath::PrefillRows4); assert_eq!(prefill.packed_bytes_read, packed.len() * 2); assert_eq!(prefill.workspace_bytes, 0);
+    let prefill = matrix.dispatch_stats(33).unwrap(); assert_eq!(prefill.path, GgmlKernelPath::TiledQmm16x8); assert_eq!(prefill.packed_bytes_read, packed.len() * 3); assert_eq!(prefill.activation_bytes_read, 33 * width * 4); assert_eq!(prefill.threadgroup_bytes, 16 * 256 * 4); assert_eq!(prefill.workspace_bytes, 0);
     let embedding = GgmlQuantizedEmbedding::from_bytes(&packed, qtype.id(), width, rows).unwrap();
     let lookup = embedding.dispatch_stats(2).unwrap(); assert_eq!(lookup.path, GgmlKernelPath::Embedding); assert_eq!(lookup.packed_bytes_read, packed.len() / rows * 2); assert_eq!(lookup.workspace_bytes, 0);
     let cloned = embedding.clone_shared();
@@ -246,6 +260,59 @@ fn dispatch_stats_record_zero_workspace_and_shape_selected_traffic() {
     assert_eq!(cloned.embedding_dim(), embedding.embedding_dim());
     assert_eq!(cloned.vocab_size(), embedding.vocab_size());
     assert_eq!(cloned.dispatch_stats(2).unwrap(), lookup);
+}
+
+#[test]
+fn packed_row_ranges_preserve_order_bounds_and_arithmetic() {
+    let qtype = GgmlQType::Q4K;
+    let width = 512usize;
+    let output_rows = 16usize;
+    let packed = fixture_matrix(qtype, width, output_rows);
+    let matrix =
+        GgmlQuantizedMatrix::from_bytes(&packed, qtype.id(), width, output_rows).unwrap();
+    assert!(matches!(
+        matrix.select_rows(&[]),
+        Err(GgmlQuantError::InvalidRowSelection)
+    ));
+    assert!(matches!(
+        matrix.select_rows(&[2..2]),
+        Err(GgmlQuantError::InvalidRowRange { .. })
+    ));
+    assert!(matches!(
+        matrix.select_rows(&[15..17]),
+        Err(GgmlQuantError::InvalidRowRange { .. })
+    ));
+    assert!(matches!(
+        matrix.select_rows(&[0..1, 1..2, 2..3, 3..4]),
+        Err(GgmlQuantError::InvalidRowSelection)
+    ));
+    let rows = matrix.select_rows(&[2..5, 10..14]).unwrap();
+    assert_eq!(rows.selected_rows(), 7);
+    let stats = rows.dispatch_stats(3).unwrap();
+    assert_eq!(stats.path, GgmlKernelPath::VerifyM2To4);
+    assert_eq!(stats.packed_bytes_read, matrix.row_bytes * 7);
+    assert_eq!(stats.floating_point_operations, 2 * 3 * 7 * width);
+    assert_eq!(stats.workspace_bytes, 0);
+    if !crate::metal_is_available() {
+        return;
+    }
+    let input_values: Vec<f32> = (0..3 * width)
+        .map(|index| (index as i32 % 19 - 9) as f32 * 0.0078125)
+        .collect();
+    let input = crate::from_slice_f32(&input_values, &[3, width as i32]);
+    let full = raw_f32(matrix.forward(input.as_ref().unwrap()).unwrap().as_ref().unwrap());
+    let selected = raw_f32(rows.forward(input.as_ref().unwrap()).unwrap().as_ref().unwrap());
+    let mapping = [2usize, 3, 4, 10, 11, 12, 13];
+    for input_row in 0..3 {
+        for (selected_row, full_row) in mapping.into_iter().enumerate() {
+            assert!(
+                ulp_distance(
+                    selected[input_row * mapping.len() + selected_row],
+                    full[input_row * output_rows + full_row],
+                ) <= 1
+            );
+        }
+    }
 }
 
 #[test]
@@ -264,15 +331,15 @@ fn metal_matrix_and_embedding_match_reference_for_every_target_qtype() {
             let tolerance = 0.002 + expected.abs() * 0.00002;
             assert!((actual - expected).abs() <= tolerance, "{qtype:?} decode row {row}: actual {actual}, expected {expected}");
         }
-        let mut prefill_input = Vec::with_capacity(width * 5);
-        for row in 0..5 { prefill_input.extend(activation.iter().map(|value| value + row as f32 * 0.0078125)); }
-        let input = crate::from_slice_f32(&prefill_input, &[5, width as i32]);
-        let prefill = matrix.forward(input.as_ref().unwrap()).unwrap(); let prefill_values = raw_f32(prefill.as_ref().unwrap());
-        for output in 0..output_rows { assert!(ulp_distance(decode_values[output], prefill_values[output]) <= 1, "{qtype:?} M=1/prefill mismatch: {} vs {}", decode_values[output], prefill_values[output]); }
-        for input_row in 0..5 { for output in 0..output_rows {
-            let expected = prefill_input[input_row * width..(input_row + 1) * width].iter().zip(&weights[output]).map(|(input, weight)| input * weight).sum::<f32>();
-            let actual = prefill_values[input_row * output_rows + output]; let tolerance = 0.002 + expected.abs() * 0.00002;
-            assert!((actual - expected).abs() <= tolerance, "{qtype:?} prefill input {input_row} output {output}: actual {actual}, expected {expected}");
+        let mut verify_input = Vec::with_capacity(width * 3);
+        for row in 0..3 { verify_input.extend(activation.iter().map(|value| value + row as f32 * 0.0078125)); }
+        let input = crate::from_slice_f32(&verify_input, &[3, width as i32]);
+        let verify = matrix.forward(input.as_ref().unwrap()).unwrap(); let verify_values = raw_f32(verify.as_ref().unwrap());
+        for output in 0..output_rows { assert!(ulp_distance(decode_values[output], verify_values[output]) <= 1, "{qtype:?} M=1/M=3 mismatch: {} vs {}", decode_values[output], verify_values[output]); }
+        for input_row in 0..3 { for output in 0..output_rows {
+            let expected = verify_input[input_row * width..(input_row + 1) * width].iter().zip(&weights[output]).map(|(input, weight)| input * weight).sum::<f32>();
+            let actual = verify_values[input_row * output_rows + output]; let tolerance = 0.002 + expected.abs() * 0.00002;
+            assert!((actual - expected).abs() <= tolerance, "{qtype:?} verify input {input_row} output {output}: actual {actual}, expected {expected}");
         }}
         let embedding = GgmlQuantizedEmbedding::from_bytes(&packed, qtype.id(), width, output_rows).unwrap();
         let indices = crate::from_slice_i32(&[2, 0, 1], &[3]); let selected = embedding.forward(indices.as_ref().unwrap()).unwrap(); let selected = raw_f32(selected.as_ref().unwrap());
@@ -341,15 +408,14 @@ fn actual_gguf_blocks_match_reference_on_metal() {
             let activation: Vec<f32> = (0..width)
                 .map(|column| (column as i32 % 29 - 14) as f32 * 0.00390625)
                 .collect();
-            let input = crate::from_slice_f32(&activation, &[1, width as i32]);
             let matrix =
                 GgmlQuantizedMatrix::from_bytes(&packed, qtype.id(), width, 1).unwrap();
-            // First call compiles the specialization. Time a synchronized warm call.
+            let input = crate::from_slice_f32(&activation, &[1, width as i32]);
             let cold = matrix.forward(input.as_ref().unwrap()).unwrap();
             let _ = raw_f32(cold.as_ref().unwrap());
             let started = Instant::now();
             let warm = matrix.forward(input.as_ref().unwrap()).unwrap();
-            let actual = raw_f32(warm.as_ref().unwrap())[0];
+            let decode_actual = raw_f32(warm.as_ref().unwrap())[0];
             let elapsed = started.elapsed();
             let expected = activation
                 .iter()
@@ -358,10 +424,44 @@ fn actual_gguf_blocks_match_reference_on_metal() {
                 .sum::<f32>();
             let tolerance = 0.003 + expected.abs() * 0.00005;
             assert!(
-                (actual - expected).abs() <= tolerance,
-                "{model_key} {qtype:?} tensor {}: actual {actual}, expected {expected}",
+                (decode_actual - expected).abs() <= tolerance,
+                "{model_key} {qtype:?} tensor {}: actual {decode_actual}, expected {expected}",
                 tensor["name"].as_str().unwrap()
             );
+
+            let mut row_counts = vec![3usize, 245, 288];
+            if model_key == "target" && qtype == GgmlQType::Q5K {
+                row_counts.push(2048);
+            }
+            for rows in row_counts {
+                let mut values = Vec::with_capacity(rows * width);
+                for row in 0..rows {
+                    values.extend(
+                        activation
+                            .iter()
+                            .map(|value| value + (row % 7) as f32 * 0.0009765625),
+                    );
+                }
+                let input = crate::from_slice_f32(&values, &[rows as i32, width as i32]);
+                let output = matrix.forward(input.as_ref().unwrap()).unwrap();
+                let actual = raw_f32(output.as_ref().unwrap());
+                if rows == 3 {
+                    assert!(ulp_distance(decode_actual, actual[0]) <= 1);
+                }
+                for row in 0..rows {
+                    let expected = values[row * width..(row + 1) * width]
+                        .iter()
+                        .zip(&weights)
+                        .map(|(input, weight)| input * weight)
+                        .sum::<f32>();
+                    let tolerance = 0.003 + expected.abs() * 0.00005;
+                    assert!(
+                        (actual[row] - expected).abs() <= tolerance,
+                        "{model_key} {qtype:?} M={rows} row={row}: {} vs {expected}",
+                        actual[row]
+                    );
+                }
+            }
 
             let embedding =
                 GgmlQuantizedEmbedding::from_bytes(&packed, qtype.id(), width, 1).unwrap();
@@ -379,4 +479,211 @@ fn actual_gguf_blocks_match_reference_on_metal() {
             );
         }
     }
+}
+
+#[test]
+#[ignore = "requires verified local target GGUF artifact"]
+fn actual_q5k_row_ranges_match_full_projection() {
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
+
+    if !crate::metal_is_available() {
+        return;
+    }
+    let structure: serde_json::Value = serde_json::from_reader(
+        File::open(std::env::var("QWR_GGUF_STRUCTURE_PATH").unwrap()).unwrap(),
+    )
+    .unwrap();
+    let model = &structure["target"];
+    let tensor = model["tensor_infos_enriched"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tensor| {
+            tensor["type"].as_u64() == Some(13)
+                && tensor["shape"][0].as_u64() == Some(5120)
+                && tensor["shape"][1].as_u64().is_some_and(|rows| rows >= 64)
+        })
+        .unwrap();
+    let qtype = GgmlQType::Q5K;
+    let width = 5120usize;
+    let output_rows = 64usize;
+    let row_bytes = width / qtype.block_elements() * qtype.block_bytes();
+    let mut packed = vec![0u8; row_bytes * output_rows];
+    let mut file =
+        File::open(std::env::var("QWR_TARGET_GGUF_SMOKE_PATH").unwrap()).unwrap();
+    file.seek(SeekFrom::Start(
+        model["data_start"].as_u64().unwrap() + tensor["offset"].as_u64().unwrap(),
+    ))
+    .unwrap();
+    file.read_exact(&mut packed).unwrap();
+    let matrix =
+        GgmlQuantizedMatrix::from_bytes(&packed, qtype.id(), width, output_rows).unwrap();
+    let selected = matrix.select_rows(&[0..7, 40..47, 60..64]).unwrap();
+    let input_values: Vec<f32> = (0..3 * width)
+        .map(|index| (index as i32 % 23 - 11) as f32 * 0.00390625)
+        .collect();
+    let input = crate::from_slice_f32(&input_values, &[3, width as i32]);
+    let full = raw_f32(matrix.forward(input.as_ref().unwrap()).unwrap().as_ref().unwrap());
+    let compact =
+        raw_f32(selected.forward(input.as_ref().unwrap()).unwrap().as_ref().unwrap());
+    let mapping = [
+        0usize, 1, 2, 3, 4, 5, 6, 40, 41, 42, 43, 44, 45, 46, 60, 61, 62, 63,
+    ];
+    for input_row in 0..3 {
+        for (compact_row, full_row) in mapping.into_iter().enumerate() {
+            assert!(
+                ulp_distance(
+                    compact[input_row * mapping.len() + compact_row],
+                    full[input_row * output_rows + full_row],
+                ) <= 1
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires verified local target GGUF artifact"]
+fn actual_q5k_qmm_microbench() {
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
+    use std::time::{Duration, Instant};
+
+    if !crate::metal_is_available() {
+        return;
+    }
+    let structure_path =
+        std::env::var("QWR_GGUF_STRUCTURE_PATH").expect("QWR_GGUF_STRUCTURE_PATH");
+    let structure: serde_json::Value =
+        serde_json::from_reader(File::open(structure_path).unwrap()).unwrap();
+    let model = &structure["target"];
+    let tensor = model["tensor_infos_enriched"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tensor| {
+            tensor["type"].as_u64() == Some(13)
+                && tensor["shape"][0].as_u64() == Some(5120)
+                && tensor["shape"][1].as_u64().is_some_and(|rows| rows >= 1024)
+        })
+        .expect("representative 5120-wide Q5_K matrix");
+    let qtype = GgmlQType::Q5K;
+    let width = 5120usize;
+    let output_rows = 1024usize;
+    let row_bytes = width / qtype.block_elements() * qtype.block_bytes();
+    let mut packed = vec![0u8; row_bytes * output_rows];
+    let mut file =
+        File::open(std::env::var("QWR_TARGET_GGUF_SMOKE_PATH").unwrap()).unwrap();
+    let offset = model["data_start"].as_u64().unwrap() + tensor["offset"].as_u64().unwrap();
+    file.seek(SeekFrom::Start(offset)).unwrap();
+    file.read_exact(&mut packed).unwrap();
+    let matrix =
+        GgmlQuantizedMatrix::from_bytes(&packed, qtype.id(), width, output_rows).unwrap();
+
+    for rows in [1usize, 3, 245, 288, 2048] {
+        let input_values: Vec<f32> = (0..rows * width)
+            .map(|index| (index as i32 % 31 - 15) as f32 * 0.00390625)
+            .collect();
+        let input = crate::from_slice_f32(&input_values, &[rows as i32, width as i32]);
+        crate::eval(input.as_ref().unwrap());
+        let warm = matrix.forward(input.as_ref().unwrap()).unwrap();
+        crate::eval(warm.as_ref().unwrap());
+        let mut samples = Vec::with_capacity(3);
+        for _ in 0..3 {
+            let started = Instant::now();
+            let output = matrix.forward(input.as_ref().unwrap()).unwrap();
+            crate::eval(output.as_ref().unwrap());
+            samples.push(started.elapsed());
+        }
+        samples.sort_unstable();
+        let median = samples[1];
+        let seconds = median.as_secs_f64();
+        let stats = matrix.dispatch_stats(rows).unwrap();
+        let gbytes = (stats.packed_bytes_read + stats.activation_bytes_read) as f64 / 1e9;
+        let flops = stats.floating_point_operations as f64;
+        eprintln!(
+            "actual Q5_K qmm M={rows} N={output_rows} K={width} median={median:?} throughput={:.3} TFLOP/s logical={:.3} GB/s workspace={}B",
+            flops / seconds / 1e12,
+            gbytes / seconds,
+            stats.workspace_bytes
+        );
+        assert!(median < Duration::from_secs(30));
+    }
+}
+
+#[test]
+#[ignore = "requires verified local target GGUF artifact and 1.1 GB packed allocation"]
+fn actual_q6_lm_head_row_range_microbench() {
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
+
+    if !crate::metal_is_available() {
+        return;
+    }
+    let structure: serde_json::Value = serde_json::from_reader(
+        File::open(std::env::var("QWR_GGUF_STRUCTURE_PATH").unwrap()).unwrap(),
+    )
+    .unwrap();
+    let model = &structure["target"];
+    let tensor = model["tensor_infos_enriched"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tensor| tensor["name"].as_str() == Some("output.weight"))
+        .unwrap();
+    assert_eq!(tensor["type"].as_u64(), Some(14));
+    let qtype = GgmlQType::Q6K;
+    let width = 5120usize;
+    let output_rows = 248_320usize;
+    let row_bytes = width / qtype.block_elements() * qtype.block_bytes();
+    let mut packed = vec![0u8; row_bytes * output_rows];
+    let mut file =
+        File::open(std::env::var("QWR_TARGET_GGUF_SMOKE_PATH").unwrap()).unwrap();
+    file.seek(SeekFrom::Start(
+        model["data_start"].as_u64().unwrap() + tensor["offset"].as_u64().unwrap(),
+    ))
+    .unwrap();
+    file.read_exact(&mut packed).unwrap();
+    let matrix =
+        GgmlQuantizedMatrix::from_bytes(&packed, qtype.id(), width, output_rows).unwrap();
+    drop(packed);
+    let draft = matrix.select_rows(&[0..65_536, 248_044..248_070]).unwrap();
+    let verify = matrix.select_rows(&[0..80_896, 248_044..248_070]).unwrap();
+    let decode_values: Vec<f32> = (0..width)
+        .map(|index| (index as i32 % 31 - 15) as f32 * 0.00390625)
+        .collect();
+    let verify_values: Vec<f32> = (0..3 * width)
+        .map(|index| (index as i32 % 31 - 15) as f32 * 0.00390625)
+        .collect();
+    let decode_input = crate::from_slice_f32(&decode_values, &[1, width as i32]);
+    let verify_input = crate::from_slice_f32(&verify_values, &[3, width as i32]);
+    crate::eval(decode_input.as_ref().unwrap());
+    crate::eval(verify_input.as_ref().unwrap());
+
+    let full_m1 = median_forward(|| matrix.forward(decode_input.as_ref().unwrap()).unwrap());
+    let draft_m1 = median_forward(|| draft.forward(decode_input.as_ref().unwrap()).unwrap());
+    let full_m3 = median_forward(|| matrix.forward(verify_input.as_ref().unwrap()).unwrap());
+    let verify_m3 = median_forward(|| verify.forward(verify_input.as_ref().unwrap()).unwrap());
+    let full_m1_stats = matrix.dispatch_stats(1).unwrap();
+    let draft_m1_stats = draft.dispatch_stats(1).unwrap();
+    let full_m3_stats = matrix.dispatch_stats(3).unwrap();
+    let verify_m3_stats = verify.dispatch_stats(3).unwrap();
+    eprintln!(
+        "actual Q6_K LM head M=1 full={full_m1:?} draft_rows={} compact={draft_m1:?} speedup={:.3}x full_packed={:.3}GB/s compact_packed={:.3}GB/s",
+        draft.selected_rows(),
+        full_m1.as_secs_f64() / draft_m1.as_secs_f64(),
+        full_m1_stats.packed_bytes_read as f64 / full_m1.as_secs_f64() / 1e9,
+        draft_m1_stats.packed_bytes_read as f64 / draft_m1.as_secs_f64() / 1e9,
+    );
+    eprintln!(
+        "actual Q6_K LM head M=3 full={full_m3:?} verify_rows={} compact={verify_m3:?} speedup={:.3}x full_packed={:.3}GB/s compact_packed={:.3}GB/s workspace={}B threadgroup={}B",
+        verify.selected_rows(),
+        full_m3.as_secs_f64() / verify_m3.as_secs_f64(),
+        full_m3_stats.packed_bytes_read as f64 / full_m3.as_secs_f64() / 1e9,
+        verify_m3_stats.packed_bytes_read as f64 / verify_m3.as_secs_f64() / 1e9,
+        verify_m3_stats.workspace_bytes,
+        verify_m3_stats.threadgroup_bytes,
+    );
+    assert!(draft_m1 < full_m1);
+    assert!(verify_m3 < full_m3);
 }

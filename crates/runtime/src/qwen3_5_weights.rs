@@ -7,7 +7,9 @@ use anyhow::{Context, Result, ensure};
 use memmap2::{Advice, Mmap, MmapOptions, UncheckedAdvice};
 use mlxcel_core::layers::{FusedQKVLinear, Linear, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
-use mlxcel_core::{GgmlQuantizedEmbedding, GgmlQuantizedMatrix, MlxArray, UniquePtr, dtype};
+use mlxcel_core::{
+    GgmlQuantizedEmbedding, GgmlQuantizedMatrix, GgmlQuantizedRows, MlxArray, UniquePtr, dtype,
+};
 
 use crate::gguf::{GgufModelPair, GgufShardSet, GgufTensorInfo, MetadataValue};
 use crate::qwen3_5::Qwen35Config;
@@ -15,6 +17,7 @@ use crate::qwen3_5::Qwen35Config;
 pub(crate) enum Qwen35Linear {
     Legacy(UnifiedLinear),
     Gguf(GgmlQuantizedMatrix),
+    GgufRows(GgmlQuantizedRows),
 }
 
 impl Qwen35Linear {
@@ -28,13 +31,26 @@ impl Qwen35Linear {
             Self::Gguf(linear) => linear
                 .forward(input)
                 .expect("validated GGML matrix execution must succeed"),
+            Self::GgufRows(linear) => linear
+                .forward(input)
+                .expect("validated GGML row projection must succeed"),
         }
     }
 
     pub(crate) fn legacy_ref(&self) -> Option<&UnifiedLinear> {
         match self {
             Self::Legacy(linear) => Some(linear),
-            Self::Gguf(_) => None,
+            Self::Gguf(_) | Self::GgufRows(_) => None,
+        }
+    }
+
+    pub(crate) fn select_gguf_rows(
+        &self,
+        ranges: &[std::ops::Range<usize>],
+    ) -> Option<Self> {
+        match self {
+            Self::Gguf(linear) => linear.select_rows(ranges).ok().map(Self::GgufRows),
+            Self::Legacy(_) | Self::GgufRows(_) => None,
         }
     }
 }

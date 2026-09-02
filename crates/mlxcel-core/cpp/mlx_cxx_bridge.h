@@ -2269,10 +2269,12 @@ bool fused_rope_qk_append_available();
 std::unique_ptr<MlxArray> ggml_packed_matmul(
     const MlxArray& x,
     const MlxArray& packed,
+    const MlxArray& row_ranges,
     const MlxArray& iq3_grid,
     int32_t qtype,
     int32_t in_features,
     int32_t out_features,
+    int32_t selected_rows,
     int32_t input_rows);
 std::unique_ptr<MlxArray> ggml_packed_embedding(
     const MlxArray& indices,

@@ -111,6 +111,14 @@ pub enum GgmlQuantError {
     IndexDType(i32),
     #[error("packed GGML embedding indices must not be empty")]
     EmptyIndices,
+    #[error("packed GGML row range {start}..{end} is outside 0..{rows}")]
+    InvalidRowRange {
+        start: usize,
+        end: usize,
+        rows: usize,
+    },
+    #[error("packed GGML row selection must contain one to three non-empty ranges")]
+    InvalidRowSelection,
     #[error("packed GGML IQ3 lookup table failed integrity validation")]
     InvalidTable,
     #[error("packed GGML Metal launch failed: {0}")]
@@ -121,7 +129,9 @@ pub enum GgmlQuantError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GgmlKernelPath {
     DecodeM1,
-    PrefillRows4,
+    VerifyM2To4,
+    TiledQmm16x8,
+    TiledQmm32x8,
     Embedding,
 }
 
@@ -133,6 +143,8 @@ pub struct GgmlDispatchStats {
     pub packed_bytes_read: usize,
     pub activation_bytes_read: usize,
     pub output_bytes_written: usize,
+    pub floating_point_operations: usize,
+    pub threadgroup_bytes: usize,
     pub workspace_bytes: usize,
 }
 
@@ -140,6 +152,7 @@ pub struct GgmlDispatchStats {
 pub struct GgmlQuantizedMatrix {
     packed: UniquePtr<MlxArray>,
     iq3_grid: UniquePtr<MlxArray>,
+    row_ranges: UniquePtr<MlxArray>,
     qtype: GgmlQType,
     in_features: i32,
     out_features: i32,
@@ -180,23 +193,37 @@ impl GgmlQuantizedMatrix {
                 actual: bytes.len(),
             });
         }
-        let packed_len = i32::try_from(expected).map_err(|_| GgmlQuantError::Overflow)?;
-
+        let row_bytes_i32 = i32::try_from(row_bytes).map_err(|_| GgmlQuantError::Overflow)?;
         let table_values: &[u32] = if qtype == GgmlQType::Iq3S {
             validate_iq3_grid()?;
             &IQ3S_GRID
         } else {
-            &[0]
+            &[0; 8]
         };
-        let packed = crate::from_bytes(bytes, &[packed_len], dtype::UINT8);
+        let packed = crate::from_bytes(
+            bytes,
+            &[out_features_i32, row_bytes_i32],
+            dtype::UINT8,
+        );
         let iq3_grid = crate::from_slice_u32(table_values, &[table_values.len() as i32]);
-        validate_device_buffers(&packed, &iq3_grid, qtype, expected)?;
+        let (row_ranges, selected_rows) =
+            make_row_ranges(&[0..out_features], out_features)?;
+        debug_assert_eq!(selected_rows, out_features_i32);
+        validate_device_buffers(
+            &packed,
+            &iq3_grid,
+            qtype,
+            expected,
+            out_features_i32,
+            row_bytes_i32,
+        )?;
         crate::eval(packed.as_ref().ok_or(GgmlQuantError::InvalidTable)?);
         crate::eval(iq3_grid.as_ref().ok_or(GgmlQuantError::InvalidTable)?);
 
         Ok(Self {
             packed,
             iq3_grid,
+            row_ranges,
             qtype,
             in_features: in_features_i32,
             out_features: out_features_i32,
@@ -235,6 +262,11 @@ impl GgmlQuantizedMatrix {
                     .as_ref()
                     .expect("validated GGML lookup table is always present"),
             ),
+            row_ranges: crate::copy(
+                self.row_ranges
+                    .as_ref()
+                    .expect("validated GGML row ranges are always present"),
+            ),
             qtype: self.qtype,
             in_features: self.in_features,
             out_features: self.out_features,
@@ -243,72 +275,111 @@ impl GgmlQuantizedMatrix {
     }
 
     pub fn forward(&self, input: &MlxArray) -> Result<UniquePtr<MlxArray>, GgmlQuantError> {
-        let shape = crate::array_shape(input);
-        if shape.is_empty() || shape.last().copied() != Some(self.in_features) {
-            return Err(GgmlQuantError::InputShape {
-                expected_width: self.in_features(),
-            });
-        }
-        let input_rows = shape[..shape.len() - 1]
-            .iter()
-            .try_fold(1usize, |rows, dim| {
-                let dim = usize::try_from(*dim).map_err(|_| GgmlQuantError::InputShape {
-                    expected_width: self.in_features(),
-                })?;
-                rows.checked_mul(dim).ok_or(GgmlQuantError::Overflow)
-            })?;
-        if input_rows == 0 {
-            return Err(GgmlQuantError::InputShape {
-                expected_width: self.in_features(),
-            });
-        }
-        let input_rows = i32::try_from(input_rows).map_err(|_| GgmlQuantError::Overflow)?;
-        let input_dtype = crate::array_dtype(input);
-        if !matches!(input_dtype, dtype::FLOAT16 | dtype::FLOAT32 | dtype::BFLOAT16) {
-            return Err(GgmlQuantError::InputDType(input_dtype));
-        }
-        crate::ggml_packed_matmul(
+        launch_matmul(
             input,
             self.packed.as_ref().ok_or(GgmlQuantError::InvalidTable)?,
+            self.row_ranges
+                .as_ref()
+                .ok_or(GgmlQuantError::InvalidTable)?,
             self.iq3_grid.as_ref().ok_or(GgmlQuantError::InvalidTable)?,
-            self.qtype.id() as i32,
+            self.qtype,
             self.in_features,
             self.out_features,
-            input_rows,
+            self.out_features,
         )
-        .map_err(|error| GgmlQuantError::Backend(error.what().to_owned()))
     }
 
-    pub fn dispatch_stats(&self, input_rows: usize) -> Result<GgmlDispatchStats, GgmlQuantError> {
-        if input_rows == 0 {
-            return Err(GgmlQuantError::EmptyShape);
-        }
-        let rows_per_group = if input_rows == 1 { 1 } else { input_rows.min(4) };
-        let groups = input_rows
-            .checked_add(rows_per_group - 1)
-            .and_then(|rows| rows.checked_div(rows_per_group))
-            .ok_or(GgmlQuantError::Overflow)?;
-        Ok(GgmlDispatchStats {
-            path: if input_rows == 1 {
-                GgmlKernelPath::DecodeM1
-            } else {
-                GgmlKernelPath::PrefillRows4
-            },
-            packed_bytes_read: self
-                .packed_bytes()
-                .checked_mul(groups)
-                .ok_or(GgmlQuantError::Overflow)?,
-            activation_bytes_read: input_rows
-                .checked_mul(self.out_features())
-                .and_then(|n| n.checked_mul(self.in_features()))
-                .and_then(|n| n.checked_mul(4))
-                .ok_or(GgmlQuantError::Overflow)?,
-            output_bytes_written: input_rows
-                .checked_mul(self.out_features())
-                .and_then(|n| n.checked_mul(4))
-                .ok_or(GgmlQuantError::Overflow)?,
-            workspace_bytes: 0,
+    /// Build a zero-copy projection view over up to three ordered packed row
+    /// ranges. The view owns only MLX aliases and a tiny immutable range table.
+    pub fn select_rows(
+        &self,
+        ranges: &[std::ops::Range<usize>],
+    ) -> Result<GgmlQuantizedRows, GgmlQuantError> {
+        let (row_ranges, selected_rows) =
+            make_row_ranges(ranges, self.out_features())?;
+        Ok(GgmlQuantizedRows {
+            packed: crate::copy(
+                self.packed
+                    .as_ref()
+                    .expect("validated packed GGML buffer is always present"),
+            ),
+            iq3_grid: crate::copy(
+                self.iq3_grid
+                    .as_ref()
+                    .expect("validated GGML lookup table is always present"),
+            ),
+            row_ranges,
+            qtype: self.qtype,
+            in_features: self.in_features,
+            out_features: self.out_features,
+            selected_rows,
+            row_bytes: self.row_bytes,
         })
+    }
+
+    pub fn dispatch_stats(
+        &self,
+        input_rows: usize,
+    ) -> Result<GgmlDispatchStats, GgmlQuantError> {
+        packed_dispatch_stats(
+            input_rows,
+            self.in_features(),
+            self.out_features(),
+            self.row_bytes,
+        )
+    }
+}
+
+/// Zero-copy ordered row selection over one resident packed matrix.
+pub struct GgmlQuantizedRows {
+    packed: UniquePtr<MlxArray>,
+    iq3_grid: UniquePtr<MlxArray>,
+    row_ranges: UniquePtr<MlxArray>,
+    qtype: GgmlQType,
+    in_features: i32,
+    out_features: i32,
+    selected_rows: i32,
+    row_bytes: usize,
+}
+
+impl GgmlQuantizedRows {
+    pub const fn qtype(&self) -> GgmlQType {
+        self.qtype
+    }
+
+    pub const fn in_features(&self) -> usize {
+        self.in_features as usize
+    }
+
+    pub const fn selected_rows(&self) -> usize {
+        self.selected_rows as usize
+    }
+
+    pub fn forward(&self, input: &MlxArray) -> Result<UniquePtr<MlxArray>, GgmlQuantError> {
+        launch_matmul(
+            input,
+            self.packed.as_ref().ok_or(GgmlQuantError::InvalidTable)?,
+            self.row_ranges
+                .as_ref()
+                .ok_or(GgmlQuantError::InvalidTable)?,
+            self.iq3_grid.as_ref().ok_or(GgmlQuantError::InvalidTable)?,
+            self.qtype,
+            self.in_features,
+            self.out_features,
+            self.selected_rows,
+        )
+    }
+
+    pub fn dispatch_stats(
+        &self,
+        input_rows: usize,
+    ) -> Result<GgmlDispatchStats, GgmlQuantError> {
+        packed_dispatch_stats(
+            input_rows,
+            self.in_features(),
+            self.selected_rows(),
+            self.row_bytes,
+        )
     }
 }
 
@@ -383,6 +454,14 @@ impl GgmlQuantizedEmbedding {
         self.matrix.forward(input)
     }
 
+    /// Build a zero-copy linear projection over ordered vocabulary row ranges.
+    pub fn select_linear_rows(
+        &self,
+        ranges: &[std::ops::Range<usize>],
+    ) -> Result<GgmlQuantizedRows, GgmlQuantError> {
+        self.matrix.select_rows(ranges)
+    }
+
     pub fn dispatch_stats(&self, selected_rows: usize) -> Result<GgmlDispatchStats, GgmlQuantError> {
         if selected_rows == 0 {
             return Err(GgmlQuantError::EmptyIndices);
@@ -399,9 +478,160 @@ impl GgmlQuantizedEmbedding {
                 .checked_mul(self.embedding_dim())
                 .and_then(|n| n.checked_mul(4))
                 .ok_or(GgmlQuantError::Overflow)?,
+            floating_point_operations: 0,
+            threadgroup_bytes: 0,
             workspace_bytes: 0,
         })
     }
+}
+
+fn launch_matmul(
+    input: &MlxArray,
+    packed: &MlxArray,
+    row_ranges: &MlxArray,
+    iq3_grid: &MlxArray,
+    qtype: GgmlQType,
+    in_features: i32,
+    out_features: i32,
+    selected_rows: i32,
+) -> Result<UniquePtr<MlxArray>, GgmlQuantError> {
+    let shape = crate::array_shape(input);
+    if shape.is_empty() || shape.last().copied() != Some(in_features) {
+        return Err(GgmlQuantError::InputShape {
+            expected_width: in_features as usize,
+        });
+    }
+    let input_rows = shape[..shape.len() - 1]
+        .iter()
+        .try_fold(1usize, |rows, dimension| {
+            let dimension =
+                usize::try_from(*dimension).map_err(|_| GgmlQuantError::InputShape {
+                    expected_width: in_features as usize,
+                })?;
+            rows.checked_mul(dimension).ok_or(GgmlQuantError::Overflow)
+        })?;
+    if input_rows == 0 {
+        return Err(GgmlQuantError::InputShape {
+            expected_width: in_features as usize,
+        });
+    }
+    let input_rows = i32::try_from(input_rows).map_err(|_| GgmlQuantError::Overflow)?;
+    let input_dtype = crate::array_dtype(input);
+    if !matches!(input_dtype, dtype::FLOAT16 | dtype::FLOAT32 | dtype::BFLOAT16) {
+        return Err(GgmlQuantError::InputDType(input_dtype));
+    }
+    crate::ggml_packed_matmul(
+        input,
+        packed,
+        row_ranges,
+        iq3_grid,
+        qtype.id() as i32,
+        in_features,
+        out_features,
+        selected_rows,
+        input_rows,
+    )
+    .map_err(|error| GgmlQuantError::Backend(error.what().to_owned()))
+}
+
+fn make_row_ranges(
+    ranges: &[std::ops::Range<usize>],
+    total_rows: usize,
+) -> Result<(UniquePtr<MlxArray>, i32), GgmlQuantError> {
+    if ranges.is_empty() || ranges.len() > 3 {
+        return Err(GgmlQuantError::InvalidRowSelection);
+    }
+    let mut selected_rows = 0usize;
+    let mut flattened = Vec::with_capacity(ranges.len() * 2);
+    for range in ranges {
+        if range.start >= range.end || range.end > total_rows {
+            return Err(GgmlQuantError::InvalidRowRange {
+                start: range.start,
+                end: range.end,
+                rows: total_rows,
+            });
+        }
+        let count = range.end - range.start;
+        selected_rows = selected_rows
+            .checked_add(count)
+            .ok_or(GgmlQuantError::Overflow)?;
+        flattened.push(u32::try_from(range.start).map_err(|_| GgmlQuantError::Overflow)?);
+        flattened.push(u32::try_from(count).map_err(|_| GgmlQuantError::Overflow)?);
+    }
+    let selected_rows = i32::try_from(selected_rows).map_err(|_| GgmlQuantError::Overflow)?;
+    let range_count = i32::try_from(ranges.len()).map_err(|_| GgmlQuantError::Overflow)?;
+    let array = crate::from_slice_u32(&flattened, &[range_count, 2]);
+    let reference = array.as_ref().ok_or(GgmlQuantError::InvalidRowSelection)?;
+    if crate::array_dtype(reference) != dtype::UINT32
+        || crate::array_shape(reference) != [range_count, 2]
+        || crate::array_nbytes(reference) != flattened.len() * 4
+    {
+        return Err(GgmlQuantError::InvalidRowSelection);
+    }
+    crate::eval(reference);
+    Ok((array, selected_rows))
+}
+
+fn packed_dispatch_stats(
+    input_rows: usize,
+    in_features: usize,
+    selected_rows: usize,
+    row_bytes: usize,
+) -> Result<GgmlDispatchStats, GgmlQuantError> {
+    if input_rows == 0 || selected_rows == 0 {
+        return Err(GgmlQuantError::EmptyShape);
+    }
+    let (path, m_tiles, n_tiles, threadgroup_bytes) = if input_rows == 1 {
+        (GgmlKernelPath::DecodeM1, 1usize, selected_rows, 0usize)
+    } else if input_rows <= 4 {
+        (
+            GgmlKernelPath::VerifyM2To4,
+            1usize,
+            selected_rows,
+            0usize,
+        )
+    } else if input_rows <= 512 {
+        (
+            GgmlKernelPath::TiledQmm16x8,
+            input_rows.div_ceil(16),
+            selected_rows.div_ceil(8),
+            16 * 256 * 4,
+        )
+    } else {
+        (
+            GgmlKernelPath::TiledQmm32x8,
+            input_rows.div_ceil(32),
+            selected_rows.div_ceil(8),
+            32 * 256 * 4,
+        )
+    };
+    let packed_bytes_read = row_bytes
+        .checked_mul(selected_rows)
+        .and_then(|bytes| bytes.checked_mul(m_tiles))
+        .ok_or(GgmlQuantError::Overflow)?;
+    let activation_bytes_read = input_rows
+        .checked_mul(in_features)
+        .and_then(|elements| elements.checked_mul(4))
+        .and_then(|bytes| bytes.checked_mul(n_tiles))
+        .ok_or(GgmlQuantError::Overflow)?;
+    let output_bytes_written = input_rows
+        .checked_mul(selected_rows)
+        .and_then(|elements| elements.checked_mul(4))
+        .ok_or(GgmlQuantError::Overflow)?;
+    let floating_point_operations = input_rows
+        .checked_mul(selected_rows)
+        .and_then(|elements| elements.checked_mul(in_features))
+        .and_then(|fmas| fmas.checked_mul(2))
+        .ok_or(GgmlQuantError::Overflow)?;
+    Ok(GgmlDispatchStats {
+        path,
+        packed_bytes_read,
+        activation_bytes_read,
+        output_bytes_written,
+        floating_point_operations,
+        threadgroup_bytes,
+        workspace_bytes: 0,
+    })
 }
 
 fn validate_device_buffers(
@@ -409,11 +639,13 @@ fn validate_device_buffers(
     table: &UniquePtr<MlxArray>,
     qtype: GgmlQType,
     expected_bytes: usize,
+    out_features: i32,
+    row_bytes: i32,
 ) -> Result<(), GgmlQuantError> {
     let packed = packed.as_ref().ok_or(GgmlQuantError::InvalidTable)?;
     if crate::array_dtype(packed) != dtype::UINT8
         || crate::array_nbytes(packed) != expected_bytes
-        || crate::array_shape(packed) != [i32::try_from(expected_bytes).map_err(|_| GgmlQuantError::Overflow)?]
+        || crate::array_shape(packed) != [out_features, row_bytes]
     {
         return Err(GgmlQuantError::ByteLength {
             expected: expected_bytes,
@@ -421,7 +653,7 @@ fn validate_device_buffers(
         });
     }
     let table = table.as_ref().ok_or(GgmlQuantError::InvalidTable)?;
-    let expected_table_len = if qtype == GgmlQType::Iq3S { 512 } else { 1 };
+    let expected_table_len = if qtype == GgmlQType::Iq3S { 512 } else { 8 };
     if crate::array_dtype(table) != dtype::UINT32
         || crate::array_shape(table) != [expected_table_len]
         || crate::array_nbytes(table) != expected_table_len as usize * 4

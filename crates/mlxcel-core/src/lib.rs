@@ -1807,10 +1807,12 @@ mod ffi {
         fn ggml_packed_matmul(
             x: &MlxArray,
             packed: &MlxArray,
+            row_ranges: &MlxArray,
             iq3_grid: &MlxArray,
             qtype: i32,
             in_features: i32,
             out_features: i32,
+            selected_rows: i32,
             input_rows: i32,
         ) -> Result<UniquePtr<MlxArray>>;
 
@@ -3280,7 +3282,7 @@ mod ops;
 pub mod ggml;
 pub use ggml::{
     GgmlDispatchStats, GgmlKernelPath, GgmlQType, GgmlQuantError,
-    GgmlQuantizedEmbedding, GgmlQuantizedMatrix,
+    GgmlQuantizedEmbedding, GgmlQuantizedMatrix, GgmlQuantizedRows,
 };
 
 // Common utility functions
