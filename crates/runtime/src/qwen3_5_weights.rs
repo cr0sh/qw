@@ -20,6 +20,7 @@ pub(crate) enum Qwen35Linear {
     #[cfg(any(feature = "specprefill", test))]
     Legacy(UnifiedLinear),
     Affine(GgmlAffineMatrix),
+    PinnedM23Affine(GgmlAffineMatrix),
     AffineRows(GgmlAffineRows),
     Q6Dual(Qwen38Q6DualMatrix),
     Gguf(GgmlQuantizedMatrix),
@@ -39,6 +40,9 @@ impl Qwen35Linear {
             Self::Affine(linear) => linear
                 .forward(input)
                 .expect("validated GGML affine matrix execution must succeed"),
+            Self::PinnedM23Affine(linear) => linear
+                .forward_qwen38_m23(input)
+                .expect("validated pinned Qwen3.8 M2/M3 affine execution must succeed"),
             Self::AffineRows(linear) => linear
                 .forward(input)
                 .expect("validated GGML affine row projection must succeed"),
@@ -59,6 +63,7 @@ impl Qwen35Linear {
         match self {
             Self::Legacy(linear) => Some(linear),
             Self::Affine(_)
+            | Self::PinnedM23Affine(_)
             | Self::AffineRows(_)
             | Self::Q6Dual(_)
             | Self::Gguf(_)
@@ -69,6 +74,9 @@ impl Qwen35Linear {
     pub(crate) fn select_gguf_rows(&self, ranges: &[std::ops::Range<usize>]) -> Option<Self> {
         match self {
             Self::Affine(linear) => linear.select_rows(ranges).ok().map(Self::AffineRows),
+            Self::PinnedM23Affine(linear) => {
+                linear.select_rows(ranges).ok().map(Self::AffineRows)
+            }
             Self::Gguf(linear) => linear.select_rows(ranges).ok().map(Self::GgufRows),
             #[cfg(any(feature = "specprefill", test))]
             Self::Legacy(_) => None,
@@ -363,6 +371,53 @@ enum PinnedSlot {
     Mtp(usize),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PinnedM23AffineSignature {
+    target_slot: usize,
+    layer: usize,
+    tensor: LayerTensor,
+    qtype: u32,
+    dimensions: [u64; 2],
+}
+
+fn pinned_m23_affine_signature(slot: TensorSlot) -> Option<PinnedM23AffineSignature> {
+    let TensorSlot::Layer {
+        role: ModelRole::Target,
+        layer,
+        tensor,
+    } = slot
+    else {
+        return None;
+    };
+    if layer >= 64 {
+        return None;
+    }
+    let full_attention = (layer + 1).is_multiple_of(4);
+    let dimensions = match (full_attention, tensor) {
+        (_, LayerTensor::MlpGate | LayerTensor::MlpUp) => [5120, 17_408],
+        (_, LayerTensor::MlpDown) => [17_408, 5120],
+        (false, LayerTensor::LinearQkv) => [5120, 10_240],
+        (false, LayerTensor::LinearGate) => [5120, 6144],
+        (false, LayerTensor::LinearOutput) => [6144, 5120],
+        (true, LayerTensor::AttentionQuery) => [5120, 12_288],
+        _ => return None,
+    };
+    let PinnedSlot::Target(target_slot) = pinned_slot(slot).ok()? else {
+        return None;
+    };
+    let descriptor = &crate::qwen38_plan::TARGET_TENSOR_PLAN[target_slot];
+    if descriptor.dimensions != dimensions || !pinned_affine_qtype(descriptor.qtype) {
+        return None;
+    }
+    Some(PinnedM23AffineSignature {
+        target_slot,
+        layer,
+        tensor,
+        qtype: descriptor.qtype,
+        dimensions,
+    })
+}
+
 fn pinned_q6_shape(slot: PinnedSlot, tensor: &GgufTensorInfo) -> Result<Option<Qwen38Q6Shape>> {
     if tensor.tensor_type.id() != 14 {
         return Ok(None);
@@ -409,10 +464,20 @@ pub(crate) struct GgufWeightSource {
     target_used: RefCell<[bool; 866]>,
     mtp_used: RefCell<[bool; 18]>,
     affine_stats: RefCell<GgufAffineLoadStats>,
+    enable_m23: bool,
 }
 
 impl GgufWeightSource {
     pub(crate) fn open() -> Result<Self> {
+        Self::open_with_m23(true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_without_m23() -> Result<Self> {
+        Self::open_with_m23(false)
+    }
+
+    fn open_with_m23(enable_m23: bool) -> Result<Self> {
         let pair = PinnedGgufPair::open()?;
         // PinnedGgufPair verifies both payload hashes and exact plans first.
         let target_map = map_file(&pair.target)?;
@@ -424,6 +489,7 @@ impl GgufWeightSource {
             target_used: RefCell::new([false; 866]),
             mtp_used: RefCell::new([false; 18]),
             affine_stats: RefCell::new(GgufAffineLoadStats::default()),
+            enable_m23,
         })
     }
 
@@ -579,7 +645,19 @@ impl GgufWeightSource {
         Ok(array)
     }
 
-    fn load_linear(&self, slot: PinnedSlot, label: &str) -> Result<Qwen35Linear> {
+    fn load_linear(
+        &self,
+        typed_slot: TensorSlot,
+        slot: PinnedSlot,
+        label: &str,
+    ) -> Result<Qwen35Linear> {
+        let m23_signature = pinned_m23_affine_signature(typed_slot);
+        if let Some(signature) = m23_signature {
+            ensure!(
+                slot == PinnedSlot::Target(signature.target_slot),
+                "typed pinned M2/M3 slot changed"
+            );
+        }
         let (tensor, bytes) = self.lookup(slot)?;
         ensure!(
             tensor.dimensions.len() == 2 && tensor.tensor_type.id() != 0,
@@ -588,6 +666,13 @@ impl GgufWeightSource {
         let input = usize::try_from(tensor.dimensions[0]).context("linear input exceeds usize")?;
         let output =
             usize::try_from(tensor.dimensions[1]).context("linear output exceeds usize")?;
+        if let Some(signature) = m23_signature {
+            ensure!(
+                tensor.tensor_type.id() == signature.qtype
+                    && tensor.dimensions == signature.dimensions,
+                "typed pinned M2/M3 descriptor changed"
+            );
+        }
         let q6_shape = pinned_q6_shape(slot, tensor)?;
         let qtype = GgmlQType::try_from(tensor.tensor_type.id())
             .context("pinned GGML qtype escaped plan validation")?;
@@ -607,7 +692,11 @@ impl GgufWeightSource {
                 |range| self.discard_tensor_byte_range(slot, range),
             )?;
             self.record_affine(affine.transcode_stats());
-            Qwen35Linear::Affine(affine)
+            if self.enable_m23 && m23_signature.is_some() {
+                Qwen35Linear::PinnedM23Affine(affine)
+            } else {
+                Qwen35Linear::Affine(affine)
+            }
         } else {
             ensure!(
                 slot == PinnedSlot::Target(0) && tensor.tensor_type.id() == 14,
@@ -662,7 +751,7 @@ impl Qwen35WeightSource for GgufWeightSource {
         _bits: i32,
     ) -> std::result::Result<Qwen35Linear, String> {
         let label = slot.canonical_name();
-        self.load_linear(pinned_slot(slot)?, &label)
+        self.load_linear(slot, pinned_slot(slot)?, &label)
             .map_err(|error| error.to_string())
     }
 
@@ -848,6 +937,227 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[test]
+    fn pinned_m23_allowlist_is_exactly_the_326_target_descriptors() {
+        const TENSORS: [LayerTensor; 7] = [
+            LayerTensor::AttentionQuery,
+            LayerTensor::MlpGate,
+            LayerTensor::MlpUp,
+            LayerTensor::MlpDown,
+            LayerTensor::LinearQkv,
+            LayerTensor::LinearGate,
+            LayerTensor::LinearOutput,
+        ];
+        const EXPECTED_LAYERS: [usize; 64] = [
+            6, 5, 5, 4, 6, 6, 4, 4, 6, 6, 6, 4, 6, 6, 6, 4, 6, 6, 6, 4, 6, 5, 5, 4, 5,
+            5, 6, 4, 5, 6, 6, 4, 6, 6, 6, 4, 6, 6, 6, 4, 6, 6, 6, 4, 6, 6, 6, 4, 6, 6,
+            5, 4, 5, 6, 6, 4, 4, 4, 3, 1, 5, 6, 5, 1,
+        ];
+
+        let mut signatures = Vec::new();
+        for layer in 0..64 {
+            for tensor in TENSORS {
+                let slot = TensorSlot::Layer {
+                    role: ModelRole::Target,
+                    layer,
+                    tensor,
+                };
+                if let Some(signature) = pinned_m23_affine_signature(slot) {
+                    assert_eq!(
+                        pinned_slot(slot),
+                        Ok(PinnedSlot::Target(signature.target_slot))
+                    );
+                    let descriptor =
+                        &crate::qwen38_plan::TARGET_TENSOR_PLAN[signature.target_slot];
+                    assert_eq!(descriptor.qtype, signature.qtype);
+                    assert_eq!(descriptor.dimensions, signature.dimensions);
+                    signatures.push(signature);
+                }
+                assert!(
+                    pinned_m23_affine_signature(TensorSlot::Layer {
+                        role: ModelRole::Mtp,
+                        layer: 0,
+                        tensor,
+                    })
+                    .is_none()
+                );
+            }
+        }
+
+        assert_eq!(signatures.len(), 326);
+        let mut layer_counts = [0usize; 64];
+        let mut tensor_counts = [0usize; 7];
+        let mut qtype_counts = [0usize; 7];
+        let mut tensor_qtypes = [[0usize; 7]; 7];
+        let mut shape_counts = [0usize; 6];
+        let mut occupied_slots = [false; 866];
+        let mut slots = Vec::with_capacity(signatures.len());
+        for signature in signatures {
+            layer_counts[signature.layer] += 1;
+            let tensor_index = match signature.tensor {
+                LayerTensor::AttentionQuery => 0,
+                LayerTensor::MlpGate => 1,
+                LayerTensor::MlpUp => 2,
+                LayerTensor::MlpDown => 3,
+                LayerTensor::LinearQkv => 4,
+                LayerTensor::LinearGate => 5,
+                LayerTensor::LinearOutput => 6,
+                _ => unreachable!(),
+            };
+            let qtype_index = match signature.qtype {
+                8 => 0,
+                11 => 1,
+                12 => 2,
+                13 => 3,
+                20 => 4,
+                21 => 5,
+                23 => 6,
+                _ => unreachable!(),
+            };
+            tensor_counts[tensor_index] += 1;
+            qtype_counts[qtype_index] += 1;
+            tensor_qtypes[tensor_index][qtype_index] += 1;
+            shape_counts[match signature.dimensions {
+                [5120, 17_408] => 0,
+                [17_408, 5120] => 1,
+                [5120, 10_240] => 2,
+                [5120, 6144] => 3,
+                [6144, 5120] => 4,
+                [5120, 12_288] => 5,
+                _ => unreachable!(),
+            }] += 1;
+            assert!(!occupied_slots[signature.target_slot]);
+            occupied_slots[signature.target_slot] = true;
+            slots.push(signature.target_slot);
+        }
+        assert_eq!(layer_counts, EXPECTED_LAYERS);
+        assert_eq!(tensor_counts, [16, 60, 62, 59, 47, 47, 35]);
+        assert_eq!(qtype_counts, [1, 3, 67, 179, 6, 1, 69]);
+        assert_eq!(
+            tensor_qtypes,
+            [
+                [0, 0, 6, 8, 0, 0, 2],
+                [0, 1, 13, 19, 2, 0, 25],
+                [0, 2, 6, 32, 1, 0, 21],
+                [0, 0, 5, 35, 2, 1, 16],
+                [0, 0, 23, 21, 1, 0, 2],
+                [0, 0, 13, 31, 0, 0, 3],
+                [1, 0, 1, 33, 0, 0, 0],
+            ]
+        );
+        assert_eq!(shape_counts, [122, 59, 47, 47, 35, 16]);
+
+        slots.sort_unstable();
+        let slot_fingerprint = slots.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, slot| {
+            (*slot as u64)
+                .to_le_bytes()
+                .iter()
+                .fold(hash, |hash, byte| {
+                    (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3)
+                })
+        });
+        assert_eq!(slots.first(), Some(&3));
+        assert_eq!(slots.last(), Some(&844));
+        assert_eq!(slots.iter().sum::<usize>(), 134_189);
+        assert_eq!(slot_fingerprint, 0x03be_e87b_92d9_9aca);
+    }
+
+    #[test]
+    #[ignore = "requires the complete pinned Qwen3.8 target and MTP GGUF pair"]
+    fn real_pinned_m23_representatives_cover_affine_bits_4_5_8() {
+        if !mlxcel_core::metal_is_available() {
+            return;
+        }
+        let weights = GgufWeightSource::open().expect("open pinned GGUF pair");
+        let representatives = [
+            TensorSlot::Layer {
+                role: ModelRole::Target,
+                layer: 3,
+                tensor: LayerTensor::MlpGate,
+            },
+            TensorSlot::Layer {
+                role: ModelRole::Target,
+                layer: 3,
+                tensor: LayerTensor::MlpDown,
+            },
+            TensorSlot::Layer {
+                role: ModelRole::Target,
+                layer: 0,
+                tensor: LayerTensor::LinearOutput,
+            },
+        ];
+        for slot in representatives {
+            let signature = pinned_m23_affine_signature(slot).expect("representative signature");
+            let linear = weights
+                .load_linear(
+                    slot,
+                    PinnedSlot::Target(signature.target_slot),
+                    "representative",
+                )
+                .expect("load representative");
+            let Qwen35Linear::PinnedM23Affine(matrix) = linear else {
+                panic!("representative did not receive the pinned M2/M3 path");
+            };
+            let width = matrix.in_features();
+            for input_rows in [1usize, 2, 3, 4] {
+                let values = (0..input_rows * width)
+                    .map(|index| {
+                        let row = index / width;
+                        let column = index % width;
+                        (column as i32 % 43 - 21) as f32 * 0.001953125
+                            + row as f32 * 0.00048828125
+                    })
+                    .collect::<Vec<_>>();
+                let input =
+                    mlxcel_core::from_slice_f32(&values, &[1, input_rows as i32, width as i32]);
+                let split_stats = matrix.dispatch_stats(input_rows).unwrap();
+                let selected_stats = matrix.qwen38_m23_dispatch_stats(input_rows).unwrap();
+                if (2..=3).contains(&input_rows) {
+                    assert_eq!(
+                        selected_stats.path,
+                        mlxcel_core::GgmlKernelPath::Qwen38AffineM23
+                    );
+                    assert_eq!(
+                        split_stats.packed_bytes_read,
+                        selected_stats.packed_bytes_read * input_rows
+                    );
+                } else {
+                    assert_eq!(selected_stats, split_stats);
+                }
+                let split = matrix.forward(input.as_ref().unwrap()).unwrap();
+                let one_pass = matrix
+                    .forward_qwen38_m23(input.as_ref().unwrap())
+                    .unwrap();
+                mlxcel_core::eval(split.as_ref().unwrap());
+                mlxcel_core::eval(one_pass.as_ref().unwrap());
+                let split = mlxcel_core::array_to_raw_bytes(split.as_ref().unwrap());
+                let one_pass = mlxcel_core::array_to_raw_bytes(one_pass.as_ref().unwrap());
+                let ordered = |value: f32| {
+                    let bits = value.to_bits() as i32;
+                    if bits < 0 { i32::MIN - bits } else { bits }
+                };
+                let max_ulp = split
+                    .chunks_exact(4)
+                    .zip(one_pass.chunks_exact(4))
+                    .map(|(left, right)| {
+                        let left = f32::from_le_bytes(left.try_into().unwrap());
+                        let right = f32::from_le_bytes(right.try_into().unwrap());
+                        ordered(left).abs_diff(ordered(right))
+                    })
+                    .max()
+                    .unwrap_or(0);
+                assert!(
+                    max_ulp <= 1,
+                    "slot {} qtype {} M={} differs by {} ULP",
+                    signature.target_slot,
+                    signature.qtype,
+                    input_rows,
+                    max_ulp
+                );
+            }
+        }
     }
 
     #[test]

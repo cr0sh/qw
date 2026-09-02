@@ -1950,6 +1950,20 @@ impl Qwen35Model {
 
     pub(crate) fn load_pinned(kv_cache_mode: KVCacheMode) -> Result<(Self, GgufTextAssets)> {
         let weights = GgufWeightSource::open().context("failed to open pinned GGUF pair")?;
+        Self::load_pinned_from_weight_source(weights, kv_cache_mode)
+    }
+
+    #[cfg(test)]
+    fn load_pinned_without_m23(kv_cache_mode: KVCacheMode) -> Result<(Self, GgufTextAssets)> {
+        let weights =
+            GgufWeightSource::open_without_m23().context("failed to open pinned GGUF pair")?;
+        Self::load_pinned_from_weight_source(weights, kv_cache_mode)
+    }
+
+    fn load_pinned_from_weight_source(
+        weights: GgufWeightSource,
+        kv_cache_mode: KVCacheMode,
+    ) -> Result<(Self, GgufTextAssets)> {
         let assets = GgufTextAssets::load(weights.target())?;
         let config = weights.config()?;
         let target_cache_mode = mtp_target_cache_mode(true, kv_cache_mode);
@@ -3782,42 +3796,55 @@ mod tests {
 
     #[test]
     #[ignore = "requires the complete pinned Qwen3.8 27B GGUF pair"]
-    fn real_gguf_target_verify_logits_stay_within_one_ulp() {
-        let (model, _) = Qwen35Model::load_pinned(KVCacheMode::Fp16).expect("load Qwen3.8 GGUF");
-        let token_ids = [9_707_i32, 11, 1_879];
-        let all = mlxcel_core::from_slice_i32(&token_ids, &[1, token_ids.len() as i32]);
-        let direct = model
-            .forward_mtp_prefill_chunks(&all, None, None, None, |_, _, _| {})
-            .expect("direct target prefill")
-            .first_logits;
-        let prefix = mlxcel_core::from_slice_i32(&token_ids[..2], &[1, 2]);
-        model
-            .forward_mtp_prefill_chunks(&prefix, None, None, None, |_, _, _| {})
-            .expect("target prefix");
-        let final_token = mlxcel_core::from_slice_i32(&token_ids[2..], &[1, 1]);
-        let verified = model.forward_mtp_verify(&final_token).logits;
-        mlxcel_core::eval(&direct);
-        mlxcel_core::eval(&verified);
-        let direct = mlxcel_core::array_to_raw_bytes(&direct);
-        let verified = mlxcel_core::array_to_raw_bytes(&verified);
-        assert_eq!(direct.len(), verified.len());
+    fn real_gguf_target_m23_verify_logit_rows_stay_within_one_ulp() {
+        fn verify_logits(model: &Qwen35Model, input_rows: usize) -> Vec<u8> {
+            let token_ids = [9_707_i32, 11, 1_879, 42, 123];
+            let prefix = mlxcel_core::from_slice_i32(&token_ids[..2], &[1, 2]);
+            model
+                .forward_mtp_prefill_chunks(&prefix, None, None, None, |_, _, _| {})
+                .expect("target prefix");
+            let block =
+                mlxcel_core::from_slice_i32(&token_ids[2..2 + input_rows], &[1, input_rows as i32]);
+            let logits = model.forward_mtp_verify(&block).logits;
+            mlxcel_core::eval(&logits);
+            mlxcel_core::array_to_raw_bytes(&logits)
+        }
+
+        let split = {
+            let (model, _) = Qwen35Model::load_pinned_without_m23(KVCacheMode::Fp16)
+                .expect("load split-QMV Qwen3.8 GGUF");
+            [verify_logits(&model, 2), verify_logits(&model, 3)]
+        };
+        let one_pass = {
+            let (model, _) =
+                Qwen35Model::load_pinned(KVCacheMode::Fp16).expect("load one-pass Qwen3.8 GGUF");
+            [verify_logits(&model, 2), verify_logits(&model, 3)]
+        };
         let ordered = |value: f32| {
             let bits = value.to_bits() as i32;
             if bits < 0 { i32::MIN - bits } else { bits }
         };
-        let max_ulp = direct
-            .chunks_exact(4)
-            .zip(verified.chunks_exact(4))
-            .map(|(left, right)| {
-                let left = f32::from_le_bytes(left.try_into().unwrap());
-                let right = f32::from_le_bytes(right.try_into().unwrap());
-                ordered(left).abs_diff(ordered(right))
-            })
-            .max()
-            .unwrap_or(0);
-        assert!(
-            max_ulp <= 1,
-            "target verification logits differ by {max_ulp} ULP"
-        );
+        for (index, (split, one_pass)) in split.iter().zip(&one_pass).enumerate() {
+            let input_rows = index + 2;
+            assert_eq!(split.len(), one_pass.len());
+            let row_bytes = split.len() / input_rows;
+            for row in 0..input_rows {
+                let range = row * row_bytes..(row + 1) * row_bytes;
+                let max_ulp = split[range.clone()]
+                    .chunks_exact(4)
+                    .zip(one_pass[range].chunks_exact(4))
+                    .map(|(left, right)| {
+                        let left = f32::from_le_bytes(left.try_into().unwrap());
+                        let right = f32::from_le_bytes(right.try_into().unwrap());
+                        ordered(left).abs_diff(ordered(right))
+                    })
+                    .max()
+                    .unwrap_or(0);
+                assert!(
+                    max_ulp <= 1,
+                    "target M={input_rows} verification row {row} differs by {max_ulp} ULP"
+                );
+            }
+        }
     }
 }

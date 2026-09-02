@@ -890,6 +890,70 @@ fn actual_q6_lm_head_row_range_microbench() {
 }
 
 #[test]
+fn qwen38_affine_m23_reads_each_bits_plane_once_with_qmv_parity() {
+    if !crate::metal_is_available() {
+        return;
+    }
+    let width = 512usize;
+    let output_rows = 8usize;
+    for qtype in [GgmlQType::Q4K, GgmlQType::Q5K, GgmlQType::Q8_0] {
+        let source = fixture_matrix(qtype, width, output_rows);
+        let matrix =
+            crate::GgmlAffineMatrix::from_ggml_bytes(&source, qtype, width, output_rows).unwrap();
+        for input_rows in [2usize, 3] {
+            let values = (0..input_rows * width)
+                .map(|index| {
+                    let row = index / width;
+                    let column = index % width;
+                    (column as i32 % 37 - 18) as f32 * 0.00390625 + row as f32 * 0.0009765625
+                })
+                .collect::<Vec<_>>();
+            let input = crate::from_slice_f32(&values, &[1, input_rows as i32, width as i32]);
+            let split = raw_f32(
+                matrix
+                    .forward(input.as_ref().unwrap())
+                    .unwrap()
+                    .as_ref()
+                    .unwrap(),
+            );
+            let one_pass = raw_f32(
+                matrix
+                    .forward_m23_test_only(input.as_ref().unwrap())
+                    .unwrap()
+                    .as_ref()
+                    .unwrap(),
+            );
+            let max_ulp = split
+                .iter()
+                .zip(&one_pass)
+                .map(|(&left, &right)| ulp_distance(left, right))
+                .max()
+                .unwrap_or(0);
+            assert!(
+                max_ulp <= 1,
+                "{qtype:?} M={input_rows} one-pass affine differs by {max_ulp} ULP"
+            );
+
+            let split_stats = matrix.dispatch_stats(input_rows).unwrap();
+            let one_pass_stats = matrix.m23_dispatch_stats_test_only(input_rows).unwrap();
+            assert_eq!(one_pass_stats.path, GgmlKernelPath::Qwen38AffineM23);
+            assert_eq!(
+                split_stats.packed_bytes_read,
+                one_pass_stats.packed_bytes_read * input_rows
+            );
+            assert_eq!(
+                split_stats.activation_bytes_read,
+                one_pass_stats.activation_bytes_read
+            );
+            assert_eq!(
+                split_stats.output_bytes_written,
+                one_pass_stats.output_bytes_written
+            );
+        }
+    }
+}
+
+#[test]
 #[ignore = "requires verified local target GGUF artifact"]
 fn prototype_actual_q5_k_affine_repack() {
     use std::fs::File;

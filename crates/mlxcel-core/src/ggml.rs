@@ -135,6 +135,7 @@ pub enum GgmlKernelPath {
     TiledQmm16x8,
     TiledQmm32x8,
     AffineQmv,
+    Qwen38AffineM23,
     AffineQmm,
     Qwen38Q6DenseF16,
     Embedding,
