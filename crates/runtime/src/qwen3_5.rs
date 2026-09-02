@@ -71,11 +71,11 @@ fn compact_head(
     prefix_len: i32,
     padded_len: i32,
 ) -> Option<Qwen35Linear> {
-    let UnifiedLinear::Quantized { weight, bias: None } = head.legacy_ref()? else {
+    if vocab_size != 248_320 {
         return None;
-    };
-    (vocab_size == 248_320).then(|| {
-        Qwen35Linear::legacy(UnifiedLinear::Quantized {
+    }
+    if let Some(UnifiedLinear::Quantized { weight, bias: None }) = head.legacy_ref() {
+        return Some(Qwen35Linear::legacy(UnifiedLinear::Quantized {
             weight: QuantizedWeight {
                 weight: compact_rows(&weight.weight, prefix_len, padded_len),
                 scales: compact_rows(&weight.scales, prefix_len, padded_len),
@@ -89,8 +89,12 @@ fn compact_head(
                 global_scale: weight.global_scale.as_ref().map(|x| mlxcel_core::copy(x)),
             },
             bias: None,
-        })
-    })
+        }));
+    }
+    head.select_gguf_rows(&[
+        0..prefix_len as usize,
+        DRAFT_CONTROL_START as usize..DRAFT_CONTROL_END as usize,
+    ])
 }
 
 // Configuration.
