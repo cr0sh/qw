@@ -16,8 +16,9 @@
 
 use crate::gated_delta::GatedDeltaCache;
 use crate::qwen_mrope::{InterleavedMRoPE, apply_multimodal_rotary_pos_emb};
+use crate::qwen3_5_weights::{Qwen35Linear, Qwen35QkvProjection, Qwen35WeightSource};
 use mlxcel_core::cache::KVCacheMode;
-use mlxcel_core::layers::{FusedQKVLinear, KVCache, QuantizedWeight, RMSNorm, UnifiedLinear};
+use mlxcel_core::layers::{KVCache, QuantizedWeight, RMSNorm, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr, concatenate};
 use serde::Deserialize;
@@ -110,8 +111,8 @@ impl Qwen3NextCache {
 
 // Attention with Gated Output.
 pub(crate) struct Qwen3NextAttention {
-    qkv_proj: FusedQKVLinear,
-    o_proj: UnifiedLinear,
+    qkv_proj: Qwen35QkvProjection,
+    o_proj: Qwen35Linear,
     q_norm: RMSNorm,
     k_norm: RMSNorm,
     num_heads: i32,
@@ -288,7 +289,7 @@ impl Qwen3NextAttention {
     }
 
     pub(crate) fn from_weights(
-        weights: &WeightMap,
+        weights: &dyn Qwen35WeightSource,
         config: &Qwen3NextConfig,
         prefix: &str,
     ) -> Result<Self, String> {
@@ -297,8 +298,7 @@ impl Qwen3NextAttention {
         let (q_group_size, q_bits) = config.quant_params(&q_prefix);
         let (o_group_size, o_bits) = config.quant_params(&o_prefix);
 
-        let qkv_proj = FusedQKVLinear::from_weights_separate(
-            weights,
+        let qkv_proj = weights.qkv(
             prefix,
             q_group_size,
             q_bits,
@@ -306,16 +306,9 @@ impl Qwen3NextAttention {
             config.num_key_value_heads as i32,
             config.head_dim as i32,
         )?;
-        let o_proj = UnifiedLinear::from_weights(weights, &o_prefix, o_group_size, o_bits)?;
-
-        let q_norm_weight = weights
-            .get(&format!("{}.q_norm.weight", prefix))
-            .map(|w| mlxcel_core::copy(w))
-            .ok_or_else(|| format!("Missing q_norm weight: {}", prefix))?;
-        let k_norm_weight = weights
-            .get(&format!("{}.k_norm.weight", prefix))
-            .map(|w| mlxcel_core::copy(w))
-            .ok_or_else(|| format!("Missing k_norm weight: {}", prefix))?;
+        let o_proj = weights.linear(&o_prefix, o_group_size, o_bits)?;
+        let q_norm_weight = weights.tensor(&format!("{}.q_norm.weight", prefix))?;
+        let k_norm_weight = weights.tensor(&format!("{}.k_norm.weight", prefix))?;
 
         let head_dim = config.head_dim as i32;
 
@@ -342,26 +335,31 @@ impl Qwen3NextAttention {
 // Dense MLP.
 enum MlpInputProjections {
     Separate {
-        gate: UnifiedLinear,
-        up: UnifiedLinear,
+        gate: Qwen35Linear,
+        up: Qwen35Linear,
     },
     Fused {
-        projection: UnifiedLinear,
+        projection: Qwen35Linear,
         intermediate_size: i32,
     },
 }
 
 fn fuse_mlp_input_projections(
-    weights: &WeightMap,
+    weights: Option<&WeightMap>,
     gate_prefix: &str,
     up_prefix: &str,
-    gate: UnifiedLinear,
-    up: UnifiedLinear,
+    gate: Qwen35Linear,
+    up: Qwen35Linear,
 ) -> MlpInputProjections {
-    let can_drop_linear_biases = !weights.contains_key(&format!("{gate_prefix}.bias"))
-        && !weights.contains_key(&format!("{up_prefix}.bias"));
+    let can_drop_linear_biases = weights.is_some_and(|weights| {
+        !weights.contains_key(&format!("{gate_prefix}.bias"))
+            && !weights.contains_key(&format!("{up_prefix}.bias"))
+    });
     let fused = (|| {
-        let (gate_weight, up_weight) = (gate.quantized_weight()?, up.quantized_weight()?);
+        let (gate_weight, up_weight) = (
+            gate.legacy_ref()?.quantized_weight()?,
+            up.legacy_ref()?.quantized_weight()?,
+        );
         if !can_drop_linear_biases
             || gate_weight.group_size != up_weight.group_size
             || gate_weight.bits != up_weight.bits
@@ -379,7 +377,7 @@ fn fuse_mlp_input_projections(
             0,
         );
         Some(MlpInputProjections::Fused {
-            projection: UnifiedLinear::new(
+            projection: Qwen35Linear::legacy(UnifiedLinear::new(
                 QuantizedWeight::new(
                     weight,
                     scales,
@@ -388,7 +386,7 @@ fn fuse_mlp_input_projections(
                     gate_weight.bits,
                 ),
                 None,
-            ),
+            )),
             intermediate_size: mlxcel_core::array_shape(&gate_weight.weight)[0],
         })
     })();
@@ -399,7 +397,7 @@ fn fuse_mlp_input_projections(
 /// Dense MLP layer
 pub(crate) struct Mlp {
     input_projections: MlpInputProjections,
-    down_proj: UnifiedLinear,
+    down_proj: Qwen35Linear,
 }
 
 impl Mlp {
@@ -435,7 +433,7 @@ impl Mlp {
     }
 
     pub(crate) fn from_weights(
-        weights: &WeightMap,
+        weights: &dyn Qwen35WeightSource,
         config: &Qwen3NextConfig,
         prefix: &str,
     ) -> Result<Self, String> {
@@ -445,23 +443,18 @@ impl Mlp {
         let (gate_group_size, gate_bits) = config.quant_params(&gate_prefix);
         let (up_group_size, up_bits) = config.quant_params(&up_prefix);
         let (down_group_size, down_bits) = config.quant_params(&down_prefix);
-        let gate = UnifiedLinear::from_weights(weights, &gate_prefix, gate_group_size, gate_bits)?;
-        let up = UnifiedLinear::from_weights(weights, &up_prefix, up_group_size, up_bits)?;
+        let gate = weights.linear(&gate_prefix, gate_group_size, gate_bits)?;
+        let up = weights.linear(&up_prefix, up_group_size, up_bits)?;
 
         Ok(Self {
             input_projections: fuse_mlp_input_projections(
-                weights,
+                weights.legacy_weights(),
                 &gate_prefix,
                 &up_prefix,
                 gate,
                 up,
             ),
-            down_proj: UnifiedLinear::from_weights(
-                weights,
-                &down_prefix,
-                down_group_size,
-                down_bits,
-            )?,
+            down_proj: weights.linear(&down_prefix, down_group_size, down_bits)?,
         })
     }
 }

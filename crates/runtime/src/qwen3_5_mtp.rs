@@ -30,7 +30,7 @@ use mlxcel_core::generate::{
     SamplingConfig, TokenConstraint, mask_logits_to_allowed,
 };
 use mlxcel_core::generation_policy::{merged_eos_token_ids, seed_rng_if_needed};
-use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedLinear};
+use mlxcel_core::layers::{KVCache, RMSNorm};
 use mlxcel_core::sampling::{
     effective_token_distribution, sample_token_optimized, sample_token_with_distribution,
 };
@@ -39,12 +39,12 @@ use mlxcel_core::speculative::mtp::walk::WalkResult;
 use mlxcel_core::speculative::stochastic_accept::{
     DraftVerdict, sampler_is_greedy, verify_draft_token,
 };
-use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use tracing::debug;
 
 use crate::qwen_vl_position::decode_rope_positions;
 use crate::qwen3_5::{Qwen35Config, Qwen35DecoderLayer, Qwen35Model};
+use crate::qwen3_5_weights::{Qwen35Linear, Qwen35WeightSource};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct MtpGenerationStats {
@@ -284,30 +284,22 @@ fn shifted_embedding_range(
 pub(crate) struct Qwen35MtpDraftModel {
     pre_fc_norm_embedding: RMSNorm,
     pre_fc_norm_hidden: RMSNorm,
-    fc: UnifiedLinear,
+    fc: Qwen35Linear,
     layer: Qwen35DecoderLayer,
     norm: RMSNorm,
     state: RefCell<Qwen35MtpDraftState>,
 }
 
 impl Qwen35MtpDraftModel {
-    pub(crate) fn from_weights(weights: &WeightMap, config: &Qwen35Config) -> Result<Self, String> {
-        let embedding_norm = weights
-            .get("mtp.pre_fc_norm_embedding.weight")
-            .map(|weight| mlxcel_core::copy(weight))
-            .ok_or_else(|| {
-                "missing required tensor mtp.pre_fc_norm_embedding.weight".to_string()
-            })?;
-        let hidden_norm = weights
-            .get("mtp.pre_fc_norm_hidden.weight")
-            .map(|weight| mlxcel_core::copy(weight))
-            .ok_or_else(|| "missing required tensor mtp.pre_fc_norm_hidden.weight".to_string())?;
-        let norm = weights
-            .get("mtp.norm.weight")
-            .map(|weight| mlxcel_core::copy(weight))
-            .ok_or_else(|| "missing required tensor mtp.norm.weight".to_string())?;
+    pub(crate) fn from_weights(
+        weights: &dyn Qwen35WeightSource,
+        config: &Qwen35Config,
+    ) -> Result<Self, String> {
+        let embedding_norm = weights.tensor("mtp.pre_fc_norm_embedding.weight")?;
+        let hidden_norm = weights.tensor("mtp.pre_fc_norm_hidden.weight")?;
+        let norm = weights.tensor("mtp.norm.weight")?;
         let (fc_group_size, fc_bits) = config.quant_params("mtp.fc");
-        let fc = UnifiedLinear::from_weights(weights, "mtp.fc", fc_group_size, fc_bits)?;
+        let fc = weights.linear("mtp.fc", fc_group_size, fc_bits)?;
         let layer = Qwen35DecoderLayer::from_weights_at_prefix(
             weights,
             config,
@@ -2365,7 +2357,8 @@ impl Qwen35MtpGenerator {
                     &verify_tokens,
                     &[1, i32::try_from(verify_tokens.len()).unwrap_or(i32::MAX)],
                 );
-                let compact_verify = greedy
+                let compact_verify = model.has_compact_dflash_verify_head()
+                    && greedy
                     && sampling.token_bias.is_empty()
                     && sampling.repetition_penalty == 1.0
                     && sampling.dry_multiplier == 0.0
