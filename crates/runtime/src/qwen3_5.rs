@@ -537,6 +537,32 @@ impl Qwen35GdnIngress {
             }
         }
     }
+
+    fn forward_geometry_for_experiment(
+        &self,
+        inputs: &MlxArray,
+        block_m: usize,
+        block_n: usize,
+    ) -> (
+        UniquePtr<MlxArray>,
+        UniquePtr<MlxArray>,
+        UniquePtr<MlxArray>,
+        UniquePtr<MlxArray>,
+    ) {
+        let Self::Separate {
+            qkv,
+            aux: Qwen35GatedAuxProjections::Separate { z, b, a },
+        } = self
+        else {
+            panic!("geometry experiment requires separate affine GDN projections");
+        };
+        (
+            qkv.forward_geometry_for_experiment(inputs, block_m, block_n),
+            z.forward_geometry_for_experiment(inputs, block_m, block_n),
+            b.forward(inputs),
+            a.forward(inputs),
+        )
+    }
 }
 
 // GatedDeltaNet - Qwen3.5 variant with separately stored projections.
@@ -4163,5 +4189,456 @@ mod tests {
                 gdn_stats.workspace_bytes,
             );
         }
+    }
+
+    #[test]
+    #[ignore = "temporary exact-artifact M288/M2048 BlockMMA investigation"]
+    fn experimental_qwen38_prefill_geometry_matrix() {
+        use crate::qwen3_5_weights::{
+            LayerTensor, ModelRole, Qwen35WeightSource, TensorSlot,
+        };
+        use std::time::Instant;
+
+        const GEOMETRIES: [(usize, usize); 9] = [
+            (16, 16),
+            (16, 32),
+            (32, 16),
+            (32, 32),
+            (16, 64),
+            (64, 16),
+            (32, 64),
+            (64, 32),
+            (64, 64),
+        ];
+
+        #[derive(Clone, Copy)]
+        struct Case {
+            name: &'static str,
+            layer: usize,
+            tensor: LayerTensor,
+            bits: i32,
+            k: usize,
+            n: usize,
+            count: usize,
+        }
+
+        let cases = [
+            Case {
+                name: "GU_A4",
+                layer: 3,
+                tensor: LayerTensor::MlpGate,
+                bits: 4,
+                k: 5120,
+                n: 17408,
+                count: 21,
+            },
+            Case {
+                name: "GU_A5",
+                layer: 3,
+                tensor: LayerTensor::MlpUp,
+                bits: 5,
+                k: 5120,
+                n: 17408,
+                count: 45,
+            },
+            Case {
+                name: "GU_A8",
+                layer: 13,
+                tensor: LayerTensor::MlpGate,
+                bits: 8,
+                k: 5120,
+                n: 17408,
+                count: 52,
+            },
+            Case {
+                name: "DOWN_A4",
+                layer: 6,
+                tensor: LayerTensor::MlpDown,
+                bits: 4,
+                k: 17408,
+                n: 5120,
+                count: 6,
+            },
+            Case {
+                name: "DOWN_A5",
+                layer: 3,
+                tensor: LayerTensor::MlpDown,
+                bits: 5,
+                k: 17408,
+                n: 5120,
+                count: 35,
+            },
+            Case {
+                name: "DOWN_A8",
+                layer: 1,
+                tensor: LayerTensor::MlpDown,
+                bits: 8,
+                k: 17408,
+                n: 5120,
+                count: 18,
+            },
+            Case {
+                name: "QKV_A4",
+                layer: 1,
+                tensor: LayerTensor::LinearQkv,
+                bits: 4,
+                k: 5120,
+                n: 10240,
+                count: 23,
+            },
+            Case {
+                name: "QKV_A5",
+                layer: 0,
+                tensor: LayerTensor::LinearQkv,
+                bits: 5,
+                k: 5120,
+                n: 10240,
+                count: 20,
+            },
+            Case {
+                name: "QKV_A8",
+                layer: 21,
+                tensor: LayerTensor::LinearQkv,
+                bits: 8,
+                k: 5120,
+                n: 10240,
+                count: 3,
+            },
+            Case {
+                name: "Z_A4",
+                layer: 1,
+                tensor: LayerTensor::LinearGate,
+                bits: 4,
+                k: 5120,
+                n: 6144,
+                count: 12,
+            },
+            Case {
+                name: "Z_A5",
+                layer: 0,
+                tensor: LayerTensor::LinearGate,
+                bits: 5,
+                k: 5120,
+                n: 6144,
+                count: 31,
+            },
+            Case {
+                name: "Z_A8",
+                layer: 17,
+                tensor: LayerTensor::LinearGate,
+                bits: 8,
+                k: 5120,
+                n: 6144,
+                count: 3,
+            },
+            Case {
+                name: "BA_A8",
+                layer: 0,
+                tensor: LayerTensor::LinearBeta,
+                bits: 8,
+                k: 5120,
+                n: 48,
+                count: 92,
+            },
+        ];
+        assert_eq!(cases.iter().map(|case| case.count).sum::<usize>(), 361);
+
+        fn input(rows: usize, width: usize) -> UniquePtr<MlxArray> {
+            let values = (0..rows * width)
+                .map(|index| {
+                    let row = index / width;
+                    let column = index % width;
+                    (column as i32 % 37 - 18) as f32 * 0.00390625
+                        + row as f32 * 0.000_000_953_674_3
+                })
+                .collect::<Vec<_>>();
+            mlxcel_core::from_slice_f32(&values, &[1, rows as i32, width as i32])
+        }
+
+        fn finish(outputs: Vec<UniquePtr<MlxArray>>) {
+            for output in &outputs {
+                mlxcel_core::eval(output.as_ref().expect("experiment output"));
+            }
+            mlxcel_core::synchronize_default();
+        }
+
+        fn paired(
+            mut baseline: impl FnMut() -> Vec<UniquePtr<MlxArray>>,
+            mut candidate: impl FnMut() -> Vec<UniquePtr<MlxArray>>,
+        ) -> (f64, f64) {
+            for _ in 0..5 {
+                finish(baseline());
+                finish(candidate());
+            }
+            let mut baseline_samples = Vec::with_capacity(15);
+            let mut candidate_samples = Vec::with_capacity(15);
+            for _ in 0..15 {
+                let started = Instant::now();
+                finish(baseline());
+                baseline_samples.push(started.elapsed().as_secs_f64());
+                let started = Instant::now();
+                finish(candidate());
+                candidate_samples.push(started.elapsed().as_secs_f64());
+            }
+            baseline_samples.sort_by(f64::total_cmp);
+            candidate_samples.sort_by(f64::total_cmp);
+            (baseline_samples[7], candidate_samples[7])
+        }
+
+        fn bytes(output: UniquePtr<MlxArray>) -> Vec<u8> {
+            mlxcel_core::eval(output.as_ref().expect("experiment output"));
+            mlxcel_core::synchronize_default();
+            mlxcel_core::array_to_raw_bytes(output.as_ref().unwrap())
+        }
+
+        fn distance(left: &[u8], right: &[u8]) -> (u32, f32) {
+            let ordered = |value: f32| {
+                let bits = value.to_bits() as i32;
+                if bits < 0 { i32::MIN - bits } else { bits }
+            };
+            left.chunks_exact(4)
+                .zip(right.chunks_exact(4))
+                .fold((0, 0.0f32), |(max_ulp, max_abs), (left, right)| {
+                    let left = f32::from_le_bytes(left.try_into().unwrap());
+                    let right = f32::from_le_bytes(right.try_into().unwrap());
+                    (
+                        max_ulp.max(ordered(left).abs_diff(ordered(right))),
+                        max_abs.max((left - right).abs()),
+                    )
+                })
+        }
+
+        let weights = GgufWeightSource::open_without_fusion().expect("open pinned pair");
+        for case in cases {
+            let linear = weights
+                .linear(
+                    TensorSlot::Layer {
+                        role: ModelRole::Target,
+                        layer: case.layer,
+                        tensor: case.tensor,
+                    },
+                    32,
+                    case.bits,
+                )
+                .expect("load representative affine matrix");
+            let matrix = linear
+                .affine_ref_for_experiment()
+                .expect("representative must be affine");
+            assert_eq!(matrix.affine_bits_for_experiment(), case.bits);
+            assert_eq!((matrix.in_features(), matrix.out_features()), (case.k, case.n));
+            let flops = |rows: usize| 2.0 * rows as f64 * case.k as f64 * case.n as f64;
+
+            for rows in [288usize, 2048] {
+                let x = input(rows, case.k);
+                let baseline_bytes = bytes(matrix.forward(&x).expect("baseline affine"));
+                for (block_m, block_n) in GEOMETRIES {
+                    let candidate_bytes = bytes(
+                        matrix
+                            .forward_geometry_for_experiment(&x, block_m, block_n)
+                            .expect("geometry affine"),
+                    );
+                    if candidate_bytes != baseline_bytes {
+                        eprintln!(
+                            "Q38_INVALID case={} M={} BM={} BN={} reason=output_bytes_changed",
+                            case.name, rows, block_m, block_n
+                        );
+                        continue;
+                    }
+                    let (baseline, candidate) = paired(
+                        || vec![matrix.forward(&x).expect("baseline affine")],
+                        || {
+                            vec![
+                                matrix
+                                    .forward_geometry_for_experiment(&x, block_m, block_n)
+                                    .expect("geometry affine"),
+                            ]
+                        },
+                    );
+                    let simdgroups = (block_m / 16) * (block_n / 16);
+                    let grid = rows.div_ceil(block_m) * case.n.div_ceil(block_n);
+                    eprintln!(
+                        "Q38_GEOM case={} count={} M={} BM={} BN={} simdgroups={} grid={} baseline_ms={:.6} candidate_ms={:.6} baseline_tf={:.6} candidate_tf={:.6} speedup={:.6}",
+                        case.name,
+                        case.count,
+                        rows,
+                        block_m,
+                        block_n,
+                        simdgroups,
+                        grid,
+                        baseline * 1e3,
+                        candidate * 1e3,
+                        flops(rows) / baseline / 1e12,
+                        flops(rows) / candidate / 1e12,
+                        baseline / candidate,
+                    );
+                }
+
+                mlxcel_core::memory::clear_cache();
+                let active_before = mlxcel_core::memory::active_memory();
+                mlxcel_core::memory::reset_peak_memory();
+                let dense = matrix
+                    .dense_f16_for_experiment()
+                    .expect("dense experiment plane");
+                mlxcel_core::eval(dense.as_ref().expect("dense plane"));
+                mlxcel_core::synchronize_default();
+                let active_after = mlxcel_core::memory::active_memory();
+                let peak = mlxcel_core::memory::peak_memory();
+                let dense_bytes = mlxcel_core::array_nbytes(dense.as_ref().unwrap());
+                assert_eq!(dense_bytes, case.k * case.n * 2);
+                let transposed = mlxcel_core::transpose(dense.as_ref().unwrap());
+                let dense_output =
+                    bytes(mlxcel_core::matmul(&x, transposed.as_ref().expect("dense transpose")));
+                let (max_ulp, max_abs) = distance(&baseline_bytes, &dense_output);
+                let (baseline, candidate) = paired(
+                    || vec![matrix.forward(&x).expect("baseline affine")],
+                    || {
+                        vec![mlxcel_core::matmul(
+                            &x,
+                            transposed.as_ref().expect("dense transpose"),
+                        )]
+                    },
+                );
+                eprintln!(
+                    "Q38_DENSE case={} count={} M={} baseline_ms={:.6} dense_ms={:.6} baseline_tf={:.6} dense_tf={:.6} speedup={:.6} dense_bytes={} active_add={} peak_add={} max_ulp={} max_abs={:.9}",
+                    case.name,
+                    case.count,
+                    rows,
+                    baseline * 1e3,
+                    candidate * 1e3,
+                    flops(rows) / baseline / 1e12,
+                    flops(rows) / candidate / 1e12,
+                    baseline / candidate,
+                    dense_bytes,
+                    active_after.saturating_sub(active_before),
+                    peak.saturating_sub(active_before),
+                    max_ulp,
+                    max_abs,
+                );
+            }
+        }
+
+        let representative_weights =
+            GgufWeightSource::open_without_fusion().expect("open representative pair");
+        let config = representative_weights.config().expect("pinned config");
+        let next = config.to_qwen3next_config();
+        let mlp = Mlp::from_weights(&representative_weights, &next, ModelRole::Target, 3)
+            .expect("A4/A5 representative MLP");
+        let gdn = Qwen35GatedDeltaNet::from_weights(
+            &representative_weights,
+            &config,
+            ModelRole::Target,
+            0,
+        )
+        .expect("A5/A8 representative GDN");
+        for rows in [288usize, 2048] {
+            let x = input(rows, 5120);
+            let mlp_flops = 6.0 * rows as f64 * 5120.0 * 17408.0;
+            let gdn_flops =
+                2.0 * rows as f64 * 5120.0 * (10240.0 + 6144.0 + 48.0 + 48.0);
+            for (block_m, block_n) in GEOMETRIES {
+                assert_eq!(
+                    bytes(mlp.forward(&x)),
+                    bytes(mlp.forward_geometry_for_experiment(&x, block_m, block_n)),
+                    "representative MLP M={rows} BM={block_m} BN={block_n}",
+                );
+                let baseline_gdn = gdn.ingress.forward(
+                    &x,
+                    1,
+                    rows as i32,
+                    gdn.value_dim,
+                    gdn.num_v_heads,
+                );
+                let candidate_gdn =
+                    gdn.ingress
+                        .forward_geometry_for_experiment(&x, block_m, block_n);
+                for (baseline, candidate) in [
+                    (baseline_gdn.0, candidate_gdn.0),
+                    (baseline_gdn.1, candidate_gdn.1),
+                    (baseline_gdn.2, candidate_gdn.2),
+                    (baseline_gdn.3, candidate_gdn.3),
+                ] {
+                    assert_eq!(
+                        bytes(baseline),
+                        bytes(candidate),
+                        "representative GDN M={rows} BM={block_m} BN={block_n}",
+                    );
+                }
+                let (mlp_baseline, mlp_candidate) = paired(
+                    || vec![mlp.forward(&x)],
+                    || vec![mlp.forward_geometry_for_experiment(&x, block_m, block_n)],
+                );
+                let (gdn_baseline, gdn_candidate) = paired(
+                    || {
+                        let values = gdn.ingress.forward(
+                            &x,
+                            1,
+                            rows as i32,
+                            gdn.value_dim,
+                            gdn.num_v_heads,
+                        );
+                        vec![values.0, values.1, values.2, values.3]
+                    },
+                    || {
+                        let values =
+                            gdn.ingress
+                                .forward_geometry_for_experiment(&x, block_m, block_n);
+                        vec![values.0, values.1, values.2, values.3]
+                    },
+                );
+                eprintln!(
+                    "Q38_REP M={} BM={} BN={} mlp_baseline_ms={:.6} mlp_candidate_ms={:.6} mlp_baseline_tf={:.6} mlp_candidate_tf={:.6} mlp_speedup={:.6} gdn_baseline_ms={:.6} gdn_candidate_ms={:.6} gdn_baseline_tf={:.6} gdn_candidate_tf={:.6} gdn_speedup={:.6}",
+                    rows,
+                    block_m,
+                    block_n,
+                    mlp_baseline * 1e3,
+                    mlp_candidate * 1e3,
+                    mlp_flops / mlp_baseline / 1e12,
+                    mlp_flops / mlp_candidate / 1e12,
+                    mlp_baseline / mlp_candidate,
+                    gdn_baseline * 1e3,
+                    gdn_candidate * 1e3,
+                    gdn_flops / gdn_baseline / 1e12,
+                    gdn_flops / gdn_candidate / 1e12,
+                    gdn_baseline / gdn_candidate,
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "fixed local Qwen3.8 GGUF memory experiment"]
+    fn experimental_qwen38_loaded_memory() {
+        const WIRED_LIMIT: u64 = 54_975_581_389;
+        const TURBO4_64K_BYTES: u64 =
+            16 * (2 * 4 * 65_536 * (256 / 2) + 3 * 4 * 65_536 * 2);
+        const GDN_STATE_BYTES: u64 =
+            48 * (3 * 10_240 * 4 + 48 * 128 * 128 * 4);
+        assert_eq!(TURBO4_64K_BYTES, 1_098_907_648);
+        assert_eq!(GDN_STATE_BYTES, 156_893_184);
+
+        mlxcel_core::memory::clear_cache();
+        let active_before = mlxcel_core::memory::active_memory();
+        mlxcel_core::memory::reset_peak_memory();
+        let (model, assets) =
+            Qwen35Model::load_pinned(KVCacheMode::Turbo4).expect("load Qwen3.8 GGUF");
+        mlxcel_core::synchronize_default();
+        let active_after = mlxcel_core::memory::active_memory();
+        let peak = mlxcel_core::memory::peak_memory();
+        let loaded_bytes = active_after.saturating_sub(active_before);
+        let peak_add = peak.saturating_sub(active_before);
+        let cache_state_bytes = TURBO4_64K_BYTES + GDN_STATE_BYTES;
+        eprintln!(
+            "Q38_MEMORY wired_limit={} loaded_active={} load_peak_add={} turbo4_64k={} gdn_state={} cache_state={} headroom_after_cache_state={}",
+            WIRED_LIMIT,
+            loaded_bytes,
+            peak_add,
+            TURBO4_64K_BYTES,
+            GDN_STATE_BYTES,
+            cache_state_bytes,
+            WIRED_LIMIT.saturating_sub(loaded_bytes + cache_state_bytes),
+        );
+        drop(model);
+        drop(assets);
+        mlxcel_core::memory::clear_cache();
     }
 }
