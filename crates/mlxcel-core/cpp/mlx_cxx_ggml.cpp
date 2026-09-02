@@ -287,6 +287,43 @@ static const char* GGML_VERIFY_QMM_METAL_SOURCE = R"(
     }
 )";
 
+static const char* QWEN38_Q6_HEAD_VERIFY_R8_SOURCE = R"(
+    constexpr uint RowsPerThreadgroup = 8u;
+    uint lane = thread_index_in_simdgroup;
+    uint output_row = threadgroup_position_in_grid.y * RowsPerThreadgroup
+        + simdgroup_index_in_threadgroup;
+    uint range_count = (uint)row_ranges_shape[0];
+    uint selected_rows = 0u;
+    for (uint range = 0u; range < range_count; ++range) {
+        selected_rows += row_ranges[range * 2u + 1u];
+    }
+    if (output_row >= selected_rows) {
+        return;
+    }
+    uint source_row =
+        ggml_source_row(row_ranges, range_count, output_row);
+    if (source_row >= (uint)packed_shape[0]) {
+        return;
+    }
+    uint row_base = source_row * (uint)packed_shape[1];
+    uint input_rows = (uint)x_shape[0];
+    uint width = (uint)x_shape[1];
+    float sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint column = lane; column < width; column += 32u) {
+        float weight =
+            ggml_decode_weight(packed, row_base, column, QType, iq3_grid);
+        for (uint row = 0u; row < input_rows; ++row) {
+            sums[row] += x[row * width + column] * weight;
+        }
+    }
+    for (uint row = 0u; row < input_rows; ++row) {
+        float total = simd_sum(sums[row]);
+        if (lane == 0u) {
+            out[row * selected_rows + output_row] = total;
+        }
+    }
+)";
+
 static const char* GGML_QMM_METAL_SOURCE = R"(
     constexpr uint BM = (uint)BlockM;
     constexpr uint BN = 8u;
@@ -373,6 +410,7 @@ struct GgmlKernelHolder {
     std::optional<mlx::core::fast::CustomKernelFunction> decode;
     std::optional<mlx::core::fast::CustomKernelFunction> verify;
     std::optional<mlx::core::fast::CustomKernelFunction> qmm;
+    std::optional<mlx::core::fast::CustomKernelFunction> qwen38_q6_head_verify_r8;
     std::optional<mlx::core::fast::CustomKernelFunction> embedding;
     std::once_flag initialize_once;
 
@@ -399,6 +437,13 @@ struct GgmlKernelHolder {
                 linear_inputs,
                 {"out"},
                 GGML_QMM_METAL_SOURCE,
+                GGML_DECODE_METAL_HEADER,
+                false);
+            qwen38_q6_head_verify_r8 = mlx::core::fast::metal_kernel(
+                "qw_qwen38_q6_head_verify_r8_v1",
+                linear_inputs,
+                {"out"},
+                QWEN38_Q6_HEAD_VERIFY_R8_SOURCE,
                 GGML_DECODE_METAL_HEADER,
                 false);
             embedding = mlx::core::fast::metal_kernel(
@@ -473,7 +518,8 @@ std::unique_ptr<MlxArray> ggml_packed_matmul(
     int32_t in_features,
     int32_t out_features,
     int32_t selected_rows,
-    int32_t input_rows
+    int32_t input_rows,
+    bool qwen38_q6_head_verify_r8
 ) {
 #ifndef __APPLE__
     throw std::invalid_argument("packed GGML execution requires Metal");
@@ -508,6 +554,13 @@ std::unique_ptr<MlxArray> ggml_packed_matmul(
         contiguous(reshape(astype(x.inner, float32), {input_rows, in_features}));
     auto& holder = ggml_kernels();
     std::vector<array> results;
+    const bool qwen38_q6_head_shape =
+        qtype == 14 && in_features == 5120 && out_features == 248320
+        && selected_rows == 80922;
+    if (qwen38_q6_head_verify_r8 && !qwen38_q6_head_shape) {
+        throw std::invalid_argument(
+            "pinned Qwen3.8 Q6 output-head descriptor is invalid");
+    }
     if (input_rows == 1) {
         auto decode_args = args;
         decode_args.push_back({"Width", in_features});
@@ -519,6 +572,21 @@ std::unique_ptr<MlxArray> ggml_packed_matmul(
             std::make_tuple(32, selected_rows, 1),
             std::make_tuple(32, 1, 1),
             decode_args,
+            std::nullopt,
+            false,
+            {});
+    } else if (qwen38_q6_head_verify_r8
+            && (input_rows == 3 || input_rows == 4)) {
+        results = (*holder.qwen38_q6_head_verify_r8)(
+            {input, packed.inner, row_ranges.inner, iq3_grid.inner},
+            {Shape{input_rows, selected_rows}},
+            {float32},
+            std::make_tuple(
+                256,
+                (selected_rows + 7) / 8,
+                1),
+            std::make_tuple(256, 1, 1),
+            args,
             std::nullopt,
             false,
             {});
