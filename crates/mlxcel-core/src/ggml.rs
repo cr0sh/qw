@@ -220,6 +220,28 @@ impl GgmlQuantizedMatrix {
         self.row_bytes * self.out_features as usize
     }
 
+    /// Produce an independent handle over the same resident packed bytes and
+    /// immutable lookup table. `copy` adds lazy MLX array aliases; it does not
+    /// duplicate either payload.
+    pub fn clone_shared(&self) -> Self {
+        Self {
+            packed: crate::copy(
+                self.packed
+                    .as_ref()
+                    .expect("validated packed GGML buffer is always present"),
+            ),
+            iq3_grid: crate::copy(
+                self.iq3_grid
+                    .as_ref()
+                    .expect("validated GGML lookup table is always present"),
+            ),
+            qtype: self.qtype,
+            in_features: self.in_features,
+            out_features: self.out_features,
+            row_bytes: self.row_bytes,
+        }
+    }
+
     pub fn forward(&self, input: &MlxArray) -> Result<UniquePtr<MlxArray>, GgmlQuantError> {
         let shape = crate::array_shape(input);
         if shape.is_empty() || shape.last().copied() != Some(self.in_features) {
@@ -322,6 +344,14 @@ impl GgmlQuantizedEmbedding {
 
     pub const fn vocab_size(&self) -> usize {
         self.matrix.out_features()
+    }
+
+    /// Produce an independent embedding handle sharing the resident packed
+    /// matrix and lookup table.
+    pub fn clone_shared(&self) -> Self {
+        Self {
+            matrix: self.matrix.clone_shared(),
+        }
     }
 
     pub fn forward(&self, indices: &MlxArray) -> Result<UniquePtr<MlxArray>, GgmlQuantError> {

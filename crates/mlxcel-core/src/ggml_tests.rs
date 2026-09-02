@@ -241,6 +241,11 @@ fn dispatch_stats_record_zero_workspace_and_shape_selected_traffic() {
     let prefill = matrix.dispatch_stats(5).unwrap(); assert_eq!(prefill.path, GgmlKernelPath::PrefillRows4); assert_eq!(prefill.packed_bytes_read, packed.len() * 2); assert_eq!(prefill.workspace_bytes, 0);
     let embedding = GgmlQuantizedEmbedding::from_bytes(&packed, qtype.id(), width, rows).unwrap();
     let lookup = embedding.dispatch_stats(2).unwrap(); assert_eq!(lookup.path, GgmlKernelPath::Embedding); assert_eq!(lookup.packed_bytes_read, packed.len() / rows * 2); assert_eq!(lookup.workspace_bytes, 0);
+    let cloned = embedding.clone_shared();
+    assert_eq!(cloned.qtype(), embedding.qtype());
+    assert_eq!(cloned.embedding_dim(), embedding.embedding_dim());
+    assert_eq!(cloned.vocab_size(), embedding.vocab_size());
+    assert_eq!(cloned.dispatch_stats(2).unwrap(), lookup);
 }
 
 #[test]
