@@ -302,14 +302,14 @@ METAL_FUNC float qwen38_qkv_qdot(
 
 template <int rows>
 METAL_FUNC void qwen38_qkv_mixed_q5_update(
-    const device float* x,
+    const device half* x,
     int row_stride,
     int column,
     half w_dq,
     thread float* accum
 ) {
     for (int row = 0; row < rows; ++row) {
-        half activation = static_cast<half>(x[row * row_stride + column]);
+        half activation = x[row * row_stride + column];
         half product = activation * w_dq;
         accum[row] += static_cast<float>(product);
     }
@@ -317,7 +317,7 @@ METAL_FUNC void qwen38_qkv_mixed_q5_update(
 
 template <int rows>
 METAL_FUNC void qwen38_qkv_mixed_q5_pack(
-    const device float* x,
+    const device half* x,
     int row_stride,
     const device uchar* packed,
     half scale,
@@ -358,7 +358,7 @@ METAL_FUNC void qwen38_qkv_mixed_q5_pack(
 
 template <int MRows, typename Sidecar>
 METAL_FUNC void qwen38_qkv_mixed_q5_project(
-    const device float* x,
+    const device half* x,
     const device uint32_t* weight,
     const device Sidecar* scales,
     const device Sidecar* biases,
@@ -391,7 +391,7 @@ METAL_FUNC void qwen38_qkv_mixed_q5_project(
             half scale = scales[group_offset];
             half bias = biases[group_offset];
             float accum[MRows] = {};
-            const device float* activation =
+            const device half* activation =
                 x + k + (int)lane * values_per_thread;
             qwen38_qkv_mixed_q5_pack<MRows>(
                 activation, width, source, scale, bias, accum);
@@ -666,7 +666,7 @@ static const char* QWEN38_MIXED_QKV_SOURCE = R"(
     if (work < QGroups) {
         if constexpr (MixedQ5) {
             qwen38_qkv_mixed_q5_project<MRows>(
-                x, q_w, q_s, q_b, q_out, K, Nq, work, sgid, lane);
+                x_half, q_w, q_s, q_b, q_out, K, Nq, work, sgid, lane);
         } else if constexpr (MRows == 3) {
             qwen38_qkv_qdot_project<QBits, MRows>(
                 x, q_w, q_s, q_b, q_out, K, Nq, work, sgid, lane);
@@ -950,8 +950,8 @@ struct Qwen38FusionKernelHolder {
                 {"x", "weight", "scales", "biases"},
                 {"out"}, QWEN38_MLP_DOWN_SOURCE, header, false);
             mixed_qkv = mlx::core::fast::metal_kernel(
-                "qw_qwen38_mixed_qkv_v2",
-                {"x", "q_w", "q_s", "q_b",
+                "qw_qwen38_mixed_qkv_v3",
+                {"x", "x_half", "q_w", "q_s", "q_b",
                  "k_w", "k_s", "k_b", "k_packed",
                  "v_w", "v_s", "v_b", "v_packed"},
                 {"q_out", "k_out", "v_out"},
@@ -1106,6 +1106,7 @@ std::unique_ptr<Qwen38GgmlQkvOutputs> qwen38_mixed_qkv_bundle(
             "pinned Qwen3.8 mixed QKV input is invalid");
     }
     array input = reshape(x.inner, {input_rows, width});
+    auto input_half = mixed_q5 ? astype(input, float16) : input;
     const auto kv_groups = [](int32_t code) {
         return code == 14 ? kv_rows / 4 : kv_rows / 16;
     };
@@ -1114,7 +1115,7 @@ std::unique_ptr<Qwen38GgmlQkvOutputs> qwen38_mixed_qkv_bundle(
     const int32_t workgroups =
         query_groups + kv_groups(k_code) + kv_groups(v_code);
     auto output = (*qwen38_fusion_kernels().mixed_qkv)(
-        {input, q_w.inner, q_s.inner, q_b.inner,
+        {input, input_half, q_w.inner, q_s.inner, q_b.inner,
          k_w.inner, k_s.inner, k_b.inner, k_packed.inner,
          v_w.inner, v_s.inner, v_b.inner, v_packed.inner},
         {Shape{input_rows, query_rows},
