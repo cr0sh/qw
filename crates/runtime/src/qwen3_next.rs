@@ -129,6 +129,23 @@ fn qwen38_use_high_m_f16_attention(
             .is_some_and(|rows| rows >= QWEN38_HIGH_M_FP16_ATTENTION_MIN_ROWS)
 }
 
+fn qwen38_can_fuse_high_m_sigmoid_gate_f16(
+    gate: &MlxArray,
+    value: &MlxArray,
+    expected_features: i32,
+) -> bool {
+    let value_shape = mlxcel_core::array_shape(value);
+    let gate_shape = mlxcel_core::array_shape(gate);
+    let rows = value_shape[..value_shape.len().saturating_sub(1)]
+        .iter()
+        .try_fold(1_i32, |rows, &dimension| rows.checked_mul(dimension));
+    value_shape.last().copied() == Some(expected_features)
+        && value_shape == gate_shape
+        && mlxcel_core::array_dtype(value) == mlxcel_core::dtype::FLOAT16
+        && mlxcel_core::array_dtype(gate) == mlxcel_core::dtype::FLOAT16
+        && rows.is_some_and(|rows| rows >= QWEN38_HIGH_M_FP16_ATTENTION_MIN_ROWS)
+}
+
 #[cfg(test)]
 pub(crate) struct F32Diagnostics {
     pub(crate) max_abs: f32,
@@ -279,13 +296,24 @@ impl Qwen3NextAttention {
         use_high_m_f16: bool,
     ) -> UniquePtr<MlxArray> {
         if use_high_m_f16 {
-            return self
-                .o_proj
-                .forward_high_m_sigmoid_gate_f16(
-                    gate.expect("full FP16 attention retains its gate view"),
-                    output,
-                )
-                .expect("pinned high-M output projection supports fused FP16 gating");
+            let gate = gate.expect("high-M attention retains its gate view");
+            if qwen38_can_fuse_high_m_sigmoid_gate_f16(
+                gate,
+                output,
+                self.num_heads * self.head_dim,
+            ) {
+                return self
+                    .o_proj
+                    .forward_high_m_sigmoid_gate_f16(gate, output)
+                    .expect("eligible pinned high-M output projection supports fused FP16 gating");
+            }
+
+            // Generic FP16-cache attention promotes its value result to FP32.
+            // Preserve that established compute path instead of forcing the
+            // FP16-only fused projection contract.
+            let gate_sigmoid = mlxcel_core::sigmoid(gate);
+            let gated_output = mlxcel_core::multiply(output, &gate_sigmoid);
+            return self.o_proj.forward(&gated_output);
         }
         let shape = mlxcel_core::array_shape(output);
         if shape.len() == 3 && shape[1] == 4 && self.o_proj.needs_m4_exact_split() {
@@ -850,6 +878,62 @@ mod tests {
     }
 
     #[test]
+    fn high_m_sigmoid_gate_fusion_requires_matching_fp16_inputs() {
+        let gate = mlxcel_core::zeros(&[1, 128, 8], mlxcel_core::dtype::FLOAT16);
+        let value = mlxcel_core::zeros(&[1, 128, 8], mlxcel_core::dtype::FLOAT16);
+        assert!(qwen38_can_fuse_high_m_sigmoid_gate_f16(
+            &gate, &value, 8
+        ));
+
+        let value_f32 = mlxcel_core::zeros(&[1, 128, 8], mlxcel_core::dtype::FLOAT32);
+        assert!(!qwen38_can_fuse_high_m_sigmoid_gate_f16(
+            &gate, &value_f32, 8
+        ));
+        let short = mlxcel_core::zeros(&[1, 127, 8], mlxcel_core::dtype::FLOAT16);
+        assert!(!qwen38_can_fuse_high_m_sigmoid_gate_f16(
+            &short, &short, 8
+        ));
+        assert!(!qwen38_can_fuse_high_m_sigmoid_gate_f16(
+            &gate, &value, 16
+        ));
+    }
+
+    #[test]
+    fn high_m_fp16_gate_with_fp32_value_runs_sigmoid_multiply_then_normal_projection() {
+        let attention = unequal_width_attention();
+        let gate_values = (0..128 * 4)
+            .map(|index| ((index * 29 % 127) as f32 - 63.0) / 17.0)
+            .collect::<Vec<_>>();
+        let value_values = (0..128 * 4)
+            .map(|index| ((index * 31 % 131) as f32 - 65.0) / 19.0)
+            .collect::<Vec<_>>();
+        let gate_f32 = mlxcel_core::from_slice_f32(&gate_values, &[1, 128, 4]);
+        let gate = mlxcel_core::astype(&gate_f32, mlxcel_core::dtype::FLOAT16);
+        let value = mlxcel_core::from_slice_f32(&value_values, &[1, 128, 4]);
+
+        let gate_sigmoid = mlxcel_core::sigmoid(&gate);
+        let gated = mlxcel_core::multiply(&value, &gate_sigmoid);
+        let expected = attention.o_proj.forward(&gated);
+        let actual = attention.project_output(&value, Some(&gate), true);
+        mlxcel_core::eval(&expected);
+        mlxcel_core::eval(&actual);
+
+        assert_eq!(mlxcel_core::array_dtype(&actual), mlxcel_core::dtype::FLOAT32);
+        assert_eq!(
+            mlxcel_core::array_to_raw_bytes(&actual),
+            mlxcel_core::array_to_raw_bytes(&expected),
+            "FP32 attention value must follow sigmoid(gate) -> multiply -> normal o_proj"
+        );
+        let ungated = attention.o_proj.forward(&value);
+        mlxcel_core::eval(&ungated);
+        assert_ne!(
+            mlxcel_core::array_to_raw_bytes(&actual),
+            mlxcel_core::array_to_raw_bytes(&ungated),
+            "fixture must observe the gating operation"
+        );
+    }
+
+    #[test]
     fn qwen38_high_m_f16_sdpa_component_quality() {
         const QUERY_HEADS: i32 = 24;
         const KV_HEADS: i32 = 4;
@@ -1063,11 +1147,15 @@ mod tests {
             &[NUM_KV_HEADS * HEAD_DIM, HIDDEN_SIZE],
             0.0,
         );
-        insert_f32(
-            &mut weights,
-            "model.layers.0.self_attn.o_proj.weight",
-            &[HIDDEN_SIZE, ATTENTION_WIDTH],
-            0.0,
+        weights.insert(
+            "model.layers.0.self_attn.o_proj.weight".to_string(),
+            mlxcel_core::from_slice_f32(
+                &[
+                    0.25, -0.5, 0.75, 1.0, -1.25, 0.375, 0.625, -0.875, 1.125, 0.5, -0.25,
+                    0.9375,
+                ],
+                &[HIDDEN_SIZE, ATTENTION_WIDTH],
+            ),
         );
         insert_f32(
             &mut weights,
