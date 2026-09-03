@@ -1230,107 +1230,253 @@ fn turbo4_fused_attention_honors_causal_tail_and_ragged_long_blocks() {
     assert_turbo4_fused_parity(3, 65_537, true, 0xCA55_A1A5);
 }
 
-fn logical_turbo4_bytes(cache: &KVCache) -> Vec<Vec<u8>> {
-    [
-        cache.k_packed.as_deref().expect("packed K"),
-        cache.k_rescale.as_deref().expect("K sidecar"),
-        cache.v_packed.as_deref().expect("packed V"),
-        cache.v_norms.as_deref().expect("V norms"),
-        cache.v_rescale.as_deref().expect("V sidecar"),
-    ]
-    .into_iter()
-    .map(|array| {
-        let shape = ffi::array_shape(array);
-        let logical = ffi::slice(
-            array,
-            &[0, 0, 0, 0],
-            &[shape[0], shape[1], cache.offset, shape[3]],
-        );
-        ffi::eval(&logical);
-        ffi::array_to_raw_bytes(&logical)
-    })
-    .collect()
+fn assert_optional_array_state_eq(
+    name: &str,
+    actual: Option<&ffi::MlxArray>,
+    expected: Option<&ffi::MlxArray>,
+) {
+    match (actual, expected) {
+        (None, None) => {}
+        (Some(actual), Some(expected)) => {
+            assert_eq!(
+                ffi::array_shape(actual),
+                ffi::array_shape(expected),
+                "{name} shape differs"
+            );
+            assert_eq!(
+                ffi::array_dtype(actual),
+                ffi::array_dtype(expected),
+                "{name} dtype differs"
+            );
+            let actual = ffi::contiguous(actual, false);
+            let expected = ffi::contiguous(expected, false);
+            ffi::eval(&actual);
+            ffi::eval(&expected);
+            assert_eq!(
+                ffi::array_to_raw_bytes(&actual),
+                ffi::array_to_raw_bytes(&expected),
+                "{name} bytes differ"
+            );
+        }
+        _ => panic!("{name} optional state differs"),
+    }
 }
 
-fn assert_turbo4_packed_rows_match_sequential_m1(query_len: i32, seed: u32) {
+fn assert_turbo4_cache_state_eq(actual: &KVCache, expected: &KVCache) {
+    assert_eq!(actual.offset, expected.offset, "offset differs");
+    assert_eq!(actual.live_start, expected.live_start, "live_start differs");
+    assert_eq!(actual.step, expected.step, "step differs");
+    assert_eq!(actual.mode, expected.mode, "mode differs");
+    assert_eq!(actual.turbo_seed, expected.turbo_seed, "turbo_seed differs");
+    assert_eq!(
+        actual.fp16_v_quantize_on_write, expected.fp16_v_quantize_on_write,
+        "FP16 write policy differs"
+    );
+    assert_eq!(actual.cold_offset, expected.cold_offset, "cold_offset differs");
+    assert_eq!(actual.hot_threshold, expected.hot_threshold, "hot threshold differs");
+    assert_eq!(
+        actual.delegated_fp16_fast_path, expected.delegated_fp16_fast_path,
+        "delegated FP16 mode differs"
+    );
+    assert_eq!(
+        actual.delegated_fp16_sidecar_policy, expected.delegated_fp16_sidecar_policy,
+        "delegated sidecar policy differs"
+    );
+    assert_eq!(
+        actual.paged_backing.is_some(),
+        expected.paged_backing.is_some(),
+        "paged backing presence differs"
+    );
+    assert_eq!(
+        actual.turbo3_params.is_some(),
+        expected.turbo3_params.is_some(),
+        "Turbo3 parameter presence differs"
+    );
+
+    for (name, actual, expected) in [
+        ("keys", actual.keys.as_deref(), expected.keys.as_deref()),
+        ("values", actual.values.as_deref(), expected.values.as_deref()),
+        (
+            "key_scales",
+            actual.key_scales.as_deref(),
+            expected.key_scales.as_deref(),
+        ),
+        (
+            "val_scales",
+            actual.val_scales.as_deref(),
+            expected.val_scales.as_deref(),
+        ),
+        (
+            "k_packed",
+            actual.k_packed.as_deref(),
+            expected.k_packed.as_deref(),
+        ),
+        (
+            "k_rescale",
+            actual.k_rescale.as_deref(),
+            expected.k_rescale.as_deref(),
+        ),
+        (
+            "v_packed",
+            actual.v_packed.as_deref(),
+            expected.v_packed.as_deref(),
+        ),
+        (
+            "v_norms",
+            actual.v_norms.as_deref(),
+            expected.v_norms.as_deref(),
+        ),
+        (
+            "v_rescale",
+            actual.v_rescale.as_deref(),
+            expected.v_rescale.as_deref(),
+        ),
+    ] {
+        assert_optional_array_state_eq(name, actual, expected);
+    }
+
+    match (&actual.turbo_params, &expected.turbo_params) {
+        (Some(actual), Some(expected)) => {
+            assert_eq!(actual.head_dim, expected.head_dim, "Turbo4 head_dim differs");
+            assert_eq!(actual.signs1, expected.signs1, "Turbo4 V signs1 differ");
+            assert_eq!(actual.signs2, expected.signs2, "Turbo4 V signs2 differ");
+            assert_eq!(actual.k_signs1, expected.k_signs1, "Turbo4 K signs1 differ");
+            assert_eq!(actual.k_signs2, expected.k_signs2, "Turbo4 K signs2 differ");
+            assert_eq!(
+                actual.codebook.centroids, expected.codebook.centroids,
+                "Turbo4 centroids differ"
+            );
+            assert_eq!(
+                actual.codebook.boundaries, expected.codebook.boundaries,
+                "Turbo4 boundaries differ"
+            );
+        }
+        (None, None) => {}
+        _ => panic!("Turbo4 parameter presence differs"),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Turbo4GroupedTestShape {
+    batch: i32,
+    query_heads: i32,
+    kv_heads: i32,
+    head_dim: i32,
+    query_dtype: i32,
+}
+
+const SMALL_GROUPED_SHAPE: Turbo4GroupedTestShape = Turbo4GroupedTestShape {
+    batch: 1,
+    query_heads: 6,
+    kv_heads: 2,
+    head_dim: 64,
+    query_dtype: dtype::FLOAT32,
+};
+
+fn assert_turbo4_grouped_shape_matches_rowwise(
+    prefix_len: i32,
+    query_len: i32,
+    seed: u32,
+    shape: Turbo4GroupedTestShape,
+    expect_grouped: bool,
+) {
     if !crate::metal_is_available() {
         return;
     }
+    if expect_grouped {
+        assert!(
+            super::turbo::fused_attention::turbo4_fused_attention_enabled()
+                && super::turbo::fused_attention::turbo4_grouped_causal_enabled(),
+            "grouped dispatch proof requires the default-on Turbo4 gates"
+        );
+    }
 
-    const PREFIX_LEN: i32 = 2_303;
-    const HEAD_DIM: i32 = 64;
-    let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+    let scale = 1.0 / (shape.head_dim as f32).sqrt();
     let mut batched = KVCache::new_with_mode(KVCacheMode::Turbo4);
-    let mut sequential = KVCache::new_with_mode(KVCacheMode::Turbo4);
-    let prefix_k = ffi::astype(
-        &synth_kv_tensor(1, 2, PREFIX_LEN, HEAD_DIM, seed),
-        dtype::FLOAT16,
-    );
-    let prefix_v = ffi::astype(
-        &synth_kv_tensor(1, 2, PREFIX_LEN, HEAD_DIM, seed.wrapping_add(1)),
-        dtype::FLOAT16,
-    );
-    batched.update(ffi::copy(&prefix_k), ffi::copy(&prefix_v));
-    sequential.update(prefix_k, prefix_v);
+    let mut rowwise = KVCache::new_with_mode(KVCacheMode::Turbo4);
+    if prefix_len > 0 {
+        let prefix_k = ffi::astype(
+            &synth_kv_tensor(
+                shape.batch,
+                shape.kv_heads,
+                prefix_len,
+                shape.head_dim,
+                seed,
+            ),
+            dtype::FLOAT16,
+        );
+        let prefix_v = ffi::astype(
+            &synth_kv_tensor(
+                shape.batch,
+                shape.kv_heads,
+                prefix_len,
+                shape.head_dim,
+                seed.wrapping_add(1),
+            ),
+            dtype::FLOAT16,
+        );
+        batched.update(ffi::copy(&prefix_k), ffi::copy(&prefix_v));
+        rowwise.update(prefix_k, prefix_v);
+    }
 
     let q = ffi::astype(
-        &synth_kv_tensor(1, 6, query_len, HEAD_DIM, seed.wrapping_add(2)),
-        dtype::FLOAT16,
+        &synth_kv_tensor(
+            shape.batch,
+            shape.query_heads,
+            query_len,
+            shape.head_dim,
+            seed.wrapping_add(2),
+        ),
+        shape.query_dtype,
     );
     let next_k = ffi::astype(
-        &synth_kv_tensor(1, 2, query_len, HEAD_DIM, seed.wrapping_add(3)),
+        &synth_kv_tensor(
+            shape.batch,
+            shape.kv_heads,
+            query_len,
+            shape.head_dim,
+            seed.wrapping_add(3),
+        ),
         dtype::FLOAT16,
     );
     let next_v = ffi::astype(
-        &synth_kv_tensor(1, 2, query_len, HEAD_DIM, seed.wrapping_add(4)),
+        &synth_kv_tensor(
+            shape.batch,
+            shape.kv_heads,
+            query_len,
+            shape.head_dim,
+            seed.wrapping_add(4),
+        ),
         dtype::FLOAT16,
     );
+
+    let dispatches_before =
+        super::turbo::fused_attention::grouped_causal_test_dispatches();
     let actual = batched.update_and_turbo4_causal_attention(
         &q,
         ffi::copy(&next_k),
         ffi::copy(&next_v),
         scale,
     );
+    let dispatches_after =
+        super::turbo::fused_attention::grouped_causal_test_dispatches();
+    assert_eq!(
+        dispatches_after,
+        dispatches_before + usize::from(expect_grouped),
+        "grouped dispatch decision differs for prefix={prefix_len} M{query_len}"
+    );
 
-    let q_shape = ffi::array_shape(&q);
-    let k_shape = ffi::array_shape(&next_k);
-    let v_shape = ffi::array_shape(&next_v);
-    let mut expected_rows = Vec::with_capacity(query_len as usize);
-    for row in 0..query_len {
-        let q_row = ffi::slice(
-            &q,
-            &[0, 0, row, 0],
-            &[q_shape[0], q_shape[1], row + 1, q_shape[3]],
-        );
-        let k_row = ffi::slice(
-            &next_k,
-            &[0, 0, row, 0],
-            &[k_shape[0], k_shape[1], row + 1, k_shape[3]],
-        );
-        let v_row = ffi::slice(
-            &next_v,
-            &[0, 0, row, 0],
-            &[v_shape[0], v_shape[1], row + 1, v_shape[3]],
-        );
-        expected_rows.push(sequential.update_and_turbo4_attention(
-            &q_row,
-            k_row,
-            v_row,
-            scale,
-            None,
-        ));
-    }
-    let pointers = expected_rows
+    let expected = rowwise.update_and_turbo4_causal_attention_rowwise_reference(
+        &q,
+        next_k,
+        next_v,
+        scale,
+    );
+    let actual_values = flatten_fp32(&actual);
+    let expected_values = flatten_fp32(&expected);
+    let max_ulp = actual_values
         .iter()
-        .map(|row| &**row as *const ffi::MlxArray)
-        .collect::<Vec<_>>();
-    // SAFETY: `expected_rows` owns every pointee through concatenation.
-    let expected = unsafe { ffi::concatenate(&pointers, 2) };
-    let actual = flatten_fp32(&actual);
-    let expected = flatten_fp32(&expected);
-    let max_ulp = actual
-        .iter()
-        .zip(&expected)
+        .zip(&expected_values)
         .map(|(&actual, &expected)| {
             let ordered = |value: f32| {
                 let bits = value.to_bits() as i32;
@@ -1342,23 +1488,89 @@ fn assert_turbo4_packed_rows_match_sequential_m1(query_len: i32, seed: u32) {
         .unwrap_or(0);
     assert!(
         max_ulp <= 1,
-        "packed M{query_len} differs from corresponding M1 rows by {max_ulp} ULP"
+        "grouped M{query_len} differs from the rowwise M1 path by {max_ulp} ULP"
     );
-    assert_eq!(batched.offset, PREFIX_LEN + query_len);
-    assert_eq!(batched.offset, sequential.offset);
-    assert_eq!(
-        logical_turbo4_bytes(&batched),
-        logical_turbo4_bytes(&sequential),
-        "batched page-boundary packing differs from sequential M1"
+    assert_turbo4_cache_state_eq(&batched, &rowwise);
+}
+
+fn assert_turbo4_grouped_matches_rowwise(prefix_len: i32, query_len: i32, seed: u32) {
+    let reduction_blocks = |tokens: i32| {
+        if tokens <= 8_192 {
+            2
+        } else if tokens <= 65_536 {
+            4
+        } else {
+            8
+        }
+    };
+    let final_offset = prefix_len + query_len;
+    let expect_grouped = final_offset > 2_048
+        && reduction_blocks(prefix_len + 1) == reduction_blocks(final_offset);
+    assert_turbo4_grouped_shape_matches_rowwise(
+        prefix_len,
+        query_len,
+        seed,
+        SMALL_GROUPED_SHAPE,
+        expect_grouped,
     );
 }
 
 #[test]
-fn turbo4_packed_m3_m4_match_sequential_m1_across_page_boundary() {
-    // The 2,303-token ragged prefix crosses the 2,304-token cache page boundary
-    // on the first accepted row.
-    assert_turbo4_packed_rows_match_sequential_m1(3, 0xFA11_BA03);
-    assert_turbo4_packed_rows_match_sequential_m1(4, 0xFA11_BA04);
+fn turbo4_grouped_m3_m4_match_rowwise_at_context_boundaries() {
+    const PREFIXES: [i32; 8] = [0, 515, 2_048, 2_051, 8_190, 10_003, 65_534, 65_537];
+    for (index, prefix_len) in PREFIXES.into_iter().enumerate() {
+        let seed = 0xFA11_BA00_u32.wrapping_add(index as u32 * 16);
+        assert_turbo4_grouped_matches_rowwise(prefix_len, 3, seed.wrapping_add(3));
+        assert_turbo4_grouped_matches_rowwise(prefix_len, 4, seed.wrapping_add(4));
+    }
+}
+
+#[test]
+fn turbo4_grouped_dispatches_production_qwen38_m3_m4_shape() {
+    let production = Turbo4GroupedTestShape {
+        batch: 1,
+        query_heads: 24,
+        kv_heads: 4,
+        head_dim: 128,
+        query_dtype: dtype::FLOAT32,
+    };
+    assert_turbo4_grouped_shape_matches_rowwise(4_093, 3, 0x38A3_0003, production, true);
+    assert_turbo4_grouped_shape_matches_rowwise(4_093, 4, 0x38A3_0004, production, true);
+}
+
+#[test]
+fn turbo4_grouped_falls_back_when_a_verify_block_crosses_a_reduction_tier() {
+    assert_turbo4_grouped_shape_matches_rowwise(
+        8_190,
+        3,
+        0x71E2_0003,
+        SMALL_GROUPED_SHAPE,
+        false,
+    );
+}
+
+#[test]
+fn turbo4_grouped_falls_back_for_bfloat16_or_batched_queries() {
+    assert_turbo4_grouped_shape_matches_rowwise(
+        2_051,
+        3,
+        0xBF16_0003,
+        Turbo4GroupedTestShape {
+            query_dtype: dtype::BFLOAT16,
+            ..SMALL_GROUPED_SHAPE
+        },
+        false,
+    );
+    assert_turbo4_grouped_shape_matches_rowwise(
+        2_051,
+        4,
+        0xBA7C_0004,
+        Turbo4GroupedTestShape {
+            batch: 2,
+            ..SMALL_GROUPED_SHAPE
+        },
+        false,
+    );
 }
 
 #[test]

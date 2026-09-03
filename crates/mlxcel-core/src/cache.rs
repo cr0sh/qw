@@ -3691,7 +3691,7 @@ impl KVCache {
         );
         let old_offset = self.offset;
         self.update(new_keys, new_values);
-        self.turbo4_causal_attention_after_update(q, old_offset, scale, false)
+        self.turbo4_causal_attention_after_update(q, old_offset, scale, false, true)
     }
 
     /// FP16-chain bottom-right causal Turbo4 attention.
@@ -3714,7 +3714,20 @@ impl KVCache {
         );
         let old_offset = self.offset;
         self.update(new_keys, new_values);
-        self.turbo4_causal_attention_after_update(q, old_offset, scale, true)
+        self.turbo4_causal_attention_after_update(q, old_offset, scale, true, true)
+    }
+
+    #[cfg(test)]
+    fn update_and_turbo4_causal_attention_rowwise_reference(
+        &mut self,
+        q: &MlxArray,
+        new_keys: UniquePtr<MlxArray>,
+        new_values: UniquePtr<MlxArray>,
+        scale: f32,
+    ) -> UniquePtr<MlxArray> {
+        let old_offset = self.offset;
+        self.update(new_keys, new_values);
+        self.turbo4_causal_attention_after_update(q, old_offset, scale, false, false)
     }
 
     fn turbo4_causal_attention_after_update(
@@ -3723,9 +3736,45 @@ impl KVCache {
         old_offset: i32,
         scale: f32,
         native_f16_rotation: bool,
+        allow_grouped: bool,
     ) -> UniquePtr<MlxArray> {
         const MAX_PACKED_ROWS: usize = 5;
         let q_shape = ffi::array_shape(q);
+        // Routing audit only; no source was copied from either reference:
+        // - MTPLX, Youssof Altoukhi (@youssofal), Apache-2.0:
+        //   https://github.com/youssofal/mtplx/commit/4bdfb227e3d9405c20145a58c94a3ad218fc9170
+        // - oMLX, Jun Kim (@jundot), Apache-2.0:
+        //   https://github.com/jundot/omlx/commit/293d697c2d5a773225891636af75a2b8dd2b8d3f
+        //
+        // b1897da introduced the row wrapper as the conservative way to pin
+        // every result to packed M1 arithmetic after the earlier dequant-SDPA
+        // oracle proved insufficient at 64K. The existing grouped kernel
+        // already assigns each row its bottom-right prefix; with a stable
+        // block-count tier its partial and merge order is also the M1 order.
+        let first_visible = old_offset + 1;
+        let reduction_blocks = |tokens: i32| {
+            if tokens <= 8_192 {
+                64
+            } else if tokens <= 65_536 {
+                128
+            } else {
+                512
+            }
+        };
+        if allow_grouped
+            && turbo::fused_attention::turbo4_grouped_causal_enabled()
+            && q_shape.len() == 4
+            && q_shape[0] == 1
+            && ffi::array_dtype(q) == dtype::FLOAT32
+            && matches!(q_shape[2], 3 | 4)
+            // A grouped call uses one compile-time block count. Keep the rare
+            // threshold-crossing round rowwise so every row retains its M1
+            // partial/merge partition.
+            && reduction_blocks(first_visible) == reduction_blocks(self.offset)
+            && let Some(output) = self.turbo4_fused_attention_prefix(q, self.offset, scale)
+        {
+            return output;
+        }
         if q_shape.len() == 4 && (2..=MAX_PACKED_ROWS as i32).contains(&q_shape[2]) {
             let row_count = q_shape[2] as usize;
             let mut rows: [UniquePtr<MlxArray>; MAX_PACKED_ROWS] =
