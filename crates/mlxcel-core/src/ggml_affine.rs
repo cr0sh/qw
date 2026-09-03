@@ -529,9 +529,9 @@ impl GgmlAffineMatrix {
 
     /// Run a high-row affine QMM with FP16 operands and retain its FP16 output.
     ///
-    /// This is an opt-in boundary for callers that keep a larger operation
-    /// chain in half precision. Ordinary [`Self::forward`] continues restoring
-    /// FP32 and every low-row dispatcher remains unchanged.
+    /// High-row callers use this boundary to keep a larger operation chain in
+    /// half precision. Ordinary [`Self::forward`] continues restoring FP32 and
+    /// every low-row dispatcher remains unchanged.
     pub fn forward_f16(&self, input: &MlxArray) -> Result<UniquePtr<MlxArray>, GgmlAffineError> {
         validate_high_m_f16_input(input, self.in_features)?;
         self.forward_f16_unchecked(input)
