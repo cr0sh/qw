@@ -3938,7 +3938,7 @@ mod tests {
 
     #[test]
     #[ignore = "requires the complete pinned Qwen3.8 27B GGUF pair"]
-    fn real_gguf_fused_target_logits_stay_within_one_ulp() {
+    fn real_gguf_fused_low_row_target_logits_stay_within_one_ulp() {
         fn verify_last_row(model: &Qwen35Model, rows: usize, repetition: usize) -> Vec<u8> {
             model.reset_runtime_state();
             let prefix = mlxcel_core::from_slice_i32(&[9_707, 11], &[1, 2]);
@@ -3961,7 +3961,9 @@ mod tests {
         }
 
         fn capture(model: &Qwen35Model) -> Vec<(usize, usize, Vec<u8>)> {
-            [(4, 1), (5, 1), (33, 1), (128, 1), (288, 3)]
+            // High-M affine prefill intentionally uses MLX's half-operand QMM
+            // and has a quality contract rather than old-FP32 ULP parity.
+            [(4, 1), (5, 1), (33, 1)]
                 .into_iter()
                 .flat_map(|(rows, repetitions)| {
                     (0..repetitions).map(move |repetition| {
@@ -4007,6 +4009,7 @@ mod tests {
             );
         }
     }
+
 
     #[test]
     #[ignore = "requires the complete pinned Qwen3.8 27B GGUF pair"]
