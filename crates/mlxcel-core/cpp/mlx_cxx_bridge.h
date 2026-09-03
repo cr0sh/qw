@@ -465,6 +465,12 @@ std::unique_ptr<MlxArray> compiled_relu_squared(const MlxArray& x);
 // Compiled silu: x * sigmoid(x) — single fused kernel
 std::unique_ptr<MlxArray> compiled_silu(const MlxArray& x);
 
+// Compiled attention output gate: sigmoid(gate) * value.
+std::unique_ptr<MlxArray> compiled_sigmoid_gate(
+    const MlxArray& gate,
+    const MlxArray& value
+);
+
 // Compiled gelu: x * 0.5 * (1 + erf(x / sqrt(2))) — single fused kernel
 // Used by: StarCoder2 and other precise GELU-based models
 std::unique_ptr<MlxArray> compiled_gelu(const MlxArray& x);

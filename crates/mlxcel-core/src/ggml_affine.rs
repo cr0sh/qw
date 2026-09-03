@@ -527,6 +527,21 @@ impl GgmlAffineMatrix {
         Ok(affine_matmul(input, &self.planes, self.bits))
     }
 
+    /// Run a high-row affine QMM with FP16 operands and retain its FP16 output.
+    ///
+    /// This is an opt-in boundary for callers that keep a larger operation
+    /// chain in half precision. Ordinary [`Self::forward`] continues restoring
+    /// FP32 and every low-row dispatcher remains unchanged.
+    pub fn forward_f16(&self, input: &MlxArray) -> Result<UniquePtr<MlxArray>, GgmlAffineError> {
+        validate_input(input, self.in_features)?;
+        if crate::array_dtype(input) != dtype::FLOAT16
+            || affine_input_rows(input)? < F16_PREFILL_MIN_ROWS
+        {
+            return Err(GgmlAffineError::InvalidInput);
+        }
+        affine_matmul_f16_output(input, &self.planes, self.bits)
+    }
+
     /// Runs exact pinned Qwen3.8 target shapes through a one-pass small-row
     /// kernel. FP32-sidecar affine matrices use the exact M2/M3/M4 kernel;
     /// Q5/IQ3S M1/M3/M4 uses its F16-only mixed-compute kernel.
@@ -866,6 +881,46 @@ impl Qwen38MixedQkvBundle {
         let output = outputs.pin_mut();
         let value = crate::qwen38_ggml_qkv_take_value(output);
         Ok(Qwen38MixedQkvOutput { query, key, value })
+    }
+
+    /// Run the pinned high-row Q/K/V projections as independent native FP16
+    /// matrix operations while sharing one caller-owned FP16 input.
+    ///
+    /// The bundled low-row M3 and exact M3+M1 M4 routes remain exclusive to
+    /// [`Self::forward`].
+    pub fn forward_f16(
+        &self,
+        input: &MlxArray,
+    ) -> Result<Qwen38MixedQkvOutput, GgmlAffineError> {
+        validate_input(input, 5120)?;
+        if crate::array_dtype(input) != dtype::FLOAT16
+            || affine_input_rows(input)? < F16_PREFILL_MIN_ROWS
+        {
+            return Err(GgmlAffineError::InvalidInput);
+        }
+        let forward = |matrix: &Qwen38QkvMatrix| match matrix {
+            Qwen38QkvMatrix::Affine(matrix) => matrix.forward_f16(input),
+            Qwen38QkvMatrix::Q6(matrix) => matrix
+                .forward(input)
+                .map_err(|error| GgmlAffineError::Backend(error.to_string())),
+        };
+        let output = Qwen38MixedQkvOutput {
+            query: self.query.forward_f16(input)?,
+            key: forward(&self.key)?,
+            value: forward(&self.value)?,
+        };
+        if [
+            output.query.as_ref(),
+            output.key.as_ref(),
+            output.value.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(|array| crate::array_dtype(array) != dtype::FLOAT16)
+        {
+            return Err(GgmlAffineError::InvalidPlane);
+        }
+        Ok(output)
     }
 }
 
@@ -1829,7 +1884,7 @@ fn affine_matmul_f16_compute(
     bits: i32,
 ) -> Result<UniquePtr<MlxArray>, GgmlAffineError> {
     // F16 operands select MLX's half BlockMMA, whose default accumulator is
-    // `float`; only the stored matrix result is F16 before this F32 boundary.
+    // `float`; ordinary affine callers restore the existing FP32 boundary.
     let input_f16 = crate::astype(input, dtype::FLOAT16);
     let output_f16 = affine_matmul_f16_output(
         input_f16

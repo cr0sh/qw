@@ -616,6 +616,8 @@ mod ffi {
         /// Uses mlx::core::compile(shapeless=true) like Python's @mx.compile
         /// output = silu(gate) * x
         fn compiled_swiglu_activation(gate: &MlxArray, x: &MlxArray) -> UniquePtr<MlxArray>;
+        /// Compiled attention output gate: sigmoid(gate) * value.
+        fn compiled_sigmoid_gate(gate: &MlxArray, value: &MlxArray) -> UniquePtr<MlxArray>;
         /// Compiled gated-delta decay gate.
         /// output = exp(-exp(float32(a_log)) * softplus(a + dt_bias))
         fn compiled_gated_delta_gate(

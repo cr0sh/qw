@@ -1193,6 +1193,25 @@ namespace {
     }
 }
 
+namespace {
+    static std::function<std::vector<array>(const std::vector<array>&)>
+    get_compiled_sigmoid_gate() {
+        auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
+            return {mlx::core::multiply(mlx::core::sigmoid(inputs[0]), inputs[1])};
+        };
+        return mlx::core::compile(fn, true);
+    }
+}
+
+std::unique_ptr<MlxArray> compiled_sigmoid_gate(
+    const MlxArray& gate,
+    const MlxArray& value
+) {
+    static auto compiled_fn = get_compiled_sigmoid_gate();
+    auto result = compiled_fn({gate.inner, value.inner});
+    return std::make_unique<MlxArray>(std::move(result[0]));
+}
+
 // Compiled relu_squared: square(maximum(x, 0)) → single fused kernel
 // Python equivalent: CompiledBroadcastMaximumSquare
 namespace {

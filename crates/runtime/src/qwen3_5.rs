@@ -4286,11 +4286,31 @@ mod tests {
     #[test]
     #[ignore = "requires the complete pinned Qwen3.8 27B GGUF pair and Metal"]
     fn experimental_qwen38_fp16_attention_whole_model_quality() {
-        fn select_attention_precision(model: &mut Qwen35Model, fp16: bool) {
+        #[derive(Clone, Copy, Debug)]
+        enum AttentionPrecision {
+            F32,
+            PostRopeF16,
+            FullF16,
+        }
+
+        fn select_attention_precision(
+            model: &mut Qwen35Model,
+            precision: AttentionPrecision,
+        ) {
             let mut attention_layers = 0;
             for layer in &mut model.layers {
                 if let Qwen35AttentionVariant::FullAttention(attention) = &mut layer.attention {
-                    attention.set_high_m_fp16_attention_for_test(fp16);
+                    match precision {
+                        AttentionPrecision::F32 => {
+                            attention.set_high_m_fp16_attention_for_test(false)
+                        }
+                        AttentionPrecision::PostRopeF16 => {
+                            attention.set_high_m_fp16_attention_for_test(true)
+                        }
+                        AttentionPrecision::FullF16 => {
+                            attention.set_full_f16_attention_for_test(true)
+                        }
+                    }
                     attention_layers += 1;
                 }
             }
@@ -4327,43 +4347,53 @@ mod tests {
         let (mut model, _) =
             Qwen35Model::load_pinned(KVCacheMode::Turbo4).expect("load Qwen3.8 GGUF");
         for rows in [1, 3, 4] {
-            select_attention_precision(&mut model, false);
+            select_attention_precision(&mut model, AttentionPrecision::F32);
             let reference = capture(&model, rows, 0);
-            select_attention_precision(&mut model, true);
-            let candidate = capture(&model, rows, 0);
-            let max_ulp = reference
-                .iter()
-                .zip(&candidate)
-                .map(|(&reference, &candidate)| {
-                    let ordered = |value: f32| {
-                        let bits = value.to_bits() as i32;
-                        if bits < 0 { i32::MIN - bits } else { bits }
-                    };
-                    ordered(reference).abs_diff(ordered(candidate))
-                })
-                .max()
-                .unwrap_or(0);
-            assert!(
-                max_ulp <= 1,
-                "disabled Qwen3.8 M={rows} path differs by {max_ulp} ULP"
-            );
+            for precision in [
+                AttentionPrecision::PostRopeF16,
+                AttentionPrecision::FullF16,
+            ] {
+                select_attention_precision(&mut model, precision);
+                let candidate = capture(&model, rows, 0);
+                let max_ulp = reference
+                    .iter()
+                    .zip(&candidate)
+                    .map(|(&reference, &candidate)| {
+                        let ordered = |value: f32| {
+                            let bits = value.to_bits() as i32;
+                            if bits < 0 { i32::MIN - bits } else { bits }
+                        };
+                        ordered(reference).abs_diff(ordered(candidate))
+                    })
+                    .max()
+                    .unwrap_or(0);
+                assert!(
+                    max_ulp <= 1,
+                    "disabled Qwen3.8 {precision:?} M={rows} path differs by {max_ulp} ULP"
+                );
+            }
         }
         for rows in [128, 288] {
             for repetition in 0..3 {
-                select_attention_precision(&mut model, false);
+                select_attention_precision(&mut model, AttentionPrecision::F32);
                 let reference = capture(&model, rows, repetition);
-                select_attention_precision(&mut model, true);
-                let candidate = capture(&model, rows, repetition);
-                let result = crate::qwen3_next::diagnose_f32(&reference, &candidate);
-                eprintln!(
-                    "QWEN38_FP16_ATTN_MODEL_QUALITY M={rows} repetition={repetition} finite=true max_abs={:.9e} rmse={:.9e} cosine={:.12} kl={:.9e} top1_equal={} top10_overlap={}/10",
-                    result.max_abs,
-                    result.rmse,
-                    result.cosine,
-                    result.kl,
-                    result.top1_equal,
-                    result.top10_overlap,
-                );
+                for precision in [
+                    AttentionPrecision::PostRopeF16,
+                    AttentionPrecision::FullF16,
+                ] {
+                    select_attention_precision(&mut model, precision);
+                    let candidate = capture(&model, rows, repetition);
+                    let result = crate::qwen3_next::diagnose_f32(&reference, &candidate);
+                    eprintln!(
+                        "QWEN38_FP16_ATTN_MODEL_QUALITY mode={precision:?} M={rows} repetition={repetition} finite=true max_abs={:.9e} rmse={:.9e} cosine={:.12} kl={:.9e} top1_equal={} top10_overlap={}/10",
+                        result.max_abs,
+                        result.rmse,
+                        result.cosine,
+                        result.kl,
+                        result.top1_equal,
+                        result.top10_overlap,
+                    );
+                }
             }
         }
     }

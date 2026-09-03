@@ -119,26 +119,48 @@ impl Qwen3NextCache {
 const QWEN38_HIGH_M_FP16_ATTENTION_ENV: &str = "QWR_EXPERIMENT_LONG_ATTN_F16";
 const QWEN38_HIGH_M_FP16_ATTENTION_MIN_ROWS: i32 = 128;
 
-fn qwen38_high_m_fp16_attention_requested() -> bool {
-    std::env::var(QWEN38_HIGH_M_FP16_ATTENTION_ENV).is_ok_and(|value| {
-        matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "on" | "yes"
-        )
-    })
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Qwen38AttentionPrecision {
+    F32,
+    PostRopeF16,
+    FullF16,
 }
 
-fn use_qwen38_high_m_fp16_attention(
+fn qwen38_attention_precision_requested() -> Qwen38AttentionPrecision {
+    match std::env::var(QWEN38_HIGH_M_FP16_ATTENTION_ENV)
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("1" | "true" | "on" | "yes" | "post-rope") => {
+            Qwen38AttentionPrecision::PostRopeF16
+        }
+        Some("full" | "full-chain") => Qwen38AttentionPrecision::FullF16,
+        _ => Qwen38AttentionPrecision::F32,
+    }
+}
+
+fn qwen38_attention_precision(
     pinned_qwen38_target: bool,
-    enabled: bool,
+    full_f16_supported: bool,
+    requested: Qwen38AttentionPrecision,
     batch_size: i32,
     sequence_length: i32,
-) -> bool {
-    pinned_qwen38_target
-        && enabled
-        && batch_size
-            .checked_mul(sequence_length)
-            .is_some_and(|rows| rows >= QWEN38_HIGH_M_FP16_ATTENTION_MIN_ROWS)
+) -> Qwen38AttentionPrecision {
+    let high_m = batch_size
+        .checked_mul(sequence_length)
+        .is_some_and(|rows| rows >= QWEN38_HIGH_M_FP16_ATTENTION_MIN_ROWS);
+    if !pinned_qwen38_target || !high_m {
+        return Qwen38AttentionPrecision::F32;
+    }
+    match requested {
+        Qwen38AttentionPrecision::FullF16 if !full_f16_supported => {
+            Qwen38AttentionPrecision::F32
+        }
+        requested => requested,
+    }
 }
 
 #[cfg(test)]
@@ -225,6 +247,8 @@ pub(crate) struct Qwen3NextAttention {
     o_proj: Qwen35Linear,
     q_norm: RMSNorm,
     k_norm: RMSNorm,
+    q_norm_f16: Option<RMSNorm>,
+    k_norm_f16: Option<RMSNorm>,
     num_heads: i32,
     num_kv_heads: i32,
     head_dim: i32,
@@ -233,7 +257,8 @@ pub(crate) struct Qwen3NextAttention {
     rope_base: f32,
     mrope: InterleavedMRoPE,
     pinned_qwen38_target: bool,
-    high_m_fp16_attention: bool,
+    full_f16_supported: bool,
+    attention_precision: Qwen38AttentionPrecision,
 }
 
 
@@ -245,8 +270,9 @@ impl Qwen3NextAttention {
         mask: Option<&MlxArray>,
         position_ids: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        let (output, _) = self.forward_impl(x, cache, mask, position_ids, false);
-        self.project_output(&output)
+        let (output, _, precision) =
+            self.forward_impl(x, cache, mask, position_ids, false);
+        self.project_output(&output, precision)
     }
 
 
@@ -260,9 +286,10 @@ impl Qwen3NextAttention {
         mask: Option<&MlxArray>,
         position_ids: Option<&MlxArray>,
     ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
-        let (output, queries) = self.forward_impl(x, cache, mask, position_ids, true);
+        let (output, queries, precision) =
+            self.forward_impl(x, cache, mask, position_ids, true);
         (
-            self.project_output(&output),
+            self.project_output(&output, precision),
             queries.expect("query capture was requested"),
         )
     }
@@ -276,11 +303,22 @@ impl Qwen3NextAttention {
         mask: Option<&MlxArray>,
         position_ids: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        let (output, _) = self.forward_impl(x, cache, mask, position_ids, false);
-        self.project_output(&output)
+        let (output, _, precision) =
+            self.forward_impl(x, cache, mask, position_ids, false);
+        self.project_output(&output, precision)
     }
 
-    fn project_output(&self, output: &MlxArray) -> UniquePtr<MlxArray> {
+    fn project_output(
+        &self,
+        output: &MlxArray,
+        precision: Qwen38AttentionPrecision,
+    ) -> UniquePtr<MlxArray> {
+        if precision == Qwen38AttentionPrecision::FullF16 {
+            return self
+                .o_proj
+                .forward_high_m_f16(output)
+                .expect("pinned high-M output projection supports FP16");
+        }
         let shape = mlxcel_core::array_shape(output);
         if shape.len() == 3 && shape[1] == 4 && self.o_proj.needs_m4_exact_split() {
             let first = mlxcel_core::slice(output, &[0, 0, 0], &[shape[0], 3, shape[2]]);
@@ -301,13 +339,33 @@ impl Qwen3NextAttention {
         mask: Option<&MlxArray>,
         position_ids: Option<&MlxArray>,
         capture_query: bool,
-    ) -> (UniquePtr<MlxArray>, Option<UniquePtr<MlxArray>>) {
+    ) -> (
+        UniquePtr<MlxArray>,
+        Option<UniquePtr<MlxArray>>,
+        Qwen38AttentionPrecision,
+    ) {
         let shape = mlxcel_core::array_shape(x);
         let b = shape[0];
         let l = shape[1];
+        let precision = qwen38_attention_precision(
+            self.pinned_qwen38_target,
+            self.full_f16_supported,
+            self.attention_precision,
+            b,
+            l,
+        );
 
-        // Q includes the learned gate plane, followed by K and V.
-        let (q_proj_output, keys, values) = self.qkv_proj.forward(x);
+        // Q includes the learned gate plane. The full-chain arm shares one
+        // normalized-input cast across the independent Q/K/V projections.
+        let projection_input = (precision == Qwen38AttentionPrecision::FullF16)
+            .then(|| mlxcel_core::astype(x, mlxcel_core::dtype::FLOAT16));
+        let (q_proj_output, keys, values) = if let Some(input) = projection_input.as_deref() {
+            self.qkv_proj
+                .forward_high_m_f16(input)
+                .expect("pinned high-M QKV bundle supports FP16")
+        } else {
+            self.qkv_proj.forward(x)
+        };
         let q_proj_reshaped = mlxcel_core::reshape(&q_proj_output, &[b, l, self.num_heads, -1]);
 
         // Split into queries and gate
@@ -330,8 +388,20 @@ impl Qwen3NextAttention {
         let keys = mlxcel_core::reshape(&keys, &[b, l, self.num_kv_heads, self.head_dim]);
         let values = mlxcel_core::reshape(&values, &[b, l, self.num_kv_heads, self.head_dim]);
 
-        let queries = self.q_norm.forward(&queries);
-        let keys = self.k_norm.forward(&keys);
+        let (queries, keys) = if precision == Qwen38AttentionPrecision::FullF16 {
+            (
+                self.q_norm_f16
+                    .as_ref()
+                    .expect("pinned FP16 query norm")
+                    .forward(&queries),
+                self.k_norm_f16
+                    .as_ref()
+                    .expect("pinned FP16 key norm")
+                    .forward(&keys),
+            )
+        } else {
+            (self.q_norm.forward(&queries), self.k_norm.forward(&keys))
+        };
 
         // Transpose to [B, H, L, D]
         let mut queries = mlxcel_core::transpose_axes(&queries, &[0, 2, 1, 3]);
@@ -382,13 +452,7 @@ impl Qwen3NextAttention {
         }
 
         let captured_query = capture_query.then(|| mlxcel_core::share(&queries));
-        let use_fp16_attention = use_qwen38_high_m_fp16_attention(
-            self.pinned_qwen38_target,
-            self.high_m_fp16_attention,
-            b,
-            l,
-        );
-        if use_fp16_attention {
+        if precision == Qwen38AttentionPrecision::PostRopeF16 {
             queries = mlxcel_core::astype(&queries, mlxcel_core::dtype::FLOAT16);
             keys = mlxcel_core::astype(&keys, mlxcel_core::dtype::FLOAT16);
             values = mlxcel_core::astype(&values, mlxcel_core::dtype::FLOAT16);
@@ -398,7 +462,17 @@ impl Qwen3NextAttention {
         // metadata while routing each row through the packed M1 reduction.
         // Corresponding rows therefore preserve sequential-decode arithmetic.
         let attn_out = if cache.mode == KVCacheMode::Turbo4 {
-            if l > 1 && mask.is_none() {
+            if precision == Qwen38AttentionPrecision::FullF16 {
+                if l > 1 && mask.is_none() {
+                    cache.update_and_turbo4_causal_attention_f16(
+                        &queries, keys, values, self.scale,
+                    )
+                } else {
+                    cache.update_and_turbo4_attention_f16(
+                        &queries, keys, values, self.scale, mask,
+                    )
+                }
+            } else if l > 1 && mask.is_none() {
                 cache.update_and_turbo4_causal_attention(&queries, keys, values, self.scale)
             } else {
                 cache.update_and_turbo4_attention(&queries, keys, values, self.scale, mask)
@@ -482,18 +556,21 @@ impl Qwen3NextAttention {
         // Transpose back and reshape
         let output = mlxcel_core::transpose_axes(&attn_out, &[0, 2, 1, 3]);
         let output = mlxcel_core::reshape(&output, &[b, l, -1]);
-        // Keep the output projection and residual stream at their existing
-        // FP32 boundary; only the high-M attention core changes precision.
-        let output = if use_fp16_attention {
+        // The post-RoPE arm restores the old FP32 projection boundary. The
+        // full chain stays FP16 through the gate and output projection; the
+        // caller's residual add is its sole FP32 promotion.
+        let output = if precision == Qwen38AttentionPrecision::PostRopeF16 {
             mlxcel_core::astype(&output, mlxcel_core::dtype::FLOAT32)
         } else {
             output
         };
-
-        // Apply sigmoid gating to output
-        let gate_sigmoid = mlxcel_core::sigmoid(&gate);
-        let gated = mlxcel_core::multiply(&output, &gate_sigmoid);
-        (gated, captured_query)
+        let gated = if precision == Qwen38AttentionPrecision::FullF16 {
+            mlxcel_core::compiled_sigmoid_gate(&gate, &output)
+        } else {
+            let gate_sigmoid = mlxcel_core::sigmoid(&gate);
+            mlxcel_core::multiply(&output, &gate_sigmoid)
+        };
+        (gated, captured_query, precision)
     }
 
     pub(crate) fn from_weights(
@@ -526,12 +603,29 @@ impl Qwen3NextAttention {
         let q_norm_weight = weights.tensor(slot(LayerTensor::AttentionQueryNorm))?;
         let k_norm_weight = weights.tensor(slot(LayerTensor::AttentionKeyNorm))?;
         let head_dim = config.head_dim as i32;
+        let pinned_qwen38_target =
+            weights.is_pinned_qwen38_gguf() && role == ModelRole::Target;
+        let full_f16_supported = pinned_qwen38_target
+            && qkv_proj.supports_high_m_f16()
+            && o_proj.supports_high_m_f16();
+        let q_norm_f16 = full_f16_supported.then(|| {
+            let weight = mlxcel_core::astype(&q_norm_weight, mlxcel_core::dtype::FLOAT16);
+            mlxcel_core::eval(&weight);
+            RMSNorm::new(weight, config.rms_norm_eps)
+        });
+        let k_norm_f16 = full_f16_supported.then(|| {
+            let weight = mlxcel_core::astype(&k_norm_weight, mlxcel_core::dtype::FLOAT16);
+            mlxcel_core::eval(&weight);
+            RMSNorm::new(weight, config.rms_norm_eps)
+        });
 
         Ok(Self {
             qkv_proj,
             o_proj,
             q_norm: RMSNorm::new(q_norm_weight, config.rms_norm_eps),
             k_norm: RMSNorm::new(k_norm_weight, config.rms_norm_eps),
+            q_norm_f16,
+            k_norm_f16,
             num_heads: config.num_attention_heads as i32,
             num_kv_heads: config.num_key_value_heads as i32,
             head_dim,
@@ -543,14 +637,28 @@ impl Qwen3NextAttention {
                 config.rope_theta,
                 config.mrope_section.clone(),
             ),
-            pinned_qwen38_target: weights.is_pinned_qwen38_gguf() && role == ModelRole::Target,
-            high_m_fp16_attention: qwen38_high_m_fp16_attention_requested(),
+            pinned_qwen38_target,
+            full_f16_supported,
+            attention_precision: qwen38_attention_precision_requested(),
         })
     }
 
     #[cfg(test)]
     pub(crate) fn set_high_m_fp16_attention_for_test(&mut self, enabled: bool) {
-        self.high_m_fp16_attention = enabled;
+        self.attention_precision = if enabled {
+            Qwen38AttentionPrecision::PostRopeF16
+        } else {
+            Qwen38AttentionPrecision::F32
+        };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_full_f16_attention_for_test(&mut self, enabled: bool) {
+        self.attention_precision = if enabled {
+            Qwen38AttentionPrecision::FullF16
+        } else {
+            Qwen38AttentionPrecision::F32
+        };
     }
 }
 
@@ -784,22 +892,58 @@ mod tests {
     #[test]
     fn qwen38_fp16_attention_gate_is_pinned_and_high_m_only() {
         for rows in [1, 3, 4, 127] {
-            assert!(!use_qwen38_high_m_fp16_attention(
-                true, true, 1, rows
-            ));
+            for requested in [
+                Qwen38AttentionPrecision::PostRopeF16,
+                Qwen38AttentionPrecision::FullF16,
+            ] {
+                assert_eq!(
+                    qwen38_attention_precision(true, true, requested, 1, rows),
+                    Qwen38AttentionPrecision::F32
+                );
+            }
         }
-        assert!(use_qwen38_high_m_fp16_attention(
-            true, true, 1, 128
-        ));
-        assert!(use_qwen38_high_m_fp16_attention(
-            true, true, 1, 288
-        ));
-        assert!(!use_qwen38_high_m_fp16_attention(
-            false, true, 1, 288
-        ));
-        assert!(!use_qwen38_high_m_fp16_attention(
-            true, false, 1, 288
-        ));
+        for rows in [128, 288] {
+            assert_eq!(
+                qwen38_attention_precision(
+                    true,
+                    false,
+                    Qwen38AttentionPrecision::PostRopeF16,
+                    1,
+                    rows,
+                ),
+                Qwen38AttentionPrecision::PostRopeF16
+            );
+            assert_eq!(
+                qwen38_attention_precision(
+                    true,
+                    true,
+                    Qwen38AttentionPrecision::FullF16,
+                    1,
+                    rows,
+                ),
+                Qwen38AttentionPrecision::FullF16
+            );
+            assert_eq!(
+                qwen38_attention_precision(
+                    true,
+                    false,
+                    Qwen38AttentionPrecision::FullF16,
+                    1,
+                    rows,
+                ),
+                Qwen38AttentionPrecision::F32
+            );
+            assert_eq!(
+                qwen38_attention_precision(
+                    false,
+                    true,
+                    Qwen38AttentionPrecision::FullF16,
+                    1,
+                    rows,
+                ),
+                Qwen38AttentionPrecision::F32
+            );
+        }
     }
 
     #[test]
