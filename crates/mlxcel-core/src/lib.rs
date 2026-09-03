@@ -616,6 +616,16 @@ mod ffi {
         /// Uses mlx::core::compile(shapeless=true) like Python's @mx.compile
         /// output = silu(gate) * x
         fn compiled_swiglu_activation(gate: &MlxArray, x: &MlxArray) -> UniquePtr<MlxArray>;
+        /// Compiled attention gate plus affine output projection. The gate
+        /// transient remains inside the compiled high-row FP16 graph.
+        fn compiled_sigmoid_gate_affine(
+            gate: &MlxArray,
+            value: &MlxArray,
+            weight: &MlxArray,
+            scales: &MlxArray,
+            biases: &MlxArray,
+            bits: i32,
+        ) -> UniquePtr<MlxArray>;
         /// Compiled gated-delta decay gate.
         /// output = exp(-exp(float32(a_log)) * softplus(a + dt_bias))
         fn compiled_gated_delta_gate(

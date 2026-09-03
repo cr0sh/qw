@@ -116,12 +116,105 @@ impl Qwen3NextCache {
     }
 }
 
+const QWEN38_HIGH_M_FP16_ATTENTION_MIN_ROWS: i32 = 128;
+
+fn qwen38_use_high_m_f16_attention(
+    supported: bool,
+    batch_size: i32,
+    sequence_length: i32,
+) -> bool {
+    supported
+        && batch_size
+            .checked_mul(sequence_length)
+            .is_some_and(|rows| rows >= QWEN38_HIGH_M_FP16_ATTENTION_MIN_ROWS)
+}
+
+#[cfg(test)]
+pub(crate) struct F32Diagnostics {
+    pub(crate) max_abs: f32,
+    pub(crate) rmse: f64,
+    pub(crate) cosine: f64,
+    pub(crate) kl: f64,
+    pub(crate) top1_equal: bool,
+    pub(crate) top10_overlap: usize,
+}
+
+#[cfg(test)]
+pub(crate) fn diagnose_f32(reference: &[f32], candidate: &[f32]) -> F32Diagnostics {
+    assert_eq!(reference.len(), candidate.len());
+    assert!(reference.len() >= 10);
+    let mut max_abs = 0.0f32;
+    let mut squared_error = 0.0f64;
+    let mut dot = 0.0f64;
+    let mut reference_norm = 0.0f64;
+    let mut candidate_norm = 0.0f64;
+    for (&reference_value, &candidate_value) in reference.iter().zip(candidate) {
+        assert!(reference_value.is_finite() && candidate_value.is_finite());
+        let error = (reference_value - candidate_value).abs();
+        max_abs = max_abs.max(error);
+        squared_error += f64::from(error) * f64::from(error);
+        dot += f64::from(reference_value) * f64::from(candidate_value);
+        reference_norm += f64::from(reference_value) * f64::from(reference_value);
+        candidate_norm += f64::from(candidate_value) * f64::from(candidate_value);
+    }
+    let reference_max = reference
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+    let candidate_max = candidate
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+    let reference_exp = reference
+        .iter()
+        .map(|&value| f64::from(value - reference_max).exp())
+        .collect::<Vec<_>>();
+    let reference_sum = reference_exp.iter().sum::<f64>();
+    let reference_log_sum = f64::from(reference_max) + reference_sum.ln();
+    let candidate_log_sum = f64::from(candidate_max)
+        + candidate
+            .iter()
+            .map(|&value| f64::from(value - candidate_max).exp())
+            .sum::<f64>()
+            .ln();
+    let kl = reference
+        .iter()
+        .zip(candidate)
+        .zip(&reference_exp)
+        .map(|((&reference_value, &candidate_value), &reference_value_exp)| {
+            let probability = reference_value_exp / reference_sum;
+            probability
+                * ((f64::from(reference_value) - reference_log_sum)
+                    - (f64::from(candidate_value) - candidate_log_sum))
+        })
+        .sum::<f64>();
+    let mut reference_order = (0..reference.len()).collect::<Vec<_>>();
+    reference_order
+        .sort_unstable_by(|&left, &right| reference[right].total_cmp(&reference[left]));
+    let mut candidate_order = (0..candidate.len()).collect::<Vec<_>>();
+    candidate_order
+        .sort_unstable_by(|&left, &right| candidate[right].total_cmp(&candidate[left]));
+    F32Diagnostics {
+        max_abs,
+        rmse: (squared_error / reference.len() as f64).sqrt(),
+        cosine: dot / (reference_norm.sqrt() * candidate_norm.sqrt()),
+        kl,
+        top1_equal: reference_order[0] == candidate_order[0],
+        top10_overlap: reference_order[..10]
+            .iter()
+            .filter(|index| candidate_order[..10].contains(index))
+            .count(),
+    }
+}
+
 // Attention with Gated Output.
 pub(crate) struct Qwen3NextAttention {
     qkv_proj: Qwen35QkvProjection,
     o_proj: Qwen35Linear,
     q_norm: RMSNorm,
     k_norm: RMSNorm,
+    q_norm_f16: Option<RMSNorm>,
+    k_norm_f16: Option<RMSNorm>,
     num_heads: i32,
     num_kv_heads: i32,
     head_dim: i32,
@@ -129,6 +222,7 @@ pub(crate) struct Qwen3NextAttention {
     rope_dims: i32,
     rope_base: f32,
     mrope: InterleavedMRoPE,
+    high_m_f16_supported: bool,
 }
 
 
@@ -140,8 +234,9 @@ impl Qwen3NextAttention {
         mask: Option<&MlxArray>,
         position_ids: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        let (output, _) = self.forward_impl(x, cache, mask, position_ids, false);
-        self.project_output(&output)
+        let (output, _, use_high_m_f16, gate) =
+            self.forward_impl(x, cache, mask, position_ids, false);
+        self.project_output(&output, gate.as_deref(), use_high_m_f16)
     }
 
 
@@ -155,9 +250,10 @@ impl Qwen3NextAttention {
         mask: Option<&MlxArray>,
         position_ids: Option<&MlxArray>,
     ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
-        let (output, queries) = self.forward_impl(x, cache, mask, position_ids, true);
+        let (output, queries, use_high_m_f16, gate) =
+            self.forward_impl(x, cache, mask, position_ids, true);
         (
-            self.project_output(&output),
+            self.project_output(&output, gate.as_deref(), use_high_m_f16),
             queries.expect("query capture was requested"),
         )
     }
@@ -171,11 +267,26 @@ impl Qwen3NextAttention {
         mask: Option<&MlxArray>,
         position_ids: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        let (output, _) = self.forward_impl(x, cache, mask, position_ids, false);
-        self.project_output(&output)
+        let (output, _, use_high_m_f16, gate) =
+            self.forward_impl(x, cache, mask, position_ids, false);
+        self.project_output(&output, gate.as_deref(), use_high_m_f16)
     }
 
-    fn project_output(&self, output: &MlxArray) -> UniquePtr<MlxArray> {
+    fn project_output(
+        &self,
+        output: &MlxArray,
+        gate: Option<&MlxArray>,
+        use_high_m_f16: bool,
+    ) -> UniquePtr<MlxArray> {
+        if use_high_m_f16 {
+            return self
+                .o_proj
+                .forward_high_m_sigmoid_gate_f16(
+                    gate.expect("full FP16 attention retains its gate view"),
+                    output,
+                )
+                .expect("pinned high-M output projection supports fused FP16 gating");
+        }
         let shape = mlxcel_core::array_shape(output);
         if shape.len() == 3 && shape[1] == 4 && self.o_proj.needs_m4_exact_split() {
             let first = mlxcel_core::slice(output, &[0, 0, 0], &[shape[0], 3, shape[2]]);
@@ -196,13 +307,29 @@ impl Qwen3NextAttention {
         mask: Option<&MlxArray>,
         position_ids: Option<&MlxArray>,
         capture_query: bool,
-    ) -> (UniquePtr<MlxArray>, Option<UniquePtr<MlxArray>>) {
+    ) -> (
+        UniquePtr<MlxArray>,
+        Option<UniquePtr<MlxArray>>,
+        bool,
+        Option<UniquePtr<MlxArray>>,
+    ) {
         let shape = mlxcel_core::array_shape(x);
         let b = shape[0];
         let l = shape[1];
+        let use_high_m_f16 =
+            qwen38_use_high_m_f16_attention(self.high_m_f16_supported, b, l);
 
-        // Q includes the learned gate plane, followed by K and V.
-        let (q_proj_output, keys, values) = self.qkv_proj.forward(x);
+        // Q includes the learned gate plane. The production high-M chain shares
+        // one normalized-input cast across the independent Q/K/V projections.
+        let projection_input =
+            use_high_m_f16.then(|| mlxcel_core::astype(x, mlxcel_core::dtype::FLOAT16));
+        let (q_proj_output, keys, values) = if let Some(input) = projection_input.as_deref() {
+            self.qkv_proj
+                .forward_high_m_f16(input)
+                .expect("pinned high-M QKV bundle supports FP16")
+        } else {
+            self.qkv_proj.forward(x)
+        };
         let q_proj_reshaped = mlxcel_core::reshape(&q_proj_output, &[b, l, self.num_heads, -1]);
 
         // Split into queries and gate
@@ -211,8 +338,13 @@ impl Qwen3NextAttention {
             &[0, 0, 0, 0],
             &[b, l, self.num_heads, self.head_dim],
         );
-        // Note: MLX slice stop=-1 means dim_size-1 (excludes last), not "to end"
-        let q_last_dim = mlxcel_core::array_shape(&q_proj_reshaped)[3];
+        let q_last_dim = if use_high_m_f16 {
+            2 * self.head_dim
+        } else {
+            // Preserve the established low-row graph, including its runtime
+            // bound lookup, outside the high-M chain.
+            mlxcel_core::array_shape(&q_proj_reshaped)[3]
+        };
         let gate = mlxcel_core::slice(
             &q_proj_reshaped,
             &[0, 0, 0, self.head_dim],
@@ -220,13 +352,30 @@ impl Qwen3NextAttention {
         );
         let gate = mlxcel_core::reshape(&gate, &[b, l, -1]);
 
-        // Reshape and apply Q/K norms
-        let queries = mlxcel_core::reshape(&queries, &[b, l, self.num_heads, self.head_dim]);
+        // Reshape and apply Q/K norms. Retain the historical no-op query
+        // reshape for low rows so their graph is untouched.
+        let queries = if use_high_m_f16 {
+            queries
+        } else {
+            mlxcel_core::reshape(&queries, &[b, l, self.num_heads, self.head_dim])
+        };
         let keys = mlxcel_core::reshape(&keys, &[b, l, self.num_kv_heads, self.head_dim]);
         let values = mlxcel_core::reshape(&values, &[b, l, self.num_kv_heads, self.head_dim]);
 
-        let queries = self.q_norm.forward(&queries);
-        let keys = self.k_norm.forward(&keys);
+        let (queries, keys) = if use_high_m_f16 {
+            (
+                self.q_norm_f16
+                    .as_ref()
+                    .expect("pinned FP16 query norm")
+                    .forward(&queries),
+                self.k_norm_f16
+                    .as_ref()
+                    .expect("pinned FP16 key norm")
+                    .forward(&keys),
+            )
+        } else {
+            (self.q_norm.forward(&queries), self.k_norm.forward(&keys))
+        };
 
         // Transpose to [B, H, L, D]
         let mut queries = mlxcel_core::transpose_axes(&queries, &[0, 2, 1, 3]);
@@ -282,7 +431,17 @@ impl Qwen3NextAttention {
         // metadata while routing each row through the packed M1 reduction.
         // Corresponding rows therefore preserve sequential-decode arithmetic.
         let attn_out = if cache.mode == KVCacheMode::Turbo4 {
-            if l > 1 && mask.is_none() {
+            if use_high_m_f16 {
+                if l > 1 && mask.is_none() {
+                    cache.update_and_turbo4_causal_attention_f16(
+                        &queries, keys, values, self.scale,
+                    )
+                } else {
+                    cache.update_and_turbo4_attention_f16(
+                        &queries, keys, values, self.scale, mask,
+                    )
+                }
+            } else if l > 1 && mask.is_none() {
                 cache.update_and_turbo4_causal_attention(&queries, keys, values, self.scale)
             } else {
                 cache.update_and_turbo4_attention(&queries, keys, values, self.scale, mask)
@@ -366,11 +525,20 @@ impl Qwen3NextAttention {
         // Transpose back and reshape
         let output = mlxcel_core::transpose_axes(&attn_out, &[0, 2, 1, 3]);
         let output = mlxcel_core::reshape(&output, &[b, l, -1]);
-
-        // Apply sigmoid gating to output
-        let gate_sigmoid = mlxcel_core::sigmoid(&gate);
-        let gated = mlxcel_core::multiply(&output, &gate_sigmoid);
-        (gated, captured_query)
+        // The high-M chain carries the FP16 gate view into the compiled output
+        // projection, avoiding a standalone gate materialization; the caller's
+        // residual add is its sole FP32 promotion.
+        if use_high_m_f16 {
+            (output, captured_query, true, Some(gate))
+        } else {
+            let gate_sigmoid = mlxcel_core::sigmoid(&gate);
+            (
+                mlxcel_core::multiply(&output, &gate_sigmoid),
+                captured_query,
+                false,
+                None,
+            )
+        }
     }
 
     pub(crate) fn from_weights(
@@ -403,12 +571,27 @@ impl Qwen3NextAttention {
         let q_norm_weight = weights.tensor(slot(LayerTensor::AttentionQueryNorm))?;
         let k_norm_weight = weights.tensor(slot(LayerTensor::AttentionKeyNorm))?;
         let head_dim = config.head_dim as i32;
-
+        let high_m_f16_supported = weights.is_pinned_qwen38_gguf()
+            && role == ModelRole::Target
+            && qkv_proj.supports_high_m_f16()
+            && o_proj.supports_high_m_sigmoid_gate_f16();
+        let q_norm_f16 = high_m_f16_supported.then(|| {
+            let weight = mlxcel_core::astype(&q_norm_weight, mlxcel_core::dtype::FLOAT16);
+            mlxcel_core::eval(&weight);
+            RMSNorm::new(weight, config.rms_norm_eps)
+        });
+        let k_norm_f16 = high_m_f16_supported.then(|| {
+            let weight = mlxcel_core::astype(&k_norm_weight, mlxcel_core::dtype::FLOAT16);
+            mlxcel_core::eval(&weight);
+            RMSNorm::new(weight, config.rms_norm_eps)
+        });
         Ok(Self {
             qkv_proj,
             o_proj,
             q_norm: RMSNorm::new(q_norm_weight, config.rms_norm_eps),
             k_norm: RMSNorm::new(k_norm_weight, config.rms_norm_eps),
+            q_norm_f16,
+            k_norm_f16,
             num_heads: config.num_attention_heads as i32,
             num_kv_heads: config.num_key_value_heads as i32,
             head_dim,
@@ -420,9 +603,12 @@ impl Qwen3NextAttention {
                 config.rope_theta,
                 config.mrope_section.clone(),
             ),
+            high_m_f16_supported,
         })
     }
 }
+
+
 
 // Dense MLP.
 enum MlpInputProjections {
@@ -650,6 +836,198 @@ impl Mlp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn qwen38_high_m_f16_attention_is_supported_and_high_m_only() {
+        for rows in [1, 3, 4, 127] {
+            assert!(!qwen38_use_high_m_f16_attention(true, 1, rows));
+        }
+        for rows in [128, 288] {
+            assert!(qwen38_use_high_m_f16_attention(true, 1, rows));
+            assert!(!qwen38_use_high_m_f16_attention(false, 1, rows));
+        }
+        assert!(!qwen38_use_high_m_f16_attention(true, i32::MAX, 2));
+    }
+
+    #[test]
+    fn qwen38_high_m_f16_sdpa_component_quality() {
+        const QUERY_HEADS: i32 = 24;
+        const KV_HEADS: i32 = 4;
+        const QUERY_ROWS: i32 = 128;
+        const KEY_ROWS: i32 = 384;
+        const HEAD_DIM: i32 = 256;
+        let values = |len: usize, stride: usize, modulus: usize| {
+            (0..len)
+                .map(|index| {
+                    ((index.wrapping_mul(stride) % modulus) as f32
+                        - (modulus / 2) as f32)
+                        / (modulus / 2) as f32
+                })
+                .collect::<Vec<_>>()
+        };
+        let query_values = values(
+            (QUERY_HEADS * QUERY_ROWS * HEAD_DIM) as usize,
+            7_919,
+            2_003,
+        );
+        let key_values = values(
+            (KV_HEADS * KEY_ROWS * HEAD_DIM) as usize,
+            104_729,
+            2_011,
+        );
+        let value_values = values(
+            (KV_HEADS * KEY_ROWS * HEAD_DIM) as usize,
+            1_879,
+            2_021,
+        );
+        let query = mlxcel_core::from_slice_f32(
+            &query_values,
+            &[1, QUERY_HEADS, QUERY_ROWS, HEAD_DIM],
+        );
+        let keys = mlxcel_core::from_slice_f32(
+            &key_values,
+            &[1, KV_HEADS, KEY_ROWS, HEAD_DIM],
+        );
+        let values = mlxcel_core::from_slice_f32(
+            &value_values,
+            &[1, KV_HEADS, KEY_ROWS, HEAD_DIM],
+        );
+        let keys = mlxcel_core::astype(&keys, mlxcel_core::dtype::FLOAT16);
+        let values = mlxcel_core::astype(&values, mlxcel_core::dtype::FLOAT16);
+        let reference = mlxcel_core::causal_attention(
+            &query,
+            &keys,
+            &values,
+            1.0 / (HEAD_DIM as f32).sqrt(),
+            0.0,
+            0,
+        );
+        let query_f16 = mlxcel_core::astype(&query, mlxcel_core::dtype::FLOAT16);
+        let candidate = mlxcel_core::causal_attention(
+            &query_f16,
+            &keys,
+            &values,
+            1.0 / (HEAD_DIM as f32).sqrt(),
+            0.0,
+            0,
+        );
+        assert_eq!(
+            mlxcel_core::array_dtype(&reference),
+            mlxcel_core::dtype::FLOAT32
+        );
+        assert_eq!(
+            mlxcel_core::array_dtype(&candidate),
+            mlxcel_core::dtype::FLOAT16
+        );
+        let candidate = mlxcel_core::astype(&candidate, mlxcel_core::dtype::FLOAT32);
+        mlxcel_core::eval(&reference);
+        mlxcel_core::eval(&candidate);
+        let to_f32 = |array: &MlxArray| {
+            mlxcel_core::array_to_raw_bytes(array)
+                .chunks_exact(4)
+                .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let reference = to_f32(&reference);
+        let candidate = to_f32(&candidate);
+        let result = diagnose_f32(&reference, &candidate);
+        assert!(
+            result.max_abs <= 1.0e-4,
+            "FP16 attention max_abs {} exceeded 1e-4",
+            result.max_abs
+        );
+        assert!(
+            result.rmse <= 2.0e-5,
+            "FP16 attention RMSE {} exceeded 2e-5",
+            result.rmse
+        );
+        assert!(
+            result.cosine >= 0.999_999,
+            "FP16 attention cosine {} fell below 0.999999",
+            result.cosine
+        );
+        assert!(
+            result.kl.abs() <= 1.0e-9,
+            "FP16 attention |KL| {} exceeded 1e-9",
+            result.kl.abs()
+        );
+        assert!(result.top1_equal, "FP16 attention changed the top-1 value");
+        assert_eq!(
+            result.top10_overlap, 10,
+            "FP16 attention changed the top-10 set"
+        );
+        eprintln!(
+            "QWEN38_FP16_SDPA_COMPONENT M={QUERY_ROWS} K={KEY_ROWS} finite=true max_abs={:.9e} rmse={:.9e} cosine={:.12} kl={:.9e} top1_equal={} top10_overlap={}/10",
+            result.max_abs,
+            result.rmse,
+            result.cosine,
+            result.kl,
+            result.top1_equal,
+            result.top10_overlap,
+        );
+    }
+
+    #[test]
+    #[ignore = "runs exact Turbo4 cache writes on Metal"]
+    fn qwen38_fp16_attention_preserves_turbo4_cache_bytes() {
+        const HEADS: i32 = 4;
+        const ROWS: i32 = 128;
+        const HEAD_DIM: i32 = 256;
+        let len = (HEADS * ROWS * HEAD_DIM) as usize;
+        let keys = (0..len)
+            .map(|index| ((index * 7_919 % 2_003) as f32 - 1_001.0) / 1_001.0)
+            .collect::<Vec<_>>();
+        let values = (0..len)
+            .map(|index| ((index * 104_729 % 2_011) as f32 - 1_005.0) / 1_005.0)
+            .collect::<Vec<_>>();
+        let mut reference = KVCache::new_with_mode(KVCacheMode::Turbo4);
+        reference.update(
+            mlxcel_core::from_slice_f32(&keys, &[1, HEADS, ROWS, HEAD_DIM]),
+            mlxcel_core::from_slice_f32(&values, &[1, HEADS, ROWS, HEAD_DIM]),
+        );
+        let candidate_keys =
+            mlxcel_core::from_slice_f32(&keys, &[1, HEADS, ROWS, HEAD_DIM]);
+        let candidate_values =
+            mlxcel_core::from_slice_f32(&values, &[1, HEADS, ROWS, HEAD_DIM]);
+        let mut candidate = KVCache::new_with_mode(KVCacheMode::Turbo4);
+        candidate.update(
+            mlxcel_core::astype(&candidate_keys, mlxcel_core::dtype::FLOAT16),
+            mlxcel_core::astype(&candidate_values, mlxcel_core::dtype::FLOAT16),
+        );
+        assert_eq!(reference.seq_len(), ROWS);
+        assert_eq!(candidate.seq_len(), ROWS);
+        let reference = reference
+            .turbo4_snapshot_tensors()
+            .expect("reference Turbo4 sidecars");
+        let candidate = candidate
+            .turbo4_snapshot_tensors()
+            .expect("candidate Turbo4 sidecars");
+        for (name, reference, candidate) in [
+            ("k_packed", reference.k_packed, candidate.k_packed),
+            ("k_rescale", reference.k_rescale, candidate.k_rescale),
+            ("v_packed", reference.v_packed, candidate.v_packed),
+            ("v_norms", reference.v_norms, candidate.v_norms),
+            ("v_rescale", reference.v_rescale, candidate.v_rescale),
+        ] {
+            mlxcel_core::eval(reference);
+            mlxcel_core::eval(candidate);
+            assert_eq!(
+                mlxcel_core::array_shape(reference),
+                mlxcel_core::array_shape(candidate),
+                "{name} shape"
+            );
+            assert_eq!(
+                mlxcel_core::array_dtype(reference),
+                mlxcel_core::array_dtype(candidate),
+                "{name} dtype"
+            );
+            assert_eq!(
+                mlxcel_core::array_to_raw_bytes(reference),
+                mlxcel_core::array_to_raw_bytes(candidate),
+                "{name} bytes"
+            );
+        }
+    }
 
     fn insert_f32(weights: &mut WeightMap, name: &str, shape: &[i32], value: f32) {
         let len = shape.iter().map(|&dim| dim as usize).product();

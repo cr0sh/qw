@@ -4283,6 +4283,7 @@ mod tests {
         }
     }
 
+
     #[test]
     #[ignore = "requires the complete pinned Qwen3.8 27B GGUF pair"]
     fn real_gguf_affine_fusion_exactness_and_timing() {

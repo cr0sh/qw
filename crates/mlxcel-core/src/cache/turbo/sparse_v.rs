@@ -1059,9 +1059,53 @@ pub fn attention_turbo4_dequant_sdpa(
     mask: Option<&MlxArray>,
     causal: bool,
 ) -> UniquePtr<MlxArray> {
+    attention_turbo4_dequant_sdpa_impl(
+        q, k_packed, k_rescale, v_packed, v_rescale, params, scale, mask, causal, false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attention_turbo4_dequant_sdpa_f16(
+    q: &MlxArray,
+    k_packed: &MlxArray,
+    k_rescale: &MlxArray,
+    v_packed: &MlxArray,
+    v_rescale: &MlxArray,
+    params: &TurboQuantParams,
+    scale: f32,
+    mask: Option<&MlxArray>,
+    causal: bool,
+) -> UniquePtr<MlxArray> {
+    attention_turbo4_dequant_sdpa_impl(
+        q, k_packed, k_rescale, v_packed, v_rescale, params, scale, mask, causal, true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attention_turbo4_dequant_sdpa_impl(
+    q: &MlxArray,
+    k_packed: &MlxArray,
+    k_rescale: &MlxArray,
+    v_packed: &MlxArray,
+    v_rescale: &MlxArray,
+    params: &TurboQuantParams,
+    scale: f32,
+    mask: Option<&MlxArray>,
+    causal: bool,
+    native_f16_rotation: bool,
+) -> UniquePtr<MlxArray> {
     let k_rot = dequantize_turbo4_rotated_for_sdpa(k_packed, k_rescale, params);
     let v_rot = dequantize_turbo4_rotated_for_sdpa(v_packed, v_rescale, params);
-    attention_turbo4_rotated_sdpa(q, &k_rot, &v_rot, params, scale, mask, causal)
+    attention_turbo4_rotated_sdpa_impl(
+        q,
+        &k_rot,
+        &v_rot,
+        params,
+        scale,
+        mask,
+        causal,
+        native_f16_rotation,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1074,14 +1118,49 @@ pub(crate) fn attention_turbo4_rotated_sdpa(
     mask: Option<&MlxArray>,
     causal: bool,
 ) -> UniquePtr<MlxArray> {
-    let q_rot_f32 = super::quant::turbo4_k_rotate(q, params);
-    let q_rot = ffi::astype(&q_rot_f32, ffi::array_dtype(q));
+    attention_turbo4_rotated_sdpa_impl(q, k_rot, v_rot, params, scale, mask, causal, false)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attention_turbo4_rotated_sdpa_f16(
+    q: &MlxArray,
+    k_rot: &MlxArray,
+    v_rot: &MlxArray,
+    params: &TurboQuantParams,
+    scale: f32,
+    mask: Option<&MlxArray>,
+    causal: bool,
+) -> UniquePtr<MlxArray> {
+    attention_turbo4_rotated_sdpa_impl(q, k_rot, v_rot, params, scale, mask, causal, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attention_turbo4_rotated_sdpa_impl(
+    q: &MlxArray,
+    k_rot: &MlxArray,
+    v_rot: &MlxArray,
+    params: &TurboQuantParams,
+    scale: f32,
+    mask: Option<&MlxArray>,
+    causal: bool,
+    native_f16_rotation: bool,
+) -> UniquePtr<MlxArray> {
+    let q_rot = if native_f16_rotation {
+        super::quant::turbo4_k_rotate_f16(q, params)
+    } else {
+        let q_rot_f32 = super::quant::turbo4_k_rotate(q, params);
+        ffi::astype(&q_rot_f32, ffi::array_dtype(q))
+    };
     let rot_out = if causal {
         crate::causal_attention(&q_rot, k_rot, v_rot, scale, 0.0, 0)
     } else {
         crate::layers::attention(&q_rot, k_rot, v_rot, scale, mask, 0.0, 0)
     };
-    super::quant::turbo4_v_inverse_rotate(&rot_out, params)
+    if native_f16_rotation {
+        super::quant::turbo4_v_inverse_rotate_f16(&rot_out, params)
+    } else {
+        super::quant::turbo4_v_inverse_rotate(&rot_out, params)
+    }
 }
 
 /// Dequant-first SDPA path for `KVCacheMode::Turbo4Asym` (FP16-K + packed-V).

@@ -1193,6 +1193,55 @@ namespace {
     }
 }
 
+namespace {
+    static std::function<std::vector<array>(const std::vector<array>&)>&
+    get_compiled_sigmoid_gate_affine(int bits) {
+        static std::mutex& mu = *new std::mutex();
+        static std::unordered_map<
+            int,
+            std::function<std::vector<array>(const std::vector<array>&)>>& cache =
+            *new std::unordered_map<
+                int,
+                std::function<std::vector<array>(const std::vector<array>&)>>();
+
+        std::lock_guard<std::mutex> lock(mu);
+        auto it = cache.find(bits);
+        if (it != cache.end()) {
+            return it->second;
+        }
+        auto fn = [bits](const std::vector<array>& inputs) -> std::vector<array> {
+            auto gated = mlx::core::multiply(
+                mlx::core::sigmoid(inputs[0]), inputs[1]);
+            auto projected = mlx::core::quantized_matmul(
+                gated,
+                inputs[2],
+                inputs[3],
+                inputs[4],
+                true,
+                32,
+                bits);
+            return {projected};
+        };
+        auto [inserted, _] =
+            cache.emplace(bits, mlx::core::compile(fn, /*shapeless=*/true));
+        return inserted->second;
+    }
+}
+
+std::unique_ptr<MlxArray> compiled_sigmoid_gate_affine(
+    const MlxArray& gate,
+    const MlxArray& value,
+    const MlxArray& weight,
+    const MlxArray& scales,
+    const MlxArray& biases,
+    int32_t bits
+) {
+    auto& compiled_fn = get_compiled_sigmoid_gate_affine(bits);
+    auto result = compiled_fn(
+        {gate.inner, value.inner, weight.inner, scales.inner, biases.inner});
+    return std::make_unique<MlxArray>(std::move(result[0]));
+}
+
 // Compiled relu_squared: square(maximum(x, 0)) → single fused kernel
 // Python equivalent: CompiledBroadcastMaximumSquare
 namespace {
