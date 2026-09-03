@@ -24,7 +24,8 @@ const F16_PREFILL_MIN_ROWS: i32 = 128;
 const RELEASE_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 const QWEN38_MIXED_Q5_ENV: &str = "MLXCEL_EXPERIMENTAL_QWEN38_MIXED_Q5";
 
-fn qwen38_mixed_q5_enabled() -> bool {
+#[doc(hidden)]
+pub fn qwen38_mixed_q5_enabled() -> bool {
     static ENABLED: LazyLock<bool> = LazyLock::new(|| {
         matches!(
             std::env::var(QWEN38_MIXED_Q5_ENV).ok().as_deref(),
@@ -168,10 +169,55 @@ impl GgmlAffineMatrix {
         qtype: GgmlQType,
         in_features: usize,
         out_features: usize,
+        release_source: impl FnMut(Range<usize>),
+    ) -> Result<Self, GgmlAffineError> {
+        Self::from_ggml_bytes_with_progress_storage(
+            bytes,
+            qtype,
+            in_features,
+            out_features,
+            false,
+            release_source,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn from_ggml_bytes_with_progress_f16_sidecars(
+        bytes: &[u8],
+        qtype: GgmlQType,
+        in_features: usize,
+        out_features: usize,
+        release_source: impl FnMut(Range<usize>),
+    ) -> Result<Self, GgmlAffineError> {
+        Self::from_ggml_bytes_with_progress_storage(
+            bytes,
+            qtype,
+            in_features,
+            out_features,
+            true,
+            release_source,
+        )
+    }
+
+    fn from_ggml_bytes_with_progress_storage(
+        bytes: &[u8],
+        qtype: GgmlQType,
+        in_features: usize,
+        out_features: usize,
+        f16_sidecars: bool,
         mut release_source: impl FnMut(Range<usize>),
     ) -> Result<Self, GgmlAffineError> {
         let started = Instant::now();
         let bits = affine_bits(qtype).ok_or(GgmlAffineError::NotRepresentable(qtype))?;
+        if f16_sidecars
+            && (!matches!(qtype, GgmlQType::Q5K | GgmlQType::Iq3S)
+                || !qwen38_m23_shape(
+                    i32::try_from(in_features).map_err(|_| GgmlAffineError::Overflow)?,
+                    i32::try_from(out_features).map_err(|_| GgmlAffineError::Overflow)?,
+                ))
+        {
+            return Err(GgmlAffineError::InvalidInput);
+        }
         if in_features == 0
             || out_features == 0
             || !in_features.is_multiple_of(qtype.block_elements())
@@ -203,8 +249,9 @@ impl GgmlAffineMatrix {
         let group_values = groups_per_row
             .checked_mul(out_features)
             .ok_or(GgmlAffineError::Overflow)?;
+        let sidecar_item_bytes = if f16_sidecars { 2 } else { 4 };
         let sidecar_bytes = group_values
-            .checked_mul(4)
+            .checked_mul(sidecar_item_bytes)
             .ok_or(GgmlAffineError::Overflow)?;
         let f16_sidecar_bytes = group_values
             .checked_mul(2)
@@ -266,13 +313,63 @@ impl GgmlAffineMatrix {
         )?;
         crate::eval(weight_array.as_ref().ok_or(GgmlAffineError::InvalidPlane)?);
         drop(weight);
-        let scale_array = crate::from_slice_f32(&scales, &[rows, groups]);
-        validate_plane(&scale_array, dtype::FLOAT32, &[rows, groups], sidecar_bytes)?;
-        crate::eval(scale_array.as_ref().ok_or(GgmlAffineError::InvalidPlane)?);
+        let scale_array_f32 = crate::from_slice_f32(&scales, &[rows, groups]);
+        let scale_array = if f16_sidecars {
+            let array = crate::astype(
+                scale_array_f32
+                    .as_ref()
+                    .ok_or(GgmlAffineError::InvalidPlane)?,
+                dtype::FLOAT16,
+            );
+            crate::eval(array.as_ref().ok_or(GgmlAffineError::InvalidPlane)?);
+            array
+        } else {
+            crate::eval(
+                scale_array_f32
+                    .as_ref()
+                    .ok_or(GgmlAffineError::InvalidPlane)?,
+            );
+            scale_array_f32
+        };
+        validate_plane(
+            &scale_array,
+            if f16_sidecars {
+                dtype::FLOAT16
+            } else {
+                dtype::FLOAT32
+            },
+            &[rows, groups],
+            sidecar_bytes,
+        )?;
         drop(scales);
-        let bias_array = crate::from_slice_f32(&biases, &[rows, groups]);
-        validate_plane(&bias_array, dtype::FLOAT32, &[rows, groups], sidecar_bytes)?;
-        crate::eval(bias_array.as_ref().ok_or(GgmlAffineError::InvalidPlane)?);
+        let bias_array_f32 = crate::from_slice_f32(&biases, &[rows, groups]);
+        let bias_array = if f16_sidecars {
+            let array = crate::astype(
+                bias_array_f32
+                    .as_ref()
+                    .ok_or(GgmlAffineError::InvalidPlane)?,
+                dtype::FLOAT16,
+            );
+            crate::eval(array.as_ref().ok_or(GgmlAffineError::InvalidPlane)?);
+            array
+        } else {
+            crate::eval(
+                bias_array_f32
+                    .as_ref()
+                    .ok_or(GgmlAffineError::InvalidPlane)?,
+            );
+            bias_array_f32
+        };
+        validate_plane(
+            &bias_array,
+            if f16_sidecars {
+                dtype::FLOAT16
+            } else {
+                dtype::FLOAT32
+            },
+            &[rows, groups],
+            sidecar_bytes,
+        )?;
         drop(biases);
         let scale_array_f16 = crate::astype(
             scale_array
@@ -309,8 +406,16 @@ impl GgmlAffineMatrix {
                 .ok_or(GgmlAffineError::InvalidPlane)?,
         );
 
+        let f16_conversion_bytes = if f16_sidecars {
+            group_values
+                .checked_mul(8)
+                .ok_or(GgmlAffineError::Overflow)?
+        } else {
+            0
+        };
         let peak_active_bytes = resident_bytes
             .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(f16_conversion_bytes))
             .and_then(|bytes| bytes.checked_add(expected.min(RELEASE_CHUNK_BYTES)))
             .ok_or(GgmlAffineError::Overflow)?;
         let stats = GgmlAffineTranscodeStats {
@@ -335,7 +440,8 @@ impl GgmlAffineMatrix {
             in_features: i32::try_from(in_features).map_err(|_| GgmlAffineError::Overflow)?,
             out_features: rows,
             bits: bits as i32,
-            resident_row_bytes: packed_row_bytes + groups_per_row * 12,
+            resident_row_bytes:
+                packed_row_bytes + groups_per_row * (sidecar_item_bytes * 2 + 4),
             stats,
         })
     }
@@ -350,6 +456,16 @@ impl GgmlAffineMatrix {
 
     pub const fn transcode_stats(&self) -> GgmlAffineTranscodeStats {
         self.stats
+    }
+
+    #[doc(hidden)]
+    pub fn has_f16_sidecars(&self) -> bool {
+        crate::array_dtype(
+            self.planes
+                .scales
+                .as_ref()
+                .expect("validated affine scale plane"),
+        ) == dtype::FLOAT16
     }
 
     pub fn clone_shared(&self) -> Self {
@@ -383,6 +499,7 @@ impl GgmlAffineMatrix {
         let pinned = qwen38_m23_shape(self.in_features, self.out_features);
         if qwen38_mixed_q5_enabled()
             && self.bits == 5
+            && self.has_f16_sidecars()
             && matches!(input_rows, 1 | 3 | 4)
             && pinned
         {
@@ -414,6 +531,7 @@ impl GgmlAffineMatrix {
             || !matches!(input_rows, 1 | 3 | 4)
             || crate::array_dtype(input) != dtype::FLOAT32
             || !qwen38_m23_shape(self.in_features, self.out_features)
+            || use_mixed_precision != self.has_f16_sidecars()
         {
             return Err(GgmlAffineError::InvalidInput);
         }
@@ -508,6 +626,28 @@ impl GgmlAffineMatrix {
         } else {
             self.dispatch_stats(input_rows)
         }
+    }
+
+    #[doc(hidden)]
+    pub fn qwen38_q5_experiment_dispatch_stats(
+        &self,
+        input_rows: usize,
+    ) -> Result<GgmlDispatchStats, GgmlAffineError> {
+        if self.bits != 5
+            || !self.has_f16_sidecars()
+            || !matches!(input_rows, 1 | 3 | 4)
+            || !qwen38_m23_shape(self.in_features, self.out_features)
+        {
+            return Err(GgmlAffineError::InvalidInput);
+        }
+        affine_dispatch_stats_with(
+            input_rows,
+            self.in_features(),
+            self.out_features(),
+            self.resident_row_bytes,
+            1,
+            GgmlKernelPath::Qwen38AffineM23,
+        )
     }
 
     pub fn qwen38_m2_dispatch_stats(
@@ -705,7 +845,9 @@ impl Qwen38MixedQkvBundle {
             value_packed,
             value_code,
             input_rows,
-            qwen38_mixed_q5_enabled() && self.query.bits == 5,
+            qwen38_mixed_q5_enabled()
+                && self.query.bits == 5
+                && self.query.has_f16_sidecars(),
         )
         .map_err(|error| GgmlAffineError::Backend(error.what().to_owned()))?;
         let output = outputs.pin_mut();
@@ -786,6 +928,9 @@ impl Qwen38AffineMlpFusion {
         if rows != 33
             || crate::array_dtype(input) != dtype::FLOAT32
             || !crate::ffi::array_is_row_contiguous(input)
+            || self.gate.has_f16_sidecars()
+            || self.up.has_f16_sidecars()
+            || self.down.has_f16_sidecars()
         {
             let forward = |matrix: &GgmlAffineMatrix, input: &MlxArray, m23| {
                 if rows == 2 && self.m2_only {
@@ -957,6 +1102,10 @@ impl Qwen38AffineGdnIngressFusion {
         if !matches!(rows, 33 | 128)
             || crate::array_dtype(input) != dtype::FLOAT32
             || !crate::ffi::array_is_row_contiguous(input)
+            || self.qkv.has_f16_sidecars()
+            || self.z.has_f16_sidecars()
+            || self.beta.has_f16_sidecars()
+            || self.alpha.has_f16_sidecars()
         {
             let forward = |matrix: &GgmlAffineMatrix, m23| {
                 if m23 {

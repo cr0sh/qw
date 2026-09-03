@@ -337,21 +337,27 @@ void validate_affine_planes(
     const mlx::core::array& biases,
     int32_t bits,
     int32_t in_features,
-    int32_t out_features
+    int32_t out_features,
+    bool use_mixed_q5
 ) {
     using namespace mlx::core;
     const int64_t packed_width =
         static_cast<int64_t>(in_features) * bits / 32;
     const int64_t groups = in_features / 32;
+    const bool f16_sidecars =
+        scales.dtype() == float16 && biases.dtype() == float16;
+    const bool valid_sidecars =
+        (scales.dtype() == float32 && biases.dtype() == float32)
+        || (bits == 5 && f16_sidecars);
     if ((bits != 4 && bits != 5 && bits != 8)
             || in_features <= 0 || in_features % 512 != 0
             || out_features <= 0 || out_features % 8 != 0
             || packed_width > std::numeric_limits<int32_t>::max()
             || weight.dtype() != uint32
             || weight.shape() != Shape{out_features, static_cast<int32_t>(packed_width)}
-            || scales.dtype() != float32
+            || !valid_sidecars
+            || (use_mixed_q5 && !f16_sidecars)
             || scales.shape() != Shape{out_features, static_cast<int32_t>(groups)}
-            || biases.dtype() != float32
             || biases.shape() != Shape{out_features, static_cast<int32_t>(groups)}) {
         throw std::invalid_argument("pinned affine M2/M3 planes are invalid");
     }
@@ -398,7 +404,8 @@ std::unique_ptr<MlxArray> qwen38_affine_m23_matmul(
         biases.inner,
         bits,
         in_features,
-        out_features);
+        out_features,
+        mixed_q5);
 
     auto input = contiguous(reshape(x.inner, {input_rows, in_features}));
     const auto args = mixed_q5

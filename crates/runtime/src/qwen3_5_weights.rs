@@ -600,24 +600,38 @@ pub(crate) struct GgufWeightSource {
     affine_stats: RefCell<GgufAffineLoadStats>,
     enable_m23: bool,
     enable_fusion: bool,
+    mixed_q5_sidecars: bool,
 }
 
 impl GgufWeightSource {
     pub(crate) fn open() -> Result<Self> {
-        Self::open_with_features(true, true)
+        Self::open_with_features(true, true, mlxcel_core::qwen38_mixed_q5_enabled())
     }
 
     #[cfg(test)]
     pub(crate) fn open_without_m23() -> Result<Self> {
-        Self::open_with_features(false, true)
+        Self::open_with_features(false, true, false)
     }
 
     #[cfg(test)]
     pub(crate) fn open_without_fusion() -> Result<Self> {
-        Self::open_with_features(true, false)
+        Self::open_with_features(
+            true,
+            false,
+            mlxcel_core::qwen38_mixed_q5_enabled(),
+        )
     }
 
-    fn open_with_features(enable_m23: bool, enable_fusion: bool) -> Result<Self> {
+    #[cfg(test)]
+    pub(crate) fn open_without_mixed_q5_sidecars() -> Result<Self> {
+        Self::open_with_features(true, true, false)
+    }
+
+    fn open_with_features(
+        enable_m23: bool,
+        enable_fusion: bool,
+        mixed_q5_sidecars: bool,
+    ) -> Result<Self> {
         let pair = PinnedGgufPair::open()?;
         // PinnedGgufPair verifies both payload hashes and exact plans first.
         let target_map = map_file(&pair.target)?;
@@ -631,6 +645,7 @@ impl GgufWeightSource {
             affine_stats: RefCell::new(GgufAffineLoadStats::default()),
             enable_m23,
             enable_fusion,
+            mixed_q5_sidecars,
         })
     }
 
@@ -839,13 +854,26 @@ impl GgufWeightSource {
             self.record_q6(dual.transcode_stats());
             Qwen35Linear::Q6Dual(dual)
         } else if pinned_affine_qtype(tensor.tensor_type.id()) {
-            let affine = GgmlAffineMatrix::from_ggml_bytes_with_progress(
-                bytes,
-                qtype,
-                input,
-                output,
-                |range| self.discard_tensor_byte_range(slot, range),
-            )?;
+            let f16_sidecars = self.mixed_q5_sidecars
+                && m23_signature
+                    .is_some_and(|signature| matches!(signature.qtype, 13 | 21));
+            let affine = if f16_sidecars {
+                GgmlAffineMatrix::from_ggml_bytes_with_progress_f16_sidecars(
+                    bytes,
+                    qtype,
+                    input,
+                    output,
+                    |range| self.discard_tensor_byte_range(slot, range),
+                )
+            } else {
+                GgmlAffineMatrix::from_ggml_bytes_with_progress(
+                    bytes,
+                    qtype,
+                    input,
+                    output,
+                    |range| self.discard_tensor_byte_range(slot, range),
+                )
+            }?;
             self.record_affine(affine.transcode_stats());
             if self.enable_m23 && m23_signature.is_some() {
                 Qwen35Linear::PinnedM23Affine(affine)
@@ -888,13 +916,26 @@ impl GgufWeightSource {
         );
         let qtype = GgmlQType::try_from(expected_qtype)
             .context("pinned QKV affine qtype escaped allowlist")?;
-        let matrix = GgmlAffineMatrix::from_ggml_bytes_with_progress(
-            bytes,
-            qtype,
-            5120,
-            usize::try_from(expected_output)?,
-            |range| self.discard_tensor_byte_range(slot, range),
-        )?;
+        let f16_sidecars = self.mixed_q5_sidecars
+            && expected_qtype == 13
+            && expected_output == 12_288;
+        let matrix = if f16_sidecars {
+            GgmlAffineMatrix::from_ggml_bytes_with_progress_f16_sidecars(
+                bytes,
+                qtype,
+                5120,
+                usize::try_from(expected_output)?,
+                |range| self.discard_tensor_byte_range(slot, range),
+            )
+        } else {
+            GgmlAffineMatrix::from_ggml_bytes_with_progress(
+                bytes,
+                qtype,
+                5120,
+                usize::try_from(expected_output)?,
+                |range| self.discard_tensor_byte_range(slot, range),
+            )
+        }?;
         self.record_affine(matrix.transcode_stats());
         self.discard_tensor_pages(slot);
         Ok(matrix)
@@ -1274,27 +1315,28 @@ mod tests {
     }
 
     fn alternating_q5_medians(
-        matrix: &GgmlAffineMatrix,
+        old_matrix: &GgmlAffineMatrix,
+        mixed_matrix: &GgmlAffineMatrix,
         input: &MlxArray,
     ) -> (Duration, Duration) {
         for repetition in 0..5 {
             if repetition % 2 == 0 {
-                let _ = timed_q5_projection(matrix, input, false);
-                let _ = timed_q5_projection(matrix, input, true);
+                let _ = timed_q5_projection(old_matrix, input, false);
+                let _ = timed_q5_projection(mixed_matrix, input, true);
             } else {
-                let _ = timed_q5_projection(matrix, input, true);
-                let _ = timed_q5_projection(matrix, input, false);
+                let _ = timed_q5_projection(mixed_matrix, input, true);
+                let _ = timed_q5_projection(old_matrix, input, false);
             }
         }
         let mut old = Vec::with_capacity(15);
         let mut mixed = Vec::with_capacity(15);
         for repetition in 0..15 {
             if repetition % 2 == 0 {
-                old.push(timed_q5_projection(matrix, input, false));
-                mixed.push(timed_q5_projection(matrix, input, true));
+                old.push(timed_q5_projection(old_matrix, input, false));
+                mixed.push(timed_q5_projection(mixed_matrix, input, true));
             } else {
-                mixed.push(timed_q5_projection(matrix, input, true));
-                old.push(timed_q5_projection(matrix, input, false));
+                mixed.push(timed_q5_projection(mixed_matrix, input, true));
+                old.push(timed_q5_projection(old_matrix, input, false));
             }
         }
         old.sort_unstable();
@@ -1774,7 +1816,8 @@ mod tests {
         if !mlxcel_core::metal_is_available() {
             return;
         }
-        let weights = GgufWeightSource::open().expect("open pinned GGUF pair");
+        let weights =
+            GgufWeightSource::open_without_mixed_q5_sidecars().expect("open pinned GGUF pair");
         let representatives = [
             TensorSlot::Layer {
                 role: ModelRole::Target,
@@ -1915,9 +1958,17 @@ mod tests {
             1
         );
 
-        let weights = GgufWeightSource::open().expect("open pinned GGUF pair");
+        assert!(
+            mlxcel_core::qwen38_mixed_q5_enabled(),
+            "set MLXCEL_EXPERIMENTAL_QWEN38_MIXED_Q5=1 for resident F16 sidecars",
+        );
+        let weights = GgufWeightSource::open().expect("open mixed pinned GGUF pair");
+        let old_weights = GgufWeightSource::open_without_mixed_q5_sidecars()
+            .expect("open old-FP32 pinned GGUF pair");
         let mut timed_shapes = BTreeSet::new();
         let mut diagnostics = BTreeMap::<(u32, [u64; 2]), OldFp32Diagnostics>::new();
+        let mut total_old_resident = 0usize;
+        let mut total_mixed_resident = 0usize;
         for (slot, signature) in signatures {
             let linear = weights
                 .load_linear(
@@ -1929,9 +1980,32 @@ mod tests {
             let Qwen35Linear::PinnedM23Affine(matrix) = linear else {
                 panic!("slot {} did not receive pinned affine storage", signature.target_slot);
             };
+            let old_linear = old_weights
+                .load_linear(
+                    slot,
+                    PinnedSlot::Target(signature.target_slot),
+                    "old FP32 Q5 diagnostic",
+                )
+                .expect("load old-FP32 pinned Q5 descriptor");
+            let Qwen35Linear::PinnedM23Affine(old_matrix) = old_linear else {
+                panic!(
+                    "old slot {} did not receive pinned affine storage",
+                    signature.target_slot
+                );
+            };
             let width = matrix.in_features();
             let output_width = matrix.out_features();
             let resident_before = matrix.transcode_stats();
+            let old_resident_before = old_matrix.transcode_stats();
+            let weight_count = width
+                .checked_mul(output_width)
+                .expect("pinned Q5 weight count");
+            assert!(matrix.has_f16_sidecars());
+            assert!(!old_matrix.has_f16_sidecars());
+            assert_eq!(resident_before.resident_bytes, weight_count * 3 / 4);
+            assert_eq!(old_resident_before.resident_bytes, weight_count * 7 / 8);
+            total_old_resident += old_resident_before.resident_bytes;
+            total_mixed_resident += resident_before.resident_bytes;
             let values = (0..4 * width)
                 .map(|index| {
                     let row = index / width;
@@ -1951,7 +2025,7 @@ mod tests {
             let mixed_m4 = matrix
                 .forward_qwen38_q5_experiment(input_m4.as_ref().unwrap(), true)
                 .expect("mixed M4");
-            let old_m4 = matrix
+            let old_m4 = old_matrix
                 .forward_qwen38_q5_experiment(input_m4.as_ref().unwrap(), false)
                 .expect("old FP32 M4 diagnostic");
             for output in [&mixed_m3, &mixed_m3_repeat, &mixed_m4, &old_m4] {
@@ -2032,10 +2106,22 @@ mod tests {
                         mlxcel_core::from_slice_f32(&values, &[1, 4, width as i32]),
                     ),
                 ] {
-                    let (old, mixed) =
-                        alternating_q5_medians(&matrix, input.as_ref().unwrap());
+                    let (old, mixed) = alternating_q5_medians(
+                        &old_matrix,
+                        &matrix,
+                        input.as_ref().unwrap(),
+                    );
+                    let old_traffic = if rows == 3 {
+                        old_matrix.qwen38_m23_dispatch_stats(rows)
+                    } else {
+                        old_matrix.dispatch_stats(rows)
+                    }
+                    .expect("old Q5 traffic");
+                    let mixed_traffic = matrix
+                        .qwen38_q5_experiment_dispatch_stats(rows)
+                        .expect("mixed Q5 traffic");
                     println!(
-                        "QWEN38_MIXED_Q5_TIMING qtype={} shape={}x{} M={} warmups=5 samples=15 old_median_us={} mixed_median_us={} speedup={:.4}",
+                        "QWEN38_MIXED_Q5_TIMING qtype={} shape={}x{} M={} warmups=5 samples=15 old_median_us={} mixed_median_us={} speedup={:.4} old_resident_bytes={} mixed_resident_bytes={} old_traffic_bytes={} mixed_traffic_bytes={}",
                         signature.qtype,
                         width,
                         output_width,
@@ -2043,6 +2129,10 @@ mod tests {
                         old.as_micros(),
                         mixed.as_micros(),
                         old.as_secs_f64() / mixed.as_secs_f64(),
+                        old_resident_before.resident_bytes,
+                        resident_before.resident_bytes,
+                        old_traffic.packed_bytes_read,
+                        mixed_traffic.packed_bytes_read,
                     );
                 }
             }
@@ -2052,9 +2142,24 @@ mod tests {
                 "slot {} changed resident affine storage during dispatch",
                 signature.target_slot,
             );
-            drop(matrix);
+            assert_eq!(
+                old_matrix.transcode_stats(),
+                old_resident_before,
+                "slot {} changed old resident affine storage during dispatch",
+                signature.target_slot,
+            );
+            drop((matrix, old_matrix));
             mlxcel_core::memory::clear_cache();
         }
+
+        println!(
+            "QWEN38_MIXED_Q5_RESIDENCY descriptors=180 old_bytes={} mixed_bytes={} saved_bytes={} bytes_per_weight_old=0.875 bytes_per_weight_mixed=0.75 reduction_percent={:.4}",
+            total_old_resident,
+            total_mixed_resident,
+            total_old_resident - total_mixed_resident,
+            100.0 * (total_old_resident - total_mixed_resident) as f64
+                / total_old_resident as f64,
+        );
 
         for ((qtype, dimensions), diagnostic) in diagnostics {
             let rmse = (diagnostic.squared_error / diagnostic.elements as f64).sqrt();

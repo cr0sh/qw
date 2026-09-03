@@ -3388,7 +3388,7 @@ pub use ggml_affine::{
     GgmlAffineEmbedding, GgmlAffineError, GgmlAffineMatrix, GgmlAffineRows,
     GgmlAffineTranscodeStats, Qwen38AffineGdnIngressFusion, Qwen38AffineMlpFusion,
     Qwen38FusionStats, Qwen38GdnIngressOutput, Qwen38MixedQkvBundle, Qwen38MixedQkvOutput,
-    Qwen38QkvMatrix,
+    Qwen38QkvMatrix, qwen38_mixed_q5_enabled,
 };
 pub use qwen38_q6::{Qwen38Q6DualMatrix, Qwen38Q6Error, Qwen38Q6Shape, Qwen38Q6TranscodeStats};
 

@@ -356,12 +356,12 @@ METAL_FUNC void qwen38_qkv_mixed_q5_pack(
         x, row_stride, 7, static_cast<half>(scale * static_cast<float>(code) + bias), accum);
 }
 
-template <int MRows>
+template <int MRows, typename Sidecar>
 METAL_FUNC void qwen38_qkv_mixed_q5_project(
     const device float* x,
     const device uint32_t* weight,
-    const device float* scales,
-    const device float* biases,
+    const device Sidecar* scales,
+    const device Sidecar* biases,
     device float* out,
     int width,
     int output_rows,
@@ -1002,15 +1002,21 @@ void validate_plane(
     const array& biases,
     int bits,
     int k,
-    int n) {
+    int n,
+    bool allow_f16 = false) {
     int packed = k * bits / 32;
     int groups = k / 32;
+    const bool valid_sidecars =
+        (scales.dtype() == mlx::core::float32
+         && biases.dtype() == mlx::core::float32)
+        || (allow_f16 && bits == 5
+            && scales.dtype() == mlx::core::float16
+            && biases.dtype() == mlx::core::float16);
     if ((bits != 4 && bits != 5 && bits != 8)
             || weight.dtype() != mlx::core::uint32
             || weight.shape() != Shape{n, packed}
-            || scales.dtype() != mlx::core::float32
+            || !valid_sidecars
             || scales.shape() != Shape{n, groups}
-            || biases.dtype() != mlx::core::float32
             || biases.shape() != Shape{n, groups}) {
         throw std::invalid_argument("pinned Qwen3.8 affine fusion plane is invalid");
     }
@@ -1074,7 +1080,7 @@ std::unique_ptr<Qwen38GgmlQkvOutputs> qwen38_mixed_qkv_bundle(
             "pinned Qwen3.8 mixed QKV experiment requires a Q5 query");
     }
     validate_plane(q_w.inner, q_s.inner, q_b.inner,
-                   q_bits, width, query_rows);
+                   q_bits, width, query_rows, mixed_q5);
     auto validate_projection = [](const array& weight, const array& scales,
                                   const array& biases, const array& packed,
                                   int32_t code) {
