@@ -1231,36 +1231,62 @@ fn turbo4_fused_attention_honors_causal_tail_and_ragged_long_blocks() {
 }
 
 #[test]
-fn turbo4_fused_attention_fallback_updates_once() {
-    const CHILD_ENV: &str = "MLXCEL_TURBO4_FALLBACK_TEST_CHILD";
-    if std::env::var_os(CHILD_ENV).is_none() {
-        let status = std::process::Command::new(
-            std::env::current_exe().expect("resolve current test executable"),
-        )
-        .arg("turbo4_fused_attention_fallback_updates_once")
-        .arg("--nocapture")
-        .env(CHILD_ENV, "1")
-        .env(
-            super::turbo::fused_attention::TURBO4_FUSED_ATTENTION_ENV_VAR,
-            "0",
-        )
-        .status()
-        .expect("run kill-switch fallback child");
-        assert!(status.success(), "kill-switch fallback child failed");
+fn turbo4_causal_mtp_dispatch_matches_exact_dequant_oracle() {
+    if !crate::metal_is_available() {
         return;
     }
 
-    let mut cache = KVCache::new_with_mode(KVCacheMode::Turbo4);
-    let q = ffi::astype(&synth_kv_tensor(1, 6, 3, 64, 0xFA11_BACC), dtype::FLOAT16);
-    let output = cache.update_and_turbo4_causal_attention(
-        &q,
-        ffi::astype(&synth_kv_tensor(1, 2, 3, 64, 0xFA11_BACD), dtype::FLOAT16),
-        ffi::astype(&synth_kv_tensor(1, 2, 3, 64, 0xFA11_BACE), dtype::FLOAT16),
-        1.0 / 8.0,
+    let mut dispatched = KVCache::new_with_mode(KVCacheMode::Turbo4);
+    let mut oracle = KVCache::new_with_mode(KVCacheMode::Turbo4);
+    let prefix_len = 2_050;
+    let head_dim = 64;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let prefix_k = ffi::astype(
+        &synth_kv_tensor(1, 2, prefix_len, head_dim, 0xFA11_BA01),
+        dtype::FLOAT16,
     );
-    ffi::eval(&output);
-    assert_eq!(cache.offset, 3, "fallback must append exactly once");
-    assert_eq!(ffi::array_shape(&output), [1, 6, 3, 64]);
+    let prefix_v = ffi::astype(
+        &synth_kv_tensor(1, 2, prefix_len, head_dim, 0xFA11_BA02),
+        dtype::FLOAT16,
+    );
+    dispatched.update(ffi::copy(&prefix_k), ffi::copy(&prefix_v));
+    oracle.update(prefix_k, prefix_v);
+
+    let q = ffi::astype(
+        &synth_kv_tensor(1, 6, 3, head_dim, 0xFA11_BACC),
+        dtype::FLOAT16,
+    );
+    let next_k = ffi::astype(
+        &synth_kv_tensor(1, 2, 3, head_dim, 0xFA11_BACD),
+        dtype::FLOAT16,
+    );
+    let next_v = ffi::astype(
+        &synth_kv_tensor(1, 2, 3, head_dim, 0xFA11_BACE),
+        dtype::FLOAT16,
+    );
+    let actual = dispatched.update_and_turbo4_causal_attention(
+        &q,
+        ffi::copy(&next_k),
+        ffi::copy(&next_v),
+        scale,
+    );
+    oracle.update(next_k, next_v);
+    let expected =
+        oracle.turbo4_dequant_sdpa_prefix(&q, oracle.offset, scale, None, true);
+    ffi::eval(&actual);
+    ffi::eval(&expected);
+
+    assert_eq!(dispatched.offset, prefix_len + 3);
+    assert_eq!(dispatched.offset, oracle.offset);
+    assert_eq!(ffi::array_shape(&actual), [1, 6, 3, head_dim]);
+    // A real 64k Qwen3.5 decode flipped a 0.039476395 logit margin when the
+    // approximate kernel changed the two leading logits by 4,714 and 93,760
+    // ULP. Speculative verification therefore requires the exact path.
+    assert_eq!(
+        ffi::array_to_raw_bytes(&actual),
+        ffi::array_to_raw_bytes(&expected),
+        "MTP causal dispatch must be bit-identical to exact dequant SDPA"
+    );
 }
 
 #[test]

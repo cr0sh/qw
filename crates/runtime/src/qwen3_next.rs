@@ -278,9 +278,9 @@ impl Qwen3NextAttention {
 
         let captured_query = capture_query.then(|| mlxcel_core::share(&queries));
 
-        // Symmetric Turbo4 reads packed K/V directly only for the specialized
-        // long-context MTP verify envelope. Other multi-token calls retain
-        // bottom-right causal metadata and use the exact dequant-SDPA fallback.
+        // Symmetric Turbo4 MTP verification retains bottom-right causal
+        // metadata and uses exact dequant-SDPA so corresponding rows preserve
+        // sequential-decode arithmetic.
         let attn_out = if cache.mode == KVCacheMode::Turbo4 {
             if l > 1 && mask.is_none() {
                 cache.update_and_turbo4_causal_attention(&queries, keys, values, self.scale)
