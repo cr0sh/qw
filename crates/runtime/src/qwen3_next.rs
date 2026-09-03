@@ -119,45 +119,26 @@ impl Qwen3NextCache {
 const QWEN38_HIGH_M_FP16_ATTENTION_ENV: &str = "QWR_EXPERIMENT_LONG_ATTN_F16";
 const QWEN38_HIGH_M_FP16_ATTENTION_MIN_ROWS: i32 = 128;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Qwen38AttentionPrecision {
-    F32,
-    PostRopeF16,
-    FullF16,
+fn qwen38_high_m_fp16_attention_requested() -> bool {
+    std::env::var(QWEN38_HIGH_M_FP16_ATTENTION_ENV).is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        )
+    })
 }
 
-fn qwen38_attention_precision_requested() -> Qwen38AttentionPrecision {
-    match std::env::var(QWEN38_HIGH_M_FP16_ATTENTION_ENV)
-        .ok()
-        .as_deref()
-        .map(str::trim)
-        .map(str::to_ascii_lowercase)
-        .as_deref()
-    {
-        Some("1" | "true" | "on" | "yes" | "post-rope") => {
-            Qwen38AttentionPrecision::PostRopeF16
-        }
-        Some("full" | "full-chain") => Qwen38AttentionPrecision::FullF16,
-        _ => Qwen38AttentionPrecision::F32,
-    }
-}
-
-fn qwen38_attention_precision(
+fn use_qwen38_high_m_fp16_attention(
     pinned_qwen38_target: bool,
-    requested: Qwen38AttentionPrecision,
+    enabled: bool,
     batch_size: i32,
     sequence_length: i32,
-) -> Qwen38AttentionPrecision {
-    if pinned_qwen38_target
-        && requested != Qwen38AttentionPrecision::F32
+) -> bool {
+    pinned_qwen38_target
+        && enabled
         && batch_size
             .checked_mul(sequence_length)
             .is_some_and(|rows| rows >= QWEN38_HIGH_M_FP16_ATTENTION_MIN_ROWS)
-    {
-        requested
-    } else {
-        Qwen38AttentionPrecision::F32
-    }
 }
 
 #[cfg(test)]
@@ -252,7 +233,7 @@ pub(crate) struct Qwen3NextAttention {
     rope_base: f32,
     mrope: InterleavedMRoPE,
     pinned_qwen38_target: bool,
-    attention_precision: Qwen38AttentionPrecision,
+    high_m_fp16_attention: bool,
 }
 
 
@@ -401,9 +382,12 @@ impl Qwen3NextAttention {
         }
 
         let captured_query = capture_query.then(|| mlxcel_core::share(&queries));
-        let attention_precision =
-            qwen38_attention_precision(self.pinned_qwen38_target, self.attention_precision, b, l);
-        let use_fp16_attention = attention_precision != Qwen38AttentionPrecision::F32;
+        let use_fp16_attention = use_qwen38_high_m_fp16_attention(
+            self.pinned_qwen38_target,
+            self.high_m_fp16_attention,
+            b,
+            l,
+        );
         if use_fp16_attention {
             queries = mlxcel_core::astype(&queries, mlxcel_core::dtype::FLOAT16);
             keys = mlxcel_core::astype(&keys, mlxcel_core::dtype::FLOAT16);
@@ -560,17 +544,13 @@ impl Qwen3NextAttention {
                 config.mrope_section.clone(),
             ),
             pinned_qwen38_target: weights.is_pinned_qwen38_gguf() && role == ModelRole::Target,
-            attention_precision: qwen38_attention_precision_requested(),
+            high_m_fp16_attention: qwen38_high_m_fp16_attention_requested(),
         })
     }
 
     #[cfg(test)]
     pub(crate) fn set_high_m_fp16_attention_for_test(&mut self, enabled: bool) {
-        self.attention_precision = if enabled {
-            Qwen38AttentionPrecision::PostRopeF16
-        } else {
-            Qwen38AttentionPrecision::F32
-        };
+        self.high_m_fp16_attention = enabled;
     }
 }
 
@@ -804,42 +784,22 @@ mod tests {
     #[test]
     fn qwen38_fp16_attention_gate_is_pinned_and_high_m_only() {
         for rows in [1, 3, 4, 127] {
-            assert_eq!(
-                qwen38_attention_precision(
-                    true,
-                    Qwen38AttentionPrecision::FullF16,
-                    1,
-                    rows,
-                ),
-                Qwen38AttentionPrecision::F32
-            );
+            assert!(!use_qwen38_high_m_fp16_attention(
+                true, true, 1, rows
+            ));
         }
-        for requested in [
-            Qwen38AttentionPrecision::PostRopeF16,
-            Qwen38AttentionPrecision::FullF16,
-        ] {
-            assert_eq!(
-                qwen38_attention_precision(true, requested, 1, 128),
-                requested
-            );
-            assert_eq!(
-                qwen38_attention_precision(true, requested, 1, 288),
-                requested
-            );
-            assert_eq!(
-                qwen38_attention_precision(false, requested, 1, 288),
-                Qwen38AttentionPrecision::F32
-            );
-        }
-        assert_eq!(
-            qwen38_attention_precision(
-                true,
-                Qwen38AttentionPrecision::F32,
-                1,
-                288,
-            ),
-            Qwen38AttentionPrecision::F32
-        );
+        assert!(use_qwen38_high_m_fp16_attention(
+            true, true, 1, 128
+        ));
+        assert!(use_qwen38_high_m_fp16_attention(
+            true, true, 1, 288
+        ));
+        assert!(!use_qwen38_high_m_fp16_attention(
+            false, true, 1, 288
+        ));
+        assert!(!use_qwen38_high_m_fp16_attention(
+            true, false, 1, 288
+        ));
     }
 
     #[test]
