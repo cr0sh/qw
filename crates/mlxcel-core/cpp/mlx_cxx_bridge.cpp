@@ -1216,11 +1216,10 @@ namespace {
                 gated,
                 inputs[2],
                 inputs[3],
-                std::optional<array>(inputs[4]),
+                inputs[4],
                 true,
-                std::optional<int>(64),
-                std::optional<int>(bits),
-                "affine");
+                32,
+                bits);
             return {projected};
         };
         auto [inserted, _] =
