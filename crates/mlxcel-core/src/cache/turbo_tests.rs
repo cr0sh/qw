@@ -1230,63 +1230,135 @@ fn turbo4_fused_attention_honors_causal_tail_and_ragged_long_blocks() {
     assert_turbo4_fused_parity(3, 65_537, true, 0xCA55_A1A5);
 }
 
-#[test]
-fn turbo4_causal_mtp_dispatch_matches_exact_dequant_oracle() {
+fn logical_turbo4_bytes(cache: &KVCache) -> Vec<Vec<u8>> {
+    [
+        cache.k_packed.as_deref().expect("packed K"),
+        cache.k_rescale.as_deref().expect("K sidecar"),
+        cache.v_packed.as_deref().expect("packed V"),
+        cache.v_norms.as_deref().expect("V norms"),
+        cache.v_rescale.as_deref().expect("V sidecar"),
+    ]
+    .into_iter()
+    .map(|array| {
+        let shape = ffi::array_shape(array);
+        let logical = ffi::slice(
+            array,
+            &[0, 0, 0, 0],
+            &[shape[0], shape[1], cache.offset, shape[3]],
+        );
+        ffi::eval(&logical);
+        ffi::array_to_raw_bytes(&logical)
+    })
+    .collect()
+}
+
+fn assert_turbo4_packed_rows_match_sequential_m1(query_len: i32, seed: u32) {
     if !crate::metal_is_available() {
         return;
     }
 
-    let mut dispatched = KVCache::new_with_mode(KVCacheMode::Turbo4);
-    let mut oracle = KVCache::new_with_mode(KVCacheMode::Turbo4);
-    let prefix_len = 2_050;
-    let head_dim = 64;
-    let scale = 1.0 / (head_dim as f32).sqrt();
+    const PREFIX_LEN: i32 = 2_303;
+    const HEAD_DIM: i32 = 64;
+    let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+    let mut batched = KVCache::new_with_mode(KVCacheMode::Turbo4);
+    let mut sequential = KVCache::new_with_mode(KVCacheMode::Turbo4);
     let prefix_k = ffi::astype(
-        &synth_kv_tensor(1, 2, prefix_len, head_dim, 0xFA11_BA01),
+        &synth_kv_tensor(1, 2, PREFIX_LEN, HEAD_DIM, seed),
         dtype::FLOAT16,
     );
     let prefix_v = ffi::astype(
-        &synth_kv_tensor(1, 2, prefix_len, head_dim, 0xFA11_BA02),
+        &synth_kv_tensor(1, 2, PREFIX_LEN, HEAD_DIM, seed.wrapping_add(1)),
         dtype::FLOAT16,
     );
-    dispatched.update(ffi::copy(&prefix_k), ffi::copy(&prefix_v));
-    oracle.update(prefix_k, prefix_v);
+    batched.update(ffi::copy(&prefix_k), ffi::copy(&prefix_v));
+    sequential.update(prefix_k, prefix_v);
 
     let q = ffi::astype(
-        &synth_kv_tensor(1, 6, 3, head_dim, 0xFA11_BACC),
+        &synth_kv_tensor(1, 6, query_len, HEAD_DIM, seed.wrapping_add(2)),
         dtype::FLOAT16,
     );
     let next_k = ffi::astype(
-        &synth_kv_tensor(1, 2, 3, head_dim, 0xFA11_BACD),
+        &synth_kv_tensor(1, 2, query_len, HEAD_DIM, seed.wrapping_add(3)),
         dtype::FLOAT16,
     );
     let next_v = ffi::astype(
-        &synth_kv_tensor(1, 2, 3, head_dim, 0xFA11_BACE),
+        &synth_kv_tensor(1, 2, query_len, HEAD_DIM, seed.wrapping_add(4)),
         dtype::FLOAT16,
     );
-    let actual = dispatched.update_and_turbo4_causal_attention(
+    let actual = batched.update_and_turbo4_causal_attention(
         &q,
         ffi::copy(&next_k),
         ffi::copy(&next_v),
         scale,
     );
-    oracle.update(next_k, next_v);
-    let expected =
-        oracle.turbo4_dequant_sdpa_prefix(&q, oracle.offset, scale, None, true);
-    ffi::eval(&actual);
-    ffi::eval(&expected);
 
-    assert_eq!(dispatched.offset, prefix_len + 3);
-    assert_eq!(dispatched.offset, oracle.offset);
-    assert_eq!(ffi::array_shape(&actual), [1, 6, 3, head_dim]);
-    // A real 64k Qwen3.5 decode flipped a 0.039476395 logit margin when the
-    // approximate kernel changed the two leading logits by 4,714 and 93,760
-    // ULP. Speculative verification therefore requires the exact path.
-    assert_eq!(
-        ffi::array_to_raw_bytes(&actual),
-        ffi::array_to_raw_bytes(&expected),
-        "MTP causal dispatch must be bit-identical to exact dequant SDPA"
+    let q_shape = ffi::array_shape(&q);
+    let k_shape = ffi::array_shape(&next_k);
+    let v_shape = ffi::array_shape(&next_v);
+    let mut expected_rows = Vec::with_capacity(query_len as usize);
+    for row in 0..query_len {
+        let q_row = ffi::slice(
+            &q,
+            &[0, 0, row, 0],
+            &[q_shape[0], q_shape[1], row + 1, q_shape[3]],
+        );
+        let k_row = ffi::slice(
+            &next_k,
+            &[0, 0, row, 0],
+            &[k_shape[0], k_shape[1], row + 1, k_shape[3]],
+        );
+        let v_row = ffi::slice(
+            &next_v,
+            &[0, 0, row, 0],
+            &[v_shape[0], v_shape[1], row + 1, v_shape[3]],
+        );
+        expected_rows.push(sequential.update_and_turbo4_attention(
+            &q_row,
+            k_row,
+            v_row,
+            scale,
+            None,
+        ));
+    }
+    let pointers = expected_rows
+        .iter()
+        .map(|row| &**row as *const ffi::MlxArray)
+        .collect::<Vec<_>>();
+    // SAFETY: `expected_rows` owns every pointee through concatenation.
+    let expected = unsafe { ffi::concatenate(&pointers, 2) };
+    let actual = flatten_fp32(&actual);
+    let expected = flatten_fp32(&expected);
+    let max_ulp = actual
+        .iter()
+        .zip(&expected)
+        .map(|(&actual, &expected)| {
+            let ordered = |value: f32| {
+                let bits = value.to_bits() as i32;
+                if bits < 0 { i32::MIN - bits } else { bits }
+            };
+            ordered(actual).abs_diff(ordered(expected))
+        })
+        .max()
+        .unwrap_or(0);
+    assert!(
+        max_ulp <= 1,
+        "packed M{query_len} differs from corresponding M1 rows by {max_ulp} ULP"
     );
+    assert_eq!(batched.offset, PREFIX_LEN + query_len);
+    assert_eq!(batched.offset, sequential.offset);
+    assert_eq!(
+        logical_turbo4_bytes(&batched),
+        logical_turbo4_bytes(&sequential),
+        "batched page-boundary packing differs from sequential M1"
+    );
+}
+
+#[test]
+fn turbo4_packed_m3_m4_match_sequential_m1_across_page_boundary() {
+    // The 2,303-token ragged prefix crosses the 2,304-token cache page boundary
+    // on the first accepted row.
+    assert_turbo4_packed_rows_match_sequential_m1(3, 0xFA11_BA03);
+    assert_turbo4_packed_rows_match_sequential_m1(4, 0xFA11_BA04);
 }
 
 #[test]
