@@ -4283,69 +4283,6 @@ mod tests {
         }
     }
 
-    #[test]
-    #[ignore = "requires the complete pinned Qwen3.8 27B GGUF pair and Metal"]
-    fn experimental_qwen38_fp16_attention_whole_model_quality() {
-        const ROWS: usize = 128;
-
-        fn capture(
-            attention: &mut Qwen3NextAttention,
-            input: &MlxArray,
-            full_f16: bool,
-        ) -> Vec<f32> {
-            attention.set_full_f16_attention_for_test(full_f16);
-            let mut cache = KVCache::new_with_mode(KVCacheMode::Turbo4);
-            let output = attention.forward_verify(input, &mut cache, None, None);
-            let shape = mlxcel_core::array_shape(&output);
-            let last = mlxcel_core::slice(
-                &output,
-                &[0, ROWS as i32 - 1, 0],
-                &[1, ROWS as i32, shape[2]],
-            );
-            let last = mlxcel_core::astype(&last, mlxcel_core::dtype::FLOAT32);
-            mlxcel_core::eval(&last);
-            mlxcel_core::array_to_raw_bytes(&last)
-                .chunks_exact(4)
-                .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
-                .collect()
-        }
-
-        unsafe { std::env::remove_var("QWR_EXPERIMENT_LONG_ATTN_F16") };
-        let weights = GgufWeightSource::open().expect("open pinned Qwen3.8 GGUF");
-        let config = weights.config().expect("load pinned config");
-        let layer = (0..config.num_hidden_layers)
-            .find(|&layer| !config.is_linear_layer(layer))
-            .expect("pinned target has a full-attention layer");
-        let mut attention = Qwen3NextAttention::from_weights(
-            &weights,
-            &config.to_qwen3next_config(),
-            ModelRole::Target,
-            layer,
-        )
-        .expect("load representative target attention");
-        let values = (0..ROWS * config.hidden_size)
-            .map(|index| {
-                let row = index / config.hidden_size;
-                let column = index % config.hidden_size;
-                (column as i32 % 257 - 128) as f32 * 0.000_976_562_5
-                    + row as f32 * 0.000_000_953_674_3
-            })
-            .collect::<Vec<_>>();
-        let input =
-            mlxcel_core::from_slice_f32(&values, &[1, ROWS as i32, config.hidden_size as i32]);
-        let reference = capture(&mut attention, &input, false);
-        let candidate = capture(&mut attention, &input, true);
-        let result = crate::qwen3_next::diagnose_f32(&reference, &candidate);
-        eprintln!(
-            "QWEN38_FP16_ATTN_FOCUSED_QUALITY layer={layer} M={ROWS} finite=true max_abs={:.9e} rmse={:.9e} cosine={:.12} kl={:.9e} top1_equal={} top10_overlap={}/10",
-            result.max_abs,
-            result.rmse,
-            result.cosine,
-            result.kl,
-            result.top1_equal,
-            result.top10_overlap,
-        );
-    }
 
     #[test]
     #[ignore = "requires the complete pinned Qwen3.8 27B GGUF pair"]

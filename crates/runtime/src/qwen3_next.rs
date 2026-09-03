@@ -662,17 +662,9 @@ impl Qwen3NextAttention {
             attention_precision: qwen38_attention_precision_requested(),
         })
     }
-
-
-    #[cfg(test)]
-    pub(crate) fn set_full_f16_attention_for_test(&mut self, enabled: bool) {
-        self.attention_precision = if enabled {
-            Qwen38AttentionPrecision::FullF16
-        } else {
-            Qwen38AttentionPrecision::F32
-        };
-    }
 }
+
+
 
 // Dense MLP.
 enum MlpInputProjections {
