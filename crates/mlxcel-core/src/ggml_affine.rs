@@ -19,6 +19,7 @@ use crate::ggml::{GgmlDispatchStats, GgmlKernelPath, GgmlQType, GgmlQuantError};
 use crate::{MlxArray, Qwen38Q6DualMatrix, dtype};
 
 const GROUP_SIZE: usize = 32;
+const F16_PREFILL_MIN_ROWS: i32 = 128;
 const RELEASE_CHUNK_BYTES: usize = 8 * 1024 * 1024;
 const IQ4_VALUES: [i16; 16] = [
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
@@ -60,6 +61,10 @@ struct AffinePlanes {
     weight: UniquePtr<MlxArray>,
     scales: UniquePtr<MlxArray>,
     biases: UniquePtr<MlxArray>,
+    // Evaluated load-time mirrors amortize sidecar casts in high-M matmuls.
+    // The FP32 planes remain authoritative for low-M arithmetic.
+    scales_f16: UniquePtr<MlxArray>,
+    biases_f16: UniquePtr<MlxArray>,
     rows: i32,
     packed_width: i32,
     groups: i32,
@@ -71,6 +76,16 @@ impl AffinePlanes {
             weight: crate::copy(self.weight.as_ref().expect("affine weight plane")),
             scales: crate::copy(self.scales.as_ref().expect("affine scale plane")),
             biases: crate::copy(self.biases.as_ref().expect("affine bias plane")),
+            scales_f16: crate::copy(
+                self.scales_f16
+                    .as_ref()
+                    .expect("affine FP16 scale plane"),
+            ),
+            biases_f16: crate::copy(
+                self.biases_f16
+                    .as_ref()
+                    .expect("affine FP16 bias plane"),
+            ),
             rows: self.rows,
             packed_width: self.packed_width,
             groups: self.groups,
@@ -93,6 +108,20 @@ impl AffinePlanes {
             ),
             biases: crate::slice(
                 self.biases.as_ref().ok_or(GgmlAffineError::InvalidPlane)?,
+                &[start, 0],
+                &[end, self.groups],
+            ),
+            scales_f16: crate::slice(
+                self.scales_f16
+                    .as_ref()
+                    .ok_or(GgmlAffineError::InvalidPlane)?,
+                &[start, 0],
+                &[end, self.groups],
+            ),
+            biases_f16: crate::slice(
+                self.biases_f16
+                    .as_ref()
+                    .ok_or(GgmlAffineError::InvalidPlane)?,
                 &[start, 0],
                 &[end, self.groups],
             ),
@@ -165,12 +194,20 @@ impl GgmlAffineMatrix {
         let sidecar_bytes = group_values
             .checked_mul(4)
             .ok_or(GgmlAffineError::Overflow)?;
+        let f16_sidecar_bytes = group_values
+            .checked_mul(2)
+            .ok_or(GgmlAffineError::Overflow)?;
         let resident_bytes = weight_bytes
             .checked_add(
                 sidecar_bytes
                     .checked_mul(2)
                     .ok_or(GgmlAffineError::Overflow)?,
             )
+            .and_then(|bytes| {
+                f16_sidecar_bytes
+                    .checked_mul(2)
+                    .and_then(|sidecars| bytes.checked_add(sidecars))
+            })
             .ok_or(GgmlAffineError::Overflow)?;
 
         let mut weight = Vec::new();
@@ -225,6 +262,40 @@ impl GgmlAffineMatrix {
         validate_plane(&bias_array, dtype::FLOAT32, &[rows, groups], sidecar_bytes)?;
         crate::eval(bias_array.as_ref().ok_or(GgmlAffineError::InvalidPlane)?);
         drop(biases);
+        let scale_array_f16 = crate::astype(
+            scale_array
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?,
+            dtype::FLOAT16,
+        );
+        validate_plane(
+            &scale_array_f16,
+            dtype::FLOAT16,
+            &[rows, groups],
+            f16_sidecar_bytes,
+        )?;
+        crate::eval(
+            scale_array_f16
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?,
+        );
+        let bias_array_f16 = crate::astype(
+            bias_array
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?,
+            dtype::FLOAT16,
+        );
+        validate_plane(
+            &bias_array_f16,
+            dtype::FLOAT16,
+            &[rows, groups],
+            f16_sidecar_bytes,
+        )?;
+        crate::eval(
+            bias_array_f16
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?,
+        );
 
         let peak_active_bytes = resident_bytes
             .checked_mul(2)
@@ -243,6 +314,8 @@ impl GgmlAffineMatrix {
                 weight: weight_array,
                 scales: scale_array,
                 biases: bias_array,
+                scales_f16: scale_array_f16,
+                biases_f16: bias_array_f16,
                 rows,
                 packed_width,
                 groups,
@@ -250,7 +323,7 @@ impl GgmlAffineMatrix {
             in_features: i32::try_from(in_features).map_err(|_| GgmlAffineError::Overflow)?,
             out_features: rows,
             bits: bits as i32,
-            resident_row_bytes: packed_row_bytes + groups_per_row * 8,
+            resident_row_bytes: packed_row_bytes + groups_per_row * 12,
             stats,
         })
     }
@@ -280,6 +353,9 @@ impl GgmlAffineMatrix {
 
     pub fn forward(&self, input: &MlxArray) -> Result<UniquePtr<MlxArray>, GgmlAffineError> {
         validate_input(input, self.in_features)?;
+        if affine_input_rows(input)? >= F16_PREFILL_MIN_ROWS {
+            return affine_matmul_f16_compute(input, &self.planes, self.bits);
+        }
         Ok(affine_matmul(input, &self.planes, self.bits))
     }
 
@@ -296,7 +372,7 @@ impl GgmlAffineMatrix {
             || crate::array_dtype(input) != dtype::FLOAT32
             || !qwen38_m23_shape(self.in_features, self.out_features)
         {
-            return Ok(affine_matmul(input, &self.planes, self.bits));
+            return self.forward(input);
         }
         qwen38_affine_m23_matmul(input, self, input_rows, true)
     }
@@ -314,7 +390,7 @@ impl GgmlAffineMatrix {
             || crate::array_dtype(input) != dtype::FLOAT32
             || !qwen38_m2_shape(self.in_features, self.out_features)
         {
-            return Ok(affine_matmul(input, &self.planes, self.bits));
+            return self.forward(input);
         }
         qwen38_affine_m23_matmul(input, self, input_rows, true)
     }
@@ -326,8 +402,10 @@ impl GgmlAffineMatrix {
     ) -> Result<UniquePtr<MlxArray>, GgmlAffineError> {
         validate_input(input, self.in_features)?;
         let input_rows = affine_input_rows(input)?;
-        if !(2..=3).contains(&input_rows) || crate::array_dtype(input) != dtype::FLOAT32 {
-            return Ok(affine_matmul(input, &self.planes, self.bits));
+        if !(2..=3).contains(&input_rows)
+            || crate::array_dtype(input) != dtype::FLOAT32
+        {
+            return self.forward(input);
         }
         qwen38_affine_m23_matmul(input, self, input_rows, false)
     }
@@ -416,6 +494,7 @@ impl GgmlAffineMatrix {
         )
     }
 }
+
 
 pub enum Qwen38QkvMatrix {
     Affine(GgmlAffineMatrix),
@@ -993,12 +1072,20 @@ impl GgmlAffineRows {
 
     pub fn forward(&self, input: &MlxArray) -> Result<UniquePtr<MlxArray>, GgmlAffineError> {
         validate_input(input, self.in_features)?;
-        let mut outputs = self
-            .planes
-            .iter()
-            .map(|planes| affine_matmul(input, planes, self.bits));
-        let mut output = outputs.next().ok_or(GgmlAffineError::InvalidRowSelection)?;
+        let input_rows = affine_input_rows(input)?;
+        let use_f16 = input_rows >= F16_PREFILL_MIN_ROWS;
+        let mut outputs = self.planes.iter().map(|planes| {
+            if use_f16 {
+                affine_matmul_f16_compute(input, planes, self.bits)
+            } else {
+                Ok(affine_matmul(input, planes, self.bits))
+            }
+        });
+        let mut output = outputs
+            .next()
+            .ok_or(GgmlAffineError::InvalidRowSelection)??;
         for next in outputs {
+            let next = next?;
             output = crate::concatenate(
                 output.as_ref().ok_or(GgmlAffineError::InvalidPlane)?,
                 next.as_ref().ok_or(GgmlAffineError::InvalidPlane)?,
@@ -1411,7 +1498,11 @@ fn qwen38_affine_m23_matmul(
     )
     .map_err(|error| GgmlAffineError::Backend(error.to_string()))
 }
-fn affine_matmul(input: &MlxArray, planes: &AffinePlanes, bits: i32) -> UniquePtr<MlxArray> {
+fn affine_matmul(
+    input: &MlxArray,
+    planes: &AffinePlanes,
+    bits: i32,
+) -> UniquePtr<MlxArray> {
     let shape = crate::array_shape(input);
     let input_rows = shape[..shape.len() - 1]
         .iter()
@@ -1434,7 +1525,11 @@ fn affine_matmul(input: &MlxArray, planes: &AffinePlanes, bits: i32) -> UniquePt
     crate::reshape(output.as_ref().unwrap(), &output_shape)
 }
 
-fn affine_matmul_raw(input: &MlxArray, planes: &AffinePlanes, bits: i32) -> UniquePtr<MlxArray> {
+fn affine_matmul_raw(
+    input: &MlxArray,
+    planes: &AffinePlanes,
+    bits: i32,
+) -> UniquePtr<MlxArray> {
     unsafe {
         crate::quantized_matmul(
             input,
@@ -1447,6 +1542,45 @@ fn affine_matmul_raw(input: &MlxArray, planes: &AffinePlanes, bits: i32) -> Uniq
             "affine",
         )
     }
+}
+
+fn affine_matmul_f16_compute(
+    input: &MlxArray,
+    planes: &AffinePlanes,
+    bits: i32,
+) -> Result<UniquePtr<MlxArray>, GgmlAffineError> {
+    // F16 operands select MLX's half BlockMMA, whose default accumulator is
+    // `float`; only the stored matrix result is F16 before this F32 boundary.
+    let input_f16 = crate::astype(input, dtype::FLOAT16);
+    let output_f16 = unsafe {
+        crate::quantized_matmul(
+            input_f16
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?,
+            planes
+                .weight
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?,
+            planes
+                .scales_f16
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?,
+            planes
+                .biases_f16
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?,
+            true,
+            GROUP_SIZE as i32,
+            bits,
+            "affine",
+        )
+    };
+    Ok(crate::astype(
+        output_f16
+            .as_ref()
+            .ok_or(GgmlAffineError::InvalidPlane)?,
+        dtype::FLOAT32,
+    ))
 }
 
 fn validate_input(input: &MlxArray, in_features: i32) -> Result<(), GgmlAffineError> {
