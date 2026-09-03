@@ -663,14 +663,6 @@ impl Qwen3NextAttention {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn set_high_m_fp16_attention_for_test(&mut self, enabled: bool) {
-        self.attention_precision = if enabled {
-            Qwen38AttentionPrecision::PostRopeF16
-        } else {
-            Qwen38AttentionPrecision::F32
-        };
-    }
 
     #[cfg(test)]
     pub(crate) fn set_full_f16_attention_for_test(&mut self, enabled: bool) {
