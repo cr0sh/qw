@@ -43,7 +43,10 @@ use mlxcel_core::{MlxArray, UniquePtr};
 use tracing::debug;
 
 use crate::qwen_vl_position::decode_rope_positions;
-use crate::qwen3_5::{Qwen35Config, Qwen35DecoderLayer, Qwen35Model};
+use crate::qwen3_5::{
+    GdnRollbackSnapshot, Qwen35Config, Qwen35DecoderLayer, Qwen35Model,
+    Qwen35MtpCompactVerifyOutput, Qwen35MtpVerifyOutput,
+};
 use crate::qwen3_5_weights::{ModelRole, Qwen35Linear, Qwen35WeightSource, TensorSlot};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -958,6 +961,86 @@ fn commit_constraint_transaction<T>(
             Err(error)
         }
     }
+}
+
+enum MtpVerifyHead {
+    Full(UniquePtr<MlxArray>),
+    Compact {
+        scores: UniquePtr<MlxArray>,
+        ids: UniquePtr<MlxArray>,
+    },
+}
+
+struct MtpRoundVerify {
+    hidden: UniquePtr<MlxArray>,
+    head: MtpVerifyHead,
+    gdn_states: Vec<GdnRollbackSnapshot>,
+}
+
+impl From<Qwen35MtpVerifyOutput> for MtpRoundVerify {
+    fn from(output: Qwen35MtpVerifyOutput) -> Self {
+        Self {
+            hidden: output.hidden,
+            head: MtpVerifyHead::Full(output.logits),
+            gdn_states: output.gdn_states,
+        }
+    }
+}
+
+impl From<Qwen35MtpCompactVerifyOutput> for MtpRoundVerify {
+    fn from(output: Qwen35MtpCompactVerifyOutput) -> Self {
+        Self {
+            hidden: output.hidden,
+            head: MtpVerifyHead::Compact {
+                scores: output.target_scores,
+                ids: output.target_ids,
+            },
+            gdn_states: output.gdn_states,
+        }
+    }
+}
+
+impl MtpRoundVerify {
+    fn eval_head(&self) {
+        match &self.head {
+            MtpVerifyHead::Full(logits) => mlxcel_core::eval(logits),
+            MtpVerifyHead::Compact { ids, .. } => mlxcel_core::eval(ids),
+        }
+    }
+
+    fn full_logits(&self) -> Option<&MlxArray> {
+        match &self.head {
+            MtpVerifyHead::Full(logits) => logits.as_ref(),
+            MtpVerifyHead::Compact { .. } => None,
+        }
+    }
+
+    fn compact_ids(&self) -> Option<&MlxArray> {
+        match &self.head {
+            MtpVerifyHead::Compact { scores, ids } => {
+                debug_assert!(!scores.is_null());
+                ids.as_ref()
+            }
+            MtpVerifyHead::Full(_) => None,
+        }
+    }
+}
+
+fn greedy_walk_compact_ids(
+    draft_tokens: &[i32],
+    target_ids: &MlxArray,
+    max_new_tokens: usize,
+) -> WalkResult {
+    let target_tokens = mlxcel_core::array_evaluated_bytes(target_ids)
+        .chunks_exact(4)
+        .map(|bytes| i32::from_ne_bytes(bytes.try_into().expect("Q6 argmax id bytes")))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        target_tokens.len(),
+        draft_tokens.len() + 1,
+        "compact target head must return one ID per verify row"
+    );
+    speculative_walk(draft_tokens, &target_tokens, max_new_tokens)
 }
 
 pub(crate) fn greedy_walk(
@@ -1968,8 +2051,7 @@ fn capture_mtp_snapshot_from_verify(
     prompt_tokens: usize,
     generated_tokens: usize,
     verify_hidden: &MlxArray,
-    verify_logits: &MlxArray,
-    compact_logits: bool,
+    verify_logits: Option<&MlxArray>,
     emitted_in_round: usize,
     previous: Option<&MtpPromptSnapshot>,
 ) -> Result<MtpPromptSnapshot, String> {
@@ -1984,15 +2066,15 @@ fn capture_mtp_snapshot_from_verify(
         &[0, aligned, 0],
         &[hidden_shape[0], aligned + 1, hidden_shape[2]],
     );
-    let continuation_logits = if compact_logits {
-        model.project_mtp_continuation_logits(&last_hidden)
-    } else {
+    let continuation_logits = if let Some(verify_logits) = verify_logits {
         let logits_shape = mlxcel_core::array_shape(verify_logits);
         mlxcel_core::slice(
             verify_logits,
             &[0, aligned, 0],
             &[logits_shape[0], aligned + 1, logits_shape[2]],
         )
+    } else {
+        model.project_mtp_continuation_logits(&last_hidden)
     };
     model.materialize_mtp_cache_state();
     let target = model
@@ -2358,18 +2440,25 @@ impl Qwen35MtpGenerator {
                     &verify_tokens,
                     &[1, i32::try_from(verify_tokens.len()).unwrap_or(i32::MAX)],
                 );
-                let compact_verify = model.has_compact_dflash_verify_head()
-                    && greedy
+                let compact_head_candidate = greedy
                     && sampling.token_bias.is_empty()
                     && sampling.repetition_penalty == 1.0
                     && sampling.dry_multiplier == 0.0
                     && sampling.frequency_penalty == 0.0
                     && sampling.presence_penalty == 0.0
-                    && sampling.xtc_probability == 0.0
-                    && remaining > block_size;
+                    && sampling.xtc_probability == 0.0;
                 let phase_start = Instant::now();
-                let verify = model.forward_mtp_verify_with_compact(&verify_input, compact_verify);
-                mlxcel_core::eval(&verify.logits);
+                let verify = if compact_head_candidate {
+                    model
+                        .forward_qwen38_mtp_compact_verify(&verify_input)
+                        .map(MtpRoundVerify::from)
+                        .unwrap_or_else(|| {
+                            MtpRoundVerify::from(model.forward_mtp_verify(&verify_input))
+                        })
+                } else {
+                    MtpRoundVerify::from(model.forward_mtp_verify(&verify_input))
+                };
+                verify.eval_head();
                 mtp_stats.target_verify_time += phase_start.elapsed();
                 mtp_stats.target_forward_calls += 1;
                 mtp_stats.speculative_rounds += 1;
@@ -2377,17 +2466,23 @@ impl Qwen35MtpGenerator {
                 let walk = if let Some(proposals) = proposal_probs.as_deref() {
                     stochastic_walk(
                         proposals,
-                        &verify.logits,
+                        verify
+                            .full_logits()
+                            .expect("stochastic verification requires full logits"),
                         &sampling,
                         &history,
                         &eos_tokens,
                         remaining,
                     )
+                } else if let Some(target_ids) = verify.compact_ids() {
+                    greedy_walk_compact_ids(&draft_tokens, target_ids, remaining)
                 } else {
                     greedy_walk(
                         &draft_tokens,
-                        &verify.logits,
-                        compact_verify,
+                        verify
+                            .full_logits()
+                            .expect("full verification requires logits"),
+                        false,
                         &sampling,
                         &history,
                         remaining,
@@ -2452,8 +2547,7 @@ impl Qwen35MtpGenerator {
                             prompt_tokens.len(),
                             generated.len(),
                             &verify.hidden,
-                            &verify.logits,
-                            compact_verify,
+                            verify.full_logits(),
                             emitted_in_round,
                             prompt_snapshots.last(),
                         )

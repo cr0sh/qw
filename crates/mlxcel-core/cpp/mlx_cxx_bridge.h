@@ -2326,6 +2326,21 @@ std::unique_ptr<MlxArray> ggml_packed_matmul(
     int32_t selected_rows,
     int32_t input_rows,
     bool qwen38_q6_head_verify_r8);
+struct Qwen38Q6HeadArgmaxOutputs {
+    std::unique_ptr<MlxArray> scores;
+    std::unique_ptr<MlxArray> ids;
+};
+std::unique_ptr<Qwen38Q6HeadArgmaxOutputs> ggml_q6_head_argmax(
+    const MlxArray& x,
+    const MlxArray& packed,
+    const MlxArray& iq3_grid,
+    int32_t in_features,
+    int32_t out_features,
+    int32_t input_rows);
+std::unique_ptr<MlxArray> qwen38_q6_head_argmax_take_scores(
+    Qwen38Q6HeadArgmaxOutputs& outputs);
+std::unique_ptr<MlxArray> qwen38_q6_head_argmax_take_ids(
+    Qwen38Q6HeadArgmaxOutputs& outputs);
 std::unique_ptr<MlxArray> ggml_packed_embedding(
     const MlxArray& indices,
     const MlxArray& packed,

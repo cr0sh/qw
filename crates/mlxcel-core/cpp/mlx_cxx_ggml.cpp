@@ -233,6 +233,28 @@ inline float ggml_decode_weight(
         * (float)scale
         * (float)values[index];
 }
+
+inline bool ggml_argmax_better(
+    float score,
+    uint id,
+    float best_score,
+    uint best_id) {
+    if (id == 0xffffffffu) {
+        return false;
+    }
+    if (best_id == 0xffffffffu) {
+        return true;
+    }
+    bool score_nan = metal::isnan(score);
+    bool best_nan = metal::isnan(best_score);
+    if (score_nan != best_nan) {
+        return best_nan;
+    }
+    if (score_nan) {
+        return id < best_id;
+    }
+    return score > best_score || (score == best_score && id < best_id);
+}
 )";
 
 static const char* GGML_QMV_METAL_SOURCE = R"(
@@ -324,6 +346,104 @@ static const char* QWEN38_Q6_HEAD_VERIFY_R8_SOURCE = R"(
     }
 )";
 
+static const char* Q6_ARGMAX_PARTIAL_SOURCE = R"(
+    constexpr uint RowsPerThreadgroup = 8u;
+    constexpr uint MaxInputRows = 4u;
+    uint lane = thread_index_in_simdgroup;
+    uint candidate = threadgroup_position_in_grid.y * RowsPerThreadgroup
+        + simdgroup_index_in_threadgroup;
+    uint input_rows = (uint)x_shape[0];
+    uint width = (uint)x_shape[1];
+    uint output_rows = (uint)packed_shape[0];
+    bool valid_candidate = candidate < output_rows;
+    uint row_base = valid_candidate
+        ? candidate * (uint)packed_shape[1]
+        : 0u;
+    float sums[MaxInputRows] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (valid_candidate) {
+        for (uint column = lane; column < width; column += 32u) {
+            float weight =
+                ggml_decode_weight(packed, row_base, column, QType, iq3_grid);
+            for (uint row = 0u; row < input_rows; ++row) {
+                sums[row] += x[row * width + column] * weight;
+            }
+        }
+    }
+
+    for (uint row = 0u; row < input_rows; ++row) {
+        sums[row] = simd_sum(sums[row]);
+    }
+    threadgroup float candidate_scores[RowsPerThreadgroup * MaxInputRows];
+    threadgroup uint candidate_ids[RowsPerThreadgroup * MaxInputRows];
+    if (lane == 0u) {
+        uint slot = simdgroup_index_in_threadgroup;
+        for (uint row = 0u; row < input_rows; ++row) {
+            uint index = row * RowsPerThreadgroup + slot;
+            candidate_scores[index] = valid_candidate ? sums[row] : -INFINITY;
+            candidate_ids[index] = valid_candidate ? candidate : 0xffffffffu;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint row = thread_index_in_threadgroup;
+    if (row < input_rows) {
+        float best_score = -INFINITY;
+        uint best_id = 0xffffffffu;
+        for (uint slot = 0u; slot < RowsPerThreadgroup; ++slot) {
+            uint index = row * RowsPerThreadgroup + slot;
+            float score = candidate_scores[index];
+            uint id = candidate_ids[index];
+            if (ggml_argmax_better(score, id, best_score, best_id)) {
+                best_score = score;
+                best_id = id;
+            }
+        }
+        uint group = threadgroup_position_in_grid.y;
+        uint groups = (output_rows + RowsPerThreadgroup - 1u) / RowsPerThreadgroup;
+        partial_scores[row * groups + group] = best_score;
+        partial_ids[row * groups + group] = best_id;
+    }
+)";
+
+static const char* Q6_ARGMAX_MERGE_SOURCE = R"(
+    uint row = threadgroup_position_in_grid.y;
+    uint tid = thread_index_in_threadgroup;
+    uint groups = (uint)partial_scores_shape[1];
+    float best_score = -INFINITY;
+    uint best_id = 0xffffffffu;
+    for (uint group = tid; group < groups; group += 256u) {
+        uint index = row * groups + group;
+        float score = partial_scores[index];
+        uint id = partial_ids[index];
+        if (ggml_argmax_better(score, id, best_score, best_id)) {
+            best_score = score;
+            best_id = id;
+        }
+    }
+
+    threadgroup float scores[256];
+    threadgroup uint ids[256];
+    scores[tid] = best_score;
+    ids[tid] = best_id;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            float score = scores[tid + stride];
+            uint id = ids[tid + stride];
+            if (ggml_argmax_better(
+                    score, id, scores[tid], ids[tid])) {
+                scores[tid] = score;
+                ids[tid] = id;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) {
+        max_scores[row] = scores[0];
+        max_ids[row] = ids[0];
+    }
+)";
+
 static const char* GGML_QMM_METAL_SOURCE = R"(
     constexpr uint BM = (uint)BlockM;
     constexpr uint BN = 8u;
@@ -411,6 +531,8 @@ struct GgmlKernelHolder {
     std::optional<mlx::core::fast::CustomKernelFunction> verify;
     std::optional<mlx::core::fast::CustomKernelFunction> qmm;
     std::optional<mlx::core::fast::CustomKernelFunction> qwen38_q6_head_verify_r8;
+    std::optional<mlx::core::fast::CustomKernelFunction> q6_argmax_partial;
+    std::optional<mlx::core::fast::CustomKernelFunction> q6_argmax_merge;
     std::optional<mlx::core::fast::CustomKernelFunction> embedding;
     std::once_flag initialize_once;
 
@@ -444,6 +566,20 @@ struct GgmlKernelHolder {
                 linear_inputs,
                 {"out"},
                 QWEN38_Q6_HEAD_VERIFY_R8_SOURCE,
+                GGML_DECODE_METAL_HEADER,
+                false);
+            q6_argmax_partial = mlx::core::fast::metal_kernel(
+                "qw_ggml_q6_argmax_partial_v2",
+                {"x", "packed", "iq3_grid"},
+                {"partial_scores", "partial_ids"},
+                Q6_ARGMAX_PARTIAL_SOURCE,
+                GGML_DECODE_METAL_HEADER,
+                false);
+            q6_argmax_merge = mlx::core::fast::metal_kernel(
+                "qw_ggml_q6_argmax_merge_v2",
+                {"partial_scores", "partial_ids"},
+                {"max_scores", "max_ids"},
+                Q6_ARGMAX_MERGE_SOURCE,
                 GGML_DECODE_METAL_HEADER,
                 false);
             embedding = mlx::core::fast::metal_kernel(
@@ -623,6 +759,94 @@ std::unique_ptr<MlxArray> ggml_packed_matmul(
     return std::make_unique<MlxArray>(
         reshape(results[0], output_shape));
 #endif
+}
+
+std::unique_ptr<Qwen38Q6HeadArgmaxOutputs> ggml_q6_head_argmax(
+    const MlxArray& x,
+    const MlxArray& packed,
+    const MlxArray& iq3_grid,
+    int32_t in_features,
+    int32_t out_features,
+    int32_t input_rows
+) {
+#ifndef __APPLE__
+    throw std::invalid_argument("packed GGML Q6 argmax requires Metal");
+#else
+    using namespace mlx::core;
+    if (!metal::is_available()) {
+        throw std::invalid_argument("packed GGML Q6 argmax requires Metal");
+    }
+    constexpr int32_t qtype = 14;
+    if (input_rows != 3 && input_rows != 4) {
+        throw std::invalid_argument("packed GGML Q6 argmax requires M3 or M4");
+    }
+    const GgmlBlockInfo info = ggml_block_info(qtype);
+    const size_t expected =
+        checked_packed_size(in_features, out_features, info);
+    const int32_t row_bytes =
+        in_features / info.elements * info.bytes;
+    if (packed.inner.dtype() != uint8
+        || packed.inner.size() != expected
+        || packed.inner.shape() != Shape{out_features, row_bytes}) {
+        throw std::invalid_argument(
+            "packed GGML Q6 argmax buffer shape, dtype, or bounds mismatch");
+    }
+    validate_iq3_table(iq3_grid.inner, qtype);
+    const auto& shape = x.inner.shape();
+    if (shape.empty() || shape.back() != in_features
+        || x.inner.size()
+            != static_cast<size_t>(input_rows)
+                * static_cast<size_t>(in_features)) {
+        throw std::invalid_argument(
+            "packed GGML Q6 argmax activation shape mismatch");
+    }
+
+    // The custom kernel flat-indexes every input. Contiguous elides the data
+    // copy for canonical runtime arrays and materializes public strided views.
+    auto input =
+        reshape(contiguous(astype(x.inner, float32)), {input_rows, in_features});
+    auto packed_input = contiguous(packed.inner);
+    auto table_input = contiguous(iq3_grid.inner);
+    auto& holder = ggml_kernels();
+    const int32_t groups = (out_features + 7) / 8;
+    const auto args = qtype_template_argument(qtype);
+    auto partials = (*holder.q6_argmax_partial)(
+        {input, packed_input, table_input},
+        {Shape{input_rows, groups}, Shape{input_rows, groups}},
+        {float32, uint32},
+        std::make_tuple(256, groups, 1),
+        std::make_tuple(256, 1, 1),
+        args,
+        std::nullopt,
+        false,
+        {});
+    auto merged = (*holder.q6_argmax_merge)(
+        {partials[0], partials[1]},
+        {Shape{input_rows}, Shape{input_rows}},
+        {float32, uint32},
+        std::make_tuple(256, input_rows, 1),
+        std::make_tuple(256, 1, 1),
+        {},
+        std::nullopt,
+        false,
+        {});
+    return std::make_unique<Qwen38Q6HeadArgmaxOutputs>(
+        Qwen38Q6HeadArgmaxOutputs{
+            std::make_unique<MlxArray>(std::move(merged[0])),
+            std::make_unique<MlxArray>(std::move(merged[1]))});
+#endif
+}
+
+std::unique_ptr<MlxArray> qwen38_q6_head_argmax_take_scores(
+    Qwen38Q6HeadArgmaxOutputs& outputs
+) {
+    return std::move(outputs.scores);
+}
+
+std::unique_ptr<MlxArray> qwen38_q6_head_argmax_take_ids(
+    Qwen38Q6HeadArgmaxOutputs& outputs
+) {
+    return std::move(outputs.ids);
 }
 
 std::unique_ptr<MlxArray> ggml_packed_embedding(

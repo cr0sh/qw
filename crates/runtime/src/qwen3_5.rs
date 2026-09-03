@@ -40,21 +40,85 @@ use mlxcel_core::layers::{KVCache, RMSNorm};
 use mlxcel_core::layers::{QuantizedWeight, UnifiedLinear};
 use mlxcel_core::utils::silu;
 use mlxcel_core::weights::WeightMap;
-use mlxcel_core::{MlxArray, UniquePtr, concatenate};
+use mlxcel_core::{MlxArray, Qwen38Q6HeadArgmax, UniquePtr, concatenate};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeSet;
 #[cfg(any(feature = "specprefill", test))]
 use std::path::Path;
+use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const MTP_DRAFT_PREFIX: i32 = 65_536;
 const MTP_DRAFT_PADDED: i32 = 65_568;
 const DFLASH_VERIFY_PREFIX: i32 = 80_896;
+#[cfg(any(feature = "dflash2", test))]
 const DFLASH_VERIFY_PADDED: i32 = 80_928;
 const DRAFT_CONTROL_START: i32 = 248_044;
 const DRAFT_CONTROL_END: i32 = 248_070;
 const TURBO4_PACKED_MTP_THRESHOLD_TOKENS: i32 = 2_048;
+pub(crate) const QWEN38_MTP_COMPACT_HEAD_ENV_VAR: &str = "MLXCEL_QWEN38_MTP_COMPACT_HEAD";
+
+fn parse_qwen38_mtp_compact_head_enabled(value: Option<&str>) -> bool {
+    !value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    })
+}
+
+static QWEN38_MTP_COMPACT_HEAD_ENABLED: LazyLock<bool> = LazyLock::new(|| {
+    let value = std::env::var(QWEN38_MTP_COMPACT_HEAD_ENV_VAR).ok();
+    parse_qwen38_mtp_compact_head_enabled(value.as_deref())
+});
+
+#[cfg(test)]
+thread_local! {
+    static QWEN38_MTP_COMPACT_HEAD_TEST_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn qwen38_mtp_compact_head_enabled() -> bool {
+    #[cfg(test)]
+    if let Some(enabled) = QWEN38_MTP_COMPACT_HEAD_TEST_OVERRIDE.get() {
+        return enabled;
+    }
+    *QWEN38_MTP_COMPACT_HEAD_ENABLED
+}
+
+#[cfg(test)]
+pub(crate) fn with_qwen38_mtp_compact_head_for_test<T>(
+    enabled: bool,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct RestoreOverride(Option<bool>);
+
+    impl Drop for RestoreOverride {
+        fn drop(&mut self) {
+            QWEN38_MTP_COMPACT_HEAD_TEST_OVERRIDE.set(self.0);
+        }
+    }
+
+    let previous = QWEN38_MTP_COMPACT_HEAD_TEST_OVERRIDE.replace(Some(enabled));
+    let _restore = RestoreOverride(previous);
+    run()
+}
+
+#[cfg(test)]
+static QWEN38_MTP_COMPACT_VERIFY_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) fn reset_qwen38_mtp_compact_verify_count() {
+    QWEN38_MTP_COMPACT_VERIFY_COUNT.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn qwen38_mtp_compact_verify_count() -> u64 {
+    QWEN38_MTP_COMPACT_VERIFY_COUNT.load(Ordering::Relaxed)
+}
+
 #[cfg(any(feature = "specprefill", test))]
 const SPECPREFILL_TARGET_CHUNK_TOKENS: usize = 512;
 
@@ -347,6 +411,70 @@ pub(crate) struct Qwen35MtpVerifyOutput {
     pub(crate) hidden: UniquePtr<MlxArray>,
     pub(crate) logits: UniquePtr<MlxArray>,
     pub(crate) gdn_states: Vec<GdnRollbackSnapshot>,
+}
+
+pub(crate) struct Qwen35MtpCompactVerifyOutput {
+    pub(crate) hidden: UniquePtr<MlxArray>,
+    pub(crate) target_scores: UniquePtr<MlxArray>,
+    pub(crate) target_ids: UniquePtr<MlxArray>,
+    pub(crate) gdn_states: Vec<GdnRollbackSnapshot>,
+}
+
+struct Qwen35MtpVerifyBackbone {
+    hidden: UniquePtr<MlxArray>,
+    normalized: UniquePtr<MlxArray>,
+    gdn_states: Vec<GdnRollbackSnapshot>,
+}
+
+fn finish_qwen38_mtp_compact_verify(
+    backbone: Qwen35MtpVerifyBackbone,
+    compact: Option<Qwen38Q6HeadArgmax>,
+    full_logits: impl FnOnce(&MlxArray) -> UniquePtr<MlxArray>,
+) -> Qwen35MtpCompactVerifyOutput {
+    if let Some(compact) = compact {
+        return Qwen35MtpCompactVerifyOutput {
+            hidden: backbone.hidden,
+            target_scores: compact.scores,
+            target_ids: compact.ids,
+            gdn_states: backbone.gdn_states,
+        };
+    }
+
+    let logits = full_logits(&backbone.normalized);
+    let target_ids = mlxcel_core::argmax_last_axis(logits.as_ref().expect("full logits"));
+    let target_indices = mlxcel_core::expand_dims(
+        mlxcel_core::astype(
+            target_ids.as_ref().expect("full-logits argmax"),
+            mlxcel_core::dtype::INT32,
+        )
+        .as_ref()
+        .expect("integer full-logits argmax"),
+        -1,
+    );
+    let target_scores = mlxcel_core::take_along_axis(
+        logits.as_ref().expect("full logits"),
+        target_indices
+            .as_ref()
+            .expect("expanded full-logits argmax"),
+        -1,
+    );
+    let input_rows = mlxcel_core::array_shape(target_ids.as_ref().expect("full-logits argmax"))
+        .into_iter()
+        .product();
+    Qwen35MtpCompactVerifyOutput {
+        hidden: backbone.hidden,
+        target_scores: mlxcel_core::reshape(
+            target_scores
+                .as_ref()
+                .expect("selected full-logits scores"),
+            &[input_rows],
+        ),
+        target_ids: mlxcel_core::reshape(
+            target_ids.as_ref().expect("full-logits argmax"),
+            &[input_rows],
+        ),
+        gdn_states: backbone.gdn_states,
+    }
 }
 
 #[cfg(any(feature = "dflash2", test))]
@@ -1217,6 +1345,7 @@ pub struct Qwen35Model {
     pub(crate) norm: RMSNorm,
     pub(crate) lm_head: Option<Qwen35Linear>,
     compact_draft_head: Option<Qwen35Linear>,
+    #[cfg(any(feature = "dflash2", test))]
     compact_dflash_verify_head: Option<Qwen35Linear>,
     pub(crate) config: Qwen35Config,
     mtp: Option<Qwen35MtpDraftModel>,
@@ -1272,6 +1401,7 @@ impl Qwen35Model {
         self.project_compact_logits(hidden, &self.compact_draft_head, MTP_DRAFT_PREFIX)
     }
 
+    #[cfg(any(feature = "dflash2", test))]
     pub(crate) fn project_dflash_verify_logits(&self, hidden: &MlxArray) -> UniquePtr<MlxArray> {
         self.project_compact_logits(
             hidden,
@@ -1308,6 +1438,7 @@ impl Qwen35Model {
         self.compact_draft_head.is_some()
     }
 
+    #[cfg(any(feature = "dflash2", test))]
     pub(crate) fn has_compact_dflash_verify_head(&self) -> bool {
         self.compact_dflash_verify_head.is_some()
     }
@@ -1532,15 +1663,7 @@ impl Qwen35Model {
         })
     }
 
-    pub(crate) fn forward_mtp_verify(&self, input_ids: &MlxArray) -> Qwen35MtpVerifyOutput {
-        self.forward_mtp_verify_with_compact(input_ids, false)
-    }
-
-    pub(crate) fn forward_mtp_verify_with_compact(
-        &self,
-        input_ids: &MlxArray,
-        compact_logits: bool,
-    ) -> Qwen35MtpVerifyOutput {
+    fn forward_mtp_verify_backbone(&self, input_ids: &MlxArray) -> Qwen35MtpVerifyBackbone {
         let rope_delta = self.mrope_state.rope_delta();
         let (output, offset) = self.sequence_state.with_internal(|caches| {
             let mut hidden = self.embed_tokens.forward(input_ids);
@@ -1568,16 +1691,11 @@ impl Qwen35Model {
                 );
             }
             let normalized = self.norm.forward(&hidden);
-            let logits = if compact_logits {
-                self.project_dflash_verify_logits(&normalized)
-            } else {
-                self.project_logits(&normalized)
-            };
             let offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
             (
-                Qwen35MtpVerifyOutput {
+                Qwen35MtpVerifyBackbone {
                     hidden,
-                    logits,
+                    normalized,
                     gdn_states,
                 },
                 offset,
@@ -1585,6 +1703,54 @@ impl Qwen35Model {
         });
         self.mrope_state.set_position(offset);
         output
+    }
+
+    pub(crate) fn forward_mtp_verify(&self, input_ids: &MlxArray) -> Qwen35MtpVerifyOutput {
+        let backbone = self.forward_mtp_verify_backbone(input_ids);
+        let logits = self.project_logits(&backbone.normalized);
+        Qwen35MtpVerifyOutput {
+            hidden: backbone.hidden,
+            logits,
+            gdn_states: backbone.gdn_states,
+        }
+    }
+
+    pub(crate) fn supports_qwen38_mtp_compact_head(&self) -> bool {
+        qwen38_mtp_compact_head_enabled()
+            && self.retain_qwen38_64k_dense_prefix
+            && self
+                .lm_head
+                .as_ref()
+                .is_some_and(Qwen35Linear::supports_qwen38_q6_head_argmax)
+    }
+
+    pub(crate) fn forward_qwen38_mtp_compact_verify(
+        &self,
+        input_ids: &MlxArray,
+    ) -> Option<Qwen35MtpCompactVerifyOutput> {
+        let shape = mlxcel_core::array_shape(input_ids);
+        if !self.supports_qwen38_mtp_compact_head()
+            || shape.len() != 2
+            || shape[0] != 1
+            || !matches!(shape[1], 3 | 4)
+        {
+            return None;
+        }
+        let head = self
+            .lm_head
+            .as_ref()
+            .expect("compact-head eligibility requires the target LM head");
+        let backbone = self.forward_mtp_verify_backbone(input_ids);
+        let compact = head.qwen38_q6_head_argmax(&backbone.normalized);
+        #[cfg(test)]
+        if compact.is_some() {
+            QWEN38_MTP_COMPACT_VERIFY_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(finish_qwen38_mtp_compact_verify(
+            backbone,
+            compact,
+            |normalized| self.project_logits(normalized),
+        ))
     }
 
     #[cfg(any(feature = "dflash2", test))]
@@ -2441,6 +2607,7 @@ impl Qwen35Model {
         let compact_draft_head = lm_head.as_ref().and_then(|head| {
             compact_head(head, config.vocab_size, MTP_DRAFT_PREFIX, MTP_DRAFT_PADDED)
         });
+        #[cfg(any(feature = "dflash2", test))]
         let compact_dflash_verify_head = lm_head.as_ref().and_then(|head| {
             compact_head(
                 head,
@@ -2467,6 +2634,7 @@ impl Qwen35Model {
             lm_head,
             initial_prefill_complete: AtomicBool::new(false),
             compact_draft_head,
+            #[cfg(any(feature = "dflash2", test))]
             compact_dflash_verify_head,
             config: config.clone(),
             kv_cache_mode,
@@ -3281,6 +3449,69 @@ mod tests {
         config.mtp_num_hidden_layers = Some(1);
         config.mtp_use_dedicated_embeddings = Some(false);
         config
+    }
+
+    #[test]
+    fn qwen38_mtp_compact_head_kill_switch_defaults_on() {
+        assert!(parse_qwen38_mtp_compact_head_enabled(None));
+        assert!(parse_qwen38_mtp_compact_head_enabled(Some("1")));
+        assert!(parse_qwen38_mtp_compact_head_enabled(Some("yes")));
+        for disabled in ["0", "false", "OFF", " no "] {
+            assert!(!parse_qwen38_mtp_compact_head_enabled(Some(disabled)));
+        }
+    }
+
+    #[test]
+    fn compact_verify_falls_back_to_full_logits_without_eagerly_computing_them() {
+        fn backbone() -> Qwen35MtpVerifyBackbone {
+            Qwen35MtpVerifyBackbone {
+                hidden: mlxcel_core::from_slice_f32(&[1.0, 2.0, 3.0], &[1, 3, 1]),
+                normalized: mlxcel_core::from_slice_f32(&[4.0, 5.0, 6.0], &[1, 3, 1]),
+                gdn_states: Vec::new(),
+            }
+        }
+
+        let full_projection_calls = std::cell::Cell::new(0usize);
+        let compact = Qwen38Q6HeadArgmax {
+            scores: mlxcel_core::from_slice_f32(&[3.0, 5.0, 7.0], &[3]),
+            ids: mlxcel_core::from_slice_u32(&[1, 2, 3], &[3]),
+        };
+        let direct = finish_qwen38_mtp_compact_verify(backbone(), Some(compact), |_| {
+            full_projection_calls.set(full_projection_calls.get() + 1);
+            mlxcel_core::from_slice_f32(&[], &[0])
+        });
+        mlxcel_core::eval(direct.target_ids.as_ref().expect("compact IDs"));
+        assert_eq!(full_projection_calls.get(), 0);
+
+        let fallback = finish_qwen38_mtp_compact_verify(backbone(), None, |_| {
+            full_projection_calls.set(full_projection_calls.get() + 1);
+            mlxcel_core::from_slice_f32(
+                &[
+                    1.0, 9.0, 3.0, 4.0, 8.0, 2.0, 7.0, 6.0, -2.0, -3.0, 10.0, 5.0,
+                ],
+                &[1, 3, 4],
+            )
+        });
+        mlxcel_core::eval(fallback.target_ids.as_ref().expect("fallback IDs"));
+        assert_eq!(full_projection_calls.get(), 1);
+        assert_eq!(
+            mlxcel_core::array_to_raw_bytes(
+                fallback.target_ids.as_ref().expect("fallback IDs")
+            ),
+            [1u32, 0, 2]
+                .into_iter()
+                .flat_map(u32::to_le_bytes)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(
+            mlxcel_core::array_to_raw_bytes(
+                fallback.target_scores.as_ref().expect("fallback scores")
+            ),
+            [9.0f32, 8.0, 10.0]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>(),
+        );
     }
 
     #[test]

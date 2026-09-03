@@ -127,6 +127,8 @@ pub enum GgmlQuantError {
     InputShape { expected_width: usize },
     #[error("packed GGML input dtype {0} is not a supported floating dtype")]
     InputDType(i32),
+    #[error("packed GGML compact argmax requires a Q6_K matrix and exactly 3 or 4 input rows")]
+    UnsupportedCompactArgmax,
     #[error("packed GGML embedding indices dtype {0} is not INT32 or UINT32")]
     IndexDType(i32),
     #[error("packed GGML embedding indices must not be empty")]
@@ -171,6 +173,12 @@ pub struct GgmlDispatchStats {
     pub floating_point_operations: usize,
     pub threadgroup_bytes: usize,
     pub workspace_bytes: usize,
+}
+
+/// Exact full-row argmax values and indices without a materialized logits slab.
+pub struct Qwen38Q6HeadArgmax {
+    pub scores: UniquePtr<MlxArray>,
+    pub ids: UniquePtr<MlxArray>,
 }
 
 /// One owned `[out_features, in_features]` matrix in original GGUF bytes.
@@ -310,6 +318,34 @@ impl GgmlQuantizedMatrix {
             self.out_features,
             false,
         )
+    }
+
+    pub fn is_qwen38_q6_head(&self) -> bool {
+        self.qtype == GgmlQType::Q6K
+            && self.in_features as usize == QWEN38_Q6_HEAD_WIDTH
+            && self.out_features as usize == QWEN38_Q6_HEAD_ROWS
+    }
+
+    pub fn compact_argmax_m34(
+        &self,
+        input: &MlxArray,
+    ) -> Result<Qwen38Q6HeadArgmax, GgmlQuantError> {
+        let input_rows = validate_matmul_input(input, self.in_features)?;
+        if self.qtype != GgmlQType::Q6K || !matches!(input_rows, 3 | 4) {
+            return Err(GgmlQuantError::UnsupportedCompactArgmax);
+        }
+        let mut outputs = crate::ggml_q6_head_argmax(
+            input,
+            self.packed.as_ref().ok_or(GgmlQuantError::InvalidTable)?,
+            self.iq3_grid.as_ref().ok_or(GgmlQuantError::InvalidTable)?,
+            self.in_features,
+            self.out_features,
+            input_rows,
+        )
+        .map_err(|error| GgmlQuantError::Backend(error.what().to_owned()))?;
+        let scores = crate::qwen38_q6_head_argmax_take_scores(outputs.pin_mut());
+        let ids = crate::qwen38_q6_head_argmax_take_ids(outputs.pin_mut());
+        Ok(Qwen38Q6HeadArgmax { scores, ids })
     }
 
     /// Build a zero-copy projection view over up to three ordered packed row
@@ -494,17 +530,7 @@ impl GgmlQuantizedEmbedding {
     }
 }
 
-fn launch_matmul(
-    input: &MlxArray,
-    packed: &MlxArray,
-    row_ranges: &MlxArray,
-    iq3_grid: &MlxArray,
-    qtype: GgmlQType,
-    in_features: i32,
-    out_features: i32,
-    selected_rows: i32,
-    qwen38_q6_head_verify_r8: bool,
-) -> Result<UniquePtr<MlxArray>, GgmlQuantError> {
+fn validate_matmul_input(input: &MlxArray, in_features: i32) -> Result<i32, GgmlQuantError> {
     let shape = crate::array_shape(input);
     if shape.is_empty() || shape.last().copied() != Some(in_features) {
         return Err(GgmlQuantError::InputShape {
@@ -533,6 +559,21 @@ fn launch_matmul(
     ) {
         return Err(GgmlQuantError::InputDType(input_dtype));
     }
+    Ok(input_rows)
+}
+
+fn launch_matmul(
+    input: &MlxArray,
+    packed: &MlxArray,
+    row_ranges: &MlxArray,
+    iq3_grid: &MlxArray,
+    qtype: GgmlQType,
+    in_features: i32,
+    out_features: i32,
+    selected_rows: i32,
+    qwen38_q6_head_verify_r8: bool,
+) -> Result<UniquePtr<MlxArray>, GgmlQuantError> {
+    let input_rows = validate_matmul_input(input, in_features)?;
     crate::ggml_packed_matmul(
         input,
         packed,

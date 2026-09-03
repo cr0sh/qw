@@ -221,12 +221,334 @@ fn fixture_matrix(qtype: GgmlQType, width: usize, rows: usize) -> Vec<u8> {
     bytes
 }
 
+fn set_q6_row_scale(bytes: &mut [u8], width: usize, row: usize, scale_bits: u16) {
+    let block_bytes = GgmlQType::Q6K.block_bytes();
+    let blocks_per_row = width / GgmlQType::Q6K.block_elements();
+    let row_offset = row * blocks_per_row * block_bytes;
+    for block in 0..blocks_per_row {
+        put_half(
+            &mut bytes[row_offset + block * block_bytes..],
+            208,
+            scale_bits,
+        );
+    }
+}
+
+fn set_q6_uniform_row(
+    bytes: &mut [u8],
+    width: usize,
+    row: usize,
+    scale_bits: u16,
+    subscale: i8,
+) {
+    let block_bytes = GgmlQType::Q6K.block_bytes();
+    let blocks_per_row = width / GgmlQType::Q6K.block_elements();
+    let row_offset = row * blocks_per_row * block_bytes;
+    for block in 0..blocks_per_row {
+        let block_offset = row_offset + block * block_bytes;
+        bytes[block_offset..block_offset + block_bytes].fill(0);
+        bytes[block_offset + 192..block_offset + 208].fill(subscale as u8);
+        put_half(&mut bytes[block_offset..], 208, scale_bits);
+    }
+}
+
 fn raw_f32(array: &MlxArray) -> Vec<f32> {
     crate::eval(array);
     crate::array_to_raw_bytes(array)
         .chunks_exact(4)
         .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
         .collect()
+}
+
+fn raw_u32(array: &MlxArray) -> Vec<u32> {
+    crate::eval(array);
+    crate::array_to_raw_bytes(array)
+        .chunks_exact(4)
+        .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+        .collect()
+}
+
+
+fn assert_q6_compact_argmax_matches_full(
+    matrix: &GgmlQuantizedMatrix,
+    input: &MlxArray,
+    expected_ids: Option<&[u32]>,
+) {
+    let full = matrix.forward(input).unwrap();
+    let full_ids = crate::argmax_last_axis(full.as_ref().unwrap());
+    let full_ids_i32 = crate::astype(full_ids.as_ref().unwrap(), crate::dtype::INT32);
+    let full_indices = crate::expand_dims(full_ids_i32.as_ref().unwrap(), -1);
+    let full_scores =
+        crate::take_along_axis(full.as_ref().unwrap(), full_indices.as_ref().unwrap(), -1);
+    crate::eval(full_scores.as_ref().unwrap());
+    let compact = matrix.compact_argmax_m34(input).unwrap();
+    crate::eval(compact.ids.as_ref().unwrap());
+
+    let full_id_values = raw_u32(full_ids.as_ref().unwrap());
+    let compact_id_values = raw_u32(compact.ids.as_ref().unwrap());
+    assert_eq!(
+        compact_id_values, full_id_values,
+        "compact argmax IDs differ"
+    );
+    if let Some(expected_ids) = expected_ids {
+        assert_eq!(compact_id_values, expected_ids);
+    }
+    assert_eq!(
+        crate::array_to_raw_bytes(compact.scores.as_ref().unwrap()),
+        crate::array_to_raw_bytes(full_scores.as_ref().unwrap()),
+        "compact argmax scores differ"
+    );
+}
+
+#[test]
+fn q6_compact_argmax_m3_m4_matches_full_logits() {
+    if !crate::metal_is_available() {
+        return;
+    }
+    let width = 512usize;
+    let output_rows = 33usize;
+    let packed = fixture_matrix(GgmlQType::Q6K, width, output_rows);
+    let matrix =
+        GgmlQuantizedMatrix::from_bytes(&packed, GgmlQType::Q6K, width, output_rows).unwrap();
+    for rows in [3usize, 4] {
+        let values = (0..rows * width)
+            .map(|index| ((index * 29 + rows * 11) as i32 % 67 - 33) as f32 * 0.0078125)
+            .collect::<Vec<_>>();
+        let input = crate::from_slice_f32(&values, &[1, rows as i32, width as i32]);
+        assert_q6_compact_argmax_matches_full(&matrix, input.as_ref().unwrap(), None);
+    }
+}
+
+#[test]
+fn q6_compact_argmax_materializes_strided_activation_and_weight() {
+    if !crate::metal_is_available() {
+        return;
+    }
+    let width = 512usize;
+    let output_rows = 33usize;
+    let packed = fixture_matrix(GgmlQType::Q6K, width, output_rows);
+    let matrix =
+        GgmlQuantizedMatrix::from_bytes(&packed, GgmlQType::Q6K, width, output_rows).unwrap();
+    let values = (0..3 * width)
+        .map(|index| ((index * 29 + 33) as i32 % 67 - 33) as f32 * 0.0078125)
+        .collect::<Vec<_>>();
+    let input = crate::from_slice_f32(&values, &[3, 1, width as i32]);
+    let padded_values = values
+        .chunks_exact(width)
+        .flat_map(|row| row.iter().copied().chain(std::iter::repeat_n(f32::NAN, width)))
+        .collect::<Vec<_>>();
+    let padded_input = crate::from_slice_f32(&padded_values, &[3, 2, width as i32]);
+    crate::eval(padded_input.as_ref().unwrap());
+    let strided_input = crate::as_strided(
+        padded_input.as_ref().unwrap(),
+        &[3, 1, width as i32],
+        &[(width * 2) as i64, width as i64, 1],
+        0,
+    );
+    let row_bytes = packed.len() / output_rows;
+    let padded_packed = packed
+        .chunks_exact(row_bytes)
+        .flat_map(|row| row.iter().copied().chain(std::iter::repeat_n(0xff, row_bytes)))
+        .collect::<Vec<_>>();
+    let padded_packed = crate::from_bytes(
+        &padded_packed,
+        &[output_rows as i32, 2, row_bytes as i32],
+        crate::dtype::UINT8,
+    );
+    crate::eval(padded_packed.as_ref().unwrap());
+    let strided_packed = crate::as_strided(
+        padded_packed.as_ref().unwrap(),
+        &[output_rows as i32, row_bytes as i32],
+        &[(row_bytes * 2) as i64, 1],
+        0,
+    );
+    crate::eval(strided_input.as_ref().unwrap());
+    crate::eval(strided_packed.as_ref().unwrap());
+    assert!(!crate::ffi::array_is_row_contiguous(
+        strided_input.as_ref().unwrap()
+    ));
+    assert!(!crate::ffi::array_is_row_contiguous(
+        strided_packed.as_ref().unwrap()
+    ));
+
+    let expected = matrix
+        .compact_argmax_m34(input.as_ref().unwrap())
+        .unwrap();
+    let mut actual = crate::ggml_q6_head_argmax(
+        strided_input.as_ref().unwrap(),
+        strided_packed.as_ref().unwrap(),
+        matrix.iq3_grid.as_ref().unwrap(),
+        width as i32,
+        output_rows as i32,
+        3,
+    )
+    .unwrap();
+    let actual_scores = crate::qwen38_q6_head_argmax_take_scores(actual.pin_mut());
+    let actual_ids = crate::qwen38_q6_head_argmax_take_ids(actual.pin_mut());
+    assert_eq!(
+        crate::array_to_raw_bytes(actual_ids.as_ref().unwrap()),
+        crate::array_to_raw_bytes(expected.ids.as_ref().unwrap()),
+    );
+    assert_eq!(
+        crate::array_to_raw_bytes(actual_scores.as_ref().unwrap()),
+        crate::array_to_raw_bytes(expected.scores.as_ref().unwrap()),
+    );
+    let scores = raw_f32(actual_scores.as_ref().unwrap());
+    assert!(
+        scores.iter().all(|score| score.is_finite())
+            && scores.iter().any(|score| *score != 0.0),
+        "fixture must produce finite, nonzero selected scores"
+    );
+}
+
+#[test]
+fn q6_compact_argmax_preserves_ties_and_vocab_boundaries() {
+    if !crate::metal_is_available() {
+        return;
+    }
+    let width = 512usize;
+    let output_rows = 17usize;
+    let row_bytes = width / GgmlQType::Q6K.block_elements() * GgmlQType::Q6K.block_bytes();
+    let zero = vec![0u8; row_bytes * output_rows];
+    let zero_matrix =
+        GgmlQuantizedMatrix::from_bytes(&zero, GgmlQType::Q6K, width, output_rows).unwrap();
+    for rows in [3usize, 4] {
+        let input =
+            crate::from_slice_f32(&vec![1.0f32; rows * width], &[1, rows as i32, width as i32]);
+        let expected = vec![0u32; rows];
+        assert_q6_compact_argmax_matches_full(
+            &zero_matrix,
+            input.as_ref().unwrap(),
+            Some(&expected),
+        );
+    }
+
+    let source_row = fixture_matrix(GgmlQType::Q6K, width, 1);
+    let activation = decode_row(GgmlQType::Q6K, &source_row, width);
+    for (selected_rows, expected_id) in [(&[7usize, 8, 16][..], 7u32), (&[16usize][..], 16u32)] {
+        let mut packed = vec![0u8; row_bytes * output_rows];
+        for &row in selected_rows {
+            packed[row * row_bytes..(row + 1) * row_bytes].copy_from_slice(&source_row);
+        }
+        let matrix =
+            GgmlQuantizedMatrix::from_bytes(&packed, GgmlQType::Q6K, width, output_rows).unwrap();
+        for rows in [3usize, 4] {
+            let input_values = activation.repeat(rows);
+            let input = crate::from_slice_f32(&input_values, &[1, rows as i32, width as i32]);
+            let expected = vec![expected_id; rows];
+            assert_q6_compact_argmax_matches_full(
+                &matrix,
+                input.as_ref().unwrap(),
+                Some(&expected),
+            );
+        }
+    }
+}
+
+#[test]
+fn q6_compact_argmax_matches_nan_and_signed_zero_semantics() {
+    if !crate::metal_is_available() {
+        return;
+    }
+    let width = 512usize;
+    let output_rows = 17usize;
+    let row_bytes = width / GgmlQType::Q6K.block_elements() * GgmlQType::Q6K.block_bytes();
+
+    let signed_zero_logits =
+        crate::from_slice_f32(&[-0.0, 0.0, f32::NAN, 0.0, -0.0, f32::NAN], &[2, 3]);
+    let signed_zero_ids = crate::argmax_last_axis(signed_zero_logits.as_ref().unwrap());
+    let signed_zero_indices = crate::expand_dims(
+        crate::astype(signed_zero_ids.as_ref().unwrap(), crate::dtype::INT32)
+            .as_ref()
+            .unwrap(),
+        -1,
+    );
+    let selected_signed_zero = crate::take_along_axis(
+        signed_zero_logits.as_ref().unwrap(),
+        signed_zero_indices.as_ref().unwrap(),
+        -1,
+    );
+    assert_eq!(raw_u32(signed_zero_ids.as_ref().unwrap()), vec![0, 0]);
+    assert_eq!(
+        raw_f32(selected_signed_zero.as_ref().unwrap())
+            .into_iter()
+            .map(f32::to_bits)
+            .collect::<Vec<_>>(),
+        vec![(-0.0f32).to_bits(), 0.0f32.to_bits()],
+    );
+
+    for rows in [3usize, 4] {
+        let input =
+            crate::from_slice_f32(&vec![1.0f32; rows * width], &[1, rows as i32, width as i32]);
+
+        let mut mixed = vec![0u8; row_bytes * output_rows];
+        set_q6_row_scale(&mut mixed, width, 0, 0x7e00);
+        set_q6_row_scale(&mut mixed, width, 8, 0x7e00);
+        let mixed_matrix =
+            GgmlQuantizedMatrix::from_bytes(&mixed, GgmlQType::Q6K, width, output_rows).unwrap();
+        let mixed_full = mixed_matrix.forward(input.as_ref().unwrap()).unwrap();
+        let mixed_values = raw_f32(mixed_full.as_ref().unwrap());
+        assert!(mixed_values[0].is_nan());
+        assert!(mixed_values[8].is_nan());
+        assert!(mixed_values[1].is_finite());
+        assert_q6_compact_argmax_matches_full(
+            &mixed_matrix,
+            input.as_ref().unwrap(),
+            Some(&vec![1u32; rows]),
+        );
+
+        let mut all_nan = vec![0u8; row_bytes * output_rows];
+        for row in 0..output_rows {
+            set_q6_row_scale(&mut all_nan, width, row, 0x7e00);
+        }
+        let all_nan_matrix =
+            GgmlQuantizedMatrix::from_bytes(&all_nan, GgmlQType::Q6K, width, output_rows).unwrap();
+        let all_nan_compact = all_nan_matrix
+            .compact_argmax_m34(input.as_ref().unwrap())
+            .unwrap();
+        assert_eq!(raw_u32(all_nan_compact.ids.as_ref().unwrap()), vec![0u32; rows]);
+        assert!(
+            raw_f32(all_nan_compact.scores.as_ref().unwrap())
+                .into_iter()
+                .all(f32::is_nan)
+        );
+        assert_q6_compact_argmax_matches_full(
+            &all_nan_matrix,
+            input.as_ref().unwrap(),
+            Some(&vec![0u32; rows]),
+        );
+
+        let mut signed_zero = vec![0u8; row_bytes * output_rows];
+        for row in 0..output_rows {
+            set_q6_uniform_row(&mut signed_zero, width, row, 0x7e00, 1);
+        }
+        set_q6_uniform_row(&mut signed_zero, width, 0, 0x0001, 1);
+        set_q6_uniform_row(&mut signed_zero, width, 1, 0x0001, -1);
+        let signed_zero_matrix = GgmlQuantizedMatrix::from_bytes(
+            &signed_zero,
+            GgmlQType::Q6K,
+            width,
+            output_rows,
+        )
+        .unwrap();
+        let subnormal_input = crate::from_slice_f32(
+            &vec![f32::from_bits(1); rows * width],
+            &[1, rows as i32, width as i32],
+        );
+        assert_eq!(signed_zero[192], 1);
+        assert_eq!(signed_zero[row_bytes + 192], (-1i8) as u8);
+        let signed_zero_full = signed_zero_matrix
+            .forward(subnormal_input.as_ref().unwrap())
+            .unwrap();
+        let signed_zero_values = raw_f32(signed_zero_full.as_ref().unwrap());
+        assert_eq!(signed_zero_values[0], 0.0);
+        assert_eq!(signed_zero_values[1], 0.0);
+        assert_q6_compact_argmax_matches_full(
+            &signed_zero_matrix,
+            subnormal_input.as_ref().unwrap(),
+            Some(&vec![0u32; rows]),
+        );
+    }
 }
 
 fn ulp_distance(left: f32, right: f32) -> u32 {
@@ -1008,6 +1330,7 @@ fn actual_q6_lm_head_selected_logits_and_ids_are_exact() {
             rows,
             GgmlKernelPath::Qwen38Q6HeadVerifyR8,
         );
+        assert_q6_compact_argmax_matches_full(&matrix, input.as_ref().unwrap(), None);
     }
 }
 

@@ -35,6 +35,8 @@ mod ffi {
 
         /// Three lazy outputs from the pinned full-attention QKV bundle.
         type Qwen38GgmlQkvOutputs;
+        /// Compact score/index outputs from the pinned Q6 target head.
+        type Qwen38Q6HeadArgmaxOutputs;
 
         /// Opaque wrapper for one MLX quantize() result triple.
         type MlxQuantizedWeights;
@@ -1845,6 +1847,22 @@ mod ffi {
             qwen38_q6_head_verify_r8: bool,
         ) -> Result<UniquePtr<MlxArray>>;
 
+        /// Exact rowwise argmax over an M3/M4 Q6_K matrix without materializing logits.
+        fn ggml_q6_head_argmax(
+            x: &MlxArray,
+            packed: &MlxArray,
+            iq3_grid: &MlxArray,
+            in_features: i32,
+            out_features: i32,
+            input_rows: i32,
+        ) -> Result<UniquePtr<Qwen38Q6HeadArgmaxOutputs>>;
+        fn qwen38_q6_head_argmax_take_scores(
+            outputs: Pin<&mut Qwen38Q6HeadArgmaxOutputs>,
+        ) -> UniquePtr<MlxArray>;
+        fn qwen38_q6_head_argmax_take_ids(
+            outputs: Pin<&mut Qwen38Q6HeadArgmaxOutputs>,
+        ) -> UniquePtr<MlxArray>;
+
         /// Direct Metal embedding lookup over original GGUF block bytes.
         fn ggml_packed_embedding(
             indices: &MlxArray,
@@ -3451,7 +3469,7 @@ mod ops;
 mod qwen38_q6;
 pub use ggml::{
     GgmlDispatchStats, GgmlKernelPath, GgmlQType, GgmlQuantError, GgmlQuantizedEmbedding,
-    GgmlQuantizedMatrix, GgmlQuantizedRows,
+    GgmlQuantizedMatrix, GgmlQuantizedRows, Qwen38Q6HeadArgmax,
 };
 pub use ggml_affine::{
     GgmlAffineEmbedding, GgmlAffineError, GgmlAffineMatrix, GgmlAffineRows,

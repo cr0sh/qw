@@ -1783,6 +1783,104 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the complete pinned Qwen3.8 27B GGUF pair and exclusive Metal access"]
+    fn real_model_q6_compact_mtp_matches_full_verifier_state() {
+        let mut provider =
+            Qwen35Provider::load(KVCacheMode::Fp16).expect("load selected Qwen3.8 GGUF pair");
+        let request = GenerationRequest {
+            prompt: "Continue this deterministic sequence with concise terms: alpha, beta, gamma,"
+                .to_string(),
+            max_tokens: 24,
+            temperature: Some(0.0),
+            top_k: Some(1),
+            top_p: Some(1.0),
+            seed: Some(0),
+        };
+        let (prompt_ids, sampling) = provider
+            .prepare_generation(&request)
+            .expect("prepare deterministic MTP request");
+
+        crate::qwen3_5::reset_qwen38_mtp_compact_verify_count();
+        let (full, full_stats) =
+            crate::qwen3_5::with_qwen38_mtp_compact_head_for_test(false, || {
+                provider.generate_mtp_streaming_for_prompt(
+                    MtpPrompt::Text {
+                        prompt_ids: &prompt_ids,
+                    },
+                    request.max_tokens,
+                    &sampling,
+                    DEFAULT_MTP_BLOCK_SIZE,
+                    None,
+                    &[],
+                    None,
+                    |_| true,
+                    true,
+                )
+            })
+            .expect("full-head MTP generation");
+        assert_eq!(crate::qwen3_5::qwen38_mtp_compact_verify_count(), 0);
+
+        crate::qwen3_5::reset_qwen38_mtp_compact_verify_count();
+        let (compact, compact_stats) =
+            crate::qwen3_5::with_qwen38_mtp_compact_head_for_test(true, || {
+                provider.generate_mtp_streaming_for_prompt(
+                    MtpPrompt::Text {
+                        prompt_ids: &prompt_ids,
+                    },
+                    request.max_tokens,
+                    &sampling,
+                    DEFAULT_MTP_BLOCK_SIZE,
+                    None,
+                    &[],
+                    None,
+                    |_| true,
+                    true,
+                )
+            })
+            .expect("compact-head MTP generation");
+        assert!(
+            crate::qwen3_5::qwen38_mtp_compact_verify_count() > 0,
+            "real generation must dispatch the Q6 compact verifier"
+        );
+
+        assert_eq!(compact.token_ids, full.token_ids, "emitted tokens differ");
+        assert_eq!(compact.text, full.text, "emitted text differs");
+        assert_eq!(compact.finish_outcome, full.finish_outcome);
+        assert_eq!(
+            compact_stats.accepted_draft_tokens, full_stats.accepted_draft_tokens,
+            "accepted draft count differs"
+        );
+        assert_eq!(
+            compact_stats.proposed_draft_tokens, full_stats.proposed_draft_tokens,
+            "proposed draft count differs"
+        );
+        assert_eq!(
+            compact_stats.target_forward_calls, full_stats.target_forward_calls,
+            "target forward count differs"
+        );
+        assert_eq!(
+            compact_stats.speculative_rounds, full_stats.speculative_rounds,
+            "speculative round count differs"
+        );
+        let full_state = full
+            .final_snapshot
+            .as_ref()
+            .expect("full-head final snapshot")
+            .to_portable()
+            .expect("materialize full-head state");
+        let compact_state = compact
+            .final_snapshot
+            .as_ref()
+            .expect("compact-head final snapshot")
+            .to_portable()
+            .expect("materialize compact-head state");
+        assert_eq!(
+            compact_state, full_state,
+            "target caches, drafter caches, and next-round state differ"
+        );
+    }
+
+    #[test]
     #[ignore = "requires real target and SpecPrefill draft checkpoints at their configured or default cache paths"]
     fn real_model_dense_specprefill_dense_has_no_position_state_leakage() {
         let draft_dir = crate::model_resolver::resolve_specprefill_draft_path(None)

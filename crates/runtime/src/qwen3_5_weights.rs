@@ -9,7 +9,8 @@ use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{
     GgmlAffineEmbedding, GgmlAffineMatrix, GgmlAffineRows, GgmlAffineTranscodeStats, GgmlQType,
     GgmlQuantizedEmbedding, GgmlQuantizedMatrix, GgmlQuantizedRows, MlxArray, Qwen38MixedQkvBundle,
-    Qwen38Q6DualMatrix, Qwen38Q6Shape, Qwen38Q6TranscodeStats, Qwen38QkvMatrix, UniquePtr, dtype,
+    Qwen38Q6DualMatrix, Qwen38Q6HeadArgmax, Qwen38Q6Shape, Qwen38Q6TranscodeStats, Qwen38QkvMatrix,
+    UniquePtr, dtype,
 };
 
 use crate::gguf::{GgufFile, GgufTensorInfo, PinnedGgufPair};
@@ -91,6 +92,19 @@ impl Qwen35Linear {
 
     pub(crate) fn needs_m4_exact_split(&self) -> bool {
         matches!(self, Self::Q6Dual(_) | Self::Gguf(_))
+    }
+
+    pub(crate) fn supports_qwen38_q6_head_argmax(&self) -> bool {
+        matches!(self, Self::Gguf(linear) if linear.is_qwen38_q6_head())
+    }
+
+    pub(crate) fn qwen38_q6_head_argmax(&self, input: &MlxArray) -> Option<Qwen38Q6HeadArgmax> {
+        match self {
+            Self::Gguf(linear) if linear.is_qwen38_q6_head() => {
+                linear.compact_argmax_m34(input).ok()
+            }
+            _ => None,
+        }
     }
 
 
