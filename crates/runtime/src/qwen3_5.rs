@@ -4284,6 +4284,91 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires the complete pinned Qwen3.8 27B GGUF pair and Metal"]
+    fn experimental_qwen38_fp16_attention_whole_model_quality() {
+        fn select_attention_precision(model: &mut Qwen35Model, fp16: bool) {
+            let mut attention_layers = 0;
+            for layer in &mut model.layers {
+                if let Qwen35AttentionVariant::FullAttention(attention) = &mut layer.attention {
+                    attention.set_high_m_fp16_attention_for_test(fp16);
+                    attention_layers += 1;
+                }
+            }
+            assert!(attention_layers > 0);
+        }
+
+        fn capture(model: &Qwen35Model, rows: usize, repetition: usize) -> Vec<f32> {
+            model.reset_runtime_state();
+            let prefix = mlxcel_core::from_slice_i32(&[9_707, 11], &[1, 2]);
+            model
+                .forward_mtp_prefill_chunks(&prefix, None, None, None, |_, _, _| {})
+                .expect("target prefix");
+            let tokens = (0..rows)
+                .map(|index| {
+                    1 + ((index * 7_919 + repetition * 104_729 + 1_879) % 200_000) as i32
+                })
+                .collect::<Vec<_>>();
+            let block = mlxcel_core::from_slice_i32(&tokens, &[1, rows as i32]);
+            let logits = model.forward_mtp_verify(&block).logits;
+            let shape = mlxcel_core::array_shape(&logits);
+            let mut start = vec![0; shape.len()];
+            let mut end = shape.clone();
+            start[shape.len() - 2] = rows as i32 - 1;
+            end[shape.len() - 2] = rows as i32;
+            let last_row = mlxcel_core::slice(&logits, &start, &end);
+            mlxcel_core::eval(&last_row);
+            mlxcel_core::array_to_raw_bytes(&last_row)
+                .chunks_exact(4)
+                .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect()
+        }
+
+        unsafe { std::env::remove_var("QWR_EXPERIMENT_LONG_ATTN_F16") };
+        let (mut model, _) =
+            Qwen35Model::load_pinned(KVCacheMode::Turbo4).expect("load Qwen3.8 GGUF");
+        for rows in [1, 3, 4] {
+            select_attention_precision(&mut model, false);
+            let reference = capture(&model, rows, 0);
+            select_attention_precision(&mut model, true);
+            let candidate = capture(&model, rows, 0);
+            let max_ulp = reference
+                .iter()
+                .zip(&candidate)
+                .map(|(&reference, &candidate)| {
+                    let ordered = |value: f32| {
+                        let bits = value.to_bits() as i32;
+                        if bits < 0 { i32::MIN - bits } else { bits }
+                    };
+                    ordered(reference).abs_diff(ordered(candidate))
+                })
+                .max()
+                .unwrap_or(0);
+            assert!(
+                max_ulp <= 1,
+                "disabled Qwen3.8 M={rows} path differs by {max_ulp} ULP"
+            );
+        }
+        for rows in [128, 288] {
+            for repetition in 0..3 {
+                select_attention_precision(&mut model, false);
+                let reference = capture(&model, rows, repetition);
+                select_attention_precision(&mut model, true);
+                let candidate = capture(&model, rows, repetition);
+                let result = crate::qwen3_next::diagnose_f32(&reference, &candidate);
+                eprintln!(
+                    "QWEN38_FP16_ATTN_MODEL_QUALITY M={rows} repetition={repetition} finite=true max_abs={:.9e} rmse={:.9e} cosine={:.12} kl={:.9e} top1_equal={} top10_overlap={}/10",
+                    result.max_abs,
+                    result.rmse,
+                    result.cosine,
+                    result.kl,
+                    result.top1_equal,
+                    result.top10_overlap,
+                );
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "requires the complete pinned Qwen3.8 27B GGUF pair"]
     fn real_gguf_affine_fusion_exactness_and_timing() {
         fn load_focused(fused: bool) -> (Mlp, Qwen35GatedDeltaNet) {
