@@ -3615,8 +3615,8 @@ impl KVCache {
         )
     }
 
-    /// Append symmetric Turbo4 K/V exactly once and use the permanent
-    /// dequant-first oracle for general attention shapes.
+    /// Append symmetric Turbo4 K/V exactly once and attend from the packed
+    /// cache when the single-query kernel supports the shape.
     pub fn update_and_turbo4_attention(
         &mut self,
         q: &MlxArray,
@@ -3631,14 +3631,20 @@ impl KVCache {
             "update_and_turbo4_attention requires Turbo4 mode"
         );
         self.update(new_keys, new_values);
+        if mask.is_none()
+            && ffi::array_shape(q).get(2) == Some(&1)
+            && let Some(output) = self.turbo4_fused_attention_prefix(q, self.offset, scale)
+        {
+            return output;
+        }
         self.turbo4_dequant_sdpa_prefix(q, self.offset, scale, mask, false)
     }
 
     /// Multi-token bottom-right causal variant of symmetric Turbo4 attention.
     ///
-    /// Speculative verification requires the same result as sequential decode,
-    /// so this path uses exact dequantization rather than the approximate
-    /// packed two-pass kernel.
+    /// K/V are appended once. Each query row then reuses the packed M1 kernel
+    /// against exactly the prefix visible to the corresponding sequential
+    /// decode step.
     pub fn update_and_turbo4_causal_attention(
         &mut self,
         q: &MlxArray,
@@ -3651,7 +3657,39 @@ impl KVCache {
             KVCacheMode::Turbo4,
             "update_and_turbo4_causal_attention requires Turbo4 mode"
         );
+        let old_offset = self.offset;
         self.update(new_keys, new_values);
+        let q_shape = ffi::array_shape(q);
+        if q_shape.len() == 4 && (2..=5).contains(&q_shape[2]) {
+            let mut rows = Vec::with_capacity(q_shape[2] as usize);
+            for row in 0..q_shape[2] {
+                let q_row = ffi::slice(
+                    q,
+                    &[0, 0, row, 0],
+                    &[q_shape[0], q_shape[1], row + 1, q_shape[3]],
+                );
+                let Some(output) = self.turbo4_fused_attention_prefix(
+                    &q_row,
+                    old_offset + row + 1,
+                    scale,
+                ) else {
+                    return self.turbo4_dequant_sdpa_prefix(
+                        q,
+                        self.offset,
+                        scale,
+                        None,
+                        true,
+                    );
+                };
+                rows.push(output);
+            }
+            let pointers = rows
+                .iter()
+                .map(|row| &**row as *const MlxArray)
+                .collect::<Vec<_>>();
+            // SAFETY: `rows` owns every pointee through concatenation.
+            return unsafe { ffi::concatenate(&pointers, 2) };
+        }
         self.turbo4_dequant_sdpa_prefix(q, self.offset, scale, None, true)
     }
 
@@ -3671,6 +3709,48 @@ impl KVCache {
         true
     }
 
+    fn turbo4_fused_attention_prefix(
+        &self,
+        q: &MlxArray,
+        prefix_len: i32,
+        scale: f32,
+    ) -> Option<UniquePtr<MlxArray>> {
+        let kp = self.k_packed.as_ref().expect("k_packed must exist");
+        let kr = self.k_rescale.as_ref().expect("k_rescale must exist");
+        let vp = self.v_packed.as_ref().expect("v_packed must exist");
+        let vr = self.v_rescale.as_ref().expect("v_rescale must exist");
+        let params = self
+            .turbo_params
+            .as_ref()
+            .expect("turbo_params must be initialised after first update_turbo4_sym");
+        let kp_shape = ffi::array_shape(kp);
+        let kr_shape = ffi::array_shape(kr);
+        let vp_shape = ffi::array_shape(vp);
+        let vr_shape = ffi::array_shape(vr);
+        let kp = ffi::slice(
+            kp,
+            &[0, 0, 0, 0],
+            &[kp_shape[0], kp_shape[1], prefix_len, kp_shape[3]],
+        );
+        let kr = ffi::slice(
+            kr,
+            &[0, 0, 0, 0],
+            &[kr_shape[0], kr_shape[1], prefix_len, 1],
+        );
+        let vp = ffi::slice(
+            vp,
+            &[0, 0, 0, 0],
+            &[vp_shape[0], vp_shape[1], prefix_len, vp_shape[3]],
+        );
+        let vr = ffi::slice(
+            vr,
+            &[0, 0, 0, 0],
+            &[vr_shape[0], vr_shape[1], prefix_len, 1],
+        );
+        turbo::fused_attention::attention_turbo4_fused(
+            q, &kp, &kr, &vp, &vr, params, scale, true,
+        )
+    }
 
     fn turbo4_dequant_sdpa_prefix(
         &self,
