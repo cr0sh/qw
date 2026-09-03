@@ -1915,6 +1915,20 @@ mod ffi {
             require_pinned_shape: bool,
         ) -> Result<UniquePtr<MlxArray>>;
 
+        /// Shared low-M gate/up projection and SwiGLU carrier for the pinned MLP.
+        #[allow(clippy::too_many_arguments)]
+        fn qwen38_affine_mlp_gate_up(
+            x: &MlxArray,
+            gate_weight: &MlxArray,
+            gate_scales: &MlxArray,
+            gate_biases: &MlxArray,
+            up_weight: &MlxArray,
+            up_scales: &MlxArray,
+            up_biases: &MlxArray,
+            bits: i32,
+            input_rows: i32,
+        ) -> Result<UniquePtr<MlxArray>>;
+
         /// M>=4 all-affine MLP for the exact pinned Qwen3.8 artifact.
         #[allow(clippy::too_many_arguments)]
         fn qwen38_affine_mlp_fused(
@@ -3474,8 +3488,8 @@ pub use ggml::{
 pub use ggml_affine::{
     GgmlAffineEmbedding, GgmlAffineError, GgmlAffineMatrix, GgmlAffineRows,
     GgmlAffineTranscodeStats, Qwen38AffineGdnIngressFusion, Qwen38AffineMlpFusion,
-    Qwen38FusionStats, Qwen38GdnIngressOutput, Qwen38MixedQkvBundle, Qwen38MixedQkvOutput,
-    Qwen38QkvMatrix,
+    Qwen38AffineMlpInputFusion, Qwen38FusionStats, Qwen38GdnIngressOutput,
+    Qwen38MixedQkvBundle, Qwen38MixedQkvOutput, Qwen38QkvMatrix,
 };
 pub use qwen38_q6::{Qwen38Q6DualMatrix, Qwen38Q6Error, Qwen38Q6Shape, Qwen38Q6TranscodeStats};
 

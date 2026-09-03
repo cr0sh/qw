@@ -2294,6 +2294,7 @@ impl Qwen35Model {
         Self::load_pinned_from_weight_source(weights, kv_cache_mode)
     }
 
+
     fn load_pinned_from_weight_source(
         weights: GgufWeightSource,
         kv_cache_mode: KVCacheMode,
@@ -4733,6 +4734,152 @@ mod tests {
                 gdn_stats.workspace_bytes,
             );
         }
+    }
+
+    #[test]
+    #[ignore = "requires the complete pinned Qwen3.8 27B GGUF pair and exclusive Metal access"]
+    fn real_gguf_mlp_carrier_exactness_and_timing() {
+        fn load(carrier: bool) -> Mlp {
+            let weights = if carrier {
+                GgufWeightSource::open()
+            } else {
+                GgufWeightSource::open_without_mlp_carrier()
+            }
+            .expect("open pinned GGUF pair");
+            let config = weights.config().expect("load pinned config");
+            Mlp::from_weights(
+                &weights,
+                &config.to_qwen3next_config(),
+                ModelRole::Target,
+                1,
+            )
+            .expect("load compatible 23/23/20 MLP")
+        }
+
+        fn input(rows: usize) -> UniquePtr<MlxArray> {
+            let values = (0..rows * 5120)
+                .map(|index| {
+                    let row = index / 5120;
+                    let column = index % 5120;
+                    (column as i32 % 43 - 21) as f32 * 0.001953125
+                        + row as f32 * 0.000244140625
+                })
+                .collect::<Vec<_>>();
+            mlxcel_core::from_slice_f32(&values, &[1, rows as i32, 5120])
+        }
+
+        fn evaluated_bytes(output: UniquePtr<MlxArray>) -> Vec<u8> {
+            mlxcel_core::eval(&output);
+            mlxcel_core::array_to_raw_bytes(&output)
+        }
+
+        fn median(mut values: Vec<std::time::Duration>) -> std::time::Duration {
+            values.sort_unstable();
+            values[values.len() / 2]
+        }
+
+        fn measure(mlp: &Mlp, input: &MlxArray) -> std::time::Duration {
+            evaluated_bytes(mlp.forward(input));
+            median(
+                (0..5)
+                    .map(|_| {
+                        let started = std::time::Instant::now();
+                        evaluated_bytes(mlp.forward(input));
+                        started.elapsed()
+                    })
+                    .collect(),
+            )
+        }
+
+        let baseline = load(false);
+        let carrier = load(true);
+        for rows in [1usize, 3, 4] {
+            let input = input(rows);
+            assert_eq!(
+                evaluated_bytes(baseline.forward(&input)),
+                evaluated_bytes(carrier.forward(&input)),
+                "carrier MLP differs at M{rows}",
+            );
+            let baseline_time = measure(&baseline, &input);
+            let carrier_time = measure(&carrier, &input);
+            let stats = carrier
+                .fusion_stats(rows)
+                .expect("carrier MLP fusion stats");
+            assert_eq!(stats.physical_dispatches, 2);
+            assert_eq!(stats.intermediate_bytes_avoided, rows * 17_408 * 8);
+            eprintln!(
+                "QWEN38_MLP_CARRIER_TIMING M={} baseline_ms={:.6} carrier_ms={:.6} ratio={:.6}",
+                rows,
+                baseline_time.as_secs_f64() * 1e3,
+                carrier_time.as_secs_f64() * 1e3,
+                carrier_time.as_secs_f64() / baseline_time.as_secs_f64(),
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the complete pinned Qwen3.8 target GGUF and exclusive Metal access"]
+    fn real_gguf_mlp_carrier_to_q6_down_is_exact_and_incompatible_pairs_fall_back() {
+        fn load(weights: &GgufWeightSource, config: &Qwen3NextConfig, layer: usize) -> Mlp {
+            Mlp::from_weights(weights, config, ModelRole::Target, layer)
+                .unwrap_or_else(|error| panic!("load target MLP layer {layer}: {error}"))
+        }
+
+        fn input(rows: usize) -> UniquePtr<MlxArray> {
+            let values = (0..rows * 5120)
+                .map(|index| {
+                    let row = index / 5120;
+                    let column = index % 5120;
+                    (column as i32 % 43 - 21) as f32 * 0.001953125
+                        + row as f32 * 0.000244140625
+                })
+                .collect::<Vec<_>>();
+            mlxcel_core::from_slice_f32(&values, &[1, rows as i32, 5120])
+        }
+
+        fn evaluated_bytes(output: UniquePtr<MlxArray>) -> Vec<u8> {
+            mlxcel_core::eval(&output);
+            mlxcel_core::array_to_raw_bytes(&output)
+        }
+
+        let baseline_weights =
+            GgufWeightSource::open_without_mlp_carrier().expect("open baseline pinned GGUF pair");
+        let baseline_config = baseline_weights
+            .config()
+            .expect("load baseline pinned config")
+            .to_qwen3next_config();
+        let carrier_weights = GgufWeightSource::open().expect("open carrier pinned GGUF pair");
+        let carrier_config = carrier_weights
+            .config()
+            .expect("load carrier pinned config")
+            .to_qwen3next_config();
+
+        let baseline = load(&baseline_weights, &baseline_config, 56);
+        let carrier = load(&carrier_weights, &carrier_config, 56);
+        assert!(carrier.uses_carrier_with_q6_down_test_only());
+        for rows in [3usize, 4] {
+            let input = input(rows);
+            assert_eq!(
+                evaluated_bytes(baseline.forward(input.as_ref().unwrap())),
+                evaluated_bytes(carrier.forward(input.as_ref().unwrap())),
+                "carrier to Q6-down MLP differs at M{rows}",
+            );
+        }
+        drop(carrier);
+        drop(baseline);
+        mlxcel_core::memory::clear_cache();
+
+        let mixed_sidecar = load(&carrier_weights, &carrier_config, 3);
+        let stats = mixed_sidecar
+            .fusion_stats(3)
+            .expect("all-affine incompatible pair exposes fallback stats");
+        assert_eq!(stats.physical_dispatches, 4);
+        assert_eq!(stats.intermediate_bytes_avoided, 0);
+        drop(mixed_sidecar);
+        mlxcel_core::memory::clear_cache();
+
+        let q6_producer = load(&carrier_weights, &carrier_config, 58);
+        assert!(q6_producer.uses_separate_path_test_only());
     }
 
     struct CandidateVerifyRun {

@@ -7102,6 +7102,15 @@ pub(crate) enum Qwen38PlanRole {
     Mtp,
 }
 
+const fn mlp_carrier_storage(qtype: u32) -> Option<(u32, bool)> {
+    match qtype {
+        8 | 11 | 20 | 23 => Some((8, false)),
+        12 => Some((4, false)),
+        13 | 21 => Some((5, true)),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Qwen38MlpFusionDescriptor {
     pub role: Qwen38PlanRole,
@@ -7113,6 +7122,18 @@ pub(crate) struct Qwen38MlpFusionDescriptor {
 impl Qwen38MlpFusionDescriptor {
     pub const fn all_affine(self) -> bool {
         self.qtypes[0] != 14 && self.qtypes[1] != 14 && self.qtypes[2] != 14
+    }
+
+    pub const fn carrier_compatible(self) -> bool {
+        match (
+            mlp_carrier_storage(self.qtypes[0]),
+            mlp_carrier_storage(self.qtypes[1]),
+        ) {
+            (Some((gate_bits, gate_f16)), Some((up_bits, up_f16))) => {
+                gate_bits == up_bits && gate_f16 == up_f16
+            }
+            _ => false,
+        }
     }
 }
 
@@ -7381,6 +7402,62 @@ mod tests {
                 assert_eq!(tensor.dimensions, dimensions[index]);
             }
         }
+    }
+
+    #[test]
+    fn mlp_carrier_inventory_accepts_only_shared_storage_topologies() {
+        let target = QWEN38_MLP_FUSION_PLAN
+            .iter()
+            .filter(|descriptor| descriptor.role == Qwen38PlanRole::Target)
+            .collect::<Vec<_>>();
+        let mut pairs = std::collections::BTreeMap::new();
+        for descriptor in &target {
+            *pairs
+                .entry((descriptor.qtypes[0], descriptor.qtypes[1]))
+                .or_insert(0usize) += 1;
+        }
+        assert_eq!(
+            pairs.into_iter().collect::<Vec<_>>(),
+            vec![
+                ((11, 23), 1),
+                ((12, 12), 3),
+                ((12, 13), 7),
+                ((12, 23), 3),
+                ((13, 13), 18),
+                ((13, 20), 1),
+                ((14, 13), 2),
+                ((14, 14), 2),
+                ((20, 13), 1),
+                ((20, 23), 1),
+                ((23, 11), 2),
+                ((23, 12), 3),
+                ((23, 13), 4),
+                ((23, 23), 16),
+            ],
+        );
+
+        let compatible = target
+            .iter()
+            .filter(|descriptor| descriptor.carrier_compatible())
+            .count();
+        let q6 = target
+            .iter()
+            .filter(|descriptor| descriptor.qtypes[..2].contains(&14))
+            .count();
+        let mixed_sidecars = target
+            .iter()
+            .filter(|descriptor| {
+                !descriptor.qtypes[..2].contains(&14)
+                    && (matches!(descriptor.qtypes[0], 13 | 21)
+                        != matches!(descriptor.qtypes[1], 13 | 21))
+            })
+            .count();
+        let different_bits = target.len() - compatible - q6 - mixed_sidecars;
+        assert_eq!(
+            (compatible, mixed_sidecars, different_bits, q6),
+            (41, 13, 6, 4),
+        );
+        assert!(QWEN38_MLP_FUSION_PLAN[64].carrier_compatible());
     }
 
     #[test]

@@ -2390,6 +2390,18 @@ std::unique_ptr<MlxArray> qwen38_affine_m234_matmul(
     int32_t input_rows,
     bool require_pinned_shape);
 
+// Shared low-M gate/up projection and SwiGLU carrier for the pinned MLP.
+std::unique_ptr<MlxArray> qwen38_affine_mlp_gate_up(
+    const MlxArray& x,
+    const MlxArray& gate_weight,
+    const MlxArray& gate_scales,
+    const MlxArray& gate_biases,
+    const MlxArray& up_weight,
+    const MlxArray& up_scales,
+    const MlxArray& up_biases,
+    int32_t bits,
+    int32_t input_rows);
+
 // M>=4 all-affine fusion for the exact pinned Qwen3.8 artifact.
 std::unique_ptr<MlxArray> qwen38_affine_mlp_fused(
     const MlxArray& x,

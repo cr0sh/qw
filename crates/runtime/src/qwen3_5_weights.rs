@@ -16,6 +16,22 @@ use mlxcel_core::{
 use crate::gguf::{GgufFile, GgufTensorInfo, PinnedGgufPair};
 use crate::qwen3_5::Qwen35Config;
 
+pub(crate) const QWEN38_MLP_CARRIER_ENV_VAR: &str = "MLXCEL_QWEN38_MLP_CARRIER";
+
+fn parse_qwen38_mlp_carrier_enabled(value: Option<&str>) -> bool {
+    !value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    })
+}
+
+fn qwen38_mlp_carrier_enabled_from_env() -> bool {
+    let value = std::env::var(QWEN38_MLP_CARRIER_ENV_VAR).ok();
+    parse_qwen38_mlp_carrier_enabled(value.as_deref())
+}
+
 pub(crate) enum Qwen35Linear {
     #[cfg(any(feature = "specprefill", test))]
     Legacy(UnifiedLinear),
@@ -88,6 +104,16 @@ impl Qwen35Linear {
 
     pub(crate) fn is_affine(&self) -> bool {
         matches!(self, Self::Affine(_) | Self::PinnedM234Affine(_))
+    }
+
+    pub(crate) fn supports_qwen38_mlp_carrier_with(&self, other: &Self) -> bool {
+        let (Self::Affine(left) | Self::PinnedM234Affine(left)) = self else {
+            return false;
+        };
+        let (Self::Affine(right) | Self::PinnedM234Affine(right)) = other else {
+            return false;
+        };
+        left.supports_qwen38_mlp_carrier_with(right)
     }
 
     pub(crate) fn needs_m4_exact_split(&self) -> bool {
@@ -399,6 +425,10 @@ pub(crate) trait Qwen35WeightSource {
         false
     }
 
+    fn qwen38_mlp_carrier_enabled(&self) -> bool {
+        false
+    }
+
     fn is_pinned_qwen38_gguf(&self) -> bool {
         false
     }
@@ -666,29 +696,36 @@ pub(crate) struct GgufWeightSource {
     affine_stats: RefCell<GgufAffineLoadStats>,
     enable_m234: bool,
     enable_fusion: bool,
+    enable_mlp_carrier: bool,
     mixed_q5_sidecars: bool,
 }
 
 impl GgufWeightSource {
     pub(crate) fn open() -> Result<Self> {
-        Self::open_with_features(true, true, true)
+        Self::open_with_features(true, true, true, qwen38_mlp_carrier_enabled_from_env())
     }
 
 
     #[cfg(test)]
     pub(crate) fn open_without_fusion() -> Result<Self> {
-        Self::open_with_features(true, false, true)
+        Self::open_with_features(true, false, true, false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_without_mlp_carrier() -> Result<Self> {
+        Self::open_with_features(true, true, true, false)
     }
 
     #[cfg(test)]
     pub(crate) fn open_without_mixed_q5_sidecars() -> Result<Self> {
-        Self::open_with_features(true, true, false)
+        Self::open_with_features(true, true, false, qwen38_mlp_carrier_enabled_from_env())
     }
 
     fn open_with_features(
         enable_m234: bool,
         enable_fusion: bool,
         mixed_q5_sidecars: bool,
+        enable_mlp_carrier: bool,
     ) -> Result<Self> {
         let pair = PinnedGgufPair::open()?;
         // PinnedGgufPair verifies both payload hashes and exact plans first.
@@ -704,6 +741,7 @@ impl GgufWeightSource {
             enable_m234,
             enable_fusion,
             mixed_q5_sidecars,
+            enable_mlp_carrier,
         })
     }
 
@@ -1164,6 +1202,10 @@ impl Qwen35WeightSource for GgufWeightSource {
         self.enable_fusion && cfg!(target_os = "macos")
     }
 
+    fn qwen38_mlp_carrier_enabled(&self) -> bool {
+        self.enable_fusion && self.enable_mlp_carrier && cfg!(target_os = "macos")
+    }
+
     fn is_pinned_qwen38_gguf(&self) -> bool {
         true
     }
@@ -1259,6 +1301,16 @@ fn layer_slot_offset(full: bool, tensor: LayerTensor) -> std::result::Result<usi
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn qwen38_mlp_carrier_kill_switch_defaults_on() {
+        assert!(parse_qwen38_mlp_carrier_enabled(None));
+        assert!(parse_qwen38_mlp_carrier_enabled(Some("1")));
+        assert!(parse_qwen38_mlp_carrier_enabled(Some("yes")));
+        for disabled in ["0", "false", "OFF", " no "] {
+            assert!(!parse_qwen38_mlp_carrier_enabled(Some(disabled)));
+        }
+    }
 
     fn max_ulp_bytes(left: &[u8], right: &[u8]) -> u32 {
         assert_eq!(left.len(), right.len());
@@ -1870,6 +1922,121 @@ mod tests {
         eprintln!(
             "QWEN38_AFFINE_M234_COVERAGE pairs=24 max_m1_vs_m4_ulp={}",
             aggregate_max_ulp
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the complete pinned Qwen3.8 target GGUF and exclusive Metal access"]
+    fn real_pinned_mlp_carrier_all_production_pairs_are_within_one_ulp() {
+        if !mlxcel_core::metal_is_available() {
+            return;
+        }
+        let mut representatives = BTreeMap::new();
+        for descriptor in crate::qwen38_plan::QWEN38_MLP_FUSION_PLAN {
+            if descriptor.role == crate::qwen38_plan::Qwen38PlanRole::Target
+                && descriptor.carrier_compatible()
+            {
+                representatives
+                    .entry((descriptor.qtypes[0], descriptor.qtypes[1]))
+                    .or_insert(descriptor);
+            }
+        }
+        assert_eq!(
+            representatives.keys().copied().collect::<Vec<_>>(),
+            vec![(11, 23), (12, 12), (13, 13), (20, 23), (23, 11), (23, 23)],
+        );
+
+        let weights = GgufWeightSource::open().expect("open pinned GGUF pair");
+        let mut aggregate_max_ulp = 0u32;
+        for ((gate_qtype, up_qtype), descriptor) in representatives {
+            let gate = weights
+                .load_linear(
+                    TensorSlot::Layer {
+                        role: ModelRole::Target,
+                        layer: descriptor.layer,
+                        tensor: LayerTensor::MlpGate,
+                    },
+                    PinnedSlot::Target(descriptor.slots[0]),
+                    "MLP carrier gate representative",
+                )
+                .expect("load MLP carrier gate");
+            let up = weights
+                .load_linear(
+                    TensorSlot::Layer {
+                        role: ModelRole::Target,
+                        layer: descriptor.layer,
+                        tensor: LayerTensor::MlpUp,
+                    },
+                    PinnedSlot::Target(descriptor.slots[1]),
+                    "MLP carrier up representative",
+                )
+                .expect("load MLP carrier up");
+            let Qwen35Linear::PinnedM234Affine(gate) = gate else {
+                panic!("MLP carrier gate representative is not pinned affine");
+            };
+            let Qwen35Linear::PinnedM234Affine(up) = up else {
+                panic!("MLP carrier up representative is not pinned affine");
+            };
+            assert!(gate.supports_qwen38_mlp_carrier_with(&up));
+            let baseline_gate = gate.clone_shared();
+            let baseline_up = up.clone_shared();
+            let fusion =
+                mlxcel_core::Qwen38AffineMlpInputFusion::new(gate, up, [true, true], true)
+                    .expect("construct MLP carrier");
+
+            let mut pair_max_ulp = 0u32;
+            for rows in [1usize, 3, 4] {
+                let values = (0..rows * 5120)
+                    .map(|index| {
+                        let row = index / 5120;
+                        let column = index % 5120;
+                        (column as i32 % 47 - 23) as f32 * 0.001953125
+                            + row as f32 * 0.000244140625
+                    })
+                    .collect::<Vec<_>>();
+                let input =
+                    mlxcel_core::from_slice_f32(&values, &[1, rows as i32, 5120]);
+                let gate = baseline_gate
+                    .forward_qwen38_m234(input.as_ref().unwrap())
+                    .expect("baseline gate");
+                let up = baseline_up
+                    .forward_qwen38_m234(input.as_ref().unwrap())
+                    .expect("baseline up");
+                let expected = mlxcel_core::compiled_swiglu_activation(
+                    gate.as_ref().unwrap(),
+                    up.as_ref().unwrap(),
+                );
+                let actual = fusion
+                    .forward(input.as_ref().unwrap())
+                    .expect("MLP carrier output");
+                mlxcel_core::eval(expected.as_ref().unwrap());
+                mlxcel_core::eval(actual.as_ref().unwrap());
+                let max_ulp = max_ulp(expected.as_ref().unwrap(), actual.as_ref().unwrap());
+                assert!(
+                    max_ulp <= 1,
+                    "layer {} qtypes {gate_qtype}/{up_qtype} M{rows} differs by {max_ulp} ULP",
+                    descriptor.layer,
+                );
+                pair_max_ulp = pair_max_ulp.max(max_ulp);
+                let stats = fusion.dispatch_stats(rows).unwrap();
+                assert_eq!(stats.physical_dispatches, 1);
+                assert_eq!(
+                    stats.intermediate_bytes_avoided,
+                    rows * 17_408 * 8,
+                );
+            }
+            aggregate_max_ulp = aggregate_max_ulp.max(pair_max_ulp);
+            eprintln!(
+                "QWEN38_MLP_CARRIER_PAIR layer={} qtypes={}/{} max_ulp={}",
+                descriptor.layer, gate_qtype, up_qtype, pair_max_ulp,
+            );
+            drop(fusion);
+            drop(baseline_gate);
+            drop(baseline_up);
+            mlxcel_core::memory::clear_cache();
+        }
+        eprintln!(
+            "QWEN38_MLP_CARRIER_COVERAGE pairs=6 rows=1,3,4 max_ulp={aggregate_max_ulp}"
         );
     }
 

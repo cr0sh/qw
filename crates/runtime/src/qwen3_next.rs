@@ -724,6 +724,10 @@ enum MlpExecution {
         down_proj: Qwen35Linear,
     },
     PinnedAffine(mlxcel_core::Qwen38AffineMlpFusion),
+    PinnedAffineInput {
+        fusion: mlxcel_core::Qwen38AffineMlpInputFusion,
+        down_proj: Qwen35Linear,
+    },
 }
 
 impl Mlp {
@@ -762,6 +766,12 @@ impl Mlp {
             MlpExecution::PinnedAffine(fusion) => fusion
                 .forward(x)
                 .expect("validated pinned Qwen3.8 MLP fusion must succeed"),
+            MlpExecution::PinnedAffineInput { fusion, down_proj } => {
+                let activated = fusion
+                    .forward(x)
+                    .expect("validated pinned Qwen3.8 MLP input fusion must succeed");
+                down_proj.forward(&activated)
+            }
         }
     }
 
@@ -769,8 +779,25 @@ impl Mlp {
     pub(crate) fn fusion_stats(&self, input_rows: usize) -> Option<mlxcel_core::Qwen38FusionStats> {
         match &self.execution {
             MlpExecution::PinnedAffine(fusion) => fusion.dispatch_stats(input_rows).ok(),
+            MlpExecution::PinnedAffineInput { .. } => None,
             MlpExecution::Separate { .. } => None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn uses_carrier_with_q6_down_test_only(&self) -> bool {
+        matches!(
+            &self.execution,
+            MlpExecution::PinnedAffineInput {
+                down_proj: Qwen35Linear::Q6Dual(_),
+                ..
+            }
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn uses_separate_path_test_only(&self) -> bool {
+        matches!(&self.execution, MlpExecution::Separate { .. })
     }
 
     pub(crate) fn from_weights(
@@ -834,14 +861,35 @@ impl Mlp {
             let (gate, gate_m234) = gate.into_affine().expect("checked affine gate");
             let (up, up_m234) = up.into_affine().expect("checked affine up");
             let (down, down_m234) = down.into_affine().expect("checked affine down");
-            return mlxcel_core::Qwen38AffineMlpFusion::new(
+            return mlxcel_core::Qwen38AffineMlpFusion::new_with_carrier(
                 gate,
                 up,
                 down,
                 [gate_m234, up_m234, down_m234],
+                weights.qwen38_mlp_carrier_enabled(),
             )
             .map(|fusion| Self {
                 execution: MlpExecution::PinnedAffine(fusion),
+            })
+            .map_err(|error| error.to_string());
+        }
+        if weights.qwen38_mlp_carrier_enabled()
+            && descriptor.is_some_and(|descriptor| descriptor.carrier_compatible())
+            && gate.supports_qwen38_mlp_carrier_with(&up)
+        {
+            let (gate, gate_m234) = gate.into_affine().expect("checked affine gate");
+            let (up, up_m234) = up.into_affine().expect("checked affine up");
+            return mlxcel_core::Qwen38AffineMlpInputFusion::new(
+                gate,
+                up,
+                [gate_m234, up_m234],
+                true,
+            )
+            .map(|fusion| Self {
+                execution: MlpExecution::PinnedAffineInput {
+                    fusion,
+                    down_proj: down,
+                },
             })
             .map_err(|error| error.to_string());
         }

@@ -507,6 +507,11 @@ impl GgmlAffineMatrix {
         ) == dtype::FLOAT16
     }
 
+    #[doc(hidden)]
+    pub fn supports_qwen38_mlp_carrier_with(&self, other: &Self) -> bool {
+        qwen38_mlp_carrier_compatible(self, other)
+    }
+
     pub fn clone_shared(&self) -> Self {
         Self {
             planes: self.planes.clone_shared(),
@@ -951,6 +956,166 @@ pub struct Qwen38FusionStats {
     pub hidden_copy_bytes: usize,
 }
 
+fn qwen38_mlp_carrier_compatible(
+    gate: &GgmlAffineMatrix,
+    up: &GgmlAffineMatrix,
+) -> bool {
+    (gate.in_features(), gate.out_features()) == (5120, 17_408)
+        && (up.in_features(), up.out_features()) == (5120, 17_408)
+        && gate.bits == up.bits
+        && gate.has_f16_sidecars() == up.has_f16_sidecars()
+}
+
+fn forward_qwen38_mlp_affine(
+    matrix: &GgmlAffineMatrix,
+    input: &MlxArray,
+    rows: i32,
+    m234: bool,
+    m2_only: bool,
+) -> Result<UniquePtr<MlxArray>, GgmlAffineError> {
+    if rows == 2 && m2_only {
+        matrix.forward_qwen38_m2(input)
+    } else if m234 {
+        matrix.forward_qwen38_m234(input)
+    } else {
+        matrix.forward(input)
+    }
+}
+
+fn forward_qwen38_mlp_gate_up(
+    gate: &GgmlAffineMatrix,
+    up: &GgmlAffineMatrix,
+    input: &MlxArray,
+    rows: i32,
+    m234: [bool; 2],
+    m2_only: bool,
+    carrier_enabled: bool,
+) -> Result<UniquePtr<MlxArray>, GgmlAffineError> {
+    if carrier_enabled
+        && matches!(rows, 1 | 3 | 4)
+        && crate::array_dtype(input) == dtype::FLOAT32
+        && qwen38_mlp_carrier_compatible(gate, up)
+    {
+        return crate::qwen38_affine_mlp_gate_up(
+            input,
+            gate.planes
+                .weight
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?,
+            gate.planes
+                .scales
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?,
+            gate.planes
+                .biases
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?,
+            up.planes
+                .weight
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?,
+            up.planes
+                .scales
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?,
+            up.planes
+                .biases
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?,
+            gate.bits,
+            rows,
+        )
+        .map_err(|error| GgmlAffineError::Backend(error.to_string()));
+    }
+
+    let gate_output = forward_qwen38_mlp_affine(gate, input, rows, m234[0], m2_only)?;
+    let up_output = forward_qwen38_mlp_affine(up, input, rows, m234[1], m2_only)?;
+    Ok(crate::compiled_swiglu_activation(
+        gate_output
+            .as_ref()
+            .ok_or(GgmlAffineError::InvalidPlane)?,
+        up_output.as_ref().ok_or(GgmlAffineError::InvalidPlane)?,
+    ))
+}
+
+pub struct Qwen38AffineMlpInputFusion {
+    gate: GgmlAffineMatrix,
+    up: GgmlAffineMatrix,
+    m234: [bool; 2],
+    carrier_enabled: bool,
+}
+
+impl Qwen38AffineMlpInputFusion {
+    pub fn new(
+        gate: GgmlAffineMatrix,
+        up: GgmlAffineMatrix,
+        m234: [bool; 2],
+        carrier_enabled: bool,
+    ) -> Result<Self, GgmlAffineError> {
+        if (gate.in_features(), gate.out_features()) != (5120, 17_408)
+            || (up.in_features(), up.out_features()) != (5120, 17_408)
+        {
+            return Err(GgmlAffineError::InvalidPlane);
+        }
+        Ok(Self {
+            gate,
+            up,
+            m234,
+            carrier_enabled,
+        })
+    }
+
+    pub fn forward(&self, input: &MlxArray) -> Result<UniquePtr<MlxArray>, GgmlAffineError> {
+        validate_input(input, 5120)?;
+        let rows = affine_input_rows(input)?;
+        forward_qwen38_mlp_gate_up(
+            &self.gate,
+            &self.up,
+            input,
+            rows,
+            self.m234,
+            false,
+            self.carrier_enabled,
+        )
+    }
+
+    pub fn dispatch_stats(
+        &self,
+        input_rows: usize,
+    ) -> Result<Qwen38FusionStats, GgmlAffineError> {
+        if input_rows == 0 {
+            return Err(GgmlAffineError::InvalidInput);
+        }
+        let matrix_bytes_read = [&self.gate, &self.up]
+            .into_iter()
+            .try_fold(0usize, |total, matrix| {
+                matrix
+                    .resident_row_bytes
+                    .checked_mul(matrix.out_features())
+                    .and_then(|bytes| total.checked_add(bytes))
+                    .ok_or(GgmlAffineError::Overflow)
+            })?;
+        let fused = self.carrier_enabled
+            && matches!(input_rows, 1 | 3 | 4)
+            && qwen38_mlp_carrier_compatible(&self.gate, &self.up);
+        let intermediate_bytes_avoided = if fused {
+            input_rows
+                .checked_mul(17_408)
+                .and_then(|values| values.checked_mul(8))
+                .ok_or(GgmlAffineError::Overflow)?
+        } else {
+            0
+        };
+        Ok(Qwen38FusionStats {
+            physical_dispatches: if fused { 1 } else { 3 },
+            matrix_bytes_read,
+            intermediate_bytes_avoided,
+            workspace_bytes: 0,
+            hidden_copy_bytes: 0,
+        })
+    }
+}
+
 pub struct Qwen38AffineMlpFusion {
     gate: GgmlAffineMatrix,
     up: GgmlAffineMatrix,
@@ -959,6 +1124,7 @@ pub struct Qwen38AffineMlpFusion {
     up_m234: bool,
     down_m234: bool,
     m2_only: bool,
+    carrier_enabled: bool,
 }
 
 impl Qwen38AffineMlpFusion {
@@ -968,7 +1134,17 @@ impl Qwen38AffineMlpFusion {
         down: GgmlAffineMatrix,
         m234: [bool; 3],
     ) -> Result<Self, GgmlAffineError> {
-        Self::with_small_row_paths(gate, up, down, m234, false)
+        Self::with_small_row_paths(gate, up, down, m234, false, true)
+    }
+
+    pub fn new_with_carrier(
+        gate: GgmlAffineMatrix,
+        up: GgmlAffineMatrix,
+        down: GgmlAffineMatrix,
+        m234: [bool; 3],
+        carrier_enabled: bool,
+    ) -> Result<Self, GgmlAffineError> {
+        Self::with_small_row_paths(gate, up, down, m234, false, carrier_enabled)
     }
 
     pub fn new_m2(
@@ -976,7 +1152,7 @@ impl Qwen38AffineMlpFusion {
         up: GgmlAffineMatrix,
         down: GgmlAffineMatrix,
     ) -> Result<Self, GgmlAffineError> {
-        Self::with_small_row_paths(gate, up, down, [false; 3], true)
+        Self::with_small_row_paths(gate, up, down, [false; 3], true, false)
     }
 
     fn with_small_row_paths(
@@ -985,6 +1161,7 @@ impl Qwen38AffineMlpFusion {
         down: GgmlAffineMatrix,
         m234: [bool; 3],
         m2_only: bool,
+        carrier_enabled: bool,
     ) -> Result<Self, GgmlAffineError> {
         if (gate.in_features(), gate.out_features()) != (5120, 17_408)
             || (up.in_features(), up.out_features()) != (5120, 17_408)
@@ -1000,6 +1177,7 @@ impl Qwen38AffineMlpFusion {
             up_m234: m234[1],
             down_m234: m234[2],
             m2_only,
+            carrier_enabled,
         })
     }
 
@@ -1042,25 +1220,21 @@ impl Qwen38AffineMlpFusion {
             || self.up.has_f16_sidecars()
             || self.down.has_f16_sidecars()
         {
-            let forward = |matrix: &GgmlAffineMatrix, input: &MlxArray, m234| {
-                if rows == 2 && self.m2_only {
-                    matrix.forward_qwen38_m2(input)
-                } else if m234 {
-                    matrix.forward_qwen38_m234(input)
-                } else {
-                    matrix.forward(input)
-                }
-            };
-            let gate = forward(&self.gate, input, self.gate_m234)?;
-            let up = forward(&self.up, input, self.up_m234)?;
-            let activated = crate::compiled_swiglu_activation(
-                gate.as_ref().ok_or(GgmlAffineError::InvalidPlane)?,
-                up.as_ref().ok_or(GgmlAffineError::InvalidPlane)?,
-            );
-            return forward(
+            let activated = forward_qwen38_mlp_gate_up(
+                &self.gate,
+                &self.up,
+                input,
+                rows,
+                [self.gate_m234, self.up_m234],
+                self.m2_only,
+                self.carrier_enabled,
+            )?;
+            return forward_qwen38_mlp_affine(
                 &self.down,
                 activated.as_ref().ok_or(GgmlAffineError::InvalidPlane)?,
+                rows,
                 self.down_m234,
+                self.m2_only,
             );
         }
         crate::qwen38_affine_mlp_fused(
@@ -1137,6 +1311,22 @@ impl Qwen38AffineMlpFusion {
                 .ok_or(GgmlAffineError::Overflow)?;
             return Ok(Qwen38FusionStats {
                 physical_dispatches: 6,
+                matrix_bytes_read,
+                intermediate_bytes_avoided,
+                workspace_bytes: 0,
+                hidden_copy_bytes: 0,
+            });
+        }
+        if self.carrier_enabled
+            && matches!(input_rows, 1 | 3 | 4)
+            && qwen38_mlp_carrier_compatible(&self.gate, &self.up)
+        {
+            let intermediate_bytes_avoided = input_rows
+                .checked_mul(17_408)
+                .and_then(|values| values.checked_mul(8))
+                .ok_or(GgmlAffineError::Overflow)?;
+            return Ok(Qwen38FusionStats {
+                physical_dispatches: 2,
                 matrix_bytes_read,
                 intermediate_bytes_avoided,
                 workspace_bytes: 0,
@@ -2244,5 +2434,114 @@ mod tests {
             GgmlAffineMatrix::from_ggml_bytes(&[], GgmlQType::Q5K, usize::MAX, 2),
             Err(GgmlAffineError::Overflow)
         ));
+    }
+
+    #[test]
+    fn qwen38_mlp_carrier_materializes_strided_activation_and_sidecar() {
+        if !crate::metal_is_available() {
+            return;
+        }
+        const ROWS: i32 = 3;
+        const IN_FEATURES: i32 = 5120;
+        const OUT_FEATURES: i32 = 17_408;
+        const GROUPS: i32 = IN_FEATURES / 32;
+        const BITS: i32 = 4;
+
+        let input_values = (0..(ROWS * IN_FEATURES) as usize)
+            .map(|index| (index as i32 % 43 - 21) as f32 * 0.001953125)
+            .collect::<Vec<_>>();
+        let input = crate::from_slice_f32(&input_values, &[ROWS, 1, IN_FEATURES]);
+        let padded_input_values = input_values
+            .chunks_exact(IN_FEATURES as usize)
+            .flat_map(|row| {
+                row.iter()
+                    .copied()
+                    .chain(std::iter::repeat_n(f32::NAN, IN_FEATURES as usize))
+            })
+            .collect::<Vec<_>>();
+        let padded_input =
+            crate::from_slice_f32(&padded_input_values, &[ROWS, 2, IN_FEATURES]);
+        crate::eval(padded_input.as_ref().unwrap());
+        let strided_input = crate::as_strided(
+            padded_input.as_ref().unwrap(),
+            &[ROWS, 1, IN_FEATURES],
+            &[i64::from(IN_FEATURES * 2), i64::from(IN_FEATURES), 1],
+            0,
+        );
+
+        let weight = crate::zeros(
+            &[OUT_FEATURES, IN_FEATURES * BITS / 32],
+            dtype::UINT32,
+        );
+        let scales = crate::full_f32(&[OUT_FEATURES, GROUPS], 0.03125, dtype::FLOAT32);
+        let bias_values = (0..(OUT_FEATURES * GROUPS) as usize)
+            .map(|index| (index as i32 % 31 - 15) as f32 * 0.0001220703125)
+            .collect::<Vec<_>>();
+        let biases = crate::from_slice_f32(&bias_values, &[OUT_FEATURES, GROUPS]);
+        let padded_bias_values = bias_values
+            .chunks_exact(GROUPS as usize)
+            .flat_map(|row| {
+                row.iter()
+                    .copied()
+                    .chain(std::iter::repeat_n(f32::NAN, GROUPS as usize))
+            })
+            .collect::<Vec<_>>();
+        let padded_biases =
+            crate::from_slice_f32(&padded_bias_values, &[OUT_FEATURES, 2, GROUPS]);
+        crate::eval(padded_biases.as_ref().unwrap());
+        let strided_biases = crate::as_strided(
+            padded_biases.as_ref().unwrap(),
+            &[OUT_FEATURES, GROUPS],
+            &[i64::from(GROUPS * 2), 1],
+            0,
+        );
+        crate::eval(strided_input.as_ref().unwrap());
+        crate::eval(strided_biases.as_ref().unwrap());
+        assert!(!crate::ffi::array_is_row_contiguous(
+            strided_input.as_ref().unwrap()
+        ));
+        assert!(!crate::ffi::array_is_row_contiguous(
+            strided_biases.as_ref().unwrap()
+        ));
+
+        let expected = crate::qwen38_affine_mlp_gate_up(
+            input.as_ref().unwrap(),
+            weight.as_ref().unwrap(),
+            scales.as_ref().unwrap(),
+            biases.as_ref().unwrap(),
+            weight.as_ref().unwrap(),
+            scales.as_ref().unwrap(),
+            biases.as_ref().unwrap(),
+            BITS,
+            ROWS,
+        )
+        .unwrap();
+        let actual = crate::qwen38_affine_mlp_gate_up(
+            strided_input.as_ref().unwrap(),
+            weight.as_ref().unwrap(),
+            scales.as_ref().unwrap(),
+            strided_biases.as_ref().unwrap(),
+            weight.as_ref().unwrap(),
+            scales.as_ref().unwrap(),
+            strided_biases.as_ref().unwrap(),
+            BITS,
+            ROWS,
+        )
+        .unwrap();
+        crate::eval(expected.as_ref().unwrap());
+        crate::eval(actual.as_ref().unwrap());
+        let expected_bytes = crate::array_to_raw_bytes(expected.as_ref().unwrap());
+        let actual_bytes = crate::array_to_raw_bytes(actual.as_ref().unwrap());
+        assert_eq!(actual_bytes, expected_bytes);
+        let values = actual_bytes
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect::<Vec<_>>();
+        assert!(
+            values.iter().all(|value| value.is_finite())
+                && values.iter().any(|value| *value != 0.0)
+                && values.windows(2).any(|pair| pair[0] != pair[1]),
+            "fixture must produce finite, nonzero, nonuniform carrier output"
+        );
     }
 }
