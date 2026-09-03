@@ -103,23 +103,27 @@ inline float qwen38_qdot(
 }
 
 template <int rows>
-inline void qwen38_mixed_q5_update(
-    const device float* x,
+inline void qwen38_mixed_q5_update4(
+    const device half* x,
     int row_stride,
     int column,
-    half w_dq,
+    half4 weights,
     thread float* accum
 ) {
     for (int row = 0; row < rows; ++row) {
-        half activation = static_cast<half>(x[row * row_stride + column]);
-        half product = activation * w_dq;
-        accum[row] += static_cast<float>(product);
+        half4 activation = *reinterpret_cast<const device half4*>(
+            x + row * row_stride + column);
+        half4 product = activation * weights;
+        accum[row] += static_cast<float>(product[0]);
+        accum[row] += static_cast<float>(product[1]);
+        accum[row] += static_cast<float>(product[2]);
+        accum[row] += static_cast<float>(product[3]);
     }
 }
 
 template <int rows>
 inline void qwen38_mixed_q5_pack(
-    const device float* x,
+    const device half* x,
     int row_stride,
     const device uchar* packed,
     half scale,
@@ -132,30 +136,35 @@ inline void qwen38_mixed_q5_pack(
     uchar b3 = packed[3];
     uchar b4 = packed[4];
 
-    ushort code = b0 & 0x1fu;
-    qwen38_mixed_q5_update<rows>(
-        x, row_stride, 0, scale * static_cast<half>(code) + bias, accum);
-    code = (b0 >> 5u) | ((b1 & 0x03u) << 3u);
-    qwen38_mixed_q5_update<rows>(
-        x, row_stride, 1, scale * static_cast<half>(code) + bias, accum);
-    code = (b1 >> 2u) & 0x1fu;
-    qwen38_mixed_q5_update<rows>(
-        x, row_stride, 2, scale * static_cast<half>(code) + bias, accum);
-    code = (b1 >> 7u) | ((b2 & 0x0fu) << 1u);
-    qwen38_mixed_q5_update<rows>(
-        x, row_stride, 3, scale * static_cast<half>(code) + bias, accum);
-    code = (b2 >> 4u) | ((b3 & 0x01u) << 4u);
-    qwen38_mixed_q5_update<rows>(
-        x, row_stride, 4, scale * static_cast<half>(code) + bias, accum);
-    code = (b3 >> 1u) & 0x1fu;
-    qwen38_mixed_q5_update<rows>(
-        x, row_stride, 5, scale * static_cast<half>(code) + bias, accum);
-    code = (b3 >> 6u) | ((b4 & 0x07u) << 2u);
-    qwen38_mixed_q5_update<rows>(
-        x, row_stride, 6, scale * static_cast<half>(code) + bias, accum);
-    code = b4 >> 3u;
-    qwen38_mixed_q5_update<rows>(
-        x, row_stride, 7, scale * static_cast<half>(code) + bias, accum);
+    ushort c0 = b0 & 0x1fu;
+    ushort c1 = (b0 >> 5u) | ((b1 & 0x03u) << 3u);
+    ushort c2 = (b1 >> 2u) & 0x1fu;
+    ushort c3 = (b1 >> 7u) | ((b2 & 0x0fu) << 1u);
+    qwen38_mixed_q5_update4<rows>(
+        x,
+        row_stride,
+        0,
+        half4(
+            scale * static_cast<half>(c0) + bias,
+            scale * static_cast<half>(c1) + bias,
+            scale * static_cast<half>(c2) + bias,
+            scale * static_cast<half>(c3) + bias),
+        accum);
+
+    c0 = (b2 >> 4u) | ((b3 & 0x01u) << 4u);
+    c1 = (b3 >> 1u) & 0x1fu;
+    c2 = (b3 >> 6u) | ((b4 & 0x07u) << 2u);
+    c3 = b4 >> 3u;
+    qwen38_mixed_q5_update4<rows>(
+        x,
+        row_stride,
+        4,
+        half4(
+            scale * static_cast<half>(c0) + bias,
+            scale * static_cast<half>(c1) + bias,
+            scale * static_cast<half>(c2) + bias,
+            scale * static_cast<half>(c3) + bias),
+        accum);
 }
 )";
 
@@ -267,7 +276,7 @@ static const char* QWEN38_AFFINE_MIXED_Q5_METAL_SOURCE = R"(
             half scale = scales[group_offset];
             half bias = biases[group_offset];
             float accum[MRows] = {};
-            const device float* activation = x + k
+            const device half* activation = x + k
                 + (int)lane * values_per_thread;
             qwen38_mixed_q5_pack<MRows>(
                 activation, width, source, scale, bias, accum);
@@ -305,7 +314,7 @@ struct Qwen38KernelHolder {
                 QWEN38_AFFINE_M234_METAL_HEADER,
                 false);
             affine_mixed_q5 = mlx::core::fast::metal_kernel(
-                "qw_qwen38_affine_mixed_q5_v1",
+                "qw_qwen38_affine_mixed_q5_v2",
                 {"x", "weight", "scales", "biases"},
                 {"out"},
                 QWEN38_AFFINE_MIXED_Q5_METAL_SOURCE,
@@ -408,6 +417,7 @@ std::unique_ptr<MlxArray> qwen38_affine_m234_matmul(
         mixed_q5);
 
     auto input = contiguous(reshape(x.inner, {input_rows, in_features}));
+    auto kernel_input = mixed_q5 ? astype(input, float16) : input;
     const auto args = mixed_q5
         ? std::vector<std::pair<std::string, fast::TemplateArg>>{
               {"MRows", input_rows}}
@@ -417,7 +427,7 @@ std::unique_ptr<MlxArray> qwen38_affine_m234_matmul(
         mixed_q5 && input_rows == 3 ? 2 : 8;
     auto results = mixed_q5
         ? (*qwen38_kernels().affine_mixed_q5)(
-              {input, weight.inner, scales.inner, biases.inner},
+              {kernel_input, weight.inner, scales.inner, biases.inner},
               {Shape{input_rows, out_features}},
               {float32},
               std::make_tuple(
