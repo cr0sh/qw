@@ -1388,8 +1388,14 @@ fn turbo4_dequant_sdpa_matches_full_dequant_attention() {
         let q = synth_kv_tensor(1, 2, 1, head_dim, 22_000 + step as u32);
 
         cache_dequant.update(k_a, v_a);
-        let out_dequant =
-            cache_dequant.turbo4_dequant_sdpa_prefix(&q, cache_dequant.offset, scale, None, false);
+        let out_dequant = cache_dequant.turbo4_dequant_sdpa_prefix(
+            &q,
+            cache_dequant.offset,
+            scale,
+            None,
+            false,
+            false,
+        );
         let out_ref = turbo4_reference_attention(&mut cache_ref, &q, k_b, v_b, scale);
 
         let flat_a = flatten_fp32(&out_dequant);

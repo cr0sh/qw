@@ -60,29 +60,26 @@ impl Qwen35Linear {
         }
     }
 
-    pub(crate) fn supports_high_m_f16(&self) -> bool {
-        matches!(
-            self,
-            Self::Affine(_) | Self::PinnedM234Affine(_) | Self::Q6Dual(_)
-        )
+    pub(crate) fn supports_high_m_sigmoid_gate_f16(&self) -> bool {
+        matches!(self, Self::Affine(_) | Self::PinnedM234Affine(_))
     }
 
-    pub(crate) fn forward_high_m_f16(&self, input: &MlxArray) -> Option<UniquePtr<MlxArray>> {
+    pub(crate) fn forward_high_m_sigmoid_gate_f16(
+        &self,
+        gate: &MlxArray,
+        value: &MlxArray,
+    ) -> Option<UniquePtr<MlxArray>> {
         match self {
             Self::Affine(linear) | Self::PinnedM234Affine(linear) => Some(
                 linear
-                    .forward_f16(input)
-                    .expect("validated high-M FP16 affine execution must succeed"),
-            ),
-            Self::Q6Dual(linear) => Some(
-                linear
-                    .forward(input)
-                    .expect("validated high-M FP16 Q6 execution must succeed"),
+                    .forward_sigmoid_gated_f16(gate, value)
+                    .expect("validated high-M FP16 gated affine execution must succeed"),
             ),
             #[cfg(any(feature = "specprefill", test))]
             Self::Legacy(_) => None,
             Self::PinnedM2Affine(_)
             | Self::AffineRows(_)
+            | Self::Q6Dual(_)
             | Self::Gguf(_)
             | Self::GgufRows(_) => None,
         }

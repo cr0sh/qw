@@ -173,6 +173,13 @@ pub struct TurboQuantParams {
     /// K-side `±1.0` sign vector applied **after** the WHT (symmetric
     /// `Turbo4` only). Length = `head_dim`.
     pub k_signs2: Arc<[f32]>,
+    /// Native FP16 encodings of the sign vectors. Keeping their host bytes
+    /// alongside the FP32 oracle avoids four runtime FP32→FP16 graph casts in
+    /// each native-FP16 Turbo4 attention call.
+    signs1_f16: Arc<[u8]>,
+    signs2_f16: Arc<[u8]>,
+    k_signs1_f16: Arc<[u8]>,
+    k_signs2_f16: Arc<[u8]>,
     /// Cached centroid + boundary tables for `(V_BIT_WIDTH, head_dim)`.
     pub codebook: Codebook,
 }
@@ -202,6 +209,10 @@ impl TurboQuantParams {
         let k_seed = seed.wrapping_add(K_SEED_OFFSET);
         let k_signs1 = generate_signs(head_dim as usize, k_seed);
         let k_signs2 = generate_signs(head_dim as usize, k_seed.wrapping_add(0x9E37_79B9));
+        let signs1_f16 = sign_bytes_f16(&signs1);
+        let signs2_f16 = sign_bytes_f16(&signs2);
+        let k_signs1_f16 = sign_bytes_f16(&k_signs1);
+        let k_signs2_f16 = sign_bytes_f16(&k_signs2);
         let codebook = optimal_codebook(V_BIT_WIDTH, head_dim);
         Self {
             head_dim,
@@ -209,6 +220,10 @@ impl TurboQuantParams {
             signs2,
             k_signs1,
             k_signs2,
+            signs1_f16,
+            signs2_f16,
+            k_signs1_f16,
+            k_signs2_f16,
             codebook,
         }
     }
@@ -228,6 +243,19 @@ pub fn generate_signs(len: usize, seed: u32) -> Arc<[f32]> {
         out.push(if bit == 0 { -1.0_f32 } else { 1.0_f32 });
     }
     Arc::from(out)
+}
+
+fn sign_bytes_f16(signs: &[f32]) -> Arc<[u8]> {
+    let mut bytes = Vec::with_capacity(signs.len() * 2);
+    for &sign in signs {
+        let bits = if sign.is_sign_negative() {
+            0xbc00_u16
+        } else {
+            0x3c00_u16
+        };
+        bytes.extend_from_slice(&bits.to_le_bytes());
+    }
+    Arc::from(bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -766,10 +794,16 @@ pub(crate) fn turbo4_k_rotate_f16(
         "turbo4_k_rotate_f16: last dim ({d}) must match TurboQuantParams head_dim ({})",
         params.head_dim
     );
-    let signs1_f32 = ffi::from_slice_f32(&params.k_signs1, &[1, 1, 1, d as i32]);
-    let signs2_f32 = ffi::from_slice_f32(&params.k_signs2, &[1, 1, 1, d as i32]);
-    let signs1 = ffi::astype(&signs1_f32, dtype::FLOAT16);
-    let signs2 = ffi::astype(&signs2_f32, dtype::FLOAT16);
+    let signs1 = ffi::from_bytes_f16(
+        &params.k_signs1_f16,
+        &[1, 1, 1, d as i32],
+        false,
+    );
+    let signs2 = ffi::from_bytes_f16(
+        &params.k_signs2_f16,
+        &[1, 1, 1, d as i32],
+        false,
+    );
     let x_d1 = ffi::multiply(x, &signs1);
     let x_h = wht(&x_d1);
     ffi::multiply(&x_h, &signs2)
@@ -822,10 +856,10 @@ pub(crate) fn turbo4_v_inverse_rotate_f16(
         "turbo4_v_inverse_rotate_f16: last dim ({d}) must match TurboQuantParams head_dim ({})",
         params.head_dim
     );
-    let signs1_f32 = ffi::from_slice_f32(&params.signs1, &[1, 1, 1, d as i32]);
-    let signs2_f32 = ffi::from_slice_f32(&params.signs2, &[1, 1, 1, d as i32]);
-    let signs1 = ffi::astype(&signs1_f32, dtype::FLOAT16);
-    let signs2 = ffi::astype(&signs2_f32, dtype::FLOAT16);
+    let signs1 =
+        ffi::from_bytes_f16(&params.signs1_f16, &[1, 1, 1, d as i32], false);
+    let signs2 =
+        ffi::from_bytes_f16(&params.signs2_f16, &[1, 1, 1, d as i32], false);
     let pre_h = ffi::multiply(x, &signs2);
     let post_h = wht(&pre_h);
     ffi::multiply(&post_h, &signs1)
@@ -896,6 +930,14 @@ mod tests {
     }
 
     #[test]
+    fn fp16_sign_bytes_are_exact_pm_one() {
+        assert_eq!(
+            sign_bytes_f16(&[-1.0, 1.0, -1.0, 1.0]).as_ref(),
+            &[0x00, 0xbc, 0x00, 0x3c, 0x00, 0xbc, 0x00, 0x3c]
+        );
+    }
+
+    #[test]
     fn turbo_quant_params_centroid_count_matches_bit_width() {
         let p = TurboQuantParams::new(128, 42);
         assert_eq!(p.codebook.centroids.len(), 1 << V_BIT_WIDTH);
@@ -904,6 +946,10 @@ mod tests {
         assert_eq!(p.signs2.len(), 128);
         assert_eq!(p.k_signs1.len(), 128);
         assert_eq!(p.k_signs2.len(), 128);
+        assert_eq!(p.signs1_f16.len(), 256);
+        assert_eq!(p.signs2_f16.len(), 256);
+        assert_eq!(p.k_signs1_f16.len(), 256);
+        assert_eq!(p.k_signs2_f16.len(), 256);
     }
 
     /// K-side and V-side sign vectors must be statistically distinct — if

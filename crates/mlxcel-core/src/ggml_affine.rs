@@ -533,13 +533,48 @@ impl GgmlAffineMatrix {
     /// chain in half precision. Ordinary [`Self::forward`] continues restoring
     /// FP32 and every low-row dispatcher remains unchanged.
     pub fn forward_f16(&self, input: &MlxArray) -> Result<UniquePtr<MlxArray>, GgmlAffineError> {
-        validate_input(input, self.in_features)?;
-        if crate::array_dtype(input) != dtype::FLOAT16
-            || affine_input_rows(input)? < F16_PREFILL_MIN_ROWS
+        validate_high_m_f16_input(input, self.in_features)?;
+        self.forward_f16_unchecked(input)
+    }
+
+    fn forward_f16_unchecked(
+        &self,
+        input: &MlxArray,
+    ) -> Result<UniquePtr<MlxArray>, GgmlAffineError> {
+        affine_matmul_f16_output(input, &self.planes, self.bits)
+    }
+
+    /// Fuse the attention sigmoid gate into this high-row FP16 affine QMM.
+    pub fn forward_sigmoid_gated_f16(
+        &self,
+        gate: &MlxArray,
+        value: &MlxArray,
+    ) -> Result<UniquePtr<MlxArray>, GgmlAffineError> {
+        let value_shape = crate::array_shape(value);
+        let gate_shape = crate::array_shape(gate);
+        let rows = value_shape[..value_shape.len().saturating_sub(1)]
+            .iter()
+            .try_fold(1_i32, |rows, &dimension| rows.checked_mul(dimension));
+        if value_shape.is_empty()
+            || value_shape.last().copied() != Some(self.in_features)
+            || value_shape != gate_shape
+            || crate::array_dtype(value) != dtype::FLOAT16
+            || crate::array_dtype(gate) != dtype::FLOAT16
+            || rows.is_none_or(|rows| rows < F16_PREFILL_MIN_ROWS)
         {
             return Err(GgmlAffineError::InvalidInput);
         }
-        affine_matmul_f16_output(input, &self.planes, self.bits)
+        Ok(crate::compiled_sigmoid_gate_affine(
+            gate,
+            value,
+            self.planes
+                .weight
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?,
+            self.planes.scales_f16()?,
+            self.planes.biases_f16()?,
+            self.bits,
+        ))
     }
 
     /// Runs exact pinned Qwen3.8 target shapes through a one-pass small-row
@@ -892,35 +927,18 @@ impl Qwen38MixedQkvBundle {
         &self,
         input: &MlxArray,
     ) -> Result<Qwen38MixedQkvOutput, GgmlAffineError> {
-        validate_input(input, 5120)?;
-        if crate::array_dtype(input) != dtype::FLOAT16
-            || affine_input_rows(input)? < F16_PREFILL_MIN_ROWS
-        {
-            return Err(GgmlAffineError::InvalidInput);
-        }
+        validate_high_m_f16_input(input, 5120)?;
         let forward = |matrix: &Qwen38QkvMatrix| match matrix {
-            Qwen38QkvMatrix::Affine(matrix) => matrix.forward_f16(input),
+            Qwen38QkvMatrix::Affine(matrix) => matrix.forward_f16_unchecked(input),
             Qwen38QkvMatrix::Q6(matrix) => matrix
                 .forward(input)
                 .map_err(|error| GgmlAffineError::Backend(error.to_string())),
         };
-        let output = Qwen38MixedQkvOutput {
-            query: self.query.forward_f16(input)?,
+        Ok(Qwen38MixedQkvOutput {
+            query: self.query.forward_f16_unchecked(input)?,
             key: forward(&self.key)?,
             value: forward(&self.value)?,
-        };
-        if [
-            output.query.as_ref(),
-            output.key.as_ref(),
-            output.value.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        .any(|array| crate::array_dtype(array) != dtype::FLOAT16)
-        {
-            return Err(GgmlAffineError::InvalidPlane);
-        }
-        Ok(output)
+        })
     }
 }
 
@@ -1906,9 +1924,7 @@ fn affine_matmul_f16_output(
     planes: &AffinePlanes,
     bits: i32,
 ) -> Result<UniquePtr<MlxArray>, GgmlAffineError> {
-    if crate::array_dtype(input_f16) != dtype::FLOAT16 {
-        return Err(GgmlAffineError::InvalidInput);
-    }
+
     Ok(unsafe {
         crate::quantized_matmul(
             input_f16,
@@ -1935,6 +1951,24 @@ fn validate_input(input: &MlxArray, in_features: i32) -> Result<(), GgmlAffineEr
             dtype_code,
             dtype::FLOAT16 | dtype::FLOAT32 | dtype::BFLOAT16
         )
+    {
+        return Err(GgmlAffineError::InvalidInput);
+    }
+    Ok(())
+}
+
+fn validate_high_m_f16_input(
+    input: &MlxArray,
+    in_features: i32,
+) -> Result<(), GgmlAffineError> {
+    let shape = crate::array_shape(input);
+    let rows = shape[..shape.len().saturating_sub(1)]
+        .iter()
+        .try_fold(1_i32, |rows, &dimension| rows.checked_mul(dimension));
+    if shape.is_empty()
+        || shape.last().copied() != Some(in_features)
+        || crate::array_dtype(input) != dtype::FLOAT16
+        || rows.is_none_or(|rows| rows < F16_PREFILL_MIN_ROWS)
     {
         return Err(GgmlAffineError::InvalidInput);
     }

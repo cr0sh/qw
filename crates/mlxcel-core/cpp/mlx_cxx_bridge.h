@@ -465,10 +465,16 @@ std::unique_ptr<MlxArray> compiled_relu_squared(const MlxArray& x);
 // Compiled silu: x * sigmoid(x) — single fused kernel
 std::unique_ptr<MlxArray> compiled_silu(const MlxArray& x);
 
-// Compiled attention output gate: sigmoid(gate) * value.
-std::unique_ptr<MlxArray> compiled_sigmoid_gate(
+// Compiled attention gate + affine output projection. The FP16 caller keeps
+// the gate transient inside the compiled graph instead of materializing it at
+// the quantized-matmul boundary.
+std::unique_ptr<MlxArray> compiled_sigmoid_gate_affine(
     const MlxArray& gate,
-    const MlxArray& value
+    const MlxArray& value,
+    const MlxArray& weight,
+    const MlxArray& scales,
+    const MlxArray& biases,
+    int32_t bits
 );
 
 // Compiled gelu: x * 0.5 * (1 + erf(x / sqrt(2))) — single fused kernel

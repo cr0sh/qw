@@ -270,9 +270,9 @@ impl Qwen3NextAttention {
         mask: Option<&MlxArray>,
         position_ids: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        let (output, _, precision) =
+        let (output, _, precision, gate) =
             self.forward_impl(x, cache, mask, position_ids, false);
-        self.project_output(&output, precision)
+        self.project_output(&output, gate.as_deref(), precision)
     }
 
 
@@ -286,10 +286,10 @@ impl Qwen3NextAttention {
         mask: Option<&MlxArray>,
         position_ids: Option<&MlxArray>,
     ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
-        let (output, queries, precision) =
+        let (output, queries, precision, gate) =
             self.forward_impl(x, cache, mask, position_ids, true);
         (
-            self.project_output(&output, precision),
+            self.project_output(&output, gate.as_deref(), precision),
             queries.expect("query capture was requested"),
         )
     }
@@ -303,21 +303,25 @@ impl Qwen3NextAttention {
         mask: Option<&MlxArray>,
         position_ids: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        let (output, _, precision) =
+        let (output, _, precision, gate) =
             self.forward_impl(x, cache, mask, position_ids, false);
-        self.project_output(&output, precision)
+        self.project_output(&output, gate.as_deref(), precision)
     }
 
     fn project_output(
         &self,
         output: &MlxArray,
+        gate: Option<&MlxArray>,
         precision: Qwen38AttentionPrecision,
     ) -> UniquePtr<MlxArray> {
         if precision == Qwen38AttentionPrecision::FullF16 {
             return self
                 .o_proj
-                .forward_high_m_f16(output)
-                .expect("pinned high-M output projection supports FP16");
+                .forward_high_m_sigmoid_gate_f16(
+                    gate.expect("full FP16 attention retains its gate view"),
+                    output,
+                )
+                .expect("pinned high-M output projection supports fused FP16 gating");
         }
         let shape = mlxcel_core::array_shape(output);
         if shape.len() == 3 && shape[1] == 4 && self.o_proj.needs_m4_exact_split() {
@@ -343,6 +347,7 @@ impl Qwen3NextAttention {
         UniquePtr<MlxArray>,
         Option<UniquePtr<MlxArray>>,
         Qwen38AttentionPrecision,
+        Option<UniquePtr<MlxArray>>,
     ) {
         let shape = mlxcel_core::array_shape(x);
         let b = shape[0];
@@ -374,8 +379,13 @@ impl Qwen3NextAttention {
             &[0, 0, 0, 0],
             &[b, l, self.num_heads, self.head_dim],
         );
-        // Note: MLX slice stop=-1 means dim_size-1 (excludes last), not "to end"
-        let q_last_dim = mlxcel_core::array_shape(&q_proj_reshaped)[3];
+        let q_last_dim = if precision == Qwen38AttentionPrecision::FullF16 {
+            2 * self.head_dim
+        } else {
+            // Preserve the established low-row graph, including its runtime
+            // bound lookup, outside the opt-in high-M chain.
+            mlxcel_core::array_shape(&q_proj_reshaped)[3]
+        };
         let gate = mlxcel_core::slice(
             &q_proj_reshaped,
             &[0, 0, 0, self.head_dim],
@@ -383,8 +393,13 @@ impl Qwen3NextAttention {
         );
         let gate = mlxcel_core::reshape(&gate, &[b, l, -1]);
 
-        // Reshape and apply Q/K norms
-        let queries = mlxcel_core::reshape(&queries, &[b, l, self.num_heads, self.head_dim]);
+        // Reshape and apply Q/K norms. Retain the historical no-op query
+        // reshape for low rows so their graph is untouched.
+        let queries = if precision == Qwen38AttentionPrecision::FullF16 {
+            queries
+        } else {
+            mlxcel_core::reshape(&queries, &[b, l, self.num_heads, self.head_dim])
+        };
         let keys = mlxcel_core::reshape(&keys, &[b, l, self.num_kv_heads, self.head_dim]);
         let values = mlxcel_core::reshape(&values, &[b, l, self.num_kv_heads, self.head_dim]);
 
@@ -557,20 +572,25 @@ impl Qwen3NextAttention {
         let output = mlxcel_core::transpose_axes(&attn_out, &[0, 2, 1, 3]);
         let output = mlxcel_core::reshape(&output, &[b, l, -1]);
         // The post-RoPE arm restores the old FP32 projection boundary. The
-        // full chain stays FP16 through the gate and output projection; the
-        // caller's residual add is its sole FP32 promotion.
+        // full chain carries the FP16 gate view into the compiled output
+        // projection, avoiding a standalone gate materialization; the caller's
+        // residual add is its sole FP32 promotion.
         let output = if precision == Qwen38AttentionPrecision::PostRopeF16 {
             mlxcel_core::astype(&output, mlxcel_core::dtype::FLOAT32)
         } else {
             output
         };
-        let gated = if precision == Qwen38AttentionPrecision::FullF16 {
-            mlxcel_core::compiled_sigmoid_gate(&gate, &output)
+        if precision == Qwen38AttentionPrecision::FullF16 {
+            (output, captured_query, precision, Some(gate))
         } else {
             let gate_sigmoid = mlxcel_core::sigmoid(&gate);
-            mlxcel_core::multiply(&output, &gate_sigmoid)
-        };
-        (gated, captured_query, precision)
+            (
+                mlxcel_core::multiply(&output, &gate_sigmoid),
+                captured_query,
+                precision,
+                None,
+            )
+        }
     }
 
     pub(crate) fn from_weights(
@@ -607,7 +627,7 @@ impl Qwen3NextAttention {
             weights.is_pinned_qwen38_gguf() && role == ModelRole::Target;
         let full_f16_supported = pinned_qwen38_target
             && qkv_proj.supports_high_m_f16()
-            && o_proj.supports_high_m_f16();
+            && o_proj.supports_high_m_sigmoid_gate_f16();
         let q_norm_f16 = full_f16_supported.then(|| {
             let weight = mlxcel_core::astype(&q_norm_weight, mlxcel_core::dtype::FLOAT16);
             mlxcel_core::eval(&weight);
