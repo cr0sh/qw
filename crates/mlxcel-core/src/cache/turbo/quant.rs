@@ -743,6 +743,38 @@ pub fn turbo4_k_rotate(x: &MlxArray, params: &TurboQuantParams) -> UniquePtr<Mlx
     ffi::multiply(&x_h, &signs2_arr)
 }
 
+/// Apply the K-side rotation while keeping FP16 tensors FP16 between kernels.
+///
+/// MLX's Hadamard kernel still accumulates in float registers. This variant
+/// only removes the explicit FP32 array materializations around the rotation.
+pub(crate) fn turbo4_k_rotate_f16(
+    x: &MlxArray,
+    params: &TurboQuantParams,
+) -> UniquePtr<MlxArray> {
+    assert_eq!(
+        ffi::array_dtype(x),
+        dtype::FLOAT16,
+        "turbo4_k_rotate_f16 requires FP16 input"
+    );
+    let shape = ffi::array_shape(x);
+    let d = *shape
+        .last()
+        .expect("turbo4_k_rotate_f16: input must be at least 1-D")
+        as usize;
+    assert_eq!(
+        d, params.head_dim as usize,
+        "turbo4_k_rotate_f16: last dim ({d}) must match TurboQuantParams head_dim ({})",
+        params.head_dim
+    );
+    let signs1_f32 = ffi::from_slice_f32(&params.k_signs1, &[1, 1, 1, d as i32]);
+    let signs2_f32 = ffi::from_slice_f32(&params.k_signs2, &[1, 1, 1, d as i32]);
+    let signs1 = ffi::astype(&signs1_f32, dtype::FLOAT16);
+    let signs2 = ffi::astype(&signs2_f32, dtype::FLOAT16);
+    let x_d1 = ffi::multiply(x, &signs1);
+    let x_h = wht(&x_d1);
+    ffi::multiply(&x_h, &signs2)
+}
+
 /// Apply the inverse TurboQuant V rotation to a tensor in rotated value basis.
 ///
 /// Used by the delegated dequant-SDPA path: cold V is dequantized as
@@ -766,6 +798,37 @@ pub fn turbo4_v_inverse_rotate(x: &MlxArray, params: &TurboQuantParams) -> Uniqu
     let post_h = wht(&pre_h);
     let out_f32 = ffi::multiply(&post_h, &signs1_arr);
     ffi::astype(&out_f32, dtype::FLOAT16)
+}
+
+/// Inverse-rotate an FP16 attention result without FP32 array boundaries.
+///
+/// The Hadamard butterfly uses float registers internally and stores FP16.
+pub(crate) fn turbo4_v_inverse_rotate_f16(
+    x: &MlxArray,
+    params: &TurboQuantParams,
+) -> UniquePtr<MlxArray> {
+    assert_eq!(
+        ffi::array_dtype(x),
+        dtype::FLOAT16,
+        "turbo4_v_inverse_rotate_f16 requires FP16 input"
+    );
+    let shape = ffi::array_shape(x);
+    let d = *shape
+        .last()
+        .expect("turbo4_v_inverse_rotate_f16: input must be at least 1-D")
+        as usize;
+    assert_eq!(
+        d, params.head_dim as usize,
+        "turbo4_v_inverse_rotate_f16: last dim ({d}) must match TurboQuantParams head_dim ({})",
+        params.head_dim
+    );
+    let signs1_f32 = ffi::from_slice_f32(&params.signs1, &[1, 1, 1, d as i32]);
+    let signs2_f32 = ffi::from_slice_f32(&params.signs2, &[1, 1, 1, d as i32]);
+    let signs1 = ffi::astype(&signs1_f32, dtype::FLOAT16);
+    let signs2 = ffi::astype(&signs2_f32, dtype::FLOAT16);
+    let pre_h = ffi::multiply(x, &signs2);
+    let post_h = wht(&pre_h);
+    ffi::multiply(&post_h, &signs1)
 }
 
 // ---------------------------------------------------------------------------

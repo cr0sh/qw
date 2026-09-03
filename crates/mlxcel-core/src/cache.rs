@@ -3637,7 +3637,39 @@ impl KVCache {
         {
             return output;
         }
-        self.turbo4_dequant_sdpa_prefix(q, self.offset, scale, mask, false)
+        self.turbo4_dequant_sdpa_prefix(q, self.offset, scale, mask, false, false)
+    }
+
+    /// FP16-chain variant of [`Self::update_and_turbo4_attention`].
+    ///
+    /// Cache mutation is identical; only the transient Q/output rotations stay
+    /// in FP16 storage around their float-accumulating Hadamard kernels.
+    pub fn update_and_turbo4_attention_f16(
+        &mut self,
+        q: &MlxArray,
+        new_keys: UniquePtr<MlxArray>,
+        new_values: UniquePtr<MlxArray>,
+        scale: f32,
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        assert_eq!(
+            self.mode,
+            KVCacheMode::Turbo4,
+            "update_and_turbo4_attention_f16 requires Turbo4 mode"
+        );
+        assert_eq!(
+            ffi::array_dtype(q),
+            dtype::FLOAT16,
+            "update_and_turbo4_attention_f16 requires FP16 Q"
+        );
+        self.update(new_keys, new_values);
+        if mask.is_none()
+            && ffi::array_shape(q).get(2) == Some(&1)
+            && let Some(output) = self.turbo4_fused_attention_prefix(q, self.offset, scale)
+        {
+            return output;
+        }
+        self.turbo4_dequant_sdpa_prefix(q, self.offset, scale, mask, false, true)
     }
 
     /// Multi-token bottom-right causal variant of symmetric Turbo4 attention.
@@ -3659,18 +3691,55 @@ impl KVCache {
         );
         let old_offset = self.offset;
         self.update(new_keys, new_values);
+        self.turbo4_causal_attention_after_update(q, old_offset, scale, false)
+    }
+
+    /// FP16-chain bottom-right causal Turbo4 attention.
+    pub fn update_and_turbo4_causal_attention_f16(
+        &mut self,
+        q: &MlxArray,
+        new_keys: UniquePtr<MlxArray>,
+        new_values: UniquePtr<MlxArray>,
+        scale: f32,
+    ) -> UniquePtr<MlxArray> {
+        assert_eq!(
+            self.mode,
+            KVCacheMode::Turbo4,
+            "update_and_turbo4_causal_attention_f16 requires Turbo4 mode"
+        );
+        assert_eq!(
+            ffi::array_dtype(q),
+            dtype::FLOAT16,
+            "update_and_turbo4_causal_attention_f16 requires FP16 Q"
+        );
+        let old_offset = self.offset;
+        self.update(new_keys, new_values);
+        self.turbo4_causal_attention_after_update(q, old_offset, scale, true)
+    }
+
+    fn turbo4_causal_attention_after_update(
+        &self,
+        q: &MlxArray,
+        old_offset: i32,
+        scale: f32,
+        native_f16_rotation: bool,
+    ) -> UniquePtr<MlxArray> {
+        const MAX_PACKED_ROWS: usize = 5;
         let q_shape = ffi::array_shape(q);
-        if q_shape.len() == 4 && (2..=5).contains(&q_shape[2]) {
-            let mut rows = Vec::with_capacity(q_shape[2] as usize);
-            for row in 0..q_shape[2] {
+        if q_shape.len() == 4 && (2..=MAX_PACKED_ROWS as i32).contains(&q_shape[2]) {
+            let row_count = q_shape[2] as usize;
+            let mut rows: [UniquePtr<MlxArray>; MAX_PACKED_ROWS] =
+                std::array::from_fn(|_| UniquePtr::null());
+            let mut pointers = [std::ptr::null(); MAX_PACKED_ROWS];
+            for row in 0..row_count {
                 let q_row = ffi::slice(
                     q,
-                    &[0, 0, row, 0],
-                    &[q_shape[0], q_shape[1], row + 1, q_shape[3]],
+                    &[0, 0, row as i32, 0],
+                    &[q_shape[0], q_shape[1], row as i32 + 1, q_shape[3]],
                 );
                 let Some(output) = self.turbo4_fused_attention_prefix(
                     &q_row,
-                    old_offset + row + 1,
+                    old_offset + row as i32 + 1,
                     scale,
                 ) else {
                     return self.turbo4_dequant_sdpa_prefix(
@@ -3679,18 +3748,26 @@ impl KVCache {
                         scale,
                         None,
                         true,
+                        native_f16_rotation,
                     );
                 };
-                rows.push(output);
+                rows[row] = output;
+                pointers[row] = rows[row]
+                    .as_ref()
+                    .map_or(std::ptr::null(), |array| array as *const MlxArray);
             }
-            let pointers = rows
-                .iter()
-                .map(|row| &**row as *const MlxArray)
-                .collect::<Vec<_>>();
-            // SAFETY: `rows` owns every pointee through concatenation.
-            return unsafe { ffi::concatenate(&pointers, 2) };
+            // SAFETY: the fixed `rows` array owns every pointee through
+            // concatenation; only its initialized prefix is exposed.
+            return unsafe { ffi::concatenate(&pointers[..row_count], 2) };
         }
-        self.turbo4_dequant_sdpa_prefix(q, self.offset, scale, None, true)
+        self.turbo4_dequant_sdpa_prefix(
+            q,
+            self.offset,
+            scale,
+            None,
+            true,
+            native_f16_rotation,
+        )
     }
 
     pub fn demote_fp16_to_turbo4(&mut self) -> bool {
@@ -3759,6 +3836,7 @@ impl KVCache {
         scale: f32,
         mask: Option<&MlxArray>,
         causal: bool,
+        native_f16_rotation: bool,
     ) -> UniquePtr<MlxArray> {
         let kp = self.k_packed.as_ref().expect("k_packed must exist");
         let kr = self.k_rescale.as_ref().expect("k_rescale must exist");
@@ -3787,9 +3865,15 @@ impl KVCache {
                     &[0, 0, 0, 0],
                     &[v_shape[0], v_shape[1], prefix_len, v_shape[3]],
                 );
-                return turbo::sparse_v::attention_turbo4_rotated_sdpa(
-                    q, &k_slice, &v_slice, params, scale, mask, causal,
-                );
+                return if native_f16_rotation {
+                    turbo::sparse_v::attention_turbo4_rotated_sdpa_f16(
+                        q, &k_slice, &v_slice, params, scale, mask, causal,
+                    )
+                } else {
+                    turbo::sparse_v::attention_turbo4_rotated_sdpa(
+                        q, &k_slice, &v_slice, params, scale, mask, causal,
+                    )
+                };
             }
         }
 
@@ -3814,9 +3898,15 @@ impl KVCache {
             &[vr_shape[0], vr_shape[1], prefix_len, 1],
         );
 
-        turbo::sparse_v::attention_turbo4_dequant_sdpa(
-            q, &kp_slice, &kr_slice, &vp_slice, &vr_slice, params, scale, mask, causal,
-        )
+        if native_f16_rotation {
+            turbo::sparse_v::attention_turbo4_dequant_sdpa_f16(
+                q, &kp_slice, &kr_slice, &vp_slice, &vr_slice, params, scale, mask, causal,
+            )
+        } else {
+            turbo::sparse_v::attention_turbo4_dequant_sdpa(
+                q, &kp_slice, &kr_slice, &vp_slice, &vr_slice, params, scale, mask, causal,
+            )
+        }
     }
 
     /// Returns `true` iff this cache is in `KVCacheMode::Turbo4Delegated` mode
