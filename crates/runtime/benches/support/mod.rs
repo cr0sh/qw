@@ -994,6 +994,14 @@ fn prepare_long_conversation_fixture_uncached(
         mtp_stats.proposed_draft_tokens > 0,
         "long-conversation MTP k={MTP_BLOCK_SIZE} must propose draft tokens"
     );
+    assert_eq!(
+        mtp_output.token_ids, baseline_output.token_ids,
+        "MTP output must match sequential baseline output"
+    );
+    assert_eq!(
+        mtp_output.text, baseline_output.text,
+        "MTP text must match sequential baseline text"
+    );
     eprintln!(
         "MTP_LONG_CONTEXT_PROFILE context={} tokens={} prefix_tokens={} accepted={} proposed={} acceptance={:.2}% forwards={} draft_ms={:.3} verify_ms={:.3} walk_ms={:.3} reconcile_ms={:.3} materializations={} snapshots={}",
         context_label,

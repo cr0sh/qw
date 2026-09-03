@@ -1147,6 +1147,21 @@ impl Qwen38AffineGdnIngressFusion {
     pub fn forward(&self, input: &MlxArray) -> Result<Qwen38GdnIngressOutput, GgmlAffineError> {
         validate_input(input, 5120)?;
         let rows = affine_input_rows(input)?;
+        // GDN high-M keeps the persistent F16 affine result as its recurrence
+        // operand. Cast the shared activation once; low-M exact M234 routes
+        // below remain FP32.
+        if rows >= F16_PREFILL_MIN_ROWS {
+            let input_f16 = crate::astype(input, dtype::FLOAT16);
+            let input_f16 = input_f16
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?;
+            return Ok(Qwen38GdnIngressOutput {
+                qkv: affine_matmul_f16_output(input_f16, &self.qkv.planes, self.qkv.bits)?,
+                z: affine_matmul_f16_output(input_f16, &self.z.planes, self.z.bits)?,
+                beta: affine_matmul_f16_output(input_f16, &self.beta.planes, self.beta.bits)?,
+                alpha: affine_matmul_f16_output(input_f16, &self.alpha.planes, self.alpha.bits)?,
+            });
+        }
         // Only the pinned M=33 and M=128 BlockMMA shapes beat ordinary MLX.
         if !matches!(rows, 33 | 128)
             || crate::array_dtype(input) != dtype::FLOAT32
@@ -1836,6 +1851,9 @@ fn affine_matmul_f16_output(
     planes: &AffinePlanes,
     bits: i32,
 ) -> Result<UniquePtr<MlxArray>, GgmlAffineError> {
+    if crate::array_dtype(input_f16) != dtype::FLOAT16 {
+        return Err(GgmlAffineError::InvalidInput);
+    }
     Ok(unsafe {
         crate::quantized_matmul(
             input_f16,

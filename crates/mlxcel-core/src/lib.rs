@@ -623,6 +623,13 @@ mod ffi {
             a: &MlxArray,
             dt_bias: &MlxArray,
         ) -> UniquePtr<MlxArray>;
+        /// Compiled gated-delta decay gate for GGUF's negative coefficient.
+        /// output = exp(float32(coefficient) * softplus(a + dt_bias))
+        fn compiled_gated_delta_coefficient_gate(
+            coefficient: &MlxArray,
+            a: &MlxArray,
+            dt_bias: &MlxArray,
+        ) -> UniquePtr<MlxArray>;
 
         /// Compiled GptOss SwiGLU activation with kernel fusion
         /// Matches mlx-lm gpt_oss.swiglu: clipped gate/up + sigmoid(1.702*gate).
@@ -1945,6 +1952,34 @@ mod ffi {
             beta: &MlxArray,
             state: &MlxArray,
             mask: *const MlxArray, // nullable
+            output: &mut UniquePtr<MlxArray>,
+            new_state: &mut UniquePtr<MlxArray>,
+        );
+
+        /// Paired FP16 q/k RMS normalization with FP32 reductions and direct
+        /// FP16 outputs for the high-M GDN chain.
+        unsafe fn metal_scaled_rms_norm_pair_f16(
+            q: &MlxArray,
+            k: &MlxArray,
+            q_scale: f32,
+            k_scale: f32,
+            eps: f32,
+            q_out: &mut UniquePtr<MlxArray>,
+            k_out: &mut UniquePtr<MlxArray>,
+        );
+
+        /// Qwen3.8 coefficient-form GDN kernel. Decay and beta are evaluated
+        /// inside the FP32 recurrent update from FP16 projected operands.
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn metal_gated_delta_coefficient_forward(
+            q: &MlxArray,
+            k: &MlxArray,
+            v: &MlxArray,
+            coefficient: &MlxArray,
+            alpha: &MlxArray,
+            beta_logit: &MlxArray,
+            dt_bias: &MlxArray,
+            state: &MlxArray,
             output: &mut UniquePtr<MlxArray>,
             new_state: &mut UniquePtr<MlxArray>,
         );

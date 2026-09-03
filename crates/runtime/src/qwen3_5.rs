@@ -554,6 +554,7 @@ pub(crate) struct Qwen35GatedDeltaNet {
     conv_dim: usize,
 
     conv1d_weight: UniquePtr<MlxArray>,
+    conv1d_weight_f16: Option<UniquePtr<MlxArray>>,
     ingress: Qwen35GdnIngress,
     dt_bias: UniquePtr<MlxArray>,
     a_log: UniquePtr<MlxArray>,
@@ -584,7 +585,6 @@ impl Qwen35GatedDeltaNet {
         let out = self.forward_hidden_internal(inputs, mask, cache, Some((layer_idx, snapshots)));
         self.out_proj.forward(&out)
     }
-
 
     fn forward_hidden_internal(
         &self,
@@ -669,9 +669,16 @@ impl Qwen35GatedDeltaNet {
         }
 
         // Apply conv1d with SiLU activation
+        let conv1d_weight = if input_dtype == mlxcel_core::dtype::FLOAT16 {
+            self.conv1d_weight_f16
+                .as_deref()
+                .unwrap_or(&self.conv1d_weight)
+        } else {
+            &self.conv1d_weight
+        };
         let conv_out = mlxcel_core::conv1d(
             &conv_input,
-            &self.conv1d_weight,
+            conv1d_weight,
             1,
             0,
             1,
@@ -724,12 +731,30 @@ impl Qwen35GatedDeltaNet {
             })
         });
 
-        // Apply RMS norm with scaling (same as Qwen3Next). Reference mlx-lm
-        // keeps this on mx.fast.rms_norm rather than expanding it into
-        // primitive ops.
+        // The high-M pair kernel accumulates both RMS reductions in FP32 and
+        // stores half results directly. Low-M exact M234 remains FP32.
         let inv_scale = (self.head_k_dim as f32).powf(-0.5);
-        let q = scaled_fast_rms_norm_no_weight(&q, inv_scale * inv_scale, 1e-6);
-        let k = scaled_fast_rms_norm_no_weight(&k, inv_scale, 1e-6);
+        let (q, k) = if input_dtype == mlxcel_core::dtype::FLOAT16 {
+            let mut q_norm = UniquePtr::null();
+            let mut k_norm = UniquePtr::null();
+            unsafe {
+                mlxcel_core::metal_scaled_rms_norm_pair_f16(
+                    &q,
+                    &k,
+                    inv_scale * inv_scale,
+                    inv_scale,
+                    1e-6,
+                    &mut q_norm,
+                    &mut k_norm,
+                );
+            }
+            (q_norm, k_norm)
+        } else {
+            (
+                scaled_fast_rms_norm_no_weight(&q, inv_scale * inv_scale, 1e-6),
+                scaled_fast_rms_norm_no_weight(&k, inv_scale, 1e-6),
+            )
+        };
 
         if let Some((layer_idx, snapshots)) = snapshot {
             snapshots.push(GdnRollbackSnapshot {
@@ -854,6 +879,13 @@ impl Qwen35GatedDeltaNet {
                 ),
             }
         };
+        let conv1d_weight_f16 = if matches!(&ingress, Qwen35GdnIngress::PinnedAffine(_)) {
+            let weight = mlxcel_core::astype(&conv1d_weight, mlxcel_core::dtype::FLOAT16);
+            mlxcel_core::eval(&weight);
+            Some(weight)
+        } else {
+            None
+        };
         let dt_bias = weights.tensor(slot(LayerTensor::LinearDtBias))?;
         let a_log = weights.tensor(slot(LayerTensor::LinearA))?;
         let norm_weight = weights.tensor(slot(LayerTensor::LinearNorm))?;
@@ -870,6 +902,7 @@ impl Qwen35GatedDeltaNet {
             conv_kernel_size,
             conv_dim,
             conv1d_weight,
+            conv1d_weight_f16,
             ingress,
             dt_bias,
             a_log,
@@ -4410,6 +4443,237 @@ mod tests {
                 gdn_stats.intermediate_bytes_avoided,
                 gdn_stats.workspace_bytes,
             );
+        }
+    }
+
+    struct CandidateVerifyRun {
+        logits: Vec<Vec<u8>>,
+        snapshot: ModelStateSnapshot,
+    }
+
+    fn candidate_verify_run(
+        model: &Qwen35Model,
+        input_rows: usize,
+        batched: bool,
+    ) -> CandidateVerifyRun {
+        let seed = [9_707_i32, 11, 1_879, 42, 123, 7_919];
+        let token_ids = (0..input_rows + 2)
+            .map(|index| seed[index % seed.len()])
+            .collect::<Vec<_>>();
+        model.reset_runtime_state();
+        let prefix = mlxcel_core::from_slice_i32(&token_ids[..2], &[1, 2]);
+        model
+            .forward_mtp_prefill_chunks(&prefix, None, None, None, |_, _, _| {})
+            .expect("target prefix");
+
+        let logits = if batched {
+            let block = mlxcel_core::from_slice_i32(
+                &token_ids[2..2 + input_rows],
+                &[1, input_rows as i32],
+            );
+            let logits = model.forward_mtp_verify(&block).logits;
+            mlxcel_core::eval(&logits);
+            let bytes = mlxcel_core::array_to_raw_bytes(&logits);
+            let row_bytes = bytes.len() / input_rows;
+            bytes
+                .chunks_exact(row_bytes)
+                .map(<[u8]>::to_vec)
+                .collect()
+        } else {
+            token_ids[2..2 + input_rows]
+                .iter()
+                .map(|&token| {
+                    let input = mlxcel_core::from_slice_i32(&[token], &[1, 1]);
+                    let logits = model.forward(&input, &mut [], None);
+                    mlxcel_core::eval(&logits);
+                    mlxcel_core::array_to_raw_bytes(&logits)
+                })
+                .collect()
+        };
+        let snapshot = model
+            .snapshot_sequence_state(SequenceId::from_raw(17), 2 + input_rows, None)
+            .expect("complete candidate-regime snapshot");
+        CandidateVerifyRun { logits, snapshot }
+    }
+
+    fn ordered_f32(value: f32) -> i32 {
+        let bits = value.to_bits() as i32;
+        if bits < 0 { i32::MIN - bits } else { bits }
+    }
+
+    fn f32_distance(left: &[u8], right: &[u8]) -> (u32, f32) {
+        assert_eq!(left.len(), right.len());
+        left.chunks_exact(4)
+            .zip(right.chunks_exact(4))
+            .fold((0, 0.0_f32), |(max_ulp, max_abs), (left, right)| {
+                let left = f32::from_le_bytes(left.try_into().expect("left f32"));
+                let right = f32::from_le_bytes(right.try_into().expect("right f32"));
+                (
+                    max_ulp.max(ordered_f32(left).abs_diff(ordered_f32(right))),
+                    max_abs.max((left - right).abs()),
+                )
+            })
+    }
+
+    fn top_indices(bytes: &[u8], count: usize) -> Vec<usize> {
+        let mut values = bytes
+            .chunks_exact(4)
+            .enumerate()
+            .map(|(index, bytes)| {
+                (
+                    index,
+                    f32::from_le_bytes(bytes.try_into().expect("logit f32")),
+                )
+            })
+            .collect::<Vec<_>>();
+        values.sort_unstable_by(|left, right| right.1.total_cmp(&left.1));
+        values.truncate(count);
+        values.into_iter().map(|(index, _)| index).collect()
+    }
+
+    fn assert_candidate_cache_close(
+        sequential: &ModelStateSnapshot,
+        batched: &ModelStateSnapshot,
+        input_rows: usize,
+    ) {
+        let sequential_names = sequential.tensor_names().collect::<Vec<_>>();
+        let batched_names = batched.tensor_names().collect::<Vec<_>>();
+        assert_eq!(sequential_names, batched_names);
+        for name in sequential_names {
+            let sequential = sequential.tensor(name).expect("sequential tensor");
+            let batched = batched.tensor(name).expect("batched tensor");
+            assert_eq!(
+                mlxcel_core::array_shape(sequential),
+                mlxcel_core::array_shape(batched),
+                "M{input_rows} cache tensor {name} shape"
+            );
+            assert_eq!(
+                mlxcel_core::array_dtype(sequential),
+                mlxcel_core::array_dtype(batched),
+                "M{input_rows} cache tensor {name} dtype"
+            );
+            let sequential_bytes = mlxcel_core::array_to_raw_bytes(sequential);
+            let batched_bytes = mlxcel_core::array_to_raw_bytes(batched);
+            if mlxcel_core::array_dtype(sequential) == mlxcel_core::dtype::FLOAT32 {
+                let (max_ulp, _) = f32_distance(&sequential_bytes, &batched_bytes);
+                assert!(
+                    max_ulp <= 1,
+                    "M{input_rows} cache tensor {name} differs by {max_ulp} ULP"
+                );
+            } else {
+                assert_eq!(
+                    sequential_bytes, batched_bytes,
+                    "M{input_rows} non-f32 cache tensor {name} differs"
+                );
+            }
+        }
+
+        let sequential_names = sequential.paged_tensor_names().collect::<Vec<_>>();
+        let batched_names = batched.paged_tensor_names().collect::<Vec<_>>();
+        assert_eq!(sequential_names, batched_names);
+        for name in sequential_names {
+            let sequential = sequential
+                .paged_tensor(name)
+                .and_then(|tensor| tensor.materialize())
+                .expect("sequential paged tensor");
+            let batched = batched
+                .paged_tensor(name)
+                .and_then(|tensor| tensor.materialize())
+                .expect("batched paged tensor");
+            assert_eq!(
+                mlxcel_core::array_to_raw_bytes(&sequential),
+                mlxcel_core::array_to_raw_bytes(&batched),
+                "M{input_rows} paged cache tensor {name} differs"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the complete pinned Qwen3.8 27B GGUF pair and exclusive Metal"]
+    fn compiled_coefficient_gate_high_m_keeps_half_operands_and_f32_state() {
+        if !mlxcel_core::metal_is_available() {
+            return;
+        }
+        let (model, _) =
+            Qwen35Model::load_pinned(KVCacheMode::Fp16).expect("load candidate Qwen3.8 GGUF");
+        model.reset_runtime_state();
+        let tokens = (0..128)
+            .map(|index| [1_879_i32, 42, 123, 7_919][index % 4])
+            .collect::<Vec<_>>();
+        let input = mlxcel_core::from_slice_i32(&tokens, &[1, 128]);
+        let output = model.forward_mtp_verify(&input);
+        mlxcel_core::eval(&output.logits);
+        assert!(!output.gdn_states.is_empty());
+        let mut half_layers = 0;
+        for state in &output.gdn_states {
+            let eligible = QWEN38_GDN_FUSION_PLAN.iter().any(|descriptor| {
+                descriptor.layer == state.layer_idx && descriptor.all_affine()
+            });
+            if !eligible {
+                continue;
+            }
+            half_layers += 1;
+            for (name, value) in [
+                ("q", state.q.as_ref().expect("q")),
+                ("k", state.k.as_ref().expect("k")),
+                ("v", state.v.as_ref().expect("v")),
+                ("alpha", state.a.as_ref().expect("alpha")),
+                ("beta", state.b.as_ref().expect("beta")),
+                (
+                    "conv_input",
+                    state.conv_input.as_ref().expect("conv input"),
+                ),
+            ] {
+                assert_eq!(
+                    mlxcel_core::array_dtype(value),
+                    mlxcel_core::dtype::FLOAT16,
+                    "eligible layer {} high-M {name} must remain FP16",
+                    state.layer_idx,
+                );
+            }
+        }
+        assert!(half_layers > 0, "pinned model must exercise half GDN layers");
+        let snapshot = model
+            .snapshot_sequence_state(SequenceId::from_raw(19), 128, None)
+            .expect("complete high-M candidate snapshot");
+        for name in snapshot.tensor_names() {
+            if name.ends_with(".state_cache") {
+                assert_eq!(
+                    mlxcel_core::array_dtype(snapshot.tensor(name).expect("state cache")),
+                    mlxcel_core::dtype::FLOAT32,
+                    "{name} must retain FP32 recurrent state",
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the complete pinned Qwen3.8 27B GGUF pair and exclusive Metal"]
+    fn compiled_coefficient_gate_candidate_regime_sequential_and_batched_m134_match() {
+        if !mlxcel_core::metal_is_available() {
+            return;
+        }
+        let (model, _) =
+            Qwen35Model::load_pinned(KVCacheMode::Fp16).expect("load candidate Qwen3.8 GGUF");
+        for input_rows in [1, 3, 4] {
+            let sequential = candidate_verify_run(&model, input_rows, false);
+            let batched = candidate_verify_run(&model, input_rows, true);
+            assert_eq!(sequential.logits.len(), batched.logits.len());
+            for (row, (sequential, batched)) in
+                sequential.logits.iter().zip(&batched.logits).enumerate()
+            {
+                let (max_ulp, _) = f32_distance(sequential, batched);
+                assert!(
+                    max_ulp <= 1,
+                    "M{input_rows} corresponding logit row {row} differs by {max_ulp} ULP"
+                );
+                assert_eq!(
+                    top_indices(sequential, 1),
+                    top_indices(batched, 1),
+                    "M{input_rows} corresponding greedy token row {row} differs"
+                );
+            }
+            assert_candidate_cache_close(&sequential.snapshot, &batched.snapshot, input_rows);
         }
     }
 

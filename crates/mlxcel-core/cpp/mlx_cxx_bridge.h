@@ -496,6 +496,13 @@ std::unique_ptr<MlxArray> compiled_gated_delta_gate(
     const MlxArray& a,
     const MlxArray& dt_bias
 );
+// Gated-delta decay gate for GGUF's pre-transformed negative coefficient.
+// output = exp(float32(coefficient) * softplus(a + dt_bias))
+std::unique_ptr<MlxArray> compiled_gated_delta_coefficient_gate(
+    const MlxArray& coefficient,
+    const MlxArray& a,
+    const MlxArray& dt_bias
+);
 
 
 // GptOss SwiGLU activation only - compiled with kernel fusion (shapeless=true)
@@ -1818,6 +1825,35 @@ void metal_gated_delta_forward(
     const MlxArray* mask,    // nullable: [B, T]
     std::unique_ptr<MlxArray>& output,      // [B, T, Hv, Dv]
     std::unique_ptr<MlxArray>& new_state    // [B, Hv, Dv, Dk]
+);
+
+// Paired FP16 q/k RMS normalization with FP32 reductions and direct FP16
+// stores, avoiding the float32-output plus conversion chain.
+void metal_scaled_rms_norm_pair_f16(
+    const MlxArray& q,
+    const MlxArray& k,
+    float q_scale,
+    float k_scale,
+    float eps,
+    std::unique_ptr<MlxArray>& q_out,
+    std::unique_ptr<MlxArray>& k_out
+);
+
+// Qwen3.8 coefficient-form gated-delta Metal kernel.
+// Computes decay and beta inside the recurrent kernel so projected operands
+// feed the recurrence without conversion or intermediate materializations.
+// Inputs and output may be FP16 or FP32; state and reductions remain FP32.
+void metal_gated_delta_coefficient_forward(
+    const MlxArray& q,             // [B, T, Hk, Dk]
+    const MlxArray& k,             // [B, T, Hk, Dk]
+    const MlxArray& v,             // [B, T, Hv, Dv]
+    const MlxArray& coefficient,   // [Hv], FP32
+    const MlxArray& alpha,         // [B, T, Hv]
+    const MlxArray& beta_logit,    // [B, T, Hv]
+    const MlxArray& dt_bias,       // [Hv], FP32
+    const MlxArray& state,         // [B, Hv, Dv, Dk], FP32
+    std::unique_ptr<MlxArray>& output,
+    std::unique_ptr<MlxArray>& new_state
 );
 
 // Quantization mode is "affine" (standard mlx-community models).

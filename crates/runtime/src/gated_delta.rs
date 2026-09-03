@@ -637,11 +637,63 @@ pub fn gated_delta_update_coefficient(
     state: Option<&MlxArray>,
     mask: Option<&MlxArray>,
 ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+    let q_shape = mlxcel_core::array_shape(q);
+    let v_shape = mlxcel_core::array_shape(v);
+    let (batch, key_heads, key_dim) = (q_shape[0], q_shape[2], q_shape[3]);
+    let (value_heads, value_dim) = (v_shape[2], v_shape[3]);
+    if mask.is_none()
+        && mlxcel_core::gated_delta_kernel_available()
+        && supports_metal_gated_delta_kernel(key_heads, value_heads, key_dim, value_dim)
+    {
+        let current_state = state
+            .map(mlxcel_core::share)
+            .unwrap_or_else(|| {
+                mlxcel_core::zeros(
+                    &[batch, value_heads, value_dim, key_dim],
+                    dtype::FLOAT32,
+                )
+            });
+        let mut output = UniquePtr::null();
+        let mut new_state = UniquePtr::null();
+        unsafe {
+            mlxcel_core::metal_gated_delta_coefficient_forward(
+                q,
+                k,
+                v,
+                coefficient,
+                a,
+                b,
+                dt_bias,
+                &current_state,
+                &mut output,
+                &mut new_state,
+            );
+        }
+        return (output, new_state);
+    }
+
     let beta = mlxcel_core::sigmoid(b);
+    let g = compute_g_coefficient(coefficient, a, dt_bias);
+    gated_delta_ops(q, k, v, &g, &beta, state, mask)
+}
+
+fn compute_g_coefficient(
+    coefficient: &MlxArray,
+    a: &MlxArray,
+    dt_bias: &MlxArray,
+) -> UniquePtr<MlxArray> {
+    mlxcel_core::compiled_gated_delta_coefficient_gate(coefficient, a, dt_bias)
+}
+
+#[cfg(test)]
+fn compute_g_coefficient_oracle(
+    coefficient: &MlxArray,
+    a: &MlxArray,
+    dt_bias: &MlxArray,
+) -> UniquePtr<MlxArray> {
     let step = mlxcel_core::softplus(&mlxcel_core::add(a, dt_bias));
     let coefficient = mlxcel_core::astype(coefficient, mlxcel_core::dtype::FLOAT32);
-    let g = mlxcel_core::exp(&mlxcel_core::multiply(&coefficient, &step));
-    gated_delta_ops(q, k, v, &g, &beta, state, mask)
+    mlxcel_core::exp(&mlxcel_core::multiply(&coefficient, &step))
 }
 
 /// Fast RMS normalization without a learned scale, followed by scalar scaling.
@@ -704,4 +756,221 @@ fn precise_swiglu_gate(x: &MlxArray, gate: &MlxArray, target_dtype: i32) -> Uniq
     let x_f32 = mlxcel_core::astype(x, dtype::FLOAT32);
     let product = mlxcel_core::multiply(&gate_silu, &x_f32);
     restore_dtype(product, target_dtype)
+}
+
+#[cfg(test)]
+mod coefficient_gate_tests {
+    use super::*;
+
+    const HEADS: i32 = 48;
+
+    fn patterned(shape: &[i32], salt: usize, scale: f32) -> UniquePtr<MlxArray> {
+        let len = shape
+            .iter()
+            .try_fold(1usize, |size, &dimension| {
+                size.checked_mul(dimension as usize)
+            })
+            .expect("test tensor size");
+        let values = (0..len)
+            .map(|index| {
+                let phase = (index
+                    .wrapping_mul(37)
+                    .wrapping_add(salt.wrapping_mul(101))
+                    % 2001) as i32
+                    - 1000;
+                phase as f32 * scale
+            })
+            .collect::<Vec<_>>();
+        mlxcel_core::from_slice_f32(&values, shape)
+    }
+
+    fn patterned_f16(shape: &[i32], salt: usize, scale: f32) -> UniquePtr<MlxArray> {
+        let value = patterned(shape, salt, scale);
+        mlxcel_core::astype(value.as_ref().expect("patterned input"), dtype::FLOAT16)
+    }
+
+    fn coefficient(layer: usize) -> UniquePtr<MlxArray> {
+        let values = (0..HEADS as usize)
+            .map(|head| -0.000_125 * (1 + (head + layer * 7) % 63) as f32)
+            .collect::<Vec<_>>();
+        mlxcel_core::from_slice_f32(&values, &[HEADS])
+    }
+
+    fn ordered(value: f32) -> i32 {
+        let bits = value.to_bits() as i32;
+        if bits < 0 { i32::MIN - bits } else { bits }
+    }
+
+    fn max_ulp(left: &MlxArray, right: &MlxArray) -> u32 {
+        mlxcel_core::eval(left);
+        mlxcel_core::eval(right);
+        mlxcel_core::array_to_raw_bytes(left)
+            .chunks_exact(4)
+            .zip(mlxcel_core::array_to_raw_bytes(right).chunks_exact(4))
+            .map(|(left, right)| {
+                let left = f32::from_le_bytes(left.try_into().expect("left f32"));
+                let right = f32::from_le_bytes(right.try_into().expect("right f32"));
+                ordered(left).abs_diff(ordered(right))
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    #[ignore = "requires exclusive Metal"]
+    fn compiled_coefficient_gate_matches_fp32_graph_for_m134() {
+        if !mlxcel_core::metal_is_available() {
+            return;
+        }
+        let coefficient = coefficient(0);
+        let dt_bias = patterned(&[HEADS], 73, 0.0009765625);
+        for rows in [1, 3, 4] {
+            let activation = patterned(&[1, rows, HEADS], 101 + rows as usize, 0.00390625);
+            let oracle = compute_g_coefficient_oracle(&coefficient, &activation, &dt_bias);
+            let compiled = mlxcel_core::compiled_gated_delta_coefficient_gate(
+                &coefficient,
+                &activation,
+                &dt_bias,
+            );
+            let max_ulp = max_ulp(&oracle, &compiled);
+            assert!(max_ulp <= 1, "M{rows} g differs by {max_ulp} ULP");
+        }
+    }
+
+    #[test]
+    #[ignore = "requires exclusive Metal"]
+    fn scaled_rms_norm_pair_stores_f16() {
+        if !mlxcel_core::metal_is_available() {
+            return;
+        }
+        let q = patterned_f16(&[1, 128, 16, 128], 17, 0.000244140625);
+        let k = patterned_f16(&[1, 128, 16, 128], 29, 0.000244140625);
+        let mut q_out = UniquePtr::null();
+        let mut k_out = UniquePtr::null();
+        unsafe {
+            mlxcel_core::metal_scaled_rms_norm_pair_f16(
+                &q,
+                &k,
+                0.0078125,
+                0.08838835,
+                1e-6,
+                &mut q_out,
+                &mut k_out,
+            );
+        }
+        mlxcel_core::eval(&q_out);
+        mlxcel_core::eval(&k_out);
+        assert_eq!(mlxcel_core::array_dtype(&q_out), dtype::FLOAT16);
+        assert_eq!(mlxcel_core::array_dtype(&k_out), dtype::FLOAT16);
+    }
+
+    #[test]
+    #[ignore = "requires exclusive Metal"]
+    fn fused_half_coefficient_recurrence_matches_sequential_m134_and_m128() {
+        if !mlxcel_core::metal_is_available() {
+            return;
+        }
+        const KEY_HEADS: i32 = 16;
+        const KEY_DIM: i32 = 128;
+        const VALUE_DIM: i32 = 128;
+
+        let coefficient = coefficient(0);
+        let dt_bias = patterned(&[HEADS], 73, 0.0009765625);
+        for rows in [1, 3, 4, 128] {
+            let half = |value: UniquePtr<MlxArray>| {
+                mlxcel_core::astype(value.as_ref().expect("patterned input"), dtype::FLOAT16)
+            };
+            let q = half(patterned(
+                &[1, rows, KEY_HEADS, KEY_DIM],
+                11 + rows as usize,
+                0.000244140625,
+            ));
+            let k = half(patterned(
+                &[1, rows, KEY_HEADS, KEY_DIM],
+                23 + rows as usize,
+                0.000244140625,
+            ));
+            let v = half(patterned(
+                &[1, rows, HEADS, VALUE_DIM],
+                37 + rows as usize,
+                0.000244140625,
+            ));
+            let alpha = half(patterned(
+                &[1, rows, HEADS],
+                41 + rows as usize,
+                0.00390625,
+            ));
+            let beta = half(patterned(
+                &[1, rows, HEADS],
+                53 + rows as usize,
+                0.00390625,
+            ));
+            let initial = patterned(
+                &[1, HEADS, VALUE_DIM, KEY_DIM],
+                67 + rows as usize,
+                0.00000011920928955078125,
+            );
+
+            let (batched_output, batched_state) = gated_delta_update_coefficient(
+                (&q, &k, &v),
+                (&alpha, &beta, &coefficient, &dt_bias),
+                Some(&initial),
+                None,
+            );
+            let mut sequential_state = mlxcel_core::share(&initial);
+            let mut sequential_outputs = Vec::with_capacity(rows as usize);
+            for row in 0..rows {
+                let q_row = mlxcel_core::slice(
+                    &q,
+                    &[0, row, 0, 0],
+                    &[1, row + 1, KEY_HEADS, KEY_DIM],
+                );
+                let k_row = mlxcel_core::slice(
+                    &k,
+                    &[0, row, 0, 0],
+                    &[1, row + 1, KEY_HEADS, KEY_DIM],
+                );
+                let v_row = mlxcel_core::slice(
+                    &v,
+                    &[0, row, 0, 0],
+                    &[1, row + 1, HEADS, VALUE_DIM],
+                );
+                let alpha_row =
+                    mlxcel_core::slice(&alpha, &[0, row, 0], &[1, row + 1, HEADS]);
+                let beta_row =
+                    mlxcel_core::slice(&beta, &[0, row, 0], &[1, row + 1, HEADS]);
+                let (output, next_state) = gated_delta_update_coefficient(
+                    (&q_row, &k_row, &v_row),
+                    (&alpha_row, &beta_row, &coefficient, &dt_bias),
+                    Some(&sequential_state),
+                    None,
+                );
+                sequential_outputs.push(output);
+                sequential_state = next_state;
+            }
+
+            mlxcel_core::eval(&batched_output);
+            for (row, sequential_output) in sequential_outputs.iter().enumerate() {
+                let batched_row = mlxcel_core::slice(
+                    &batched_output,
+                    &[0, row as i32, 0, 0],
+                    &[1, row as i32 + 1, HEADS, VALUE_DIM],
+                );
+                mlxcel_core::eval(&batched_row);
+                mlxcel_core::eval(sequential_output);
+                assert_eq!(
+                    mlxcel_core::array_to_raw_bytes(&batched_row),
+                    mlxcel_core::array_to_raw_bytes(sequential_output),
+                    "M{rows} recurrence output row {row} differs",
+                );
+            }
+            assert_eq!(mlxcel_core::array_dtype(&batched_state), dtype::FLOAT32);
+            assert_eq!(mlxcel_core::array_dtype(&sequential_state), dtype::FLOAT32);
+            let state_ulp = max_ulp(&batched_state, &sequential_state);
+            assert!(
+                state_ulp <= 1,
+                "M{rows} recurrent state differs by {state_ulp} ULP",
+            );
+        }
+    }
 }

@@ -691,6 +691,112 @@ namespace {
         }
     )";
 
+    // Paired high-M q/k RMS normalization. One SIMD group handles one
+    // [Dk] vector, reduces in float, and writes half outputs directly.
+    static const char* SCALED_RMS_NORM_PAIR_F16_METAL_SOURCE = R"(
+        auto vector_idx = thread_position_in_grid.y;
+        auto lane = thread_position_in_threadgroup.x;
+        constexpr int n_per_t = Dk / 32;
+        auto q_ = q + vector_idx * Dk;
+        auto k_ = k + vector_idx * Dk;
+        auto q_out_ = q_out + vector_idx * Dk;
+        auto k_out_ = k_out + vector_idx * Dk;
+
+        float q_values[n_per_t];
+        float k_values[n_per_t];
+        float q_squares = 0.0f;
+        float k_squares = 0.0f;
+        for (int i = 0; i < n_per_t; ++i) {
+            auto index = 32 * i + lane;
+            q_values[i] = static_cast<float>(q_[index]);
+            k_values[i] = static_cast<float>(k_[index]);
+            q_squares += q_values[i] * q_values[i];
+            k_squares += k_values[i] * k_values[i];
+        }
+        q_squares = simd_sum(q_squares);
+        k_squares = simd_sum(k_squares);
+        const float q_factor = fast::rsqrt(q_squares / Dk + eps) * q_scale;
+        const float k_factor = fast::rsqrt(k_squares / Dk + eps) * k_scale;
+        for (int i = 0; i < n_per_t; ++i) {
+            auto index = 32 * i + lane;
+            q_out_[index] = static_cast<half>(q_values[i] * q_factor);
+            k_out_[index] = static_cast<half>(k_values[i] * k_factor);
+        }
+    )";
+
+    // Qwen3.8 scalar coefficient gate, no mask. Operands retain their input
+    // dtype while decay, recurrence, reductions, and state stay f32.
+    static const char* GATED_DELTA_COEFFICIENT_METAL_SOURCE = R"(
+        auto n = thread_position_in_grid.z;
+        auto b_idx = n / Hv;
+        auto hv_idx = n % Hv;
+        auto hk_idx = hv_idx / (Hv / Hk);
+        constexpr int n_per_t = Dk / 32;
+
+        auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
+        auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+        auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+        auto alpha_ = alpha + b_idx * T * Hv + hv_idx;
+        auto beta_logit_ = beta_logit + b_idx * T * Hv + hv_idx;
+        y += b_idx * T * Hv * Dv + hv_idx * Dv;
+
+        auto dk_idx = thread_position_in_threadgroup.x;
+        auto dv_idx = thread_position_in_grid.y;
+        auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+        auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+
+        float state[n_per_t];
+        for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = 32 * i + dk_idx;
+            state[i] = static_cast<float>(i_state[s_idx]);
+        }
+
+        const float decay_coefficient =
+            static_cast<float>(coefficient[hv_idx]);
+        const float decay_bias = static_cast<float>(dt_bias[hv_idx]);
+        for (int t = 0; t < T; ++t) {
+            const float alpha_value = static_cast<float>(*alpha_) + decay_bias;
+            const float softplus = alpha_value > 0.0f
+                ? alpha_value + fast::log(1.0f + fast::exp(-alpha_value))
+                : fast::log(1.0f + fast::exp(alpha_value));
+            const float decay = fast::exp(decay_coefficient * softplus);
+            const float beta_value =
+                1.0f / (1.0f + fast::exp(-static_cast<float>(*beta_logit_)));
+
+            float kv_mem = 0.0f;
+            for (int i = 0; i < n_per_t; ++i) {
+                auto s_idx = 32 * i + dk_idx;
+                state[i] *= decay;
+                kv_mem += state[i] * static_cast<float>(k_[s_idx]);
+            }
+            kv_mem = simd_sum(kv_mem);
+
+            const float delta =
+                (static_cast<float>(v_[dv_idx]) - kv_mem) * beta_value;
+            float out = 0.0f;
+            for (int i = 0; i < n_per_t; ++i) {
+                auto s_idx = 32 * i + dk_idx;
+                state[i] += static_cast<float>(k_[s_idx]) * delta;
+                out += state[i] * static_cast<float>(q_[s_idx]);
+            }
+            out = simd_sum(out);
+            if (thread_index_in_simdgroup == 0) {
+                y[dv_idx] = static_cast<InT>(out);
+            }
+
+            q_ += Hk * Dk;
+            k_ += Hk * Dk;
+            v_ += Hv * Dv;
+            alpha_ += Hv;
+            beta_logit_ += Hv;
+            y += Hv * Dv;
+        }
+        for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = 32 * i + dk_idx;
+            o_state[s_idx] = state[i];
+        }
+    )";
+
     // Variant 2: scalar gate, with mask
     static const char* GATED_DELTA_METAL_SOURCE_MASK = R"(
         auto n = thread_position_in_grid.z;
@@ -913,7 +1019,33 @@ namespace {
         }
     };
 
+
+    struct RmsNormPairKernelHolder {
+        std::optional<mlx::core::fast::CustomKernelFunction> kernel;
+
+        mlx::core::fast::CustomKernelFunction& get() {
+            if (!kernel) {
+                kernel = mlx::core::fast::metal_kernel(
+                    "scaled_rms_norm_pair_f16",
+                    {"q", "k", "q_scale", "k_scale", "eps"},
+                    {"q_out", "k_out"},
+                    SCALED_RMS_NORM_PAIR_F16_METAL_SOURCE
+                );
+            }
+            return *kernel;
+        }
+    };
+
+    static RmsNormPairKernelHolder& get_rms_norm_pair_kernel() {
+        static RmsNormPairKernelHolder holder;
+        return holder;
+    }
+
     static GatedDeltaKernelHolder& get_gd_kernel() {
+        static GatedDeltaKernelHolder holder;
+        return holder;
+    }
+    static GatedDeltaKernelHolder& get_gd_coefficient_kernel() {
         static GatedDeltaKernelHolder holder;
         return holder;
     }
@@ -973,6 +1105,37 @@ void metal_start_capture(rust::Str path) {
 
 void metal_stop_capture() {
     mlx::core::metal::stop_capture();
+}
+
+void metal_scaled_rms_norm_pair_f16(
+    const MlxArray& q,
+    const MlxArray& k,
+    float q_scale,
+    float k_scale,
+    float eps,
+    std::unique_ptr<MlxArray>& q_out,
+    std::unique_ptr<MlxArray>& k_out
+) {
+    using namespace mlx::core;
+    const auto shape = q.inner.shape();
+    const int Dk = shape.back();
+    const int vectors = q.inner.size() / Dk;
+    const auto q_scale_array = mlx::core::array(q_scale);
+    const auto k_scale_array = mlx::core::array(k_scale);
+    const auto eps_array = mlx::core::array(eps);
+    auto results = get_rms_norm_pair_kernel().get()(
+        {q.inner, k.inner, q_scale_array, k_scale_array, eps_array},
+        {shape, shape},
+        {float16, float16},
+        std::make_tuple(32, vectors, 1),
+        std::make_tuple(32, 1, 1),
+        {{"Dk", Dk}},
+        std::nullopt,
+        false,
+        {}
+    );
+    q_out = std::make_unique<MlxArray>(std::move(results[0]));
+    k_out = std::make_unique<MlxArray>(std::move(results[1]));
 }
 
 void metal_gated_delta_forward(
@@ -1079,6 +1242,78 @@ void metal_gated_delta_forward(
         {}             // stream (default)
     );
 
+    output = std::make_unique<MlxArray>(std::move(results[0]));
+    new_state = std::make_unique<MlxArray>(std::move(results[1]));
+}
+
+void metal_gated_delta_coefficient_forward(
+    const MlxArray& q,
+    const MlxArray& k,
+    const MlxArray& v,
+    const MlxArray& coefficient,
+    const MlxArray& alpha,
+    const MlxArray& beta_logit,
+    const MlxArray& dt_bias,
+    const MlxArray& state,
+    std::unique_ptr<MlxArray>& output,
+    std::unique_ptr<MlxArray>& new_state
+) {
+    using namespace mlx::core;
+
+    const auto q_shape = q.inner.shape();
+    const int B = q_shape[0];
+    const int T_val = q_shape[1];
+    const int Hk = q_shape[2];
+    const int Dk = q_shape[3];
+    const auto v_shape = v.inner.shape();
+    const int Hv = v_shape[2];
+    const int Dv = v_shape[3];
+    const auto input_type = q.inner.dtype();
+    const auto T_arr = mlx::core::array(T_val);
+    const std::vector<std::string> input_names = {
+        "q", "k", "v", "coefficient", "alpha", "beta_logit", "dt_bias",
+        "state_in", "T"
+    };
+    auto& kernel = get_gd_coefficient_kernel().get(
+        "gated_delta_coefficient_step",
+        input_names,
+        GATED_DELTA_COEFFICIENT_METAL_SOURCE
+    );
+    const std::vector<array> inputs = {
+        q.inner,
+        k.inner,
+        v.inner,
+        coefficient.inner,
+        alpha.inner,
+        beta_logit.inner,
+        dt_bias.inner,
+        state.inner,
+        T_arr,
+    };
+    const std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>>
+        template_args = {
+            {"InT", input_type},
+            {"Dk", Dk},
+            {"Dv", Dv},
+            {"Hk", Hk},
+            {"Hv", Hv},
+        };
+    const std::vector<Shape> output_shapes = {
+        Shape{B, T_val, Hv, Dv},
+        state.inner.shape(),
+    };
+    const std::vector<Dtype> output_dtypes = {input_type, float32};
+    auto results = kernel(
+        inputs,
+        output_shapes,
+        output_dtypes,
+        std::make_tuple(32, Dv, B * Hv),
+        std::make_tuple(32, 4, 1),
+        template_args,
+        std::nullopt,
+        false,
+        {}
+    );
     output = std::make_unique<MlxArray>(std::move(results[0]));
     new_state = std::make_unique<MlxArray>(std::move(results[1]));
 }
