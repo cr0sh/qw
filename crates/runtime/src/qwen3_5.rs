@@ -4119,78 +4119,136 @@ mod tests {
 
     #[test]
     #[ignore = "requires the complete pinned Qwen3.8 27B GGUF pair"]
-    fn real_gguf_fused_low_row_target_logits_stay_within_one_ulp() {
-        fn verify_last_row(model: &Qwen35Model, rows: usize, repetition: usize) -> Vec<u8> {
-            model.reset_runtime_state();
-            let prefix = mlxcel_core::from_slice_i32(&[9_707, 11], &[1, 2]);
-            model
-                .forward_mtp_prefill_chunks(&prefix, None, None, None, |_, _, _| {})
-                .expect("target prefix");
-            let tokens = (0..rows)
-                .map(|index| 1 + ((index * 7_919 + repetition * 104_729 + 1_879) % 200_000) as i32)
-                .collect::<Vec<_>>();
-            let block = mlxcel_core::from_slice_i32(&tokens, &[1, rows as i32]);
-            let logits = model.forward_mtp_verify(&block).logits;
-            let shape = mlxcel_core::array_shape(&logits);
-            let mut start = vec![0; shape.len()];
-            let mut end = shape.clone();
-            start[shape.len() - 2] = rows as i32 - 1;
-            end[shape.len() - 2] = rows as i32;
-            let last_row = mlxcel_core::slice(&logits, &start, &end);
-            mlxcel_core::eval(&last_row);
-            mlxcel_core::array_to_raw_bytes(&last_row)
-        }
-
-        fn capture(model: &Qwen35Model) -> Vec<(usize, usize, Vec<u8>)> {
-            // High-M affine prefill intentionally uses MLX's half-operand QMM
-            // and has a quality contract rather than old-FP32 ULP parity.
-            [(4, 1), (5, 1), (33, 1)]
-                .into_iter()
-                .flat_map(|(rows, repetitions)| {
-                    (0..repetitions).map(move |repetition| {
-                        (rows, repetition, verify_last_row(model, rows, repetition))
-                    })
+    fn real_gguf_high_row_mlp_chain_preserves_target_quality() {
+        fn capture(fused: bool) -> Vec<Vec<f32>> {
+            let (model, _) = if fused {
+                Qwen35Model::load_pinned(KVCacheMode::Fp16)
+            } else {
+                Qwen35Model::load_pinned_without_fusion(KVCacheMode::Fp16)
+            }
+            .expect("load Qwen3.8 GGUF");
+            (0..3)
+                .map(|repetition| {
+                    model.reset_runtime_state();
+                    let prefix = mlxcel_core::from_slice_i32(&[9_707, 11], &[1, 2]);
+                    model
+                        .forward_mtp_prefill_chunks(&prefix, None, None, None, |_, _, _| {})
+                        .expect("target prefix");
+                    let rows = 288usize;
+                    let tokens = (0..rows)
+                        .map(|index| {
+                            1 + ((index * 7_919 + repetition * 104_729 + 1_879) % 200_000)
+                                as i32
+                        })
+                        .collect::<Vec<_>>();
+                    let block = mlxcel_core::from_slice_i32(&tokens, &[1, rows as i32]);
+                    let logits = model.forward_mtp_verify(&block).logits;
+                    let shape = mlxcel_core::array_shape(&logits);
+                    let mut start = vec![0; shape.len()];
+                    let mut end = shape.clone();
+                    start[shape.len() - 2] = rows as i32 - 1;
+                    end[shape.len() - 2] = rows as i32;
+                    let last_row = mlxcel_core::slice(&logits, &start, &end);
+                    mlxcel_core::eval(&last_row);
+                    mlxcel_core::array_to_raw_bytes(&last_row)
+                        .chunks_exact(4)
+                        .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+                        .collect()
                 })
                 .collect()
         }
 
-        let unfused = {
-            let (model, _) = Qwen35Model::load_pinned_without_fusion(KVCacheMode::Fp16)
-                .expect("load unfused Qwen3.8 GGUF");
-            capture(&model)
-        };
-        let fused = {
-            let (model, _) =
-                Qwen35Model::load_pinned(KVCacheMode::Fp16).expect("load fused Qwen3.8 GGUF");
-            capture(&model)
-        };
-
-        let ordered = |value: f32| {
-            let bits = value.to_bits() as i32;
-            if bits < 0 { i32::MIN - bits } else { bits }
-        };
-        for ((rows, repetition, left), (right_rows, right_repetition, right)) in
-            unfused.iter().zip(&fused)
-        {
-            assert_eq!((rows, repetition), (right_rows, right_repetition));
-            assert_eq!(left.len(), right.len());
-            let max_ulp = left
-                .chunks_exact(4)
-                .zip(right.chunks_exact(4))
-                .map(|(left, right)| {
-                    let left = f32::from_le_bytes(left.try_into().unwrap());
-                    let right = f32::from_le_bytes(right.try_into().unwrap());
-                    ordered(left).abs_diff(ordered(right))
+        fn diagnostics(
+            reference: &[f32],
+            candidate: &[f32],
+        ) -> (f32, f64, f64, f64, bool, usize) {
+            assert_eq!(reference.len(), candidate.len());
+            let mut max_abs = 0.0f32;
+            let mut squared_error = 0.0f64;
+            let mut dot = 0.0f64;
+            let mut reference_norm = 0.0f64;
+            let mut candidate_norm = 0.0f64;
+            for (&reference_value, &candidate_value) in reference.iter().zip(candidate) {
+                assert!(reference_value.is_finite() && candidate_value.is_finite());
+                let error = (reference_value - candidate_value).abs();
+                max_abs = max_abs.max(error);
+                squared_error += f64::from(error) * f64::from(error);
+                dot += f64::from(reference_value) * f64::from(candidate_value);
+                reference_norm += f64::from(reference_value) * f64::from(reference_value);
+                candidate_norm += f64::from(candidate_value) * f64::from(candidate_value);
+            }
+            let reference_max = reference
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max);
+            let candidate_max = candidate
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max);
+            let reference_exp = reference
+                .iter()
+                .map(|&value| f64::from(value - reference_max).exp())
+                .collect::<Vec<_>>();
+            let candidate_exp = candidate
+                .iter()
+                .map(|&value| f64::from(value - candidate_max).exp())
+                .collect::<Vec<_>>();
+            let reference_sum = reference_exp.iter().sum::<f64>();
+            let candidate_sum = candidate_exp.iter().sum::<f64>();
+            let kl = reference_exp
+                .iter()
+                .zip(&candidate_exp)
+                .map(|(&reference_value, &candidate_value)| {
+                    let p = reference_value / reference_sum;
+                    let q = candidate_value / candidate_sum;
+                    p * (p.ln() - q.ln())
                 })
-                .max()
-                .unwrap_or(0);
+                .sum::<f64>();
+            let mut reference_order = (0..reference.len()).collect::<Vec<_>>();
+            reference_order.sort_unstable_by(|&left, &right| {
+                reference[right].total_cmp(&reference[left])
+            });
+            let mut candidate_order = (0..candidate.len()).collect::<Vec<_>>();
+            candidate_order.sort_unstable_by(|&left, &right| {
+                candidate[right].total_cmp(&candidate[left])
+            });
+            let top1_equal = reference_order[0] == candidate_order[0];
+            let top10_overlap = reference_order[..10]
+                .iter()
+                .filter(|index| candidate_order[..10].contains(index))
+                .count();
+            (
+                max_abs,
+                (squared_error / reference.len() as f64).sqrt(),
+                dot / (reference_norm.sqrt() * candidate_norm.sqrt()),
+                kl,
+                top1_equal,
+                top10_overlap,
+            )
+        }
+
+        let reference = capture(false);
+        let candidate = capture(true);
+        for (repetition, (reference, candidate)) in reference.iter().zip(&candidate).enumerate() {
+            let (max_abs, rmse, cosine, kl, top1_equal, top10_overlap) =
+                diagnostics(reference, candidate);
+            assert!(max_abs <= 0.125, "repetition {repetition}: max_abs={max_abs}");
+            assert!(rmse <= 0.02, "repetition {repetition}: rmse={rmse}");
             assert!(
-                max_ulp <= 1,
-                "target M={rows} repetition {repetition} differs by {max_ulp} ULP"
+                cosine >= 0.99995,
+                "repetition {repetition}: cosine={cosine}"
+            );
+            assert!(kl <= 0.0002, "repetition {repetition}: kl={kl}");
+            assert!(top1_equal, "repetition {repetition}: top-1 changed");
+            assert_eq!(
+                top10_overlap, 10,
+                "repetition {repetition}: top-10 set changed"
+            );
+            println!(
+                "QWEN38_HIGH_ROW_MLP_QUALITY repetition={repetition} max_abs={max_abs:.9e} rmse={rmse:.9e} cosine={cosine:.12} kl={kl:.9e} top1_equal={top1_equal} top10_overlap={top10_overlap}/10"
             );
         }
     }
-
 
     #[test]
     #[ignore = "requires the complete pinned Qwen3.8 27B GGUF pair"]
@@ -4271,7 +4329,7 @@ mod tests {
 
         let (unfused_mlp, unfused_gdn) = load_focused(false);
         let (fused_mlp, fused_gdn) = load_focused(true);
-        for rows in [4, 5, 32, 33, 64, 128, 256, 288, 2048] {
+        for rows in [4, 5, 32, 33, 64] {
             let input = input(rows);
             let unfused = bytes(unfused_mlp.forward(&input));
             let fused = bytes(fused_mlp.forward(&input));
@@ -4320,10 +4378,10 @@ mod tests {
             (32, 0, 4, 0, 4),
             (33, 4_595_712, 2, 1_013_760, 3),
             (64, 0, 4, 0, 4),
-            (128, 0, 4, 1_966_080, 3),
-            (256, 0, 4, 0, 4),
-            (288, 0, 4, 0, 4),
-            (2048, 0, 4, 0, 4),
+            (128, 28_049_408, 6, 1_966_080, 3),
+            (256, 56_098_816, 6, 0, 4),
+            (288, 63_111_168, 6, 0, 4),
+            (2048, 448_790_528, 6, 0, 4),
         ] {
             let input = input(rows);
             let unfused_mlp_time = time_mlp(&unfused_mlp, &input);
@@ -4354,4 +4412,5 @@ mod tests {
             );
         }
     }
+
 }

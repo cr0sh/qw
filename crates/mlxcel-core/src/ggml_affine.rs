@@ -933,6 +933,34 @@ impl Qwen38AffineMlpFusion {
     pub fn forward(&self, input: &MlxArray) -> Result<UniquePtr<MlxArray>, GgmlAffineError> {
         validate_input(input, 5120)?;
         let rows = affine_input_rows(input)?;
+        // Share the normalized-input cast and keep the MLP interior in F16;
+        // the native quantized matmuls still accumulate in F32.
+        if rows >= F16_PREFILL_MIN_ROWS {
+            let input_f16 = crate::astype(input, dtype::FLOAT16);
+            let input_f16 = input_f16
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?;
+            let gate = affine_matmul_f16_output(input_f16, &self.gate.planes, self.gate.bits)?;
+            let up = affine_matmul_f16_output(input_f16, &self.up.planes, self.up.bits)?;
+            let activated = crate::compiled_swiglu_activation(
+                gate.as_ref().ok_or(GgmlAffineError::InvalidPlane)?,
+                up.as_ref().ok_or(GgmlAffineError::InvalidPlane)?,
+            );
+            let activated = activated
+                .as_ref()
+                .ok_or(GgmlAffineError::InvalidPlane)?;
+            if crate::array_dtype(activated) != dtype::FLOAT16 {
+                return Err(GgmlAffineError::InvalidPlane);
+            }
+            let output_f16 =
+                affine_matmul_f16_output(activated, &self.down.planes, self.down.bits)?;
+            return Ok(crate::astype(
+                output_f16
+                    .as_ref()
+                    .ok_or(GgmlAffineError::InvalidPlane)?,
+                dtype::FLOAT32,
+            ));
+        }
         // Only the pinned M=33 BlockMMA shape beats ordinary MLX.
         if rows != 33
             || crate::array_dtype(input) != dtype::FLOAT32
@@ -1030,6 +1058,18 @@ impl Qwen38AffineMlpFusion {
                         .and_then(|bytes| total.checked_add(bytes))
                         .ok_or(GgmlAffineError::Overflow)
                 })?;
+        if input_rows >= F16_PREFILL_MIN_ROWS as usize {
+            let intermediate_bytes_avoided = input_rows
+                .checked_mul(2 * 5120 + 12 * 17_408)
+                .ok_or(GgmlAffineError::Overflow)?;
+            return Ok(Qwen38FusionStats {
+                physical_dispatches: 6,
+                matrix_bytes_read,
+                intermediate_bytes_avoided,
+                workspace_bytes: 0,
+                hidden_copy_bytes: 0,
+            });
+        }
         if input_rows != 33 {
             return Ok(Qwen38FusionStats {
                 physical_dispatches: 4,
@@ -1776,11 +1816,29 @@ fn affine_matmul_f16_compute(
     // F16 operands select MLX's half BlockMMA, whose default accumulator is
     // `float`; only the stored matrix result is F16 before this F32 boundary.
     let input_f16 = crate::astype(input, dtype::FLOAT16);
-    let output_f16 = unsafe {
+    let output_f16 = affine_matmul_f16_output(
+        input_f16
+            .as_ref()
+            .ok_or(GgmlAffineError::InvalidPlane)?,
+        planes,
+        bits,
+    )?;
+    Ok(crate::astype(
+        output_f16
+            .as_ref()
+            .ok_or(GgmlAffineError::InvalidPlane)?,
+        dtype::FLOAT32,
+    ))
+}
+
+fn affine_matmul_f16_output(
+    input_f16: &MlxArray,
+    planes: &AffinePlanes,
+    bits: i32,
+) -> Result<UniquePtr<MlxArray>, GgmlAffineError> {
+    Ok(unsafe {
         crate::quantized_matmul(
-            input_f16
-                .as_ref()
-                .ok_or(GgmlAffineError::InvalidPlane)?,
+            input_f16,
             planes
                 .weight
                 .as_ref()
@@ -1792,13 +1850,7 @@ fn affine_matmul_f16_compute(
             bits,
             "affine",
         )
-    };
-    Ok(crate::astype(
-        output_f16
-            .as_ref()
-            .ok_or(GgmlAffineError::InvalidPlane)?,
-        dtype::FLOAT32,
-    ))
+    })
 }
 
 fn validate_input(input: &MlxArray, in_features: i32) -> Result<(), GgmlAffineError> {
