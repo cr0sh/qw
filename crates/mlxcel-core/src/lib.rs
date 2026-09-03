@@ -1854,7 +1854,6 @@ mod ffi {
             v_packed: &MlxArray,
             v_code: i32,
             input_rows: i32,
-            use_mixed_q5: bool,
         ) -> Result<UniquePtr<Qwen38GgmlQkvOutputs>>;
         fn qwen38_ggml_qkv_take_query(
             outputs: Pin<&mut Qwen38GgmlQkvOutputs>,
@@ -1865,8 +1864,8 @@ mod ffi {
             outputs: Pin<&mut Qwen38GgmlQkvOutputs>,
         ) -> UniquePtr<MlxArray>;
 
-        /// One-pass affine M2/M3 projection for the exact pinned Qwen3.8 target.
-        fn qwen38_affine_m23_matmul(
+        /// One-pass affine M2/M3/M4 projection for the exact pinned Qwen3.8 target.
+        fn qwen38_affine_m234_matmul(
             x: &MlxArray,
             weight: &MlxArray,
             scales: &MlxArray,
@@ -1876,7 +1875,6 @@ mod ffi {
             out_features: i32,
             input_rows: i32,
             require_pinned_shape: bool,
-            use_mixed_q5: bool,
         ) -> Result<UniquePtr<MlxArray>>;
 
         /// M>=4 all-affine MLP for the exact pinned Qwen3.8 artifact.
@@ -3388,7 +3386,7 @@ pub use ggml_affine::{
     GgmlAffineEmbedding, GgmlAffineError, GgmlAffineMatrix, GgmlAffineRows,
     GgmlAffineTranscodeStats, Qwen38AffineGdnIngressFusion, Qwen38AffineMlpFusion,
     Qwen38FusionStats, Qwen38GdnIngressOutput, Qwen38MixedQkvBundle, Qwen38MixedQkvOutput,
-    Qwen38QkvMatrix, qwen38_mixed_q5_enabled,
+    Qwen38QkvMatrix,
 };
 pub use qwen38_q6::{Qwen38Q6DualMatrix, Qwen38Q6Error, Qwen38Q6Shape, Qwen38Q6TranscodeStats};
 

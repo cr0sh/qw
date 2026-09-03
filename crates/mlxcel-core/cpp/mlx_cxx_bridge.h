@@ -2307,8 +2307,7 @@ std::unique_ptr<Qwen38GgmlQkvOutputs> qwen38_mixed_qkv_bundle(
     const MlxArray& v_b,
     const MlxArray& v_packed,
     int32_t v_code,
-    int32_t input_rows,
-    bool use_mixed_q5);
+    int32_t input_rows);
 std::unique_ptr<MlxArray> qwen38_ggml_qkv_take_query(
     Qwen38GgmlQkvOutputs& outputs);
 std::unique_ptr<MlxArray> qwen38_ggml_qkv_take_key(
@@ -2316,8 +2315,8 @@ std::unique_ptr<MlxArray> qwen38_ggml_qkv_take_key(
 std::unique_ptr<MlxArray> qwen38_ggml_qkv_take_value(
     Qwen38GgmlQkvOutputs& outputs);
 
-// One-pass affine M2/M3 projection for the exact pinned Qwen3.8 target.
-std::unique_ptr<MlxArray> qwen38_affine_m23_matmul(
+// One-pass affine M2/M3/M4 projection for the exact pinned Qwen3.8 target.
+std::unique_ptr<MlxArray> qwen38_affine_m234_matmul(
     const MlxArray& x,
     const MlxArray& weight,
     const MlxArray& scales,
@@ -2326,8 +2325,7 @@ std::unique_ptr<MlxArray> qwen38_affine_m23_matmul(
     int32_t in_features,
     int32_t out_features,
     int32_t input_rows,
-    bool require_pinned_shape,
-    bool use_mixed_q5);
+    bool require_pinned_shape);
 
 // M>=4 all-affine fusion for the exact pinned Qwen3.8 artifact.
 std::unique_ptr<MlxArray> qwen38_affine_mlp_fused(

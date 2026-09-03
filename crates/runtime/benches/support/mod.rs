@@ -2,6 +2,7 @@ use std::fs::{self, File};
 use std::hint::black_box;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+#[cfg(feature = "dflash2")]
 use std::time::UNIX_EPOCH;
 
 #[cfg(feature = "dflash2")]
@@ -22,14 +23,6 @@ pub const LONG_CONTEXT_64K_MIN_TOKENS: usize = 64_000;
 /// Environment variable pointing at the DFlash2 drafter checkpoint directory.
 pub const DRAFT_MODEL_ENV: &str = "QW_BENCH_DRAFT_MODEL";
 const DFLASH2_DRAFT_CACHE_RELATIVE_DIR: &str = ".cache/qw/models/incoai/Qwen3.8-27B-DFlash2";
-const QWEN38_MIXED_Q5_ENV: &str = "MLXCEL_EXPERIMENTAL_QWEN38_MIXED_Q5";
-
-pub fn qwen38_mixed_q5_enabled() -> bool {
-    matches!(
-        std::env::var(QWEN38_MIXED_Q5_ENV).ok().as_deref(),
-        Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
-    )
-}
 pub const PROMPT: &str = concat!(
     "You are the on-call support operations analyst for Acme Commerce. ",
     "Review this incident and return only one compact JSON object with keys ",
@@ -122,14 +115,7 @@ fn long_context_cache_identity(context_label: &str, min_prefix_tokens: usize) ->
     ] {
         hash_bytes(&mut hash, bytes);
     }
-    hash_bytes(
-        &mut hash,
-        if qwen38_mixed_q5_enabled() {
-            b"qwen38-mixed-q5-on"
-        } else {
-            b"qwen38-mixed-q5-off"
-        },
-    );
+    hash_bytes(&mut hash, b"qwen38-q5-iq3s-f16-low-m-v1");
     hash_bytes(&mut hash, model_dir.as_os_str().as_encoded_bytes());
 
     for bytes in [
@@ -186,15 +172,10 @@ fn long_context_cache_identity(context_label: &str, min_prefix_tokens: usize) ->
 }
 
 fn long_context_cache_path(context_label: &str) -> PathBuf {
-    let arithmetic = if qwen38_mixed_q5_enabled() {
-        "_q5mixed"
-    } else {
-        ""
-    };
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/qw-bench-fixtures")
         .join(format!(
-            "long_{context_label}_mtp_k{MTP_BLOCK_SIZE}{arithmetic}.bin"
+            "long_{context_label}_mtp_k{MTP_BLOCK_SIZE}_q5f16.bin"
         ))
 }
 

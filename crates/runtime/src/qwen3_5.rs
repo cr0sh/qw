@@ -585,6 +585,7 @@ impl Qwen35GatedDeltaNet {
         self.out_proj.forward(&out)
     }
 
+
     fn forward_hidden_internal(
         &self,
         inputs: &MlxArray,
@@ -827,17 +828,17 @@ impl Qwen35GatedDeltaNet {
             && in_proj_b.is_affine()
             && in_proj_a.is_affine()
         {
-            let (qkv, qkv_m23) = in_proj_qkv.into_affine().expect("checked affine qkv");
-            let (z, z_m23) = in_proj_z.into_affine().expect("checked affine z");
-            let (beta, beta_m23) = in_proj_b.into_affine().expect("checked affine beta");
-            let (alpha, alpha_m23) = in_proj_a.into_affine().expect("checked affine alpha");
+            let (qkv, qkv_m234) = in_proj_qkv.into_affine().expect("checked affine qkv");
+            let (z, z_m234) = in_proj_z.into_affine().expect("checked affine z");
+            let (beta, beta_m234) = in_proj_b.into_affine().expect("checked affine beta");
+            let (alpha, alpha_m234) = in_proj_a.into_affine().expect("checked affine alpha");
             Qwen35GdnIngress::PinnedAffine(
                 mlxcel_core::Qwen38AffineGdnIngressFusion::new(
                     qkv,
                     z,
                     beta,
                     alpha,
-                    [qkv_m23, z_m23, beta_m23, alpha_m23],
+                    [qkv_m234, z_m234, beta_m234, alpha_m234],
                 )
                 .map_err(|error| error.to_string())?,
             )
@@ -2029,12 +2030,6 @@ impl Qwen35Model {
         Self::load_pinned_from_weight_source(weights, kv_cache_mode)
     }
 
-    #[cfg(test)]
-    fn load_pinned_without_m23(kv_cache_mode: KVCacheMode) -> Result<(Self, GgufTextAssets)> {
-        let weights =
-            GgufWeightSource::open_without_m23().context("failed to open pinned GGUF pair")?;
-        Self::load_pinned_from_weight_source(weights, kv_cache_mode)
-    }
 
     #[cfg(test)]
     fn load_pinned_without_fusion(kv_cache_mode: KVCacheMode) -> Result<(Self, GgufTextAssets)> {
@@ -3882,13 +3877,32 @@ mod tests {
         assert!(model.layers.iter().any(|layer| !layer.is_linear));
     }
 
+
     #[test]
     #[ignore = "requires the complete pinned Qwen3.8 GGUF pair and exclusive Metal access"]
-    fn real_gguf_mixed_m1_logits_match_m3_m4_and_log_old_fp32_diagnostics() {
+    fn real_gguf_m234_logits_and_cache_match_sequential_m1() {
+        #[derive(Debug, PartialEq, Eq)]
+        struct CacheTensor {
+            name: String,
+            shape: Vec<i32>,
+            dtype: i32,
+            bytes: Vec<u8>,
+        }
+
+        #[derive(Debug, PartialEq, Eq)]
+        struct CacheCapture {
+            offsets: Vec<i32>,
+            tensors: Vec<CacheTensor>,
+        }
+
         struct Capture {
             sequential: Vec<Vec<u8>>,
+            sequential_m3_cache: CacheCapture,
+            sequential_m4_cache: CacheCapture,
             m3: Vec<u8>,
+            m3_cache: CacheCapture,
             m4: Vec<u8>,
+            m4_cache: CacheCapture,
         }
 
         fn prefill(model: &Qwen35Model) {
@@ -3898,19 +3912,62 @@ mod tests {
                 .expect("target prefix");
         }
 
+        fn tensor(name: String, value: &MlxArray) -> CacheTensor {
+            mlxcel_core::eval(value);
+            CacheTensor {
+                name,
+                shape: mlxcel_core::array_shape(value),
+                dtype: mlxcel_core::array_dtype(value),
+                bytes: mlxcel_core::array_to_raw_bytes(value),
+            }
+        }
+
+        fn capture_cache(model: &Qwen35Model) -> CacheCapture {
+            model.sequence_state.with_internal(|caches| {
+                let offsets = caches.iter().map(Qwen3NextCache::offset).collect();
+                let mut tensors = Vec::with_capacity(caches.len() * 2);
+                for (layer, cache) in caches.iter().enumerate() {
+                    match cache {
+                        Qwen3NextCache::Attention(cache) => {
+                            let (keys, values) =
+                                cache.visible_state().expect("plain FP16 attention cache");
+                            tensors.push(tensor(format!("layer.{layer}.keys"), &keys));
+                            tensors.push(tensor(format!("layer.{layer}.values"), &values));
+                        }
+                        Qwen3NextCache::Linear(cache) => {
+                            tensors.push(tensor(
+                                format!("layer.{layer}.conv_state"),
+                                cache.conv_state.as_ref().expect("GDN conv state"),
+                            ));
+                            tensors.push(tensor(
+                                format!("layer.{layer}.state_cache"),
+                                cache.state_cache.as_ref().expect("GDN recurrent state"),
+                            ));
+                        }
+                    }
+                }
+                CacheCapture { offsets, tensors }
+            })
+        }
+
         fn capture(model: &Qwen35Model) -> Capture {
             let tokens = [1_879_i32, 42, 123, 104_729];
             model.reset_runtime_state();
             prefill(model);
-            let sequential = tokens
-                .iter()
-                .map(|token| {
-                    let token = mlxcel_core::from_slice_i32(&[*token], &[1, 1]);
-                    let logits = model.forward_last_logits(&token, &mut [], None, 0);
-                    mlxcel_core::eval(&logits);
-                    mlxcel_core::array_to_raw_bytes(&logits)
-                })
-                .collect::<Vec<_>>();
+            let mut sequential = Vec::with_capacity(tokens.len());
+            let mut sequential_m3_cache = None;
+            let mut sequential_m4_cache = None;
+            for (row, token) in tokens.iter().enumerate() {
+                let token = mlxcel_core::from_slice_i32(&[*token], &[1, 1]);
+                let logits = model.forward_last_logits(&token, &mut [], None, 0);
+                mlxcel_core::eval(&logits);
+                sequential.push(mlxcel_core::array_to_raw_bytes(&logits));
+                match row {
+                    2 => sequential_m3_cache = Some(capture_cache(model)),
+                    3 => sequential_m4_cache = Some(capture_cache(model)),
+                    _ => {}
+                }
+            }
 
             let batched = |rows: usize| {
                 model.reset_runtime_state();
@@ -3918,12 +3975,21 @@ mod tests {
                 let block = mlxcel_core::from_slice_i32(&tokens[..rows], &[1, rows as i32]);
                 let logits = model.forward_mtp_verify(&block).logits;
                 mlxcel_core::eval(&logits);
-                mlxcel_core::array_to_raw_bytes(&logits)
+                (
+                    mlxcel_core::array_to_raw_bytes(&logits),
+                    capture_cache(model),
+                )
             };
+            let (m3, m3_cache) = batched(3);
+            let (m4, m4_cache) = batched(4);
             Capture {
                 sequential,
-                m3: batched(3),
-                m4: batched(4),
+                sequential_m3_cache: sequential_m3_cache.unwrap(),
+                sequential_m4_cache: sequential_m4_cache.unwrap(),
+                m3,
+                m3_cache,
+                m4,
+                m4_cache,
             }
         }
 
@@ -3932,135 +3998,122 @@ mod tests {
             if bits < 0 { i32::MIN - bits } else { bits }
         }
 
-        fn assert_corresponding(sequential: &[Vec<u8>], batched: &[u8], rows: usize) {
+        fn corresponding_max_ulp(sequential: &[Vec<u8>], batched: &[u8]) -> u32 {
+            let rows = sequential.len();
             let row_bytes = batched.len() / rows;
-            for row in 0..rows {
-                let range = row * row_bytes..(row + 1) * row_bytes;
-                assert_eq!(sequential[row].len(), row_bytes);
-                let max_ulp = sequential[row]
-                    .chunks_exact(4)
-                    .zip(batched[range].chunks_exact(4))
-                    .map(|(left, right)| {
-                        let left = f32::from_le_bytes(left.try_into().unwrap());
-                        let right = f32::from_le_bytes(right.try_into().unwrap());
-                        ordered(left).abs_diff(ordered(right))
-                    })
-                    .max()
-                    .unwrap_or(0);
-                assert!(
-                    max_ulp <= 1,
-                    "mixed M1 sequential logit row {row} vs mixed M{rows} differs by {max_ulp} ULP"
+            let mut max_ulp = 0;
+            for (row, expected) in sequential.iter().enumerate() {
+                assert_eq!(expected.len(), row_bytes);
+                let actual = &batched[row * row_bytes..(row + 1) * row_bytes];
+                for (expected, actual) in expected.chunks_exact(4).zip(actual.chunks_exact(4)) {
+                    let expected = f32::from_le_bytes(expected.try_into().unwrap());
+                    let actual = f32::from_le_bytes(actual.try_into().unwrap());
+                    max_ulp = max_ulp.max(ordered(expected).abs_diff(ordered(actual)));
+                }
+            }
+            max_ulp
+        }
+
+        fn ordered_16(bits: u16) -> i16 {
+            let bits = bits as i16;
+            if bits < 0 { i16::MIN - bits } else { bits }
+        }
+
+        fn cache_max_ulp(expected: &CacheCapture, actual: &CacheCapture) -> u32 {
+            assert_eq!(expected.offsets, actual.offsets, "cache offsets differ");
+            assert_eq!(expected.tensors.len(), actual.tensors.len());
+            let mut max_ulp = 0;
+            for (expected, actual) in expected.tensors.iter().zip(&actual.tensors) {
+                assert_eq!(expected.name, actual.name);
+                assert_eq!(expected.shape, actual.shape, "{} shape differs", expected.name);
+                assert_eq!(expected.dtype, actual.dtype, "{} dtype differs", expected.name);
+                assert_eq!(
+                    expected.bytes.len(),
+                    actual.bytes.len(),
+                    "{} byte length differs",
+                    expected.name
                 );
+                let tensor_max_ulp = match expected.dtype {
+                    mlxcel_core::dtype::FLOAT32 => expected
+                        .bytes
+                        .chunks_exact(4)
+                        .zip(actual.bytes.chunks_exact(4))
+                        .map(|(expected, actual)| {
+                            let expected =
+                                f32::from_le_bytes(expected.try_into().expect("f32 cache value"));
+                            let actual =
+                                f32::from_le_bytes(actual.try_into().expect("f32 cache value"));
+                            ordered(expected).abs_diff(ordered(actual))
+                        })
+                        .max()
+                        .unwrap_or(0),
+                    mlxcel_core::dtype::FLOAT16 | mlxcel_core::dtype::BFLOAT16 => expected
+                        .bytes
+                        .chunks_exact(2)
+                        .zip(actual.bytes.chunks_exact(2))
+                        .map(|(expected, actual)| {
+                            let expected =
+                                u16::from_le_bytes(expected.try_into().expect("f16 cache value"));
+                            let actual =
+                                u16::from_le_bytes(actual.try_into().expect("f16 cache value"));
+                            u32::from(ordered_16(expected).abs_diff(ordered_16(actual)))
+                        })
+                        .max()
+                        .unwrap_or(0),
+                    _ => {
+                        assert_eq!(
+                            expected.bytes, actual.bytes,
+                            "{} non-floating values differ",
+                            expected.name
+                        );
+                        0
+                    }
+                };
+                max_ulp = max_ulp.max(tensor_max_ulp);
             }
+            max_ulp
         }
 
-        fn values(bytes: &[u8]) -> Vec<f32> {
-            bytes
-                .chunks_exact(4)
-                .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
-                .collect()
-        }
+        let (model, _) =
+            Qwen35Model::load_pinned(KVCacheMode::Fp16).expect("load pinned Qwen3.8 GGUF");
+        let capture = capture(&model);
+        let m3_max_ulp = corresponding_max_ulp(&capture.sequential[..3], &capture.m3);
+        let m4_max_ulp = corresponding_max_ulp(&capture.sequential, &capture.m4);
 
-        fn top8(values: &[f32]) -> Vec<(usize, f32)> {
-            let mut indices = (0..values.len()).collect::<Vec<_>>();
-            indices.sort_unstable_by(|left, right| values[*right].total_cmp(&values[*left]));
-            indices.truncate(8);
-            indices
-                .into_iter()
-                .map(|index| (index, values[index]))
-                .collect()
-        }
-
+        let m3_cache_max_ulp =
+            cache_max_ulp(&capture.sequential_m3_cache, &capture.m3_cache);
+        let m4_cache_max_ulp =
+            cache_max_ulp(&capture.sequential_m4_cache, &capture.m4_cache);
         assert!(
-            matches!(
-                std::env::var("MLXCEL_EXPERIMENTAL_QWEN38_MIXED_Q5")
-                    .ok()
-                    .as_deref(),
-                Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
-            ),
-            "set MLXCEL_EXPERIMENTAL_QWEN38_MIXED_Q5=1 for this experiment"
+            capture
+                .sequential_m3_cache
+                .offsets
+                .iter()
+                .all(|offset| *offset == 5),
+            "sequential M3 cache lengths must include the two-token prefix"
         );
-        let old = {
-            let (model, _) = Qwen35Model::load_pinned_without_m23(KVCacheMode::Fp16)
-                .expect("load old FP32 Qwen3.8 GGUF");
-            capture(&model)
-        };
-        mlxcel_core::memory::clear_cache();
-        let (mixed, mixed_repeat) = {
-            let (model, _) =
-                Qwen35Model::load_pinned(KVCacheMode::Fp16).expect("load mixed Qwen3.8 GGUF");
-            (capture(&model), capture(&model))
-        };
-
-        assert_corresponding(&mixed.sequential, &mixed.m3, 3);
-        assert_corresponding(&mixed.sequential, &mixed.m4, 4);
-        assert_eq!(mixed.m3, mixed_repeat.m3, "mixed M3 logits are not deterministic");
-        assert_eq!(mixed.m4, mixed_repeat.m4, "mixed M4 logits are not deterministic");
+        assert!(
+            capture
+                .sequential_m4_cache
+                .offsets
+                .iter()
+                .all(|offset| *offset == 6),
+            "sequential M4 cache lengths must include the two-token prefix"
+        );
         assert_eq!(
-            mixed.sequential, mixed_repeat.sequential,
-            "mixed M1 sequential logits are not deterministic"
+            m3_cache_max_ulp, 0,
+            "M3 target cache values differ from sequential M1"
         );
-
-        let old = values(&old.m4);
-        let mixed = values(&mixed.m4);
-        assert_eq!(old.len(), mixed.len());
-        assert!(old.iter().all(|value| value.is_finite()));
-        assert!(mixed.iter().all(|value| value.is_finite()));
-        let mut squared_error = 0.0f64;
-        let mut old_squared = 0.0f64;
-        let mut mixed_squared = 0.0f64;
-        let mut dot = 0.0f64;
-        let mut max_abs = 0.0f32;
-        for (&old, &mixed) in old.iter().zip(&mixed) {
-            let error = old - mixed;
-            squared_error += f64::from(error) * f64::from(error);
-            old_squared += f64::from(old) * f64::from(old);
-            mixed_squared += f64::from(mixed) * f64::from(mixed);
-            dot += f64::from(old) * f64::from(mixed);
-            max_abs = max_abs.max(error.abs());
-        }
-        let row_width = mixed.len() / 4;
-        let mut kl = 0.0f64;
-        let mut top8_overlap = 0usize;
-        for (row, (old_row, mixed_row)) in old
-            .chunks_exact(row_width)
-            .zip(mixed.chunks_exact(row_width))
-            .enumerate()
-        {
-            let old_top = top8(old_row);
-            let mixed_top = top8(mixed_row);
-            top8_overlap += old_top
-                .iter()
-                .filter(|(token, _)| mixed_top.iter().any(|(mixed, _)| mixed == token))
-                .count();
-            let old_max = old_row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mixed_max = mixed_row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let old_sum = old_row
-                .iter()
-                .map(|value| f64::from(*value - old_max).exp())
-                .sum::<f64>();
-            let mixed_sum = mixed_row
-                .iter()
-                .map(|value| f64::from(*value - mixed_max).exp())
-                .sum::<f64>();
-            for (&old, &mixed) in old_row.iter().zip(mixed_row) {
-                let log_p = f64::from(old - old_max) - old_sum.ln();
-                let log_q = f64::from(mixed - mixed_max) - mixed_sum.ln();
-                kl += log_p.exp() * (log_p - log_q);
-            }
-            println!(
-                "QWEN38_MIXED_Q5_QUALITY_SAMPLE row={} old_fp32_top8={:?} mixed_top8={:?}",
-                row, old_top, mixed_top
-            );
-        }
+        assert!(
+            m4_cache_max_ulp <= 1,
+            "M4 target cache values exceeded 1 ULP: {m4_cache_max_ulp}"
+        );
+        assert!(
+            m3_max_ulp <= 1 && m4_max_ulp <= 1,
+            "corresponding target logits exceeded 1 ULP: M3={m3_max_ulp} M4={m4_max_ulp}"
+        );
         println!(
-            "QWEN38_MIXED_Q5_LOGIT_DIAGNOSTIC elements={} max_abs={} rmse={} cosine={} mean_kl={} top8_overlap={}/32",
-            old.len(),
-            max_abs,
-            (squared_error / old.len() as f64).sqrt(),
-            dot / (old_squared * mixed_squared).sqrt(),
-            kl / 4.0,
-            top8_overlap,
+            "QWEN38_M234_FULL_MODEL_PARITY m3_max_ulp={m3_max_ulp} m4_max_ulp={m4_max_ulp} m3_cache_max_ulp={m3_cache_max_ulp} m4_cache_max_ulp={m4_cache_max_ulp}"
         );
     }
 

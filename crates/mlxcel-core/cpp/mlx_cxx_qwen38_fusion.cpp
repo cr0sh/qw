@@ -320,8 +320,8 @@ METAL_FUNC void qwen38_qkv_mixed_q5_pack(
     const device float* x,
     int row_stride,
     const device uchar* packed,
-    float scale,
-    float bias,
+    half scale,
+    half bias,
     thread float* accum
 ) {
     uchar b0 = packed[0];
@@ -332,28 +332,28 @@ METAL_FUNC void qwen38_qkv_mixed_q5_pack(
 
     ushort code = b0 & 0x1fu;
     qwen38_qkv_mixed_q5_update<rows>(
-        x, row_stride, 0, static_cast<half>(scale * static_cast<float>(code) + bias), accum);
+        x, row_stride, 0, scale * static_cast<half>(code) + bias, accum);
     code = (b0 >> 5u) | ((b1 & 0x03u) << 3u);
     qwen38_qkv_mixed_q5_update<rows>(
-        x, row_stride, 1, static_cast<half>(scale * static_cast<float>(code) + bias), accum);
+        x, row_stride, 1, scale * static_cast<half>(code) + bias, accum);
     code = (b1 >> 2u) & 0x1fu;
     qwen38_qkv_mixed_q5_update<rows>(
-        x, row_stride, 2, static_cast<half>(scale * static_cast<float>(code) + bias), accum);
+        x, row_stride, 2, scale * static_cast<half>(code) + bias, accum);
     code = (b1 >> 7u) | ((b2 & 0x0fu) << 1u);
     qwen38_qkv_mixed_q5_update<rows>(
-        x, row_stride, 3, static_cast<half>(scale * static_cast<float>(code) + bias), accum);
+        x, row_stride, 3, scale * static_cast<half>(code) + bias, accum);
     code = (b2 >> 4u) | ((b3 & 0x01u) << 4u);
     qwen38_qkv_mixed_q5_update<rows>(
-        x, row_stride, 4, static_cast<half>(scale * static_cast<float>(code) + bias), accum);
+        x, row_stride, 4, scale * static_cast<half>(code) + bias, accum);
     code = (b3 >> 1u) & 0x1fu;
     qwen38_qkv_mixed_q5_update<rows>(
-        x, row_stride, 5, static_cast<half>(scale * static_cast<float>(code) + bias), accum);
+        x, row_stride, 5, scale * static_cast<half>(code) + bias, accum);
     code = (b3 >> 6u) | ((b4 & 0x07u) << 2u);
     qwen38_qkv_mixed_q5_update<rows>(
-        x, row_stride, 6, static_cast<half>(scale * static_cast<float>(code) + bias), accum);
+        x, row_stride, 6, scale * static_cast<half>(code) + bias, accum);
     code = b4 >> 3u;
     qwen38_qkv_mixed_q5_update<rows>(
-        x, row_stride, 7, static_cast<half>(scale * static_cast<float>(code) + bias), accum);
+        x, row_stride, 7, scale * static_cast<half>(code) + bias, accum);
 }
 
 template <int MRows, typename Sidecar>
@@ -388,8 +388,8 @@ METAL_FUNC void qwen38_qkv_mixed_q5_project(
                 reinterpret_cast<const device uchar*>(weight) + byte_offset;
             int group_offset = output_row * groups_per_row + k / 32
                 + (int)lane / 2;
-            float scale = scales[group_offset];
-            float bias = biases[group_offset];
+            half scale = scales[group_offset];
+            half bias = biases[group_offset];
             float accum[MRows] = {};
             const device float* activation =
                 x + k + (int)lane * values_per_thread;
@@ -1061,8 +1061,7 @@ std::unique_ptr<Qwen38GgmlQkvOutputs> qwen38_mixed_qkv_bundle(
     const MlxArray& v_b,
     const MlxArray& v_packed,
     int32_t v_code,
-    int32_t input_rows,
-    bool use_mixed_q5
+    int32_t input_rows
 ) {
 #ifndef __APPLE__
     throw std::invalid_argument("pinned Qwen3.8 mixed QKV requires Metal");
@@ -1074,11 +1073,9 @@ std::unique_ptr<Qwen38GgmlQkvOutputs> qwen38_mixed_qkv_bundle(
     if (!metal::is_available()) {
         throw std::invalid_argument("pinned Qwen3.8 mixed QKV requires Metal");
     }
-    const bool mixed_q5 = use_mixed_q5 && q_bits == 5;
-    if (use_mixed_q5 && !mixed_q5) {
-        throw std::invalid_argument(
-            "pinned Qwen3.8 mixed QKV experiment requires a Q5 query");
-    }
+    const bool mixed_q5 = q_bits == 5
+        && q_s.inner.dtype() == float16
+        && q_b.inner.dtype() == float16;
     validate_plane(q_w.inner, q_s.inner, q_b.inner,
                    q_bits, width, query_rows, mixed_q5);
     auto validate_projection = [](const array& weight, const array& scales,

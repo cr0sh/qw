@@ -258,7 +258,7 @@ fn transcode_q6_row_to_f16(row: &[u8], output: &mut Vec<u8>) {
     }
 }
 
-fn f32_to_f16_bits(value: f32) -> u16 {
+pub(crate) fn f32_to_f16_bits(value: f32) -> u16 {
     let bits = value.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
     let magnitude = bits & 0x7fff_ffff;

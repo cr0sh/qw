@@ -10,30 +10,18 @@
 //! represented by MLX's smallest supported affine group (32 elements).
 
 use std::ops::Range;
-use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use cxx::UniquePtr;
 use thiserror::Error;
 
 use crate::ggml::{GgmlDispatchStats, GgmlKernelPath, GgmlQType, GgmlQuantError};
+use crate::qwen38_q6::f32_to_f16_bits;
 use crate::{MlxArray, Qwen38Q6DualMatrix, dtype};
 
 const GROUP_SIZE: usize = 32;
 const F16_PREFILL_MIN_ROWS: i32 = 128;
 const RELEASE_CHUNK_BYTES: usize = 8 * 1024 * 1024;
-const QWEN38_MIXED_Q5_ENV: &str = "MLXCEL_EXPERIMENTAL_QWEN38_MIXED_Q5";
-
-#[doc(hidden)]
-pub fn qwen38_mixed_q5_enabled() -> bool {
-    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-        matches!(
-            std::env::var(QWEN38_MIXED_Q5_ENV).ok().as_deref(),
-            Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
-        )
-    });
-    *ENABLED
-}
 const IQ4_VALUES: [i16; 16] = [
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 ];
@@ -56,7 +44,7 @@ pub enum GgmlAffineError {
     InvalidRowSelection,
     #[error("GGML affine input shape or dtype is invalid")]
     InvalidInput,
-    #[error("pinned Qwen3.8 affine M2/M3 Metal launch failed: {0}")]
+    #[error("pinned Qwen3.8 affine M2/M3/M4 Metal launch failed: {0}")]
     Backend(String),
 }
 
@@ -74,10 +62,10 @@ struct AffinePlanes {
     weight: UniquePtr<MlxArray>,
     scales: UniquePtr<MlxArray>,
     biases: UniquePtr<MlxArray>,
-    // Evaluated load-time mirrors amortize sidecar casts in high-M matmuls.
-    // The FP32 planes remain authoritative for low-M arithmetic.
-    scales_f16: UniquePtr<MlxArray>,
-    biases_f16: UniquePtr<MlxArray>,
+    // F32-primary matrices retain evaluated F16 mirrors for high-M BlockMMA.
+    // Q5/IQ3S matrices store F16 coefficients as their sole representation.
+    scales_f16: Option<UniquePtr<MlxArray>>,
+    biases_f16: Option<UniquePtr<MlxArray>>,
     rows: i32,
     packed_width: i32,
     groups: i32,
@@ -89,16 +77,12 @@ impl AffinePlanes {
             weight: crate::copy(self.weight.as_ref().expect("affine weight plane")),
             scales: crate::copy(self.scales.as_ref().expect("affine scale plane")),
             biases: crate::copy(self.biases.as_ref().expect("affine bias plane")),
-            scales_f16: crate::copy(
-                self.scales_f16
-                    .as_ref()
-                    .expect("affine FP16 scale plane"),
-            ),
-            biases_f16: crate::copy(
-                self.biases_f16
-                    .as_ref()
-                    .expect("affine FP16 bias plane"),
-            ),
+            scales_f16: self.scales_f16.as_ref().map(|plane| {
+                crate::copy(plane.as_ref().expect("affine FP16 scale plane"))
+            }),
+            biases_f16: self.biases_f16.as_ref().map(|plane| {
+                crate::copy(plane.as_ref().expect("affine FP16 bias plane"))
+            }),
             rows: self.rows,
             packed_width: self.packed_width,
             groups: self.groups,
@@ -108,6 +92,15 @@ impl AffinePlanes {
     fn slice_rows(&self, range: Range<usize>) -> Result<Self, GgmlAffineError> {
         let start = i32::try_from(range.start).map_err(|_| GgmlAffineError::Overflow)?;
         let end = i32::try_from(range.end).map_err(|_| GgmlAffineError::Overflow)?;
+        let slice_optional = |plane: &Option<UniquePtr<MlxArray>>| {
+            plane.as_ref().map(|plane| {
+                crate::slice(
+                    plane.as_ref().expect("validated affine FP16 plane"),
+                    &[start, 0],
+                    &[end, self.groups],
+                )
+            })
+        };
         Ok(Self {
             weight: crate::slice(
                 self.weight.as_ref().ok_or(GgmlAffineError::InvalidPlane)?,
@@ -124,24 +117,37 @@ impl AffinePlanes {
                 &[start, 0],
                 &[end, self.groups],
             ),
-            scales_f16: crate::slice(
-                self.scales_f16
-                    .as_ref()
-                    .ok_or(GgmlAffineError::InvalidPlane)?,
-                &[start, 0],
-                &[end, self.groups],
-            ),
-            biases_f16: crate::slice(
-                self.biases_f16
-                    .as_ref()
-                    .ok_or(GgmlAffineError::InvalidPlane)?,
-                &[start, 0],
-                &[end, self.groups],
-            ),
+            scales_f16: slice_optional(&self.scales_f16),
+            biases_f16: slice_optional(&self.biases_f16),
             rows: end - start,
             packed_width: self.packed_width,
             groups: self.groups,
         })
+    }
+
+    fn primary_is_f16(&self) -> bool {
+        crate::array_dtype(self.scales.as_ref().expect("validated affine scale plane"))
+            == dtype::FLOAT16
+    }
+
+    fn scales_f16(&self) -> Result<&MlxArray, GgmlAffineError> {
+        if self.primary_is_f16() {
+            return self.scales.as_ref().ok_or(GgmlAffineError::InvalidPlane);
+        }
+        self.scales_f16
+            .as_ref()
+            .and_then(UniquePtr::as_ref)
+            .ok_or(GgmlAffineError::InvalidPlane)
+    }
+
+    fn biases_f16(&self) -> Result<&MlxArray, GgmlAffineError> {
+        if self.primary_is_f16() {
+            return self.biases.as_ref().ok_or(GgmlAffineError::InvalidPlane);
+        }
+        self.biases_f16
+            .as_ref()
+            .and_then(UniquePtr::as_ref)
+            .ok_or(GgmlAffineError::InvalidPlane)
     }
 }
 
@@ -211,7 +217,7 @@ impl GgmlAffineMatrix {
         let bits = affine_bits(qtype).ok_or(GgmlAffineError::NotRepresentable(qtype))?;
         if f16_sidecars
             && (!matches!(qtype, GgmlQType::Q5K | GgmlQType::Iq3S)
-                || !qwen38_m23_shape(
+                || !qwen38_m234_shape(
                     i32::try_from(in_features).map_err(|_| GgmlAffineError::Overflow)?,
                     i32::try_from(out_features).map_err(|_| GgmlAffineError::Overflow)?,
                 ))
@@ -249,41 +255,80 @@ impl GgmlAffineMatrix {
         let group_values = groups_per_row
             .checked_mul(out_features)
             .ok_or(GgmlAffineError::Overflow)?;
-        let sidecar_item_bytes = if f16_sidecars { 2 } else { 4 };
-        let sidecar_bytes = group_values
-            .checked_mul(sidecar_item_bytes)
+        let primary_sidecar_item_bytes = if f16_sidecars { 2 } else { 4 };
+        let primary_sidecar_bytes = group_values
+            .checked_mul(primary_sidecar_item_bytes)
             .ok_or(GgmlAffineError::Overflow)?;
         let f16_sidecar_bytes = group_values
             .checked_mul(2)
             .ok_or(GgmlAffineError::Overflow)?;
+        let mirror_sidecar_bytes = if f16_sidecars {
+            0
+        } else {
+            f16_sidecar_bytes
+                .checked_mul(2)
+                .ok_or(GgmlAffineError::Overflow)?
+        };
         let resident_bytes = weight_bytes
             .checked_add(
-                sidecar_bytes
+                primary_sidecar_bytes
                     .checked_mul(2)
                     .ok_or(GgmlAffineError::Overflow)?,
             )
-            .and_then(|bytes| {
-                f16_sidecar_bytes
-                    .checked_mul(2)
-                    .and_then(|sidecars| bytes.checked_add(sidecars))
-            })
+            .and_then(|bytes| bytes.checked_add(mirror_sidecar_bytes))
             .ok_or(GgmlAffineError::Overflow)?;
 
         let mut weight = Vec::new();
         let mut scales = Vec::new();
         let mut biases = Vec::new();
+        let mut scales_f16_bytes = Vec::new();
+        let mut biases_f16_bytes = Vec::new();
+        let mut row_scales = Vec::new();
+        let mut row_biases = Vec::new();
         weight
             .try_reserve_exact(weight_bytes)
             .map_err(|_| GgmlAffineError::Overflow)?;
-        scales
-            .try_reserve_exact(group_values)
-            .map_err(|_| GgmlAffineError::Overflow)?;
-        biases
-            .try_reserve_exact(group_values)
-            .map_err(|_| GgmlAffineError::Overflow)?;
+        if f16_sidecars {
+            scales_f16_bytes
+                .try_reserve_exact(f16_sidecar_bytes)
+                .map_err(|_| GgmlAffineError::Overflow)?;
+            biases_f16_bytes
+                .try_reserve_exact(f16_sidecar_bytes)
+                .map_err(|_| GgmlAffineError::Overflow)?;
+            row_scales
+                .try_reserve_exact(groups_per_row)
+                .map_err(|_| GgmlAffineError::Overflow)?;
+            row_biases
+                .try_reserve_exact(groups_per_row)
+                .map_err(|_| GgmlAffineError::Overflow)?;
+        } else {
+            scales
+                .try_reserve_exact(group_values)
+                .map_err(|_| GgmlAffineError::Overflow)?;
+            biases
+                .try_reserve_exact(group_values)
+                .map_err(|_| GgmlAffineError::Overflow)?;
+        }
         let mut released = 0usize;
         for (row_index, row) in bytes.chunks_exact(source_row_bytes).enumerate() {
-            transcode_row(qtype, row, &mut weight, &mut scales, &mut biases)?;
+            if f16_sidecars {
+                transcode_row(
+                    qtype,
+                    row,
+                    &mut weight,
+                    &mut row_scales,
+                    &mut row_biases,
+                )?;
+                if row_scales.len() != groups_per_row || row_biases.len() != groups_per_row {
+                    return Err(GgmlAffineError::InvalidPlane);
+                }
+                extend_f16_bytes(&row_scales, &mut scales_f16_bytes);
+                extend_f16_bytes(&row_biases, &mut biases_f16_bytes);
+                row_scales.clear();
+                row_biases.clear();
+            } else {
+                transcode_row(qtype, row, &mut weight, &mut scales, &mut biases)?;
+            }
             let consumed = (row_index + 1) * source_row_bytes;
             if consumed - released >= RELEASE_CHUNK_BYTES {
                 release_source(released..consumed);
@@ -293,10 +338,13 @@ impl GgmlAffineMatrix {
         if released < bytes.len() {
             release_source(released..bytes.len());
         }
-        if weight.len() != weight_bytes
-            || scales.len() != group_values
-            || biases.len() != group_values
-        {
+        let valid_sidecars = if f16_sidecars {
+            scales_f16_bytes.len() == f16_sidecar_bytes
+                && biases_f16_bytes.len() == f16_sidecar_bytes
+        } else {
+            scales.len() == group_values && biases.len() == group_values
+        };
+        if weight.len() != weight_bytes || !valid_sidecars {
             return Err(GgmlAffineError::InvalidPlane);
         }
 
@@ -313,109 +361,100 @@ impl GgmlAffineMatrix {
         )?;
         crate::eval(weight_array.as_ref().ok_or(GgmlAffineError::InvalidPlane)?);
         drop(weight);
-        let scale_array_f32 = crate::from_slice_f32(&scales, &[rows, groups]);
-        let scale_array = if f16_sidecars {
-            let array = crate::astype(
-                scale_array_f32
-                    .as_ref()
-                    .ok_or(GgmlAffineError::InvalidPlane)?,
-                dtype::FLOAT16,
-            );
-            crate::eval(array.as_ref().ok_or(GgmlAffineError::InvalidPlane)?);
-            array
-        } else {
-            crate::eval(
-                scale_array_f32
-                    .as_ref()
-                    .ok_or(GgmlAffineError::InvalidPlane)?,
-            );
-            scale_array_f32
-        };
-        validate_plane(
-            &scale_array,
-            if f16_sidecars {
-                dtype::FLOAT16
-            } else {
-                dtype::FLOAT32
-            },
-            &[rows, groups],
-            sidecar_bytes,
-        )?;
-        drop(scales);
-        let bias_array_f32 = crate::from_slice_f32(&biases, &[rows, groups]);
-        let bias_array = if f16_sidecars {
-            let array = crate::astype(
-                bias_array_f32
-                    .as_ref()
-                    .ok_or(GgmlAffineError::InvalidPlane)?,
-                dtype::FLOAT16,
-            );
-            crate::eval(array.as_ref().ok_or(GgmlAffineError::InvalidPlane)?);
-            array
-        } else {
-            crate::eval(
-                bias_array_f32
-                    .as_ref()
-                    .ok_or(GgmlAffineError::InvalidPlane)?,
-            );
-            bias_array_f32
-        };
-        validate_plane(
-            &bias_array,
-            if f16_sidecars {
-                dtype::FLOAT16
-            } else {
-                dtype::FLOAT32
-            },
-            &[rows, groups],
-            sidecar_bytes,
-        )?;
-        drop(biases);
-        let scale_array_f16 = crate::astype(
-            scale_array
-                .as_ref()
-                .ok_or(GgmlAffineError::InvalidPlane)?,
-            dtype::FLOAT16,
-        );
-        validate_plane(
-            &scale_array_f16,
-            dtype::FLOAT16,
-            &[rows, groups],
-            f16_sidecar_bytes,
-        )?;
-        crate::eval(
-            scale_array_f16
-                .as_ref()
-                .ok_or(GgmlAffineError::InvalidPlane)?,
-        );
-        let bias_array_f16 = crate::astype(
-            bias_array
-                .as_ref()
-                .ok_or(GgmlAffineError::InvalidPlane)?,
-            dtype::FLOAT16,
-        );
-        validate_plane(
-            &bias_array_f16,
-            dtype::FLOAT16,
-            &[rows, groups],
-            f16_sidecar_bytes,
-        )?;
-        crate::eval(
-            bias_array_f16
-                .as_ref()
-                .ok_or(GgmlAffineError::InvalidPlane)?,
-        );
 
-        let f16_conversion_bytes = if f16_sidecars {
+        let (scale_array, bias_array, scale_array_f16, bias_array_f16) = if f16_sidecars {
+            let scale_array =
+                crate::from_bytes(&scales_f16_bytes, &[rows, groups], dtype::FLOAT16);
+            let bias_array =
+                crate::from_bytes(&biases_f16_bytes, &[rows, groups], dtype::FLOAT16);
+            validate_plane(
+                &scale_array,
+                dtype::FLOAT16,
+                &[rows, groups],
+                f16_sidecar_bytes,
+            )?;
+            validate_plane(
+                &bias_array,
+                dtype::FLOAT16,
+                &[rows, groups],
+                f16_sidecar_bytes,
+            )?;
+            crate::eval(scale_array.as_ref().ok_or(GgmlAffineError::InvalidPlane)?);
+            crate::eval(bias_array.as_ref().ok_or(GgmlAffineError::InvalidPlane)?);
+            (scale_array, bias_array, None, None)
+        } else {
+            let scale_array = crate::from_slice_f32(&scales, &[rows, groups]);
+            let bias_array = crate::from_slice_f32(&biases, &[rows, groups]);
+            validate_plane(
+                &scale_array,
+                dtype::FLOAT32,
+                &[rows, groups],
+                primary_sidecar_bytes,
+            )?;
+            validate_plane(
+                &bias_array,
+                dtype::FLOAT32,
+                &[rows, groups],
+                primary_sidecar_bytes,
+            )?;
+            crate::eval(scale_array.as_ref().ok_or(GgmlAffineError::InvalidPlane)?);
+            crate::eval(bias_array.as_ref().ok_or(GgmlAffineError::InvalidPlane)?);
+            let scale_array_f16 = crate::astype(
+                scale_array
+                    .as_ref()
+                    .ok_or(GgmlAffineError::InvalidPlane)?,
+                dtype::FLOAT16,
+            );
+            let bias_array_f16 = crate::astype(
+                bias_array
+                    .as_ref()
+                    .ok_or(GgmlAffineError::InvalidPlane)?,
+                dtype::FLOAT16,
+            );
+            validate_plane(
+                &scale_array_f16,
+                dtype::FLOAT16,
+                &[rows, groups],
+                f16_sidecar_bytes,
+            )?;
+            validate_plane(
+                &bias_array_f16,
+                dtype::FLOAT16,
+                &[rows, groups],
+                f16_sidecar_bytes,
+            )?;
+            crate::eval(
+                scale_array_f16
+                    .as_ref()
+                    .ok_or(GgmlAffineError::InvalidPlane)?,
+            );
+            crate::eval(
+                bias_array_f16
+                    .as_ref()
+                    .ok_or(GgmlAffineError::InvalidPlane)?,
+            );
+            (
+                scale_array,
+                bias_array,
+                Some(scale_array_f16),
+                Some(bias_array_f16),
+            )
+        };
+        drop((scales, biases, scales_f16_bytes, biases_f16_bytes));
+
+        let host_sidecar_bytes = if f16_sidecars {
+            primary_sidecar_bytes
+                .checked_mul(2)
+                .and_then(|bytes| bytes.checked_add(groups_per_row * 8))
+                .ok_or(GgmlAffineError::Overflow)?
+        } else {
             group_values
                 .checked_mul(8)
                 .ok_or(GgmlAffineError::Overflow)?
-        } else {
-            0
         };
         let peak_active_bytes = resident_bytes
-            .checked_mul(2)
-            .and_then(|bytes| bytes.checked_add(f16_conversion_bytes))
+            .checked_add(weight_bytes)
+            .and_then(|bytes| bytes.checked_add(host_sidecar_bytes))
             .and_then(|bytes| bytes.checked_add(expected.min(RELEASE_CHUNK_BYTES)))
             .ok_or(GgmlAffineError::Overflow)?;
         let stats = GgmlAffineTranscodeStats {
@@ -440,8 +479,8 @@ impl GgmlAffineMatrix {
             in_features: i32::try_from(in_features).map_err(|_| GgmlAffineError::Overflow)?,
             out_features: rows,
             bits: bits as i32,
-            resident_row_bytes:
-                packed_row_bytes + groups_per_row * (sidecar_item_bytes * 2 + 4),
+            resident_row_bytes: packed_row_bytes
+                + groups_per_row * (primary_sidecar_item_bytes * 2 + if f16_sidecars { 0 } else { 4 }),
             stats,
         })
     }
@@ -481,67 +520,40 @@ impl GgmlAffineMatrix {
 
     pub fn forward(&self, input: &MlxArray) -> Result<UniquePtr<MlxArray>, GgmlAffineError> {
         validate_input(input, self.in_features)?;
-        if affine_input_rows(input)? >= F16_PREFILL_MIN_ROWS {
+        let input_rows = affine_input_rows(input)?;
+        if input_rows >= F16_PREFILL_MIN_ROWS || self.planes.primary_is_f16() {
             return affine_matmul_f16_compute(input, &self.planes, self.bits);
         }
         Ok(affine_matmul(input, &self.planes, self.bits))
     }
 
-    /// Runs exact pinned Qwen3.8 target shapes through the selected small-row
-    /// kernel. The mixed Q5 experiment is opt-in and covers only M1/M3/M4;
-    /// every other case retains the existing M2/M3 or ordinary affine path.
-    pub fn forward_qwen38_m23(
+    /// Runs exact pinned Qwen3.8 target shapes through a one-pass small-row
+    /// kernel. FP32-sidecar affine matrices use the exact M2/M3/M4 kernel;
+    /// Q5/IQ3S M1/M3/M4 uses its F16-only mixed-compute kernel.
+    pub fn forward_qwen38_m234(
         &self,
         input: &MlxArray,
     ) -> Result<UniquePtr<MlxArray>, GgmlAffineError> {
         validate_input(input, self.in_features)?;
+        let contiguous_input = (!crate::array_is_row_contiguous(input))
+            .then(|| crate::contiguous(input, false));
+        let input = contiguous_input.as_deref().unwrap_or(input);
         let input_rows = affine_input_rows(input)?;
-        let pinned = qwen38_m23_shape(self.in_features, self.out_features);
-        if qwen38_mixed_q5_enabled()
-            && self.bits == 5
+        let pinned = qwen38_m234_shape(self.in_features, self.out_features);
+        if self.bits == 5
             && self.has_f16_sidecars()
             && matches!(input_rows, 1 | 3 | 4)
             && pinned
         {
-            return qwen38_affine_m23_matmul(input, self, input_rows, true, true);
+            return qwen38_affine_m234_matmul(input, self, input_rows, true);
         }
-        if !(2..=3).contains(&input_rows)
+        if !(2..=4).contains(&input_rows)
             || crate::array_dtype(input) != dtype::FLOAT32
             || !pinned
         {
             return self.forward(input);
         }
-        qwen38_affine_m23_matmul(input, self, input_rows, true, false)
-    }
-
-    /// Direct A/B entry point for the disposable pinned mixed-Q5 experiment.
-    ///
-    /// `use_mixed_precision=false` selects the current production path for the
-    /// same row count. The method intentionally rejects every non-Q5, non-pinned,
-    /// or non-M1/M3/M4 input instead of broadening the experiment gate.
-    #[doc(hidden)]
-    pub fn forward_qwen38_q5_experiment(
-        &self,
-        input: &MlxArray,
-        use_mixed_precision: bool,
-    ) -> Result<UniquePtr<MlxArray>, GgmlAffineError> {
-        validate_input(input, self.in_features)?;
-        let input_rows = affine_input_rows(input)?;
-        if self.bits != 5
-            || !matches!(input_rows, 1 | 3 | 4)
-            || crate::array_dtype(input) != dtype::FLOAT32
-            || !qwen38_m23_shape(self.in_features, self.out_features)
-            || use_mixed_precision != self.has_f16_sidecars()
-        {
-            return Err(GgmlAffineError::InvalidInput);
-        }
-        if use_mixed_precision {
-            qwen38_affine_m23_matmul(input, self, input_rows, true, true)
-        } else if input_rows == 3 {
-            qwen38_affine_m23_matmul(input, self, input_rows, true, false)
-        } else {
-            Ok(affine_matmul(input, &self.planes, self.bits))
-        }
+        qwen38_affine_m234_matmul(input, self, input_rows, true)
     }
 
     /// Runs the exact pinned Qwen3.8 MTP shapes through one affine weight pass
@@ -559,22 +571,22 @@ impl GgmlAffineMatrix {
         {
             return self.forward(input);
         }
-        qwen38_affine_m23_matmul(input, self, input_rows, true, false)
+        qwen38_affine_m234_matmul(input, self, input_rows, true)
     }
 
     #[cfg(test)]
-    pub(crate) fn forward_m23_test_only(
+    pub(crate) fn forward_m234_test_only(
         &self,
         input: &MlxArray,
     ) -> Result<UniquePtr<MlxArray>, GgmlAffineError> {
         validate_input(input, self.in_features)?;
         let input_rows = affine_input_rows(input)?;
-        if !(2..=3).contains(&input_rows)
+        if !(2..=4).contains(&input_rows)
             || crate::array_dtype(input) != dtype::FLOAT32
         {
             return self.forward(input);
         }
-        qwen38_affine_m23_matmul(input, self, input_rows, false, false)
+        qwen38_affine_m234_matmul(input, self, input_rows, false)
     }
 
     pub fn select_rows(&self, ranges: &[Range<usize>]) -> Result<GgmlAffineRows, GgmlAffineError> {
@@ -610,44 +622,28 @@ impl GgmlAffineMatrix {
         )
     }
 
-    pub fn qwen38_m23_dispatch_stats(
+    pub fn qwen38_m234_dispatch_stats(
         &self,
         input_rows: usize,
     ) -> Result<GgmlDispatchStats, GgmlAffineError> {
-        if (2..=3).contains(&input_rows) && qwen38_m23_shape(self.in_features, self.out_features) {
+        let pinned = qwen38_m234_shape(self.in_features, self.out_features);
+        let one_pass = pinned
+            && ((self.bits == 5
+                && self.has_f16_sidecars()
+                && matches!(input_rows, 1 | 3 | 4))
+                || (2..=4).contains(&input_rows));
+        if one_pass {
             affine_dispatch_stats_with(
                 input_rows,
                 self.in_features(),
                 self.out_features(),
                 self.resident_row_bytes,
                 1,
-                GgmlKernelPath::Qwen38AffineM23,
+                GgmlKernelPath::Qwen38AffineM234,
             )
         } else {
             self.dispatch_stats(input_rows)
         }
-    }
-
-    #[doc(hidden)]
-    pub fn qwen38_q5_experiment_dispatch_stats(
-        &self,
-        input_rows: usize,
-    ) -> Result<GgmlDispatchStats, GgmlAffineError> {
-        if self.bits != 5
-            || !self.has_f16_sidecars()
-            || !matches!(input_rows, 1 | 3 | 4)
-            || !qwen38_m23_shape(self.in_features, self.out_features)
-        {
-            return Err(GgmlAffineError::InvalidInput);
-        }
-        affine_dispatch_stats_with(
-            input_rows,
-            self.in_features(),
-            self.out_features(),
-            self.resident_row_bytes,
-            1,
-            GgmlKernelPath::Qwen38AffineM23,
-        )
     }
 
     pub fn qwen38_m2_dispatch_stats(
@@ -661,7 +657,7 @@ impl GgmlAffineMatrix {
                 self.out_features(),
                 self.resident_row_bytes,
                 1,
-                GgmlKernelPath::Qwen38AffineM23,
+                GgmlKernelPath::Qwen38AffineM234,
             )
         } else {
             self.dispatch_stats(input_rows)
@@ -669,7 +665,7 @@ impl GgmlAffineMatrix {
     }
 
     #[cfg(test)]
-    pub(crate) fn m23_dispatch_stats_test_only(
+    pub(crate) fn m234_dispatch_stats_test_only(
         &self,
         input_rows: usize,
     ) -> Result<GgmlDispatchStats, GgmlAffineError> {
@@ -679,7 +675,7 @@ impl GgmlAffineMatrix {
             self.out_features(),
             self.resident_row_bytes,
             1,
-            GgmlKernelPath::Qwen38AffineM23,
+            GgmlKernelPath::Qwen38AffineM234,
         )
     }
 }
@@ -792,6 +788,22 @@ impl Qwen38MixedQkvBundle {
         if crate::array_dtype(input) != dtype::FLOAT32 {
             return Err(GgmlAffineError::InvalidInput);
         }
+        if input_rows == 4 {
+            // The bundled M4 K/V path does not preserve corresponding M1
+            // arithmetic. Reuse its exact M3 path plus one decode row.
+            let shape = crate::array_shape(input);
+            let first_input =
+                crate::slice(input, &[0, 0, 0], &[shape[0], 3, shape[2]]);
+            let last_input =
+                crate::slice(input, &[0, 3, 0], &[shape[0], 4, shape[2]]);
+            let first = self.forward(&first_input)?;
+            let last = self.forward(&last_input)?;
+            return Ok(Qwen38MixedQkvOutput {
+                query: crate::concatenate(&first.query, &last.query, 1),
+                key: crate::concatenate(&first.key, &last.key, 1),
+                value: crate::concatenate(&first.value, &last.value, 1),
+            });
+        }
         if !Self::uses_bundled_dispatch(input_rows) {
             let forward = |matrix: &Qwen38QkvMatrix| match matrix {
                 Qwen38QkvMatrix::Affine(matrix) => matrix.forward(input),
@@ -800,7 +812,7 @@ impl Qwen38MixedQkvBundle {
                     .map_err(|error| GgmlAffineError::Backend(error.to_string())),
             };
             return Ok(Qwen38MixedQkvOutput {
-                query: self.query.forward_qwen38_m23(input)?,
+                query: self.query.forward_qwen38_m234(input)?,
                 key: forward(&self.key)?,
                 value: forward(&self.value)?,
             });
@@ -845,9 +857,6 @@ impl Qwen38MixedQkvBundle {
             value_packed,
             value_code,
             input_rows,
-            qwen38_mixed_q5_enabled()
-                && self.query.bits == 5
-                && self.query.has_f16_sidecars(),
         )
         .map_err(|error| GgmlAffineError::Backend(error.what().to_owned()))?;
         let output = outputs.pin_mut();
@@ -873,9 +882,9 @@ pub struct Qwen38AffineMlpFusion {
     gate: GgmlAffineMatrix,
     up: GgmlAffineMatrix,
     down: GgmlAffineMatrix,
-    gate_m23: bool,
-    up_m23: bool,
-    down_m23: bool,
+    gate_m234: bool,
+    up_m234: bool,
+    down_m234: bool,
     m2_only: bool,
 }
 
@@ -884,9 +893,9 @@ impl Qwen38AffineMlpFusion {
         gate: GgmlAffineMatrix,
         up: GgmlAffineMatrix,
         down: GgmlAffineMatrix,
-        m23: [bool; 3],
+        m234: [bool; 3],
     ) -> Result<Self, GgmlAffineError> {
-        Self::with_small_row_paths(gate, up, down, m23, false)
+        Self::with_small_row_paths(gate, up, down, m234, false)
     }
 
     pub fn new_m2(
@@ -901,7 +910,7 @@ impl Qwen38AffineMlpFusion {
         gate: GgmlAffineMatrix,
         up: GgmlAffineMatrix,
         down: GgmlAffineMatrix,
-        m23: [bool; 3],
+        m234: [bool; 3],
         m2_only: bool,
     ) -> Result<Self, GgmlAffineError> {
         if (gate.in_features(), gate.out_features()) != (5120, 17_408)
@@ -914,9 +923,9 @@ impl Qwen38AffineMlpFusion {
             gate,
             up,
             down,
-            gate_m23: m23[0],
-            up_m23: m23[1],
-            down_m23: m23[2],
+            gate_m234: m234[0],
+            up_m234: m234[1],
+            down_m234: m234[2],
             m2_only,
         })
     }
@@ -932,17 +941,17 @@ impl Qwen38AffineMlpFusion {
             || self.up.has_f16_sidecars()
             || self.down.has_f16_sidecars()
         {
-            let forward = |matrix: &GgmlAffineMatrix, input: &MlxArray, m23| {
+            let forward = |matrix: &GgmlAffineMatrix, input: &MlxArray, m234| {
                 if rows == 2 && self.m2_only {
                     matrix.forward_qwen38_m2(input)
-                } else if m23 {
-                    matrix.forward_qwen38_m23(input)
+                } else if m234 {
+                    matrix.forward_qwen38_m234(input)
                 } else {
                     matrix.forward(input)
                 }
             };
-            let gate = forward(&self.gate, input, self.gate_m23)?;
-            let up = forward(&self.up, input, self.up_m23)?;
+            let gate = forward(&self.gate, input, self.gate_m234)?;
+            let up = forward(&self.up, input, self.up_m234)?;
             let activated = crate::compiled_swiglu_activation(
                 gate.as_ref().ok_or(GgmlAffineError::InvalidPlane)?,
                 up.as_ref().ok_or(GgmlAffineError::InvalidPlane)?,
@@ -950,7 +959,7 @@ impl Qwen38AffineMlpFusion {
             return forward(
                 &self.down,
                 activated.as_ref().ok_or(GgmlAffineError::InvalidPlane)?,
-                self.down_m23,
+                self.down_m234,
             );
         }
         crate::qwen38_affine_mlp_fused(
@@ -1068,7 +1077,7 @@ pub struct Qwen38AffineGdnIngressFusion {
     z: GgmlAffineMatrix,
     beta: GgmlAffineMatrix,
     alpha: GgmlAffineMatrix,
-    m23: [bool; 4],
+    m234: [bool; 4],
 }
 
 impl Qwen38AffineGdnIngressFusion {
@@ -1077,7 +1086,7 @@ impl Qwen38AffineGdnIngressFusion {
         z: GgmlAffineMatrix,
         beta: GgmlAffineMatrix,
         alpha: GgmlAffineMatrix,
-        m23: [bool; 4],
+        m234: [bool; 4],
     ) -> Result<Self, GgmlAffineError> {
         if (qkv.in_features(), qkv.out_features()) != (5120, 10_240)
             || (z.in_features(), z.out_features()) != (5120, 6144)
@@ -1091,7 +1100,7 @@ impl Qwen38AffineGdnIngressFusion {
             z,
             beta,
             alpha,
-            m23,
+            m234,
         })
     }
 
@@ -1107,18 +1116,18 @@ impl Qwen38AffineGdnIngressFusion {
             || self.beta.has_f16_sidecars()
             || self.alpha.has_f16_sidecars()
         {
-            let forward = |matrix: &GgmlAffineMatrix, m23| {
-                if m23 {
-                    matrix.forward_qwen38_m23(input)
+            let forward = |matrix: &GgmlAffineMatrix, m234| {
+                if m234 {
+                    matrix.forward_qwen38_m234(input)
                 } else {
                     matrix.forward(input)
                 }
             };
             return Ok(Qwen38GdnIngressOutput {
-                qkv: forward(&self.qkv, self.m23[0])?,
-                z: forward(&self.z, self.m23[1])?,
-                beta: forward(&self.beta, self.m23[2])?,
-                alpha: forward(&self.alpha, self.m23[3])?,
+                qkv: forward(&self.qkv, self.m234[0])?,
+                z: forward(&self.z, self.m234[1])?,
+                beta: forward(&self.beta, self.m234[2])?,
+                alpha: forward(&self.alpha, self.m234[3])?,
             });
         }
         let mut outputs = crate::qwen38_affine_gdn_ingress_fused(
@@ -1272,7 +1281,11 @@ impl GgmlAffineRows {
     pub fn forward(&self, input: &MlxArray) -> Result<UniquePtr<MlxArray>, GgmlAffineError> {
         validate_input(input, self.in_features)?;
         let input_rows = affine_input_rows(input)?;
-        let use_f16 = input_rows >= F16_PREFILL_MIN_ROWS;
+        let use_f16 = input_rows >= F16_PREFILL_MIN_ROWS
+            || self
+                .planes
+                .first()
+                .is_some_and(AffinePlanes::primary_is_f16);
         let mut outputs = self.planes.iter().map(|planes| {
             if use_f16 {
                 affine_matmul_f16_compute(input, planes, self.bits)
@@ -1636,6 +1649,12 @@ fn pack_codes(codes: &[u8], bits: usize, output: &mut Vec<u8>) {
     }
 }
 
+fn extend_f16_bytes(values: &[f32], output: &mut Vec<u8>) {
+    for &value in values {
+        output.extend_from_slice(&f32_to_f16_bits(value).to_le_bytes());
+    }
+}
+
 fn affine_input_rows(input: &MlxArray) -> Result<i32, GgmlAffineError> {
     crate::array_shape(input)[..crate::array_ndim(input) - 1]
         .iter()
@@ -1645,15 +1664,21 @@ fn affine_input_rows(input: &MlxArray) -> Result<i32, GgmlAffineError> {
         })
 }
 
-fn qwen38_m23_shape(in_features: i32, out_features: i32) -> bool {
+fn qwen38_m234_shape(in_features: i32, out_features: i32) -> bool {
     matches!(
         (in_features, out_features),
-        (5120, 17408) | (17408, 5120) | (5120, 10240) | (5120, 6144) | (6144, 5120) | (5120, 12288)
+        (5120, 48)
+            | (5120, 17408)
+            | (17408, 5120)
+            | (5120, 10240)
+            | (5120, 6144)
+            | (6144, 5120)
+            | (5120, 12288)
     )
 }
 
 fn qwen38_m2_shape(in_features: i32, out_features: i32) -> bool {
-    qwen38_m23_shape(in_features, out_features) || (in_features, out_features) == (10_240, 5120)
+    qwen38_m234_shape(in_features, out_features) || (in_features, out_features) == (10_240, 5120)
 }
 
 fn qwen38_split_k(input_rows: usize, in_features: usize, out_features: usize) -> usize {
@@ -1666,14 +1691,13 @@ fn qwen38_split_k(input_rows: usize, in_features: usize, out_features: usize) ->
     split
 }
 
-fn qwen38_affine_m23_matmul(
+fn qwen38_affine_m234_matmul(
     input: &MlxArray,
     matrix: &GgmlAffineMatrix,
     input_rows: i32,
     require_pinned_shape: bool,
-    use_mixed_q5: bool,
 ) -> Result<UniquePtr<MlxArray>, GgmlAffineError> {
-    crate::ffi::qwen38_affine_m23_matmul(
+    crate::ffi::qwen38_affine_m234_matmul(
         input,
         matrix
             .planes
@@ -1695,7 +1719,6 @@ fn qwen38_affine_m23_matmul(
         matrix.out_features,
         input_rows,
         require_pinned_shape,
-        use_mixed_q5,
     )
     .map_err(|error| GgmlAffineError::Backend(error.to_string()))
 }
@@ -1762,14 +1785,8 @@ fn affine_matmul_f16_compute(
                 .weight
                 .as_ref()
                 .ok_or(GgmlAffineError::InvalidPlane)?,
-            planes
-                .scales_f16
-                .as_ref()
-                .ok_or(GgmlAffineError::InvalidPlane)?,
-            planes
-                .biases_f16
-                .as_ref()
-                .ok_or(GgmlAffineError::InvalidPlane)?,
+            planes.scales_f16()?,
+            planes.biases_f16()?,
             true,
             GROUP_SIZE as i32,
             bits,

@@ -19,7 +19,7 @@ pub(crate) enum Qwen35Linear {
     #[cfg(any(feature = "specprefill", test))]
     Legacy(UnifiedLinear),
     Affine(GgmlAffineMatrix),
-    PinnedM23Affine(GgmlAffineMatrix),
+    PinnedM234Affine(GgmlAffineMatrix),
     PinnedM2Affine(GgmlAffineMatrix),
     AffineRows(GgmlAffineRows),
     Q6Dual(Qwen38Q6DualMatrix),
@@ -40,9 +40,8 @@ impl Qwen35Linear {
             Self::Affine(linear) => linear
                 .forward(input)
                 .expect("validated GGML affine matrix execution must succeed"),
-            Self::PinnedM23Affine(linear) => linear
-                .forward_qwen38_m23(input)
-                .expect("validated pinned Qwen3.8 M2/M3 affine execution must succeed"),
+            Self::PinnedM234Affine(linear) => linear.forward_qwen38_m234(input)
+                .expect("validated pinned Qwen3.8 M2/M3/M4 affine execution must succeed"),
             Self::PinnedM2Affine(linear) => linear
                 .forward_qwen38_m2(input)
                 .expect("validated pinned Qwen3.8 M2 affine execution must succeed"),
@@ -62,8 +61,13 @@ impl Qwen35Linear {
     }
 
     pub(crate) fn is_affine(&self) -> bool {
-        matches!(self, Self::Affine(_) | Self::PinnedM23Affine(_))
+        matches!(self, Self::Affine(_) | Self::PinnedM234Affine(_))
     }
+
+    pub(crate) fn needs_m4_exact_split(&self) -> bool {
+        matches!(self, Self::Q6Dual(_) | Self::Gguf(_))
+    }
+
 
     pub(crate) fn is_m2_affine(&self) -> bool {
         matches!(self, Self::PinnedM2Affine(_))
@@ -72,7 +76,7 @@ impl Qwen35Linear {
     pub(crate) fn into_affine(self) -> Option<(GgmlAffineMatrix, bool)> {
         match self {
             Self::Affine(matrix) => Some((matrix, false)),
-            Self::PinnedM23Affine(matrix) => Some((matrix, true)),
+            Self::PinnedM234Affine(matrix) => Some((matrix, true)),
             _ => None,
         }
     }
@@ -89,7 +93,7 @@ impl Qwen35Linear {
         match self {
             Self::Legacy(linear) => Some(linear),
             Self::Affine(_)
-            | Self::PinnedM23Affine(_)
+            | Self::PinnedM234Affine(_)
             | Self::PinnedM2Affine(_)
             | Self::AffineRows(_)
             | Self::Q6Dual(_)
@@ -101,7 +105,7 @@ impl Qwen35Linear {
     pub(crate) fn select_gguf_rows(&self, ranges: &[std::ops::Range<usize>]) -> Option<Self> {
         match self {
             Self::Affine(linear) => linear.select_rows(ranges).ok().map(Self::AffineRows),
-            Self::PinnedM23Affine(linear) => linear.select_rows(ranges).ok().map(Self::AffineRows),
+            Self::PinnedM234Affine(linear) => linear.select_rows(ranges).ok().map(Self::AffineRows),
             Self::PinnedM2Affine(linear) => linear.select_rows(ranges).ok().map(Self::AffineRows),
             Self::Gguf(linear) => linear.select_rows(ranges).ok().map(Self::GgufRows),
             #[cfg(any(feature = "specprefill", test))]
@@ -413,7 +417,7 @@ enum PinnedSlot {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PinnedM23AffineSignature {
+struct PinnedM234AffineSignature {
     target_slot: usize,
     layer: usize,
     tensor: LayerTensor,
@@ -421,7 +425,7 @@ struct PinnedM23AffineSignature {
     dimensions: [u64; 2],
 }
 
-fn pinned_m23_affine_signature(slot: TensorSlot) -> Option<PinnedM23AffineSignature> {
+fn pinned_m234_affine_signature(slot: TensorSlot) -> Option<PinnedM234AffineSignature> {
     let TensorSlot::Layer {
         role: ModelRole::Target,
         layer,
@@ -439,8 +443,10 @@ fn pinned_m23_affine_signature(slot: TensorSlot) -> Option<PinnedM23AffineSignat
         (_, LayerTensor::MlpDown) => [17_408, 5120],
         (false, LayerTensor::LinearQkv) => [5120, 10_240],
         (false, LayerTensor::LinearGate) => [5120, 6144],
+        (false, LayerTensor::LinearAlpha | LayerTensor::LinearBeta) => [5120, 48],
         (false, LayerTensor::LinearOutput) => [6144, 5120],
         (true, LayerTensor::AttentionQuery) => [5120, 12_288],
+        (true, LayerTensor::AttentionOutput) => [6144, 5120],
         _ => return None,
     };
     let PinnedSlot::Target(target_slot) = pinned_slot(slot).ok()? else {
@@ -450,7 +456,7 @@ fn pinned_m23_affine_signature(slot: TensorSlot) -> Option<PinnedM23AffineSignat
     if descriptor.dimensions != dimensions || !pinned_affine_qtype(descriptor.qtype) {
         return None;
     }
-    Some(PinnedM23AffineSignature {
+    Some(PinnedM234AffineSignature {
         target_slot,
         layer,
         tensor,
@@ -598,28 +604,20 @@ pub(crate) struct GgufWeightSource {
     target_used: RefCell<[bool; 866]>,
     mtp_used: RefCell<[bool; 18]>,
     affine_stats: RefCell<GgufAffineLoadStats>,
-    enable_m23: bool,
+    enable_m234: bool,
     enable_fusion: bool,
     mixed_q5_sidecars: bool,
 }
 
 impl GgufWeightSource {
     pub(crate) fn open() -> Result<Self> {
-        Self::open_with_features(true, true, mlxcel_core::qwen38_mixed_q5_enabled())
+        Self::open_with_features(true, true, true)
     }
 
-    #[cfg(test)]
-    pub(crate) fn open_without_m23() -> Result<Self> {
-        Self::open_with_features(false, true, false)
-    }
 
     #[cfg(test)]
     pub(crate) fn open_without_fusion() -> Result<Self> {
-        Self::open_with_features(
-            true,
-            false,
-            mlxcel_core::qwen38_mixed_q5_enabled(),
-        )
+        Self::open_with_features(true, false, true)
     }
 
     #[cfg(test)]
@@ -628,7 +626,7 @@ impl GgufWeightSource {
     }
 
     fn open_with_features(
-        enable_m23: bool,
+        enable_m234: bool,
         enable_fusion: bool,
         mixed_q5_sidecars: bool,
     ) -> Result<Self> {
@@ -643,7 +641,7 @@ impl GgufWeightSource {
             target_used: RefCell::new([false; 866]),
             mtp_used: RefCell::new([false; 18]),
             affine_stats: RefCell::new(GgufAffineLoadStats::default()),
-            enable_m23,
+            enable_m234,
             enable_fusion,
             mixed_q5_sidecars,
         })
@@ -807,12 +805,12 @@ impl GgufWeightSource {
         slot: PinnedSlot,
         label: &str,
     ) -> Result<Qwen35Linear> {
-        let m23_signature = pinned_m23_affine_signature(typed_slot);
+        let m234_signature = pinned_m234_affine_signature(typed_slot);
         let m2_signature = pinned_m2_affine_signature(typed_slot);
-        if let Some(signature) = m23_signature {
+        if let Some(signature) = m234_signature {
             ensure!(
                 slot == PinnedSlot::Target(signature.target_slot),
-                "typed pinned M2/M3 slot changed"
+                "typed pinned M2/M3/M4 slot changed"
             );
         }
         if let Some(signature) = m2_signature {
@@ -829,11 +827,11 @@ impl GgufWeightSource {
         let input = usize::try_from(tensor.dimensions[0]).context("linear input exceeds usize")?;
         let output =
             usize::try_from(tensor.dimensions[1]).context("linear output exceeds usize")?;
-        if let Some(signature) = m23_signature {
+        if let Some(signature) = m234_signature {
             ensure!(
                 tensor.tensor_type.id() == signature.qtype
                     && tensor.dimensions == signature.dimensions,
-                "typed pinned M2/M3 descriptor changed"
+                "typed pinned M2/M3/M4 descriptor changed"
             );
         }
         if let Some(signature) = m2_signature {
@@ -855,7 +853,7 @@ impl GgufWeightSource {
             Qwen35Linear::Q6Dual(dual)
         } else if pinned_affine_qtype(tensor.tensor_type.id()) {
             let f16_sidecars = self.mixed_q5_sidecars
-                && m23_signature
+                && m234_signature
                     .is_some_and(|signature| matches!(signature.qtype, 13 | 21));
             let affine = if f16_sidecars {
                 GgmlAffineMatrix::from_ggml_bytes_with_progress_f16_sidecars(
@@ -875,9 +873,9 @@ impl GgufWeightSource {
                 )
             }?;
             self.record_affine(affine.transcode_stats());
-            if self.enable_m23 && m23_signature.is_some() {
-                Qwen35Linear::PinnedM23Affine(affine)
-            } else if self.enable_m23 && m2_signature.is_some() {
+            if self.enable_m234 && m234_signature.is_some() {
+                Qwen35Linear::PinnedM234Affine(affine)
+            } else if self.enable_m234 && m2_signature.is_some() {
                 Qwen35Linear::PinnedM2Affine(affine)
             } else {
                 Qwen35Linear::Affine(affine)
@@ -1200,28 +1198,7 @@ fn layer_slot_offset(full: bool, tensor: LayerTensor) -> std::result::Result<usi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{BTreeMap, BTreeSet};
-    use std::time::{Duration, Instant};
-
-    #[derive(Default)]
-    struct OldFp32Diagnostics {
-        elements: usize,
-        rows: usize,
-        squared_error: f64,
-        reference_squared: f64,
-        candidate_squared: f64,
-        dot: f64,
-        kl: f64,
-        max_abs: f32,
-        top8_overlap: usize,
-    }
-
-    fn f32_values(bytes: &[u8]) -> Vec<f32> {
-        bytes
-            .chunks_exact(4)
-            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
-            .collect()
-    }
+    use std::collections::BTreeMap;
 
     fn max_ulp_bytes(left: &[u8], right: &[u8]) -> u32 {
         assert_eq!(left.len(), right.len());
@@ -1240,109 +1217,6 @@ mod tests {
             .unwrap_or(0)
     }
 
-    fn top_indices(values: &[f32], count: usize) -> Vec<usize> {
-        let mut indices = (0..values.len()).collect::<Vec<_>>();
-        indices.sort_unstable_by(|left, right| values[*right].total_cmp(&values[*left]));
-        indices.truncate(count.min(indices.len()));
-        indices
-    }
-
-    fn record_old_fp32_diagnostics(
-        diagnostics: &mut OldFp32Diagnostics,
-        old: &[u8],
-        candidate: &[u8],
-        output_width: usize,
-    ) {
-        let old = f32_values(old);
-        let candidate = f32_values(candidate);
-        assert_eq!(old.len(), candidate.len());
-        assert!(old.iter().all(|value| value.is_finite()));
-        assert!(candidate.iter().all(|value| value.is_finite()));
-        diagnostics.elements += old.len();
-        diagnostics.rows += old.len() / output_width;
-        for (&reference, &mixed) in old.iter().zip(&candidate) {
-            let error = reference - mixed;
-            diagnostics.squared_error += f64::from(error) * f64::from(error);
-            diagnostics.reference_squared += f64::from(reference) * f64::from(reference);
-            diagnostics.candidate_squared += f64::from(mixed) * f64::from(mixed);
-            diagnostics.dot += f64::from(reference) * f64::from(mixed);
-            diagnostics.max_abs = diagnostics.max_abs.max(error.abs());
-        }
-        for (reference, mixed) in old.chunks_exact(output_width).zip(candidate.chunks_exact(output_width))
-        {
-            let reference_top = top_indices(reference, 8);
-            let mixed_top = top_indices(mixed, 8);
-            diagnostics.top8_overlap += reference_top
-                .iter()
-                .filter(|index| mixed_top.contains(index))
-                .count();
-
-            let reference_max = reference.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mixed_max = mixed.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let reference_sum = reference
-                .iter()
-                .map(|value| f64::from(*value - reference_max).exp())
-                .sum::<f64>();
-            let mixed_sum = mixed
-                .iter()
-                .map(|value| f64::from(*value - mixed_max).exp())
-                .sum::<f64>();
-            for (&reference, &mixed) in reference.iter().zip(mixed) {
-                let log_p = f64::from(reference - reference_max) - reference_sum.ln();
-                let log_q = f64::from(mixed - mixed_max) - mixed_sum.ln();
-                diagnostics.kl += log_p.exp() * (log_p - log_q);
-            }
-        }
-    }
-
-    fn timed_q5_projection(
-        matrix: &GgmlAffineMatrix,
-        input: &MlxArray,
-        mixed: bool,
-    ) -> Duration {
-        let start = Instant::now();
-        let output = matrix
-            .forward_qwen38_q5_experiment(input, mixed)
-            .expect("run pinned Q5 experiment");
-        mlxcel_core::eval(output.as_ref().unwrap());
-        let elapsed = start.elapsed();
-        assert!(
-            f32_values(&mlxcel_core::array_to_raw_bytes(output.as_ref().unwrap()))
-                .iter()
-                .all(|value| value.is_finite())
-        );
-        elapsed
-    }
-
-    fn alternating_q5_medians(
-        old_matrix: &GgmlAffineMatrix,
-        mixed_matrix: &GgmlAffineMatrix,
-        input: &MlxArray,
-    ) -> (Duration, Duration) {
-        for repetition in 0..5 {
-            if repetition % 2 == 0 {
-                let _ = timed_q5_projection(old_matrix, input, false);
-                let _ = timed_q5_projection(mixed_matrix, input, true);
-            } else {
-                let _ = timed_q5_projection(mixed_matrix, input, true);
-                let _ = timed_q5_projection(old_matrix, input, false);
-            }
-        }
-        let mut old = Vec::with_capacity(15);
-        let mut mixed = Vec::with_capacity(15);
-        for repetition in 0..15 {
-            if repetition % 2 == 0 {
-                old.push(timed_q5_projection(old_matrix, input, false));
-                mixed.push(timed_q5_projection(mixed_matrix, input, true));
-            } else {
-                mixed.push(timed_q5_projection(mixed_matrix, input, true));
-                old.push(timed_q5_projection(old_matrix, input, false));
-            }
-        }
-        old.sort_unstable();
-        mixed.sort_unstable();
-        (old[old.len() / 2], mixed[mixed.len() / 2])
-    }
 
     fn max_ulp(left: &MlxArray, right: &MlxArray) -> u32 {
         let ordered = |value: f32| {
@@ -1554,20 +1428,23 @@ mod tests {
     }
 
     #[test]
-    fn pinned_m23_allowlist_is_exactly_the_326_target_descriptors() {
-        const TENSORS: [LayerTensor; 7] = [
+    fn pinned_m234_allowlist_is_exactly_the_430_target_descriptors() {
+        const TENSORS: [LayerTensor; 10] = [
             LayerTensor::AttentionQuery,
             LayerTensor::MlpGate,
             LayerTensor::MlpUp,
             LayerTensor::MlpDown,
             LayerTensor::LinearQkv,
             LayerTensor::LinearGate,
+            LayerTensor::LinearAlpha,
+            LayerTensor::LinearBeta,
             LayerTensor::LinearOutput,
+            LayerTensor::AttentionOutput,
         ];
         const EXPECTED_LAYERS: [usize; 64] = [
-            6, 5, 5, 4, 6, 6, 4, 4, 6, 6, 6, 4, 6, 6, 6, 4, 6, 6, 6, 4, 6, 5, 5, 4, 5, 5, 6, 4, 5,
-            6, 6, 4, 6, 6, 6, 4, 6, 6, 6, 4, 6, 6, 6, 4, 6, 6, 6, 4, 6, 6, 5, 4, 5, 6, 6, 4, 4, 4,
-            3, 1, 5, 6, 5, 1,
+            8, 7, 7, 4, 8, 8, 6, 5, 8, 8, 8, 5, 8, 8, 8, 5, 8, 8, 8, 5, 8, 7, 7, 4, 7, 7, 8, 4, 7,
+            8, 8, 4, 8, 8, 8, 4, 8, 8, 8, 5, 8, 8, 8, 4, 8, 8, 8, 5, 8, 8, 7, 4, 7, 8, 8, 5, 6, 6,
+            5, 2, 7, 8, 7, 1,
         ];
 
         let mut signatures = Vec::new();
@@ -1578,7 +1455,7 @@ mod tests {
                     layer,
                     tensor,
                 };
-                if let Some(signature) = pinned_m23_affine_signature(slot) {
+                if let Some(signature) = pinned_m234_affine_signature(slot) {
                     assert_eq!(
                         pinned_slot(slot),
                         Ok(PinnedSlot::Target(signature.target_slot))
@@ -1589,7 +1466,7 @@ mod tests {
                     signatures.push(signature);
                 }
                 assert!(
-                    pinned_m23_affine_signature(TensorSlot::Layer {
+                    pinned_m234_affine_signature(TensorSlot::Layer {
                         role: ModelRole::Mtp,
                         layer: 0,
                         tensor,
@@ -1599,12 +1476,12 @@ mod tests {
             }
         }
 
-        assert_eq!(signatures.len(), 326);
+        assert_eq!(signatures.len(), 430);
         let mut layer_counts = [0usize; 64];
-        let mut tensor_counts = [0usize; 7];
+        let mut tensor_counts = [0usize; 10];
         let mut qtype_counts = [0usize; 7];
-        let mut tensor_qtypes = [[0usize; 7]; 7];
-        let mut shape_counts = [0usize; 6];
+        let mut tensor_qtypes = [[0usize; 7]; 10];
+        let mut shape_counts = [0usize; 7];
         let mut occupied_slots = [false; 866];
         let mut slots = Vec::with_capacity(signatures.len());
         for signature in signatures {
@@ -1616,7 +1493,10 @@ mod tests {
                 LayerTensor::MlpDown => 3,
                 LayerTensor::LinearQkv => 4,
                 LayerTensor::LinearGate => 5,
-                LayerTensor::LinearOutput => 6,
+                LayerTensor::LinearAlpha => 6,
+                LayerTensor::LinearBeta => 7,
+                LayerTensor::LinearOutput => 8,
+                LayerTensor::AttentionOutput => 9,
                 _ => unreachable!(),
             };
             let qtype_index = match signature.qtype {
@@ -1637,8 +1517,9 @@ mod tests {
                 [17_408, 5120] => 1,
                 [5120, 10_240] => 2,
                 [5120, 6144] => 3,
-                [6144, 5120] => 4,
-                [5120, 12_288] => 5,
+                [5120, 48] => 4,
+                [6144, 5120] => 5,
+                [5120, 12_288] => 6,
                 _ => unreachable!(),
             }] += 1;
             assert!(!occupied_slots[signature.target_slot]);
@@ -1646,8 +1527,8 @@ mod tests {
             slots.push(signature.target_slot);
         }
         assert_eq!(layer_counts, EXPECTED_LAYERS);
-        assert_eq!(tensor_counts, [16, 60, 62, 59, 47, 47, 35]);
-        assert_eq!(qtype_counts, [1, 3, 67, 179, 6, 1, 69]);
+        assert_eq!(tensor_counts, [16, 60, 62, 59, 47, 47, 48, 48, 35, 8]);
+        assert_eq!(qtype_counts, [97, 3, 67, 186, 6, 1, 70]);
         assert_eq!(
             tensor_qtypes,
             [
@@ -1657,10 +1538,13 @@ mod tests {
                 [0, 0, 5, 35, 2, 1, 16],
                 [0, 0, 23, 21, 1, 0, 2],
                 [0, 0, 13, 31, 0, 0, 3],
+                [48, 0, 0, 0, 0, 0, 0],
+                [48, 0, 0, 0, 0, 0, 0],
                 [1, 0, 1, 33, 0, 0, 0],
+                [0, 0, 0, 7, 0, 0, 1],
             ]
         );
-        assert_eq!(shape_counts, [122, 59, 47, 47, 35, 16]);
+        assert_eq!(shape_counts, [122, 59, 47, 47, 96, 43, 16]);
 
         slots.sort_unstable();
         let slot_fingerprint = slots.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, slot| {
@@ -1673,8 +1557,8 @@ mod tests {
         });
         assert_eq!(slots.first(), Some(&3));
         assert_eq!(slots.last(), Some(&844));
-        assert_eq!(slots.iter().sum::<usize>(), 134_189);
-        assert_eq!(slot_fingerprint, 0x03be_e87b_92d9_9aca);
+        assert_eq!(slots.iter().sum::<usize>(), 178_202);
+        assert_eq!(slot_fingerprint, 0x5eae_6e1c_c1d2_f58c);
     }
 
     #[test]
@@ -1730,7 +1614,7 @@ mod tests {
                 if input_rows == 2 {
                     assert_eq!(
                         selected_stats.path,
-                        mlxcel_core::GgmlKernelPath::Qwen38AffineM23
+                        mlxcel_core::GgmlKernelPath::Qwen38AffineM234
                     );
                     assert_eq!(
                         split_stats.packed_bytes_read,
@@ -1810,115 +1694,132 @@ mod tests {
         }
     }
 
+
     #[test]
-    #[ignore = "requires the complete pinned Qwen3.8 target and MTP GGUF pair"]
-    fn real_pinned_m23_representatives_cover_affine_bits_4_5_8() {
+    #[ignore = "requires the complete pinned Qwen3.8 target GGUF and exclusive Metal access"]
+    fn real_pinned_m234_all_shape_qtype_pairs_are_exact() {
         if !mlxcel_core::metal_is_available() {
             return;
         }
+        const TENSORS: [LayerTensor; 9] = [
+            LayerTensor::AttentionQuery,
+            LayerTensor::MlpGate,
+            LayerTensor::MlpUp,
+            LayerTensor::MlpDown,
+            LayerTensor::LinearQkv,
+            LayerTensor::LinearGate,
+            LayerTensor::LinearAlpha,
+            LayerTensor::LinearBeta,
+            LayerTensor::LinearOutput,
+        ];
+        let mut representatives = BTreeMap::new();
+        for layer in 0..64 {
+            for tensor in TENSORS {
+                let slot = TensorSlot::Layer {
+                    role: ModelRole::Target,
+                    layer,
+                    tensor,
+                };
+                if let Some(signature) = pinned_m234_affine_signature(slot) {
+                    representatives
+                        .entry((signature.qtype, signature.dimensions))
+                        .or_insert((slot, signature));
+                }
+            }
+        }
+        assert_eq!(
+            representatives.len(),
+            24,
+            "pinned affine shape/qtype coverage changed"
+        );
+
         let weights =
             GgufWeightSource::open_without_mixed_q5_sidecars().expect("open pinned GGUF pair");
-        let representatives = [
-            TensorSlot::Layer {
-                role: ModelRole::Target,
-                layer: 3,
-                tensor: LayerTensor::MlpGate,
-            },
-            TensorSlot::Layer {
-                role: ModelRole::Target,
-                layer: 3,
-                tensor: LayerTensor::MlpDown,
-            },
-            TensorSlot::Layer {
-                role: ModelRole::Target,
-                layer: 0,
-                tensor: LayerTensor::LinearOutput,
-            },
-        ];
-        for slot in representatives {
-            let signature = pinned_m23_affine_signature(slot).expect("representative signature");
+        let mut aggregate_max_ulp = 0;
+        for ((qtype, dimensions), (slot, signature)) in representatives {
             let linear = weights
                 .load_linear(
                     slot,
                     PinnedSlot::Target(signature.target_slot),
-                    "representative",
+                    "M234 shape/qtype representative",
                 )
-                .expect("load representative");
-            let Qwen35Linear::PinnedM23Affine(matrix) = linear else {
-                panic!("representative did not receive the pinned M2/M3 path");
+                .expect("load M234 representative");
+            let Qwen35Linear::PinnedM234Affine(matrix) = linear else {
+                panic!("representative did not receive the pinned M234 path");
             };
+            assert!(
+                !matrix.has_f16_sidecars(),
+                "generic M234 gate requires FP32 sidecars"
+            );
             let width = matrix.in_features();
-            for input_rows in [1usize, 2, 3, 4] {
-                let values = (0..input_rows * width)
-                    .map(|index| {
-                        let row = index / width;
-                        let column = index % width;
-                        (column as i32 % 43 - 21) as f32 * 0.001953125 + row as f32 * 0.00048828125
-                    })
-                    .collect::<Vec<_>>();
-                let input =
-                    mlxcel_core::from_slice_f32(&values, &[1, input_rows as i32, width as i32]);
-                let split_stats = matrix.dispatch_stats(input_rows).unwrap();
-                let selected_stats = matrix.qwen38_m23_dispatch_stats(input_rows).unwrap();
-                if (2..=3).contains(&input_rows) {
-                    assert_eq!(
-                        selected_stats.path,
-                        mlxcel_core::GgmlKernelPath::Qwen38AffineM23
-                    );
-                    assert_eq!(
-                        split_stats.packed_bytes_read,
-                        selected_stats.packed_bytes_read * input_rows
-                    );
-                } else {
-                    assert_eq!(selected_stats, split_stats);
-                }
-                let split = matrix.forward(input.as_ref().unwrap()).unwrap();
-                let one_pass = if matches!(signature.qtype, 13 | 21)
-                    && matches!(input_rows, 1 | 3 | 4)
-                {
-                    matrix
-                        .forward_qwen38_q5_experiment(input.as_ref().unwrap(), false)
-                        .unwrap()
-                } else {
-                    matrix.forward_qwen38_m23(input.as_ref().unwrap()).unwrap()
-                };
-                mlxcel_core::eval(split.as_ref().unwrap());
-                mlxcel_core::eval(one_pass.as_ref().unwrap());
-                let split = mlxcel_core::array_to_raw_bytes(split.as_ref().unwrap());
-                let one_pass = mlxcel_core::array_to_raw_bytes(one_pass.as_ref().unwrap());
-                let ordered = |value: f32| {
-                    let bits = value.to_bits() as i32;
-                    if bits < 0 { i32::MIN - bits } else { bits }
-                };
-                let max_ulp = split
-                    .chunks_exact(4)
-                    .zip(one_pass.chunks_exact(4))
-                    .map(|(left, right)| {
-                        let left = f32::from_le_bytes(left.try_into().unwrap());
-                        let right = f32::from_le_bytes(right.try_into().unwrap());
-                        ordered(left).abs_diff(ordered(right))
-                    })
-                    .max()
-                    .unwrap_or(0);
-                assert!(
-                    max_ulp <= 1,
-                    "slot {} qtype {} M={} differs by {} ULP",
-                    signature.target_slot,
-                    signature.qtype,
-                    input_rows,
-                    max_ulp
+            let output_width = matrix.out_features();
+            let values = (0..4 * width)
+                .map(|index| {
+                    let row = index / width;
+                    let column = index % width;
+                    (column as i32 % 43 - 21) as f32 * 0.001953125
+                        + row as f32 * 0.00048828125
+                })
+                .collect::<Vec<_>>();
+            let input = mlxcel_core::from_slice_f32(&values, &[1, 4, width as i32]);
+            let one_pass = matrix
+                .forward_qwen38_m234(input.as_ref().unwrap())
+                .expect("one-pass M4 representative");
+            mlxcel_core::eval(one_pass.as_ref().unwrap());
+            let one_pass = mlxcel_core::array_to_raw_bytes(one_pass.as_ref().unwrap());
+            let selected_stats = matrix.qwen38_m234_dispatch_stats(4).unwrap();
+            let sequential_stats = matrix.dispatch_stats(1).unwrap();
+            assert_eq!(
+                selected_stats.path,
+                mlxcel_core::GgmlKernelPath::Qwen38AffineM234
+            );
+            assert_eq!(
+                sequential_stats.packed_bytes_read,
+                selected_stats.packed_bytes_read
+            );
+
+            let mut pair_max_ulp = 0;
+            for row in 0..4 {
+                let input_m1 = mlxcel_core::from_slice_f32(
+                    &values[row * width..(row + 1) * width],
+                    &[1, 1, width as i32],
                 );
+                let sequential = matrix.forward(input_m1.as_ref().unwrap()).expect("M1 row");
+                mlxcel_core::eval(sequential.as_ref().unwrap());
+                let sequential = mlxcel_core::array_to_raw_bytes(sequential.as_ref().unwrap());
+                let row_bytes = output_width * 4;
+                let range = row * row_bytes..(row + 1) * row_bytes;
+                pair_max_ulp = pair_max_ulp.max(max_ulp_bytes(&sequential, &one_pass[range]));
             }
+            assert!(
+                pair_max_ulp <= 1,
+                "slot {} qtype {} shape {:?} M4 differs by {} ULP",
+                signature.target_slot,
+                qtype,
+                dimensions,
+                pair_max_ulp
+            );
+            aggregate_max_ulp = aggregate_max_ulp.max(pair_max_ulp);
+            eprintln!(
+                "QWEN38_AFFINE_M234_PAIR qtype={} shape={}x{} max_ulp={}",
+                qtype, dimensions[0], dimensions[1], pair_max_ulp
+            );
+            drop(matrix);
+            mlxcel_core::memory::clear_cache();
         }
+        eprintln!(
+            "QWEN38_AFFINE_M234_COVERAGE pairs=24 max_m1_vs_m4_ulp={}",
+            aggregate_max_ulp
+        );
     }
 
     #[test]
     #[ignore = "requires the complete pinned Qwen3.8 target GGUF and exclusive Metal access"]
-    fn real_pinned_mixed_q5_all_descriptors_parity_diagnostics_and_timing() {
+    fn real_pinned_mixed_q5_all_descriptors_are_exact_and_compact() {
         if !mlxcel_core::metal_is_available() {
             return;
         }
-        const TENSORS: [LayerTensor; 7] = [
+        const TENSORS: [LayerTensor; 8] = [
             LayerTensor::AttentionQuery,
             LayerTensor::MlpGate,
             LayerTensor::MlpUp,
@@ -1926,6 +1827,7 @@ mod tests {
             LayerTensor::LinearQkv,
             LayerTensor::LinearGate,
             LayerTensor::LinearOutput,
+            LayerTensor::AttentionOutput,
         ];
         let mut signatures = Vec::new();
         for layer in 0..64 {
@@ -1935,20 +1837,20 @@ mod tests {
                     layer,
                     tensor,
                 };
-                if let Some(signature) = pinned_m23_affine_signature(slot)
+                if let Some(signature) = pinned_m234_affine_signature(slot)
                     && matches!(signature.qtype, 13 | 21)
                 {
                     signatures.push((slot, signature));
                 }
             }
         }
-        assert_eq!(signatures.len(), 180);
+        assert_eq!(signatures.len(), 187);
         assert_eq!(
             signatures
                 .iter()
                 .filter(|(_, signature)| signature.qtype == 13)
                 .count(),
-            179
+            186
         );
         assert_eq!(
             signatures
@@ -1958,43 +1860,37 @@ mod tests {
             1
         );
 
-        assert!(
-            mlxcel_core::qwen38_mixed_q5_enabled(),
-            "set MLXCEL_EXPERIMENTAL_QWEN38_MIXED_Q5=1 for resident F16 sidecars",
-        );
         let weights = GgufWeightSource::open().expect("open mixed pinned GGUF pair");
-        let old_weights = GgufWeightSource::open_without_mixed_q5_sidecars()
-            .expect("open old-FP32 pinned GGUF pair");
-        let mut timed_shapes = BTreeSet::new();
-        let mut diagnostics = BTreeMap::<(u32, [u64; 2]), OldFp32Diagnostics>::new();
         let mut total_old_resident = 0usize;
         let mut total_mixed_resident = 0usize;
+        let mut max_m1_vs_m3_ulp = 0;
+        let mut max_m1_vs_m4_ulp = 0;
         for (slot, signature) in signatures {
             let linear = weights
                 .load_linear(
                     slot,
                     PinnedSlot::Target(signature.target_slot),
-                    "mixed Q5 experiment",
+                    "FP16-sidecar Q5 descriptor",
                 )
                 .expect("load pinned Q5 descriptor");
-            let Qwen35Linear::PinnedM23Affine(matrix) = linear else {
+            let Qwen35Linear::PinnedM234Affine(matrix) = linear else {
                 panic!("slot {} did not receive pinned affine storage", signature.target_slot);
-            };
-            let old_linear = old_weights
-                .load_linear(
-                    slot,
-                    PinnedSlot::Target(signature.target_slot),
-                    "old FP32 Q5 diagnostic",
-                )
-                .expect("load old-FP32 pinned Q5 descriptor");
-            let Qwen35Linear::PinnedM23Affine(old_matrix) = old_linear else {
-                panic!(
-                    "old slot {} did not receive pinned affine storage",
-                    signature.target_slot
-                );
             };
             let width = matrix.in_features();
             let output_width = matrix.out_features();
+            let source_slot = PinnedSlot::Target(signature.target_slot);
+            let (tensor, map) = weights.slot_parts(source_slot);
+            let start = usize::try_from(tensor.absolute_offset).expect("tensor offset");
+            let end = start
+                .checked_add(usize::try_from(tensor.byte_len).expect("tensor byte length"))
+                .expect("tensor end");
+            let old_matrix = GgmlAffineMatrix::from_ggml_bytes(
+                &map[start..end],
+                GgmlQType::try_from(signature.qtype).expect("Q5/IQ3S qtype"),
+                width,
+                output_width,
+            )
+            .expect("construct FP32-sidecar reference from verified source");
             let resident_before = matrix.transcode_stats();
             let old_resident_before = old_matrix.transcode_stats();
             let weight_count = width
@@ -2003,7 +1899,7 @@ mod tests {
             assert!(matrix.has_f16_sidecars());
             assert!(!old_matrix.has_f16_sidecars());
             assert_eq!(resident_before.resident_bytes, weight_count * 3 / 4);
-            assert_eq!(old_resident_before.resident_bytes, weight_count * 7 / 8);
+            assert_eq!(old_resident_before.resident_bytes, weight_count);
             total_old_resident += old_resident_before.resident_bytes;
             total_mixed_resident += resident_before.resident_bytes;
             let values = (0..4 * width)
@@ -2016,19 +1912,13 @@ mod tests {
                 .collect::<Vec<_>>();
             let input_m3 = mlxcel_core::from_slice_f32(&values[..3 * width], &[1, 3, width as i32]);
             let input_m4 = mlxcel_core::from_slice_f32(&values, &[1, 4, width as i32]);
-            let mixed_m3 = matrix
-                .forward_qwen38_q5_experiment(input_m3.as_ref().unwrap(), true)
+            let mixed_m3 = matrix.forward_qwen38_m234(input_m3.as_ref().unwrap())
                 .expect("mixed M3");
-            let mixed_m3_repeat = matrix
-                .forward_qwen38_q5_experiment(input_m3.as_ref().unwrap(), true)
+            let mixed_m3_repeat = matrix.forward_qwen38_m234(input_m3.as_ref().unwrap())
                 .expect("mixed M3 repeat");
-            let mixed_m4 = matrix
-                .forward_qwen38_q5_experiment(input_m4.as_ref().unwrap(), true)
+            let mixed_m4 = matrix.forward_qwen38_m234(input_m4.as_ref().unwrap())
                 .expect("mixed M4");
-            let old_m4 = old_matrix
-                .forward_qwen38_q5_experiment(input_m4.as_ref().unwrap(), false)
-                .expect("old FP32 M4 diagnostic");
-            for output in [&mixed_m3, &mixed_m3_repeat, &mixed_m4, &old_m4] {
+            for output in [&mixed_m3, &mixed_m3_repeat, &mixed_m4] {
                 mlxcel_core::eval(output.as_ref().unwrap());
             }
             assert_eq!(
@@ -2043,27 +1933,25 @@ mod tests {
             let mixed_m3_repeat =
                 mlxcel_core::array_to_raw_bytes(mixed_m3_repeat.as_ref().unwrap());
             let mixed_m4 = mlxcel_core::array_to_raw_bytes(mixed_m4.as_ref().unwrap());
-            let old_m4 = mlxcel_core::array_to_raw_bytes(old_m4.as_ref().unwrap());
             assert_eq!(
                 mixed_m3, mixed_m3_repeat,
                 "slot {} mixed M3 is not repeat deterministic",
                 signature.target_slot
             );
-            assert!(f32_values(&mixed_m4).iter().all(|value| value.is_finite()));
 
             for row in 0..4 {
                 let input_m1 = mlxcel_core::from_slice_f32(
                     &values[row * width..(row + 1) * width],
                     &[1, 1, width as i32],
                 );
-                let mixed_m1 = matrix
-                    .forward_qwen38_q5_experiment(input_m1.as_ref().unwrap(), true)
+                let mixed_m1 = matrix.forward_qwen38_m234(input_m1.as_ref().unwrap())
                     .expect("mixed M1");
                 mlxcel_core::eval(mixed_m1.as_ref().unwrap());
                 let mixed_m1 = mlxcel_core::array_to_raw_bytes(mixed_m1.as_ref().unwrap());
                 let row_bytes = output_width * 4;
                 let m4_range = row * row_bytes..(row + 1) * row_bytes;
                 let m4_ulp = max_ulp_bytes(&mixed_m1, &mixed_m4[m4_range]);
+                max_m1_vs_m4_ulp = max_m1_vs_m4_ulp.max(m4_ulp);
                 assert!(
                     m4_ulp <= 1,
                     "slot {} qtype {} mixed M1 row {row} vs M4 differs by {m4_ulp} ULP",
@@ -2073,6 +1961,7 @@ mod tests {
                 if row < 3 {
                     let m3_range = row * row_bytes..(row + 1) * row_bytes;
                     let m3_ulp = max_ulp_bytes(&mixed_m1, &mixed_m3[m3_range]);
+                    max_m1_vs_m3_ulp = max_m1_vs_m3_ulp.max(m3_ulp);
                     assert!(
                         m3_ulp <= 1,
                         "slot {} qtype {} mixed M1 row {row} vs M3 differs by {m3_ulp} ULP",
@@ -2082,60 +1971,6 @@ mod tests {
                 }
             }
 
-            record_old_fp32_diagnostics(
-                diagnostics.entry((signature.qtype, signature.dimensions)).or_default(),
-                &old_m4,
-                &mixed_m4,
-                output_width,
-            );
-            if timed_shapes.insert((signature.qtype, signature.dimensions)) {
-                for (rows, input) in [
-                    (
-                        1usize,
-                        mlxcel_core::from_slice_f32(&values[..width], &[1, 1, width as i32]),
-                    ),
-                    (
-                        3,
-                        mlxcel_core::from_slice_f32(
-                            &values[..3 * width],
-                            &[1, 3, width as i32],
-                        ),
-                    ),
-                    (
-                        4,
-                        mlxcel_core::from_slice_f32(&values, &[1, 4, width as i32]),
-                    ),
-                ] {
-                    let (old, mixed) = alternating_q5_medians(
-                        &old_matrix,
-                        &matrix,
-                        input.as_ref().unwrap(),
-                    );
-                    let old_traffic = if rows == 3 {
-                        old_matrix.qwen38_m23_dispatch_stats(rows)
-                    } else {
-                        old_matrix.dispatch_stats(rows)
-                    }
-                    .expect("old Q5 traffic");
-                    let mixed_traffic = matrix
-                        .qwen38_q5_experiment_dispatch_stats(rows)
-                        .expect("mixed Q5 traffic");
-                    println!(
-                        "QWEN38_MIXED_Q5_TIMING qtype={} shape={}x{} M={} warmups=5 samples=15 old_median_us={} mixed_median_us={} speedup={:.4} old_resident_bytes={} mixed_resident_bytes={} old_traffic_bytes={} mixed_traffic_bytes={}",
-                        signature.qtype,
-                        width,
-                        output_width,
-                        rows,
-                        old.as_micros(),
-                        mixed.as_micros(),
-                        old.as_secs_f64() / mixed.as_secs_f64(),
-                        old_resident_before.resident_bytes,
-                        resident_before.resident_bytes,
-                        old_traffic.packed_bytes_read,
-                        mixed_traffic.packed_bytes_read,
-                    );
-                }
-            }
             assert_eq!(
                 matrix.transcode_stats(),
                 resident_before,
@@ -2153,32 +1988,18 @@ mod tests {
         }
 
         println!(
-            "QWEN38_MIXED_Q5_RESIDENCY descriptors=180 old_bytes={} mixed_bytes={} saved_bytes={} bytes_per_weight_old=0.875 bytes_per_weight_mixed=0.75 reduction_percent={:.4}",
+            "QWEN38_MIXED_Q5_PARITY descriptors=187 q5=186 iq3s=1 m3_repeat_exact=true max_m1_vs_m3_ulp={} max_m1_vs_m4_ulp={}",
+            max_m1_vs_m3_ulp,
+            max_m1_vs_m4_ulp,
+        );
+        println!(
+            "QWEN38_MIXED_Q5_RESIDENCY descriptors=187 old_bytes={} mixed_bytes={} saved_bytes={} bytes_per_weight_old=1 bytes_per_weight_mixed=0.75 reduction_percent={:.4}",
             total_old_resident,
             total_mixed_resident,
             total_old_resident - total_mixed_resident,
             100.0 * (total_old_resident - total_mixed_resident) as f64
                 / total_old_resident as f64,
         );
-
-        for ((qtype, dimensions), diagnostic) in diagnostics {
-            let rmse = (diagnostic.squared_error / diagnostic.elements as f64).sqrt();
-            let cosine = diagnostic.dot
-                / (diagnostic.reference_squared * diagnostic.candidate_squared).sqrt();
-            println!(
-                "QWEN38_MIXED_Q5_OLD_FP32_DIAGNOSTIC qtype={} shape={}x{} elements={} max_abs={} rmse={} cosine={} mean_kl={} top8_overlap={}/{}",
-                qtype,
-                dimensions[0],
-                dimensions[1],
-                diagnostic.elements,
-                diagnostic.max_abs,
-                rmse,
-                cosine,
-                diagnostic.kl / diagnostic.rows as f64,
-                diagnostic.top8_overlap,
-                diagnostic.rows * 8,
-            );
-        }
     }
 
     #[test]
@@ -2211,8 +2032,32 @@ mod tests {
                     })
                     .collect::<Vec<_>>();
                 let input = mlxcel_core::from_slice_f32(&values, &[1, input_rows as i32, 5120]);
-                let (baseline_q, baseline_k, baseline_v) =
-                    baseline.forward(input.as_ref().unwrap());
+                let mut baseline_q: Option<UniquePtr<MlxArray>> = None;
+                let mut baseline_k: Option<UniquePtr<MlxArray>> = None;
+                let mut baseline_v: Option<UniquePtr<MlxArray>> = None;
+                for row in 0..input_rows {
+                    let row_input = mlxcel_core::slice(
+                        input.as_ref().unwrap(),
+                        &[0, row as i32, 0],
+                        &[1, row as i32 + 1, 5120],
+                    );
+                    let (row_q, row_k, row_v) = baseline.forward(&row_input);
+                    baseline_q = Some(match baseline_q {
+                        Some(previous) => mlxcel_core::concatenate(&previous, &row_q, 1),
+                        None => row_q,
+                    });
+                    baseline_k = Some(match baseline_k {
+                        Some(previous) => mlxcel_core::concatenate(&previous, &row_k, 1),
+                        None => row_k,
+                    });
+                    baseline_v = Some(match baseline_v {
+                        Some(previous) => mlxcel_core::concatenate(&previous, &row_v, 1),
+                        None => row_v,
+                    });
+                }
+                let baseline_q = baseline_q.unwrap();
+                let baseline_k = baseline_k.unwrap();
+                let baseline_v = baseline_v.unwrap();
                 let (bundled_q, bundled_k, bundled_v) = bundled.forward(input.as_ref().unwrap());
                 for (name, baseline, bundled, output_rows) in [
                     (
