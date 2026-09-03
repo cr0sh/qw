@@ -131,6 +131,7 @@ pub(crate) struct Qwen3NextAttention {
     mrope: InterleavedMRoPE,
 }
 
+
 impl Qwen3NextAttention {
     pub(crate) fn forward_with_position_ids(
         &self,
@@ -140,8 +141,9 @@ impl Qwen3NextAttention {
         position_ids: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
         let (output, _) = self.forward_impl(x, cache, mask, position_ids, false);
-        self.o_proj.forward(&output)
+        self.project_output(&output)
     }
+
 
     #[cfg(any(feature = "specprefill", test))]
     /// Draft-lookahead entry point used by SpecPrefill. The captured tensor is
@@ -155,7 +157,7 @@ impl Qwen3NextAttention {
     ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
         let (output, queries) = self.forward_impl(x, cache, mask, position_ids, true);
         (
-            self.o_proj.forward(&output),
+            self.project_output(&output),
             queries.expect("query capture was requested"),
         )
     }
@@ -170,7 +172,21 @@ impl Qwen3NextAttention {
         position_ids: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
         let (output, _) = self.forward_impl(x, cache, mask, position_ids, false);
-        self.o_proj.forward(&output)
+        self.project_output(&output)
+    }
+
+    fn project_output(&self, output: &MlxArray) -> UniquePtr<MlxArray> {
+        let shape = mlxcel_core::array_shape(output);
+        if shape.len() == 3 && shape[1] == 4 && self.o_proj.needs_m4_exact_split() {
+            let first = mlxcel_core::slice(output, &[0, 0, 0], &[shape[0], 3, shape[2]]);
+            let last = mlxcel_core::slice(output, &[0, 3, 0], &[shape[0], 4, shape[2]]);
+            return mlxcel_core::concatenate(
+                &self.o_proj.forward(&first),
+                &self.o_proj.forward(&last),
+                1,
+            );
+        }
+        self.o_proj.forward(output)
     }
 
     fn forward_impl(
@@ -271,6 +287,68 @@ impl Qwen3NextAttention {
             } else {
                 cache.update_and_turbo4_attention(&queries, keys, values, self.scale, mask)
             }
+        } else if l == 4 && mask.is_none() {
+            // The native M4 SDPA crosses into a different reduction kernel.
+            // Preserve corresponding-token M1 arithmetic with the exact M3
+            // path plus one decode row, updating the cache once per segment.
+            let first_queries = mlxcel_core::slice(
+                &queries,
+                &[0, 0, 0, 0],
+                &[b, self.num_heads, 3, self.head_dim],
+            );
+            let last_query = mlxcel_core::slice(
+                &queries,
+                &[0, 0, 3, 0],
+                &[b, self.num_heads, 4, self.head_dim],
+            );
+            let first_keys = mlxcel_core::slice(
+                &keys,
+                &[0, 0, 0, 0],
+                &[b, self.num_kv_heads, 3, self.head_dim],
+            );
+            let first_keys = mlxcel_core::contiguous(&first_keys, false);
+            let last_key = mlxcel_core::slice(
+                &keys,
+                &[0, 0, 3, 0],
+                &[b, self.num_kv_heads, 4, self.head_dim],
+            );
+            let last_key = mlxcel_core::contiguous(&last_key, false);
+            let first_values = mlxcel_core::slice(
+                &values,
+                &[0, 0, 0, 0],
+                &[b, self.num_kv_heads, 3, self.head_dim],
+            );
+            let first_values = mlxcel_core::contiguous(&first_values, false);
+            let last_value = mlxcel_core::slice(
+                &values,
+                &[0, 0, 3, 0],
+                &[b, self.num_kv_heads, 4, self.head_dim],
+            );
+            let last_value = mlxcel_core::contiguous(&last_value, false);
+
+            let (first_cache_k, first_cache_v) =
+                cache.update_and_fetch(first_keys, first_values);
+            let first = mlxcel_core::causal_attention(
+                &first_queries,
+                &first_cache_k,
+                &first_cache_v,
+                self.scale,
+                0.0,
+                0,
+            );
+            let (cache_k, cache_v) = cache.update_and_fetch(last_key, last_value);
+            let last = unsafe {
+                mlxcel_core::layers::attention_from_ptr(
+                    &last_query,
+                    &cache_k,
+                    &cache_v,
+                    self.scale,
+                    std::ptr::null(),
+                    0.0,
+                    0,
+                )
+            };
+            mlxcel_core::concatenate(&first, &last, 2)
         } else {
             let (cache_k, cache_v) = cache.update_and_fetch(keys, values);
             if l > 1 && mask.is_none() {
@@ -539,14 +617,14 @@ impl Mlp {
             && up.is_affine()
             && down.is_affine()
         {
-            let (gate, gate_m23) = gate.into_affine().expect("checked affine gate");
-            let (up, up_m23) = up.into_affine().expect("checked affine up");
-            let (down, down_m23) = down.into_affine().expect("checked affine down");
+            let (gate, gate_m234) = gate.into_affine().expect("checked affine gate");
+            let (up, up_m234) = up.into_affine().expect("checked affine up");
+            let (down, down_m234) = down.into_affine().expect("checked affine down");
             return mlxcel_core::Qwen38AffineMlpFusion::new(
                 gate,
                 up,
                 down,
-                [gate_m23, up_m23, down_m23],
+                [gate_m234, up_m234, down_m234],
             )
             .map(|fusion| Self {
                 execution: MlpExecution::PinnedAffine(fusion),
@@ -657,4 +735,156 @@ mod tests {
         let verify = attention.forward_verify(&input, &mut verify_cache, None, None);
         assert_eq!(mlxcel_core::array_shape(&verify), vec![1, 2, 3]);
     }
+    #[test]
+    fn m4_m3_plus_m1_attention_matches_sequential_outputs_and_fp16_cache() {
+        const QUERY_HEADS: i32 = 24;
+        const KV_HEADS: i32 = 4;
+        const HEAD_DIM: i32 = 256;
+        const PREFIX: i32 = 17;
+        const ROWS: i32 = 4;
+        const SCALE: f32 = 0.0625;
+
+        let tensor = |shape: &[i32], seed: usize| {
+            let len = shape.iter().map(|dimension| *dimension as usize).product::<usize>();
+            let values = (0..len)
+                .map(|index| {
+                    let centered = ((index * 17 + seed * 29) % 257) as i32 - 128;
+                    centered as f32 * 0.001901
+                })
+                .collect::<Vec<_>>();
+            mlxcel_core::from_slice_f32(&values, shape)
+        };
+        let ordered = |value: f32| {
+            let bits = value.to_bits() as i32;
+            if bits < 0 { i32::MIN - bits } else { bits }
+        };
+        let max_ulp = |left: &[u8], right: &[u8]| {
+            assert_eq!(left.len(), right.len());
+            left.chunks_exact(4)
+                .zip(right.chunks_exact(4))
+                .map(|(left, right)| {
+                    let left = ordered(f32::from_le_bytes(left.try_into().unwrap()));
+                    let right = ordered(f32::from_le_bytes(right.try_into().unwrap()));
+                    left.abs_diff(right)
+                })
+                .max()
+                .unwrap_or(0)
+        };
+        let initialize = || {
+            let mut cache = KVCache::new_with_mode(KVCacheMode::Fp16);
+            cache.update(
+                tensor(&[1, KV_HEADS, PREFIX, HEAD_DIM], 1),
+                tensor(&[1, KV_HEADS, PREFIX, HEAD_DIM], 2),
+            );
+            cache
+        };
+        let queries = tensor(&[1, ROWS, QUERY_HEADS, HEAD_DIM], 3);
+        let queries = mlxcel_core::transpose_axes(&queries, &[0, 2, 1, 3]);
+        let keys = tensor(&[1, ROWS, KV_HEADS, HEAD_DIM], 4);
+        let keys = mlxcel_core::transpose_axes(&keys, &[0, 2, 1, 3]);
+        let values = tensor(&[1, ROWS, KV_HEADS, HEAD_DIM], 5);
+        let values = mlxcel_core::transpose_axes(&values, &[0, 2, 1, 3]);
+
+        let mut sequential_cache = initialize();
+        let mut sequential_rows = Vec::with_capacity(ROWS as usize);
+        let mut sequential_final = None;
+        for row in 0..ROWS {
+            let query = mlxcel_core::slice(
+                &queries,
+                &[0, 0, row, 0],
+                &[1, QUERY_HEADS, row + 1, HEAD_DIM],
+            );
+            let key = mlxcel_core::slice(
+                &keys,
+                &[0, 0, row, 0],
+                &[1, KV_HEADS, row + 1, HEAD_DIM],
+            );
+            let value = mlxcel_core::slice(
+                &values,
+                &[0, 0, row, 0],
+                &[1, KV_HEADS, row + 1, HEAD_DIM],
+            );
+            let (cache_k, cache_v) = sequential_cache.update_and_fetch(key, value);
+            let output = unsafe {
+                mlxcel_core::layers::attention_from_ptr(
+                    &query,
+                    &cache_k,
+                    &cache_v,
+                    SCALE,
+                    std::ptr::null(),
+                    0.0,
+                    0,
+                )
+            };
+            let output = mlxcel_core::transpose_axes(&output, &[0, 2, 1, 3]);
+            mlxcel_core::eval(&output);
+            sequential_rows.push(mlxcel_core::array_to_raw_bytes(&output));
+            sequential_final = Some((cache_k, cache_v));
+        }
+        let (sequential_k, sequential_v) = sequential_final.unwrap();
+
+        let mut split_cache = initialize();
+        let first_queries =
+            mlxcel_core::slice(&queries, &[0, 0, 0, 0], &[1, QUERY_HEADS, 3, HEAD_DIM]);
+        let last_query =
+            mlxcel_core::slice(&queries, &[0, 0, 3, 0], &[1, QUERY_HEADS, 4, HEAD_DIM]);
+        let first_keys =
+            mlxcel_core::slice(&keys, &[0, 0, 0, 0], &[1, KV_HEADS, 3, HEAD_DIM]);
+        let first_keys = mlxcel_core::contiguous(&first_keys, false);
+        let last_key = mlxcel_core::slice(&keys, &[0, 0, 3, 0], &[1, KV_HEADS, 4, HEAD_DIM]);
+        let last_key = mlxcel_core::contiguous(&last_key, false);
+        let first_values =
+            mlxcel_core::slice(&values, &[0, 0, 0, 0], &[1, KV_HEADS, 3, HEAD_DIM]);
+        let first_values = mlxcel_core::contiguous(&first_values, false);
+        let last_value =
+            mlxcel_core::slice(&values, &[0, 0, 3, 0], &[1, KV_HEADS, 4, HEAD_DIM]);
+        let last_value = mlxcel_core::contiguous(&last_value, false);
+        let (first_cache_k, first_cache_v) =
+            split_cache.update_and_fetch(first_keys, first_values);
+        let first = mlxcel_core::causal_attention(
+            &first_queries,
+            &first_cache_k,
+            &first_cache_v,
+            SCALE,
+            0.0,
+            0,
+        );
+        let (split_k, split_v) = split_cache.update_and_fetch(last_key, last_value);
+        let last = unsafe {
+            mlxcel_core::layers::attention_from_ptr(
+                &last_query,
+                &split_k,
+                &split_v,
+                SCALE,
+                std::ptr::null(),
+                0.0,
+                0,
+            )
+        };
+        let split = mlxcel_core::concatenate(&first, &last, 2);
+        let split = mlxcel_core::transpose_axes(&split, &[0, 2, 1, 3]);
+        for value in [&split, &sequential_k, &sequential_v, &split_k, &split_v] {
+            mlxcel_core::eval(value);
+        }
+        let split = mlxcel_core::array_to_raw_bytes(&split);
+        let row_bytes = split.len() / ROWS as usize;
+        let mut output_max_ulp = 0;
+        for row in 0..ROWS as usize {
+            let row_ulp = max_ulp(
+                &sequential_rows[row],
+                &split[row * row_bytes..(row + 1) * row_bytes],
+            );
+            output_max_ulp = output_max_ulp.max(row_ulp);
+        }
+        let sequential_k = mlxcel_core::array_to_raw_bytes(&sequential_k);
+        let sequential_v = mlxcel_core::array_to_raw_bytes(&sequential_v);
+        let split_k = mlxcel_core::array_to_raw_bytes(&split_k);
+        let split_v = mlxcel_core::array_to_raw_bytes(&split_v);
+        assert!(output_max_ulp <= 1);
+        assert_eq!(sequential_cache.offset, PREFIX + ROWS);
+        assert_eq!(split_cache.offset, PREFIX + ROWS);
+        assert_eq!(sequential_k, split_k);
+        assert_eq!(sequential_v, split_v);
+    }
+
 }

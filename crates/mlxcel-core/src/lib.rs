@@ -1864,8 +1864,8 @@ mod ffi {
             outputs: Pin<&mut Qwen38GgmlQkvOutputs>,
         ) -> UniquePtr<MlxArray>;
 
-        /// One-pass affine M2/M3 projection for the exact pinned Qwen3.8 target.
-        fn qwen38_affine_m23_matmul(
+        /// One-pass affine M2/M3/M4 projection for the exact pinned Qwen3.8 target.
+        fn qwen38_affine_m234_matmul(
             x: &MlxArray,
             weight: &MlxArray,
             scales: &MlxArray,

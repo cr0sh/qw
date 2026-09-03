@@ -2,6 +2,7 @@ use std::fs::{self, File};
 use std::hint::black_box;
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+#[cfg(feature = "dflash2")]
 use std::time::UNIX_EPOCH;
 
 #[cfg(feature = "dflash2")]
@@ -114,6 +115,7 @@ fn long_context_cache_identity(context_label: &str, min_prefix_tokens: usize) ->
     ] {
         hash_bytes(&mut hash, bytes);
     }
+    hash_bytes(&mut hash, b"qwen38-q5-iq3s-f16-low-m-v1");
     hash_bytes(&mut hash, model_dir.as_os_str().as_encoded_bytes());
 
     for bytes in [
@@ -126,6 +128,10 @@ fn long_context_cache_identity(context_label: &str, min_prefix_tokens: usize) ->
         include_bytes!("../../src/gguf.rs").as_slice(),
         include_bytes!("../../src/qwen38_plan.rs").as_slice(),
         include_bytes!("../../src/qwen3_5_weights.rs").as_slice(),
+        include_bytes!("../../src/qwen3_5.rs").as_slice(),
+        include_bytes!("../../../mlxcel-core/src/ggml_affine.rs").as_slice(),
+        include_bytes!("../../../mlxcel-core/cpp/mlx_cxx_qwen38.cpp").as_slice(),
+        include_bytes!("../../../mlxcel-core/cpp/mlx_cxx_qwen38_fusion.cpp").as_slice(),
     ] {
         hash_bytes(&mut hash, bytes);
     }
@@ -168,7 +174,9 @@ fn long_context_cache_identity(context_label: &str, min_prefix_tokens: usize) ->
 fn long_context_cache_path(context_label: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/qw-bench-fixtures")
-        .join(format!("long_{context_label}_mtp_k{MTP_BLOCK_SIZE}.bin"))
+        .join(format!(
+            "long_{context_label}_mtp_k{MTP_BLOCK_SIZE}_q5f16.bin"
+        ))
 }
 
 fn write_u8(writer: &mut impl Write, value: u8) -> io::Result<()> {

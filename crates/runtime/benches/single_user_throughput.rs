@@ -332,6 +332,7 @@ fn main() {
         "BENCHMARK_CONFIG speculative_engine={speculative_engine} warmup_repetitions=1 \
          timed_repetitions={TIMED_REPETITIONS}"
     );
+    println!("BENCHMARK_ARITHMETIC mode=q5_iq3s_f16");
 
     let mut provider = support::load_provider();
     let fresh_prefill_prompt_ids = selection

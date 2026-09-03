@@ -2315,8 +2315,8 @@ std::unique_ptr<MlxArray> qwen38_ggml_qkv_take_key(
 std::unique_ptr<MlxArray> qwen38_ggml_qkv_take_value(
     Qwen38GgmlQkvOutputs& outputs);
 
-// One-pass affine M2/M3 projection for the exact pinned Qwen3.8 target.
-std::unique_ptr<MlxArray> qwen38_affine_m23_matmul(
+// One-pass affine M2/M3/M4 projection for the exact pinned Qwen3.8 target.
+std::unique_ptr<MlxArray> qwen38_affine_m234_matmul(
     const MlxArray& x,
     const MlxArray& weight,
     const MlxArray& scales,
