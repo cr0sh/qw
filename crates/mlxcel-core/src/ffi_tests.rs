@@ -3910,3 +3910,196 @@ fn dequantize_commutes_with_output_axis_slice_on_strided_inputs() {
         );
     }
 }
+
+#[test]
+fn qwen38_gdn_prework_matches_fp32_graph_m134() {
+    if !metal_is_available() {
+        return;
+    }
+
+    const CONV_DIM: usize = 10_240;
+    const KEY_DIM: i32 = 2_048;
+    const N_KEEP: i32 = 3;
+    let ordered = |value: f32| {
+        let bits = value.to_bits() as i32;
+        if bits < 0 { i32::MIN - bits } else { bits }
+    };
+    let max_ulp = |actual: &MlxArray, expected: &MlxArray| {
+        eval(actual);
+        eval(expected);
+        array_to_raw_bytes(actual)
+            .chunks_exact(4)
+            .zip(array_to_raw_bytes(expected).chunks_exact(4))
+            .map(|(actual, expected)| {
+                let actual = f32::from_le_bytes(actual.try_into().expect("actual f32"));
+                let expected = f32::from_le_bytes(expected.try_into().expect("expected f32"));
+                ordered(actual).abs_diff(ordered(expected))
+            })
+            .max()
+            .unwrap_or(0)
+    };
+
+    let conv_state_values = (0..3 * CONV_DIM)
+        .map(|index| (((index * 17 + 29) % 2_003) as f32 - 1_001.0) / 8_192.0)
+        .collect::<Vec<_>>();
+    let conv_weight_values = (0..4 * CONV_DIM)
+        .map(|index| (((index * 31 + 7) % 509) as f32 - 254.0) / 4_096.0)
+        .collect::<Vec<_>>();
+    // Low-row decode can follow a high-M FP16 prefill, leaving the persisted
+    // convolution tail in FP16 while the new QKV rows are FP32.
+    let conv_state = from_slice_f32(&conv_state_values, &[1, 3, CONV_DIM as i32]);
+    let conv_state = astype(&conv_state, dtype::FLOAT16);
+    let conv_weight = from_slice_f32(&conv_weight_values, &[CONV_DIM as i32, 4, 1]);
+    let inv_scale = (128.0_f32).powf(-0.5);
+
+    for rows in [1_i32, 3, 4] {
+        let qkv_values = (0..rows as usize * CONV_DIM)
+            .map(|index| {
+                (((index * 43 + rows as usize * 101) % 4_099) as f32 - 2_049.0) / 4_096.0
+            })
+            .collect::<Vec<_>>();
+        let qkv = from_slice_f32(&qkv_values, &[1, rows, CONV_DIM as i32]);
+        let joined = concatenate(&conv_state, &qkv, 1);
+        let reference_tail = contiguous(
+            &slice(
+                &joined,
+                &[0, rows, 0],
+                &[1, rows + N_KEEP, CONV_DIM as i32],
+            ),
+            false,
+        );
+        let reference_conv = conv1d(&joined, &conv_weight, 1, 0, 1, CONV_DIM as i32);
+        let reference_conv = crate::utils::silu(&reference_conv);
+        let reference_q = reshape(
+            &slice(&reference_conv, &[0, 0, 0], &[1, rows, KEY_DIM]),
+            &[1, rows, 16, 128],
+        );
+        let reference_k = reshape(
+            &slice(
+                &reference_conv,
+                &[0, 0, KEY_DIM],
+                &[1, rows, 2 * KEY_DIM],
+            ),
+            &[1, rows, 16, 128],
+        );
+        let reference_v = reshape(
+            &slice(
+                &reference_conv,
+                &[0, 0, 2 * KEY_DIM],
+                &[1, rows, CONV_DIM as i32],
+            ),
+            &[1, rows, 48, 128],
+        );
+        let reference_q =
+            multiply_scalar(&fast_rms_norm_no_weight(&reference_q, 1e-6), inv_scale * inv_scale);
+        let reference_k =
+            multiply_scalar(&fast_rms_norm_no_weight(&reference_k, 1e-6), inv_scale);
+
+        let mut outputs = qwen38_gdn_prework(
+            &qkv,
+            &conv_state,
+            &conv_weight,
+            inv_scale * inv_scale,
+            inv_scale,
+            1e-6,
+        )
+        .expect("fixed Qwen3.8 GDN prework inputs");
+        let output = outputs.pin_mut();
+        let actual_q = qwen38_gdn_prework_take_q(output);
+        let output = outputs.pin_mut();
+        let actual_k = qwen38_gdn_prework_take_k(output);
+        let output = outputs.pin_mut();
+        let actual_v = qwen38_gdn_prework_take_v(output);
+        let output = outputs.pin_mut();
+        let actual_tail = qwen38_gdn_prework_take_conv_tail(output);
+
+        let q_ulp = max_ulp(&actual_q, &reference_q);
+        let k_ulp = max_ulp(&actual_k, &reference_k);
+        let v_ulp = max_ulp(&actual_v, &reference_v);
+        let tail_ulp = max_ulp(&actual_tail, &reference_tail);
+        println!(
+            "QWEN38_GDN_PREWORK_PARITY M{rows} q_max_ulp={q_ulp} \
+             k_max_ulp={k_ulp} v_max_ulp={v_ulp} conv_tail_max_ulp={tail_ulp}"
+        );
+        assert!(q_ulp <= 1, "M{rows} Q differs by {q_ulp} ULP");
+        assert!(k_ulp <= 1, "M{rows} K differs by {k_ulp} ULP");
+        assert!(v_ulp <= 1, "M{rows} V differs by {v_ulp} ULP");
+        assert_eq!(tail_ulp, 0, "M{rows} conv tail differs");
+    }
+}
+
+#[test]
+fn qwen38_gdn_prework_safely_materializes_strided_public_ffi_input() {
+    if !metal_is_available() {
+        return;
+    }
+
+    const CONV_DIM: i32 = 10_240;
+    let qkv_storage_values = (0..2 * CONV_DIM as usize)
+        .map(|index| ((index * 37 % 1_009) as f32 - 504.0) / 2_048.0)
+        .collect::<Vec<_>>();
+    let qkv_storage = from_slice_f32(&qkv_storage_values, &[1, 1, 2 * CONV_DIM]);
+    let strided_qkv = as_strided(
+        &qkv_storage,
+        &[1, 1, CONV_DIM],
+        &[(2 * CONV_DIM) as i64, (2 * CONV_DIM) as i64, 2],
+        0,
+    );
+    let contiguous_qkv = contiguous(&strided_qkv, false);
+    let conv_state = full_f32(&[1, 3, CONV_DIM], 0.03125, dtype::FLOAT32);
+    let conv_weight = full_f32(&[CONV_DIM, 4, 1], 0.015625, dtype::FLOAT32);
+    let inv_scale = (128.0_f32).powf(-0.5);
+
+    let mut actual = qwen38_gdn_prework(
+        &strided_qkv,
+        &conv_state,
+        &conv_weight,
+        inv_scale * inv_scale,
+        inv_scale,
+        1e-6,
+    )
+    .expect("strided public input is safely materialized");
+    let output = actual.pin_mut();
+    let actual_q = qwen38_gdn_prework_take_q(output);
+    let output = actual.pin_mut();
+    let actual_k = qwen38_gdn_prework_take_k(output);
+    let output = actual.pin_mut();
+    let actual_v = qwen38_gdn_prework_take_v(output);
+    let output = actual.pin_mut();
+    let actual_tail = qwen38_gdn_prework_take_conv_tail(output);
+
+    let mut expected = qwen38_gdn_prework(
+        &contiguous_qkv,
+        &conv_state,
+        &conv_weight,
+        inv_scale * inv_scale,
+        inv_scale,
+        1e-6,
+    )
+    .expect("contiguous reference input");
+    let output = expected.pin_mut();
+    let expected_q = qwen38_gdn_prework_take_q(output);
+    let output = expected.pin_mut();
+    let expected_k = qwen38_gdn_prework_take_k(output);
+    let output = expected.pin_mut();
+    let expected_v = qwen38_gdn_prework_take_v(output);
+    let output = expected.pin_mut();
+    let expected_tail = qwen38_gdn_prework_take_conv_tail(output);
+
+    for (name, actual, expected) in [
+        ("q", actual_q.as_ref().unwrap(), expected_q.as_ref().unwrap()),
+        ("k", actual_k.as_ref().unwrap(), expected_k.as_ref().unwrap()),
+        ("v", actual_v.as_ref().unwrap(), expected_v.as_ref().unwrap()),
+        (
+            "conv_tail",
+            actual_tail.as_ref().unwrap(),
+            expected_tail.as_ref().unwrap(),
+        ),
+    ] {
+        assert_eq!(
+            array_to_raw_bytes(actual),
+            array_to_raw_bytes(expected),
+            "strided {name} differs from safely materialized reference"
+        );
+    }
+}

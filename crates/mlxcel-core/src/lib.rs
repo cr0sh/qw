@@ -30,6 +30,9 @@ mod ffi {
         /// Four lazy outputs from the fixed Qwen3.8 GDN ingress fusion.
         type Qwen38GdnIngressOutputs;
 
+        /// Exact low-row conv/SiLU/QK-normalization outputs for pinned Qwen3.8 GDN.
+        type Qwen38GdnPreworkOutputs;
+
         /// Three lazy outputs from the pinned full-attention QKV bundle.
         type Qwen38GgmlQkvOutputs;
 
@@ -1938,6 +1941,29 @@ mod ffi {
         fn qwen38_gdn_take_beta(outputs: Pin<&mut Qwen38GdnIngressOutputs>) -> UniquePtr<MlxArray>;
         fn qwen38_gdn_take_alpha(outputs: Pin<&mut Qwen38GdnIngressOutputs>)
         -> UniquePtr<MlxArray>;
+
+        /// Exact FP32 conv/SiLU/QK-normalization prework for pinned Qwen3.8
+        /// B1 M1/M3/M4 GDN. Recurrence coefficient/beta remains a separate leaf.
+        fn qwen38_gdn_prework(
+            qkv: &MlxArray,
+            conv_state: &MlxArray,
+            conv_weight: &MlxArray,
+            q_scale: f32,
+            k_scale: f32,
+            eps: f32,
+        ) -> Result<UniquePtr<Qwen38GdnPreworkOutputs>>;
+        fn qwen38_gdn_prework_take_q(
+            outputs: Pin<&mut Qwen38GdnPreworkOutputs>,
+        ) -> UniquePtr<MlxArray>;
+        fn qwen38_gdn_prework_take_k(
+            outputs: Pin<&mut Qwen38GdnPreworkOutputs>,
+        ) -> UniquePtr<MlxArray>;
+        fn qwen38_gdn_prework_take_v(
+            outputs: Pin<&mut Qwen38GdnPreworkOutputs>,
+        ) -> UniquePtr<MlxArray>;
+        fn qwen38_gdn_prework_take_conv_tail(
+            outputs: Pin<&mut Qwen38GdnPreworkOutputs>,
+        ) -> UniquePtr<MlxArray>;
 
         /// Start a Metal GPU trace capture. `path` must be an absolute
         /// path ending in `.gputrace` and must not already exist. The

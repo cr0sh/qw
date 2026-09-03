@@ -334,7 +334,8 @@ pub(crate) struct GdnRollbackSnapshot {
     a: UniquePtr<MlxArray>,
     b: UniquePtr<MlxArray>,
     init_state: Option<UniquePtr<MlxArray>>,
-    conv_input: UniquePtr<MlxArray>,
+    initial_conv_state: UniquePtr<MlxArray>,
+    qkv: UniquePtr<MlxArray>,
 }
 
 pub(crate) struct Qwen35MtpPrefill {
@@ -541,6 +542,26 @@ impl Qwen35GdnIngress {
 
 // GatedDeltaNet - Qwen3.5 variant with separately stored projections.
 /// Fuses compatible z, beta, and decay projections at load time.
+
+const QWEN38_GDN_PREWORK_ENV: &str = "MLXCEL_QWEN38_GDN_PREWORK";
+
+fn qwen38_gdn_prework_enabled_from(value: Option<&str>) -> bool {
+    !value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        )
+    })
+}
+
+fn qwen38_gdn_prework_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        qwen38_gdn_prework_enabled_from(
+            std::env::var(QWEN38_GDN_PREWORK_ENV).ok().as_deref(),
+        )
+    });
+    *ENABLED
+}
 #[allow(dead_code)]
 pub(crate) struct Qwen35GatedDeltaNet {
     hidden_size: usize,
@@ -555,6 +576,7 @@ pub(crate) struct Qwen35GatedDeltaNet {
 
     conv1d_weight: UniquePtr<MlxArray>,
     conv1d_weight_f16: Option<UniquePtr<MlxArray>>,
+    qwen38_prework_supported: bool,
     ingress: Qwen35GdnIngress,
     dt_bias: UniquePtr<MlxArray>,
     a_log: UniquePtr<MlxArray>,
@@ -606,6 +628,18 @@ impl Qwen35GatedDeltaNet {
 
         // Get conv state from cache
         let input_dtype = mlxcel_core::array_dtype(&qkv);
+        let use_qwen38_prework = self.qwen38_prework_supported
+            && qwen38_gdn_prework_enabled()
+            && mlxcel_core::metal_is_available()
+            && b == 1
+            && matches!(s, 1 | 3 | 4)
+            && input_dtype == mlxcel_core::dtype::FLOAT32
+            && self.conv_kernel_size == 4
+            && self.conv_dim == 10_240
+            && self.num_k_heads == 16
+            && self.num_v_heads == 48
+            && self.head_k_dim == 128
+            && self.head_v_dim == 128;
         let conv_state = if let Some(ref c) = cache {
             c.conv_state
                 .as_ref()
@@ -616,7 +650,11 @@ impl Qwen35GatedDeltaNet {
                     if state_shape[0] != b {
                         None
                     } else {
-                        Some(mlxcel_core::copy(s))
+                        Some(if use_qwen38_prework {
+                            mlxcel_core::share(s)
+                        } else {
+                            mlxcel_core::copy(s)
+                        })
                     }
                 })
                 .unwrap_or_else(|| {
@@ -648,113 +686,126 @@ impl Qwen35GatedDeltaNet {
             qkv
         };
 
-        // Concatenate with conv state
-        let conv_input = concatenate(&conv_state, &qkv, 1);
+        let inv_scale = (self.head_k_dim as f32).powf(-0.5);
 
-        // Update cache with new conv state.
-        // Wrap slice in contiguous() to force MLX to materialize a fresh,
-        // independent buffer. Without this, the slice is a lazy view that
-        // retains a reference to the full conv_input allocation, causing a
-        // memory leak proportional to the sequence length.
-        if let Some(c) = cache.as_deref_mut() {
-            let n_keep = (self.conv_kernel_size - 1) as i32;
-            let conv_shape = mlxcel_core::array_shape(&conv_input);
-            let conv_len = conv_shape[1];
-            let tail = mlxcel_core::slice(
+        let (q, k, v, next_conv_state) = if use_qwen38_prework {
+            let mut outputs = mlxcel_core::qwen38_gdn_prework(
+                &qkv,
+                &conv_state,
+                &self.conv1d_weight,
+                inv_scale * inv_scale,
+                inv_scale,
+                1e-6,
+            )
+            .expect("validated pinned Qwen3.8 GDN prework must succeed");
+            let output = outputs.pin_mut();
+            let q = mlxcel_core::qwen38_gdn_prework_take_q(output);
+            let output = outputs.pin_mut();
+            let k = mlxcel_core::qwen38_gdn_prework_take_k(output);
+            let output = outputs.pin_mut();
+            let v = mlxcel_core::qwen38_gdn_prework_take_v(output);
+            let output = outputs.pin_mut();
+            let conv_tail = mlxcel_core::qwen38_gdn_prework_take_conv_tail(output);
+            (q, k, v, Some(conv_tail))
+        } else {
+            let conv_input = concatenate(&conv_state, &qkv, 1);
+            let next_conv_state = cache.as_ref().map(|_| {
+                let n_keep = (self.conv_kernel_size - 1) as i32;
+                let conv_shape = mlxcel_core::array_shape(&conv_input);
+                let conv_len = conv_shape[1];
+                let tail = mlxcel_core::slice(
+                    &conv_input,
+                    &[0, conv_len - n_keep, 0],
+                    &[b, conv_len, self.conv_dim as i32],
+                );
+                // The fallback still needs an independent buffer: retaining a
+                // view here would keep the complete joined history alive.
+                mlxcel_core::contiguous(&tail, false)
+            });
+
+            let conv1d_weight = if input_dtype == mlxcel_core::dtype::FLOAT16 {
+                self.conv1d_weight_f16
+                    .as_deref()
+                    .unwrap_or(&self.conv1d_weight)
+            } else {
+                &self.conv1d_weight
+            };
+            let conv_out = mlxcel_core::conv1d(
                 &conv_input,
-                &[0, conv_len - n_keep, 0],
-                &[b, conv_len, self.conv_dim as i32],
+                conv1d_weight,
+                1,
+                0,
+                1,
+                self.conv_dim as i32,
             );
-            c.conv_state = Some(mlxcel_core::contiguous(&tail, false));
+            let conv_out = silu(&conv_out);
+            let conv_out_shape = mlxcel_core::array_shape(&conv_out);
+            let conv_seq = conv_out_shape[1];
+            let q_out =
+                mlxcel_core::slice(&conv_out, &[0, 0, 0], &[b, conv_seq, self.key_dim as i32]);
+            let k_out = mlxcel_core::slice(
+                &conv_out,
+                &[0, 0, self.key_dim as i32],
+                &[b, conv_seq, (2 * self.key_dim) as i32],
+            );
+            let v_out = mlxcel_core::slice(
+                &conv_out,
+                &[0, 0, (2 * self.key_dim) as i32],
+                &[b, conv_seq, self.conv_dim as i32],
+            );
+            let q = mlxcel_core::reshape(
+                &q_out,
+                &[b, s, self.num_k_heads as i32, self.head_k_dim as i32],
+            );
+            let k = mlxcel_core::reshape(
+                &k_out,
+                &[b, s, self.num_k_heads as i32, self.head_k_dim as i32],
+            );
+            let v = mlxcel_core::reshape(
+                &v_out,
+                &[b, s, self.num_v_heads as i32, self.head_v_dim as i32],
+            );
+
+            // The high-M pair kernel accumulates both RMS reductions in FP32
+            // and stores half results directly. Low-M fallback remains FP32.
+            let (q, k) = if input_dtype == mlxcel_core::dtype::FLOAT16 {
+                let mut q_norm = UniquePtr::null();
+                let mut k_norm = UniquePtr::null();
+                unsafe {
+                    mlxcel_core::metal_scaled_rms_norm_pair_f16(
+                        &q,
+                        &k,
+                        inv_scale * inv_scale,
+                        inv_scale,
+                        1e-6,
+                        &mut q_norm,
+                        &mut k_norm,
+                    );
+                }
+                (q_norm, k_norm)
+            } else {
+                (
+                    scaled_fast_rms_norm_no_weight(&q, inv_scale * inv_scale, 1e-6),
+                    scaled_fast_rms_norm_no_weight(&k, inv_scale, 1e-6),
+                )
+            };
+            (q, k, v, next_conv_state)
+        };
+
+        if let Some(c) = cache.as_deref_mut()
+            && let Some(next_conv_state) = next_conv_state
+        {
+            c.conv_state = Some(next_conv_state);
         }
 
-        // Apply conv1d with SiLU activation
-        let conv1d_weight = if input_dtype == mlxcel_core::dtype::FLOAT16 {
-            self.conv1d_weight_f16
-                .as_deref()
-                .unwrap_or(&self.conv1d_weight)
-        } else {
-            &self.conv1d_weight
-        };
-        let conv_out = mlxcel_core::conv1d(
-            &conv_input,
-            conv1d_weight,
-            1,
-            0,
-            1,
-            self.conv_dim as i32,
-        );
-        let conv_out = silu(&conv_out);
-
-        // Split conv output into q, k, v
-        // Note: MLX slice with stop=-1 means dim_size-1 (excludes last), not "to end"
-        // Use actual conv_out seq length for correct slicing
-        let conv_out_shape = mlxcel_core::array_shape(&conv_out);
-        let conv_seq = conv_out_shape[1];
-        let q_out = mlxcel_core::slice(&conv_out, &[0, 0, 0], &[b, conv_seq, self.key_dim as i32]);
-        let k_out = mlxcel_core::slice(
-            &conv_out,
-            &[0, 0, self.key_dim as i32],
-            &[b, conv_seq, (2 * self.key_dim) as i32],
-        );
-        let v_out = mlxcel_core::slice(
-            &conv_out,
-            &[0, 0, (2 * self.key_dim) as i32],
-            &[b, conv_seq, self.conv_dim as i32],
-        );
-
-        // Reshape to heads
-        let q = mlxcel_core::reshape(
-            &q_out,
-            &[b, s, self.num_k_heads as i32, self.head_k_dim as i32],
-        );
-        let k = mlxcel_core::reshape(
-            &k_out,
-            &[b, s, self.num_k_heads as i32, self.head_k_dim as i32],
-        );
-        let v = mlxcel_core::reshape(
-            &v_out,
-            &[b, s, self.num_v_heads as i32, self.head_v_dim as i32],
-        );
-
-        // Get recurrent state from cache
-        // Guard: discard cached state if batch dimension doesn't match (continuous batching)
-        let state = cache.as_ref().and_then(|c| {
-            c.state_cache.as_ref().and_then(|s| {
-                let s = s.as_ref().unwrap();
-                let state_shape = mlxcel_core::array_shape(s);
-                if state_shape[0] != b {
-                    None
-                } else {
-                    Some(mlxcel_core::share(s))
-                }
+        // Guard cached recurrent state against a continuous-batching batch
+        // change. The prework kernel does not absorb this recurrence.
+        let state = cache.as_ref().and_then(|cache| {
+            cache.state_cache.as_ref().and_then(|state| {
+                let state = state.as_ref().unwrap();
+                (mlxcel_core::array_shape(state)[0] == b).then(|| mlxcel_core::share(state))
             })
         });
-
-        // The high-M pair kernel accumulates both RMS reductions in FP32 and
-        // stores half results directly. Low-M exact M234 remains FP32.
-        let inv_scale = (self.head_k_dim as f32).powf(-0.5);
-        let (q, k) = if input_dtype == mlxcel_core::dtype::FLOAT16 {
-            let mut q_norm = UniquePtr::null();
-            let mut k_norm = UniquePtr::null();
-            unsafe {
-                mlxcel_core::metal_scaled_rms_norm_pair_f16(
-                    &q,
-                    &k,
-                    inv_scale * inv_scale,
-                    inv_scale,
-                    1e-6,
-                    &mut q_norm,
-                    &mut k_norm,
-                );
-            }
-            (q_norm, k_norm)
-        } else {
-            (
-                scaled_fast_rms_norm_no_weight(&q, inv_scale * inv_scale, 1e-6),
-                scaled_fast_rms_norm_no_weight(&k, inv_scale, 1e-6),
-            )
-        };
 
         if let Some((layer_idx, snapshots)) = snapshot {
             snapshots.push(GdnRollbackSnapshot {
@@ -766,7 +817,8 @@ impl Qwen35GatedDeltaNet {
                 a: mlxcel_core::share(&a),
                 b: mlxcel_core::share(&b_proj),
                 init_state: state.as_ref().map(|value| mlxcel_core::share(value)),
-                conv_input: mlxcel_core::share(&conv_input),
+                initial_conv_state: mlxcel_core::share(&conv_state),
+                qkv: mlxcel_core::share(&qkv),
             });
         }
 
@@ -879,6 +931,8 @@ impl Qwen35GatedDeltaNet {
                 ),
             }
         };
+        let qwen38_prework_supported =
+            weights.is_pinned_qwen38_gguf() && role == ModelRole::Target;
         let conv1d_weight_f16 = if matches!(&ingress, Qwen35GdnIngress::PinnedAffine(_)) {
             let weight = mlxcel_core::astype(&conv1d_weight, mlxcel_core::dtype::FLOAT16);
             mlxcel_core::eval(&weight);
@@ -903,6 +957,7 @@ impl Qwen35GatedDeltaNet {
             conv_dim,
             conv1d_weight,
             conv1d_weight_f16,
+            qwen38_prework_supported,
             ingress,
             dt_bias,
             a_log,
@@ -1813,10 +1868,12 @@ impl Qwen35Model {
                 );
                 cache.state_cache = Some(replayed_state);
 
+                let joined_conv_state =
+                    concatenate(&snapshot.initial_conv_state, &snapshot.qkv, 1);
                 let start = plan.accepted_block_len;
                 let end = start + layer.conv_kernel_size as i32 - 1;
                 let conv_state = mlxcel_core::slice(
-                    &snapshot.conv_input,
+                    &joined_conv_state,
                     &[0, start, 0],
                     &[batch, end, layer.conv_dim as i32],
                 );
@@ -4620,10 +4677,8 @@ mod tests {
                 ("v", state.v.as_ref().expect("v")),
                 ("alpha", state.a.as_ref().expect("alpha")),
                 ("beta", state.b.as_ref().expect("beta")),
-                (
-                    "conv_input",
-                    state.conv_input.as_ref().expect("conv input"),
-                ),
+                ("initial_conv_state", state.initial_conv_state.as_ref().expect("conv state")),
+                ("qkv", state.qkv.as_ref().expect("qkv")),
             ] {
                 assert_eq!(
                     mlxcel_core::array_dtype(value),

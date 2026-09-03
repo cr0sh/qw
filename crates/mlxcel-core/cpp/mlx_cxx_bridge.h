@@ -2421,6 +2421,28 @@ std::unique_ptr<MlxArray> qwen38_gdn_take_z(Qwen38GdnIngressOutputs& outputs);
 std::unique_ptr<MlxArray> qwen38_gdn_take_beta(Qwen38GdnIngressOutputs& outputs);
 std::unique_ptr<MlxArray> qwen38_gdn_take_alpha(Qwen38GdnIngressOutputs& outputs);
 
+// Exact FP32 conv/SiLU/QK-normalization prework for the pinned Qwen3.8 GDN
+// low-row path. The recurrent coefficient/beta update is intentionally not
+// part of this result.
+struct Qwen38GdnPreworkOutputs {
+    std::unique_ptr<MlxArray> q;
+    std::unique_ptr<MlxArray> k;
+    std::unique_ptr<MlxArray> v;
+    std::unique_ptr<MlxArray> conv_tail;
+};
+std::unique_ptr<Qwen38GdnPreworkOutputs> qwen38_gdn_prework(
+    const MlxArray& qkv,
+    const MlxArray& conv_state,
+    const MlxArray& conv_weight,
+    float q_scale,
+    float k_scale,
+    float eps);
+std::unique_ptr<MlxArray> qwen38_gdn_prework_take_q(Qwen38GdnPreworkOutputs& outputs);
+std::unique_ptr<MlxArray> qwen38_gdn_prework_take_k(Qwen38GdnPreworkOutputs& outputs);
+std::unique_ptr<MlxArray> qwen38_gdn_prework_take_v(Qwen38GdnPreworkOutputs& outputs);
+std::unique_ptr<MlxArray> qwen38_gdn_prework_take_conv_tail(
+    Qwen38GdnPreworkOutputs& outputs);
+
 // Opaque holder for weights loaded via MLX's native load_safetensors().
 // Arrays are lazy — MLX manages the mmap internally, no eager copy needed.
 struct MlxLoadedWeights {

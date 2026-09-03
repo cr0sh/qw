@@ -299,9 +299,120 @@ static const char* QWEN38_AFFINE_MIXED_Q5_METAL_SOURCE = R"(
     }
 )";
 
+// The packed prework topology is adapted from:
+// - Yukon, Qwen35.swift:
+//   https://github.com/Layr-Labs/qwen-3.8-mtp-challenge/commit/e3b4531d947cbcab06a2d25929900c022dd9ad1b
+//   MIT; Copyright (c) 2026 Layr Labs Inc.; co-author mega-dmitriy
+//   <225149244+mega-dmitriy@users.noreply.github.com>.
+// - oMLX, qwen35_gdn_prework.py:
+//   https://github.com/jundot/omlx/commit/293d697c2d5a773225891636af75a2b8dd2b8d3f
+//   Apache-2.0; Copyright 2026 Jun Kim (jundot).
+//
+// This fixed-artifact FP32 variant deliberately stops before the recurrent
+// coefficient/beta update. It also keeps the reference chain's materialization
+// boundaries: depthwise conv -> SiLU -> independent Q/K RMSNorm -> scale.
+static const char* QWEN38_GDN_PREWORK_METAL_SOURCE = R"(
+    constexpr uint NKeep = 3;
+    constexpr uint ConvDim = 10240;
+    constexpr uint Hk = 16;
+    constexpr uint Hv = 48;
+    constexpr uint Dk = 128;
+    constexpr uint Dv = 128;
+
+    const uint lane = thread_position_in_threadgroup.x;
+    const uint row = threadgroup_position_in_grid.y;
+    const uint logical_head = threadgroup_position_in_grid.z;
+    const bool is_q = logical_head < Hk;
+    const bool is_k = logical_head >= Hk && logical_head < 2 * Hk;
+    const uint head = is_q
+        ? logical_head
+        : (is_k ? logical_head - Hk : logical_head - 2 * Hk);
+    const uint channel_base = is_q
+        ? head * Dk
+        : (is_k ? Hk * Dk + head * Dk : 2 * Hk * Dk + head * Dv);
+
+    // The cache tail is the last three rows of [old_state | qkv]. The launch
+    // keeps at least three grid rows even for M1, so every tail row is written
+    // without a concatenate/slice/contiguous graph.
+    if (row < NKeep) {
+        const uint input_row = MRows + row;
+        for (uint i = 0; i < 4; ++i) {
+            const uint channel = channel_base + lane * 4 + i;
+            const float value = input_row < NKeep
+                ? conv_state[
+                    ulong(input_row) * ulong(conv_state_strides[1])
+                    + ulong(channel) * ulong(conv_state_strides[2])]
+                : qkv[
+                    ulong(input_row - NKeep) * ulong(qkv_strides[1])
+                    + ulong(channel) * ulong(qkv_strides[2])];
+            conv_tail[(row * ConvDim) + channel] = value;
+        }
+    }
+    if (row >= MRows) {
+        return;
+    }
+
+    float activated[4];
+    float sumsq = 0.0f;
+    for (uint i = 0; i < 4; ++i) {
+        const uint channel = channel_base + lane * 4 + i;
+        float acc = 0.0f;
+        for (uint tap = 0; tap < 4; ++tap) {
+            const uint input_row = row + tap;
+            const float value = input_row < NKeep
+                ? conv_state[
+                    ulong(input_row) * ulong(conv_state_strides[1])
+                    + ulong(channel) * ulong(conv_state_strides[2])]
+                : qkv[
+                    ulong(input_row - NKeep) * ulong(qkv_strides[1])
+                    + ulong(channel) * ulong(qkv_strides[2])];
+            const float weight = conv_weight[
+                ulong(channel) * ulong(conv_weight_strides[0])
+                + ulong(tap) * ulong(conv_weight_strides[1])];
+            acc += value * weight;
+        }
+
+        // These volatile assignments preserve the two FP32 producer
+        // boundaries that were physical buffers in the reference graph.
+        volatile float conv_value = acc;
+        const float sigmoid_base =
+            1.0f / (1.0f + metal::exp(metal::abs(conv_value)));
+        const float sigmoid = conv_value < 0.0f
+            ? sigmoid_base
+            : 1.0f - sigmoid_base;
+        volatile float activated_value = conv_value * sigmoid;
+        activated[i] = activated_value;
+        sumsq += activated[i] * activated[i];
+    }
+
+    if (is_q || is_k) {
+        sumsq = simd_sum(sumsq);
+        const float inv_rms = metal::precise::rsqrt(sumsq / Dk + eps);
+        const float scale = is_q ? q_scale : k_scale;
+        const uint output_base = (row * Hk + head) * Dk + lane * 4;
+        for (uint i = 0; i < 4; ++i) {
+            // fast::rms_norm and the following scalar multiply are separate
+            // reference kernels. Keep their intermediate FP32 rounding here.
+            volatile float normalized = activated[i] * inv_rms;
+            const float value = normalized * scale;
+            if (is_q) {
+                q_out[output_base + i] = value;
+            } else {
+                k_out[output_base + i] = value;
+            }
+        }
+    } else {
+        const uint output_base = (row * Hv + head) * Dv + lane * 4;
+        for (uint i = 0; i < 4; ++i) {
+            v_out[output_base + i] = activated[i];
+        }
+    }
+)";
+
 struct Qwen38KernelHolder {
     std::optional<mlx::core::fast::CustomKernelFunction> affine_m234;
     std::optional<mlx::core::fast::CustomKernelFunction> affine_mixed_q5;
+    std::optional<mlx::core::fast::CustomKernelFunction> gdn_prework;
     std::once_flag initialize_once;
 
     void initialize() {
@@ -319,6 +430,13 @@ struct Qwen38KernelHolder {
                 {"out"},
                 QWEN38_AFFINE_MIXED_Q5_METAL_SOURCE,
                 QWEN38_AFFINE_M234_METAL_HEADER,
+                false);
+            gdn_prework = mlx::core::fast::metal_kernel(
+                "qw_qwen38_gdn_prework_f32_v1",
+                {"qkv", "conv_state", "conv_weight", "q_scale", "k_scale", "eps"},
+                {"q_out", "k_out", "v_out", "conv_tail"},
+                QWEN38_GDN_PREWORK_METAL_SOURCE,
+                "",
                 false);
         });
     }
@@ -340,6 +458,7 @@ bool qwen38_affine_shape(int32_t in_features, int32_t out_features) {
         || (in_features == 5120 && out_features == 12288)
         || (in_features == 10240 && out_features == 5120);
 }
+
 
 void validate_affine_planes(
     const mlx::core::array& weight,
@@ -454,6 +573,98 @@ std::unique_ptr<MlxArray> qwen38_affine_m234_matmul(
     output_shape.push_back(out_features);
     return std::make_unique<MlxArray>(reshape(results[0], output_shape));
 #endif
+}
+
+std::unique_ptr<Qwen38GdnPreworkOutputs> qwen38_gdn_prework(
+    const MlxArray& qkv,
+    const MlxArray& conv_state,
+    const MlxArray& conv_weight,
+    float q_scale,
+    float k_scale,
+    float eps
+) {
+#ifndef __APPLE__
+    throw std::invalid_argument("pinned Qwen3.8 GDN prework requires Metal");
+#else
+    using namespace mlx::core;
+    if (!metal::is_available()) {
+        throw std::invalid_argument("pinned Qwen3.8 GDN prework requires Metal");
+    }
+    if (qkv.inner.dtype() != float32
+            || (conv_state.inner.dtype() != float32
+                && conv_state.inner.dtype() != float16)
+            || conv_weight.inner.dtype() != float32
+            || qkv.inner.ndim() != 3
+            || qkv.inner.shape(0) != 1
+            || (qkv.inner.shape(1) != 1
+                && qkv.inner.shape(1) != 3
+                && qkv.inner.shape(1) != 4)
+            || qkv.inner.shape(2) != 10240
+            || conv_state.inner.shape() != Shape{1, 3, 10240}
+            || conv_weight.inner.shape() != Shape{10240, 4, 1}) {
+        throw std::invalid_argument("pinned Qwen3.8 GDN prework inputs are invalid");
+    }
+
+    const int rows = qkv.inner.shape(1);
+    // A lazy view does not expose trustworthy stride flags until evaluation,
+    // while the custom kernel receives unsigned stride metadata. Contiguous
+    // returns its input unchanged for production row-major arrays and inserts
+    // a safe materialization for arbitrary public-FFI views.
+    const auto qkv_input = contiguous(qkv.inner);
+    const auto conv_state_input = contiguous(conv_state.inner);
+    const auto conv_weight_input = contiguous(conv_weight.inner);
+    const auto q_scale_array = array(q_scale);
+    const auto k_scale_array = array(k_scale);
+    const auto eps_array = array(eps);
+    // q_scale/k_scale/eps are zero-dimensional constant references in MLX's
+    // custom-kernel ABI, so the Metal source uses the bare names consistently.
+    auto results = (*qwen38_kernels().gdn_prework)(
+        {
+            qkv_input,
+            conv_state_input,
+            conv_weight_input,
+            q_scale_array,
+            k_scale_array,
+            eps_array,
+        },
+        {
+            Shape{1, rows, 16, 128},
+            Shape{1, rows, 16, 128},
+            Shape{1, rows, 48, 128},
+            Shape{1, 3, 10240},
+        },
+        {float32, float32, float32, float32},
+        std::make_tuple(32, std::max(rows, 3), 80),
+        std::make_tuple(32, 1, 1),
+        {{"MRows", rows}},
+        std::nullopt,
+        false,
+        {});
+    auto outputs = std::make_unique<Qwen38GdnPreworkOutputs>();
+    outputs->q = std::make_unique<MlxArray>(std::move(results[0]));
+    outputs->k = std::make_unique<MlxArray>(std::move(results[1]));
+    outputs->v = std::make_unique<MlxArray>(std::move(results[2]));
+    outputs->conv_tail = std::make_unique<MlxArray>(std::move(results[3]));
+    return outputs;
+#endif
+}
+
+std::unique_ptr<MlxArray> qwen38_gdn_prework_take_q(Qwen38GdnPreworkOutputs& outputs) {
+    return std::move(outputs.q);
+}
+
+std::unique_ptr<MlxArray> qwen38_gdn_prework_take_k(Qwen38GdnPreworkOutputs& outputs) {
+    return std::move(outputs.k);
+}
+
+std::unique_ptr<MlxArray> qwen38_gdn_prework_take_v(Qwen38GdnPreworkOutputs& outputs) {
+    return std::move(outputs.v);
+}
+
+std::unique_ptr<MlxArray> qwen38_gdn_prework_take_conv_tail(
+    Qwen38GdnPreworkOutputs& outputs
+) {
+    return std::move(outputs.conv_tail);
 }
 
 } // namespace mlx_cxx
