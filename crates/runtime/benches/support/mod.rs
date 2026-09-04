@@ -4,14 +4,14 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-#[cfg(feature = "dflash2")]
-use qw_runtime::Dflash2PrefixReuse;
 use qw_runtime::provider::Qwen35GenerationMode;
 use qw_runtime::{
     ChatMessage, ChatMessageContent, GenerationRequest, KVCacheMode, PortableArray,
     PortableModelState, PortablePage, PortablePagedTensor, PortablePromptSnapshot, PromptSnapshot,
     Qwen35Provider,
 };
+#[cfg(feature = "dflash2")]
+use qw_runtime::{DEFAULT_DFLASH2_DRAFT_MODEL_IDENTIFIER, Dflash2PrefixReuse};
 
 pub const DECODE_MAX_TOKENS: usize = 128;
 pub const MTP_BLOCK_SIZE: usize = 3;
@@ -21,9 +21,7 @@ pub const LONG_CONTEXT_MIN_TOKENS: usize = 10_000;
 pub const LONG_CONTEXT_64K_MIN_TOKENS: usize = 64_000;
 /// Environment variable pointing at the DFlash2 drafter checkpoint
 /// directory (optional; defaults to the model cache path below).
-pub const DRAFT_MODEL_ENV: &str = "QW_BENCH_DRAFT_MODEL";
-/// Default DFlash2 drafter identifier resolved through the model cache.
-pub const DEFAULT_DRAFT_MODEL_IDENTIFIER: &str = "incoai/Qwen3.8-27B-DFlash2";
+pub const DRAFT_MODEL_ENV: &str = "QW_DFLASH_DRAFT_MODEL_PATH";
 pub const PROMPT: &str = concat!(
     "You are the on-call support operations analyst for Acme Commerce. ",
     "Review this incident and return only one compact JSON object with keys ",
@@ -766,6 +764,7 @@ pub fn prompt_token_ids(provider: &Qwen35Provider) -> Vec<i32> {
 /// Resolve the DFlash2 drafter directory: `QW_BENCH_DRAFT_MODEL` when set,
 /// else the model cache path for the default identifier (mirrors the model
 /// resolution `qw generate` / `qw serve` use).
+#[cfg(feature = "dflash2")]
 #[allow(dead_code)]
 pub fn draft_model_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os(DRAFT_MODEL_ENV).filter(|value| !value.is_empty()) {
@@ -774,7 +773,7 @@ pub fn draft_model_dir() -> PathBuf {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .expect("HOME must be set to resolve the default drafter cache path");
-    qw_runtime::model_cache_path(&home, DEFAULT_DRAFT_MODEL_IDENTIFIER)
+    qw_runtime::model_cache_path(&home, DEFAULT_DFLASH2_DRAFT_MODEL_IDENTIFIER)
         .expect("default DFlash2 drafter identifier is valid")
 }
 

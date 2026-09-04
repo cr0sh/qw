@@ -6,7 +6,7 @@ repository = "https://github.com/cr0sh/qw"
 publish = false
 
 [features]
-default = []
+default = ["dflash2"]
 dflash2 = []
 specprefill = []
 

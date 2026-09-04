@@ -6,7 +6,7 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
 use futures_util::StreamExt;
 use qw_prefix_cache::CacheConfig;
-use qw_runtime::{KVCacheMode, resolve_model_path};
+use qw_runtime::{KVCacheMode, Qwen35GenerationMode, resolve_model_path};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 use tower::ServiceExt;
@@ -452,6 +452,11 @@ async fn real_responses_sse_latency_stays_bounded_across_cold_fork_and_continuat
         },
         true,
         3,
+        DecoderConfig {
+            mode: Qwen35GenerationMode::Mtp,
+            crossover_tokens: 6_000,
+            dflash2_draft_model: std::path::PathBuf::new(),
+        },
         KVCacheMode::Turbo4,
         #[cfg(feature = "specprefill")]
         SpecPrefillPolicyConfig::default(),

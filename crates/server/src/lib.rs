@@ -1,6 +1,6 @@
 mod cli;
 
-pub use cli::{ServerArgs, serve};
+pub use cli::{Decoder, ServerArgs, serve};
 
 mod engine;
 mod grammar;
@@ -25,13 +25,13 @@ use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{Instrument, Span, debug, error, info_span, trace, warn};
 
+#[cfg(feature = "specprefill")]
+pub use engine::SpecPrefillPolicyConfig;
 use engine::{
     Admission, CompletionRecord, FailureKind, FinishReason, GeneratedToolCall, WorkerDelta,
     WorkerEvent, WorkerFailure,
 };
-pub use engine::{Engine, SubmitError};
-#[cfg(feature = "specprefill")]
-pub use engine::SpecPrefillPolicyConfig;
+pub use engine::{DecoderConfig, Engine, SubmitError};
 use protocol::{Endpoint, RequestError};
 
 #[derive(Clone)]

@@ -20,6 +20,7 @@ use mlxcel_core::loop_detection::detect_repetition_loop;
 use mlxcel_core::sampling::{
     SamplerState, sample_token_optimized, sample_token_optimized_with_state,
 };
+use mlxcel_core::speculative::stochastic_accept::sampler_is_greedy;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use tokenizers::Tokenizer;
@@ -49,6 +50,10 @@ use crate::specprefill::{
 };
 
 const DEFAULT_MTP_BLOCK_SIZE: usize = 3;
+/// MTP wins the fresh benchmark by 1.413 tok/s while DFlash2 wins at 10k by
+/// 0.950 tok/s. Linear interpolation crosses at 5,980 tokens; use a round,
+/// memorable request-level default.
+pub const DEFAULT_DECODER_CROSSOVER_TOKENS: usize = 6_000;
 
 fn tokens_per_second(tokens: usize, elapsed: Duration) -> f64 {
     let seconds = elapsed.as_secs_f64();
@@ -323,12 +328,53 @@ fn advance_decoded_text(emitted: &mut String, decoded: &str, final_chunk: bool) 
     Ok(delta)
 }
 
-#[doc(hidden)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Qwen35GenerationMode {
     Automatic,
     Baseline,
     Mtp,
+    Dflash2,
+}
+
+/// Resolve one request to an explicit decoder. Explicit modes never consult
+/// context length; `Automatic` selects DFlash2 only for compatible long text
+/// requests and otherwise prefers bundled MTP.
+pub fn select_qwen35_decoder(
+    mode: Qwen35GenerationMode,
+    prompt_tokens: usize,
+    crossover_tokens: usize,
+    mtp_available: bool,
+    dflash2_available: bool,
+    dflash2_compatible: bool,
+) -> std::result::Result<Qwen35GenerationMode, String> {
+    if crossover_tokens == 0 {
+        return Err("decoder crossover tokens must be greater than zero".to_string());
+    }
+    match mode {
+        Qwen35GenerationMode::Automatic => {
+            if dflash2_available && dflash2_compatible && prompt_tokens >= crossover_tokens {
+                Ok(Qwen35GenerationMode::Dflash2)
+            } else if mtp_available {
+                Ok(Qwen35GenerationMode::Mtp)
+            } else if dflash2_available && dflash2_compatible {
+                Ok(Qwen35GenerationMode::Dflash2)
+            } else {
+                Ok(Qwen35GenerationMode::Baseline)
+            }
+        }
+        Qwen35GenerationMode::Baseline => Ok(Qwen35GenerationMode::Baseline),
+        Qwen35GenerationMode::Mtp if mtp_available => Ok(Qwen35GenerationMode::Mtp),
+        Qwen35GenerationMode::Mtp => {
+            Err("the loaded checkpoint does not contain a bundled Qwen 3.5 MTP head".to_string())
+        }
+        Qwen35GenerationMode::Dflash2 if !dflash2_available => {
+            Err("the DFlash2 draft checkpoint is unavailable".to_string())
+        }
+        Qwen35GenerationMode::Dflash2 if !dflash2_compatible => {
+            Err("DFlash2 supports greedy text generation only".to_string())
+        }
+        Qwen35GenerationMode::Dflash2 => Ok(Qwen35GenerationMode::Dflash2),
+    }
 }
 
 pub struct Qwen35Provider {
@@ -1135,8 +1181,64 @@ impl Qwen35Provider {
         sampling: &SamplingConfig,
         draft_dir: &Path,
         prefix_reuse: Option<Dflash2PrefixReuse<'_>>,
-        mut on_delta: F,
+        on_delta: F,
     ) -> Result<(GenerationOutput, Dflash2GenerationStats, usize)> {
+        self.generate_dflash2_cached_generation(
+            prompt_ids,
+            max_tokens,
+            sampling,
+            draft_dir,
+            prefix_reuse,
+            on_delta,
+        )
+        .map(|(output, stats, cached_tokens, _)| (output, stats, cached_tokens))
+    }
+
+    #[cfg(any(feature = "dflash2", test))]
+    pub fn generate_dflash2_baseline_streaming<F: FnMut(&str) -> bool>(
+        &mut self,
+        prompt_ids: &[i32],
+        max_tokens: usize,
+        sampling: &SamplingConfig,
+        draft_dir: &Path,
+        on_delta: F,
+    ) -> Result<BaselineGeneration> {
+        let (output, stats, cached_tokens, finish_outcome) = self
+            .generate_dflash2_cached_generation(
+                prompt_ids, max_tokens, sampling, draft_dir, None, on_delta,
+            )?;
+        let completion_tokens = output.token_ids.len();
+        Ok(BaselineGeneration {
+            text: output.text,
+            token_ids: output.token_ids,
+            prompt_tokens: prompt_ids.len(),
+            completion_tokens,
+            cached_tokens,
+            finish_outcome,
+            prompt_snapshots: Vec::new(),
+            final_snapshot: None,
+            prefill_time: stats.prefill_time,
+            decode_time: stats.decode_time,
+            #[cfg(any(feature = "specprefill", test))]
+            specprefill_stats: None,
+        })
+    }
+
+    #[cfg(any(feature = "dflash2", test))]
+    fn generate_dflash2_cached_generation<F: FnMut(&str) -> bool>(
+        &mut self,
+        prompt_ids: &[i32],
+        max_tokens: usize,
+        sampling: &SamplingConfig,
+        draft_dir: &Path,
+        prefix_reuse: Option<Dflash2PrefixReuse<'_>>,
+        mut on_delta: F,
+    ) -> Result<(
+        GenerationOutput,
+        Dflash2GenerationStats,
+        usize,
+        GenerationStopReason,
+    )> {
         if self.dflash2_generator.is_none() {
             self.dflash2_generator = Some(
                 crate::qwen3_5_dflash::Qwen35Dflash2Generator::new(&self.model, draft_dir)
@@ -1148,6 +1250,7 @@ impl Qwen35Provider {
             .as_mut()
             .expect("DFlash2 generator was initialized");
         let mut decoder = IncrementalTextDecoder::new(&self.tokenizer);
+        let mut callback_active = true;
         let mut decode_error = None;
         let generation = generator
             .generate_streaming(
@@ -1157,7 +1260,10 @@ impl Qwen35Provider {
                 sampling,
                 prefix_reuse,
                 |token_id| match decoder.push(token_id) {
-                    Ok(delta) => on_delta(&delta),
+                    Ok(delta) => {
+                        callback_active = on_delta(&delta);
+                        callback_active
+                    }
                     Err(error) => {
                         decode_error = Some(error);
                         false
@@ -1169,8 +1275,13 @@ impl Qwen35Provider {
         if let Some(error) = decode_error {
             return Err(error);
         }
+        let final_delta = decoder.finish()?;
+        if callback_active && !final_delta.is_empty() {
+            let _ = on_delta(&final_delta);
+        }
         let completion_tokens = generation.token_ids.len();
         let stats = generation.stats;
+        let stop_reason = generation.stop_reason;
         log_generation_metrics(
             "dflash2",
             prompt_ids.len(),
@@ -1186,6 +1297,7 @@ impl Qwen35Provider {
             },
             stats,
             generation.cached_tokens,
+            stop_reason,
         ))
     }
 
@@ -1340,6 +1452,10 @@ impl Qwen35Provider {
             mtp_full_state_materializations = generated.stats.full_state_materializations,
             mtp_cache_snapshot_count = generated.stats.cache_snapshot_count,
             mtp_cache_clear_seconds = generated.stats.cache_clear_time.as_secs_f64(),
+            mtp_draft_materializations = generated.stats.draft_materializations,
+            mtp_adaptive_stop_rounds = generated.stats.adaptive_stop_rounds,
+            mtp_adaptive_skipped_draft_tokens =
+                generated.stats.adaptive_skipped_draft_tokens,
         );
         Ok((
             BaselineGeneration {
@@ -1371,6 +1487,88 @@ impl Qwen35Provider {
     ) -> Result<GenerationOutput> {
         self.generate_streaming_in_mode(request, Qwen35GenerationMode::Automatic, on_delta)
             .map(|(output, _)| output)
+    }
+
+    pub fn generate_streaming_with_decoder<F: FnMut(&str) -> bool>(
+        &mut self,
+        request: &GenerationRequest,
+        mode: Qwen35GenerationMode,
+        crossover_tokens: usize,
+        dflash2_draft_dir: Option<&Path>,
+        on_delta: F,
+    ) -> Result<GenerationOutput> {
+        let (prompt_ids, sampling) = self.prepare_generation(request)?;
+        let dflash2_available =
+            cfg!(feature = "dflash2") && dflash2_draft_dir.is_some_and(Path::is_dir);
+        let decoder = select_qwen35_decoder(
+            mode,
+            prompt_ids.len(),
+            crossover_tokens,
+            self.mtp_generator.is_some(),
+            dflash2_available,
+            sampler_is_greedy(&sampling),
+        )
+        .map_err(anyhow::Error::msg)?;
+        debug!(
+            phase = "decoder.selected",
+            decoder = ?decoder,
+            configured_decoder = ?mode,
+            prompt_tokens = prompt_ids.len(),
+            crossover_tokens,
+            dflash2_available,
+        );
+        let generation = match decoder {
+            Qwen35GenerationMode::Baseline => self.generate_baseline_streaming(
+                &prompt_ids,
+                request.max_tokens,
+                &sampling,
+                None,
+                None,
+                &[],
+                #[cfg(any(feature = "specprefill", test))]
+                PrefillMode::Dense,
+                on_delta,
+            )?,
+            Qwen35GenerationMode::Mtp => {
+                self.generate_mtp_streaming_for_prompt(
+                    MtpPrompt::Text {
+                        prompt_ids: &prompt_ids,
+                    },
+                    request.max_tokens,
+                    &sampling,
+                    DEFAULT_MTP_BLOCK_SIZE,
+                    None,
+                    &[],
+                    None,
+                    on_delta,
+                    false,
+                )?
+                .0
+            }
+            Qwen35GenerationMode::Dflash2 => {
+                #[cfg(any(feature = "dflash2", test))]
+                {
+                    self.generate_dflash2_baseline_streaming(
+                        &prompt_ids,
+                        request.max_tokens,
+                        &sampling,
+                        dflash2_draft_dir.expect("selected DFlash2 has an available checkpoint"),
+                        on_delta,
+                    )?
+                }
+                #[cfg(not(any(feature = "dflash2", test)))]
+                {
+                    unreachable!("DFlash2 cannot be selected without its build feature")
+                }
+            }
+            Qwen35GenerationMode::Automatic => {
+                unreachable!("automatic decoder selection always returns an explicit decoder")
+            }
+        };
+        Ok(GenerationOutput {
+            text: generation.text,
+            token_ids: generation.token_ids,
+        })
     }
 
     #[tracing::instrument(
@@ -1431,9 +1629,8 @@ impl Qwen35Provider {
             Some(stats),
         ))
     }
-
-    /// Controlled decode benchmark route. Production callers continue through
-    /// [`Self::generate_streaming`], which selects bundled MTP when present.
+    /// Controlled decode benchmark route. Production CLI/server callers use
+    /// [`Self::generate_streaming_with_decoder`] and the request-level router.
     #[doc(hidden)]
     pub fn benchmark_streaming_in_mode<F: FnMut(&str) -> bool>(
         &mut self,
@@ -1545,6 +1742,9 @@ impl Qwen35Provider {
             (Qwen35GenerationMode::Automatic, _) => {
                 anyhow::bail!("cached benchmark mode must be explicit")
             }
+            (Qwen35GenerationMode::Dflash2, _) => {
+                anyhow::bail!("cached DFlash2 benchmarks use the dedicated DFlash2 entrypoint")
+            }
             (Qwen35GenerationMode::Mtp, PromptSnapshot::Baseline(_)) => {
                 anyhow::bail!("cached benchmark mode does not match the snapshot family")
             }
@@ -1565,6 +1765,9 @@ impl Qwen35Provider {
                     "the loaded checkpoint does not contain a bundled Qwen 3.5 MTP head"
                 );
                 Ok(true)
+            }
+            Qwen35GenerationMode::Dflash2 => {
+                anyhow::bail!("DFlash2 generation requires a draft checkpoint path")
             }
         }
     }
@@ -1638,10 +1841,8 @@ fn configure_metal_wired_limit_with(
         );
     }
 
-    let wired_limit_bytes = mlxcel_core::memory::recommended_wired_limit(
-        system_memory_bytes,
-        metal_recommended_bytes,
-    );
+    let wired_limit_bytes =
+        mlxcel_core::memory::recommended_wired_limit(system_memory_bytes, metal_recommended_bytes);
     if wired_limit_bytes == 0 {
         return Err("wired-memory policy computed a zero-byte limit".to_string());
     }
@@ -1766,6 +1967,130 @@ mod tests {
     }
 
     #[test]
+    fn automatic_decoder_uses_the_measured_context_crossover() {
+        let select = |tokens| {
+            select_qwen35_decoder(
+                Qwen35GenerationMode::Automatic,
+                tokens,
+                DEFAULT_DECODER_CROSSOVER_TOKENS,
+                true,
+                true,
+                true,
+            )
+            .expect("automatic decoder")
+        };
+        assert_eq!(
+            select(DEFAULT_DECODER_CROSSOVER_TOKENS - 1),
+            Qwen35GenerationMode::Mtp
+        );
+        assert_eq!(
+            select(DEFAULT_DECODER_CROSSOVER_TOKENS),
+            Qwen35GenerationMode::Dflash2
+        );
+    }
+
+    #[test]
+    fn explicit_decoder_selection_ignores_context_and_fails_closed() {
+        for tokens in [1, DEFAULT_DECODER_CROSSOVER_TOKENS, 64_000] {
+            assert_eq!(
+                select_qwen35_decoder(
+                    Qwen35GenerationMode::Mtp,
+                    tokens,
+                    DEFAULT_DECODER_CROSSOVER_TOKENS,
+                    true,
+                    true,
+                    true,
+                ),
+                Ok(Qwen35GenerationMode::Mtp)
+            );
+            assert_eq!(
+                select_qwen35_decoder(
+                    Qwen35GenerationMode::Dflash2,
+                    tokens,
+                    DEFAULT_DECODER_CROSSOVER_TOKENS,
+                    true,
+                    true,
+                    true,
+                ),
+                Ok(Qwen35GenerationMode::Dflash2)
+            );
+        }
+        assert!(
+            select_qwen35_decoder(
+                Qwen35GenerationMode::Mtp,
+                1,
+                DEFAULT_DECODER_CROSSOVER_TOKENS,
+                false,
+                true,
+                true,
+            )
+            .is_err()
+        );
+        assert!(
+            select_qwen35_decoder(
+                Qwen35GenerationMode::Dflash2,
+                64_000,
+                DEFAULT_DECODER_CROSSOVER_TOKENS,
+                true,
+                false,
+                true,
+            )
+            .is_err()
+        );
+        assert!(
+            select_qwen35_decoder(
+                Qwen35GenerationMode::Dflash2,
+                64_000,
+                DEFAULT_DECODER_CROSSOVER_TOKENS,
+                true,
+                true,
+                false,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn automatic_decoder_falls_back_without_changing_exactness_constraints() {
+        assert_eq!(
+            select_qwen35_decoder(
+                Qwen35GenerationMode::Automatic,
+                64_000,
+                DEFAULT_DECODER_CROSSOVER_TOKENS,
+                true,
+                false,
+                true,
+            ),
+            Ok(Qwen35GenerationMode::Mtp)
+        );
+        assert_eq!(
+            select_qwen35_decoder(
+                Qwen35GenerationMode::Automatic,
+                64_000,
+                DEFAULT_DECODER_CROSSOVER_TOKENS,
+                true,
+                true,
+                false,
+            ),
+            Ok(Qwen35GenerationMode::Mtp)
+        );
+        assert_eq!(
+            select_qwen35_decoder(
+                Qwen35GenerationMode::Automatic,
+                64_000,
+                DEFAULT_DECODER_CROSSOVER_TOKENS,
+                false,
+                false,
+                true,
+            ),
+            Ok(Qwen35GenerationMode::Baseline)
+        );
+        assert!(
+            select_qwen35_decoder(Qwen35GenerationMode::Automatic, 1, 0, true, true, true).is_err()
+        );
+    }
+
+    #[test]
     fn wired_limit_initialization_applies_computed_policy() {
         use std::cell::Cell;
 
@@ -1828,9 +2153,11 @@ mod tests {
             "{error}"
         );
 
-        let error = configure_metal_wired_limit_with(|| Some(1024), || 1024, |_| {
-            Err("backend rejected limit".to_string())
-        })
+        let error = configure_metal_wired_limit_with(
+            || Some(1024),
+            || 1024,
+            |_| Err("backend rejected limit".to_string()),
+        )
         .expect_err("setter failure must abort initialization");
         assert!(error.contains("failed to configure"), "{error}");
         assert!(error.contains("backend rejected limit"), "{error}");
@@ -1978,8 +2305,8 @@ mod tests {
     #[ignore = "requires real target and SpecPrefill draft checkpoints at their configured or default cache paths"]
     fn real_model_dense_specprefill_dense_has_no_position_state_leakage() {
         let model_dir = crate::resolve_model_path(None).expect("resolve target checkpoint");
-        let draft_dir =
-            crate::resolve_specprefill_draft_path(None).expect("resolve SpecPrefill draft checkpoint");
+        let draft_dir = crate::resolve_specprefill_draft_path(None)
+            .expect("resolve SpecPrefill draft checkpoint");
         let mut provider =
             Qwen35Provider::load_with_specprefill_draft(model_dir, draft_dir, KVCacheMode::Fp16)
                 .expect("load target and SpecPrefill draft");

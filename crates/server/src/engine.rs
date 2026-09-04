@@ -7,15 +7,19 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};
 use mlxcel_core::generate::{GenerationStopReason, PrefixReuse};
+use mlxcel_core::speculative::stochastic_accept::sampler_is_greedy;
 use qw_prefix_cache::{
     AdaptivePrefixCache, CacheConfig, CacheNamespaces, ResponseResumeMetadata, ResumeLookupError,
     SnapshotRoute as CacheSnapshotRoute, namespace_hash,
 };
 #[cfg(test)]
 use qw_runtime::ChatContentRef;
-use qw_runtime::{KVCacheMode, MtpPrefixReuse, PromptSnapshot, Qwen35Provider};
 #[cfg(any(feature = "specprefill", test))]
 use qw_runtime::ChatMessage;
+use qw_runtime::{
+    KVCacheMode, MtpPrefixReuse, PromptSnapshot, Qwen35GenerationMode, Qwen35Provider,
+    select_qwen35_decoder,
+};
 #[cfg(feature = "specprefill")]
 use qw_runtime::{PrefillMode, SpecPrefillConfig};
 use serde_json::Value;
@@ -169,7 +173,10 @@ struct CurrentTurnPolicy {
 
 #[cfg(feature = "specprefill")]
 fn messages_before_model_input_turn(messages: &[ChatMessage]) -> Option<&[ChatMessage]> {
-    let boundary = if messages.last().is_some_and(|message| message.role == "tool") {
+    let boundary = if messages
+        .last()
+        .is_some_and(|message| message.role == "tool")
+    {
         messages
             .iter()
             .rposition(|message| message.role != "tool")
@@ -217,29 +224,62 @@ fn current_turn_policy(
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct DecoderConfig {
+    pub mode: Qwen35GenerationMode,
+    pub crossover_tokens: usize,
+    pub dflash2_draft_model: PathBuf,
+}
+
+impl DecoderConfig {
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.crossover_tokens > 0,
+            "--decoder-crossover-tokens must be greater than zero"
+        );
+        if self.mode == Qwen35GenerationMode::Dflash2 {
+            ensure!(
+                self.dflash2_draft_model.is_dir(),
+                "DFlash2 draft checkpoint is unavailable at {}",
+                self.dflash2_draft_model.display()
+            );
+        }
+        Ok(())
+    }
+
+    fn dflash2_available(&self) -> bool {
+        cfg!(feature = "dflash2") && self.dflash2_draft_model.is_dir()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QwenGenerationRoute {
     BaselineText,
     BaselineMultimodal,
     MtpText,
     MtpMultimodal,
+    #[cfg(feature = "dflash2")]
+    Dflash2Text,
 }
 
-fn qwen_generation_route(
-    has_mtp: bool,
-    has_images: bool,
-    #[cfg(feature = "specprefill")]
-    use_specprefill: bool,
-) -> QwenGenerationRoute {
-    #[cfg(feature = "specprefill")]
-    if use_specprefill && !has_images {
-        return QwenGenerationRoute::BaselineText;
-    }
-    match (has_mtp, has_images) {
-        (true, false) => QwenGenerationRoute::MtpText,
-        (true, true) => QwenGenerationRoute::MtpMultimodal,
-        (false, false) => QwenGenerationRoute::BaselineText,
-        (false, true) => QwenGenerationRoute::BaselineMultimodal,
+fn qwen_generation_route(decoder: Qwen35GenerationMode, has_images: bool) -> QwenGenerationRoute {
+    match (decoder, has_images) {
+        (Qwen35GenerationMode::Baseline, false) => QwenGenerationRoute::BaselineText,
+        (Qwen35GenerationMode::Baseline, true) => QwenGenerationRoute::BaselineMultimodal,
+        (Qwen35GenerationMode::Mtp, false) => QwenGenerationRoute::MtpText,
+        (Qwen35GenerationMode::Mtp, true) => QwenGenerationRoute::MtpMultimodal,
+        #[cfg(feature = "dflash2")]
+        (Qwen35GenerationMode::Dflash2, false) => QwenGenerationRoute::Dflash2Text,
+        (Qwen35GenerationMode::Automatic, _) => {
+            unreachable!("request decoder must be resolved before route construction")
+        }
+        (Qwen35GenerationMode::Dflash2, true) => {
+            unreachable!("DFlash2 compatibility rejects multimodal requests")
+        }
+        #[cfg(not(feature = "dflash2"))]
+        (Qwen35GenerationMode::Dflash2, false) => {
+            unreachable!("DFlash2 is unavailable without its build feature")
+        }
     }
 }
 
@@ -248,15 +288,15 @@ fn cache_snapshot_route(route: QwenGenerationRoute) -> Option<CacheSnapshotRoute
         QwenGenerationRoute::BaselineText => Some(CacheSnapshotRoute::Baseline),
         QwenGenerationRoute::MtpText => Some(CacheSnapshotRoute::Mtp),
         QwenGenerationRoute::BaselineMultimodal | QwenGenerationRoute::MtpMultimodal => None,
+        #[cfg(feature = "dflash2")]
+        QwenGenerationRoute::Dflash2Text => None,
     }
 }
 
 fn cache_lookup_route(
     route: QwenGenerationRoute,
-    #[cfg(feature = "specprefill")]
-    mtp_available: bool,
-    #[cfg(feature = "specprefill")]
-    specprefill_active: bool,
+    #[cfg(feature = "specprefill")] mtp_available: bool,
+    #[cfg(feature = "specprefill")] specprefill_active: bool,
 ) -> Option<CacheSnapshotRoute> {
     #[cfg(feature = "specprefill")]
     if route == QwenGenerationRoute::BaselineText && mtp_available && specprefill_active {
@@ -681,12 +721,13 @@ impl Engine {
         cache_config: CacheConfig,
         prefix_cache_enabled: bool,
         mtp_k: usize,
+        decoder: DecoderConfig,
         kv_cache_mode: KVCacheMode,
-        #[cfg(feature = "specprefill")]
-        specprefill_policy: SpecPrefillPolicyConfig,
+        #[cfg(feature = "specprefill")] specprefill_policy: SpecPrefillPolicyConfig,
     ) -> Result<Self> {
         cache_config.validate().map_err(anyhow::Error::msg)?;
         validate_mtp_k(mtp_k)?;
+        decoder.validate()?;
         #[cfg(feature = "specprefill")]
         specprefill_policy.validate()?;
         let (jobs_tx, jobs_rx) = mpsc::channel(JOB_QUEUE_CAPACITY);
@@ -699,6 +740,7 @@ impl Engine {
                     cache_config,
                     prefix_cache_enabled,
                     mtp_k,
+                    decoder,
                     kv_cache_mode,
                     #[cfg(feature = "specprefill")]
                     specprefill_policy,
@@ -1122,6 +1164,7 @@ struct QwenWorker {
     prefix_cache: AdaptivePrefixCache,
     prefix_cache_enabled: bool,
     mtp_k: usize,
+    decoder: DecoderConfig,
 }
 
 enum WorkerNextAction<T> {
@@ -1168,10 +1211,7 @@ fn collect_job_batch_with_wait<T>(
     batch
 }
 
-fn enqueue_cache_maintenance(
-    maintenance: &mut VecDeque<CacheMaintenance>,
-    work: CacheMaintenance,
-) {
+fn enqueue_cache_maintenance(maintenance: &mut VecDeque<CacheMaintenance>, work: CacheMaintenance) {
     if maintenance.len() == CACHE_MAINTENANCE_CAPACITY {
         warn!(
             event = "cache.maintenance_dropped",
@@ -1190,14 +1230,24 @@ impl QwenWorker {
         cache_config: CacheConfig,
         prefix_cache_enabled: bool,
         mtp_k: usize,
+        decoder: DecoderConfig,
         kv_cache_mode: KVCacheMode,
-        #[cfg(feature = "specprefill")]
-        specprefill_policy: SpecPrefillPolicyConfig,
+        #[cfg(feature = "specprefill")] specprefill_policy: SpecPrefillPolicyConfig,
     ) -> Result<Self> {
         validate_mtp_k(mtp_k)?;
+        decoder.validate()?;
         #[cfg(feature = "specprefill")]
         specprefill_policy.validate()?;
         let provider = Qwen35Provider::load(model_path, kv_cache_mode)?;
+        select_qwen35_decoder(
+            decoder.mode,
+            0,
+            decoder.crossover_tokens,
+            provider.has_mtp(),
+            decoder.dflash2_available(),
+            true,
+        )
+        .map_err(anyhow::Error::msg)?;
         ensure!(
             provider.supports_qwen35_tool_calls(),
             "unsupported Qwen3.5 chat template: expected <tool_call>, <function=, and <parameter= literals"
@@ -1259,6 +1309,7 @@ impl QwenWorker {
             prefix_cache,
             prefix_cache_enabled,
             mtp_k,
+            decoder,
         })
     }
     fn run(&mut self, mut jobs: mpsc::Receiver<Job>) {
@@ -1444,6 +1495,29 @@ impl QwenWorker {
                 }
             }
         };
+        let sampling = self.provider.baseline_sampling(
+            job.request.temperature,
+            job.request.top_p,
+            job.request.seed,
+        );
+        let mtp_available =
+            self.provider.has_mtp() && std::env::var_os("QW_BENCH_DISABLE_MTP").is_none();
+        let dflash2_compatible =
+            !has_images && constraint.is_none() && sampler_is_greedy(&sampling);
+        let routed_decoder = match select_qwen35_decoder(
+            self.decoder.mode,
+            prompt_ids.len(),
+            self.decoder.crossover_tokens,
+            mtp_available,
+            self.decoder.dflash2_available(),
+            dflash2_compatible,
+        ) {
+            Ok(decoder) => decoder,
+            Err(error) => {
+                send_failure(&job, FailureKind::InvalidRequest, error, None);
+                return;
+            }
+        };
         #[cfg(feature = "specprefill")]
         let preceding_ids = if has_images {
             None
@@ -1469,14 +1543,17 @@ impl QwenWorker {
             preceding_ids.as_deref(),
             !has_images
                 && constraint.is_none()
-                && job.request.resume_response_id.is_none(),
+                && job.request.resume_response_id.is_none()
+                && matches!(
+                    self.decoder.mode,
+                    Qwen35GenerationMode::Automatic | Qwen35GenerationMode::Baseline
+                )
+                && routed_decoder != Qwen35GenerationMode::Dflash2,
             self.specprefill_policy,
         );
         #[cfg(feature = "specprefill")]
-        let specprefill_active = matches!(
-            specprefill_policy.prefill_mode,
-            PrefillMode::SpecPrefill(_)
-        );
+        let specprefill_active =
+            matches!(specprefill_policy.prefill_mode, PrefillMode::SpecPrefill(_));
         #[cfg(feature = "specprefill")]
         debug!(
             phase = "specprefill.policy",
@@ -1485,8 +1562,18 @@ impl QwenWorker {
             prefill_mode = ?specprefill_policy.prefill_mode,
             specprefill_active,
         );
+        #[cfg(feature = "specprefill")]
+        let force_baseline_for_specprefill = specprefill_active;
+        #[cfg(not(feature = "specprefill"))]
+        let force_baseline_for_specprefill = false;
+        let decoder = if force_baseline_for_specprefill {
+            Qwen35GenerationMode::Baseline
+        } else {
+            routed_decoder
+        };
+        let route = qwen_generation_route(decoder, has_images);
         let mut checkpoint_token_lengths = Vec::new();
-        if self.prefix_cache_enabled && !has_images {
+        if self.prefix_cache_enabled && !has_images && cache_snapshot_route(route).is_some() {
             match self.provider.tokenize_history(
                 &job.request.messages,
                 effective_tools,
@@ -1519,17 +1606,6 @@ impl QwenWorker {
             tool_count = effective_tools.len(),
         );
 
-        let sampling = self.provider.baseline_sampling(
-            job.request.temperature,
-            job.request.top_p,
-            job.request.seed,
-        );
-        let mtp_available =
-            self.provider.has_mtp() && std::env::var_os("QW_BENCH_DISABLE_MTP").is_none();
-        #[cfg(feature = "specprefill")]
-        let route = qwen_generation_route(mtp_available, has_images, specprefill_active);
-        #[cfg(not(feature = "specprefill"))]
-        let route = qwen_generation_route(mtp_available, has_images);
         let cache_behavior = cache_behavior(
             route,
             self.prefix_cache_enabled,
@@ -1634,8 +1710,7 @@ impl QwenWorker {
             );
         }
         let hit = if resume_entry.is_none() {
-            lookup_cache_route
-                .and_then(|route| cache.lookup(&generation_prompt_ids, route))
+            lookup_cache_route.and_then(|route| cache.lookup(&generation_prompt_ids, route))
         } else {
             None
         };
@@ -1731,6 +1806,7 @@ impl QwenWorker {
             top_p = ?job.request.top_p,
             seed = ?job.request.seed,
             route = ?route,
+            decoder = ?decoder,
         );
         trace!(
             event = "cache.decision",
@@ -1752,6 +1828,15 @@ impl QwenWorker {
                 || mtp_prefix_reuse.as_ref().map_or(0, |reuse| reuse.cached_tokens),
                 |reuse| reuse.cached_tokens,
             ),
+        );
+        debug!(
+            phase = "decoder.selected",
+            decoder = ?decoder,
+            configured_decoder = ?self.decoder.mode,
+            prompt_tokens = prompt_ids.len(),
+            crossover_tokens = self.decoder.crossover_tokens,
+            dflash2_available = self.decoder.dflash2_available(),
+            dflash2_compatible,
         );
         let mut output = StreamOutputTracker::new(enable_thinking, tool_enabled);
         if let Some(resume) = &resume_entry {
@@ -1822,6 +1907,14 @@ impl QwenWorker {
                 constraint
                     .as_mut()
                     .map(|value| value as &mut dyn mlxcel_core::generate::TokenConstraint),
+                &mut emit_delta,
+            ),
+            #[cfg(feature = "dflash2")]
+            QwenGenerationRoute::Dflash2Text => provider.generate_dflash2_baseline_streaming(
+                &generation_prompt_ids,
+                max_tokens,
+                &sampling,
+                &self.decoder.dflash2_draft_model,
                 &mut emit_delta,
             ),
             QwenGenerationRoute::BaselineText => provider.generate_baseline_streaming(
@@ -2114,8 +2207,6 @@ fn publish_completion(events: &mpsc::Sender<WorkerEvent>, record: CompletionReco
     }
 }
 
-
-
 fn send_failure(job: &Job, kind: FailureKind, message: String, param: Option<String>) {
     error!(
         phase = "generation.failed",
@@ -2161,13 +2252,7 @@ mod tests {
 
     #[test]
     fn generation_metrics_account_for_cache_totals_and_zero_durations() {
-        let metrics = generation_metrics(
-            100,
-            40,
-            25,
-            Duration::from_secs(3),
-            Duration::ZERO,
-        );
+        let metrics = generation_metrics(100, 40, 25, Duration::from_secs(3), Duration::ZERO);
 
         assert_eq!(
             metrics,
@@ -2180,14 +2265,8 @@ mod tests {
             }
         );
         assert_eq!(
-            generation_metrics(
-                usize::MAX,
-                1,
-                usize::MAX,
-                Duration::ZERO,
-                Duration::ZERO,
-            )
-            .total_tokens,
+            generation_metrics(usize::MAX, 1, usize::MAX, Duration::ZERO, Duration::ZERO,)
+                .total_tokens,
             usize::MAX,
         );
     }
@@ -2451,8 +2530,7 @@ mod tests {
         for current_turn_tokens in [512, 513, 580, 1_948] {
             let mut prompt_ids = preceding_ids.clone();
             prompt_ids.resize(preceding_ids.len() + current_turn_tokens, 20);
-            let policy =
-                current_turn_policy(&prompt_ids, Some(&preceding_ids), true, config);
+            let policy = current_turn_policy(&prompt_ids, Some(&preceding_ids), true, config);
             assert_eq!(policy.current_turn_tokens, Some(current_turn_tokens));
             if current_turn_tokens == 512 {
                 assert_eq!(policy.prefill_mode, PrefillMode::Dense);
@@ -2511,33 +2589,60 @@ mod tests {
     }
 
     #[test]
-    fn dense_routing_matrix_is_unchanged() {
-        for has_mtp in [false, true] {
-            for has_images in [false, true] {
-                let route = qwen_generation_route(
-                    has_mtp,
-                    has_images,
-                    #[cfg(feature = "specprefill")]
-                    false,
-                );
-                let expected = match (has_mtp, has_images) {
-                    (true, false) => QwenGenerationRoute::MtpText,
-                    (true, true) => QwenGenerationRoute::MtpMultimodal,
-                    (false, false) => QwenGenerationRoute::BaselineText,
-                    (false, true) => QwenGenerationRoute::BaselineMultimodal,
-                };
-                assert_eq!(route, expected, "has_mtp={has_mtp} has_images={has_images}");
-            }
+    fn decoder_config_fails_closed_only_for_explicit_unavailable_dflash() {
+        let unavailable =
+            std::env::temp_dir().join(format!("qw-missing-dflash-{}", std::process::id()));
+        let automatic = DecoderConfig {
+            mode: Qwen35GenerationMode::Automatic,
+            crossover_tokens: 6_000,
+            dflash2_draft_model: unavailable.clone(),
+        };
+        automatic
+            .validate()
+            .expect("automatic mode may fall back when DFlash is absent");
+        let explicit = DecoderConfig {
+            mode: Qwen35GenerationMode::Dflash2,
+            ..automatic
+        };
+        assert!(explicit.validate().is_err());
+        let zero_crossover = DecoderConfig {
+            mode: Qwen35GenerationMode::Baseline,
+            crossover_tokens: 0,
+            dflash2_draft_model: unavailable,
+        };
+        assert!(zero_crossover.validate().is_err());
+    }
+
+    #[test]
+    fn explicit_decoder_routes_preserve_text_and_multimodal_semantics() {
+        for (decoder, has_images, expected) in [
+            (
+                Qwen35GenerationMode::Baseline,
+                false,
+                QwenGenerationRoute::BaselineText,
+            ),
+            (
+                Qwen35GenerationMode::Baseline,
+                true,
+                QwenGenerationRoute::BaselineMultimodal,
+            ),
+            (
+                Qwen35GenerationMode::Mtp,
+                false,
+                QwenGenerationRoute::MtpText,
+            ),
+            (
+                Qwen35GenerationMode::Mtp,
+                true,
+                QwenGenerationRoute::MtpMultimodal,
+            ),
+        ] {
+            assert_eq!(qwen_generation_route(decoder, has_images), expected);
         }
-        #[cfg(feature = "specprefill")]
+        #[cfg(feature = "dflash2")]
         assert_eq!(
-            qwen_generation_route(true, false, true),
-            QwenGenerationRoute::BaselineText
-        );
-        #[cfg(feature = "specprefill")]
-        assert_eq!(
-            qwen_generation_route(true, true, true),
-            QwenGenerationRoute::MtpMultimodal
+            qwen_generation_route(Qwen35GenerationMode::Dflash2, false),
+            QwenGenerationRoute::Dflash2Text
         );
     }
 
@@ -2548,6 +2653,8 @@ mod tests {
             QwenGenerationRoute::BaselineMultimodal,
             QwenGenerationRoute::MtpText,
             QwenGenerationRoute::MtpMultimodal,
+            #[cfg(feature = "dflash2")]
+            QwenGenerationRoute::Dflash2Text,
         ] {
             let behavior = cache_behavior(
                 route,
@@ -2560,8 +2667,11 @@ mod tests {
             let expected_route = match route {
                 QwenGenerationRoute::BaselineText => Some(CacheSnapshotRoute::Baseline),
                 QwenGenerationRoute::MtpText => Some(CacheSnapshotRoute::Mtp),
-                QwenGenerationRoute::BaselineMultimodal
-                | QwenGenerationRoute::MtpMultimodal => None,
+                QwenGenerationRoute::BaselineMultimodal | QwenGenerationRoute::MtpMultimodal => {
+                    None
+                }
+                #[cfg(feature = "dflash2")]
+                QwenGenerationRoute::Dflash2Text => None,
             };
             assert_eq!(behavior.snapshot_route, expected_route);
             assert_eq!(behavior.lookup_route, expected_route);
@@ -2583,6 +2693,8 @@ mod tests {
             QwenGenerationRoute::BaselineMultimodal,
             QwenGenerationRoute::MtpText,
             QwenGenerationRoute::MtpMultimodal,
+            #[cfg(feature = "dflash2")]
+            QwenGenerationRoute::Dflash2Text,
         ] {
             let behavior = cache_behavior(
                 route,
@@ -2604,13 +2716,10 @@ mod tests {
     #[cfg(feature = "specprefill")]
     #[test]
     fn specprefill_over_mtp_looks_up_the_mtp_target_snapshot() {
-        let sparse_route = qwen_generation_route(true, false, true);
+        let sparse_route = qwen_generation_route(Qwen35GenerationMode::Baseline, false);
         assert_eq!(sparse_route, QwenGenerationRoute::BaselineText);
         let sparse_behavior = cache_behavior(sparse_route, true, true, true);
-        assert_eq!(
-            sparse_behavior.lookup_route,
-            Some(CacheSnapshotRoute::Mtp)
-        );
+        assert_eq!(sparse_behavior.lookup_route, Some(CacheSnapshotRoute::Mtp));
         assert_eq!(
             sparse_behavior.snapshot_route,
             Some(CacheSnapshotRoute::Baseline)
@@ -2626,13 +2735,7 @@ mod tests {
             Some(CacheSnapshotRoute::Baseline)
         );
         assert_eq!(
-            cache_behavior(
-                QwenGenerationRoute::BaselineMultimodal,
-                true,
-                true,
-                true
-            )
-            .lookup_route,
+            cache_behavior(QwenGenerationRoute::BaselineMultimodal, true, true, true).lookup_route,
             None
         );
     }

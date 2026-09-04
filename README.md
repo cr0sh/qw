@@ -20,8 +20,8 @@ QW aims to be explicitly "focused", to achieve these goals below:
   metrics to optimize.
 - Minimal: No fancy features, fixed model, fixed environment.
   - No fancy features: GUI, MCP integration, etc. are outside this project's
-    scope. 4-bit TurboQuant cache quantization and MTP with depth `$k=3$` are
-    enabled by default.
+    scope. 4-bit TurboQuant cache quantization and request-level MTP/DFlash2
+    decoder routing are enabled by default.
   - Fixed model: Qwen3.8 27B (dense model) only. No generalization across
     different model structures.
     - QW serves [Jundot/Qwen3.8-27B-oQ4e-fp16-mtp](https://huggingface.co/Jundot/Qwen3.8-27B-oQ4e-fp16-mtp) as the default model.
@@ -49,18 +49,30 @@ Or, compile from the source. Prerequisites:
 cargo install --locked --git https://github.com/cr0sh/qw [--tag TAG] qw-cli
 ```
 
-Download the model from Hugging Face(model ID unset means the default preferred model `Jundot/Qwen3.8-27B-oQ4e-fp16-mtp`):
+Download the target model and the DFlash2 draft checkpoint from Hugging Face
+(the first model ID defaults to `Jundot/Qwen3.8-27B-oQ4e-fp16-mtp`):
 
 ```bash
 qw download
+qw download incoai/Qwen3.8-27B-DFlash2
 ```
 
-
+If the draft checkpoint is absent, automatic routing safely stays on bundled
+MTP.
 Run the server:
 
 ```bash
 qw serve
 ```
+
+`--decoder auto` is the default for both `qw generate` and `qw serve`. It uses
+bundled MTP below 6,000 prompt tokens and DFlash2 at or above 6,000 tokens.
+DFlash2 currently supports greedy, unconstrained text generation; automatic
+routing keeps MTP for sampling, structured output, and image requests.
+`--decoder baseline|mtp|dflash` makes an explicit selection and ignores the
+crossover. Override the boundary with `--decoder-crossover-tokens`, and override
+the draft checkpoint with `--dflash-draft-model` or
+`QW_DFLASH_DRAFT_MODEL_PATH`.
 
 Obtain statistics about storage usage and status:
 
@@ -99,21 +111,32 @@ a Mac Studio with an Apple M4 Max chip, 64 GB of memory, and a 40-core GPU.
 
 All values are tokens/s; `10k`/`64k` are prefilled prompt lengths in tokens.
 
+The automatic decoder boundary comes from the local greedy decode measurements
+below. Linear interpolation between the fresh and 10k deltas crosses at 5,980
+prompt tokens; the stable configured boundary is rounded to 6,000.
+
+   | decoder | fresh | 10k | 64k |
+   |---|------:|-----:|-----:|
+   | **MTP** | 56.697 | 52.037 | 36.279 |
+   | **DFlash2** | 55.284 | 52.987 | 37.814 |
+
+All decoder values are tokens/s.
+
 QW stores prefix caches under `~/.cache/qw/checkpoint`. Disk usage is capped at
 16 GB by default; the hard ceiling is twice the configured limit.
 
-An attempt to achieve better TPS/TTFT numbers for hardcore use produced
-unsatisfying results, so these options are feature-gated and disabled by
-default. See `crates/runtime/Cargo.toml`.
+The default build includes the DFlash2 router. Other experimental inference
+features remain feature-gated; see `crates/runtime/Cargo.toml`.
 
 ## Project Policy
 
 Any configuration other than the default is considered experimental and out
 of scope for testing by the maintainer. The default is:
 
-- Model checkpoint (`Jundot/Qwen3.8-27B-oQ4e-fp16-mtp` on HuggingFace) and its
-  quantization method
-- MTP with depth $k=3$
+- Target checkpoint (`Jundot/Qwen3.8-27B-oQ4e-fp16-mtp` on Hugging Face), its
+  quantization method, and the DFlash2 draft checkpoint
+  (`incoai/Qwen3.8-27B-DFlash2`)
+- Automatic bundled-MTP/DFlash2 routing at a 6,000-token prompt boundary
 - KV cache is 4-bit quantized with TurboQuant
 - The above configuration is tested on an M4 Max 40-core GPU with 64 GB of
   unified memory

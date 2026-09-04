@@ -8,11 +8,13 @@ use std::thread;
 
 use clap::Parser as _;
 use clap_derive::{Args, Parser, Subcommand};
+#[cfg(feature = "dflash2")]
+use qw_runtime::resolve_dflash2_draft_path;
 use qw_runtime::{
-    DEFAULT_MODEL_IDENTIFIER, GenerationRequest, KVCacheMode, Qwen35Provider, model_cache_path,
-    resolve_model_path, validate_identifier,
+    DEFAULT_DECODER_CROSSOVER_TOKENS, DEFAULT_MODEL_IDENTIFIER, GenerationRequest, KVCacheMode,
+    Qwen35Provider, model_cache_path, resolve_model_path, validate_identifier,
 };
-use qw_server::serve;
+use qw_server::{Decoder, serve};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -48,6 +50,18 @@ struct GenerateArgs {
     /// Checkpoint directory or HF identifier; defaults to the qw model cache unless QW_MODEL_PATH is set.
     #[arg(long)]
     model: Option<PathBuf>,
+
+    /// Decoder policy. Explicit values ignore the context crossover.
+    #[arg(long, value_enum, default_value = "auto")]
+    decoder: Decoder,
+
+    /// Prompt-token boundary where automatic routing changes from MTP to DFlash.
+    #[arg(long, default_value_t = DEFAULT_DECODER_CROSSOVER_TOKENS)]
+    decoder_crossover_tokens: usize,
+
+    /// DFlash2 draft checkpoint directory; defaults to QW_DFLASH_DRAFT_MODEL_PATH or the model cache.
+    #[arg(long)]
+    dflash_draft_model: Option<PathBuf>,
 
     /// User prompt text.
     #[arg(long)]
@@ -143,6 +157,10 @@ fn stats_report() -> Result<String, Box<dyn std::error::Error>> {
         |path| path.display().to_string(),
     );
     let model_exists = model_path.try_exists()?;
+    #[cfg(feature = "dflash2")]
+    let dflash2_path = resolve_dflash2_draft_path(None)?;
+    #[cfg(feature = "dflash2")]
+    let dflash2_exists = dflash2_path.try_exists()?;
 
     let mut report = String::new();
     writeln!(report, "Cache root: {}", cache_root.display())?;
@@ -168,6 +186,15 @@ fn stats_report() -> Result<String, Box<dyn std::error::Error>> {
         "Model exists locally: {}",
         if model_exists { "yes" } else { "no" }
     )?;
+    #[cfg(feature = "dflash2")]
+    {
+        writeln!(report, "DFlash2 path: {}", dflash2_path.display())?;
+        writeln!(
+            report,
+            "DFlash2 exists locally: {}",
+            if dflash2_exists { "yes" } else { "no" }
+        )?;
+    }
     Ok(report)
 }
 
@@ -385,26 +412,62 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             print!("{}", stats_report()?);
         }
         Command::Generate(args) => {
+            if args.decoder_crossover_tokens == 0 {
+                return Err(
+                    invalid_input("--decoder-crossover-tokens must be greater than zero").into(),
+                );
+            }
+            #[cfg(not(feature = "dflash2"))]
+            if args.decoder == Decoder::Dflash2 {
+                return Err(
+                    invalid_input("--decoder dflash requires the dflash2 build feature").into(),
+                );
+            }
+            #[cfg(feature = "dflash2")]
+            let dflash_draft_model = Some(resolve_dflash2_draft_path(
+                args.dflash_draft_model.as_deref(),
+            )?);
+            #[cfg(feature = "dflash2")]
+            if args.decoder == Decoder::Dflash2
+                && !dflash_draft_model.as_deref().is_some_and(Path::is_dir)
+            {
+                return Err(invalid_input(format!(
+                    "DFlash2 draft checkpoint is unavailable at {}",
+                    dflash_draft_model
+                        .as_deref()
+                        .expect("DFlash2 path is resolved")
+                        .display()
+                ))
+                .into());
+            }
+            #[cfg(not(feature = "dflash2"))]
+            let dflash_draft_model: Option<PathBuf> = None;
             let model = qw_runtime::resolve_model_path(args.model.as_deref())?;
             eprintln!("Loading model from {}", model.display());
             let mut provider = Qwen35Provider::load(&model, KVCacheMode::Fp16)?;
             let stdout = std::io::stdout();
             let mut stdout = stdout.lock();
             let mut io_error = None;
-            let generation = provider.generate_streaming(&args.request(), |delta| {
-                if delta.is_empty() {
-                    return true;
-                }
-                if let Err(error) = stdout
-                    .write_all(delta.as_bytes())
-                    .and_then(|()| stdout.flush())
-                {
-                    io_error = Some(error);
-                    false
-                } else {
-                    true
-                }
-            });
+            let generation = provider.generate_streaming_with_decoder(
+                &args.request(),
+                args.decoder.generation_mode(),
+                args.decoder_crossover_tokens,
+                dflash_draft_model.as_deref(),
+                |delta| {
+                    if delta.is_empty() {
+                        return true;
+                    }
+                    if let Err(error) = stdout
+                        .write_all(delta.as_bytes())
+                        .and_then(|()| stdout.flush())
+                    {
+                        io_error = Some(error);
+                        false
+                    } else {
+                        true
+                    }
+                },
+            );
             if let Some(error) = io_error {
                 return Err(Box::new(error));
             }
@@ -521,6 +584,44 @@ mod tests {
         let cli = Cli::try_parse_from(["qw", "generate", "--prompt", "hello"])
             .expect("model is optional");
         assert!(matches!(cli.command, Command::Generate(args) if args.model.is_none()));
+    }
+
+    #[test]
+    fn generate_decoder_defaults_and_explicit_values_are_stable() {
+        let cli = Cli::try_parse_from(["qw", "generate", "--prompt", "hello"])
+            .expect("parse default decoder");
+        let Command::Generate(args) = cli.command else {
+            panic!("expected generate command");
+        };
+        assert_eq!(args.decoder, Decoder::Automatic);
+        assert_eq!(
+            args.decoder_crossover_tokens,
+            DEFAULT_DECODER_CROSSOVER_TOKENS
+        );
+        assert_eq!(args.dflash_draft_model, None);
+
+        let cli = Cli::try_parse_from([
+            "qw",
+            "generate",
+            "--prompt",
+            "hello",
+            "--decoder",
+            "dflash",
+            "--decoder-crossover-tokens",
+            "8192",
+            "--dflash-draft-model",
+            "/tmp/dflash",
+        ])
+        .expect("parse explicit DFlash decoder");
+        let Command::Generate(args) = cli.command else {
+            panic!("expected generate command");
+        };
+        assert_eq!(args.decoder, Decoder::Dflash2);
+        assert_eq!(args.decoder_crossover_tokens, 8192);
+        assert_eq!(
+            args.dflash_draft_model.as_deref(),
+            Some(Path::new("/tmp/dflash"))
+        );
     }
 
     #[test]
