@@ -19,7 +19,7 @@
 namespace mlxcel::turbo {
 
 // Exact two-pass symmetric-Turbo4 attention for causal MTP verify rows
-// (2 <= Tq <= 4) over a long packed target. Q is already in the rotated K
+// (1 <= Tq <= 5) over a long packed target. Q is already in the rotated K
 // basis; the FP32 result remains in the rotated V basis.
 mlx::core::array turbo4_attention(
     const mlx::core::array& q_rot,       // [B, Hq, Tq, D] f32

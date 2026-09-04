@@ -357,8 +357,8 @@ void validate_inputs(
     if (batch <= 0 || hq <= 0 || hkv <= 0 || tk <= MIN_MTP_VERIFY_TOKENS) {
         throw std::invalid_argument("turbo4_attention requires a non-empty long target cache");
     }
-    if (!causal || tq < 2 || tq > 5 || tk < tq) {
-        throw std::invalid_argument("turbo4_attention only supports causal MTP verify rows 2..=5");
+    if (!causal || tq < 1 || tq > 5 || tk < tq) {
+        throw std::invalid_argument("turbo4_attention only supports causal rows 1..=5");
     }
     if (hq % hkv != 0 || hq / hkv > 32) {
         throw std::invalid_argument("turbo4_attention has unsupported GQA repeat geometry");
