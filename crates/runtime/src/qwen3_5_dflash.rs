@@ -670,6 +670,10 @@ impl Dflash2SlidingCacheSnapshot {
     }
 }
 
+// Steady-state decode already projects only `accepted + 1` newly committed
+// target rows and retains their FC-to-K/V result in the live caches. This one
+// bounded memo covers the remaining expensive case: rebuilding a restored
+// prompt snapshot at the start of every repeated cached generation.
 struct Dflash2ProjectedPrefix {
     snapshot_id: u64,
     committed_suffix: Vec<i32>,
@@ -2458,6 +2462,46 @@ mod tests {
         assert!(top_k_candidate_logits(&logits, 4, false).is_err());
         assert!(top_k_candidate_logits(&logits, 5, false).is_err());
         assert!(top_k_candidate_logits(&logits, 1, false).is_ok());
+    }
+
+    #[test]
+    fn projected_sliding_cache_restore_preserves_eviction_order() {
+        let initial_values = (0..31).map(|value| value as f32).collect::<Vec<_>>();
+        let initial_keys =
+            mlxcel_core::from_slice_f32(&initial_values, &[1, 1, initial_values.len() as i32, 1]);
+        let initial_vals =
+            mlxcel_core::from_slice_f32(&initial_values, &[1, 1, initial_values.len() as i32, 1]);
+        let mut original = DFlash2KVCache::Sliding(RotatingKVCache::new(32));
+        let DFlash2KVCache::Sliding(cache) = &mut original else {
+            unreachable!()
+        };
+        cache.offset = 69;
+        original.update_and_fetch(initial_keys, initial_vals);
+
+        let snapshots = Dflash2SlidingCacheSnapshot::capture(std::slice::from_ref(&original))
+            .expect("snapshot");
+        Dflash2SlidingCacheSnapshot::materialize_and_detach_all(&snapshots);
+        let mut restored =
+            Dflash2SlidingCacheSnapshot::restore_all(&snapshots).expect("restore snapshot");
+
+        let appended = [31.0_f32, 32.0, 33.0];
+        let original_out = original.update_and_fetch(
+            mlxcel_core::from_slice_f32(&appended, &[1, 1, 3, 1]),
+            mlxcel_core::from_slice_f32(&appended, &[1, 1, 3, 1]),
+        );
+        let restored_out = restored[0].update_and_fetch(
+            mlxcel_core::from_slice_f32(&appended, &[1, 1, 3, 1]),
+            mlxcel_core::from_slice_f32(&appended, &[1, 1, 3, 1]),
+        );
+
+        assert_eq!(raw_f32(&original_out.0), raw_f32(&restored_out.0));
+        assert_eq!(raw_f32(&original_out.1), raw_f32(&restored_out.1));
+        let (DFlash2KVCache::Sliding(original), DFlash2KVCache::Sliding(restored)) =
+            (&original, &restored[0])
+        else {
+            unreachable!()
+        };
+        assert_eq!(original.snapshot_state(), restored.snapshot_state());
     }
 
     #[test]
