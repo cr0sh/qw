@@ -2244,6 +2244,26 @@ fn capture_mtp_snapshot_from_verify(
         .ok_or_else(|| "failed to capture aligned MTP snapshot".to_string())
 }
 
+// A requested prompt-boundary checkpoint is already the strongest reusable
+// state for terminal reconstruction. Prefer it over the incoming prefix so an
+// EOS-only final round cannot replay the uncached prompt after its last delta.
+fn final_snapshot_reuse<'a>(
+    prompt_tokens: usize,
+    prefix_reuse: Option<MtpPrefixReuse<'a>>,
+    prompt_snapshots: &'a [MtpPromptSnapshot],
+) -> Option<MtpPrefixReuse<'a>> {
+    prompt_snapshots
+        .iter()
+        .rev()
+        .find(|snapshot| snapshot.token_len() == prompt_tokens)
+        .map(|snapshot| MtpPrefixReuse {
+            snapshot,
+            cached_tokens: prompt_tokens,
+            continuation_token: None,
+        })
+        .or(prefix_reuse)
+}
+
 fn capture_mtp_final_snapshot(
     model: &Qwen35Model,
     drafter: &Qwen35MtpDraftModel,
@@ -2743,7 +2763,11 @@ impl Qwen35MtpGenerator {
                     drafter,
                     prompt_tokens,
                     prefill_input,
-                    final_prefix_reuse,
+                    final_snapshot_reuse(
+                        prompt_tokens.len(),
+                        final_prefix_reuse,
+                        &prompt_snapshots,
+                    ),
                     &generated,
                 )
             },
@@ -2864,7 +2888,11 @@ impl Qwen35MtpGenerator {
                             drafter,
                             prompt_tokens,
                             prefill_input,
-                            final_prefix_reuse,
+                            final_snapshot_reuse(
+                                prompt_tokens.len(),
+                                final_prefix_reuse,
+                                &prompt_snapshots,
+                            ),
                             &generated,
                         )
                     },
@@ -2891,7 +2919,11 @@ impl Qwen35MtpGenerator {
                             drafter,
                             prompt_tokens,
                             prefill_input,
-                            final_prefix_reuse,
+                            final_snapshot_reuse(
+                                prompt_tokens.len(),
+                                final_prefix_reuse,
+                                &prompt_snapshots,
+                            ),
                             &generated,
                         )
                     },
@@ -3113,7 +3145,11 @@ impl Qwen35MtpGenerator {
                     drafter,
                     prompt_tokens,
                     prefill_input,
-                    final_prefix_reuse,
+                    final_snapshot_reuse(
+                        prompt_tokens.len(),
+                        final_prefix_reuse,
+                        &prompt_snapshots,
+                    ),
                     &generated,
                 )
             },
@@ -3136,6 +3172,43 @@ mod tests {
     use crate::qwen_mrope_state::MRopeState;
     use crate::qwen3_5::rollback_plan;
     use crate::qwen3_next::Qwen3NextCache;
+    fn selection_snapshot(token_len: usize) -> MtpPromptSnapshot {
+        let hidden = mlxcel_core::from_slice_f32(&[0.0], &[1, 1, 1]);
+        let logits = mlxcel_core::from_slice_f32(&[0.0], &[1, 1, 1]);
+        MtpPromptSnapshot {
+            target: ModelStateSnapshot::new("final-snapshot-selection-test", token_len),
+            draft: ModelStateSnapshot::new(
+                "final-snapshot-selection-draft-test",
+                token_len.saturating_sub(1),
+            ),
+            draft_offset: i32::try_from(token_len.saturating_sub(1)).unwrap(),
+            last_hidden: materialize_detached(hidden),
+            continuation_logits: materialize_detached(logits),
+        }
+    }
+
+    #[test]
+    fn terminal_snapshot_rebuild_prefers_the_exact_prompt_checkpoint() {
+        let original = selection_snapshot(128);
+        let checkpoints = [selection_snapshot(512), selection_snapshot(1_024)];
+        let original_reuse = MtpPrefixReuse {
+            snapshot: &original,
+            cached_tokens: original.token_len(),
+            continuation_token: Some(7),
+        };
+
+        let exact =
+            final_snapshot_reuse(1_024, Some(original_reuse), &checkpoints).expect("exact reuse");
+        assert_eq!(exact.cached_tokens, 1_024);
+        assert!(std::ptr::eq(exact.snapshot, &checkpoints[1]));
+        assert_eq!(exact.continuation_token, None);
+
+        let fallback = final_snapshot_reuse(2_048, Some(original_reuse), &checkpoints)
+            .expect("fallback reuse");
+        assert_eq!(fallback.cached_tokens, 128);
+        assert!(std::ptr::eq(fallback.snapshot, &original));
+        assert_eq!(fallback.continuation_token, Some(7));
+    }
 
     #[test]
     fn mtp_prompt_snapshot_arrays_remain_owned_after_sources_drop() {
