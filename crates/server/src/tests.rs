@@ -354,7 +354,8 @@ struct ResponsesSseMeasurement {
     completed_response: Value,
     assistant_text: String,
     ttft: Duration,
-    terminal_tail: Duration,
+    last_delta_to_completed: Duration,
+    completed_to_eof: Duration,
 }
 
 async fn read_responses_sse(app: Router, body: Value) -> Result<ResponsesSseMeasurement, String> {
@@ -377,7 +378,7 @@ async fn read_responses_sse(app: Router, body: Value) -> Result<ResponsesSseMeas
     let mut assistant_text = String::new();
     let mut first_delta_at = None;
     let mut last_delta_at = None;
-    let mut completed_response = None;
+    let mut completed = None;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| format!("SSE body stream: {error}"))?;
         buffer.extend_from_slice(&chunk);
@@ -409,12 +410,13 @@ async fn read_responses_sse(app: Router, body: Value) -> Result<ResponsesSseMeas
                     assistant_text.push_str(delta);
                 }
                 "response.completed" => {
-                    completed_response = Some(
+                    completed = Some((
+                        Instant::now(),
                         value
                             .get("response")
                             .cloned()
                             .ok_or_else(|| "response.completed lacks response".to_string())?,
-                    );
+                    ));
                 }
                 _ => {}
             }
@@ -428,19 +430,20 @@ async fn read_responses_sse(app: Router, body: Value) -> Result<ResponsesSseMeas
         "Responses SSE ended without a response.output_text.delta event".to_string()
     })?;
     let last_delta_at = last_delta_at.expect("first and last delta timestamps are paired");
-    let completed_response = completed_response
-        .ok_or_else(|| "Responses SSE ended without response.completed".to_string())?;
+    let (completed_at, completed_response) =
+        completed.ok_or_else(|| "Responses SSE ended without response.completed".to_string())?;
     Ok(ResponsesSseMeasurement {
         completed_response,
         assistant_text,
         ttft: first_delta_at.duration_since(started),
-        terminal_tail: eof.duration_since(last_delta_at),
+        last_delta_to_completed: completed_at.duration_since(last_delta_at),
+        completed_to_eof: eof.duration_since(completed_at),
     })
 }
 
 #[tokio::test]
 #[ignore = "requires the resolver's default bundled-MTP checkpoint"]
-async fn real_responses_sse_latency_stays_bounded_across_cold_fork_and_continuation() {
+async fn real_responses_sse_measures_multiturn_and_structural_prefix_latency() {
     let model_dir = resolve_model_path(None)
         .expect("resolver's default bundled-MTP checkpoint must be available");
     let engine = Engine::start_qwen(
@@ -463,19 +466,21 @@ async fn real_responses_sse_latency_stays_bounded_across_cold_fork_and_continuat
     )
     .expect("start real Qwen engine");
     let app = router(engine);
-    let shared_prefix = || {
+    let system = json!({
+        "role": "system",
+        "content": "You are a deterministic benchmark assistant. Follow the user's visible-answer instruction exactly."
+    });
+    let intra_turn_prefix =
+        "This stable context is shared inside one user turn before its divergent suffix. "
+            .repeat(128);
+    let one_turn = |suffix: &str, answer: &str| {
         vec![
-            json!({
-                "role": "system",
-                "content": "You are a deterministic benchmark assistant. Follow the user's visible-answer instruction exactly."
-            }),
+            system.clone(),
             json!({
                 "role": "user",
-                "content": "A deterministic cache benchmark paragraph. ".repeat(128)
-            }),
-            json!({
-                "role": "assistant",
-                "content": "The shared benchmark prefix is acknowledged."
+                "content": format!(
+                    "{intra_turn_prefix}\nVariant suffix: {suffix}. Output exactly {answer} and then stop."
+                )
             }),
         ]
     };
@@ -489,78 +494,103 @@ async fn real_responses_sse_latency_stays_bounded_across_cold_fork_and_continuat
             "max_output_tokens": 128
         })
     };
-    let mut cold_input = shared_prefix();
-    cold_input.push(json!({
-        "role": "user",
-        "content": "Output exactly the single plain word COLD and then stop. Do not explain, reason, or output any other text."
-    }));
-    let cold = tokio::time::timeout(
-        Duration::from_secs(30),
-        read_responses_sse(app.clone(), request(cold_input)),
-    )
-    .await
-    .expect("cold Responses SSE exceeded the 30-second hang guard")
-    .expect("cold Responses SSE");
-    let mut fork_input = shared_prefix();
+    let measure = |input: Vec<Value>| {
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            read_responses_sse(app.clone(), request(input)),
+        )
+    };
 
-    fork_input.push(json!({
-        "role": "user",
-        "content": "Output exactly the single plain word FORK and then stop. Do not explain, reason, or output any other text."
-    }));
-    let fork = tokio::time::timeout(
-        Duration::from_secs(30),
-        read_responses_sse(app.clone(), request(fork_input)),
-    )
-    .await
-    .expect("fork Responses SSE exceeded the 30-second hang guard")
-    .expect("fork Responses SSE");
+    let seed_input = one_turn("seed", "SEED");
+    let seed = measure(seed_input.clone())
+        .await
+        .expect("seed Responses SSE exceeded the 30-second hang guard")
+        .expect("seed Responses SSE");
+    tokio::time::sleep(Duration::from_millis(20)).await;
 
-    let mut continuation_input = shared_prefix();
-    continuation_input.push(json!({
+    let mut turn_boundary_input = seed_input;
+    turn_boundary_input.push(json!({
         "role": "assistant",
-        "content": cold.assistant_text.clone()
+        "content": seed.assistant_text.clone()
     }));
-    continuation_input.push(json!({
+    turn_boundary_input.push(json!({
         "role": "user",
-        "content": "Output exactly the single plain word CONTINUATION and then stop. Do not explain, reason, or output any other text."
+        "content": "This is the next conversational turn. Output exactly BOUNDARY and then stop."
     }));
-    let continuation = tokio::time::timeout(
-        Duration::from_secs(30),
-        read_responses_sse(app, request(continuation_input)),
-    )
-    .await
-    .expect("continuation Responses SSE exceeded the 30-second hang guard")
-    .expect("continuation Responses SSE");
+    let turn_boundary = measure(turn_boundary_input)
+        .await
+        .expect("turn-boundary Responses SSE exceeded the 30-second hang guard")
+        .expect("turn-boundary Responses SSE");
+    tokio::time::sleep(Duration::from_millis(20)).await;
 
+    let discovery_input = one_turn("structural discovery", "DISCOVERY");
+    let discovery = measure(discovery_input.clone())
+        .await
+        .expect("structural-discovery Responses SSE exceeded the 30-second hang guard")
+        .expect("structural-discovery Responses SSE");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let probe_input = one_turn("structural probe", "PROBE");
+    assert_ne!(
+        discovery_input, probe_input,
+        "intra-turn reuse must not be identical-prompt reuse"
+    );
+    let probe = measure(probe_input)
+        .await
+        .expect("structural-probe Responses SSE exceeded the 30-second hang guard")
+        .expect("structural-probe Responses SSE");
+
+    let usage = |measurement: &ResponsesSseMeasurement, field: &str| {
+        measurement.completed_response["usage"][field]
+            .as_u64()
+            .unwrap_or_else(|| panic!("Responses completion usage lacks {field}"))
+    };
     let cached_tokens = |measurement: &ResponsesSseMeasurement| {
         measurement.completed_response["usage"]["input_tokens_details"]["cached_tokens"]
             .as_u64()
             .expect("Responses completion cached token count")
     };
-    let cold_cached = cached_tokens(&cold);
-    let fork_cached = cached_tokens(&fork);
-    let continuation_cached = cached_tokens(&continuation);
+    let seed_cached = cached_tokens(&seed);
+    let turn_boundary_cached = cached_tokens(&turn_boundary);
+    let discovery_cached = cached_tokens(&discovery);
+    let probe_cached = cached_tokens(&probe);
     let diagnostics = format!(
-        "cold(ttft={:?}, tail={:?}, cached={cold_cached}), \
-         fork(ttft={:?}, tail={:?}, cached={fork_cached}), \
-         continuation(ttft={:?}, tail={:?}, cached={continuation_cached})",
-        cold.ttft,
-        cold.terminal_tail,
-        fork.ttft,
-        fork.terminal_tail,
-        continuation.ttft,
-        continuation.terminal_tail,
+        "seed(ttft={:?}, delta_to_completed={:?}, completed_to_eof={:?}, cached={seed_cached}), \
+         boundary(ttft={:?}, delta_to_completed={:?}, completed_to_eof={:?}, cached={turn_boundary_cached}), \
+         discovery(ttft={:?}, delta_to_completed={:?}, completed_to_eof={:?}, cached={discovery_cached}), \
+         probe(ttft={:?}, delta_to_completed={:?}, completed_to_eof={:?}, cached={probe_cached})",
+        seed.ttft,
+        seed.last_delta_to_completed,
+        seed.completed_to_eof,
+        turn_boundary.ttft,
+        turn_boundary.last_delta_to_completed,
+        turn_boundary.completed_to_eof,
+        discovery.ttft,
+        discovery.last_delta_to_completed,
+        discovery.completed_to_eof,
+        probe.ttft,
+        probe.last_delta_to_completed,
+        probe.completed_to_eof,
     );
-    assert!(cold.terminal_tail < Duration::from_secs(1), "{diagnostics}");
-    assert!(fork.terminal_tail < Duration::from_secs(1), "{diagnostics}");
+    for measurement in [&seed, &turn_boundary, &discovery, &probe] {
+        assert!(
+            measurement.last_delta_to_completed + measurement.completed_to_eof
+                < Duration::from_secs(1),
+            "{diagnostics}"
+        );
+    }
+    assert_eq!(seed_cached, 0, "{diagnostics}");
+    assert!(turn_boundary_cached > 0, "{diagnostics}");
     assert!(
-        continuation.terminal_tail < Duration::from_secs(1),
+        turn_boundary_cached < usage(&turn_boundary, "input_tokens"),
         "{diagnostics}"
     );
-    assert!(fork_cached > 0, "{diagnostics}");
-    assert!(continuation_cached > 0, "{diagnostics}");
-    assert!(fork.ttft < cold.ttft, "{diagnostics}");
-    assert!(continuation.ttft < cold.ttft, "{diagnostics}");
+    assert!(probe_cached > discovery_cached, "{diagnostics}");
+    assert!(probe_cached > 0, "{diagnostics}");
+    assert!(
+        probe_cached < usage(&probe, "input_tokens"),
+        "{diagnostics}"
+    );
 }
 
 fn responses_replay_call(item: &Value) -> Value {
