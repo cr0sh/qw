@@ -412,6 +412,14 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             print!("{}", stats_report()?);
         }
         Command::Generate(args) => {
+            let tracing_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| {
+                    tracing_subscriber::EnvFilter::new("qw_runtime::provider=debug")
+                });
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(tracing_filter)
+                .with_ansi(false)
+                .try_init();
             if args.decoder_crossover_tokens == 0 {
                 return Err(
                     invalid_input("--decoder-crossover-tokens must be greater than zero").into(),

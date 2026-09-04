@@ -1739,6 +1739,7 @@ dependencies = [
  "qw-server",
  "serde_json",
  "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]

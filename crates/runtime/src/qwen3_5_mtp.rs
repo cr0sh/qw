@@ -446,19 +446,21 @@ impl Qwen35MtpDraftModel {
         committed_history: &[i32],
         eos_tokens: &[i32],
     ) -> GreedyDraft {
-        if target.has_compact_draft_head() && mtp_greedy_graph_eligible(sampling) {
+        let supports_token_bias = target.mtp_draft_graph_supports_token_bias(&sampling.token_bias);
+        if mtp_greedy_graph_eligible(sampling, supports_token_bias) {
             return self.draft_block_greedy_graph(
                 target,
                 last_bonus,
                 target_hidden,
                 proposal_count,
+                sampling,
                 eos_tokens,
             );
         }
 
         // History-dependent penalties need each sampled token on the host
         // before the next distribution can be formed. Keep that uncommon path
-        // exact; the default compact greedy path below is fully device-resident
+        // exact; the default plain-greedy path below is fully device-resident
         // within each graph chunk.
         let mut state = self.state.borrow_mut();
         state.round_appended = 0;
@@ -500,6 +502,7 @@ impl Qwen35MtpDraftModel {
         last_bonus: i32,
         target_hidden: &MlxArray,
         proposal_count: usize,
+        sampling: &SamplingConfig,
         eos_tokens: &[i32],
     ) -> GreedyDraft {
         let mut state = self.state.borrow_mut();
@@ -511,15 +514,22 @@ impl Qwen35MtpDraftModel {
         let mut survival = 1.0_f32;
         let mut hidden = self.draft_seed_hidden(target, last_bonus, target_hidden, &mut state);
         let mut logits = target.project_draft_logits(&hidden);
+        let compact = target.has_compact_draft_head();
 
         'drafting: while result.tokens.len() < proposal_count {
             let chunk_len = MTP_DRAFT_GRAPH_CHUNK_SIZE.min(proposal_count - result.tokens.len());
             let mut device_tokens = Vec::with_capacity(chunk_len);
             let mut device_confidences = Vec::with_capacity(chunk_len);
             for index in 0..chunk_len {
-                let compact_token = mlxcel_core::argmax_last_axis(&logits);
-                let token = Qwen35Model::map_draft_tokens(&compact_token);
-                let probabilities = mlxcel_core::softmax_precise(&logits, -1);
+                let sampled_logits =
+                    mlxcel_core::sampling::apply_token_bias(&logits, &sampling.token_bias);
+                let sampled = mlxcel_core::argmax_last_axis(&sampled_logits);
+                let token = if compact {
+                    Qwen35Model::map_draft_tokens(&sampled)
+                } else {
+                    sampled
+                };
+                let probabilities = mlxcel_core::softmax_precise(&sampled_logits, -1);
                 let confidence = mlxcel_core::astype(
                     &mlxcel_core::max_axis(&probabilities, -1, false),
                     mlxcel_core::dtype::FLOAT32,
@@ -950,9 +960,9 @@ fn evaluated_f32_values(array: &MlxArray) -> Vec<f32> {
         .collect()
 }
 
-fn mtp_greedy_graph_eligible(sampling: &SamplingConfig) -> bool {
+fn mtp_greedy_graph_eligible(sampling: &SamplingConfig, supports_token_bias: bool) -> bool {
     sampler_is_greedy(sampling)
-        && sampling.token_bias.is_empty()
+        && (sampling.token_bias.is_empty() || supports_token_bias)
         && sampling.repetition_penalty == 1.0
         && sampling.dry_multiplier == 0.0
         && sampling.frequency_penalty == 0.0
@@ -2559,7 +2569,8 @@ impl Qwen35MtpGenerator {
                     &verify_tokens,
                     &[1, i32::try_from(verify_tokens.len()).unwrap_or(i32::MAX)],
                 );
-                let compact_verify = mtp_greedy_graph_eligible(&sampling) && remaining > block_size;
+                let compact_verify =
+                    mtp_greedy_graph_eligible(&sampling, false) && remaining > block_size;
                 let phase_start = Instant::now();
                 let verify = model.forward_mtp_verify_with_compact(&verify_input, compact_verify);
                 mlxcel_core::eval(&verify.logits);
@@ -3467,13 +3478,14 @@ mod tests {
 
     #[test]
     fn greedy_graph_requires_history_independent_exact_argmax_sampling() {
-        assert!(mtp_greedy_graph_eligible(&SamplingConfig::greedy()));
+        assert!(mtp_greedy_graph_eligible(&SamplingConfig::greedy(), true));
         let mut penalized = SamplingConfig::greedy();
         penalized.repetition_penalty = 1.1;
-        assert!(!mtp_greedy_graph_eligible(&penalized));
+        assert!(!mtp_greedy_graph_eligible(&penalized, true));
         let mut biased = SamplingConfig::greedy();
         biased.token_bias.insert(17, 1.0);
-        assert!(!mtp_greedy_graph_eligible(&biased));
+        assert!(mtp_greedy_graph_eligible(&biased, true));
+        assert!(!mtp_greedy_graph_eligible(&biased, false));
     }
 
     #[test]

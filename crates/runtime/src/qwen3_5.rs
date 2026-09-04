@@ -29,6 +29,7 @@ use anyhow::{Context, Result, ensure};
 use mlxcel_core::cache::{KVCacheMode, SequenceId, Turbo4SnapshotTensors};
 use mlxcel_core::generate::{LanguageModel, ModelStateSnapshot};
 use mlxcel_core::layers::{KVCache, QuantizedWeight, RMSNorm, UnifiedEmbedding, UnifiedLinear};
+use mlxcel_core::sampling::TokenBiasMap;
 use mlxcel_core::utils::silu;
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr, concatenate};
@@ -1078,6 +1079,17 @@ impl Qwen35Model {
         self.compact_draft_head.is_some()
     }
 
+    // `apply_token_bias` ignores ids outside the actual logits tensor. Such
+    // entries are no-ops for a compact head and do not prevent graph batching.
+    pub(crate) fn mtp_draft_graph_supports_token_bias(&self, bias: &TokenBiasMap) -> bool {
+        if self.compact_draft_head.is_none() {
+            return true;
+        }
+        let compact_token_count = MTP_DRAFT_PREFIX + DFLASH_CONTROL_END - DFLASH_CONTROL_START;
+        bias.iter()
+            .all(|(&token, _)| token < 0 || token >= compact_token_count)
+    }
+
     #[cfg(any(feature = "dflash2", test))]
     pub(crate) fn has_compact_dflash_verify_head(&self) -> bool {
         self.compact_dflash_verify_head.is_some()
@@ -1121,8 +1133,7 @@ impl Qwen35Model {
         // repository's i32 token-id contract before adding the control offset.
         let tokens = mlxcel_core::astype(tokens, mlxcel_core::dtype::INT32);
         let boundary = mlxcel_core::from_slice_i32(&[prefix], &[1]);
-        let offset =
-            mlxcel_core::from_slice_i32(&[DFLASH_CONTROL_START - prefix], &[1]);
+        let offset = mlxcel_core::from_slice_i32(&[DFLASH_CONTROL_START - prefix], &[1]);
         let mapped_tail = mlxcel_core::add(&tokens, &offset);
         let is_control = mlxcel_core::greater_equal(&tokens, &boundary);
         mlxcel_core::where_cond(&is_control, &mapped_tail, &tokens)
@@ -2606,10 +2617,7 @@ fn push_turbo4_attention_snapshot(
 ) -> bool {
     // A donated snapshot and the live continuation must use identical cache
     // storage; packing only the snapshot can eventually change greedy output.
-    if cache.mode == KVCacheMode::Fp16
-        && cache.offset > 0
-        && !cache.demote_fp16_to_turbo4()
-    {
+    if cache.mode == KVCacheMode::Fp16 && cache.offset > 0 && !cache.demote_fp16_to_turbo4() {
         return false;
     }
     let Some(tensors) = cache.turbo4_snapshot_tensors() else {
@@ -3141,10 +3149,7 @@ mod tests {
             .chunks_exact(4)
             .map(|bytes| i32::from_ne_bytes(bytes.try_into().expect("i32 bytes")))
             .collect::<Vec<_>>();
-        assert_eq!(
-            mapped,
-            [0, DFLASH_COMPACT_PREFIX - 1, 248_044, 248_069]
-        );
+        assert_eq!(mapped, [0, DFLASH_COMPACT_PREFIX - 1, 248_044, 248_069]);
 
         let mtp_ids = mlxcel_core::from_slice_i32(
             &[0, MTP_DRAFT_PREFIX - 1, MTP_DRAFT_PREFIX, MTP_DRAFT_PREFIX + 25],
