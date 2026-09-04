@@ -13,6 +13,8 @@
 // limitations under the License.
 
 use std::sync::LazyLock;
+#[cfg(test)]
+use std::cell::Cell;
 
 use cxx::UniquePtr;
 
@@ -21,6 +23,7 @@ use crate::{MlxArray, dtype, ffi};
 use super::quant::{TurboQuantParams, turbo4_k_rotate, turbo4_v_inverse_rotate};
 
 pub const TURBO4_FUSED_ATTENTION_ENV_VAR: &str = "MLXCEL_TURBO4_FUSED_ATTENTION";
+pub const TURBO4_GROUPED_CAUSAL_ENV_VAR: &str = "MLXCEL_TURBO4_GROUPED_CAUSAL";
 fn parse_fused_attention_enabled(value: Option<&str>) -> bool {
     !value.is_some_and(|value| {
         matches!(
@@ -37,6 +40,30 @@ static TURBO4_FUSED_ATTENTION_ENABLED: LazyLock<bool> = LazyLock::new(|| {
 
 pub fn turbo4_fused_attention_enabled() -> bool {
     cfg!(target_os = "macos") && ffi::metal_is_available() && *TURBO4_FUSED_ATTENTION_ENABLED
+}
+
+static TURBO4_GROUPED_CAUSAL_ENABLED: LazyLock<bool> = LazyLock::new(|| {
+    let value = std::env::var(TURBO4_GROUPED_CAUSAL_ENV_VAR).ok();
+    parse_fused_attention_enabled(value.as_deref())
+});
+
+/// Whether the packed multi-row causal verify launch is enabled.
+///
+/// This is separate from the general fused-attention switch so the grouped
+/// route can be disabled for A/B comparison without disabling single-token
+/// Turbo4 attention. The default is on.
+pub fn turbo4_grouped_causal_enabled() -> bool {
+    cfg!(target_os = "macos") && ffi::metal_is_available() && *TURBO4_GROUPED_CAUSAL_ENABLED
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static GROUPED_CAUSAL_TEST_DISPATCHES: Cell<usize> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn grouped_causal_test_dispatches() -> usize {
+    GROUPED_CAUSAL_TEST_DISPATCHES.with(Cell::get)
 }
 
 fn supported_inputs(
@@ -77,7 +104,7 @@ fn supported_inputs(
     batch > 0
         && hq > 0
         && hkv > 0
-        && (2..=5).contains(&tq)
+        && (1..=5).contains(&tq)
         && tk > 2048
         && hq % hkv == 0
         && hq / hkv <= 32
@@ -120,6 +147,12 @@ pub fn attention_turbo4_fused(
     let rotated = ffi::turbo4_attention(
         &q_rot, k_packed, k_rescale, v_packed, v_rescale, &codebook, scale, causal,
     );
+    #[cfg(test)]
+    if ffi::array_shape(q)[2] > 1 {
+        GROUPED_CAUSAL_TEST_DISPATCHES.with(|dispatches| {
+            dispatches.set(dispatches.get() + 1);
+        });
+    }
     Some(turbo4_v_inverse_rotate(&rotated, params))
 }
 

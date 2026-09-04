@@ -3538,8 +3538,13 @@ impl KVCache {
     }
 
     /// Multi-token bottom-right causal variant of symmetric Turbo4 attention.
-    /// Decode-shaped MTP verify calls may use the packed two-pass kernel;
-    /// continuation prefill and unsupported shapes use the exact fallback.
+    ///
+    /// MTP/DFlash target verification uses 3–5 query rows. The packed kernel
+    /// consumes the complete packed prefix once and applies bottom-right
+    /// visibility per query row, so those rows must not be sliced into separate
+    /// packed-K/V launches. At an M1 block-tier boundary, however, each row's
+    /// visible prefix can select a different reduction partition; retain the
+    /// rowwise packed path there to preserve the established reduction order.
     pub fn update_and_turbo4_causal_attention(
         &mut self,
         q: &MlxArray,
@@ -3552,11 +3557,72 @@ impl KVCache {
             KVCacheMode::Turbo4,
             "update_and_turbo4_causal_attention requires Turbo4 mode"
         );
+        let old_offset = self.offset;
         self.update(new_keys, new_values);
+
+        let q_shape = ffi::array_shape(q);
+        let qlen = q_shape.get(2).copied().unwrap_or(0);
+        if turbo::fused_attention::turbo4_grouped_causal_enabled()
+            && q_shape.len() == 4
+            && q_shape[0] == 1
+            && matches!(qlen, 3..=5)
+            && Self::turbo4_mtp_reduction_blocks(old_offset + 1)
+                == Self::turbo4_mtp_reduction_blocks(self.offset)
+            && let Some(output) = self.turbo4_fused_attention_prefix(q, self.offset, scale, true)
+        {
+            return output;
+        }
+
+        // Keep the proven rowwise packed path for the rare reduction-tier
+        // crossing. Each row gets exactly the prefix it sees in sequential
+        // decode, while the packed kernel still avoids materialising K/V.
+        if q_shape.len() == 4 && q_shape[0] == 1 && matches!(qlen, 3..=5) {
+            let mut rows = Vec::with_capacity(qlen as usize);
+            for row in 0..qlen {
+                let q_row = ffi::slice(
+                    q,
+                    &[0, 0, row, 0],
+                    &[q_shape[0], q_shape[1], row + 1, q_shape[3]],
+                );
+                let Some(output) = self.turbo4_fused_attention_prefix(
+                    &q_row,
+                    old_offset + row + 1,
+                    scale,
+                    true,
+                ) else {
+                    return self.turbo4_dequant_sdpa_prefix(
+                        q,
+                        self.offset,
+                        scale,
+                        None,
+                        true,
+                    );
+                };
+                rows.push(output);
+            }
+            let pointers = rows
+                .iter()
+                .map(|row| &**row as *const MlxArray)
+                .collect::<Vec<_>>();
+            // SAFETY: every pointer references an array owned by `rows`.
+            return unsafe { ffi::concatenate(&pointers, 2) };
+        }
+
         if let Some(output) = self.turbo4_fused_attention_prefix(q, self.offset, scale, true) {
             return output;
         }
         self.turbo4_dequant_sdpa_prefix(q, self.offset, scale, None, true)
+    }
+    /// Number of M1 partial blocks used by the exact Turbo4 verify kernel.
+    #[inline]
+    fn turbo4_mtp_reduction_blocks(tokens: i32) -> i32 {
+        if tokens <= 8_192 {
+            64
+        } else if tokens <= 65_536 {
+            128
+        } else {
+            512
+        }
     }
 
     pub fn demote_fp16_to_turbo4(&mut self) -> bool {
