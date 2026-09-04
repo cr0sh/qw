@@ -48,9 +48,10 @@
 //! with inf → NaN). Attention masks are the one exception — additive 0/-inf
 //! f32 sentinels, matching every other mask builder in the repo.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use mlxcel_core::cache::SequenceId;
+use mlxcel_core::cache::{RotatingKVCacheSnapshotState, SequenceId};
 use mlxcel_core::generate::{GenerationStopReason, LanguageModel, ModelStateSnapshot};
 use mlxcel_core::layers::{
     KVCache, QuantizedWeight, RMSNorm, RotatingKVCache, UnifiedEmbedding, UnifiedLinear,
@@ -59,18 +60,15 @@ use mlxcel_core::weights::{WeightMap, load_weights_from_dir};
 use mlxcel_core::{MlxArray, UniquePtr, concatenate, multiply_scalar};
 use serde_json::Value;
 
-use crate::qwen3_5::Qwen35Model;
 use crate::portable_snapshot::{
     PortableArray, PortablePromptSnapshot, array_from_portable, array_to_portable,
     portable_model_state,
 };
+use crate::qwen3_5::Qwen35Model;
 const DRAFT_QUANT_GROUP_SIZE: i32 = 128;
 const DRAFT_QUANT_BITS: i32 = 4;
 
-fn quantized_draft_linear(
-    weights: &WeightMap,
-    prefix: &str,
-) -> Result<UnifiedLinear, String> {
+fn quantized_draft_linear(weights: &WeightMap, prefix: &str) -> Result<UnifiedLinear, String> {
     let weight_name = format!("{prefix}.weight");
     let dense = weights
         .get(&weight_name)
@@ -84,12 +82,13 @@ fn quantized_draft_linear(
             DRAFT_QUANT_BITS,
         );
     }
-    let quantized =
-        mlxcel_core::quantize_weights(dense, DRAFT_QUANT_GROUP_SIZE, DRAFT_QUANT_BITS);
+    let quantized = mlxcel_core::quantize_weights(dense, DRAFT_QUANT_GROUP_SIZE, DRAFT_QUANT_BITS);
     let weight = mlxcel_core::quantized_weights_w(&quantized);
     let scales = mlxcel_core::quantized_weights_scales(&quantized);
     if !mlxcel_core::quantized_weights_has_biases(&quantized) {
-        return Err(format!("Affine quantization produced no biases for {prefix}"));
+        return Err(format!(
+            "Affine quantization produced no biases for {prefix}"
+        ));
     }
     let biases = mlxcel_core::quantized_weights_biases(&quantized);
     mlxcel_core::eval(&weight);
@@ -109,7 +108,6 @@ fn quantized_draft_linear(
         bias,
     ))
 }
-
 
 // ---------------------------------------------------------------------------
 // # 1. DFlash2 config
@@ -324,11 +322,7 @@ impl DFlash2Config {
                         .ok_or("layer_types must be strings")
                 })
                 .collect::<Result<_, _>>()?,
-            _ => {
-                return Err(
-                    "config layer_types is required for the DFlash2 drafter".to_owned()
-                )
-            }
+            _ => return Err("config layer_types is required for the DFlash2 drafter".to_owned()),
         };
         if layer_types.len() != num_hidden_layers {
             return Err(format!(
@@ -338,11 +332,9 @@ impl DFlash2Config {
             ));
         }
         let sliding_window = match get("sliding_window") {
-            Some(value) => Some(
-                value
-                    .as_u64()
-                    .ok_or("sliding_window must be an integer")? as usize,
-            ),
+            Some(value) => {
+                Some(value.as_u64().ok_or("sliding_window must be an integer")? as usize)
+            }
             None => None,
         };
         if layer_types.iter().any(|t| t == "sliding_attention") && sliding_window.is_none() {
@@ -362,11 +354,7 @@ impl DFlash2Config {
             ));
         }
         let is_causal = match get("is_causal") {
-            Some(value) => Some(
-                value
-                    .as_bool()
-                    .ok_or("is_causal must be a boolean")?,
-            ),
+            Some(value) => Some(value.as_bool().ok_or("is_causal must be a boolean")?),
             None => None,
         };
         let selector_rank = get_int("selector_rank", default_selector_rank())?;
@@ -479,35 +467,22 @@ impl DFlash2GroupedConv {
             &[0, 0, 1, 0, 0],
             &[shape[0], shape[1], 2, self.taps, self.num_groups],
         );
-        let side0 = mlxcel_core::reshape(
-            &side0,
-            &[shape[0], shape[1], self.taps, self.num_groups],
-        );
-        let side1 = mlxcel_core::reshape(
-            &side1,
-            &[shape[0], shape[1], self.taps, self.num_groups],
-        );
+        let side0 = mlxcel_core::reshape(&side0, &[shape[0], shape[1], self.taps, self.num_groups]);
+        let side1 = mlxcel_core::reshape(&side1, &[shape[0], shape[1], self.taps, self.num_groups]);
         let base_shape = mlxcel_core::array_shape(&self.base_kernel);
         let base0 = mlxcel_core::slice(
             &self.base_kernel,
             &[0, 0, 0],
             &[1, self.taps, base_shape[2]],
         );
-        (
-            self.convolve(hidden, &side0, &base0),
-            side1,
-        )
+        (self.convolve(hidden, &side0, &base0), side1)
     }
 
     /// `DFlashGroupedConv.finish`: convolve `hidden` with the kernel returned
     /// by [`Self::prepare`].
     pub fn finish(&self, hidden: &MlxArray, dynamic: &MlxArray) -> UniquePtr<MlxArray> {
         let shape = mlxcel_core::array_shape(hidden);
-        let base1 = mlxcel_core::slice(
-            &self.base_kernel,
-            &[1, 0, 0],
-            &[2, self.taps, shape[2]],
-        );
+        let base1 = mlxcel_core::slice(&self.base_kernel, &[1, 0, 0], &[2, self.taps, shape[2]]);
         self.convolve(hidden, dynamic, &base1)
     }
 
@@ -551,13 +526,9 @@ impl DFlash2GroupedConv {
                 // SGLang `F.pad(blocks[:-tap], (0, 0, 0, 0, tap, 0))`:
                 // prepend `tap` zero rows to blocks[0 : L - tap], so row `j`
                 // sees row `j - tap`.
-                let tail = mlxcel_core::slice(
-                    &blocks,
-                    &[0, 0, 0, 0],
-                    &[batch, length - tap, groups, gs],
-                );
-                let zero_block =
-                    mlxcel_core::zeros(&[batch, tap, groups, gs], hidden_dtype);
+                let tail =
+                    mlxcel_core::slice(&blocks, &[0, 0, 0, 0], &[batch, length - tap, groups, gs]);
+                let zero_block = mlxcel_core::zeros(&[batch, tap, groups, gs], hidden_dtype);
                 mlxcel_core::concatenate(&zero_block, &tail, 1)
             };
             let mut values = values;
@@ -581,22 +552,12 @@ impl DFlash2GroupedConv {
             // singleton broadcasts the per-group kernel over the group_size
             // channels (SGLang `delta.unsqueeze(-1)` against
             // `base.view(1, taps, groups, group_size)`).
-            let delta_tap = mlxcel_core::slice(
-                dynamic,
-                &[0, 0, tap, 0],
-                &[batch, length, tap + 1, groups],
-            );
-            let delta_tap = mlxcel_core::reshape(
-                &delta_tap,
-                &[batch, length, groups, 1],
-            );
+            let delta_tap =
+                mlxcel_core::slice(dynamic, &[0, 0, tap, 0], &[batch, length, tap + 1, groups]);
+            let delta_tap = mlxcel_core::reshape(&delta_tap, &[batch, length, groups, 1]);
             let delta_tap = mlxcel_core::astype(&delta_tap, hidden_dtype);
             // base_tap [1, 1, groups, gs]
-            let base_tap = mlxcel_core::slice(
-                &base,
-                &[0, tap, 0, 0],
-                &[1, tap + 1, groups, gs],
-            );
+            let base_tap = mlxcel_core::slice(&base, &[0, tap, 0, 0], &[1, tap + 1, groups, gs]);
             let base_tap = mlxcel_core::reshape(&base_tap, &[1, 1, groups, gs]);
             // coefficients = base_tap + delta_tap, broadcast [B, L, groups, gs]
             let coefficients = mlxcel_core::add(&base_tap, &delta_tap);
@@ -655,6 +616,73 @@ impl DFlash2KVCache {
                 cache.trim(trim);
             }
         }
+    }
+}
+
+struct Dflash2SlidingCacheSnapshot {
+    state: RotatingKVCacheSnapshotState,
+    keys: UniquePtr<MlxArray>,
+    values: UniquePtr<MlxArray>,
+}
+
+impl Dflash2SlidingCacheSnapshot {
+    fn capture(caches: &[DFlash2KVCache]) -> Option<Vec<Self>> {
+        caches
+            .iter()
+            .map(|cache| {
+                let DFlash2KVCache::Sliding(cache) = cache else {
+                    return None;
+                };
+                Some(Self {
+                    state: cache.snapshot_state(),
+                    keys: mlxcel_core::share(cache.keys.as_ref()?),
+                    values: mlxcel_core::share(cache.values.as_ref()?),
+                })
+            })
+            .collect()
+    }
+
+    fn restore_all(snapshots: &[Self]) -> Result<Vec<DFlash2KVCache>, String> {
+        snapshots
+            .iter()
+            .map(|snapshot| {
+                let mut cache = RotatingKVCache::new(snapshot.state.max_size);
+                cache.restore_fp16_snapshot_state(
+                    snapshot.state,
+                    Some(mlxcel_core::share(&snapshot.keys)),
+                    Some(mlxcel_core::share(&snapshot.values)),
+                )?;
+                Ok(DFlash2KVCache::Sliding(cache))
+            })
+            .collect()
+    }
+
+    fn materialize_and_detach_all(snapshots: &[Self]) {
+        let arrays = snapshots
+            .iter()
+            .flat_map(|snapshot| [&*snapshot.keys, &*snapshot.values])
+            .map(|array| array as *const MlxArray)
+            .collect::<Vec<_>>();
+        unsafe {
+            mlxcel_core::eval_all(&arrays);
+            mlxcel_core::detach_all(&arrays);
+        }
+    }
+}
+
+struct Dflash2ProjectedPrefix {
+    snapshot_id: u64,
+    committed_suffix: Vec<i32>,
+    caches: Vec<Dflash2SlidingCacheSnapshot>,
+}
+
+impl Dflash2ProjectedPrefix {
+    fn restore(&self) -> Result<Vec<DFlash2KVCache>, String> {
+        Dflash2SlidingCacheSnapshot::restore_all(&self.caches)
+    }
+
+    fn materialize_and_detach(&self) {
+        Dflash2SlidingCacheSnapshot::materialize_and_detach_all(&self.caches);
     }
 }
 
@@ -732,83 +760,99 @@ impl DFlash2Attention {
     /// Forward with split projections.
     ///
     /// - `x` — proposal sequence `[B, L, hidden_size]`.
-    /// - `x_ctx` — context buffer `[B, S, hidden_size]`.
-    /// - `cache` — this layer's K/V cache; updated in place with the
-    ///   context-side K/V only.
+    /// - `x_ctx` — newly committed context `[B, S, hidden_size]`, or `None`
+    ///   when an exact projected prefix has already populated `cache`.
+    /// - `cache` — this layer's K/V cache; updated only with context-side K/V.
     ///
     /// Returns `[B, L, hidden_size]`.
     pub fn forward(
         &self,
         x: &MlxArray,
-        x_ctx: &MlxArray,
+        x_ctx: Option<&MlxArray>,
         cache: &mut DFlash2KVCache,
     ) -> UniquePtr<MlxArray> {
         let x_shape = mlxcel_core::array_shape(x);
-        let ctx_shape = mlxcel_core::array_shape(x_ctx);
         let b = x_shape[0];
         let l = x_shape[1];
-        let mut s = ctx_shape[1];
 
-        // Sliding trim: keep at most `sliding_window - 1` context rows
-        // (SGLang `get_dflash_attention_sliding_window_size` converts the HF
-        // window, which includes the current token, to a window_left).
-        let mut x_ctx = mlxcel_core::copy(x_ctx);
-        if self.is_sliding && s > self.sliding_window - 1 {
-            let skip = s - (self.sliding_window - 1);
-            x_ctx = mlxcel_core::slice(&x_ctx, &[0, skip, 0], &[b, s, ctx_shape[2]]);
-            s = self.sliding_window - 1;
-            match cache {
-                DFlash2KVCache::Sliding(cache) => cache.offset += skip,
-                DFlash2KVCache::Full(_) => {}
-            }
-        }
-
-        // Project context and proposal separately (SGLang's fused QKV is the
-        // same linear map; the checkpoint stores q/k/v independently).
+        // Proposal projections are never cached. The projected-prefix path
+        // below restores only committed context K/V, so rejected proposals
+        // cannot leak into a later request or round.
         let queries = self.q_proj.forward(x);
-        let ctx_keys = self.k_proj.forward(&x_ctx);
-        let ctx_values = self.v_proj.forward(&x_ctx);
         let prop_keys = self.k_proj.forward(x);
         let prop_values = self.v_proj.forward(x);
-
-        // Reshape to [B, seq, n_*, head_dim] for the per-head norms.
         let queries = mlxcel_core::reshape(&queries, &[b, l, self.n_heads, self.head_dim]);
-        let ctx_keys = mlxcel_core::reshape(&ctx_keys, &[b, s, self.n_kv_heads, self.head_dim]);
-        let ctx_values = mlxcel_core::reshape(&ctx_values, &[b, s, self.n_kv_heads, self.head_dim]);
         let prop_keys = mlxcel_core::reshape(&prop_keys, &[b, l, self.n_kv_heads, self.head_dim]);
         let prop_values =
             mlxcel_core::reshape(&prop_values, &[b, l, self.n_kv_heads, self.head_dim]);
-
         let queries = self.q_norm.forward(&queries);
-        let ctx_keys = self.k_norm.forward(&ctx_keys);
         let prop_keys = self.k_norm.forward(&prop_keys);
-
-        // Transpose to [B, n_heads, seq, head_dim].
         let queries = mlxcel_core::transpose_axes(&queries, &[0, 2, 1, 3]);
-        let ctx_keys = mlxcel_core::transpose_axes(&ctx_keys, &[0, 2, 1, 3]);
-        let ctx_values = mlxcel_core::transpose_axes(&ctx_values, &[0, 2, 1, 3]);
         let prop_keys = mlxcel_core::transpose_axes(&prop_keys, &[0, 2, 1, 3]);
         let prop_values = mlxcel_core::transpose_axes(&prop_values, &[0, 2, 1, 3]);
 
-        // RoPE offsets (absolute positions): the context rows sit at
-        // [past_offset, past_offset + S); the proposal block right after.
-        let past_offset = cache.offset();
-        let after_ctx_offset = past_offset + s;
+        let (keys, values, s, proposal_offset) = if let Some(x_ctx) = x_ctx {
+            let ctx_shape = mlxcel_core::array_shape(x_ctx);
+            let mut s = ctx_shape[1];
+            let mut x_ctx = mlxcel_core::copy(x_ctx);
+            if self.is_sliding && s > self.sliding_window - 1 {
+                let skip = s - (self.sliding_window - 1);
+                x_ctx = mlxcel_core::slice(&x_ctx, &[0, skip, 0], &[b, s, ctx_shape[2]]);
+                s = self.sliding_window - 1;
+                if let DFlash2KVCache::Sliding(cache) = cache {
+                    cache.offset += skip;
+                }
+            }
+
+            let past_offset = cache.offset();
+            let ctx_keys = self.k_proj.forward(&x_ctx);
+            let ctx_values = self.v_proj.forward(&x_ctx);
+            let ctx_keys = mlxcel_core::reshape(&ctx_keys, &[b, s, self.n_kv_heads, self.head_dim]);
+            let ctx_values =
+                mlxcel_core::reshape(&ctx_values, &[b, s, self.n_kv_heads, self.head_dim]);
+            let ctx_keys = self.k_norm.forward(&ctx_keys);
+            let ctx_keys = mlxcel_core::transpose_axes(&ctx_keys, &[0, 2, 1, 3]);
+            let ctx_values = mlxcel_core::transpose_axes(&ctx_values, &[0, 2, 1, 3]);
+            let ctx_keys = mlxcel_core::fast_rope(
+                &ctx_keys,
+                self.head_dim,
+                false,
+                self.rope_base,
+                1.0,
+                past_offset,
+            );
+            let (keys, values) = cache.update_and_fetch(ctx_keys, ctx_values);
+            (keys, values, s, past_offset + s)
+        } else {
+            // A no-context call is valid only immediately after restoring the
+            // reusable projected prefix. Its sliding snapshots are captured in
+            // chronological order before any ring wrap.
+            let DFlash2KVCache::Sliding(cache) = cache else {
+                unreachable!("only sliding DFlash2 caches have projected-prefix snapshots");
+            };
+            let keys = mlxcel_core::share(
+                cache
+                    .keys
+                    .as_ref()
+                    .expect("projected DFlash2 prefix must contain keys"),
+            );
+            let values = mlxcel_core::share(
+                cache
+                    .values
+                    .as_ref()
+                    .expect("projected DFlash2 prefix must contain values"),
+            );
+            let s = mlxcel_core::array_shape(&keys)[2];
+            (keys, values, s, cache.offset)
+        };
+
         let queries = mlxcel_core::fast_rope(
             &queries,
             self.head_dim,
             false,
             self.rope_base,
             1.0,
-            after_ctx_offset,
-        );
-        let ctx_keys = mlxcel_core::fast_rope(
-            &ctx_keys,
-            self.head_dim,
-            false,
-            self.rope_base,
-            1.0,
-            past_offset,
+            proposal_offset,
         );
         let prop_keys = mlxcel_core::fast_rope(
             &prop_keys,
@@ -816,15 +860,8 @@ impl DFlash2Attention {
             false,
             self.rope_base,
             1.0,
-            after_ctx_offset,
+            proposal_offset,
         );
-
-        // Cache write: ONLY context K/V. The proposal K/V is concatenated
-        // post-hoc and never enters the cache. This is the load-bearing
-        // invariant of the DFlash drafter forward — the next round's offset
-        // and RoPE positions depend on it (pin it so a future edit cannot
-        // silently regress to writing proposal K/V into the cache).
-        let (keys, values) = cache.update_and_fetch(ctx_keys, ctx_values);
         let keys_combined = mlxcel_core::concatenate(&keys, &prop_keys, 2);
         let values_combined = mlxcel_core::concatenate(&values, &prop_values, 2);
 
@@ -851,12 +888,7 @@ impl DFlash2Attention {
     /// Additive `[1, 1, L, total]` f32 mask (0.0 = attend, -inf = block),
     /// or `None` when no key needs masking. `keys_combined` is
     /// `[B, H, total, D]`; `S` is the context length after trimming.
-    fn build_mask(
-        &self,
-        l: i32,
-        s: i32,
-        keys_combined: &MlxArray,
-    ) -> Option<UniquePtr<MlxArray>> {
+    fn build_mask(&self, l: i32, s: i32, keys_combined: &MlxArray) -> Option<UniquePtr<MlxArray>> {
         let total = mlxcel_core::array_shape(keys_combined)[2];
         let need_mask = self.is_causal || (self.is_sliding && s + l > self.sliding_window);
         if !need_mask {
@@ -975,7 +1007,7 @@ impl DFlash2DecoderLayer {
     pub fn forward(
         &self,
         x: &MlxArray,
-        x_ctx: &MlxArray,
+        x_ctx: Option<&MlxArray>,
         cache: &mut DFlash2KVCache,
     ) -> UniquePtr<MlxArray> {
         let residual = x;
@@ -1088,13 +1120,9 @@ impl CandidateSelector {
         let mut path_rows = Vec::with_capacity(npos as usize);
         for position in 0..npos {
             let pred_emb = mlxcel_core::embedding(&self.predecessor_codebook, &predecessor); // [B, rank]
-            let candidate_slice = mlxcel_core::slice(
-                candidates,
-                &[0, position, 0],
-                &[batch, position + 1, k],
-            );
-            let succ_emb =
-                mlxcel_core::embedding(&self.successor_codebook, &candidate_slice); // [B, K, rank]
+            let candidate_slice =
+                mlxcel_core::slice(candidates, &[0, position, 0], &[batch, position + 1, k]);
+            let succ_emb = mlxcel_core::embedding(&self.successor_codebook, &candidate_slice); // [B, K, rank]
             let hidden_row = mlxcel_core::slice(
                 &hidden_proj,
                 &[0, position, 0],
@@ -1111,22 +1139,15 @@ impl CandidateSelector {
                 -1,
                 false,
             ); // [B, K]
-            let unary_row = mlxcel_core::slice(
-                unary,
-                &[0, position, 0],
-                &[batch, position + 1, k],
-            );
+            let unary_row = mlxcel_core::slice(unary, &[0, position, 0], &[batch, position + 1, k]);
             let scores = if edge_scale == 1.0 {
                 mlxcel_core::add(&unary_row, &edges)
             } else {
                 mlxcel_core::add(&unary_row, &multiply_scalar(&edges, edge_scale))
             }; // [B, K]
             let selected = mlxcel_core::argmax(&scores, -1, false); // [B]
-            let candidate_row = mlxcel_core::slice(
-                candidates,
-                &[0, position, 0],
-                &[batch, position + 1, k],
-            );
+            let candidate_row =
+                mlxcel_core::slice(candidates, &[0, position, 0], &[batch, position + 1, k]);
             let selected_emb = mlxcel_core::expand_dims(&selected, -1); // [B, 1]
             let selected_id = mlxcel_core::take_along_axis(&candidate_row, &selected_emb, -1); // [B, 1]
             predecessor = mlxcel_core::reshape(&selected_id, &[batch]); // [B]
@@ -1160,11 +1181,8 @@ fn top_k_candidate_logits(
         ));
     }
     let partition = mlxcel_core::argpartition(logits, -k, -1);
-    let compact_ids = mlxcel_core::slice(
-        &partition,
-        &[0, 0, vocab - k],
-        &[shape[0], shape[1], vocab],
-    );
+    let compact_ids =
+        mlxcel_core::slice(&partition, &[0, 0, vocab - k], &[shape[0], shape[1], vocab]);
     let compact_ids = mlxcel_core::contiguous(&compact_ids, false);
     let values = mlxcel_core::take_along_axis(logits, &compact_ids, -1);
     let target_ids = if compact_domain {
@@ -1258,17 +1276,22 @@ impl DFlash2DraftModel {
     /// Backbone forward over the masked draft block, returning the final
     /// normalized hidden states `[1, bs, H]` (SGLang `DFlashDraftModel.forward`
     /// + `norm`).
+    /// Project newly committed target-layer rows once, then reuse the result
+    /// across every draft layer. Passing `None` is reserved for an exact
+    /// projected-prefix restore whose per-layer K/V is already in `caches`.
     pub fn hidden_states(
         &self,
         inputs: &MlxArray,
-        target_hidden: &MlxArray,
+        target_hidden: Option<&MlxArray>,
         caches: &mut [DFlash2KVCache],
     ) -> UniquePtr<MlxArray> {
         let mut h = self.embed_tokens.forward(inputs);
-        let fc_out = self.fc.forward(target_hidden);
-        let h_ctx = self.hidden_norm.forward(&fc_out);
+        let projected_context = target_hidden.map(|target_hidden| {
+            let fc_out = self.fc.forward(target_hidden);
+            self.hidden_norm.forward(&fc_out)
+        });
         for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
-            h = layer.forward(&h, &h_ctx, cache);
+            h = layer.forward(&h, projected_context.as_deref(), cache);
         }
         self.norm.forward(&h)
     }
@@ -1313,7 +1336,7 @@ impl DFlash2DraftModel {
     pub fn propose(
         &self,
         inputs: &MlxArray,
-        target_hidden: &MlxArray,
+        target_hidden: Option<&MlxArray>,
         caches: &mut [DFlash2KVCache],
         target: &Qwen35Model,
         selector_edge_scale: f32,
@@ -1408,7 +1431,10 @@ impl RunningMoments {
             0.0
         };
         let radius = DFLASH2_CONFIDENCE_Z * (variance / self.count as f64).sqrt();
-        Some(((self.mean - radius).max(f64::MIN_POSITIVE), self.mean + radius))
+        Some((
+            (self.mean - radius).max(f64::MIN_POSITIVE),
+            self.mean + radius,
+        ))
     }
 }
 
@@ -1507,8 +1533,7 @@ impl Dflash2ContextCalibration {
         let (marginal_lower, marginal_upper) = self.prefix.confidence_bounds(3)?;
         let (narrow_latency_lower, narrow_latency_upper) =
             self.width_latency[0].confidence_bounds()?;
-        let (wide_latency_lower, wide_latency_upper) =
-            self.width_latency[1].confidence_bounds()?;
+        let (wide_latency_lower, wide_latency_upper) = self.width_latency[1].confidence_bounds()?;
 
         // Every verified round emits the target bonus. Width five adds exactly
         // one possible accepted proposal, whose marginal yield is survival to
@@ -1551,9 +1576,7 @@ impl Dflash2ContextCalibration {
     }
 
     fn choose_selector_arm(&self, proposed: usize) -> usize {
-        if self.selector_rounds[DFLASH2_DEFAULT_SELECTOR_ARM]
-            < DFLASH2_SELECTOR_BASELINE_SAMPLES
-        {
+        if self.selector_rounds[DFLASH2_DEFAULT_SELECTOR_ARM] < DFLASH2_SELECTOR_BASELINE_SAMPLES {
             return DFLASH2_DEFAULT_SELECTOR_ARM;
         }
 
@@ -1696,11 +1719,18 @@ impl Dflash2Calibration {
 /// Detached target state and target-layer hidden context at an exact prompt
 /// boundary. The hidden rows seed the drafter's bounded sliding context after
 /// the target snapshot is restored.
+static NEXT_DFLASH2_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_dflash2_snapshot_id() -> u64 {
+    NEXT_DFLASH2_SNAPSHOT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
 pub struct Dflash2PromptSnapshot {
     target: ModelStateSnapshot,
     hidden_concat: UniquePtr<MlxArray>,
     hidden_offset: usize,
     continuation_logits: UniquePtr<MlxArray>,
+    id: u64,
 }
 
 impl Dflash2PromptSnapshot {
@@ -1723,7 +1753,6 @@ impl Dflash2PromptSnapshot {
             + mlxcel_core::array_nbytes(&self.continuation_logits);
         summary
     }
-
 
     pub(crate) fn to_portable(&self) -> PortablePromptSnapshot {
         PortablePromptSnapshot::Dflash2 {
@@ -1765,6 +1794,7 @@ impl Dflash2PromptSnapshot {
             );
         }
         Ok(Self {
+            id: next_dflash2_snapshot_id(),
             target,
             hidden_concat: array_from_portable(hidden_concat, None)?,
             hidden_offset,
@@ -1804,6 +1834,8 @@ pub struct Dflash2GenerationStats {
     pub selector_scale_rounds: [usize; 3],
     pub selector_scale_accepted_draft_tokens: [usize; 3],
     pub selector_scale_proposed_draft_tokens: [usize; 3],
+    /// Number of exact prompt-boundary projected K/V snapshots reused.
+    pub projected_context_cache_hits: usize,
 }
 
 impl Dflash2GenerationStats {
@@ -1815,12 +1847,7 @@ impl Dflash2GenerationStats {
         }
     }
 
-    fn record_round(
-        &mut self,
-        policy: Dflash2RoundPolicy,
-        accepted: usize,
-        proposed: usize,
-    ) {
+    fn record_round(&mut self, policy: Dflash2RoundPolicy, accepted: usize, proposed: usize) {
         self.accepted_draft_tokens += accepted;
         self.proposed_draft_tokens += proposed;
         self.verify_width_rounds[policy.width_index] += 1;
@@ -1874,6 +1901,7 @@ pub struct Qwen35Dflash2Generator {
     calibration: Dflash2Calibration,
     target_layer_ids: Vec<usize>,
     hidden_limit: usize,
+    projected_prefix: Option<Dflash2ProjectedPrefix>,
 }
 
 impl Qwen35Dflash2Generator {
@@ -1893,6 +1921,7 @@ impl Qwen35Dflash2Generator {
         let calibration = Dflash2Calibration::from_environment()?;
         Ok(Self {
             model,
+            projected_prefix: None,
             caches,
             calibration,
             target_layer_ids: config.target_layer_ids.clone(),
@@ -1921,13 +1950,13 @@ impl Qwen35Dflash2Generator {
             .snapshot_sequence_state(SequenceId::from_raw(0), prompt_tokens.len(), None)
             .ok_or_else(|| "failed to capture DFlash2 target prefix state".to_string())?;
         Ok(Dflash2PromptSnapshot {
+            id: next_dflash2_snapshot_id(),
             target: target_state,
             hidden_concat: materialize_detached(mlxcel_core::copy(&prefill.hidden_concat)),
             hidden_offset: prefill.hidden_offset,
             continuation_logits: materialize_detached(mlxcel_core::copy(&prefill.first_logits)),
         })
     }
-
 
     /// Generate greedily with DFlash2 draft verification.
     pub fn generate_streaming<F: FnMut(i32) -> bool>(
@@ -1954,21 +1983,35 @@ impl Qwen35Dflash2Generator {
         }
 
         // Restore an exact target prefix when supplied, then process only the
-        // uncached prompt suffix. Drafter caches are request-local and are
-        // rebuilt so no speculative state survives across Criterion rounds.
+        // uncached prompt suffix. Repeated reuse can also restore projected
+        // drafter K/V when both the snapshot identity and committed suffix
+        // match exactly; a changed suffix takes the raw-hidden rebuild path.
         let prefill_start = Instant::now();
-        self.caches = self.model.make_cache();
         let reusable = prefix_reuse.filter(|reuse| {
             reuse.cached_tokens == reuse.snapshot.token_len()
                 && reuse.cached_tokens <= prompt_tokens.len()
         });
         let cached_tokens = reusable.map_or(0, |reuse| reuse.cached_tokens);
+        let projected_caches = reusable
+            .and_then(|reuse| {
+                let committed_suffix = &prompt_tokens[reuse.cached_tokens..];
+                self.projected_prefix.as_ref().filter(|projected| {
+                    projected.snapshot_id == reuse.snapshot.id
+                        && projected.committed_suffix == committed_suffix
+                })
+            })
+            .map(Dflash2ProjectedPrefix::restore)
+            .transpose()?;
+        let projected_cache_hit = projected_caches.is_some();
+        self.caches = projected_caches.unwrap_or_else(|| self.model.make_cache());
+
         let (mut hidden_concat, first_logits, hidden_offset) = if let Some(reuse) = reusable {
             target.restore_sequence_state(SequenceId::from_raw(0), &reuse.snapshot.target)?;
             let suffix = &prompt_tokens[cached_tokens..];
             if suffix.is_empty() {
                 (
-                    mlxcel_core::copy(&reuse.snapshot.hidden_concat),
+                    (!projected_cache_hit)
+                        .then(|| mlxcel_core::copy(&reuse.snapshot.hidden_concat)),
                     mlxcel_core::copy(&reuse.snapshot.continuation_logits),
                     reuse.snapshot.hidden_offset,
                 )
@@ -1982,17 +2025,18 @@ impl Qwen35Dflash2Generator {
                     &self.target_layer_ids,
                     self.hidden_limit,
                 )?;
-                let hidden = merge_hidden_context(
-                    &reuse.snapshot.hidden_concat,
-                    &suffix_prefill.hidden_concat,
-                    self.hidden_limit,
-                );
-                let rows = mlxcel_core::array_shape(&hidden)[1] as usize;
-                (
-                    hidden,
-                    suffix_prefill.first_logits,
-                    prompt_tokens.len().saturating_sub(rows),
-                )
+                let (hidden, hidden_offset) = if projected_cache_hit {
+                    (None, suffix_prefill.hidden_offset)
+                } else {
+                    let hidden = merge_hidden_context(
+                        &reuse.snapshot.hidden_concat,
+                        &suffix_prefill.hidden_concat,
+                        self.hidden_limit,
+                    );
+                    let rows = mlxcel_core::array_shape(&hidden)[1] as usize;
+                    (Some(hidden), prompt_tokens.len().saturating_sub(rows))
+                };
+                (hidden, suffix_prefill.first_logits, hidden_offset)
             }
         } else {
             let prompt_array = mlxcel_core::from_slice_i32(
@@ -2005,15 +2049,17 @@ impl Qwen35Dflash2Generator {
                 self.hidden_limit,
             )?;
             (
-                prefill.hidden_concat,
+                Some(prefill.hidden_concat),
                 prefill.first_logits,
                 prefill.hidden_offset,
             )
         };
-        for cache in self.caches.iter_mut() {
-            match cache {
-                DFlash2KVCache::Full(c) => c.offset = hidden_offset as i32,
-                DFlash2KVCache::Sliding(c) => c.offset = hidden_offset as i32,
+        if !projected_cache_hit {
+            for cache in self.caches.iter_mut() {
+                match cache {
+                    DFlash2KVCache::Full(c) => c.offset = hidden_offset as i32,
+                    DFlash2KVCache::Sliding(c) => c.offset = hidden_offset as i32,
+                }
             }
         }
         let mut bonus = {
@@ -2030,6 +2076,7 @@ impl Qwen35Dflash2Generator {
         let mut history = prompt_tokens.to_vec();
         let mut stats = Dflash2GenerationStats {
             prefill_time,
+            projected_context_cache_hits: usize::from(projected_cache_hit),
             ..Dflash2GenerationStats::default()
         };
         let (mut stop_reason, continue_decoding) = emit_initial_dflash2_token(
@@ -2043,6 +2090,14 @@ impl Qwen35Dflash2Generator {
         let decode_start = Instant::now();
         let mut draft_block =
             vec![self.model.config.mask_token_id; DFLASH2_STATIC_VERIFY_WIDTHS[1]];
+        let mut projected_prefix_to_capture = reusable
+            .filter(|_| !projected_cache_hit && self.hidden_limit != usize::MAX)
+            .map(|reuse| {
+                (
+                    reuse.snapshot.id,
+                    prompt_tokens[reuse.cached_tokens..].to_vec(),
+                )
+            });
 
         while continue_decoding && generated.len() < max_tokens {
             let remaining = max_tokens - generated.len();
@@ -2056,15 +2111,26 @@ impl Qwen35Dflash2Generator {
             // the anchor and a static width from `DFLASH2_STATIC_VERIFY_WIDTHS`;
             // a short final budget never introduces a new compiled MLX shape.
             draft_block[0] = bonus;
-            let inputs =
-                mlxcel_core::from_slice_i32(&draft_block[..bs], &[1, bs as i32]);
+            let inputs = mlxcel_core::from_slice_i32(&draft_block[..bs], &[1, bs as i32]);
             let out = self.model.propose(
                 &inputs,
-                &hidden_concat,
+                hidden_concat.as_deref(),
                 &mut self.caches,
                 target,
                 policy.selector_edge_scale,
             )?;
+            let pending_projected_prefix =
+                projected_prefix_to_capture
+                    .take()
+                    .and_then(|(snapshot_id, committed_suffix)| {
+                        Dflash2SlidingCacheSnapshot::capture(&self.caches).map(|caches| {
+                            Dflash2ProjectedPrefix {
+                                snapshot_id,
+                                caches,
+                                committed_suffix,
+                            }
+                        })
+                    });
             mlxcel_core::async_eval(&out.path);
             stats.draft_time += phase_start.elapsed();
 
@@ -2098,6 +2164,13 @@ impl Qwen35Dflash2Generator {
                 &history,
                 remaining,
             );
+            if let Some(projected_prefix) = pending_projected_prefix {
+                // The target walk above has synchronized every draft ancestor.
+                // Detaching here retains only the bounded committed K/V, not
+                // the large FC/projection construction graph.
+                projected_prefix.materialize_and_detach();
+                self.projected_prefix = Some(projected_prefix);
+            }
             stats.target_verify_time += phase_start.elapsed();
             let compute_latency = round_compute_start.elapsed();
             stats.record_round(policy, walk.accepted, draft_tokens.len());
@@ -2125,8 +2198,10 @@ impl Qwen35Dflash2Generator {
 
             // Concatenate only committed rows; rejected verify rows never feed
             // the next draft round.
-            hidden_concat =
-                concatenate_hiddens(&verify.hidden_by_layer, walk.accepted + 1);
+            hidden_concat = Some(concatenate_hiddens(
+                &verify.hidden_by_layer,
+                walk.accepted + 1,
+            ));
             bonus = *walk
                 .new_tokens
                 .last()
@@ -2175,30 +2250,18 @@ fn merge_hidden_context(
         return combined;
     }
     let start = shape[1] - i32::try_from(hidden_limit).unwrap_or(i32::MAX);
-    mlxcel_core::slice(
-        &combined,
-        &[0, start, 0],
-        &[shape[0], shape[1], shape[2]],
-    )
+    mlxcel_core::slice(&combined, &[0, start, 0], &[shape[0], shape[1], shape[2]])
 }
 
-
 /// Concatenate a `[1, L, H]` per-target-layer hidden list along `-1`.
-fn concatenate_hiddens(
-    hiddens: &[UniquePtr<MlxArray>],
-    prefix_len: usize,
-) -> UniquePtr<MlxArray> {
+fn concatenate_hiddens(hiddens: &[UniquePtr<MlxArray>], prefix_len: usize) -> UniquePtr<MlxArray> {
     debug_assert!(
         !hiddens.is_empty(),
         "DFlash2 verify must capture hidden states"
     );
     let prefix = |hidden: &MlxArray| {
         let shape = mlxcel_core::array_shape(hidden);
-        mlxcel_core::slice(
-            hidden,
-            &[0, 0, 0],
-            &[shape[0], prefix_len as i32, shape[2]],
-        )
+        mlxcel_core::slice(hidden, &[0, 0, 0], &[shape[0], prefix_len as i32, shape[2]])
     };
     let mut acc = prefix(hiddens[0].as_ref().expect("captured hidden"));
     for hidden in &hiddens[1..] {
@@ -2212,8 +2275,7 @@ fn concatenate_hiddens(
 mod tests {
     use super::*;
     use crate::qwen3_5::{
-        DFLASH_COMPACT_PREFIX, DFLASH_COMPACT_TOKEN_COUNT, DFLASH_CONTROL_END,
-        DFLASH_CONTROL_START,
+        DFLASH_COMPACT_PREFIX, DFLASH_COMPACT_TOKEN_COUNT, DFLASH_CONTROL_END, DFLASH_CONTROL_START,
     };
     use mlxcel_core::generate::SamplingConfig;
     use std::collections::BTreeMap;
@@ -2247,10 +2309,7 @@ mod tests {
         for (position, &token) in target_tokens.iter().enumerate() {
             logits[position * vocab + token as usize] = 100.0;
         }
-        mlxcel_core::from_slice_f32(
-            &logits,
-            &[1, target_tokens.len() as i32, vocab as i32],
-        )
+        mlxcel_core::from_slice_f32(&logits, &[1, target_tokens.len() as i32, vocab as i32])
     }
 
     fn fixture_config_json() -> Value {
@@ -2512,15 +2571,14 @@ mod tests {
                 let proposal_array =
                     mlxcel_core::from_slice_i32(&proposals, &[1, proposals.len() as i32]);
                 let logits = verify_logits(&target_tokens, 7);
-                let (walk, materialized) =
-                    crate::qwen3_5_mtp::greedy_walk_device_proposals(
-                        &proposal_array,
-                        &logits,
-                        false,
-                        &sampling,
-                        &[],
-                        width,
-                    );
+                let (walk, materialized) = crate::qwen3_5_mtp::greedy_walk_device_proposals(
+                    &proposal_array,
+                    &logits,
+                    false,
+                    &sampling,
+                    &[],
+                    width,
+                );
                 assert_eq!(materialized, proposals);
                 assert_eq!(walk.accepted, accepted);
                 let mut expected = proposals[..accepted].to_vec();
@@ -2561,17 +2619,11 @@ mod tests {
         let mut generated = Vec::new();
         let mut history = vec![3, 4];
         let mut callbacks = 0;
-        let (reason, continue_decoding) = emit_initial_dflash2_token(
-            5,
-            &[],
-            10,
-            &mut generated,
-            &mut history,
-            &mut |_| {
+        let (reason, continue_decoding) =
+            emit_initial_dflash2_token(5, &[], 10, &mut generated, &mut history, &mut |_| {
                 callbacks += 1;
                 false
-            },
-        );
+            });
         assert_eq!(reason, GenerationStopReason::CallbackCancelled);
         assert!(!continue_decoding);
         assert_eq!(generated, [5]);
@@ -2628,7 +2680,11 @@ mod tests {
             let pos = mlxcel_core::slice(
                 &out,
                 &[0, (i / out_shape[2]) as i32, (i % out_shape[2]) as i32],
-                &[1, (i / out_shape[2]) as i32 + 1, (i % out_shape[2]) as i32 + 1],
+                &[
+                    1,
+                    (i / out_shape[2]) as i32 + 1,
+                    (i % out_shape[2]) as i32 + 1,
+                ],
             );
             got.push(mlxcel_core::item_f32(&pos));
         }

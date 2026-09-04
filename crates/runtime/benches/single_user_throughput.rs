@@ -7,8 +7,6 @@ use std::path::Path;
 use std::time::Duration;
 
 use mlxcel_core::generate::SamplingConfig;
-#[cfg(feature = "dflash2")]
-use qw_runtime::Dflash2PrefixReuse;
 #[cfg(not(feature = "dflash2"))]
 use qw_runtime::MtpGenerationStats;
 #[cfg(feature = "specprefill")]
@@ -16,6 +14,8 @@ use qw_runtime::PrefillMode;
 #[cfg(feature = "dflash2")]
 use qw_runtime::PromptSnapshot;
 use qw_runtime::provider::Qwen35GenerationMode;
+#[cfg(feature = "dflash2")]
+use qw_runtime::{Dflash2GenerationStats, Dflash2PrefixReuse};
 use qw_runtime::{GenerationRequest, Qwen35Provider};
 use support::{
     DECODE_MAX_TOKENS, LONG_CONTEXT_64K_MIN_TOKENS, LONG_CONTEXT_MIN_TOKENS,
@@ -219,6 +219,7 @@ fn fresh_dflash2_sample(
         stats.proposed_draft_tokens > 0,
         "fresh DFlash2 must propose draft tokens"
     );
+    profile_dflash2(stats);
     let elapsed = stats.decode_time;
     black_box(output);
     elapsed
@@ -259,9 +260,31 @@ fn long_dflash2_sample(
         stats.proposed_draft_tokens > 0,
         "cached DFlash2 must propose draft tokens"
     );
+    profile_dflash2(stats);
     let elapsed = stats.decode_time;
     black_box(output);
     elapsed
+}
+
+#[cfg(feature = "dflash2")]
+fn profile_dflash2(stats: Dflash2GenerationStats) {
+    if env::var_os("QW_BENCH_PROFILE_DFLASH2").is_some() {
+        eprintln!(
+            "DFLASH2_PROFILE proposed={} accepted={} projected_cache_hits={} \
+             width_rounds={:?} width_accepted={:?} width_proposed={:?} \
+             selector_rounds={:?} draft_ms={:.3} verify_ms={:.3} decode_ms={:.3}",
+            stats.proposed_draft_tokens,
+            stats.accepted_draft_tokens,
+            stats.projected_context_cache_hits,
+            stats.verify_width_rounds,
+            stats.verify_width_accepted_draft_tokens,
+            stats.verify_width_proposed_draft_tokens,
+            stats.selector_scale_rounds,
+            stats.draft_time.as_secs_f64() * 1_000.0,
+            stats.target_verify_time.as_secs_f64() * 1_000.0,
+            stats.decode_time.as_secs_f64() * 1_000.0,
+        );
+    }
 }
 
 #[cfg(not(feature = "dflash2"))]
