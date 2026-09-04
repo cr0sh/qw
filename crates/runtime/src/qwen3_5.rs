@@ -40,10 +40,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 const MTP_DRAFT_PREFIX: i32 = 65_536;
 const MTP_DRAFT_PADDED: i32 = 65_568;
-const DFLASH_VERIFY_PREFIX: i32 = 80_896;
+pub(crate) const DFLASH_COMPACT_PREFIX: i32 = 80_896;
 const DFLASH_VERIFY_PADDED: i32 = 80_928;
-const DRAFT_CONTROL_START: i32 = 248_044;
-const DRAFT_CONTROL_END: i32 = 248_070;
+pub(crate) const DFLASH_CONTROL_START: i32 = 248_044;
+pub(crate) const DFLASH_CONTROL_END: i32 = 248_070;
+pub(crate) const DFLASH_COMPACT_TOKEN_COUNT: i32 =
+    DFLASH_COMPACT_PREFIX + DFLASH_CONTROL_END - DFLASH_CONTROL_START;
 const TURBO4_PACKED_MTP_THRESHOLD_TOKENS: i32 = 2_048;
 #[cfg(any(feature = "specprefill", test))]
 const SPECPREFILL_TARGET_CHUNK_TOKENS: usize = 512;
@@ -53,10 +55,10 @@ fn compact_rows(array: &MlxArray, prefix_len: i32, padded_len: i32) -> UniquePtr
     let prefix = mlxcel_core::slice(array, &[0, 0], &[prefix_len, columns]);
     let controls = mlxcel_core::slice(
         array,
-        &[DRAFT_CONTROL_START, 0],
-        &[DRAFT_CONTROL_END, columns],
+        &[DFLASH_CONTROL_START, 0],
+        &[DFLASH_CONTROL_END, columns],
     );
-    let real = prefix_len + DRAFT_CONTROL_END - DRAFT_CONTROL_START;
+    let real = prefix_len + DFLASH_CONTROL_END - DFLASH_CONTROL_START;
     let padding = mlxcel_core::slice(array, &[0, 0], &[padded_len - real, columns]);
     let compact = concatenate(&prefix, &controls, 0);
     concatenate(&compact, &padding, 0)
@@ -1036,11 +1038,15 @@ impl Qwen35Model {
         self.project_compact_logits(hidden, &self.compact_draft_head, MTP_DRAFT_PREFIX)
     }
 
+    /// Project onto the verifier-safe DFlash token domain: ordinary tokenizer
+    /// rows `[0, 80_896)` followed by the 26 target control-token rows
+    /// `[248_044, 248_070)`. Falls back to the full target head when the
+    /// quantized compact head is unavailable.
     pub(crate) fn project_dflash_verify_logits(&self, hidden: &MlxArray) -> UniquePtr<MlxArray> {
         self.project_compact_logits(
             hidden,
             &self.compact_dflash_verify_head,
-            DFLASH_VERIFY_PREFIX,
+            DFLASH_COMPACT_PREFIX,
         )
     }
 
@@ -1061,7 +1067,7 @@ impl Qwen35Model {
                     &[
                         shape[0],
                         shape[1],
-                        prefix_len + DRAFT_CONTROL_END - DRAFT_CONTROL_START,
+                        prefix_len + DFLASH_CONTROL_END - DFLASH_CONTROL_START,
                     ],
                 )
             },
@@ -1081,16 +1087,45 @@ impl Qwen35Model {
         if token < MTP_DRAFT_PREFIX {
             token
         } else {
-            token + DRAFT_CONTROL_START - MTP_DRAFT_PREFIX
+            token + DFLASH_CONTROL_START - MTP_DRAFT_PREFIX
         }
     }
 
+    /// Device-side MTP compact-domain remap. This is the same piecewise map as
+    /// [`Self::map_draft_token`] and keeps graph-mode draft argmax on device.
+    pub(crate) fn map_draft_tokens(tokens: &MlxArray) -> UniquePtr<MlxArray> {
+        Self::map_compact_control_tail(tokens, MTP_DRAFT_PREFIX)
+    }
+
+    /// Map one id in the compact DFlash verifier/candidate domain back to the
+    /// target tokenizer id. The only discontinuity is the control-token tail;
+    /// the mask token at `248_070` is deliberately not representable.
     pub(crate) fn map_dflash_verify_token(token: i32) -> i32 {
-        if token < DFLASH_VERIFY_PREFIX {
+        debug_assert!((0..DFLASH_COMPACT_TOKEN_COUNT).contains(&token));
+        if token < DFLASH_COMPACT_PREFIX {
             token
         } else {
-            token + DRAFT_CONTROL_START - DFLASH_VERIFY_PREFIX
+            token + DFLASH_CONTROL_START - DFLASH_COMPACT_PREFIX
         }
+    }
+
+    /// Device-side form of [`Self::map_dflash_verify_token`], used to remap a
+    /// complete top-k candidate tensor without a host synchronization.
+    #[cfg(any(feature = "dflash2", test))]
+    pub(crate) fn map_dflash_verify_tokens(tokens: &MlxArray) -> UniquePtr<MlxArray> {
+        Self::map_compact_control_tail(tokens, DFLASH_COMPACT_PREFIX)
+    }
+
+    fn map_compact_control_tail(tokens: &MlxArray, prefix: i32) -> UniquePtr<MlxArray> {
+        // MLX index operations yield unsigned index tensors. Normalize to the
+        // repository's i32 token-id contract before adding the control offset.
+        let tokens = mlxcel_core::astype(tokens, mlxcel_core::dtype::INT32);
+        let boundary = mlxcel_core::from_slice_i32(&[prefix], &[1]);
+        let offset =
+            mlxcel_core::from_slice_i32(&[DFLASH_CONTROL_START - prefix], &[1]);
+        let mapped_tail = mlxcel_core::add(&tokens, &offset);
+        let is_control = mlxcel_core::greater_equal(&tokens, &boundary);
+        mlxcel_core::where_cond(&is_control, &mapped_tail, &tokens)
     }
 
     fn make_internal_caches(&self) -> Vec<Qwen3NextCache> {
@@ -2219,7 +2254,7 @@ impl Qwen35Model {
             compact_head(
                 head,
                 config.vocab_size,
-                DFLASH_VERIFY_PREFIX,
+                DFLASH_COMPACT_PREFIX,
                 DFLASH_VERIFY_PADDED,
             )
         });
@@ -3061,6 +3096,67 @@ mod tests {
             mtp_target_cache_mode(true, KVCacheMode::Int8),
             KVCacheMode::Int8
         );
+    }
+
+    #[test]
+    fn dflash_compact_token_map_is_unique_and_excludes_the_mask() {
+        let mapped = (0..DFLASH_COMPACT_TOKEN_COUNT)
+            .map(Qwen35Model::map_dflash_verify_token)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(mapped.len(), DFLASH_COMPACT_TOKEN_COUNT as usize);
+        assert_eq!(
+            Qwen35Model::map_dflash_verify_token(DFLASH_COMPACT_PREFIX - 1),
+            DFLASH_COMPACT_PREFIX - 1
+        );
+        assert_eq!(
+            Qwen35Model::map_dflash_verify_token(DFLASH_COMPACT_PREFIX),
+            DFLASH_CONTROL_START
+        );
+        assert_eq!(
+            Qwen35Model::map_dflash_verify_token(DFLASH_COMPACT_TOKEN_COUNT - 1),
+            DFLASH_CONTROL_END - 1
+        );
+        assert!(mapped.contains(&248_044));
+        assert!(mapped.contains(&248_069));
+        assert!(
+            !mapped.contains(&248_070),
+            "the DFlash mask token is input-only and must not be generated"
+        );
+    }
+
+    #[test]
+    fn compact_token_tensor_maps_match_scalar_boundaries() {
+        let dflash_ids = mlxcel_core::from_slice_i32(
+            &[
+                0,
+                DFLASH_COMPACT_PREFIX - 1,
+                DFLASH_COMPACT_PREFIX,
+                DFLASH_COMPACT_TOKEN_COUNT - 1,
+            ],
+            &[4],
+        );
+        let mapped = Qwen35Model::map_dflash_verify_tokens(&dflash_ids);
+        mlxcel_core::eval(&mapped);
+        let mapped = mlxcel_core::array_evaluated_bytes(&mapped)
+            .chunks_exact(4)
+            .map(|bytes| i32::from_ne_bytes(bytes.try_into().expect("i32 bytes")))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mapped,
+            [0, DFLASH_COMPACT_PREFIX - 1, 248_044, 248_069]
+        );
+
+        let mtp_ids = mlxcel_core::from_slice_i32(
+            &[0, MTP_DRAFT_PREFIX - 1, MTP_DRAFT_PREFIX, MTP_DRAFT_PREFIX + 25],
+            &[4],
+        );
+        let mapped = Qwen35Model::map_draft_tokens(&mtp_ids);
+        mlxcel_core::eval(&mapped);
+        let mapped = mlxcel_core::array_evaluated_bytes(&mapped)
+            .chunks_exact(4)
+            .map(|bytes| i32::from_ne_bytes(bytes.try_into().expect("i32 bytes")))
+            .collect::<Vec<_>>();
+        assert_eq!(mapped, [0, MTP_DRAFT_PREFIX - 1, 248_044, 248_069]);
     }
 
     fn test_attention_tensor(tokens: i32, scale: f32) -> UniquePtr<MlxArray> {

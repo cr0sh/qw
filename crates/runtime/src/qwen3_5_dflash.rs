@@ -51,7 +51,7 @@
 use std::time::{Duration, Instant};
 
 use mlxcel_core::cache::SequenceId;
-use mlxcel_core::generate::{LanguageModel, ModelStateSnapshot};
+use mlxcel_core::generate::{GenerationStopReason, LanguageModel, ModelStateSnapshot};
 use mlxcel_core::layers::{
     KVCache, QuantizedWeight, RMSNorm, RotatingKVCache, UnifiedEmbedding, UnifiedLinear,
 };
@@ -369,6 +369,14 @@ impl DFlash2Config {
             ),
             None => None,
         };
+        let selector_rank = get_int("selector_rank", default_selector_rank())?;
+        let selector_top_k = get_int("selector_top_k", default_selector_top_k())?;
+        if selector_rank == 0 {
+            return Err("selector_rank must be greater than zero".to_owned());
+        }
+        if selector_top_k == 0 {
+            return Err("selector_top_k must be greater than zero".to_owned());
+        }
 
         Ok(Self {
             hidden_size,
@@ -393,8 +401,8 @@ impl DFlash2Config {
             is_causal,
             conv_kernel_size,
             conv_group_size,
-            selector_rank: get_int("selector_rank", default_selector_rank())?,
-            selector_top_k: get_int("selector_top_k", default_selector_top_k())?,
+            selector_rank,
+            selector_top_k,
             output_multiplier: get_f32("output_multiplier", default_output_multiplier())?,
             final_logit_softcapping: get("final_logit_softcapping")
                 .and_then(Value::as_f64)
@@ -1054,13 +1062,16 @@ impl CandidateSelector {
     /// - `unary` `[1, L, K]` — the transformed top-K logits.
     /// - `anchor_ids` `[1]` int32 — the token immediately before the block.
     ///
-    /// Returns the chosen draft token path `[1, L]` int32.
+    /// Returns the chosen draft token path `[1, L]` int32. `edge_scale`
+    /// calibrates the learned DFlash2/LiLiCorr-style correlation against the
+    /// unary target-head score; `1.0` is the checkpoint's exact default.
     pub fn select(
         &self,
         hidden: &MlxArray,
         candidates: &MlxArray,
         unary: &MlxArray,
         anchor_ids: &MlxArray,
+        edge_scale: f32,
     ) -> Result<SelectorOutput, String> {
         let logits_shape = mlxcel_core::array_shape(unary);
         let batch = logits_shape[0];
@@ -1105,7 +1116,11 @@ impl CandidateSelector {
                 &[0, position, 0],
                 &[batch, position + 1, k],
             );
-            let scores = mlxcel_core::add(&unary_row, &edges); // [B, K]
+            let scores = if edge_scale == 1.0 {
+                mlxcel_core::add(&unary_row, &edges)
+            } else {
+                mlxcel_core::add(&unary_row, &multiply_scalar(&edges, edge_scale))
+            }; // [B, K]
             let selected = mlxcel_core::argmax(&scores, -1, false); // [B]
             let candidate_row = mlxcel_core::slice(
                 candidates,
@@ -1121,6 +1136,43 @@ impl CandidateSelector {
         let path = mlxcel_core::stack(&path_ptrs, 1);
         Ok(SelectorOutput { path })
     }
+}
+
+/// Select an exact top-k set from either the full target vocabulary or the
+/// compact DFlash verifier domain. Compact indices are remapped only after
+/// gathering their logits, preserving candidate/value alignment on device.
+fn top_k_candidate_logits(
+    logits: &MlxArray,
+    top_k: usize,
+    compact_domain: bool,
+) -> Result<(UniquePtr<MlxArray>, UniquePtr<MlxArray>), String> {
+    let shape = mlxcel_core::array_shape(logits);
+    if shape.len() != 3 {
+        return Err(format!(
+            "DFlash2 candidate logits must have layout [batch, positions, vocab], got {shape:?}"
+        ));
+    }
+    let vocab = shape[2];
+    let k = i32::try_from(top_k).map_err(|_| "selector_top_k too large".to_owned())?;
+    if k <= 0 || k >= vocab {
+        return Err(format!(
+            "selector_top_k={k} must be in 1..{vocab} for the projected token domain"
+        ));
+    }
+    let partition = mlxcel_core::argpartition(logits, -k, -1);
+    let compact_ids = mlxcel_core::slice(
+        &partition,
+        &[0, 0, vocab - k],
+        &[shape[0], shape[1], vocab],
+    );
+    let compact_ids = mlxcel_core::contiguous(&compact_ids, false);
+    let values = mlxcel_core::take_along_axis(logits, &compact_ids, -1);
+    let target_ids = if compact_domain {
+        Qwen35Model::map_dflash_verify_tokens(&compact_ids)
+    } else {
+        compact_ids
+    };
+    Ok((target_ids, values))
 }
 
 // ---------------------------------------------------------------------------
@@ -1239,37 +1291,21 @@ impl DFlash2DraftModel {
         }
     }
 
-    /// Top-K candidates per position via the target's LM head (SGLang
-    /// `compute_candidates`): `hidden [1, L, H]` → `candidates [1, L, K]`
-    /// int32 ids + `unary [1, L, K]` transformed logits.
+    /// Top-K candidates per position via the target's compact verifier head
+    /// when available (SGLang `compute_candidates`):
+    /// `hidden [1, L, H]` → `candidates [1, L, K]` target-token ids + `unary
+    /// [1, L, K]` transformed logits. The compact projection contains 80,922
+    /// unique rows instead of all 248,320 target rows.
     pub fn compute_candidates(
         &self,
         hidden: &MlxArray,
         target: &Qwen35Model,
     ) -> Result<(UniquePtr<MlxArray>, UniquePtr<MlxArray>), String> {
-        let logits = target.project_logits(hidden);
-        let logits_shape = mlxcel_core::array_shape(&logits);
-        let k = i32::try_from(self.candidate_selector.top_k)
-            .map_err(|_| "selector_top_k too large".to_owned())?;
-        let vocab = logits_shape[2];
-        if k >= vocab {
-            return Err(format!(
-                "selector_top_k={k} must be smaller than the target vocab size {vocab}"
-            ));
-        }
-        let args = mlxcel_core::argpartition(&logits, -k, -1);
-        let candidates = mlxcel_core::slice(
-            &args,
-            &[0, 0, vocab - k],
-            &[logits_shape[0], logits_shape[1], vocab],
-        );
-        let candidates = mlxcel_core::contiguous(&candidates, false);
-        let unary = self.transform_unary_logits(&mlxcel_core::take_along_axis(
-            &logits,
-            &candidates,
-            -1,
-        ));
-        Ok((candidates, unary))
+        let compact_domain = target.has_compact_dflash_verify_head();
+        let logits = target.project_dflash_verify_logits(hidden);
+        let (candidates, unary) =
+            top_k_candidate_logits(&logits, self.candidate_selector.top_k, compact_domain)?;
+        Ok((candidates, self.transform_unary_logits(&unary)))
     }
 
     /// One masked-forward draft round: hidden → target-head top-K candidates
@@ -1280,6 +1316,7 @@ impl DFlash2DraftModel {
         target_hidden: &MlxArray,
         caches: &mut [DFlash2KVCache],
         target: &Qwen35Model,
+        selector_edge_scale: f32,
     ) -> Result<SelectorOutput, String> {
         let hidden = self.hidden_states(inputs, target_hidden, caches);
         let hidden_shape = mlxcel_core::array_shape(&hidden);
@@ -1292,8 +1329,13 @@ impl DFlash2DraftModel {
         );
         let (candidates, unary) = self.compute_candidates(&pred_hidden, target)?;
         let anchor = mlxcel_core::slice(inputs, &[0, 0], &[1, 1]);
-        self.candidate_selector
-            .select(&pred_hidden, &candidates, &unary, &anchor)
+        self.candidate_selector.select(
+            &pred_hidden,
+            &candidates,
+            &unary,
+            &anchor,
+            selector_edge_scale,
+        )
     }
 }
 
@@ -1318,6 +1360,333 @@ pub fn load_draft_weights(dir: &std::path::Path) -> Result<(WeightMap, DFlash2Co
     let config = DFlash2Config::from_json(&config_value)?;
     let weights = load_weights_from_dir(dir)?;
     Ok((weights, config))
+}
+
+// The current MLX quantized matmul path has two useful DFlash2 verify shapes.
+// Keeping the controller on this closed set avoids accumulating one compiled
+// graph per tail length while still retaining the measured long-context win of
+// width five. Tail rounds intentionally use a full static width and let exact
+// verification truncate the committed output to the caller's remaining budget.
+const DFLASH2_STATIC_VERIFY_WIDTHS: [usize; 2] = [4, 5];
+const DFLASH2_LONG_CONTEXT_TOKENS: usize = 64_000;
+const DFLASH2_SELECTOR_EDGE_SCALES: [f32; 3] = [0.75, 1.0, 1.25];
+const DFLASH2_DEFAULT_SELECTOR_ARM: usize = 1;
+const DFLASH2_CONFIDENCE_Z: f64 = 1.644_853_626_951_472_2;
+const DFLASH2_WIDTH_MIN_SAMPLES: u64 = 4;
+const DFLASH2_WIDTH_PROBE_INTERVAL: u64 = 16;
+const DFLASH2_SELECTOR_BASELINE_SAMPLES: u64 = 8;
+const DFLASH2_SELECTOR_MIN_SAMPLES: u64 = 4;
+const DFLASH2_SELECTOR_PROBE_INTERVAL: u64 = 32;
+const DFLASH2_VERIFY_WIDTH_ENV: &str = "QW_DFLASH2_VERIFY_WIDTH";
+const DFLASH2_SELECTOR_SCALE_ENV: &str = "QW_DFLASH2_SELECTOR_EDGE_SCALE";
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RunningMoments {
+    count: u64,
+    mean: f64,
+    m2: f64,
+}
+
+impl RunningMoments {
+    fn observe(&mut self, sample: f64) {
+        if !sample.is_finite() || sample <= 0.0 {
+            return;
+        }
+        self.count += 1;
+        let delta = sample - self.mean;
+        self.mean += delta / self.count as f64;
+        self.m2 += delta * (sample - self.mean);
+    }
+
+    fn confidence_bounds(self) -> Option<(f64, f64)> {
+        if self.count < DFLASH2_WIDTH_MIN_SAMPLES {
+            return None;
+        }
+        let variance = if self.count > 1 {
+            (self.m2 / (self.count - 1) as f64).max(0.0)
+        } else {
+            0.0
+        };
+        let radius = DFLASH2_CONFIDENCE_Z * (variance / self.count as f64).sqrt();
+        Some(((self.mean - radius).max(f64::MIN_POSITIVE), self.mean + radius))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PrefixSurvival {
+    trials: [u64; 4],
+    survived: [u64; 4],
+}
+
+impl PrefixSurvival {
+    fn observe(&mut self, accepted: usize, proposed: usize) {
+        for depth in 0..proposed.min(self.trials.len()) {
+            self.trials[depth] += 1;
+            if accepted > depth {
+                self.survived[depth] += 1;
+            }
+        }
+    }
+
+    /// Wilson interval for `P(accepted_prefix >= depth + 1)`.
+    fn confidence_bounds(self, depth: usize) -> Option<(f64, f64)> {
+        let n = *self.trials.get(depth)?;
+        if n < DFLASH2_SELECTOR_MIN_SAMPLES {
+            return None;
+        }
+        let p = self.survived[depth] as f64 / n as f64;
+        let z2 = DFLASH2_CONFIDENCE_Z * DFLASH2_CONFIDENCE_Z;
+        let denominator = 1.0 + z2 / n as f64;
+        let center = (p + z2 / (2.0 * n as f64)) / denominator;
+        let margin = DFLASH2_CONFIDENCE_Z
+            * ((p * (1.0 - p) + z2 / (4.0 * n as f64)) / n as f64).sqrt()
+            / denominator;
+        Some(((center - margin).max(0.0), (center + margin).min(1.0)))
+    }
+
+    /// Expected accepted-prefix length, not a global path likelihood.
+    ///
+    /// `E[A] = sum_d P(A >= d)`: a later position contributes only when every
+    /// earlier proposal survived target verification, matching speculative
+    /// decoding's actual utility.
+    fn utility_bounds(self, proposed: usize) -> Option<(f64, f64)> {
+        let mut lower = 0.0;
+        let mut upper = 0.0;
+        for depth in 0..proposed.min(self.trials.len()) {
+            let (depth_lower, depth_upper) = self.confidence_bounds(depth)?;
+            lower += depth_lower;
+            upper += depth_upper;
+        }
+        Some((lower, upper))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Dflash2ContextClass {
+    Short,
+    Long,
+}
+
+impl Dflash2ContextClass {
+    fn for_tokens(tokens: usize) -> Self {
+        if tokens >= DFLASH2_LONG_CONTEXT_TOKENS {
+            Self::Long
+        } else {
+            Self::Short
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Short => 0,
+            Self::Long => 1,
+        }
+    }
+
+    fn default_width_index(self) -> usize {
+        match self {
+            Self::Short => 0,
+            Self::Long => 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct Dflash2ContextCalibration {
+    prefix: PrefixSurvival,
+    width_latency: [RunningMoments; 2],
+    width_rounds: [u64; 2],
+    selector_prefix: [PrefixSurvival; 3],
+    selector_rounds: [u64; 3],
+    rounds: u64,
+}
+
+impl Dflash2ContextCalibration {
+    fn throughput_bounds(&self) -> Option<[(f64, f64); 2]> {
+        let (base_lower, base_upper) = self.prefix.utility_bounds(3)?;
+        let (marginal_lower, marginal_upper) = self.prefix.confidence_bounds(3)?;
+        let (narrow_latency_lower, narrow_latency_upper) =
+            self.width_latency[0].confidence_bounds()?;
+        let (wide_latency_lower, wide_latency_upper) =
+            self.width_latency[1].confidence_bounds()?;
+
+        // Every verified round emits the target bonus. Width five adds exactly
+        // one possible accepted proposal, whose marginal yield is survival to
+        // depth four. Comparing these intervals is equivalent to comparing
+        // `marginal_yield / marginal_latency`, but remains stable when the
+        // measured latency delta is close to zero.
+        let base_lower = 1.0 + base_lower;
+        let base_upper = 1.0 + base_upper;
+        Some([
+            (
+                base_lower / narrow_latency_upper,
+                base_upper / narrow_latency_lower,
+            ),
+            (
+                (base_lower + marginal_lower) / wide_latency_upper,
+                (base_upper + marginal_upper) / wide_latency_lower,
+            ),
+        ])
+    }
+
+    fn choose_width_index(&self, default: usize) -> usize {
+        if self.width_rounds[default] < DFLASH2_WIDTH_MIN_SAMPLES {
+            return default;
+        }
+        let challenger = 1 - default;
+        if self.width_rounds[challenger] < DFLASH2_WIDTH_MIN_SAMPLES {
+            return challenger;
+        }
+        if self.rounds > 0 && self.rounds.is_multiple_of(DFLASH2_WIDTH_PROBE_INTERVAL) {
+            return challenger;
+        }
+        let Some(bounds) = self.throughput_bounds() else {
+            return default;
+        };
+        if bounds[challenger].0 > bounds[default].1 {
+            challenger
+        } else {
+            default
+        }
+    }
+
+    fn choose_selector_arm(&self, proposed: usize) -> usize {
+        if self.selector_rounds[DFLASH2_DEFAULT_SELECTOR_ARM]
+            < DFLASH2_SELECTOR_BASELINE_SAMPLES
+        {
+            return DFLASH2_DEFAULT_SELECTOR_ARM;
+        }
+
+        let challenger = [0, 2]
+            .into_iter()
+            .min_by_key(|&arm| self.selector_rounds[arm])
+            .expect("selector has two calibration arms");
+        if self.selector_rounds[challenger] < DFLASH2_SELECTOR_MIN_SAMPLES {
+            return challenger;
+        }
+        if self.rounds > 0 && self.rounds.is_multiple_of(DFLASH2_SELECTOR_PROBE_INTERVAL) {
+            return challenger;
+        }
+
+        let Some((baseline_lower, baseline_upper)) =
+            self.selector_prefix[DFLASH2_DEFAULT_SELECTOR_ARM].utility_bounds(proposed)
+        else {
+            return DFLASH2_DEFAULT_SELECTOR_ARM;
+        };
+        let mut selected = DFLASH2_DEFAULT_SELECTOR_ARM;
+        let mut selected_lower = baseline_lower;
+        for arm in [0, 2] {
+            let Some((lower, _upper)) = self.selector_prefix[arm].utility_bounds(proposed) else {
+                continue;
+            };
+            // Only replace the checkpoint-compatible scale when its accepted
+            // prefix utility is confidently beaten. Ties and overlap retain the
+            // deterministic DFlash2 default.
+            if lower > baseline_upper && lower > selected_lower {
+                selected = arm;
+                selected_lower = lower;
+            }
+        }
+        selected
+    }
+
+    fn observe(
+        &mut self,
+        width_index: usize,
+        selector_arm: usize,
+        accepted: usize,
+        proposed: usize,
+        compute_latency: Duration,
+    ) {
+        self.prefix.observe(accepted, proposed);
+        self.width_latency[width_index].observe(compute_latency.as_secs_f64());
+        self.width_rounds[width_index] += 1;
+        self.selector_prefix[selector_arm].observe(accepted, proposed);
+        self.selector_rounds[selector_arm] += 1;
+        self.rounds += 1;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Dflash2RoundPolicy {
+    width_index: usize,
+    width: usize,
+    selector_arm: usize,
+    selector_edge_scale: f32,
+}
+
+#[derive(Debug, Clone, Default)]
+struct Dflash2Calibration {
+    contexts: [Dflash2ContextCalibration; 2],
+    forced_width_index: Option<usize>,
+    forced_selector_arm: Option<usize>,
+}
+
+impl Dflash2Calibration {
+    fn from_environment() -> Result<Self, String> {
+        let forced_width_index = std::env::var(DFLASH2_VERIFY_WIDTH_ENV)
+            .ok()
+            .map(|value| match value.trim() {
+                "4" => Ok(0),
+                "5" => Ok(1),
+                other => Err(format!(
+                    "{DFLASH2_VERIFY_WIDTH_ENV} must be one of 4 or 5, got {other:?}"
+                )),
+            })
+            .transpose()?;
+        let forced_selector_arm = std::env::var(DFLASH2_SELECTOR_SCALE_ENV)
+            .ok()
+            .map(|value| match value.trim() {
+                "0.75" => Ok(0),
+                "1" | "1.0" | "1.00" => Ok(1),
+                "1.25" => Ok(2),
+                other => Err(format!(
+                    "{DFLASH2_SELECTOR_SCALE_ENV} must be one of 0.75, 1.0, or 1.25, \
+                     got {other:?}"
+                )),
+            })
+            .transpose()?;
+        Ok(Self {
+            contexts: Default::default(),
+            forced_width_index,
+            forced_selector_arm,
+        })
+    }
+
+    fn policy(&self, context_tokens: usize) -> Dflash2RoundPolicy {
+        let class = Dflash2ContextClass::for_tokens(context_tokens);
+        let context = &self.contexts[class.index()];
+        let width_index = self
+            .forced_width_index
+            .unwrap_or_else(|| context.choose_width_index(class.default_width_index()));
+        let width = DFLASH2_STATIC_VERIFY_WIDTHS[width_index];
+        let selector_arm = self
+            .forced_selector_arm
+            .unwrap_or_else(|| context.choose_selector_arm(width - 1));
+        Dflash2RoundPolicy {
+            width_index,
+            width,
+            selector_arm,
+            selector_edge_scale: DFLASH2_SELECTOR_EDGE_SCALES[selector_arm],
+        }
+    }
+
+    fn observe(
+        &mut self,
+        context_tokens: usize,
+        policy: Dflash2RoundPolicy,
+        accepted: usize,
+        proposed: usize,
+        compute_latency: Duration,
+    ) {
+        self.contexts[Dflash2ContextClass::for_tokens(context_tokens).index()].observe(
+            policy.width_index,
+            policy.selector_arm,
+            accepted,
+            proposed,
+            compute_latency,
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1424,6 +1793,17 @@ pub struct Dflash2GenerationStats {
     pub reconcile_time: Duration,
     pub target_forward_calls: usize,
     pub speculative_rounds: usize,
+    /// Per-width calibration outcomes. Index 0 is verify width 4; index 1 is
+    /// verify width 5. These observable counters can be used by offline
+    /// benchmarks before pinning `QW_DFLASH2_VERIFY_WIDTH`.
+    pub verify_width_rounds: [usize; 2],
+    pub verify_width_accepted_draft_tokens: [usize; 2],
+    pub verify_width_proposed_draft_tokens: [usize; 2],
+    /// Per-selector calibration outcomes for edge scales `[0.75, 1.0, 1.25]`.
+    /// Offline runs can pin one with `QW_DFLASH2_SELECTOR_EDGE_SCALE`.
+    pub selector_scale_rounds: [usize; 3],
+    pub selector_scale_accepted_draft_tokens: [usize; 3],
+    pub selector_scale_proposed_draft_tokens: [usize; 3],
 }
 
 impl Dflash2GenerationStats {
@@ -1435,9 +1815,20 @@ impl Dflash2GenerationStats {
         }
     }
 
-    fn record_round(&mut self, accepted: usize, proposed: usize) {
+    fn record_round(
+        &mut self,
+        policy: Dflash2RoundPolicy,
+        accepted: usize,
+        proposed: usize,
+    ) {
         self.accepted_draft_tokens += accepted;
         self.proposed_draft_tokens += proposed;
+        self.verify_width_rounds[policy.width_index] += 1;
+        self.verify_width_accepted_draft_tokens[policy.width_index] += accepted;
+        self.verify_width_proposed_draft_tokens[policy.width_index] += proposed;
+        self.selector_scale_rounds[policy.selector_arm] += 1;
+        self.selector_scale_accepted_draft_tokens[policy.selector_arm] += accepted;
+        self.selector_scale_proposed_draft_tokens[policy.selector_arm] += proposed;
     }
 }
 
@@ -1445,6 +1836,30 @@ pub(crate) struct Dflash2Generation {
     pub(crate) token_ids: Vec<i32>,
     pub(crate) stats: Dflash2GenerationStats,
     pub(crate) cached_tokens: usize,
+    pub(crate) stop_reason: GenerationStopReason,
+}
+
+fn emit_initial_dflash2_token<F: FnMut(i32) -> bool>(
+    bonus: i32,
+    eos_tokens: &[i32],
+    max_tokens: usize,
+    generated: &mut Vec<i32>,
+    history: &mut Vec<i32>,
+    on_token: &mut F,
+) -> (GenerationStopReason, bool) {
+    if eos_tokens.contains(&bonus) {
+        return (GenerationStopReason::Eos, false);
+    }
+    generated.push(bonus);
+    history.push(bonus);
+    if !on_token(bonus) {
+        (GenerationStopReason::CallbackCancelled, false)
+    } else {
+        (
+            GenerationStopReason::MaxTokens,
+            generated.len() < max_tokens,
+        )
+    }
 }
 
 /// DFlash2 generation driver: prefill → speculative draft/verify rounds.
@@ -1456,7 +1871,7 @@ pub(crate) struct Dflash2Generation {
 pub struct Qwen35Dflash2Generator {
     model: DFlash2DraftModel,
     caches: Vec<DFlash2KVCache>,
-    block_size: usize,
+    calibration: Dflash2Calibration,
     target_layer_ids: Vec<usize>,
     hidden_limit: usize,
 }
@@ -1475,10 +1890,11 @@ impl Qwen35Dflash2Generator {
         } else {
             usize::MAX
         };
+        let calibration = Dflash2Calibration::from_environment()?;
         Ok(Self {
             model,
             caches,
-            block_size: 4,
+            calibration,
             target_layer_ids: config.target_layer_ids.clone(),
             hidden_limit,
         })
@@ -1533,6 +1949,7 @@ impl Qwen35Dflash2Generator {
                 token_ids: Vec::new(),
                 stats: Dflash2GenerationStats::default(),
                 cached_tokens: 0,
+                stop_reason: GenerationStopReason::MaxTokens,
             });
         }
 
@@ -1615,38 +2032,39 @@ impl Qwen35Dflash2Generator {
             prefill_time,
             ..Dflash2GenerationStats::default()
         };
-        if eos_tokens.contains(&bonus) {
-            // No tokens emitted; the caller observes the empty token list.
-        } else {
-            generated.push(bonus);
-            history.push(bonus);
-            let _ = on_token(bonus);
-        }
+        let (mut stop_reason, continue_decoding) = emit_initial_dflash2_token(
+            bonus,
+            &eos_tokens,
+            max_tokens,
+            &mut generated,
+            &mut history,
+            &mut on_token,
+        );
         let decode_start = Instant::now();
-        // Five-row verification pays off for the 64K target it was tuned on;
-        // its larger draft regresses the shorter decode paths.
-        let block_size = if prompt_tokens.len() >= 64_000 {
-            5
-        } else {
-            self.block_size
-        };
-        let mut draft_block = vec![self.model.config.mask_token_id; block_size];
+        let mut draft_block =
+            vec![self.model.config.mask_token_id; DFLASH2_STATIC_VERIFY_WIDTHS[1]];
 
-        while generated.len() < max_tokens {
+        while continue_decoding && generated.len() < max_tokens {
             let remaining = max_tokens - generated.len();
-            let bs = block_size.min(remaining + 1);
-            if bs <= 1 {
-                break;
-            }
+            let round_context_tokens = prompt_tokens.len() + generated.len();
+            let policy = self.calibration.policy(round_context_tokens);
+            let bs = policy.width;
+            let round_compute_start = Instant::now();
             let phase_start = Instant::now();
 
-            // Reuse the host block buffer; only the staged anchor changes.
+            // Reuse one maximum-width host buffer. The only staged values are
+            // the anchor and a static width from `DFLASH2_STATIC_VERIFY_WIDTHS`;
+            // a short final budget never introduces a new compiled MLX shape.
             draft_block[0] = bonus;
             let inputs =
                 mlxcel_core::from_slice_i32(&draft_block[..bs], &[1, bs as i32]);
-            let out = self
-                .model
-                .propose(&inputs, &hidden_concat, &mut self.caches, target)?;
+            let out = self.model.propose(
+                &inputs,
+                &hidden_concat,
+                &mut self.caches,
+                target,
+                policy.selector_edge_scale,
+            )?;
             mlxcel_core::async_eval(&out.path);
             stats.draft_time += phase_start.elapsed();
 
@@ -1681,7 +2099,15 @@ impl Qwen35Dflash2Generator {
                 remaining,
             );
             stats.target_verify_time += phase_start.elapsed();
-            stats.record_round(walk.accepted, draft_tokens.len());
+            let compute_latency = round_compute_start.elapsed();
+            stats.record_round(policy, walk.accepted, draft_tokens.len());
+            self.calibration.observe(
+                round_context_tokens,
+                policy,
+                walk.accepted,
+                draft_tokens.len(),
+                compute_latency,
+            );
 
             // Emit the accepted prefix (and possibly a corrected token).
             let phase_start = Instant::now();
@@ -1715,7 +2141,8 @@ impl Qwen35Dflash2Generator {
                 );
             }
             stats.reconcile_time += phase_start.elapsed();
-            if round_stop_reason.is_some() {
+            if let Some(reason) = round_stop_reason {
+                stop_reason = reason;
                 break;
             }
         }
@@ -1724,6 +2151,7 @@ impl Qwen35Dflash2Generator {
             token_ids: generated,
             stats,
             cached_tokens,
+            stop_reason,
         })
     }
 }
@@ -1783,6 +2211,47 @@ fn concatenate_hiddens(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::qwen3_5::{
+        DFLASH_COMPACT_PREFIX, DFLASH_COMPACT_TOKEN_COUNT, DFLASH_CONTROL_END,
+        DFLASH_CONTROL_START,
+    };
+    use mlxcel_core::generate::SamplingConfig;
+    use std::collections::BTreeMap;
+
+    fn raw_i32(array: &MlxArray) -> Vec<i32> {
+        mlxcel_core::eval(array);
+        mlxcel_core::array_evaluated_bytes(array)
+            .chunks_exact(4)
+            .map(|bytes| i32::from_ne_bytes(bytes.try_into().expect("i32 bytes")))
+            .collect()
+    }
+
+    fn raw_f32(array: &MlxArray) -> Vec<f32> {
+        mlxcel_core::eval(array);
+        mlxcel_core::array_evaluated_bytes(array)
+            .chunks_exact(4)
+            .map(|bytes| f32::from_ne_bytes(bytes.try_into().expect("f32 bytes")))
+            .collect()
+    }
+
+    fn candidate_map(ids: &MlxArray, logits: &MlxArray) -> BTreeMap<i32, i32> {
+        raw_i32(ids)
+            .into_iter()
+            .zip(raw_f32(logits))
+            .map(|(token, score)| (token, score as i32))
+            .collect()
+    }
+
+    fn verify_logits(target_tokens: &[i32], vocab: usize) -> UniquePtr<MlxArray> {
+        let mut logits = vec![-100.0_f32; target_tokens.len() * vocab];
+        for (position, &token) in target_tokens.iter().enumerate() {
+            logits[position * vocab + token as usize] = 100.0;
+        }
+        mlxcel_core::from_slice_f32(
+            &logits,
+            &[1, target_tokens.len() as i32, vocab as i32],
+        )
+    }
 
     fn fixture_config_json() -> Value {
         serde_json::json!({
@@ -1857,6 +2326,16 @@ mod tests {
     }
 
     #[test]
+    fn config_rejects_empty_selector_domains() {
+        for field in ["selector_rank", "selector_top_k"] {
+            let mut json = fixture_config_json();
+            json["dflash_config"][field] = serde_json::json!(0);
+            let error = DFlash2Config::from_json(&json).expect_err("zero selector dimension");
+            assert!(error.contains(field), "{error}");
+        }
+    }
+
+    #[test]
     fn config_requires_sliding_window_for_sliding_layers() {
         let mut json = fixture_config_json();
         json["sliding_window"] = Value::Null;
@@ -1864,6 +2343,240 @@ mod tests {
             DFlash2Config::from_json(&json).is_err(),
             "sliding_attention layers require sliding_window"
         );
+    }
+
+    #[test]
+    fn compact_candidate_top_k_matches_full_head_when_top_k_is_representable() {
+        let compact_len = DFLASH_COMPACT_TOKEN_COUNT as usize;
+        assert_eq!(compact_len, 80_922);
+        let peaks = [
+            (0_i32, 40.0_f32),
+            (DFLASH_COMPACT_PREFIX - 1, 50.0),
+            (DFLASH_COMPACT_PREFIX, 60.0),
+            (DFLASH_COMPACT_TOKEN_COUNT - 1, 70.0),
+        ];
+
+        let mut compact_scores = vec![-1_000.0_f32; compact_len];
+        for &(id, score) in &peaks {
+            compact_scores[id as usize] = score;
+        }
+        let compact_logits =
+            mlxcel_core::from_slice_f32(&compact_scores, &[1, 1, compact_len as i32]);
+        let (compact_ids, compact_values) =
+            top_k_candidate_logits(&compact_logits, peaks.len(), true).expect("compact top-k");
+        let compact = candidate_map(&compact_ids, &compact_values);
+
+        let mut full_scores = vec![-2_000.0_f32; 248_320];
+        for compact_id in 0..DFLASH_COMPACT_TOKEN_COUNT {
+            let target_id = Qwen35Model::map_dflash_verify_token(compact_id);
+            full_scores[target_id as usize] = compact_scores[compact_id as usize];
+        }
+        let full_logits = mlxcel_core::from_slice_f32(&full_scores, &[1, 1, 248_320]);
+        let (full_ids, full_values) =
+            top_k_candidate_logits(&full_logits, peaks.len(), false).expect("full top-k");
+        let full = candidate_map(&full_ids, &full_values);
+
+        assert_eq!(compact, full);
+        assert_eq!(
+            compact,
+            BTreeMap::from([
+                (0, 40),
+                (DFLASH_COMPACT_PREFIX - 1, 50),
+                (DFLASH_CONTROL_START, 60),
+                (DFLASH_CONTROL_END - 1, 70),
+            ])
+        );
+        assert!(
+            !compact.contains_key(&248_070),
+            "input-only mask token must not enter the candidate lattice"
+        );
+    }
+
+    #[test]
+    fn candidate_top_k_rejects_zero_and_domain_size_boundaries() {
+        let logits = mlxcel_core::zeros(&[1, 1, 4], mlxcel_core::dtype::FLOAT32);
+        assert!(top_k_candidate_logits(&logits, 0, false).is_err());
+        assert!(top_k_candidate_logits(&logits, 4, false).is_err());
+        assert!(top_k_candidate_logits(&logits, 5, false).is_err());
+        assert!(top_k_candidate_logits(&logits, 1, false).is_ok());
+    }
+
+    #[test]
+    fn adaptive_width_uses_static_defaults_until_calibrated() {
+        let calibration = Dflash2Calibration::default();
+        assert_eq!(calibration.policy(63_999).width, 4);
+        assert_eq!(calibration.policy(64_000).width, 5);
+        assert_eq!(
+            calibration.policy(usize::MAX).selector_edge_scale,
+            1.0,
+            "untrained runtime state must preserve checkpoint scoring"
+        );
+        assert!(
+            calibration
+                .contexts
+                .iter()
+                .flat_map(|context| context.width_rounds)
+                .all(|rounds| rounds == 0)
+        );
+    }
+
+    #[test]
+    fn adaptive_width_selects_prefix_survival_over_marginal_latency() {
+        let mut faster_wide = Dflash2ContextCalibration::default();
+        for _ in 0..201 {
+            faster_wide.observe(0, 1, 3, 3, Duration::from_micros(100));
+            faster_wide.observe(1, 1, 4, 4, Duration::from_micros(105));
+        }
+        assert_eq!(
+            faster_wide.choose_width_index(0),
+            1,
+            "one extra surviving prefix token pays for 5us marginal latency"
+        );
+
+        let mut expensive_wide = Dflash2ContextCalibration::default();
+        for _ in 0..201 {
+            expensive_wide.observe(0, 1, 3, 3, Duration::from_micros(100));
+            expensive_wide.observe(1, 1, 3, 4, Duration::from_micros(150));
+        }
+        assert_eq!(
+            expensive_wide.choose_width_index(1),
+            0,
+            "no depth-four survival cannot pay 50us marginal latency"
+        );
+    }
+
+    #[test]
+    fn selector_calibration_optimizes_accepted_prefix_utility() {
+        let mut context = Dflash2ContextCalibration::default();
+        for _ in 0..200 {
+            context.selector_prefix[0].observe(4, 4);
+            context.selector_rounds[0] += 1;
+            context.selector_prefix[1].observe(1, 4);
+            context.selector_rounds[1] += 1;
+            context.selector_prefix[2].observe(0, 4);
+            context.selector_rounds[2] += 1;
+        }
+        assert_eq!(context.choose_selector_arm(4), 0);
+        assert_eq!(DFLASH2_SELECTOR_EDGE_SCALES[0], 0.75);
+    }
+
+    #[test]
+    fn selector_edge_scale_changes_the_local_correlation_decision() {
+        let mut weights = WeightMap::new();
+        weights.insert(
+            "candidate_selector.predecessor_codebook".to_owned(),
+            mlxcel_core::from_slice_f32(&[1.0; 7], &[7, 1]),
+        );
+        weights.insert(
+            "candidate_selector.successor_codebook".to_owned(),
+            mlxcel_core::from_slice_f32(&[0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0], &[7, 1]),
+        );
+        weights.insert(
+            "candidate_selector.hidden_projection.weight".to_owned(),
+            mlxcel_core::from_slice_f32(&[1.0], &[1, 1]),
+        );
+        let selector = CandidateSelector::from_weights(
+            &weights,
+            &DFlash2Config {
+                hidden_size: 1,
+                selector_rank: 1,
+                selector_top_k: 2,
+                ..Default::default()
+            },
+        )
+        .expect("tiny selector");
+        let hidden = mlxcel_core::from_slice_f32(&[1.0], &[1, 1, 1]);
+        let candidates = mlxcel_core::from_slice_i32(&[1, 2], &[1, 1, 2]);
+        let unary = mlxcel_core::from_slice_f32(&[0.9, 0.0], &[1, 1, 2]);
+        let anchor = mlxcel_core::from_slice_i32(&[0], &[1]);
+
+        let unary_favored = selector
+            .select(&hidden, &candidates, &unary, &anchor, 0.75)
+            .expect("low correlation scale");
+        let correlation_favored = selector
+            .select(&hidden, &candidates, &unary, &anchor, 1.25)
+            .expect("high correlation scale");
+        assert_eq!(raw_i32(&unary_favored.path), [1]);
+        assert_eq!(raw_i32(&correlation_favored.path), [2]);
+    }
+
+    #[test]
+    fn static_width_and_selector_choices_preserve_exact_target_output() {
+        let sampling = SamplingConfig::greedy();
+        for &width in &DFLASH2_STATIC_VERIFY_WIDTHS {
+            let proposals = (1..width as i32).collect::<Vec<_>>();
+            for accepted in 0..proposals.len() {
+                let mut target_tokens = proposals.clone();
+                target_tokens[accepted] = 6;
+                target_tokens.push(0);
+                let proposal_array =
+                    mlxcel_core::from_slice_i32(&proposals, &[1, proposals.len() as i32]);
+                let logits = verify_logits(&target_tokens, 7);
+                let (walk, materialized) =
+                    crate::qwen3_5_mtp::greedy_walk_device_proposals(
+                        &proposal_array,
+                        &logits,
+                        false,
+                        &sampling,
+                        &[],
+                        width,
+                    );
+                assert_eq!(materialized, proposals);
+                assert_eq!(walk.accepted, accepted);
+                let mut expected = proposals[..accepted].to_vec();
+                expected.push(6);
+                assert_eq!(walk.new_tokens, expected);
+            }
+
+            let mut target_tokens = proposals.clone();
+            target_tokens.push(0);
+            let proposal_array =
+                mlxcel_core::from_slice_i32(&proposals, &[1, proposals.len() as i32]);
+            let logits = verify_logits(&target_tokens, 7);
+            let (walk, _) = crate::qwen3_5_mtp::greedy_walk_device_proposals(
+                &proposal_array,
+                &logits,
+                false,
+                &sampling,
+                &[],
+                width,
+            );
+            assert_eq!(walk.accepted, proposals.len());
+            assert_eq!(walk.new_tokens, target_tokens);
+
+            let (tail, _) = crate::qwen3_5_mtp::greedy_walk_device_proposals(
+                &proposal_array,
+                &logits,
+                false,
+                &sampling,
+                &[],
+                1,
+            );
+            assert_eq!(tail.new_tokens, target_tokens[..1]);
+        }
+    }
+
+    #[test]
+    fn initial_callback_cancellation_stops_before_a_verify_round() {
+        let mut generated = Vec::new();
+        let mut history = vec![3, 4];
+        let mut callbacks = 0;
+        let (reason, continue_decoding) = emit_initial_dflash2_token(
+            5,
+            &[],
+            10,
+            &mut generated,
+            &mut history,
+            &mut |_| {
+                callbacks += 1;
+                false
+            },
+        );
+        assert_eq!(reason, GenerationStopReason::CallbackCancelled);
+        assert!(!continue_decoding);
+        assert_eq!(generated, [5]);
+        assert_eq!(history, [3, 4, 5]);
+        assert_eq!(callbacks, 1);
     }
 
     /// Synthetic conv check: with `base_kernel[side][tap=0]` = 1 and
