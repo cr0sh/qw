@@ -9,6 +9,8 @@ use std::time::Duration;
 use mlxcel_core::generate::SamplingConfig;
 #[cfg(feature = "dflash2")]
 use qw_runtime::Dflash2PrefixReuse;
+#[cfg(not(feature = "dflash2"))]
+use qw_runtime::MtpGenerationStats;
 #[cfg(feature = "specprefill")]
 use qw_runtime::PrefillMode;
 #[cfg(feature = "dflash2")]
@@ -263,6 +265,25 @@ fn long_dflash2_sample(
 }
 
 #[cfg(not(feature = "dflash2"))]
+fn profile_mtp(stats: MtpGenerationStats) {
+    if env::var_os("QW_BENCH_PROFILE_MTP").is_some() {
+        eprintln!(
+            "MTP_PROFILE proposed={} accepted={} draft_materializations={} \
+             adaptive_stop_rounds={} adaptive_skipped={} draft_ms={:.3} verify_ms={:.3} \
+             decode_ms={:.3}",
+            stats.proposed_draft_tokens,
+            stats.accepted_draft_tokens,
+            stats.draft_materializations,
+            stats.adaptive_stop_rounds,
+            stats.adaptive_skipped_draft_tokens,
+            stats.draft_time.as_secs_f64() * 1_000.0,
+            stats.target_verify_time.as_secs_f64() * 1_000.0,
+            stats.decode_time.as_secs_f64() * 1_000.0,
+        );
+    }
+}
+
+#[cfg(not(feature = "dflash2"))]
 fn fresh_mtp_sample(
     provider: &mut Qwen35Provider,
     request: &GenerationRequest,
@@ -283,6 +304,7 @@ fn fresh_mtp_sample(
         stats.proposed_draft_tokens > 0,
         "fresh bundled-MTP must propose draft tokens"
     );
+    profile_mtp(stats);
     let elapsed = stats.decode_time;
     black_box(output);
     elapsed
@@ -317,6 +339,7 @@ fn long_mtp_sample(
         stats.proposed_draft_tokens > 0,
         "cached bundled-MTP must propose draft tokens"
     );
+    profile_mtp(stats);
     let elapsed = stats.decode_time;
     black_box(output);
     elapsed

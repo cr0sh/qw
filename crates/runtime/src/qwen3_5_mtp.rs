@@ -64,6 +64,14 @@ pub struct MtpGenerationStats {
     pub speculative_rounds: usize,
     pub full_state_materializations: usize,
     pub cache_snapshot_count: usize,
+    /// Device-to-host synchronization points used to materialize greedy draft
+    /// chunks. The default two-token graph chunk makes this smaller than
+    /// `proposed_draft_tokens` whenever a round drafts more than one token.
+    pub draft_materializations: usize,
+    /// Rounds whose confidence/cost gate stopped before the configured maximum.
+    pub adaptive_stop_rounds: usize,
+    /// Candidate slots skipped or omitted by the adaptive confidence/cost gate.
+    pub adaptive_skipped_draft_tokens: usize,
 }
 
 impl MtpGenerationStats {
@@ -239,6 +247,14 @@ struct Qwen35MtpDraftState {
     seed_hidden: Option<UniquePtr<MlxArray>>,
     rope_delta: Option<i32>,
     round_appended: usize,
+}
+
+#[derive(Debug, Default)]
+struct GreedyDraft {
+    tokens: Vec<i32>,
+    materializations: usize,
+    adaptively_stopped: bool,
+    skipped: usize,
 }
 
 impl Qwen35MtpDraftState {
@@ -420,7 +436,7 @@ impl Qwen35MtpDraftModel {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn draft_block_greedy(
+    fn draft_block_greedy(
         &self,
         target: &Qwen35Model,
         last_bonus: i32,
@@ -429,27 +445,30 @@ impl Qwen35MtpDraftModel {
         sampling: &SamplingConfig,
         committed_history: &[i32],
         eos_tokens: &[i32],
-    ) -> Vec<i32> {
+    ) -> GreedyDraft {
+        if target.has_compact_draft_head() && mtp_greedy_graph_eligible(sampling) {
+            return self.draft_block_greedy_graph(
+                target,
+                last_bonus,
+                target_hidden,
+                proposal_count,
+                eos_tokens,
+            );
+        }
+
+        // History-dependent penalties need each sampled token on the host
+        // before the next distribution can be formed. Keep that uncommon path
+        // exact; the default compact greedy path below is fully device-resident
+        // within each graph chunk.
         let mut state = self.state.borrow_mut();
         state.round_appended = 0;
         let compact = target.has_compact_draft_head();
         let mut tokens = Vec::with_capacity(proposal_count);
-        let mut history = (!compact).then(|| committed_history.to_vec());
+        let mut history = committed_history.to_vec();
         let mut hidden = self.draft_seed_hidden(target, last_bonus, target_hidden, &mut state);
         let mut logits = target.project_draft_logits(&hidden);
         while tokens.len() < proposal_count {
-            let token_array = if compact && sampler_is_greedy(sampling) {
-                mlxcel_core::argmax_last_axis(&logits)
-            } else {
-                sample_token_optimized(
-                    &logits,
-                    sampling,
-                    history
-                        .as_deref()
-                        .expect("non-compact drafting keeps history"),
-                )
-                .0
-            };
+            let token_array = sample_token_optimized(&logits, sampling, &history).0;
             mlxcel_core::eval(&token_array);
             let sampled = mlxcel_core::item_i32(&token_array);
             let token = if compact {
@@ -461,15 +480,126 @@ impl Qwen35MtpDraftModel {
             if eos_tokens.contains(&token) || tokens.len() == proposal_count {
                 break;
             }
-            if let Some(history) = &mut history {
-                history.push(token);
-            }
+            history.push(token);
             let token_array = mlxcel_core::from_slice_i32(&[token], &[1, 1]);
             hidden = self.forward_tokens(target, &token_array, &hidden, &mut state);
             state.round_appended += 1;
             logits = target.project_draft_logits(&hidden);
         }
-        tokens
+        let materializations = tokens.len();
+        GreedyDraft {
+            tokens,
+            materializations,
+            ..GreedyDraft::default()
+        }
+    }
+
+    fn draft_block_greedy_graph(
+        &self,
+        target: &Qwen35Model,
+        last_bonus: i32,
+        target_hidden: &MlxArray,
+        proposal_count: usize,
+        eos_tokens: &[i32],
+    ) -> GreedyDraft {
+        let mut state = self.state.borrow_mut();
+        state.round_appended = 0;
+        let mut result = GreedyDraft {
+            tokens: Vec::with_capacity(proposal_count),
+            ..GreedyDraft::default()
+        };
+        let mut survival = 1.0_f32;
+        let mut hidden = self.draft_seed_hidden(target, last_bonus, target_hidden, &mut state);
+        let mut logits = target.project_draft_logits(&hidden);
+
+        'drafting: while result.tokens.len() < proposal_count {
+            let chunk_len = MTP_DRAFT_GRAPH_CHUNK_SIZE.min(proposal_count - result.tokens.len());
+            let mut device_tokens = Vec::with_capacity(chunk_len);
+            let mut device_confidences = Vec::with_capacity(chunk_len);
+            for index in 0..chunk_len {
+                let compact_token = mlxcel_core::argmax_last_axis(&logits);
+                let token = Qwen35Model::map_draft_tokens(&compact_token);
+                let probabilities = mlxcel_core::softmax_precise(&logits, -1);
+                let confidence = mlxcel_core::astype(
+                    &mlxcel_core::max_axis(&probabilities, -1, false),
+                    mlxcel_core::dtype::FLOAT32,
+                );
+                device_tokens.push(token);
+                device_confidences.push(confidence);
+
+                if index + 1 < chunk_len {
+                    hidden = self.forward_tokens(
+                        target,
+                        device_tokens
+                            .last()
+                            .expect("draft chunk contains the current token"),
+                        &hidden,
+                        &mut state,
+                    );
+                    state.round_appended += 1;
+                    logits = target.project_draft_logits(&hidden);
+                }
+            }
+
+            let token_batch = concatenate_draft_rows(&device_tokens);
+            let confidence_batch = concatenate_draft_rows(&device_confidences);
+            let arrays = [
+                token_batch.as_ref().expect("draft token batch"),
+                confidence_batch.as_ref().expect("draft confidence batch"),
+            ]
+            .map(|array| array as *const MlxArray);
+            unsafe { mlxcel_core::eval_all(&arrays) };
+            result.materializations += 1;
+            let chunk_tokens = evaluated_i32_values(&token_batch);
+            let chunk_confidences = evaluated_f32_values(&confidence_batch);
+
+            for (index, (&token, &confidence)) in
+                chunk_tokens.iter().zip(&chunk_confidences).enumerate()
+            {
+                let marginal_benefit = survival * confidence.clamp(0.0, 1.0);
+                if !result.tokens.is_empty() && !mtp_marginal_candidate_pays(marginal_benefit) {
+                    result.adaptively_stopped = true;
+                    result.skipped = proposal_count - result.tokens.len();
+                    break 'drafting;
+                }
+                result.tokens.push(token);
+                survival = marginal_benefit;
+                if eos_tokens.contains(&token) {
+                    result.skipped = proposal_count - result.tokens.len();
+                    break 'drafting;
+                }
+                debug!(
+                    phase = "mtp.draft.adaptive",
+                    proposal = result.tokens.len(),
+                    confidence,
+                    survival,
+                    marginal_cost = MTP_ADAPTIVE_MARGINAL_COST,
+                );
+
+                if index + 1 == chunk_tokens.len() && result.tokens.len() < proposal_count {
+                    let forecast = survival * confidence.clamp(0.0, 1.0);
+                    if !mtp_marginal_candidate_pays(forecast) {
+                        result.adaptively_stopped = true;
+                        result.skipped = proposal_count - result.tokens.len();
+                        break 'drafting;
+                    }
+                }
+            }
+
+            if result.tokens.len() < proposal_count {
+                hidden = self.forward_tokens(
+                    target,
+                    device_tokens
+                        .last()
+                        .expect("non-empty draft chunk has a final token"),
+                    &hidden,
+                    &mut state,
+                );
+                state.round_appended += 1;
+                logits = target.project_draft_logits(&hidden);
+            }
+        }
+        result
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -785,6 +915,87 @@ fn materialize_detached(array: UniquePtr<MlxArray>) -> UniquePtr<MlxArray> {
     array
 }
 
+fn concatenate_draft_rows(rows: &[UniquePtr<MlxArray>]) -> UniquePtr<MlxArray> {
+    let mut combined = mlxcel_core::copy(
+        rows.first()
+            .expect("a draft graph chunk always contains at least one row"),
+    );
+    for row in &rows[1..] {
+        combined = mlxcel_core::concatenate(&combined, row, 1);
+    }
+    combined
+}
+
+fn evaluated_i32_values(array: &MlxArray) -> Vec<i32> {
+    assert_eq!(
+        mlxcel_core::array_itemsize(array),
+        std::mem::size_of::<i32>(),
+        "draft token graph must produce i32 token identifiers"
+    );
+    mlxcel_core::array_evaluated_bytes(array)
+        .chunks_exact(std::mem::size_of::<i32>())
+        .map(|bytes| i32::from_ne_bytes(bytes.try_into().expect("one i32 token")))
+        .collect()
+}
+
+fn evaluated_f32_values(array: &MlxArray) -> Vec<f32> {
+    assert_eq!(
+        mlxcel_core::array_itemsize(array),
+        std::mem::size_of::<f32>(),
+        "draft confidence graph must produce f32 values"
+    );
+    mlxcel_core::array_evaluated_bytes(array)
+        .chunks_exact(std::mem::size_of::<f32>())
+        .map(|bytes| f32::from_ne_bytes(bytes.try_into().expect("one f32 confidence")))
+        .collect()
+}
+
+fn mtp_greedy_graph_eligible(sampling: &SamplingConfig) -> bool {
+    sampler_is_greedy(sampling)
+        && sampling.token_bias.is_empty()
+        && sampling.repetition_penalty == 1.0
+        && sampling.dry_multiplier == 0.0
+        && sampling.frequency_penalty == 0.0
+        && sampling.presence_penalty == 0.0
+        && sampling.xtc_probability == 0.0
+}
+
+// Two autoregressive MTP steps are submitted as one lazy MLX graph and
+// synchronized together. MLX has no device-side while/control-flow primitive
+// that can conditionally execute a whole transformer layer, so checking every
+// candidate would restore the argmax -> eval -> item synchronization this path
+// removes. Two is the exact/default K=3 proposal width and is the smallest
+// useful graph batch for larger configured K values.
+const MTP_DRAFT_GRAPH_CHUNK_SIZE: usize = 2;
+
+// Candidate costs expressed in target-token equivalents. The fixed threshold
+// compares a request-local acceptance estimate (the cumulative draft max-softmax
+// confidence) with the measured draft-step plus incremental verify-row cost.
+// Confidence is a proxy, not a trained target-match predictor. A deterministic
+// fixed threshold avoids timing-dependent schedules while remaining request-local.
+// This follows SpecDec++'s rejection-risk threshold and DISCO's per-draft
+// confidence gate without their trained heads:
+// https://arxiv.org/abs/2405.19715
+// https://arxiv.org/abs/2405.04304
+const MTP_ADAPTIVE_MARGINAL_COST: f32 = 0.20;
+
+fn mtp_marginal_candidate_pays(expected_accepted_tokens: f32) -> bool {
+    expected_accepted_tokens >= MTP_ADAPTIVE_MARGINAL_COST
+}
+
+#[cfg(test)]
+fn adaptive_greedy_prefix_len(confidences: &[f32]) -> usize {
+    let mut survival = 1.0_f32;
+    for (index, &confidence) in confidences.iter().enumerate() {
+        let marginal_benefit = survival * confidence.clamp(0.0, 1.0);
+        if index > 0 && !mtp_marginal_candidate_pays(marginal_benefit) {
+            return index;
+        }
+        survival = marginal_benefit;
+    }
+    confidences.len()
+}
+
 fn mtp_round_reaches_cache_clear(previous: usize, emitted: usize, interval: usize) -> bool {
     mlxcel_core::memory::should_clear_cache_crossing(previous, emitted, interval)
 }
@@ -794,11 +1005,6 @@ fn target_cache_accepted_count(emitted: usize) -> usize {
 }
 
 const MTP_STATE_MATERIALIZE_INTERVAL: usize = 128;
-/// Context range where one wider verify block amortizes target-weight reads.
-/// At 32k and beyond, long-context attention is query-row dominated, so the
-/// configured base depth is faster.
-const MTP_ADAPTIVE_DEPTH_MIN_CONTEXT: usize = 8_192;
-const MTP_ADAPTIVE_DEPTH_MAX_CONTEXT: usize = 32_768;
 
 // Variable MTP verify shapes accumulate reusable Metal buffers much faster than
 // ordinary one-token decode. Keep a bounded cache, but retain those buffers
@@ -875,25 +1081,6 @@ fn trim_draft_cache(cache: &mut KVCache, round_appended: usize, accepted: usize)
 
 fn round_proposal_count(block_size: usize, remaining: usize) -> usize {
     block_size.saturating_sub(1).min(remaining)
-}
-fn adaptive_proposal_count(block_size: usize, remaining: usize, extend: bool) -> usize {
-    if extend {
-        block_size.min(remaining)
-    } else {
-        round_proposal_count(block_size, remaining)
-    }
-}
-
-fn should_extend_greedy_draft(
-    greedy: bool,
-    prompt_tokens: usize,
-    accepted: usize,
-    proposed: usize,
-) -> bool {
-    greedy
-        && prompt_tokens >= MTP_ADAPTIVE_DEPTH_MIN_CONTEXT
-        && prompt_tokens < MTP_ADAPTIVE_DEPTH_MAX_CONTEXT
-        && accepted.saturating_add(1) >= proposed
 }
 
 fn logits_at(logits: &MlxArray, position: usize) -> UniquePtr<MlxArray> {
@@ -2314,22 +2501,20 @@ impl Qwen35MtpGenerator {
             let mut next_hidden =
                 finish_drafter_prefill(model, drafter, prefill_input, prefill, first_token);
             let mut bonus = first_token;
-            let mut extend_greedy_draft = false;
             let mut verify_tokens = Vec::with_capacity(block_size.saturating_add(1));
 
             while generated.len() < max_tokens {
                 let emitted_before = generated.len();
                 let remaining = max_tokens - generated.len();
                 let greedy = sampler_is_greedy(&sampling);
-                let proposal_count =
-                    adaptive_proposal_count(block_size, remaining, extend_greedy_draft);
+                let proposal_count = round_proposal_count(block_size, remaining);
                 if proposal_count == 0 {
                     break;
                 }
                 let phase_start = Instant::now();
-                let (draft_tokens, proposal_probs) = if greedy {
-                    (
-                        drafter.draft_block_greedy(
+                let (draft_tokens, proposal_probs, draft_materializations, adaptive_stop, skipped) =
+                    if greedy {
+                        let draft = drafter.draft_block_greedy(
                             model,
                             bonus,
                             &next_hidden,
@@ -2337,22 +2522,31 @@ impl Qwen35MtpGenerator {
                             &sampling,
                             &history,
                             &eos_tokens,
-                        ),
-                        None,
-                    )
-                } else {
-                    let proposals = drafter.draft_block_stochastic(
-                        model,
-                        bonus,
-                        &next_hidden,
-                        proposal_count,
-                        &sampling,
-                        &history,
-                        &eos_tokens,
-                    );
-                    let tokens = proposals.iter().map(|proposal| proposal.token).collect();
-                    (tokens, Some(proposals))
-                };
+                        );
+                        (
+                            draft.tokens,
+                            None,
+                            draft.materializations,
+                            draft.adaptively_stopped,
+                            draft.skipped,
+                        )
+                    } else {
+                        let proposals = drafter.draft_block_stochastic(
+                            model,
+                            bonus,
+                            &next_hidden,
+                            proposal_count,
+                            &sampling,
+                            &history,
+                            &eos_tokens,
+                        );
+                        let tokens = proposals.iter().map(|proposal| proposal.token).collect();
+                        let materializations = proposals.len();
+                        (tokens, Some(proposals), materializations, false, 0)
+                    };
+                mtp_stats.draft_materializations += draft_materializations;
+                mtp_stats.adaptive_stop_rounds += usize::from(adaptive_stop);
+                mtp_stats.adaptive_skipped_draft_tokens += skipped;
                 mtp_stats.draft_time += phase_start.elapsed();
                 if draft_tokens.is_empty() {
                     break;
@@ -2365,14 +2559,7 @@ impl Qwen35MtpGenerator {
                     &verify_tokens,
                     &[1, i32::try_from(verify_tokens.len()).unwrap_or(i32::MAX)],
                 );
-                let compact_verify = greedy
-                    && sampling.token_bias.is_empty()
-                    && sampling.repetition_penalty == 1.0
-                    && sampling.dry_multiplier == 0.0
-                    && sampling.frequency_penalty == 0.0
-                    && sampling.presence_penalty == 0.0
-                    && sampling.xtc_probability == 0.0
-                    && remaining > block_size;
+                let compact_verify = mtp_greedy_graph_eligible(&sampling) && remaining > block_size;
                 let phase_start = Instant::now();
                 let verify = model.forward_mtp_verify_with_compact(&verify_input, compact_verify);
                 mlxcel_core::eval(&verify.logits);
@@ -2402,12 +2589,6 @@ impl Qwen35MtpGenerator {
                 mtp_stats.walk_time += phase_start.elapsed();
                 let phase_start = Instant::now();
                 mtp_stats.record_round(walk.accepted, draft_tokens.len());
-                extend_greedy_draft = should_extend_greedy_draft(
-                    greedy,
-                    prompt_tokens.len(),
-                    walk.accepted,
-                    draft_tokens.len(),
-                );
 
                 let round_stop_reason = emit_walk_tokens(
                     &walk.new_tokens,
@@ -3256,20 +3437,10 @@ mod tests {
     }
 
     #[test]
-    fn k_two_k_three_and_budget_clamping_use_verify_block_semantics() {
+    fn configured_k_and_budget_clamp_the_maximum_verify_block() {
         assert_eq!(round_proposal_count(2, 8), 1);
         assert_eq!(round_proposal_count(3, 8), 2);
         assert_eq!(round_proposal_count(3, 1), 1);
-        assert_eq!(adaptive_proposal_count(3, 8, false), 2);
-        assert_eq!(adaptive_proposal_count(3, 8, true), 3);
-        assert_eq!(adaptive_proposal_count(3, 2, true), 2);
-        assert!(!should_extend_greedy_draft(true, 8_191, 2, 2));
-        assert!(should_extend_greedy_draft(true, 8_192, 1, 2));
-        assert!(should_extend_greedy_draft(true, 8_192, 2, 3));
-        assert!(!should_extend_greedy_draft(true, 8_192, 1, 3));
-        assert!(!should_extend_greedy_draft(false, 8_192, 3, 3));
-        assert!(should_extend_greedy_draft(true, 32_767, 2, 2));
-        assert!(!should_extend_greedy_draft(true, 32_768, 2, 2));
         assert_eq!(speculative_walk(&[1], &[1, 2], 2).new_tokens, [1, 2]);
         assert_eq!(
             speculative_walk(&[1, 2], &[1, 2, 3], 3).new_tokens,
@@ -3278,6 +3449,72 @@ mod tests {
         let clamped = speculative_walk(&[1, 2], &[1, 2, 3], 1);
         assert_eq!(clamped.accepted, 2);
         assert_eq!(clamped.new_tokens, [1]);
+    }
+
+    #[test]
+    fn adaptive_marginal_gate_has_static_inclusive_boundaries() {
+        assert_eq!(adaptive_greedy_prefix_len(&[]), 0);
+        assert_eq!(adaptive_greedy_prefix_len(&[0.0]), 1);
+        assert_eq!(adaptive_greedy_prefix_len(&[1.0, 0.199_999]), 1);
+        assert_eq!(
+            adaptive_greedy_prefix_len(&[1.0, MTP_ADAPTIVE_MARGINAL_COST]),
+            2,
+            "benefit equal to cost is retained"
+        );
+        assert_eq!(adaptive_greedy_prefix_len(&[0.5, 0.5, 0.5]), 2);
+        assert_eq!(adaptive_greedy_prefix_len(&[1.0, f32::NAN]), 1);
+    }
+
+    #[test]
+    fn greedy_graph_requires_history_independent_exact_argmax_sampling() {
+        assert!(mtp_greedy_graph_eligible(&SamplingConfig::greedy()));
+        let mut penalized = SamplingConfig::greedy();
+        penalized.repetition_penalty = 1.1;
+        assert!(!mtp_greedy_graph_eligible(&penalized));
+        let mut biased = SamplingConfig::greedy();
+        biased.token_bias.insert(17, 1.0);
+        assert!(!mtp_greedy_graph_eligible(&biased));
+    }
+
+    #[test]
+    fn adaptive_verify_lengths_preserve_the_exact_greedy_target_stream() {
+        fn decode_with_lengths(target: &[i32], lengths: &[usize]) -> Vec<i32> {
+            let mut output = Vec::new();
+            let mut round = 0;
+            while output.len() < target.len() {
+                let proposals = lengths[round % lengths.len()]
+                    .min(target.len().saturating_sub(output.len() + 1));
+                let draft = target[output.len()..output.len() + proposals].to_vec();
+                let verify_end = (output.len() + proposals + 1).min(target.len());
+                let verify = target[output.len()..verify_end].to_vec();
+                let remaining = target.len() - output.len();
+                output.extend(speculative_walk(&draft, &verify, remaining).new_tokens);
+                round += 1;
+            }
+            output.truncate(target.len());
+            output
+        }
+
+        let target = [3, 1, 4, 1, 5, 9, 2, 6, 5];
+        assert_eq!(decode_with_lengths(&target, &[1]), target);
+        assert_eq!(decode_with_lengths(&target, &[2, 1, 2]), target);
+    }
+
+    #[test]
+    fn greedy_graph_batch_preserves_argmax_first_tie_and_device_mapping() {
+        let first_logits = logits_rows(&[&[7.0, 7.0, 1.0]]);
+        let second_logits = logits_rows(&[&[0.0, 2.0, 9.0]]);
+        let first = mlxcel_core::argmax_last_axis(&first_logits);
+        let second = mlxcel_core::argmax_last_axis(&second_logits);
+        let rows = vec![first, second];
+        let batch = concatenate_draft_rows(&rows);
+        mlxcel_core::eval(&batch);
+        assert_eq!(evaluated_i32_values(&batch), [0, 2]);
+
+        let compact = mlxcel_core::from_slice_i32(&[65_535, 65_536, 65_567], &[1, 3]);
+        let canonical = Qwen35Model::map_draft_tokens(&compact);
+        mlxcel_core::eval(&canonical);
+        assert_eq!(evaluated_i32_values(&canonical), [65_535, 248_044, 248_075]);
     }
 
     #[test]
