@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""Run a command while holding QW's machine-wide advisory GPU lock."""
+
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+from pathlib import Path
+import shlex
+import sys
+import time
+
+
+LOCK_PATH = Path.home() / ".cache" / "qw" / "gpu_lock"
+SESSION_ENV_VARS = (
+    "QW_GPU_LOCK_SESSION",
+    "OMP_SESSION_ID",
+    "TMUX_PANE",
+    "TERM_SESSION_ID",
+    "CI_JOB_ID",
+)
+
+
+def usage() -> str:
+    return "usage: ./gpu-lock -- COMMAND [ARG ...]"
+
+
+def session_label() -> str:
+    for name in SESSION_ENV_VARS:
+        value = os.environ.get(name)
+        if value:
+            return f"{name}={value}"
+    try:
+        return f"sid={os.getsid(0)}"
+    except OSError:
+        return "unknown"
+
+
+def read_holder(fd: int) -> str:
+    try:
+        payload = os.pread(fd, 4096, 0).decode("utf-8", errors="replace").strip()
+    except OSError:
+        return "metadata unavailable"
+    return payload or "metadata unavailable"
+
+
+def write_holder(fd: int, command: list[str], session: str) -> None:
+    metadata = {
+        "pid": os.getpid(),
+        "ppid": os.getppid(),
+        "session": session,
+        "cwd": os.getcwd(),
+        "command": shlex.join(command),
+        "acquired_unix_ns": time.time_ns(),
+    }
+    payload = (json.dumps(metadata, sort_keys=True) + "\n").encode("utf-8")
+    os.ftruncate(fd, 0)
+    os.pwrite(fd, payload, 0)
+    os.fsync(fd)
+
+
+def run(command: list[str]) -> int:
+    LOCK_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o600)
+    waited = False
+    wait_started = time.monotonic()
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            waited = True
+            print(
+                f"gpu-lock: waiting for {LOCK_PATH}; current holder {read_holder(fd)}",
+                file=sys.stderr,
+                flush=True,
+            )
+            fcntl.flock(fd, fcntl.LOCK_EX)
+
+        session = session_label()
+        write_holder(fd, command, session)
+        waited_suffix = (
+            f" after {time.monotonic() - wait_started:.3f}s" if waited else ""
+        )
+        print(
+            f"gpu-lock: acquired {LOCK_PATH}{waited_suffix}; "
+            f"holder pid={os.getpid()} session={session} command={shlex.join(command)}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+        # Python opens descriptors close-on-exec by default. Make this descriptor
+        # inheritable so the exec'd command itself owns the lock. Its normal exit,
+        # signal termination, or explicit descriptor close releases the flock.
+        os.set_inheritable(fd, True)
+        child_env = os.environ.copy()
+        child_env["QW_GPU_LOCK_FD"] = str(fd)
+        child_env["QW_GPU_LOCK_PATH"] = os.fspath(LOCK_PATH)
+        os.execvpe(command[0], command, child_env)
+    except FileNotFoundError:
+        print(f"gpu-lock: command not found: {command[0]}", file=sys.stderr)
+        return 127
+    except PermissionError:
+        print(f"gpu-lock: command is not executable: {command[0]}", file=sys.stderr)
+        return 126
+    except OSError as error:
+        print(f"gpu-lock: cannot execute {command[0]}: {error}", file=sys.stderr)
+        return 126
+    finally:
+        os.close(fd)
+
+
+def main(argv: list[str]) -> int:
+    if argv in (["-h"], ["--help"]):
+        print(usage())
+        return 0
+    if len(argv) < 2 or argv[0] != "--":
+        print(usage(), file=sys.stderr)
+        return 2
+    return run(argv[1:])
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

@@ -70,6 +70,21 @@ qw stats
 
 For a more detailed manual, use `--help` — or just ask your LLM.
 
+## GPU command serialization
+
+GPU tests, benchmarks, and smoke commands can be serialized across worktrees and
+agent sessions with the repository wrapper:
+
+```bash
+./gpu-lock -- cargo test -p mlxcel-core
+./gpu-lock -- target/release/deps/single_user_throughput-HASH single_user_decode/long_10k_mtp_k3
+```
+
+The wrapper takes a blocking exclusive advisory lock on the persistent
+`~/.cache/qw/gpu_lock` file, reports the current holder while waiting, and
+replaces itself with the command so exit statuses and signals propagate
+unchanged. Do not delete the lock file.
+
 ## Performance
 
 QW aims to be fast enough for daily use. Below is the benchmark table from
