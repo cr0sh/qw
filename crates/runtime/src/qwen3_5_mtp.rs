@@ -32,7 +32,8 @@ use mlxcel_core::generate::{
 use mlxcel_core::generation_policy::{merged_eos_token_ids, seed_rng_if_needed};
 use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedLinear};
 use mlxcel_core::sampling::{
-    effective_token_distribution, sample_token_optimized, sample_token_with_distribution,
+    TokenBiasMap, effective_token_distribution, sample_token_optimized,
+    sample_token_with_distribution,
 };
 use mlxcel_core::speculative::mtp::speculative_walk;
 use mlxcel_core::speculative::mtp::walk::WalkResult;
@@ -443,17 +444,21 @@ impl Qwen35MtpDraftModel {
         target_hidden: &MlxArray,
         proposal_count: usize,
         sampling: &SamplingConfig,
+        compact_sampling: Option<&SamplingConfig>,
         committed_history: &[i32],
         eos_tokens: &[i32],
     ) -> GreedyDraft {
-        let supports_token_bias = target.mtp_draft_graph_supports_token_bias(&sampling.token_bias);
+        let compact = compact_sampling.is_some();
+        let supports_token_bias = !target.has_compact_draft_head() || compact;
+        let draft_sampling = compact_sampling.unwrap_or(sampling);
         if mtp_greedy_graph_eligible(sampling, supports_token_bias) {
             return self.draft_block_greedy_graph(
                 target,
                 last_bonus,
                 target_hidden,
                 proposal_count,
-                sampling,
+                &draft_sampling.token_bias,
+                compact,
                 eos_tokens,
             );
         }
@@ -462,15 +467,20 @@ impl Qwen35MtpDraftModel {
         // before the next distribution can be formed. Keep that uncommon path
         // exact; the default plain-greedy path below is fully device-resident
         // within each graph chunk.
+        // Active bias for a row omitted by the compact head takes this path
+        // with the full target projection and the original sampling config.
         let mut state = self.state.borrow_mut();
         state.round_appended = 0;
-        let compact = target.has_compact_draft_head();
         let mut tokens = Vec::with_capacity(proposal_count);
         let mut history = committed_history.to_vec();
         let mut hidden = self.draft_seed_hidden(target, last_bonus, target_hidden, &mut state);
-        let mut logits = target.project_draft_logits(&hidden);
+        let mut logits = if compact {
+            target.project_draft_logits(&hidden)
+        } else {
+            target.project_logits(&hidden)
+        };
         while tokens.len() < proposal_count {
-            let token_array = sample_token_optimized(&logits, sampling, &history).0;
+            let token_array = sample_token_optimized(&logits, draft_sampling, &history).0;
             mlxcel_core::eval(&token_array);
             let sampled = mlxcel_core::item_i32(&token_array);
             let token = if compact {
@@ -486,7 +496,11 @@ impl Qwen35MtpDraftModel {
             let token_array = mlxcel_core::from_slice_i32(&[token], &[1, 1]);
             hidden = self.forward_tokens(target, &token_array, &hidden, &mut state);
             state.round_appended += 1;
-            logits = target.project_draft_logits(&hidden);
+            logits = if compact {
+                target.project_draft_logits(&hidden)
+            } else {
+                target.project_logits(&hidden)
+            };
         }
         let materializations = tokens.len();
         GreedyDraft {
@@ -502,7 +516,8 @@ impl Qwen35MtpDraftModel {
         last_bonus: i32,
         target_hidden: &MlxArray,
         proposal_count: usize,
-        sampling: &SamplingConfig,
+        draft_bias: &TokenBiasMap,
+        compact: bool,
         eos_tokens: &[i32],
     ) -> GreedyDraft {
         let mut state = self.state.borrow_mut();
@@ -513,16 +528,18 @@ impl Qwen35MtpDraftModel {
         };
         let mut survival = 1.0_f32;
         let mut hidden = self.draft_seed_hidden(target, last_bonus, target_hidden, &mut state);
-        let mut logits = target.project_draft_logits(&hidden);
-        let compact = target.has_compact_draft_head();
+        let mut logits = if compact {
+            target.project_draft_logits(&hidden)
+        } else {
+            target.project_logits(&hidden)
+        };
 
         'drafting: while result.tokens.len() < proposal_count {
             let chunk_len = MTP_DRAFT_GRAPH_CHUNK_SIZE.min(proposal_count - result.tokens.len());
             let mut device_tokens = Vec::with_capacity(chunk_len);
             let mut device_confidences = Vec::with_capacity(chunk_len);
             for index in 0..chunk_len {
-                let sampled_logits =
-                    mlxcel_core::sampling::apply_token_bias(&logits, &sampling.token_bias);
+                let sampled_logits = mlxcel_core::sampling::apply_token_bias(&logits, draft_bias);
                 let sampled = mlxcel_core::argmax_last_axis(&sampled_logits);
                 let token = if compact {
                     Qwen35Model::map_draft_tokens(&sampled)
@@ -547,7 +564,11 @@ impl Qwen35MtpDraftModel {
                         &mut state,
                     );
                     state.round_appended += 1;
-                    logits = target.project_draft_logits(&hidden);
+                    logits = if compact {
+                        target.project_draft_logits(&hidden)
+                    } else {
+                        target.project_logits(&hidden)
+                    };
                 }
             }
 
@@ -606,7 +627,11 @@ impl Qwen35MtpDraftModel {
                     &mut state,
                 );
                 state.round_appended += 1;
-                logits = target.project_draft_logits(&hidden);
+                logits = if compact {
+                    target.project_draft_logits(&hidden)
+                } else {
+                    target.project_logits(&hidden)
+                };
             }
         }
         result
@@ -958,6 +983,12 @@ fn evaluated_f32_values(array: &MlxArray) -> Vec<f32> {
         .chunks_exact(std::mem::size_of::<f32>())
         .map(|bytes| f32::from_ne_bytes(bytes.try_into().expect("one f32 confidence")))
         .collect()
+}
+
+fn sampling_with_token_bias(sampling: &SamplingConfig, token_bias: TokenBiasMap) -> SamplingConfig {
+    let mut mapped = sampling.clone();
+    mapped.token_bias = token_bias;
+    mapped
 }
 
 fn mtp_greedy_graph_eligible(sampling: &SamplingConfig, supports_token_bias: bool) -> bool {
@@ -2461,6 +2492,14 @@ impl Qwen35MtpGenerator {
                 cached_tokens: 0,
             });
         }
+        let greedy = sampler_is_greedy(&sampling);
+        let compact_draft_sampling = if greedy && model.has_compact_draft_head() {
+            model
+                .compact_mtp_token_bias(&sampling.token_bias)
+                .map(|token_bias| sampling_with_token_bias(&sampling, token_bias))
+        } else {
+            None
+        };
 
         let prefill_start = Instant::now();
         let (prefill, cached_tokens, prompt_snapshots) = match prefill_input {
@@ -2516,7 +2555,7 @@ impl Qwen35MtpGenerator {
             while generated.len() < max_tokens {
                 let emitted_before = generated.len();
                 let remaining = max_tokens - generated.len();
-                let greedy = sampler_is_greedy(&sampling);
+
                 let proposal_count = round_proposal_count(block_size, remaining);
                 if proposal_count == 0 {
                     break;
@@ -2530,6 +2569,7 @@ impl Qwen35MtpGenerator {
                             &next_hidden,
                             proposal_count,
                             &sampling,
+                            compact_draft_sampling.as_ref(),
                             &history,
                             &eos_tokens,
                         );
@@ -3477,7 +3517,7 @@ mod tests {
     }
 
     #[test]
-    fn greedy_graph_requires_history_independent_exact_argmax_sampling() {
+    fn compact_mtp_graph_requires_history_independent_exact_bias_domain() {
         assert!(mtp_greedy_graph_eligible(&SamplingConfig::greedy(), true));
         let mut penalized = SamplingConfig::greedy();
         penalized.repetition_penalty = 1.1;
@@ -3486,6 +3526,56 @@ mod tests {
         biased.token_bias.insert(17, 1.0);
         assert!(mtp_greedy_graph_eligible(&biased, true));
         assert!(!mtp_greedy_graph_eligible(&biased, false));
+    }
+
+    #[test]
+    fn compact_mtp_host_sampling_replaces_only_token_bias() {
+        let mut sampling = SamplingConfig::default();
+        sampling.temperature = 0.7;
+        sampling.top_k = 23;
+        sampling.top_p = 0.8;
+        sampling.min_p = 0.04;
+        sampling.seed = Some(42);
+        sampling.repetition_penalty = 1.1;
+        sampling.dry_multiplier = 0.3;
+        sampling.dry_base = 1.6;
+        sampling.dry_allowed_length = 4;
+        sampling.dry_penalty_last_n = 64;
+        sampling.dry_sequence_breakers = vec![10, 11];
+        sampling.frequency_penalty = 0.2;
+        sampling.presence_penalty = 0.1;
+        sampling.stop_token_ids = vec![248_044, 248_046];
+        sampling.token_bias.insert(248_044, -2.0);
+        sampling.xtc_probability = 0.25;
+        sampling.xtc_threshold = 0.15;
+        sampling.xtc_special_token_ids = vec![12, 13];
+
+        let mut compact_bias = TokenBiasMap::new();
+        compact_bias.insert_byte_fragment(65_536, -2.0);
+        let mapped = sampling_with_token_bias(&sampling, compact_bias);
+
+        assert_eq!(mapped.temperature, sampling.temperature);
+        assert_eq!(mapped.top_k, sampling.top_k);
+        assert_eq!(mapped.top_p, sampling.top_p);
+        assert_eq!(mapped.min_p, sampling.min_p);
+        assert_eq!(mapped.seed, sampling.seed);
+        assert_eq!(mapped.repetition_penalty, sampling.repetition_penalty);
+        assert_eq!(mapped.dry_multiplier, sampling.dry_multiplier);
+        assert_eq!(mapped.dry_base, sampling.dry_base);
+        assert_eq!(mapped.dry_allowed_length, sampling.dry_allowed_length);
+        assert_eq!(mapped.dry_penalty_last_n, sampling.dry_penalty_last_n);
+        assert_eq!(mapped.dry_sequence_breakers, sampling.dry_sequence_breakers);
+        assert_eq!(mapped.frequency_penalty, sampling.frequency_penalty);
+        assert_eq!(mapped.presence_penalty, sampling.presence_penalty);
+        assert_eq!(mapped.stop_token_ids, sampling.stop_token_ids);
+        assert_eq!(mapped.loop_detection, sampling.loop_detection);
+        assert_eq!(mapped.xtc_probability, sampling.xtc_probability);
+        assert_eq!(mapped.xtc_threshold, sampling.xtc_threshold);
+        assert_eq!(mapped.xtc_special_token_ids, sampling.xtc_special_token_ids);
+        assert_eq!(mapped.token_bias.get(&65_536), Some(&-2.0));
+        assert!(mapped.token_bias.is_byte_fragment(65_536));
+        assert!(!mapped.token_bias.contains(248_044));
+        assert_eq!(sampling.token_bias.get(&248_044), Some(&-2.0));
     }
 
     #[test]

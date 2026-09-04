@@ -91,6 +91,34 @@ fn compact_head(
     })
 }
 
+fn compact_mtp_token_bias_for_vocab(
+    vocab_size: usize,
+    bias: &TokenBiasMap,
+) -> Option<TokenBiasMap> {
+    let mut compact = TokenBiasMap::new();
+    for (&token, &value) in bias.iter() {
+        if value == 0.0 {
+            continue;
+        }
+        if token < 0 || token as usize >= vocab_size {
+            continue;
+        }
+        let compact_token = if token < MTP_DRAFT_PREFIX {
+            token
+        } else if (DFLASH_CONTROL_START..DFLASH_CONTROL_END).contains(&token) {
+            MTP_DRAFT_PREFIX + token - DFLASH_CONTROL_START
+        } else {
+            return None;
+        };
+        if bias.is_byte_fragment(token) {
+            compact.insert_byte_fragment(compact_token, value);
+        } else {
+            compact.insert(compact_token, value);
+        }
+    }
+    Some(compact)
+}
+
 // Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Qwen35Config {
@@ -1079,15 +1107,13 @@ impl Qwen35Model {
         self.compact_draft_head.is_some()
     }
 
-    // `apply_token_bias` ignores ids outside the actual logits tensor. Such
-    // entries are no-ops for a compact head and do not prevent graph batching.
-    pub(crate) fn mtp_draft_graph_supports_token_bias(&self, bias: &TokenBiasMap) -> bool {
-        if self.compact_draft_head.is_none() {
-            return true;
-        }
-        let compact_token_count = MTP_DRAFT_PREFIX + DFLASH_CONTROL_END - DFLASH_CONTROL_START;
-        bias.iter()
-            .all(|(&token, _)| token < 0 || token >= compact_token_count)
+    /// Map target-vocabulary token bias into the compact MTP draft domain.
+    ///
+    /// Active bias for an in-vocabulary row omitted by the compact head cannot
+    /// be represented exactly, so `None` requires the caller to use the full
+    /// target head. Zero bias and out-of-vocabulary ids remain harmless.
+    pub(crate) fn compact_mtp_token_bias(&self, bias: &TokenBiasMap) -> Option<TokenBiasMap> {
+        compact_mtp_token_bias_for_vocab(self.config.vocab_size, bias)
     }
 
     #[cfg(any(feature = "dflash2", test))]
@@ -3104,6 +3130,59 @@ mod tests {
             mtp_target_cache_mode(true, KVCacheMode::Int8),
             KVCacheMode::Int8
         );
+    }
+
+    #[test]
+    fn compact_mtp_bias_maps_prefix_and_control_boundaries() {
+        let mut bias = TokenBiasMap::new();
+        bias.insert(17, 2.0);
+        bias.insert(DFLASH_CONTROL_START, 3.0);
+        bias.insert_byte_fragment(DFLASH_CONTROL_END - 1, 4.0);
+
+        let compact =
+            compact_mtp_token_bias_for_vocab(248_320, &bias).expect("representable MTP bias");
+        assert_eq!(compact.get(&17), Some(&2.0));
+        assert_eq!(compact.get(&MTP_DRAFT_PREFIX), Some(&3.0));
+        assert_eq!(compact.get(&(MTP_DRAFT_PREFIX + 25)), Some(&4.0));
+        assert!(compact.is_byte_fragment(MTP_DRAFT_PREFIX + 25));
+        assert_eq!(compact.byte_fragment_len(), 1);
+    }
+
+    #[test]
+    fn compact_mtp_bias_requires_full_head_for_active_omitted_rows() {
+        for token in [DFLASH_CONTROL_END, 100_000] {
+            let mut bias = TokenBiasMap::new();
+            bias.insert(token, 1.0);
+            assert!(
+                compact_mtp_token_bias_for_vocab(248_320, &bias).is_none(),
+                "active omitted target id {token} must use the full head"
+            );
+        }
+
+        let mut mixed = TokenBiasMap::new();
+        mixed.insert(17, 2.0);
+        mixed.insert(DFLASH_CONTROL_START, 3.0);
+        mixed.insert(DFLASH_CONTROL_END, 1.0);
+        assert!(
+            compact_mtp_token_bias_for_vocab(248_320, &mixed).is_none(),
+            "one active omitted id must force full-head fallback for the complete map"
+        );
+    }
+
+    #[test]
+    fn compact_mtp_bias_ignores_zero_and_out_of_vocabulary_entries() {
+        let mut bias = TokenBiasMap::new();
+        bias.insert(17, 2.0);
+        bias.insert(100_000, 0.0);
+        bias.insert(DFLASH_CONTROL_END, -0.0);
+        bias.insert(-1, 7.0);
+        bias.insert(248_320, 8.0);
+        bias.insert(i32::MAX, 9.0);
+
+        let compact =
+            compact_mtp_token_bias_for_vocab(248_320, &bias).expect("harmless bias entries");
+        assert_eq!(compact.len(), 1);
+        assert_eq!(compact.get(&17), Some(&2.0));
     }
 
     #[test]
