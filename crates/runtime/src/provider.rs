@@ -2775,7 +2775,7 @@ mod tests {
                 &stop_sampling,
                 DEFAULT_MTP_BLOCK_SIZE,
                 None,
-                &[],
+                &[prompt_ids.len()],
                 None,
                 |token| {
                     callback_tokens.push(token);
@@ -2794,8 +2794,8 @@ mod tests {
         assert!(!callback_tokens.contains(&candidate_token));
         assert!(!stopped.token_ids.contains(&candidate_token));
         assert!(
-            terminal_tail < Duration::from_secs(10),
-            "terminal snapshot must not replay the prompt: tail={terminal_tail:?}"
+            terminal_tail < Duration::from_secs(1),
+            "terminal snapshot must reuse the prompt checkpoint: tail={terminal_tail:?}"
         );
         let snapshot = stopped
             .final_snapshot
