@@ -2016,6 +2016,8 @@ impl Qwen35Dflash2Generator {
             hidden_limit,
         })
     }
+    /// Capture an extendable prefix without finalizing initial prefill.
+    /// Generation finalizes it at the eventual full prompt boundary.
     pub fn capture_prompt_snapshot(
         &mut self,
         target: &Qwen35Model,
@@ -2029,10 +2031,12 @@ impl Qwen35Dflash2Generator {
             prompt_tokens,
             &[1, i32::try_from(prompt_tokens.len()).unwrap_or(i32::MAX)],
         );
-        let prefill = target.forward_dflash_prefill(
+        let prefill = target.forward_dflash_prefill_segment(
             &prompt_array,
             &self.target_layer_ids,
             self.hidden_limit,
+            true,
+            false,
         )?;
         Dflash2PromptSnapshot::capture(
             target,
@@ -2084,21 +2088,23 @@ impl Qwen35Dflash2Generator {
         let mut start = cached_tokens;
         for token_len in boundaries.into_iter().chain(std::iter::once(prompt_tokens.len())) {
             if token_len == start {
+                // A restored standalone prefix may still hold initial FP16
+                // state. Finalization is idempotent for already-finished
+                // prompt and terminal snapshots.
+                target.finish_dflash_prefill();
                 continue;
             }
             let input = mlxcel_core::from_slice_i32(
                 &prompt_tokens[start..token_len],
                 &[1, (token_len - start) as i32],
             );
-            let prefill = if start == 0 {
-                target.forward_dflash_prefill(&input, &self.target_layer_ids, self.hidden_limit)?
-            } else {
-                target.forward_dflash_continuation(
-                    &input,
-                    &self.target_layer_ids,
-                    self.hidden_limit,
-                )?
-            };
+            let prefill = target.forward_dflash_prefill_segment(
+                &input,
+                &self.target_layer_ids,
+                self.hidden_limit,
+                start == 0,
+                token_len == prompt_tokens.len(),
+            )?;
             if need_hidden {
                 hidden = Some(match hidden.take() {
                     Some(prefix) => {
@@ -3104,6 +3110,23 @@ mod tests {
         ).expect("uninterrupted uncached generation");
         assert_eq!(control.token_ids.len(), 48, "fixture must reach the requested token budget");
         assert!(control.prompt_snapshots.is_empty() && control.final_snapshot.is_none());
+
+        // Capture alone must not change the live target's numerical state.
+        // This control keeps precisely the cold prefill execution schedule.
+        let prompt_checkpointed = provider.generate_dflash2_baseline_streaming(
+            &prompt, 48, &sampling, &draft_dir, None, &[prompt.len()], true, |_| true,
+        ).expect("capture full prompt and terminal without structural segmentation");
+        assert_eq!(prompt_checkpointed.token_ids, control.token_ids);
+        assert_eq!(
+            prompt_checkpointed.prompt_snapshots.iter()
+                .map(PromptSnapshot::token_len).collect::<Vec<_>>(),
+            [prompt.len()]
+        );
+        assert_eq!(
+            prompt_checkpointed.final_snapshot.as_ref().expect("terminal capture control").token_len(),
+            prompt.len() + control.token_ids.len()
+        );
+        drop(prompt_checkpointed);
 
         let boundary = prompt.len() - 17;
         let mut checkpointed = provider.generate_dflash2_baseline_streaming(
