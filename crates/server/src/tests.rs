@@ -457,7 +457,6 @@ async fn real_responses_sse_measures_multiturn_and_structural_prefix_latency() {
         3,
         DecoderConfig {
             mode: Qwen35GenerationMode::Mtp,
-            crossover_tokens: 6_000,
             dflash2_draft_model: std::path::PathBuf::new(),
         },
         KVCacheMode::Turbo4,

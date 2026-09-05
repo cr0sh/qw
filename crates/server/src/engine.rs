@@ -227,16 +227,11 @@ fn current_turn_policy(
 #[derive(Debug, Clone)]
 pub struct DecoderConfig {
     pub mode: Qwen35GenerationMode,
-    pub crossover_tokens: usize,
     pub dflash2_draft_model: PathBuf,
 }
 
 impl DecoderConfig {
     fn validate(&self) -> Result<()> {
-        ensure!(
-            self.crossover_tokens > 0,
-            "--decoder-crossover-tokens must be greater than zero"
-        );
         if self.mode == Qwen35GenerationMode::Dflash2 {
             ensure!(
                 self.dflash2_draft_model.is_dir(),
@@ -1241,8 +1236,6 @@ impl QwenWorker {
         let provider = Qwen35Provider::load(model_path, kv_cache_mode)?;
         select_qwen35_decoder(
             decoder.mode,
-            0,
-            decoder.crossover_tokens,
             provider.has_mtp(),
             decoder.dflash2_available(),
             true,
@@ -1506,8 +1499,6 @@ impl QwenWorker {
             !has_images && constraint.is_none() && sampler_is_greedy(&sampling);
         let routed_decoder = match select_qwen35_decoder(
             self.decoder.mode,
-            prompt_ids.len(),
-            self.decoder.crossover_tokens,
             mtp_available,
             self.decoder.dflash2_available(),
             dflash2_compatible,
@@ -1834,7 +1825,6 @@ impl QwenWorker {
             decoder = ?decoder,
             configured_decoder = ?self.decoder.mode,
             prompt_tokens = prompt_ids.len(),
-            crossover_tokens = self.decoder.crossover_tokens,
             dflash2_available = self.decoder.dflash2_available(),
             dflash2_compatible,
         );
@@ -2594,8 +2584,7 @@ mod tests {
             std::env::temp_dir().join(format!("qw-missing-dflash-{}", std::process::id()));
         let automatic = DecoderConfig {
             mode: Qwen35GenerationMode::Automatic,
-            crossover_tokens: 6_000,
-            dflash2_draft_model: unavailable.clone(),
+            dflash2_draft_model: unavailable,
         };
         automatic
             .validate()
@@ -2605,12 +2594,6 @@ mod tests {
             ..automatic
         };
         assert!(explicit.validate().is_err());
-        let zero_crossover = DecoderConfig {
-            mode: Qwen35GenerationMode::Baseline,
-            crossover_tokens: 0,
-            dflash2_draft_model: unavailable,
-        };
-        assert!(zero_crossover.validate().is_err());
     }
 
     #[test]
