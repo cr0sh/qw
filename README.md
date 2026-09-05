@@ -99,28 +99,52 @@ unchanged. Do not delete the lock file.
 
 ## Performance
 
-QW aims to be fast enough for daily use. Below is the benchmark table from
-tag v0.1.0. You can reproduce it with `cargo bench`. The benchmark was run on
-a Mac Studio with an Apple M4 Max chip, 64 GB of memory, and a 40-core GPU.
+Latest recorded local measurements for the default oQ4e checkpoint and Turbo4
+cache, collected on September 2–4, 2026, on a Mac Studio with an Apple M4 Max
+chip, 64 GB of memory, and a 40-core GPU. These are separate runs, not a single
+benchmark of the current revision or the v0.1.0 release.
 
    |  | fresh | 10k | 64k |
    |---|------:|-----:|-----:|
-   | **prefill** | 254.27 | 221.07 | 97.08 |
-   | **decode (baseline)** | 27.20 | 21.65 | 12.80 |
-   | **decode (MTP)** | 58.20 | 53.38 | 35.66 |
+   | **prefill** | 253.737 | 231.129 | 153.974 |
+   | **decode (baseline, historical)** | 27.595 | 21.914 | 12.856 |
+   | **decode (MTP)** | 57.710 | 53.782 | 36.903 |
 
-All values are tokens/s; `10k`/`64k` are prefilled prompt lengths in tokens.
+All values are tokens/s. Fresh prefill processes 4,341 tokens; `10k`/`64k`
+prefill processes a 288-token suffix after cached prefixes of 10,337/64,297
+tokens, not the entire history. Decode measures 127 tokens after the first token.
 
-The automatic decoder boundary comes from the local greedy decode measurements
-below. Linear interpolation between the fresh and 10k deltas crosses at 5,980
-prompt tokens; the stable configured boundary is rounded to 6,000.
+Prefill comes from the September 4 six-case run at `1a36b3b`; MTP comes from
+the grouped-attention runs merged as `f4887cb`, using the latest 10k repeat.
+Baseline decode retains the September 2 Criterion point estimates: the newer
+six-case harness no longer measures ordinary baseline decode. The newer rows
+report total tokens divided by total phase time over three timed repetitions,
+after one untimed warmup.
+
+Latest greedy decoder measurements:
 
    | decoder | fresh | 10k | 64k |
    |---|------:|-----:|-----:|
-   | **MTP** | 56.697 | 52.037 | 36.279 |
-   | **DFlash2** | 55.284 | 52.987 | 37.814 |
+   | **MTP** | 57.710 | 53.782 | 36.903 |
+   | **DFlash2** | 57.510 | 56.477 | 40.050 |
 
-All decoder values are tokens/s.
+All decoder values are tokens/s. DFlash2 comes from the September 4 combined
+optimization runs merged through `7ada6d4`; 64k uses the latest confirmation
+(40.050), not the earlier 40.268 result. Long-context timed DFlash2 repetitions
+reuse the same live prompt snapshot and exact suffix, including projected-context
+cache hits; these are warm-reuse measurements, not cold-request throughput.
+
+The configured automatic boundary remains 6,000 prompt tokens. It was calibrated
+from an earlier MTP/DFlash2 comparison (5,980 tokens by linear interpolation),
+not recomputed from the separate latest runs above.
+
+Reproduce the current prefill and DFlash2 cases with:
+
+```bash
+./gpu-lock -- cargo bench -p qw-runtime --bench single_user_throughput
+```
+
+For the prefill and bundled-MTP cases, add `--no-default-features`.
 
 QW stores prefix caches under `~/.cache/qw/checkpoint`. Disk usage is capped at
 16 GB by default; the hard ceiling is twice the configured limit.
