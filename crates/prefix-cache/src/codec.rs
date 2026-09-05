@@ -42,6 +42,9 @@ pub struct Manifest {
     pub draft_family: Option<String>,
     #[serde(deserialize_with = "required_option")]
     pub draft_offset: Option<i32>,
+    #[cfg(feature = "dflash2")]
+    #[serde(deserialize_with = "required_option")]
+    pub hidden_offset: Option<usize>,
     pub arrays: Vec<ArrayDescriptor>,
     pub paged_tensors: Vec<PagedTensorDescriptor>,
     pub retention: RetentionMetadata,
@@ -94,6 +97,10 @@ pub enum ArrayRole {
     TargetContinuation,
     DraftTensor,
     DraftContinuation,
+    #[cfg(feature = "dflash2")]
+    DflashHidden,
+    #[cfg(feature = "dflash2")]
+    DflashContinuation,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContentBlob {
@@ -148,17 +155,22 @@ pub fn encode_portable(
         #[cfg(feature = "dflash2")]
         PortablePromptSnapshot::Dflash2 { target, .. } => target.token_len,
     };
-    if t.is_empty()
-        || len != t.len()
-        || !matches!(
-            (r, &p),
-            (SnapshotRoute::Baseline, PortablePromptSnapshot::Baseline(_))
-                | (SnapshotRoute::Mtp, PortablePromptSnapshot::Mtp { .. })
-        )
-    {
+    let route_matches = match (&p, r) {
+        (PortablePromptSnapshot::Baseline(_), SnapshotRoute::Baseline)
+        | (PortablePromptSnapshot::Mtp { .. }, SnapshotRoute::Mtp) => true,
+        #[cfg(feature = "dflash2")]
+        (PortablePromptSnapshot::Dflash2 { .. }, SnapshotRoute::Dflash2) => true,
+        _ => false,
+    };
+    if t.is_empty() || len != t.len() || !route_matches {
         return Err("portable snapshot route and token length must match the cache entry".into());
     }
     validate_resume_metadata(t, res.as_ref())?;
+    #[cfg(feature = "dflash2")]
+    let hidden_offset = match &p {
+        PortablePromptSnapshot::Dflash2 { hidden_offset, .. } => Some(*hidden_offset),
+        _ => None,
+    };
     let (f, df, off, dense, paged) = flatten(p)?;
     let mut blobs = Vec::new();
     let mut seen = HashSet::new();
@@ -238,6 +250,8 @@ pub fn encode_portable(
         family: f,
         draft_family: df,
         draft_offset: off,
+        #[cfg(feature = "dflash2")]
+        hidden_offset,
         arrays,
         paged_tensors,
         retention: ret,
@@ -246,6 +260,7 @@ pub fn encode_portable(
         blob_sha256: blobs.iter().map(|b| b.sha256.clone()).collect(),
         total_bytes: total,
     };
+    validate_manifest(ns, &m)?;
     Ok(EncodedEntry {
         key: entry_key(ns, r, t),
         manifest: serde_json::to_vec(&m).map_err(|e| e.to_string())?,
@@ -336,6 +351,8 @@ fn validate_manifest(ns: &str, m: &Manifest) -> Result<(), String> {
     let family_metadata_valid = match (&m.route, &m.draft_offset, &m.draft_family) {
         (SnapshotRoute::Baseline, None, None) => true,
         (SnapshotRoute::Mtp, Some(_), Some(family)) => !family.is_empty(),
+        #[cfg(feature = "dflash2")]
+        (SnapshotRoute::Dflash2, None, None) => true,
         _ => false,
     };
     if m.family.is_empty()
@@ -344,7 +361,20 @@ fn validate_manifest(ns: &str, m: &Manifest) -> Result<(), String> {
     {
         return Err("cache manifest is missing model state".into());
     }
-    let mut total = 0;
+    #[cfg(feature = "dflash2")]
+    if m.route == SnapshotRoute::Dflash2 {
+        validate_dflash_manifest(m)?;
+    } else if m.hidden_offset.is_some()
+        || m.arrays.iter().any(|a| {
+            matches!(a.role, ArrayRole::DflashHidden | ArrayRole::DflashContinuation)
+        })
+        || m.paged_tensors.iter().any(|a| {
+            matches!(a.role, ArrayRole::DflashHidden | ArrayRole::DflashContinuation)
+        })
+    {
+        return Err("non-DFlash2 manifest contains DFlash2 state".into());
+    }
+    let mut total = 0u64;
     let mut sizes = HashMap::new();
     for a in &m.arrays {
         if a.shape.is_empty()
@@ -383,13 +413,114 @@ fn validate_manifest(ns: &str, m: &Manifest) -> Result<(), String> {
         }
     }
     for n in sizes.values() {
-        total += *n
+        total = total.checked_add(*n).ok_or("cache payload byte count overflow")?;
     }
     if total != m.total_bytes {
         return Err("cache payload byte count does not match manifest".into());
     }
     Ok(())
 }
+
+#[cfg(feature = "dflash2")]
+fn validate_dflash_manifest(m: &Manifest) -> Result<(), String> {
+    use mlxcel_core::dtype::{BFLOAT16, FLOAT16, FLOAT32};
+
+    let offset = m.hidden_offset.ok_or("DFlash2 manifest is missing hidden offset")?;
+    let mut names = HashSet::new();
+    let mut singleton_roles = HashSet::new();
+    for array in &m.arrays {
+        validate_dflash_array(&array.shape, array.dtype, array.byte_len)?;
+        match array.role {
+            ArrayRole::TargetTensor => {
+                let name = array.name.as_deref().ok_or("DFlash2 target tensor is unnamed")?;
+                if name.is_empty() || !names.insert(name) {
+                    return Err("DFlash2 target tensor names must be unique and nonempty".into());
+                }
+            }
+            ArrayRole::TargetContinuation
+            | ArrayRole::DflashHidden
+            | ArrayRole::DflashContinuation => {
+                if array.name.is_some() || !singleton_roles.insert(array.role) {
+                    return Err("DFlash2 auxiliary tensor is named or duplicated".into());
+                }
+                if array.shape.len() != 3
+                    || array.shape[0] != 1
+                    || !matches!(array.dtype, FLOAT16 | FLOAT32 | BFLOAT16)
+                {
+                    return Err("DFlash2 auxiliary tensor must be floating-point [1, rows, width]".into());
+                }
+                if array.role == ArrayRole::DflashHidden {
+                    if offset.checked_add(array.shape[1] as usize) != Some(m.token_len) {
+                        return Err("DFlash2 hidden context does not match the target boundary".into());
+                    }
+                } else if array.shape[1] != 1 {
+                    return Err("DFlash2 continuation logits must have one row".into());
+                }
+            }
+            _ => return Err("DFlash2 manifest contains a tensor from another route".into()),
+        }
+    }
+    if !singleton_roles.contains(&ArrayRole::DflashHidden)
+        || !singleton_roles.contains(&ArrayRole::DflashContinuation)
+    {
+        return Err("DFlash2 manifest is missing hidden context or continuation logits".into());
+    }
+    for tensor in &m.paged_tensors {
+        if tensor.role != ArrayRole::TargetTensor
+            || tensor.name.is_empty()
+            || !names.insert(tensor.name.as_str())
+            || tensor.token_len != m.token_len
+        {
+            return Err("DFlash2 target page role, name, or boundary is invalid".into());
+        }
+        let first = tensor.pages.first().ok_or("DFlash2 target pages are empty")?;
+        for page in &tensor.pages {
+            validate_dflash_array(&page.shape, page.dtype, page.byte_len)?;
+            if page.shape.len() != first.shape.len()
+                || page.dtype != first.dtype
+                || page.shape.get(tensor.token_axis).map(|&n| n as usize)
+                    != page.token_end.checked_sub(page.token_start)
+                || page.shape.iter().zip(&first.shape).enumerate().any(|(axis, (a, b))| {
+                    axis != tensor.token_axis && a != b
+                })
+            {
+                return Err("DFlash2 target page layout is inconsistent".into());
+            }
+        }
+    }
+    if names.is_empty() {
+        return Err("DFlash2 manifest is missing target model state".into());
+    }
+    let referenced = m.arrays.iter().map(|a| a.blob_sha256.as_str())
+        .chain(m.paged_tensors.iter().flat_map(|t| t.pages.iter().map(|p| p.blob_sha256.as_str())))
+        .collect::<HashSet<_>>();
+    if m.blob_sha256.len() != referenced.len()
+        || m.blob_sha256.iter().any(|digest| !referenced.contains(digest.as_str()))
+        || m.blob_sha256.iter().collect::<HashSet<_>>().len() != referenced.len()
+    {
+        return Err("DFlash2 blob set does not match tensor descriptors".into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "dflash2")]
+fn validate_dflash_array(shape: &[i32], dtype: i32, byte_len: u64) -> Result<(), String> {
+    use mlxcel_core::dtype::*;
+
+    if shape.is_empty() || shape.iter().any(|&n| n <= 0)
+        || !matches!(dtype, UINT8 | INT8 | UINT32 | UINT64 | INT32 | INT64 | FLOAT16 | FLOAT32 | BFLOAT16)
+    {
+        return Err("DFlash2 tensor shape or dtype is invalid".into());
+    }
+    let bytes = shape.iter().try_fold(size_bytes(dtype).unwrap() as u64, |bytes, &n| {
+        bytes.checked_mul(n as u64)
+    }).ok_or("DFlash2 tensor byte length overflow")?;
+    if bytes != byte_len {
+        return Err("DFlash2 tensor byte length does not match shape and dtype".into());
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_resume_metadata(
     t: &[i32],
     m: Option<&ResponseResumeMetadata>,
@@ -465,8 +596,20 @@ fn flatten(
             Ok((f, Some(df), Some(draft_offset), d, p))
         }
         #[cfg(feature = "dflash2")]
-        PortablePromptSnapshot::Dflash2 { .. } => {
-            Err("DFlash2 snapshots are not supported by the prefix cache".into())
+        PortablePromptSnapshot::Dflash2 {
+            target,
+            hidden_concat,
+            continuation_logits,
+            ..
+        } => {
+            let (f, mut d, p) = m(
+                target,
+                ArrayRole::TargetTensor,
+                ArrayRole::TargetContinuation,
+            );
+            d.push((ArrayRole::DflashHidden, hidden_concat));
+            d.push((ArrayRole::DflashContinuation, continuation_logits));
+            Ok((f, None, None, d, p))
         }
     }
 }
@@ -499,6 +642,10 @@ fn inflate(
             ArrayRole::DraftTensor => dr.tensors.push(a),
             ArrayRole::LastHidden => h = Some(a),
             ArrayRole::MtpContinuation => c = Some(a),
+            #[cfg(feature = "dflash2")]
+            ArrayRole::DflashHidden => h = Some(a),
+            #[cfg(feature = "dflash2")]
+            ArrayRole::DflashContinuation => c = Some(a),
             _ => {}
         }
     }
@@ -508,6 +655,15 @@ fn inflate(
             ArrayRole::DraftTensor => dr.paged_tensors.push(a),
             _ => {}
         }
+    }
+    #[cfg(feature = "dflash2")]
+    if m.route == SnapshotRoute::Dflash2 {
+        return Ok(PortablePromptSnapshot::Dflash2 {
+            target: t,
+            hidden_concat: h.ok_or("DFlash2 manifest is missing hidden context")?,
+            hidden_offset: m.hidden_offset.ok_or("DFlash2 manifest is missing hidden offset")?,
+            continuation_logits: c.ok_or("DFlash2 manifest is missing continuation logits")?,
+        });
     }
     if m.route == SnapshotRoute::Baseline {
         Ok(PortablePromptSnapshot::Baseline(t))
