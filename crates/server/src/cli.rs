@@ -9,9 +9,7 @@ use clap_derive::{Args as DeriveArgs, ValueEnum};
 use qw_prefix_cache::CacheConfig;
 #[cfg(feature = "dflash2")]
 use qw_runtime::resolve_dflash2_draft_path;
-use qw_runtime::{
-    DEFAULT_DECODER_CROSSOVER_TOKENS, KVCacheMode, Qwen35GenerationMode, resolve_model_path,
-};
+use qw_runtime::{KVCacheMode, Qwen35GenerationMode, resolve_model_path};
 use tracing::info;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::Layer as _;
@@ -154,13 +152,9 @@ pub struct ServerArgs {
     #[arg(long = "mtp-k", default_value_t = 3)]
     mtp_k: usize,
 
-    /// Decoder policy. Explicit values ignore the context crossover.
+    /// Decoder policy. Auto prefers available, compatible DFlash2, then available MTP, then baseline.
     #[arg(long, value_enum, default_value = "auto")]
     decoder: Decoder,
-
-    /// Prompt-token boundary where automatic routing changes from MTP to DFlash.
-    #[arg(long, default_value_t = DEFAULT_DECODER_CROSSOVER_TOKENS)]
-    decoder_crossover_tokens: usize,
 
     /// DFlash2 draft checkpoint directory; defaults to QW_DFLASH_DRAFT_MODEL_PATH or the model cache.
     #[arg(long)]
@@ -229,10 +223,6 @@ fn validate_cli(cli: &ServerArgs) -> Result<()> {
         "--prefix-cache-filesystem-bytes must be greater than zero"
     );
     ensure!(cli.mtp_k >= 2, "--mtp-k must be at least 2");
-    ensure!(
-        cli.decoder_crossover_tokens > 0,
-        "--decoder-crossover-tokens must be greater than zero"
-    );
     #[cfg(not(feature = "dflash2"))]
     ensure!(
         cli.decoder != Decoder::Dflash2,
@@ -375,7 +365,6 @@ pub async fn serve(cli: ServerArgs) -> Result<()> {
         cli.mtp_k,
         crate::DecoderConfig {
             mode: cli.decoder.generation_mode(),
-            crossover_tokens: cli.decoder_crossover_tokens,
             dflash2_draft_model: dflash_draft_model,
         },
         kv_cache_mode,
@@ -393,12 +382,12 @@ pub async fn serve(cli: ServerArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Decoder, OutputFormat, ServerArgs, parse_si_bytes, persistent_log_format,
+        OutputFormat, ServerArgs, parse_si_bytes, persistent_log_format,
         resolve_persistent_log_filter, resolve_prefix_cache_directory, validate_cli,
     };
     use clap::{CommandFactory as _, Parser as _};
     use clap_derive::Parser;
-    use qw_runtime::{DEFAULT_DECODER_CROSSOVER_TOKENS, KVCacheMode};
+    use qw_runtime::KVCacheMode;
     use std::fs::OpenOptions;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tracing_subscriber::{EnvFilter, Layer as _, layer::SubscriberExt as _};
@@ -842,55 +831,6 @@ mod tests {
             "--specprefill-keep-rate",
             "--specprefill-keep-first-tokens",
             "--specprefill-keep-last-tokens",
-        ] {
-            assert!(help.contains(option), "{help}");
-        }
-    }
-
-    #[test]
-    fn cli_exposes_stable_decoder_policy_defaults_and_overrides() {
-        let default =
-            TestCli::try_parse_from(["qw-server", "--model", "/tmp/checkpoint"]).expect("CLI");
-        assert_eq!(default.args.decoder, Decoder::Automatic);
-        assert_eq!(
-            default.args.decoder_crossover_tokens,
-            DEFAULT_DECODER_CROSSOVER_TOKENS
-        );
-        assert_eq!(default.args.dflash_draft_model, None);
-
-        let explicit = TestCli::try_parse_from([
-            "qw-server",
-            "--model",
-            "/tmp/checkpoint",
-            "--decoder",
-            "dflash",
-            "--decoder-crossover-tokens",
-            "8192",
-            "--dflash-draft-model",
-            "/tmp/dflash",
-        ])
-        .expect("explicit decoder CLI");
-        assert_eq!(explicit.args.decoder, Decoder::Dflash2);
-        assert_eq!(explicit.args.decoder_crossover_tokens, 8192);
-        assert_eq!(
-            explicit.args.dflash_draft_model.as_deref(),
-            Some(std::path::Path::new("/tmp/dflash"))
-        );
-
-        let invalid = TestCli::try_parse_from(["qw-server", "--decoder-crossover-tokens", "0"])
-            .expect("crossover reaches startup validation");
-        assert_eq!(
-            validate_cli(&invalid.args)
-                .expect_err("zero crossover")
-                .to_string(),
-            "--decoder-crossover-tokens must be greater than zero"
-        );
-
-        let help = TestCli::command().render_long_help().to_string();
-        for option in [
-            "--decoder",
-            "--decoder-crossover-tokens",
-            "--dflash-draft-model",
         ] {
             assert!(help.contains(option), "{help}");
         }
