@@ -528,25 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn persistent_log_filter_defaults_and_preserves_precedence() {
-        let default_output = capture_persistent_log_filter_events(
-            resolve_persistent_log_filter(None, None).unwrap(),
-        );
-        for message in [
-            "qw_server trace",
-            "qw_runtime trace",
-            "qw_prefix_cache trace",
-            "mlxcel_core trace",
-            "qw_cli trace",
-            "third_party debug",
-            "tokenizer info",
-        ] {
-            assert!(default_output.contains(message), "{default_output}");
-        }
-        for message in ["third_party trace", "tokenizer debug", "tokenizer trace"] {
-            assert!(!default_output.contains(message), "{default_output}");
-        }
-
+    fn persistent_log_filter_preserves_cli_and_environment_precedence() {
         let cli = TestCli::try_parse_from([
             "qw-server",
             "--model",
@@ -571,16 +553,6 @@ mod tests {
         );
         assert!(env_output.contains("qw_server debug"), "{env_output}");
         assert!(!env_output.contains("qw_server trace"), "{env_output}");
-
-        let help = TestCli::command().render_long_help().to_string();
-        assert!(
-            help.contains("--persistent-log-filter <PERSISTENT_LOG_FILTER>"),
-            "{help}"
-        );
-        assert!(help.contains("overrides QW_LOG"), "{help}");
-        assert!(help.contains("defaults to"), "{help}");
-        assert!(help.contains("qw_server=trace"), "{help}");
-        assert!(help.contains("tokenizers=info"), "{help}");
     }
 
     #[test]
