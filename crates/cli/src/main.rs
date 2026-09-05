@@ -415,6 +415,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let _ = tracing_subscriber::fmt()
                 .with_env_filter(tracing_filter)
                 .with_ansi(false)
+                .with_writer(std::io::stderr)
                 .try_init();
             #[cfg(not(feature = "dflash2"))]
             if args.decoder == Decoder::Dflash2 {
