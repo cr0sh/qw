@@ -1497,22 +1497,6 @@ impl Qwen35Model {
     }
 
     #[cfg(any(feature = "dflash2", test))]
-    /// DFlash2 prefill: chunked backbone forward that also captures the
-    /// post-layer hidden state at each `target_layer_ids[i]`, keeping only the
-    /// last `hidden_limit` rows per layer (dropping leading rows once over the
-    /// limit, as the drafter's sliding window bounds the context the draft
-    /// layers can attend to). After all chunks, `hidden_concat` is the
-    /// per-layer hiddens concatenated along `-1`.
-    pub(crate) fn forward_dflash_prefill(
-        &self,
-        input_ids: &MlxArray,
-        target_layer_ids: &[usize],
-        hidden_limit: usize,
-    ) -> std::result::Result<Qwen35DflashPrefill, String> {
-        self.forward_dflash_prefill_segment(input_ids, target_layer_ids, hidden_limit, true, true)
-    }
-
-    #[cfg(any(feature = "dflash2", test))]
     pub(crate) fn forward_dflash_continuation(
         &self,
         input_ids: &MlxArray,
@@ -2644,11 +2628,9 @@ fn push_attention_snapshot(
     cache: &KVCache,
 ) -> bool {
     match cache.mode {
-        KVCacheMode::Turbo4 => cache
-            .turbo4_snapshot_tensors()
-            .is_some_and(|tensors| {
-                push_turbo4_snapshot_tensors(snapshot, previous, index, tensors).is_ok()
-            }),
+        KVCacheMode::Turbo4 => cache.turbo4_snapshot_tensors().is_some_and(|tensors| {
+            push_turbo4_snapshot_tensors(snapshot, previous, index, tensors).is_ok()
+        }),
         KVCacheMode::Fp16 => {
             let (Some(keys), Some(values)) = (cache.keys.as_deref(), cache.values.as_deref())
             else {
@@ -2729,7 +2711,11 @@ fn validate_snapshot_tensor_names(
     if actual_dense.len() + actual_paged.len()
         != snapshot.tensor_count() + snapshot.paged_tensor_names().count()
         || !actual_dense.is_disjoint(&actual_paged)
-        || actual_dense.union(&actual_paged).cloned().collect::<BTreeSet<_>>() != expected
+        || actual_dense
+            .union(&actual_paged)
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            != expected
     {
         return Err("Qwen3.5 snapshot tensor layout does not match the loaded model".to_string());
     }
@@ -2994,7 +2980,9 @@ impl LanguageModel for Qwen35Model {
                         })?;
                     let shape = mlxcel_core::array_shape(&tensor);
                     let packed = suffix.ends_with("_packed");
-                    let head_dim = self.config.head_dim
+                    let head_dim = self
+                        .config
+                        .head_dim
                         .unwrap_or(self.config.hidden_size / self.config.num_attention_heads);
                     let width = if packed { head_dim / 2 } else { 1 };
                     let dtype = if packed {
@@ -3009,7 +2997,9 @@ impl LanguageModel for Qwen35Model {
                         || shape[3] != width as i32
                         || mlxcel_core::array_dtype(&tensor) != dtype
                     {
-                        return Err(format!("Qwen3.5 snapshot layer {index} {suffix} layout mismatch"));
+                        return Err(format!(
+                            "Qwen3.5 snapshot layer {index} {suffix} layout mismatch"
+                        ));
                     }
                     Ok(tensor)
                 };
@@ -3050,14 +3040,19 @@ impl LanguageModel for Qwen35Model {
                     || key_shape[0] != 1
                     || key_shape[1] != self.config.num_key_value_heads as i32
                     || key_shape[2] != token_len
-                    || key_shape[3] != self.config.head_dim
-                        .unwrap_or(self.config.hidden_size / self.config.num_attention_heads) as i32
+                    || key_shape[3]
+                        != self
+                            .config
+                            .head_dim
+                            .unwrap_or(self.config.hidden_size / self.config.num_attention_heads)
+                            as i32
                     || mlxcel_core::array_dtype(&keys) != mlxcel_core::array_dtype(&values)
                     || ![
                         mlxcel_core::dtype::FLOAT16,
                         mlxcel_core::dtype::BFLOAT16,
                         mlxcel_core::dtype::FLOAT32,
-                    ].contains(&mlxcel_core::array_dtype(&keys))
+                    ]
+                    .contains(&mlxcel_core::array_dtype(&keys))
                 {
                     return Err(format!(
                         "Qwen3.5 snapshot layer {index} attention cache layout mismatch"
@@ -3084,7 +3079,8 @@ impl LanguageModel for Qwen35Model {
             .restore(position, snapshot.tensor("mrope.position_ids"), rope_delta);
         // A restored prefix can still be inside initial prefill. Its caller
         // finalizes at the full prompt boundary, never at a structural checkpoint.
-        self.initial_prefill_complete.store(false, Ordering::Relaxed);
+        self.initial_prefill_complete
+            .store(false, Ordering::Relaxed);
         Ok(())
     }
 
@@ -3258,7 +3254,12 @@ mod tests {
         assert_eq!(mapped, [0, DFLASH_COMPACT_PREFIX - 1, 248_044, 248_069]);
 
         let mtp_ids = mlxcel_core::from_slice_i32(
-            &[0, MTP_DRAFT_PREFIX - 1, MTP_DRAFT_PREFIX, MTP_DRAFT_PREFIX + 25],
+            &[
+                0,
+                MTP_DRAFT_PREFIX - 1,
+                MTP_DRAFT_PREFIX,
+                MTP_DRAFT_PREFIX + 25,
+            ],
             &[4],
         );
         let mapped = Qwen35Model::map_draft_tokens(&mtp_ids);
@@ -3330,16 +3331,28 @@ mod tests {
         let mut live = KVCache::new_with_mode(KVCacheMode::Fp16);
         let mut control = KVCache::new_with_mode(KVCacheMode::Fp16);
         for cache in [&mut live, &mut control] {
-            cache.update(test_attention_tensor(2, 0.01), test_attention_tensor(2, 0.02));
+            cache.update(
+                test_attention_tensor(2, 0.01),
+                test_attention_tensor(2, 0.02),
+            );
         }
         let keys_before = live.keys.as_deref().unwrap() as *const MlxArray;
         let values_before = live.values.as_deref().unwrap() as *const MlxArray;
         let mut snapshot = ModelStateSnapshot::new("test", 2);
         assert!(push_attention_snapshot(&mut snapshot, None, 0, &live));
         assert_eq!(live.mode, KVCacheMode::Fp16);
-        assert_eq!(live.keys.as_deref().unwrap() as *const MlxArray, keys_before);
-        assert_eq!(live.values.as_deref().unwrap() as *const MlxArray, values_before);
-        assert_eq!(attention_snapshot_mode(&snapshot, 0).unwrap(), KVCacheMode::Fp16);
+        assert_eq!(
+            live.keys.as_deref().unwrap() as *const MlxArray,
+            keys_before
+        );
+        assert_eq!(
+            live.values.as_deref().unwrap() as *const MlxArray,
+            values_before
+        );
+        assert_eq!(
+            attention_snapshot_mode(&snapshot, 0).unwrap(),
+            KVCacheMode::Fp16
+        );
 
         let tensor = |suffix: &str| {
             snapshot
@@ -3352,19 +3365,37 @@ mod tests {
         restored.values = Some(tensor("values"));
         restored.offset = 2;
         for cache in [&mut live, &mut control, &mut restored] {
-            cache.update(test_attention_tensor(1, 0.03), test_attention_tensor(1, 0.04));
+            cache.update(
+                test_attention_tensor(1, 0.03),
+                test_attention_tensor(1, 0.04),
+            );
         }
         for (actual, expected) in [
-            (live.keys.as_deref().unwrap(), control.keys.as_deref().unwrap()),
-            (live.values.as_deref().unwrap(), control.values.as_deref().unwrap()),
-            (restored.keys.as_deref().unwrap(), control.keys.as_deref().unwrap()),
-            (restored.values.as_deref().unwrap(), control.values.as_deref().unwrap()),
+            (
+                live.keys.as_deref().unwrap(),
+                control.keys.as_deref().unwrap(),
+            ),
+            (
+                live.values.as_deref().unwrap(),
+                control.values.as_deref().unwrap(),
+            ),
+            (
+                restored.keys.as_deref().unwrap(),
+                control.keys.as_deref().unwrap(),
+            ),
+            (
+                restored.values.as_deref().unwrap(),
+                control.values.as_deref().unwrap(),
+            ),
         ] {
             let actual = mlxcel_core::slice(actual, &[0, 0, 0, 0], &[1, 1, 3, 64]);
             let expected = mlxcel_core::slice(expected, &[0, 0, 0, 0], &[1, 1, 3, 64]);
             mlxcel_core::eval(&actual);
             mlxcel_core::eval(&expected);
-            assert_eq!(mlxcel_core::array_to_raw_bytes(&actual), mlxcel_core::array_to_raw_bytes(&expected));
+            assert_eq!(
+                mlxcel_core::array_to_raw_bytes(&actual),
+                mlxcel_core::array_to_raw_bytes(&expected)
+            );
         }
         assert_eq!(restored.offset, control.offset);
         // The donor remains a two-token prefix after either continuation.
@@ -3372,7 +3403,10 @@ mod tests {
         let original_keys = test_attention_tensor(2, 0.01);
         mlxcel_core::eval(&donor_keys);
         mlxcel_core::eval(&original_keys);
-        assert_eq!(mlxcel_core::array_to_raw_bytes(&donor_keys), mlxcel_core::array_to_raw_bytes(&original_keys));
+        assert_eq!(
+            mlxcel_core::array_to_raw_bytes(&donor_keys),
+            mlxcel_core::array_to_raw_bytes(&original_keys)
+        );
     }
 
     #[test]
@@ -3383,7 +3417,10 @@ mod tests {
         snapshot.push_tensor("layer.0.keys", &tensor);
         assert!(attention_snapshot_mode(&snapshot, 0).is_err());
         snapshot.push_tensor("layer.0.values", &tensor);
-        assert_eq!(attention_snapshot_mode(&snapshot, 0).unwrap(), KVCacheMode::Fp16);
+        assert_eq!(
+            attention_snapshot_mode(&snapshot, 0).unwrap(),
+            KVCacheMode::Fp16
+        );
         snapshot.push_tensor("layer.0.k_packed", &tensor);
         assert!(attention_snapshot_mode(&snapshot, 0).is_err());
 
@@ -3393,7 +3430,10 @@ mod tests {
         }
         assert!(attention_snapshot_mode(&packed, 0).is_err());
         packed.push_tensor("layer.0.v_rescale", &tensor);
-        assert_eq!(attention_snapshot_mode(&packed, 0).unwrap(), KVCacheMode::Turbo4);
+        assert_eq!(
+            attention_snapshot_mode(&packed, 0).unwrap(),
+            KVCacheMode::Turbo4
+        );
     }
 
     #[test]

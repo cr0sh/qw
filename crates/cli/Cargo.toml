@@ -17,8 +17,8 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 clap_derive.workspace = true
-qw-runtime = { path = "../runtime" }
-qw-server = { path = "../server" }
+qw-runtime = { path = "../runtime", default-features = false }
+qw-server = { path = "../server", default-features = false }
 serde_json.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true

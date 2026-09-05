@@ -444,6 +444,17 @@ async fn read_responses_sse(app: Router, body: Value) -> Result<ResponsesSseMeas
 #[tokio::test]
 #[ignore = "requires the resolver's default bundled-MTP checkpoint"]
 async fn real_responses_sse_measures_multiturn_and_structural_prefix_latency() {
+    measure_real_responses_prefix_latency(Qwen35GenerationMode::Mtp).await;
+}
+
+#[cfg(feature = "dflash2")]
+#[tokio::test]
+#[ignore = "requires the default target and DFlash2 checkpoints"]
+async fn real_dflash_responses_sse_reuses_multiturn_and_structural_prefixes() {
+    measure_real_responses_prefix_latency(Qwen35GenerationMode::Dflash2).await;
+}
+
+async fn measure_real_responses_prefix_latency(mode: Qwen35GenerationMode) {
     let model_dir = resolve_model_path(None)
         .expect("resolver's default bundled-MTP checkpoint must be available");
     let engine = Engine::start_qwen(
@@ -456,7 +467,11 @@ async fn real_responses_sse_measures_multiturn_and_structural_prefix_latency() {
         true,
         3,
         DecoderConfig {
-            mode: Qwen35GenerationMode::Mtp,
+            mode,
+            #[cfg(feature = "dflash2")]
+            dflash2_draft_model: qw_runtime::resolve_dflash2_draft_path(None)
+                .expect("resolve DFlash2 checkpoint"),
+            #[cfg(not(feature = "dflash2"))]
             dflash2_draft_model: std::path::PathBuf::new(),
         },
         KVCacheMode::Turbo4,

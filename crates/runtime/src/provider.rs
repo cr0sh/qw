@@ -2009,15 +2009,9 @@ mod tests {
             select_qwen35_decoder(Qwen35GenerationMode::Dflash2, true, true, true),
             Ok(Qwen35GenerationMode::Dflash2)
         );
-        assert!(
-            select_qwen35_decoder(Qwen35GenerationMode::Mtp, false, true, true).is_err()
-        );
-        assert!(
-            select_qwen35_decoder(Qwen35GenerationMode::Dflash2, true, false, true).is_err()
-        );
-        assert!(
-            select_qwen35_decoder(Qwen35GenerationMode::Dflash2, true, true, false).is_err()
-        );
+        assert!(select_qwen35_decoder(Qwen35GenerationMode::Mtp, false, true, true).is_err());
+        assert!(select_qwen35_decoder(Qwen35GenerationMode::Dflash2, true, false, true).is_err());
+        assert!(select_qwen35_decoder(Qwen35GenerationMode::Dflash2, true, true, false).is_err());
     }
 
     #[test]

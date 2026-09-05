@@ -57,22 +57,32 @@ qw download
 qw download incoai/Qwen3.8-27B-DFlash2
 ```
 
-If the draft checkpoint is absent, automatic routing safely stays on bundled
-MTP.
+If the draft checkpoint is absent, automatic routing falls back to bundled
+MTP, or baseline decoding when bundled MTP is unavailable.
 Run the server:
 
 ```bash
 qw serve
 ```
 
-`--decoder auto` is the default for both `qw generate` and `qw serve`. It uses
-bundled MTP below 6,000 prompt tokens and DFlash2 at or above 6,000 tokens.
-DFlash2 currently supports greedy, unconstrained text generation; automatic
-routing keeps MTP for sampling, structured output, and image requests.
-`--decoder baseline|mtp|dflash` makes an explicit selection and ignores the
-crossover. Override the boundary with `--decoder-crossover-tokens`, and override
-the draft checkpoint with `--dflash-draft-model` or
+`--decoder auto` is the default for both `qw generate` and `qw serve`. It
+prefers DFlash2 whenever the draft is available and the request is compatible,
+regardless of prompt length. DFlash2 supports greedy, unconstrained text
+generation; sampling, structured output, and image requests retain MTP or
+baseline routing. `--decoder baseline|mtp|dflash` makes an explicit selection.
+Override the draft checkpoint with `--dflash-draft-model` or
 `QW_DFLASH_DRAFT_MODEL_PATH`.
+
+DFlash2 participates in the server's memory and filesystem prefix cache, in a
+separate decoder namespace. Snapshots retain target state at its actual resident
+precision, the bounded drafter hidden window, and continuation logits. Structural
+checkpoints do not prematurely quantize the live prefill cache. Interrupted
+response snapshots end at the emitted-token boundary without replaying the prompt.
+Cache maintenance publishes snapshots while the generation queue is idle, so
+immediately queued requests can arrive before a preceding snapshot is available.
+Turbo4 speculative regrouping can change floating-point results and greedy token
+choices; byte-preserving snapshots do not promise token-identical continuations
+across different execution groupings.
 
 Obtain statistics about storage usage and status:
 
@@ -134,9 +144,9 @@ optimization runs merged through `7ada6d4`; 64k uses the latest confirmation
 reuse the same live prompt snapshot and exact suffix, including projected-context
 cache hits; these are warm-reuse measurements, not cold-request throughput.
 
-The configured automatic boundary remains 6,000 prompt tokens. It was calibrated
-from an earlier MTP/DFlash2 comparison (5,980 tokens by linear interpolation),
-not recomputed from the separate latest runs above.
+Automatic routing is capability-based, not calibrated to a prompt-length
+crossover. These historical throughput measurements do not establish an
+end-to-end latency win for every short request or cache state.
 
 Reproduce the current prefill and DFlash2 cases with:
 
@@ -160,8 +170,9 @@ of scope for testing by the maintainer. The default is:
 - Target checkpoint (`Jundot/Qwen3.8-27B-oQ4e-fp16-mtp` on Hugging Face), its
   quantization method, and the DFlash2 draft checkpoint
   (`incoai/Qwen3.8-27B-DFlash2`)
-- Automatic bundled-MTP/DFlash2 routing at a 6,000-token prompt boundary
-- KV cache is 4-bit quantized with TurboQuant
+- Automatic DFlash2 preference, with capability-based MTP/baseline fallback
+- TurboQuant 4-bit KV cache with an FP16 resident fast path; snapshots preserve
+  the resident representation rather than changing precision during capture
 - The above configuration is tested on an M4 Max 40-core GPU with 64 GB of
   unified memory
 

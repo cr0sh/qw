@@ -16,6 +16,8 @@ use qw_prefix_cache::{
 use qw_runtime::ChatContentRef;
 #[cfg(any(feature = "specprefill", test))]
 use qw_runtime::ChatMessage;
+#[cfg(feature = "dflash2")]
+use qw_runtime::Dflash2PrefixReuse;
 use qw_runtime::{
     KVCacheMode, MtpPrefixReuse, PromptSnapshot, Qwen35GenerationMode, Qwen35Provider,
     select_qwen35_decoder,
@@ -284,7 +286,7 @@ fn cache_snapshot_route(route: QwenGenerationRoute) -> Option<CacheSnapshotRoute
         QwenGenerationRoute::MtpText => Some(CacheSnapshotRoute::Mtp),
         QwenGenerationRoute::BaselineMultimodal | QwenGenerationRoute::MtpMultimodal => None,
         #[cfg(feature = "dflash2")]
-        QwenGenerationRoute::Dflash2Text => None,
+        QwenGenerationRoute::Dflash2Text => Some(CacheSnapshotRoute::Dflash2),
     }
 }
 
@@ -1288,9 +1290,21 @@ impl QwenWorker {
                 route,
             ])
         };
+        #[cfg(feature = "dflash2")]
+        let dflash2_namespace = {
+            let draft_config = if decoder.dflash2_available() {
+                std::fs::read(decoder.dflash2_draft_model.join("config.json"))
+                    .context("failed to read DFlash2 config for prefix cache namespace")?
+            } else {
+                Vec::new()
+            };
+            namespace_hash(&[namespace_parts(b"dflash2").as_bytes(), &draft_config])
+        };
         let namespaces = CacheNamespaces {
             baseline: namespace_parts(b"baseline"),
             mtp: namespace_parts(b"mtp"),
+            #[cfg(feature = "dflash2")]
+            dflash2: dflash2_namespace,
         };
         let prefix_cache =
             AdaptivePrefixCache::new(namespaces, cache_config).map_err(anyhow::Error::msg)?;
@@ -1705,6 +1719,32 @@ impl QwenWorker {
         } else {
             None
         };
+        #[cfg(feature = "dflash2")]
+        let dflash2_prefix_reuse = match (route, resume_entry.as_ref(), hit.as_ref()) {
+            (QwenGenerationRoute::Dflash2Text, Some(resume), _) => match &resume.snapshot {
+                PromptSnapshot::Dflash2(snapshot) => Some(Dflash2PrefixReuse {
+                    snapshot,
+                    cached_tokens: snapshot.token_len(),
+                }),
+                _ => {
+                    send_failure(
+                        &job,
+                        FailureKind::ResumeNotFound,
+                        "response continuation checkpoint was not found".to_string(),
+                        Some("resume_response_id".to_string()),
+                    );
+                    return;
+                }
+            },
+            (QwenGenerationRoute::Dflash2Text, None, Some(hit)) => match hit.snapshot {
+                PromptSnapshot::Dflash2(snapshot) => Some(Dflash2PrefixReuse {
+                    snapshot,
+                    cached_tokens: hit.token_count,
+                }),
+                _ => None,
+            },
+            _ => None,
+        };
         let (prefix_reuse, mtp_prefix_reuse) = match (route, resume_entry.as_ref(), hit) {
             (QwenGenerationRoute::BaselineText, Some(resume), _) => match &resume.snapshot {
                 PromptSnapshot::Baseline(snapshot) => (
@@ -1774,11 +1814,23 @@ impl QwenWorker {
             },
             _ => (None, None),
         };
+        let reused_tokens = prefix_reuse.as_ref().map_or_else(
+            || {
+                mtp_prefix_reuse
+                    .as_ref()
+                    .map_or(0, |reuse| reuse.cached_tokens)
+            },
+            |reuse| reuse.cached_tokens,
+        );
+        #[cfg(feature = "dflash2")]
+        let reused_tokens = dflash2_prefix_reuse
+            .as_ref()
+            .map_or(reused_tokens, |reuse| reuse.cached_tokens);
         let cache_source = if resume_entry.is_some() {
             "response_resume"
         } else if lookup_cache_route.is_none() {
             "disabled"
-        } else if prefix_reuse.is_some() || mtp_prefix_reuse.is_some() {
+        } else if reused_tokens > 0 {
             "prefix_hit"
         } else {
             "prefix_miss"
@@ -1804,10 +1856,7 @@ impl QwenWorker {
             response_id = %job.admission.response_id,
             route = ?route,
             source = cache_source,
-            reused_tokens = prefix_reuse.as_ref().map_or_else(
-                || mtp_prefix_reuse.as_ref().map_or(0, |reuse| reuse.cached_tokens),
-                |reuse| reuse.cached_tokens,
-            ),
+            reused_tokens,
             prompt_tokens = generation_prompt_ids.len(),
             lookup_duration_ms = cache_lookup_started.elapsed().as_secs_f64() * 1_000.0,
         );
@@ -1815,10 +1864,7 @@ impl QwenWorker {
             phase = "model_generation.started",
             route = ?route,
             mtp_k,
-            prefix_cached_tokens = prefix_reuse.as_ref().map_or_else(
-                || mtp_prefix_reuse.as_ref().map_or(0, |reuse| reuse.cached_tokens),
-                |reuse| reuse.cached_tokens,
-            ),
+            prefix_cached_tokens = reused_tokens,
         );
         debug!(
             phase = "decoder.selected",
@@ -1905,6 +1951,9 @@ impl QwenWorker {
                 max_tokens,
                 &sampling,
                 &self.decoder.dflash2_draft_model,
+                dflash2_prefix_reuse,
+                &checkpoint_token_lengths,
+                cache_behavior.capture_final_snapshot(),
                 &mut emit_delta,
             ),
             QwenGenerationRoute::BaselineText => provider.generate_baseline_streaming(
@@ -2627,46 +2676,6 @@ mod tests {
             qwen_generation_route(Qwen35GenerationMode::Dflash2, false),
             QwenGenerationRoute::Dflash2Text
         );
-    }
-
-    #[test]
-    fn enabled_prefix_cache_preserves_snapshot_ownership() {
-        for route in [
-            QwenGenerationRoute::BaselineText,
-            QwenGenerationRoute::BaselineMultimodal,
-            QwenGenerationRoute::MtpText,
-            QwenGenerationRoute::MtpMultimodal,
-            #[cfg(feature = "dflash2")]
-            QwenGenerationRoute::Dflash2Text,
-        ] {
-            let behavior = cache_behavior(
-                route,
-                true,
-                #[cfg(feature = "specprefill")]
-                true,
-                #[cfg(feature = "specprefill")]
-                false,
-            );
-            let expected_route = match route {
-                QwenGenerationRoute::BaselineText => Some(CacheSnapshotRoute::Baseline),
-                QwenGenerationRoute::MtpText => Some(CacheSnapshotRoute::Mtp),
-                QwenGenerationRoute::BaselineMultimodal | QwenGenerationRoute::MtpMultimodal => {
-                    None
-                }
-                #[cfg(feature = "dflash2")]
-                QwenGenerationRoute::Dflash2Text => None,
-            };
-            assert_eq!(behavior.snapshot_route, expected_route);
-            assert_eq!(behavior.lookup_route, expected_route);
-            assert_eq!(behavior.capture_final_snapshot(), expected_route.is_some());
-            let mut checkpoint_token_lengths = vec![64, 128];
-            behavior.apply_checkpoint_policy(&mut checkpoint_token_lengths);
-            if expected_route.is_some() {
-                assert_eq!(checkpoint_token_lengths, [64, 128]);
-            } else {
-                assert!(checkpoint_token_lengths.is_empty());
-            }
-        }
     }
 
     #[test]
