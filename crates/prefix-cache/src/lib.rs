@@ -50,20 +50,26 @@ pub struct EntryKey(pub String);
 pub enum SnapshotRoute {
     Baseline,
     Mtp,
+    #[cfg(feature = "dflash2")]
+    Dflash2,
 }
 
 impl SnapshotRoute {
     pub fn matches(self, snapshot: &PromptSnapshot) -> bool {
-        matches!(
-            (self, snapshot),
-            (Self::Baseline, PromptSnapshot::Baseline(_)) | (Self::Mtp, PromptSnapshot::Mtp(_))
-        )
+        match self {
+            Self::Baseline => matches!(snapshot, PromptSnapshot::Baseline(_)),
+            Self::Mtp => matches!(snapshot, PromptSnapshot::Mtp(_)),
+            #[cfg(feature = "dflash2")]
+            Self::Dflash2 => matches!(snapshot, PromptSnapshot::Dflash2(_)),
+        }
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Baseline => "baseline",
             Self::Mtp => "mtp",
+            #[cfg(feature = "dflash2")]
+            Self::Dflash2 => "dflash2",
         }
     }
 }
@@ -71,6 +77,8 @@ impl SnapshotRoute {
 pub struct CacheNamespaces {
     pub baseline: String,
     pub mtp: String,
+    #[cfg(feature = "dflash2")]
+    pub dflash2: String,
 }
 
 impl CacheNamespaces {
@@ -78,6 +86,8 @@ impl CacheNamespaces {
         match route {
             SnapshotRoute::Baseline => &self.baseline,
             SnapshotRoute::Mtp => &self.mtp,
+            #[cfg(feature = "dflash2")]
+            SnapshotRoute::Dflash2 => &self.dflash2,
         }
     }
 
@@ -85,6 +95,8 @@ impl CacheNamespaces {
         [
             (SnapshotRoute::Baseline, self.baseline.as_str()),
             (SnapshotRoute::Mtp, self.mtp.as_str()),
+            #[cfg(feature = "dflash2")]
+            (SnapshotRoute::Dflash2, self.dflash2.as_str()),
         ]
         .into_iter()
     }

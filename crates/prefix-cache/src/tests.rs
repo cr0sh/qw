@@ -44,11 +44,15 @@ impl tracing::Subscriber for InfoCounter {
 
 const NAMESPACE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const MTP_NAMESPACE: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+#[cfg(feature = "dflash2")]
+const DFLASH_NAMESPACE: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 
 fn namespaces() -> CacheNamespaces {
     CacheNamespaces {
         baseline: NAMESPACE.to_string(),
         mtp: MTP_NAMESPACE.to_string(),
+        #[cfg(feature = "dflash2")]
+        dflash2: DFLASH_NAMESPACE.to_string(),
     }
 }
 
@@ -629,31 +633,63 @@ fn filesystem_restart_promotes_valid_entry_and_deletes_corrupt_payload() {
 }
 
 #[cfg(feature = "dflash2")]
-#[test]
-fn dflash2_portable_snapshot_is_rejected() {
-    let array = qw_runtime::PortableArray {
-        name: None,
-        shape: vec![1],
-        dtype: mlxcel_core::dtype::FLOAT32,
-        bytes: vec![0; std::mem::size_of::<f32>()],
+fn dflash_portable(token_len: usize, hidden_offset: usize) -> PortablePromptSnapshot {
+    use qw_runtime::{PortableArray, PortableModelState, PortablePage, PortablePagedTensor};
+
+    let floats = |shape: Vec<i32>, start: usize| {
+        let count = shape.iter().map(|&n| n as usize).product::<usize>();
+        PortableArray {
+            name: None,
+            shape,
+            dtype: mlxcel_core::dtype::FLOAT32,
+            bytes: (start..start + count).flat_map(|n| (n as f32).to_le_bytes()).collect(),
+        }
     };
-    let snapshot = PortablePromptSnapshot::Dflash2 {
-        target: qw_runtime::PortableModelState {
-            family: "test".to_string(),
-            token_len: 1,
-            tensors: Vec::new(),
-            paged_tensors: Vec::new(),
-            continuation_logits: None,
+    let logits = floats(vec![1, 1, 2], 99);
+    let pages = [(0, 1), (1, token_len)].into_iter()
+        .filter(|(start, end)| start < end)
+        .map(|(start, end)| {
+            let array = floats(vec![1, 1, (end - start) as i32, 2], 1 + start * 2);
+            PortablePage {
+                token_start: start,
+                token_end: end,
+                shape: array.shape,
+                dtype: array.dtype,
+                bytes: Arc::from(array.bytes),
+            }
+        }).collect();
+    PortablePromptSnapshot::Dflash2 {
+        target: PortableModelState {
+            family: "qwen3.5-target-v1".to_string(),
+            token_len,
+            tensors: [("meta.layer_count", 1), ("layer.0.offset", token_len as i32)]
+                .into_iter().map(|(name, value)| PortableArray {
+                    name: Some(name.into()),
+                    shape: vec![1],
+                    dtype: mlxcel_core::dtype::INT32,
+                    bytes: value.to_le_bytes().to_vec(),
+                }).collect(),
+            paged_tensors: vec![PortablePagedTensor {
+                name: "layer.0.keys".into(),
+                token_axis: 2,
+                token_len,
+                pages,
+            }],
+            continuation_logits: Some(logits.clone()),
         },
-        hidden_concat: array.clone(),
-        hidden_offset: 0,
-        continuation_logits: array,
-    };
-    let error = codec::encode_portable(
-        NAMESPACE,
-        SnapshotRoute::Baseline,
-        &[1],
-        snapshot,
+        hidden_concat: floats(vec![1, (token_len - hidden_offset) as i32, 2], 10),
+        hidden_offset,
+        continuation_logits: logits,
+    }
+}
+
+#[cfg(feature = "dflash2")]
+fn encode_dflash(portable: PortablePromptSnapshot) -> Result<codec::EncodedEntry, String> {
+    codec::encode_portable(
+        DFLASH_NAMESPACE,
+        SnapshotRoute::Dflash2,
+        &[1, 2, 3],
+        portable,
         RetentionMetadata {
             observations: 1,
             reuse_count: 0,
@@ -662,11 +698,223 @@ fn dflash2_portable_snapshot_is_rejected() {
         INITIAL_TTL_MS,
         None,
     )
-    .expect_err("DFlash2 snapshots must not enter the prefix cache");
-    assert_eq!(
-        error,
-        "portable snapshot route and token length must match the cache entry"
-    );
+}
+
+#[cfg(feature = "dflash2")]
+#[test]
+fn dflash2_roundtrip_preserves_target_pages_hidden_window_and_logits() {
+    for hidden_offset in [0, 1] {
+        let portable = dflash_portable(3, hidden_offset);
+        let encoded = encode_dflash(portable.clone()).expect("encode DFlash2");
+        let unique_bytes = 8 + 24 + (3 - hidden_offset) as u64 * 8 + 8;
+        assert_eq!(encoded.blobs.iter().map(|b| b.bytes.len() as u64).sum::<u64>(), unique_bytes);
+        let decoded = codec::decode(DFLASH_NAMESPACE, &encoded.manifest, encoded.blobs)
+            .expect("decode DFlash2");
+        assert_eq!(decoded.manifest.total_bytes, unique_bytes);
+        assert_eq!(decoded.snapshot.nbytes() as u64, unique_bytes + 8);
+        assert_eq!(decoded.snapshot.to_portable().expect("portable DFlash2"), portable);
+    }
+}
+
+#[cfg(feature = "dflash2")]
+#[test]
+fn dflash2_rejects_invalid_boundaries_shapes_and_tensor_roles() {
+    let encoded = encode_dflash(dflash_portable(3, 1)).expect("encode DFlash2");
+    let original: Manifest = serde_json::from_slice(&encoded.manifest).expect("manifest");
+    let mut malformed = Vec::new();
+    let mut changed = original.clone();
+    changed.hidden_offset = Some(0);
+    malformed.push(changed);
+    let mut changed = original.clone();
+    changed.hidden_offset = Some(usize::MAX);
+    malformed.push(changed);
+    let mut changed = original.clone();
+    changed.hidden_offset = None;
+    malformed.push(changed);
+    let mut changed = original.clone();
+    changed.draft_family = Some("qwen3.5-mtp-draft".into());
+    malformed.push(changed);
+    let mut changed = original.clone();
+    changed.token_len = 2;
+    changed.token_ids.pop();
+    malformed.push(changed);
+    let mut changed = original.clone();
+    changed.arrays.retain(|a| a.role != codec::ArrayRole::DflashContinuation);
+    malformed.push(changed);
+    let mut changed = original.clone();
+    let hidden = changed.arrays.iter().find(|a| a.role == codec::ArrayRole::DflashHidden).unwrap().clone();
+    changed.arrays.push(hidden);
+    malformed.push(changed);
+    let mut changed = original.clone();
+    changed.arrays[0].role = codec::ArrayRole::ModelTensor;
+    malformed.push(changed);
+    let mut changed = original.clone();
+    changed.arrays[0].name = Some("layer.0.keys".into());
+    malformed.push(changed);
+    let mut changed = original.clone();
+    changed.arrays.iter_mut().find(|a| a.role == codec::ArrayRole::DflashHidden).unwrap().shape = vec![1, 1, 4];
+    malformed.push(changed);
+    let mut changed = original.clone();
+    changed.arrays.iter_mut().find(|a| a.role == codec::ArrayRole::DflashContinuation).unwrap().shape = vec![1, 2, 1];
+    malformed.push(changed);
+    let mut changed = original.clone();
+    changed.arrays.iter_mut().find(|a| a.role == codec::ArrayRole::DflashContinuation).unwrap().dtype = mlxcel_core::dtype::INT32;
+    malformed.push(changed);
+    let mut changed = original.clone();
+    changed.arrays[0].byte_len += 1;
+    malformed.push(changed);
+    let mut changed = original.clone();
+    changed.paged_tensors[0].token_len = 2;
+    malformed.push(changed);
+    let mut changed = original.clone();
+    changed.paged_tensors[0].token_axis = 7;
+    malformed.push(changed);
+    let mut changed = original.clone();
+    changed.paged_tensors[0].pages[1].token_start = 0;
+    malformed.push(changed);
+    let mut changed = original.clone();
+    changed.paged_tensors[0].pages[1].shape = vec![1, 2, 2, 1];
+    malformed.push(changed);
+    let mut changed = original.clone();
+    changed.paged_tensors[0].role = codec::ArrayRole::DflashHidden;
+    malformed.push(changed);
+    let mut changed = original.clone();
+    changed.blob_sha256.push(changed.blob_sha256[0].clone());
+    malformed.push(changed);
+    let mut changed = original.clone();
+    changed.total_bytes += 1;
+    malformed.push(changed);
+    for (index, manifest) in malformed.into_iter().enumerate() {
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        assert!(codec::parse_manifest(DFLASH_NAMESPACE, &bytes).is_err(), "invalid case {index}");
+        assert!(codec::decode(DFLASH_NAMESPACE, &bytes, encoded.blobs.clone()).is_err(), "invalid case {index}");
+    }
+    let PortablePromptSnapshot::Dflash2 { target, hidden_concat, continuation_logits, .. } = dflash_portable(3, 1) else {
+        unreachable!()
+    };
+    assert!(encode_dflash(PortablePromptSnapshot::Dflash2 {
+        target,
+        hidden_concat,
+        hidden_offset: 0,
+        continuation_logits,
+    }).is_err());
+    assert!(encode_dflash(dflash_portable(2, 0)).is_err());
+    for route in [SnapshotRoute::Baseline, SnapshotRoute::Mtp] {
+        let mut changed = original.clone();
+        changed.route = route;
+        changed.hidden_offset = None;
+        if route == SnapshotRoute::Mtp {
+            changed.draft_family = Some("qwen3.5-mtp-draft".into());
+            changed.draft_offset = Some(2);
+        }
+        assert!(codec::decode(DFLASH_NAMESPACE, &serde_json::to_vec(&changed).unwrap(), encoded.blobs.clone()).is_err());
+        assert_ne!(entry_key(DFLASH_NAMESPACE, route, &[1, 2, 3]), encoded.key);
+    }
+}
+
+#[cfg(feature = "dflash2")]
+#[test]
+fn dflash2_filesystem_restart_isolates_routes_and_deletes_corrupt_payload() {
+    let directory = TempDirectory::new();
+    let config = CacheConfig {
+        memory_bytes: 1_000_000,
+        directory: Some(directory.path.clone()),
+        filesystem_bytes: 1_000_000,
+    };
+    let portable = dflash_portable(3, 1);
+    let key = entry_key(DFLASH_NAMESPACE, SnapshotRoute::Dflash2, &[1, 2, 3]);
+    {
+        let mut cache = AdaptivePrefixCache::new(namespaces(), config.clone()).expect("cache");
+        cache.insert(&[1, 2, 3], vec![PromptSnapshot::from_portable(portable.clone()).unwrap()], SnapshotRoute::Dflash2);
+        assert_eq!(cache.memory_bytes(), 64);
+        assert_eq!(cache.lookup(&[1, 2, 3], SnapshotRoute::Dflash2).unwrap().snapshot.to_portable().unwrap(), portable);
+        assert!(cache.lookup(&[1, 2, 3], SnapshotRoute::Baseline).is_none());
+        assert!(cache.lookup(&[1, 2, 3], SnapshotRoute::Mtp).is_none());
+        cache.flush_persistence();
+        assert_eq!(cache.filesystem_bytes, 56);
+    }
+    {
+        let mut restarted = AdaptivePrefixCache::new(namespaces(), config.clone()).expect("restart");
+        let hit = restarted.lookup(&[1, 2, 3, 4], SnapshotRoute::Dflash2).expect("DFlash2 disk hit");
+        assert_eq!(hit.token_count, 3);
+        assert_eq!(hit.snapshot.to_portable().unwrap(), portable);
+        assert!(restarted.lookup(&[1, 2, 3], SnapshotRoute::Baseline).is_none());
+        assert!(restarted.lookup(&[1, 2, 3], SnapshotRoute::Mtp).is_none());
+        restarted.flush_persistence();
+    }
+    let entry_path = directory.path.join("entries").join(format!("{}.json", key.0));
+    let manifest: Manifest = serde_json::from_slice(&std::fs::read(&entry_path).unwrap()).unwrap();
+    let hidden = manifest.arrays.iter().find(|a| a.role == codec::ArrayRole::DflashHidden).unwrap();
+    std::fs::write(directory.path.join("blobs").join(&hidden.blob_sha256), b"corrupt").unwrap();
+    let mut restarted = AdaptivePrefixCache::new(namespaces(), config).expect("restart corrupt");
+    assert!(restarted.lookup(&[1, 2, 3], SnapshotRoute::Dflash2).is_none());
+    assert!(!entry_path.exists());
+}
+
+#[cfg(feature = "dflash2")]
+#[test]
+fn dflash2_resume_survives_restart_is_route_safe_and_one_shot() {
+    let directory = TempDirectory::new();
+    let config = CacheConfig {
+        memory_bytes: 1,
+        directory: Some(directory.path.clone()),
+        filesystem_bytes: 1_000_000,
+    };
+    let portable = dflash_portable(3, 1);
+    let metadata = resume_metadata("resp_dflash", "fingerprint");
+    {
+        let mut cache = AdaptivePrefixCache::new(namespaces(), config.clone()).unwrap();
+        cache.insert_resume(&[1, 2, 3], PromptSnapshot::from_portable(portable.clone()).unwrap(), SnapshotRoute::Dflash2, metadata.clone());
+        cache.flush_persistence();
+        assert_eq!(cache.memory_bytes(), 64, "active resume survives memory pressure");
+    }
+    {
+        let mut restarted = AdaptivePrefixCache::new(namespaces(), config.clone()).unwrap();
+        assert!(matches!(restarted.take_resume("resp_dflash", "fingerprint", SnapshotRoute::Mtp), Err(ResumeLookupError::NotFound)));
+        assert!(matches!(restarted.take_resume("resp_dflash", "other", SnapshotRoute::Dflash2), Err(ResumeLookupError::Mismatch)));
+        let resumed = restarted.take_resume("resp_dflash", "fingerprint", SnapshotRoute::Dflash2).expect("DFlash2 resume");
+        assert_eq!(resumed.token_ids, [1, 2, 3]);
+        assert_eq!(resumed.metadata, metadata);
+        assert_eq!(resumed.snapshot.to_portable().unwrap(), portable);
+        assert_eq!(restarted.memory_bytes(), 0);
+        restarted.flush_persistence();
+    }
+    let mut restarted = AdaptivePrefixCache::new(namespaces(), config).unwrap();
+    assert!(matches!(restarted.take_resume("resp_dflash", "fingerprint", SnapshotRoute::Dflash2), Err(ResumeLookupError::NotFound)));
+}
+
+#[cfg(feature = "dflash2")]
+#[test]
+fn dflash2_hidden_and_logits_count_toward_eviction_and_expiry() {
+    let clock = ManualClock::new(10_000);
+    let portable = dflash_portable(3, 1);
+    let mut cache = AdaptivePrefixCache::with_optional_store(
+        namespaces(), memory_config(63), None, Box::new(clock.clone()),
+    ).unwrap();
+    cache.insert(&[1, 2, 3], vec![PromptSnapshot::from_portable(portable.clone()).unwrap()], SnapshotRoute::Dflash2);
+    assert!(cache.lookup(&[1, 2, 3], SnapshotRoute::Dflash2).is_none());
+    assert_eq!(cache.memory_bytes(), 0);
+    let directory = TempDirectory::new();
+    let mut cache = AdaptivePrefixCache::with_store_and_clock(
+        namespaces(),
+        CacheConfig {
+            filesystem_bytes: 55,
+            directory: Some(directory.path.clone()),
+            ..memory_config(64)
+        },
+        Box::new(FilesystemSnapshotStore::new(&directory.path).unwrap()),
+        Box::new(clock.clone()),
+    ).unwrap();
+    cache.insert(&[1, 2, 3], vec![PromptSnapshot::from_portable(portable).unwrap()], SnapshotRoute::Dflash2);
+    cache.flush_persistence();
+    let key = entry_key(DFLASH_NAMESPACE, SnapshotRoute::Dflash2, &[1, 2, 3]);
+    assert!(!directory.path.join("entries").join(format!("{}.json", key.0)).exists());
+    assert_eq!(cache.filesystem_bytes, 0);
+    assert_eq!(cache.memory_bytes(), 64);
+    assert!(cache.lookup(&[1, 2, 3], SnapshotRoute::Dflash2).is_some());
+    clock.set(10_000 + INITIAL_TTL_MS + 1);
+    assert!(cache.lookup(&[1, 2, 3], SnapshotRoute::Dflash2).is_none());
+    assert_eq!(cache.memory_bytes(), 0);
 }
 
 #[test]
@@ -851,6 +1099,8 @@ fn filesystem_namespace_isolation_and_partial_recovery_are_misses() {
         CacheNamespaces {
             baseline: other_namespace.to_string(),
             mtp: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string(),
+            #[cfg(feature = "dflash2")]
+            dflash2: "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".to_string(),
         },
         config.clone(),
     )
