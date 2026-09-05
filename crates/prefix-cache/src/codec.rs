@@ -366,10 +366,16 @@ fn validate_manifest(ns: &str, m: &Manifest) -> Result<(), String> {
         validate_dflash_manifest(m)?;
     } else if m.hidden_offset.is_some()
         || m.arrays.iter().any(|a| {
-            matches!(a.role, ArrayRole::DflashHidden | ArrayRole::DflashContinuation)
+            matches!(
+                a.role,
+                ArrayRole::DflashHidden | ArrayRole::DflashContinuation
+            )
         })
         || m.paged_tensors.iter().any(|a| {
-            matches!(a.role, ArrayRole::DflashHidden | ArrayRole::DflashContinuation)
+            matches!(
+                a.role,
+                ArrayRole::DflashHidden | ArrayRole::DflashContinuation
+            )
         })
     {
         return Err("non-DFlash2 manifest contains DFlash2 state".into());
@@ -413,7 +419,9 @@ fn validate_manifest(ns: &str, m: &Manifest) -> Result<(), String> {
         }
     }
     for n in sizes.values() {
-        total = total.checked_add(*n).ok_or("cache payload byte count overflow")?;
+        total = total
+            .checked_add(*n)
+            .ok_or("cache payload byte count overflow")?;
     }
     if total != m.total_bytes {
         return Err("cache payload byte count does not match manifest".into());
@@ -425,14 +433,19 @@ fn validate_manifest(ns: &str, m: &Manifest) -> Result<(), String> {
 fn validate_dflash_manifest(m: &Manifest) -> Result<(), String> {
     use mlxcel_core::dtype::{BFLOAT16, FLOAT16, FLOAT32};
 
-    let offset = m.hidden_offset.ok_or("DFlash2 manifest is missing hidden offset")?;
+    let offset = m
+        .hidden_offset
+        .ok_or("DFlash2 manifest is missing hidden offset")?;
     let mut names = HashSet::new();
     let mut singleton_roles = HashSet::new();
     for array in &m.arrays {
         validate_dflash_array(&array.shape, array.dtype, array.byte_len)?;
         match array.role {
             ArrayRole::TargetTensor => {
-                let name = array.name.as_deref().ok_or("DFlash2 target tensor is unnamed")?;
+                let name = array
+                    .name
+                    .as_deref()
+                    .ok_or("DFlash2 target tensor is unnamed")?;
                 if name.is_empty() || !names.insert(name) {
                     return Err("DFlash2 target tensor names must be unique and nonempty".into());
                 }
@@ -447,11 +460,15 @@ fn validate_dflash_manifest(m: &Manifest) -> Result<(), String> {
                     || array.shape[0] != 1
                     || !matches!(array.dtype, FLOAT16 | FLOAT32 | BFLOAT16)
                 {
-                    return Err("DFlash2 auxiliary tensor must be floating-point [1, rows, width]".into());
+                    return Err(
+                        "DFlash2 auxiliary tensor must be floating-point [1, rows, width]".into(),
+                    );
                 }
                 if array.role == ArrayRole::DflashHidden {
                     if offset.checked_add(array.shape[1] as usize) != Some(m.token_len) {
-                        return Err("DFlash2 hidden context does not match the target boundary".into());
+                        return Err(
+                            "DFlash2 hidden context does not match the target boundary".into()
+                        );
                     }
                 } else if array.shape[1] != 1 {
                     return Err("DFlash2 continuation logits must have one row".into());
@@ -473,16 +490,22 @@ fn validate_dflash_manifest(m: &Manifest) -> Result<(), String> {
         {
             return Err("DFlash2 target page role, name, or boundary is invalid".into());
         }
-        let first = tensor.pages.first().ok_or("DFlash2 target pages are empty")?;
+        let first = tensor
+            .pages
+            .first()
+            .ok_or("DFlash2 target pages are empty")?;
         for page in &tensor.pages {
             validate_dflash_array(&page.shape, page.dtype, page.byte_len)?;
             if page.shape.len() != first.shape.len()
                 || page.dtype != first.dtype
                 || page.shape.get(tensor.token_axis).map(|&n| n as usize)
                     != page.token_end.checked_sub(page.token_start)
-                || page.shape.iter().zip(&first.shape).enumerate().any(|(axis, (a, b))| {
-                    axis != tensor.token_axis && a != b
-                })
+                || page
+                    .shape
+                    .iter()
+                    .zip(&first.shape)
+                    .enumerate()
+                    .any(|(axis, (a, b))| axis != tensor.token_axis && a != b)
             {
                 return Err("DFlash2 target page layout is inconsistent".into());
             }
@@ -491,11 +514,20 @@ fn validate_dflash_manifest(m: &Manifest) -> Result<(), String> {
     if names.is_empty() {
         return Err("DFlash2 manifest is missing target model state".into());
     }
-    let referenced = m.arrays.iter().map(|a| a.blob_sha256.as_str())
-        .chain(m.paged_tensors.iter().flat_map(|t| t.pages.iter().map(|p| p.blob_sha256.as_str())))
+    let referenced = m
+        .arrays
+        .iter()
+        .map(|a| a.blob_sha256.as_str())
+        .chain(
+            m.paged_tensors
+                .iter()
+                .flat_map(|t| t.pages.iter().map(|p| p.blob_sha256.as_str())),
+        )
         .collect::<HashSet<_>>();
     if m.blob_sha256.len() != referenced.len()
-        || m.blob_sha256.iter().any(|digest| !referenced.contains(digest.as_str()))
+        || m.blob_sha256
+            .iter()
+            .any(|digest| !referenced.contains(digest.as_str()))
         || m.blob_sha256.iter().collect::<HashSet<_>>().len() != referenced.len()
     {
         return Err("DFlash2 blob set does not match tensor descriptors".into());
@@ -507,14 +539,21 @@ fn validate_dflash_manifest(m: &Manifest) -> Result<(), String> {
 fn validate_dflash_array(shape: &[i32], dtype: i32, byte_len: u64) -> Result<(), String> {
     use mlxcel_core::dtype::*;
 
-    if shape.is_empty() || shape.iter().any(|&n| n <= 0)
-        || !matches!(dtype, UINT8 | INT8 | UINT32 | UINT64 | INT32 | INT64 | FLOAT16 | FLOAT32 | BFLOAT16)
+    if shape.is_empty()
+        || shape.iter().any(|&n| n <= 0)
+        || !matches!(
+            dtype,
+            UINT8 | INT8 | UINT32 | UINT64 | INT32 | INT64 | FLOAT16 | FLOAT32 | BFLOAT16
+        )
     {
         return Err("DFlash2 tensor shape or dtype is invalid".into());
     }
-    let bytes = shape.iter().try_fold(size_bytes(dtype).unwrap() as u64, |bytes, &n| {
-        bytes.checked_mul(n as u64)
-    }).ok_or("DFlash2 tensor byte length overflow")?;
+    let bytes = shape
+        .iter()
+        .try_fold(size_bytes(dtype).unwrap() as u64, |bytes, &n| {
+            bytes.checked_mul(n as u64)
+        })
+        .ok_or("DFlash2 tensor byte length overflow")?;
     if bytes != byte_len {
         return Err("DFlash2 tensor byte length does not match shape and dtype".into());
     }
@@ -661,7 +700,9 @@ fn inflate(
         return Ok(PortablePromptSnapshot::Dflash2 {
             target: t,
             hidden_concat: h.ok_or("DFlash2 manifest is missing hidden context")?,
-            hidden_offset: m.hidden_offset.ok_or("DFlash2 manifest is missing hidden offset")?,
+            hidden_offset: m
+                .hidden_offset
+                .ok_or("DFlash2 manifest is missing hidden offset")?,
             continuation_logits: c.ok_or("DFlash2 manifest is missing continuation logits")?,
         });
     }

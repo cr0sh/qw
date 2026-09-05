@@ -24,8 +24,8 @@ clap_derive.workspace = true
 futures-util.workspace = true
 llguidance.workspace = true
 mlxcel-core = { path = "../mlxcel-core", features = ["metal", "accelerate"] }
-qw-runtime = { path = "../runtime" }
-qw-prefix-cache = { path = "../prefix-cache" }
+qw-runtime = { path = "../runtime", default-features = false }
+qw-prefix-cache = { path = "../prefix-cache", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

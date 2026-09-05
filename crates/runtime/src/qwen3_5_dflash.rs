@@ -1756,7 +1756,9 @@ impl Dflash2PromptSnapshot {
                 token_len,
                 previous.map(|snapshot| &snapshot.target),
             )
-            .ok_or_else(|| format!("failed to capture DFlash2 target state at {token_len} tokens"))?;
+            .ok_or_else(|| {
+                format!("failed to capture DFlash2 target state at {token_len} tokens")
+            })?;
         Ok(Self {
             id: next_dflash2_snapshot_id(),
             target,
@@ -1853,7 +1855,11 @@ fn validate_dflash2_portable_float(array: &PortableArray) -> Result<(), String> 
                     != exponent_mask
             })
         }
-        _ => return Err("DFlash2 hidden context and logits require floating-point arrays".to_string()),
+        _ => {
+            return Err(
+                "DFlash2 hidden context and logits require floating-point arrays".to_string(),
+            );
+        }
     };
     if !finite {
         return Err("DFlash2 hidden context and logits must be finite".to_string());
@@ -1961,9 +1967,8 @@ fn emit_dflash2_walk_tokens<F: FnMut(i32) -> bool>(
     on_token: &mut F,
 ) -> Option<GenerationStopReason> {
     for &token in tokens {
-        let (reason, keep_going) = emit_initial_dflash2_token(
-            token, eos_tokens, max_tokens, generated, history, on_token,
-        );
+        let (reason, keep_going) =
+            emit_initial_dflash2_token(token, eos_tokens, max_tokens, generated, history, on_token);
         if !keep_going {
             return Some(reason);
         }
@@ -2086,7 +2091,10 @@ impl Qwen35Dflash2Generator {
             logits = Some(mlxcel_core::share(&reuse.snapshot.continuation_logits));
         }
         let mut start = cached_tokens;
-        for token_len in boundaries.into_iter().chain(std::iter::once(prompt_tokens.len())) {
+        for token_len in boundaries
+            .into_iter()
+            .chain(std::iter::once(prompt_tokens.len()))
+        {
             if token_len == start {
                 // A restored standalone prefix may still hold initial FP16
                 // state. Finalization is idempotent for already-finished
@@ -2118,9 +2126,15 @@ impl Qwen35Dflash2Generator {
                 let snapshot = Dflash2PromptSnapshot::capture(
                     target,
                     token_len,
-                    hidden.as_deref().expect("checkpoints retain hidden context"),
-                    logits.as_deref().expect("prefill produces continuation logits"),
-                    snapshots.last().or_else(|| reuse.map(|reuse| reuse.snapshot)),
+                    hidden
+                        .as_deref()
+                        .expect("checkpoints retain hidden context"),
+                    logits
+                        .as_deref()
+                        .expect("prefill produces continuation logits"),
+                    snapshots
+                        .last()
+                        .or_else(|| reuse.map(|reuse| reuse.snapshot)),
                 )?;
                 // Continue from detached immutable boundary rows rather than
                 // retaining the preceding prefill construction graph.
@@ -2217,14 +2231,18 @@ impl Qwen35Dflash2Generator {
         )?;
         let mut snapshot_hidden = if capture_final_snapshot {
             Some(materialize_detached(mlxcel_core::share(
-                hidden_concat.as_deref().expect("final capture retains hidden context"),
+                hidden_concat
+                    .as_deref()
+                    .expect("final capture retains hidden context"),
             )))
         } else {
             None
         };
         if !projected_cache_hit {
             let hidden_rows = mlxcel_core::array_shape(
-                hidden_concat.as_deref().expect("uncached projections require hidden context"),
+                hidden_concat
+                    .as_deref()
+                    .expect("uncached projections require hidden context"),
             )[1] as usize;
             let hidden_offset = prompt_tokens.len() - hidden_rows;
             for cache in self.caches.iter_mut() {
@@ -2399,22 +2417,24 @@ impl Qwen35Dflash2Generator {
                 && committed_tokens == history.len()
             {
                 let row = (committed_rows - 1) as i32;
-                terminal_logits = Some(if compact_verify && target.has_compact_dflash_verify_head() {
-                    let shape = mlxcel_core::array_shape(&verify.hidden);
-                    let hidden = mlxcel_core::slice(
-                        &verify.hidden,
-                        &[0, row, 0],
-                        &[shape[0], row + 1, shape[2]],
-                    );
-                    target.project_mtp_continuation_logits(&hidden)
-                } else {
-                    let shape = mlxcel_core::array_shape(&verify.logits);
-                    mlxcel_core::slice(
-                        &verify.logits,
-                        &[0, row, 0],
-                        &[shape[0], row + 1, shape[2]],
-                    )
-                });
+                terminal_logits = Some(
+                    if compact_verify && target.has_compact_dflash_verify_head() {
+                        let shape = mlxcel_core::array_shape(&verify.hidden);
+                        let hidden = mlxcel_core::slice(
+                            &verify.hidden,
+                            &[0, row, 0],
+                            &[shape[0], row + 1, shape[2]],
+                        );
+                        target.project_mtp_continuation_logits(&hidden)
+                    } else {
+                        let shape = mlxcel_core::array_shape(&verify.logits);
+                        mlxcel_core::slice(
+                            &verify.logits,
+                            &[0, row, 0],
+                            &[shape[0], row + 1, shape[2]],
+                        )
+                    },
+                );
             }
             bonus = *walk
                 .new_tokens
@@ -2448,7 +2468,9 @@ impl Qwen35Dflash2Generator {
                 )?;
                 stats.target_forward_calls += 1;
                 snapshot_hidden = Some(merge_hidden_context(
-                    snapshot_hidden.as_deref().expect("capture retains hidden window"),
+                    snapshot_hidden
+                        .as_deref()
+                        .expect("capture retains hidden window"),
                     &continuation.hidden_concat,
                     self.hidden_limit,
                 ));
@@ -2457,9 +2479,15 @@ impl Qwen35Dflash2Generator {
             Some(Dflash2PromptSnapshot::capture(
                 target,
                 history.len(),
-                snapshot_hidden.as_deref().expect("capture retains hidden window"),
-                terminal_logits.as_deref().expect("capture retains continuation logits"),
-                prompt_snapshots.last().or_else(|| reusable.map(|reuse| reuse.snapshot)),
+                snapshot_hidden
+                    .as_deref()
+                    .expect("capture retains hidden window"),
+                terminal_logits
+                    .as_deref()
+                    .expect("capture retains continuation logits"),
+                prompt_snapshots
+                    .last()
+                    .or_else(|| reusable.map(|reuse| reuse.snapshot)),
             )?)
         } else {
             None
@@ -2933,11 +2961,41 @@ mod tests {
         let verified = [10, 11, 12, 13];
         let walk = [11, 12, 99];
         for (eos, budget, cancel_after, expected, reason) in [
-            (Vec::new(), 20, 1, vec![10, 11], GenerationStopReason::CallbackCancelled),
-            (vec![12], 20, usize::MAX, vec![10, 11], GenerationStopReason::Eos),
-            (vec![11], 20, usize::MAX, vec![10], GenerationStopReason::Eos),
-            (Vec::new(), 3, usize::MAX, vec![10, 11, 12], GenerationStopReason::MaxTokens),
-            (Vec::new(), 4, usize::MAX, vec![10, 11, 12, 99], GenerationStopReason::MaxTokens),
+            (
+                Vec::new(),
+                20,
+                1,
+                vec![10, 11],
+                GenerationStopReason::CallbackCancelled,
+            ),
+            (
+                vec![12],
+                20,
+                usize::MAX,
+                vec![10, 11],
+                GenerationStopReason::Eos,
+            ),
+            (
+                vec![11],
+                20,
+                usize::MAX,
+                vec![10],
+                GenerationStopReason::Eos,
+            ),
+            (
+                Vec::new(),
+                3,
+                usize::MAX,
+                vec![10, 11, 12],
+                GenerationStopReason::MaxTokens,
+            ),
+            (
+                Vec::new(),
+                4,
+                usize::MAX,
+                vec![10, 11, 12, 99],
+                GenerationStopReason::MaxTokens,
+            ),
         ] {
             let mut generated = vec![10];
             let mut history = vec![7, 10];
@@ -2961,7 +3019,11 @@ mod tests {
             assert_eq!(&verified[..committed], &expected[..committed]);
             assert_eq!(
                 &expected[committed..],
-                if expected.last() == Some(&99) { &[99][..] } else { &[] },
+                if expected.last() == Some(&99) {
+                    &[99][..]
+                } else {
+                    &[]
+                },
                 "only an emitted correction may remain unforwarded"
             );
         }
@@ -2990,8 +3052,11 @@ mod tests {
         .expect("restore evicted window at its absolute target boundary");
         assert_eq!(snapshot.hidden_offset, 7);
         assert_eq!(raw_f32(&snapshot.hidden_concat), [7.0, 8.0, 9.0, 10.0]);
-        let PortablePromptSnapshot::Dflash2 { hidden_offset, hidden_concat, .. } =
-            snapshot.to_portable()
+        let PortablePromptSnapshot::Dflash2 {
+            hidden_offset,
+            hidden_concat,
+            ..
+        } = snapshot.to_portable()
         else {
             panic!("DFlash2 snapshot changed family")
         };
@@ -3004,7 +3069,10 @@ mod tests {
             name: None,
             shape: vec![1, 2, 1],
             dtype: mlxcel_core::dtype::FLOAT32,
-            bytes: [1.0_f32, 2.0].into_iter().flat_map(f32::to_ne_bytes).collect(),
+            bytes: [1.0_f32, 2.0]
+                .into_iter()
+                .flat_map(f32::to_ne_bytes)
+                .collect(),
         };
         let logits = PortableArray {
             shape: vec![1, 1, 2],
@@ -3041,7 +3109,10 @@ mod tests {
         ] {
             let mut half = hidden.clone();
             half.dtype = dtype;
-            half.bytes = [finite, finite].into_iter().flat_map(u16::to_ne_bytes).collect();
+            half.bytes = [finite, finite]
+                .into_iter()
+                .flat_map(u16::to_ne_bytes)
+                .collect();
             assert!(restore(half.clone(), 6, logits.clone()).is_ok());
             half.bytes[..2].copy_from_slice(&nonfinite.to_ne_bytes());
             assert!(restore(half, 6, logits.clone()).is_err());
@@ -3067,15 +3138,19 @@ mod tests {
         }
 
         let model_dir = crate::resolve_model_path(None).expect("resolve real target checkpoint");
-        let draft_dir = crate::resolve_dflash2_draft_path(None).expect("resolve real draft checkpoint");
+        let draft_dir =
+            crate::resolve_dflash2_draft_path(None).expect("resolve real draft checkpoint");
         let config_json = std::fs::read(draft_dir.join("config.json")).expect("read draft config");
         let config = DFlash2Config::from_json(
             &serde_json::from_slice(&config_json).expect("parse draft config"),
         )
         .expect("validate draft config");
         let hidden_limit = config.sliding_window.expect("real sliding-window drafter") - 1;
-        let mut provider = Qwen35Provider::load(&model_dir, KVCacheMode::Turbo4)
-            .expect("load real DFlash2 target");
+        // FP16 isolates exact state restoration from Turbo4's sensitivity to
+        // speculative regrouping after interruption. Default Turbo4 cache
+        // storage and end-to-end reuse are exercised separately.
+        let mut provider =
+            Qwen35Provider::load(&model_dir, KVCacheMode::Fp16).expect("load real DFlash2 target");
         let messages = vec![
             ChatMessage {
                 role: "system".to_string(),
@@ -3101,63 +3176,121 @@ mod tests {
                 tool_call_id: None,
             },
         ];
-        let prompt = provider.tokenize_messages(&messages, &[], None, false)
+        let prompt = provider
+            .tokenize_messages(&messages, &[], None, false)
             .expect("tokenize long snapshot fixture");
-        assert!(prompt.len() > hidden_limit + 32, "fixture must exercise hidden-window eviction");
+        assert!(
+            prompt.len() > hidden_limit + 32,
+            "fixture must exercise hidden-window eviction"
+        );
         let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(7));
-        let control = provider.generate_dflash2_baseline_streaming(
-            &prompt, 48, &sampling, &draft_dir, None, &[], false, |_| true,
-        ).expect("uninterrupted uncached generation");
-        assert_eq!(control.token_ids.len(), 48, "fixture must reach the requested token budget");
+        let control = provider
+            .generate_dflash2_baseline_streaming(
+                &prompt,
+                48,
+                &sampling,
+                &draft_dir,
+                None,
+                &[],
+                false,
+                |_| true,
+            )
+            .expect("uninterrupted uncached generation");
+        assert_eq!(
+            control.token_ids.len(),
+            48,
+            "fixture must reach the requested token budget"
+        );
         assert!(control.prompt_snapshots.is_empty() && control.final_snapshot.is_none());
 
         // Capture alone must not change the live target's numerical state.
         // This control keeps precisely the cold prefill execution schedule.
-        let prompt_checkpointed = provider.generate_dflash2_baseline_streaming(
-            &prompt, 48, &sampling, &draft_dir, None, &[prompt.len()], true, |_| true,
-        ).expect("capture full prompt and terminal without structural segmentation");
+        let prompt_checkpointed = provider
+            .generate_dflash2_baseline_streaming(
+                &prompt,
+                48,
+                &sampling,
+                &draft_dir,
+                None,
+                &[prompt.len()],
+                true,
+                |_| true,
+            )
+            .expect("capture full prompt and terminal without structural segmentation");
         assert_eq!(prompt_checkpointed.token_ids, control.token_ids);
         assert_eq!(
-            prompt_checkpointed.prompt_snapshots.iter()
-                .map(PromptSnapshot::token_len).collect::<Vec<_>>(),
+            prompt_checkpointed
+                .prompt_snapshots
+                .iter()
+                .map(PromptSnapshot::token_len)
+                .collect::<Vec<_>>(),
             [prompt.len()]
         );
         assert_eq!(
-            prompt_checkpointed.final_snapshot.as_ref().expect("terminal capture control").token_len(),
+            prompt_checkpointed
+                .final_snapshot
+                .as_ref()
+                .expect("terminal capture control")
+                .token_len(),
             prompt.len() + control.token_ids.len()
         );
         drop(prompt_checkpointed);
 
         let boundary = prompt.len() - 17;
-        let mut checkpointed = provider.generate_dflash2_baseline_streaming(
-            &prompt,
-            48,
-            &sampling,
-            &draft_dir,
-            None,
-            &[prompt.len(), boundary, 0, boundary, prompt.len() + 1],
-            true,
-            |_| true,
-        ).expect("capture exact structural, prompt, and terminal boundaries");
+        let mut checkpointed = provider
+            .generate_dflash2_baseline_streaming(
+                &prompt,
+                48,
+                &sampling,
+                &draft_dir,
+                None,
+                &[prompt.len(), boundary, 0, boundary, prompt.len() + 1],
+                true,
+                |_| true,
+            )
+            .expect("capture exact structural, prompt, and terminal boundaries");
         assert_eq!(checkpointed.token_ids, control.token_ids);
         assert_eq!(checkpointed.cached_tokens, 0);
         assert_eq!(
-            checkpointed.prompt_snapshots.iter().map(PromptSnapshot::token_len).collect::<Vec<_>>(),
+            checkpointed
+                .prompt_snapshots
+                .iter()
+                .map(PromptSnapshot::token_len)
+                .collect::<Vec<_>>(),
             [boundary, prompt.len()]
         );
-        let terminal = checkpointed.final_snapshot.take().expect("terminal snapshot");
-        assert_eq!(terminal.token_len(), prompt.len() + control.token_ids.len());
-        let logical_bytes = checkpointed.prompt_snapshots.iter()
+        let terminal = checkpointed
+            .final_snapshot
+            .take()
+            .expect("terminal snapshot");
+        assert_eq!(
+            terminal.token_len(),
+            prompt.len() + checkpointed.token_ids.len()
+        );
+        let logical_bytes = checkpointed
+            .prompt_snapshots
+            .iter()
             .chain(std::iter::once(&terminal))
             .map(|snapshot| match snapshot {
                 PromptSnapshot::Dflash2(snapshot) => snapshot.nbytes(),
                 _ => panic!("DFlash2 generation donated a foreign snapshot"),
             })
             .sum::<usize>();
-        eprintln!("DFlash2 retained snapshots=3 logical_bytes={logical_bytes} hidden_limit={hidden_limit}");
-        for snapshot in checkpointed.prompt_snapshots.iter().chain(std::iter::once(&terminal)) {
-            let PromptSnapshot::Dflash2(snapshot) = snapshot else { unreachable!() };
-            assert_eq!(mlxcel_core::array_shape(&snapshot.hidden_concat)[1] as usize, hidden_limit);
+        eprintln!(
+            "DFlash2 retained snapshots=3 logical_bytes={logical_bytes} hidden_limit={hidden_limit}"
+        );
+        for snapshot in checkpointed
+            .prompt_snapshots
+            .iter()
+            .chain(std::iter::once(&terminal))
+        {
+            let PromptSnapshot::Dflash2(snapshot) = snapshot else {
+                unreachable!()
+            };
+            assert_eq!(
+                mlxcel_core::array_shape(&snapshot.hidden_concat)[1] as usize,
+                hidden_limit
+            );
             assert_eq!(snapshot.hidden_offset, snapshot.token_len() - hidden_limit);
         }
         drop(terminal);
@@ -3165,15 +3298,20 @@ mod tests {
         let structural = restored(checkpoints.next().expect("structural checkpoint"));
         let full_prompt = restored(checkpoints.next().expect("prompt checkpoint"));
         for repetition in 0..2 {
-            let (warm, stats, cached_tokens) = provider.generate_dflash2_cached_streaming(
-                &prompt,
-                48,
-                &sampling,
-                &draft_dir,
-                Some(Dflash2PrefixReuse { snapshot: &structural, cached_tokens: boundary }),
-                |_| true,
-            ).expect("continue cached prompt suffix");
-            assert_eq!(warm.token_ids, control.token_ids);
+            let (warm, stats, cached_tokens) = provider
+                .generate_dflash2_cached_streaming(
+                    &prompt,
+                    48,
+                    &sampling,
+                    &draft_dir,
+                    Some(Dflash2PrefixReuse {
+                        snapshot: &structural,
+                        cached_tokens: boundary,
+                    }),
+                    |_| true,
+                )
+                .expect("continue cached prompt suffix");
+            assert_eq!(warm.token_ids, checkpointed.token_ids);
             assert_eq!(cached_tokens, boundary);
             assert_eq!(stats.projected_context_cache_hits, repetition);
         }
@@ -3185,72 +3323,111 @@ mod tests {
         // maintaining a raw hidden window for terminal capture.
         for (stop_after, cancel) in [(1, true), (2, true), (7, true), (5, false)] {
             let mut callbacks = 0;
-            let mut interrupted = provider.generate_dflash2_baseline_streaming(
-                &prompt,
-                if cancel { 48 } else { stop_after },
-                &sampling,
-                &draft_dir,
-                Some(Dflash2PrefixReuse { snapshot: &full_prompt, cached_tokens: prompt.len() }),
-                &[],
-                true,
-                |_| {
-                    callbacks += 1;
-                    !cancel || callbacks < stop_after
-                },
-            ).expect("stop DFlash2 at an emitted boundary");
-            assert_eq!(interrupted.token_ids, control.token_ids[..stop_after]);
+            let mut interrupted = provider
+                .generate_dflash2_baseline_streaming(
+                    &prompt,
+                    if cancel { 48 } else { stop_after },
+                    &sampling,
+                    &draft_dir,
+                    Some(Dflash2PrefixReuse {
+                        snapshot: &full_prompt,
+                        cached_tokens: prompt.len(),
+                    }),
+                    &[],
+                    true,
+                    |_| {
+                        callbacks += 1;
+                        !cancel || callbacks < stop_after
+                    },
+                )
+                .expect("stop DFlash2 at an emitted boundary");
+            assert_eq!(interrupted.token_ids, checkpointed.token_ids[..stop_after]);
             assert_eq!(callbacks, stop_after);
             assert_eq!(interrupted.cached_tokens, prompt.len());
             assert_eq!(
                 interrupted.finish_outcome,
-                if cancel { GenerationStopReason::CallbackCancelled } else { GenerationStopReason::MaxTokens }
+                if cancel {
+                    GenerationStopReason::CallbackCancelled
+                } else {
+                    GenerationStopReason::MaxTokens
+                }
             );
             let snapshot = restored(interrupted.final_snapshot.take().expect("stopped snapshot"));
             let mut resume_prompt = prompt.clone();
             resume_prompt.extend_from_slice(&interrupted.token_ids);
             assert_eq!(snapshot.token_len(), resume_prompt.len());
             assert_eq!(snapshot.hidden_offset, resume_prompt.len() - hidden_limit);
-            let resumed = provider.generate_dflash2_baseline_streaming(
-                &resume_prompt,
-                48 - stop_after,
-                &sampling,
-                &draft_dir,
-                Some(Dflash2PrefixReuse { cached_tokens: snapshot.token_len(), snapshot: &snapshot }),
-                &[],
-                false,
-                |_| true,
-            ).expect("resume portable cancelled/terminal snapshot");
+            let resumed = provider
+                .generate_dflash2_baseline_streaming(
+                    &resume_prompt,
+                    48 - stop_after,
+                    &sampling,
+                    &draft_dir,
+                    Some(Dflash2PrefixReuse {
+                        cached_tokens: snapshot.token_len(),
+                        snapshot: &snapshot,
+                    }),
+                    &[],
+                    false,
+                    |_| true,
+                )
+                .expect("resume portable cancelled/terminal snapshot");
             assert_eq!(resumed.cached_tokens, resume_prompt.len());
             let mut combined = interrupted.token_ids;
             combined.extend_from_slice(&resumed.token_ids);
-            assert_eq!(combined, control.token_ids, "resumed tokens differ at stop={stop_after}");
+            assert_eq!(
+                combined, checkpointed.token_ids,
+                "resumed tokens differ at stop={stop_after}"
+            );
         }
 
         // Turn one of the real verified tokens into a stop token, then remove
         // that policy on resume. The un-emitted EOS row must not enter state.
-        let eos_index = control.token_ids.iter()
-            .position(|&token| token != control.token_ids[0])
+        let eos_index = checkpointed
+            .token_ids
+            .iter()
+            .position(|&token| token != checkpointed.token_ids[0])
             .expect("fixture contains a noninitial stop token");
         for eos_index in [0, eos_index] {
             let mut eos_sampling = sampling.clone();
-            eos_sampling.stop_token_ids = vec![control.token_ids[eos_index]];
-            let mut stopped = provider.generate_dflash2_baseline_streaming(
-                &prompt, 48, &eos_sampling, &draft_dir,
-                Some(Dflash2PrefixReuse { snapshot: &full_prompt, cached_tokens: prompt.len() }),
-                &[], true, |_| true,
-            ).expect("stop before emitting EOS");
+            eos_sampling.stop_token_ids = vec![checkpointed.token_ids[eos_index]];
+            let mut stopped = provider
+                .generate_dflash2_baseline_streaming(
+                    &prompt,
+                    48,
+                    &eos_sampling,
+                    &draft_dir,
+                    Some(Dflash2PrefixReuse {
+                        snapshot: &full_prompt,
+                        cached_tokens: prompt.len(),
+                    }),
+                    &[],
+                    true,
+                    |_| true,
+                )
+                .expect("stop before emitting EOS");
             assert_eq!(stopped.finish_outcome, GenerationStopReason::Eos);
-            assert_eq!(stopped.token_ids, control.token_ids[..eos_index]);
+            assert_eq!(stopped.token_ids, checkpointed.token_ids[..eos_index]);
             let snapshot = restored(stopped.final_snapshot.take().expect("EOS snapshot"));
             let mut resume_prompt = prompt.clone();
             resume_prompt.extend_from_slice(&stopped.token_ids);
             assert_eq!(snapshot.token_len(), resume_prompt.len());
-            let resumed = provider.generate_dflash2_baseline_streaming(
-                &resume_prompt, 48 - eos_index, &sampling, &draft_dir,
-                Some(Dflash2PrefixReuse { cached_tokens: snapshot.token_len(), snapshot: &snapshot }),
-                &[], false, |_| true,
-            ).expect("resume before the un-emitted EOS token");
-            assert_eq!(resumed.token_ids, control.token_ids[eos_index..]);
+            let resumed = provider
+                .generate_dflash2_baseline_streaming(
+                    &resume_prompt,
+                    48 - eos_index,
+                    &sampling,
+                    &draft_dir,
+                    Some(Dflash2PrefixReuse {
+                        cached_tokens: snapshot.token_len(),
+                        snapshot: &snapshot,
+                    }),
+                    &[],
+                    false,
+                    |_| true,
+                )
+                .expect("resume before the un-emitted EOS token");
+            assert_eq!(resumed.token_ids, checkpointed.token_ids[eos_index..]);
         }
     }
 
