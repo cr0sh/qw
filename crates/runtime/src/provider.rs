@@ -1178,9 +1178,20 @@ impl Qwen35Provider {
             sampling,
             draft_dir,
             prefix_reuse,
+            &[],
+            false,
             on_delta,
         )
-        .map(|(output, stats, cached_tokens, _)| (output, stats, cached_tokens))
+        .map(|(generation, stats)| {
+            (
+                GenerationOutput {
+                    text: generation.text,
+                    token_ids: generation.token_ids,
+                },
+                stats,
+                generation.cached_tokens,
+            )
+        })
     }
 
     #[cfg(any(feature = "dflash2", test))]
@@ -1190,27 +1201,22 @@ impl Qwen35Provider {
         max_tokens: usize,
         sampling: &SamplingConfig,
         draft_dir: &Path,
+        prefix_reuse: Option<Dflash2PrefixReuse<'_>>,
+        checkpoint_token_lengths: &[usize],
+        capture_final_snapshot: bool,
         on_delta: F,
     ) -> Result<BaselineGeneration> {
-        let (output, stats, cached_tokens, finish_outcome) = self
-            .generate_dflash2_cached_generation(
-                prompt_ids, max_tokens, sampling, draft_dir, None, on_delta,
-            )?;
-        let completion_tokens = output.token_ids.len();
-        Ok(BaselineGeneration {
-            text: output.text,
-            token_ids: output.token_ids,
-            prompt_tokens: prompt_ids.len(),
-            completion_tokens,
-            cached_tokens,
-            finish_outcome,
-            prompt_snapshots: Vec::new(),
-            final_snapshot: None,
-            prefill_time: stats.prefill_time,
-            decode_time: stats.decode_time,
-            #[cfg(any(feature = "specprefill", test))]
-            specprefill_stats: None,
-        })
+        self.generate_dflash2_cached_generation(
+            prompt_ids,
+            max_tokens,
+            sampling,
+            draft_dir,
+            prefix_reuse,
+            checkpoint_token_lengths,
+            capture_final_snapshot,
+            on_delta,
+        )
+        .map(|(generation, _)| generation)
     }
 
     #[cfg(any(feature = "dflash2", test))]
@@ -1221,13 +1227,10 @@ impl Qwen35Provider {
         sampling: &SamplingConfig,
         draft_dir: &Path,
         prefix_reuse: Option<Dflash2PrefixReuse<'_>>,
+        checkpoint_token_lengths: &[usize],
+        capture_final_snapshot: bool,
         mut on_delta: F,
-    ) -> Result<(
-        GenerationOutput,
-        Dflash2GenerationStats,
-        usize,
-        GenerationStopReason,
-    )> {
+    ) -> Result<(BaselineGeneration, Dflash2GenerationStats)> {
         if self.dflash2_generator.is_none() {
             self.dflash2_generator = Some(
                 crate::qwen3_5_dflash::Qwen35Dflash2Generator::new(&self.model, draft_dir)
@@ -1248,6 +1251,8 @@ impl Qwen35Provider {
                 max_tokens,
                 sampling,
                 prefix_reuse,
+                checkpoint_token_lengths,
+                capture_final_snapshot,
                 |token_id| match decoder.push(token_id) {
                     Ok(delta) => {
                         callback_active = on_delta(&delta);
@@ -1280,13 +1285,25 @@ impl Qwen35Provider {
             stats.decode_time,
         );
         Ok((
-            GenerationOutput {
+            BaselineGeneration {
                 text: decoder.emitted,
                 token_ids: generation.token_ids,
+                prompt_tokens: prompt_ids.len(),
+                completion_tokens,
+                cached_tokens: generation.cached_tokens,
+                finish_outcome: stop_reason,
+                prompt_snapshots: generation
+                    .prompt_snapshots
+                    .into_iter()
+                    .map(PromptSnapshot::Dflash2)
+                    .collect(),
+                final_snapshot: generation.final_snapshot.map(PromptSnapshot::Dflash2),
+                prefill_time: stats.prefill_time,
+                decode_time: stats.decode_time,
+                #[cfg(any(feature = "specprefill", test))]
+                specprefill_stats: None,
             },
             stats,
-            generation.cached_tokens,
-            stop_reason,
         ))
     }
 
@@ -1474,8 +1491,16 @@ impl Qwen35Provider {
         request: &GenerationRequest,
         on_delta: F,
     ) -> Result<GenerationOutput> {
-        self.generate_streaming_in_mode(request, Qwen35GenerationMode::Automatic, on_delta)
-            .map(|(output, _)| output)
+        #[cfg(feature = "dflash2")]
+        let draft_dir = crate::resolve_dflash2_draft_path(None).ok();
+        #[cfg(not(feature = "dflash2"))]
+        let draft_dir: Option<std::path::PathBuf> = None;
+        self.generate_streaming_with_decoder(
+            request,
+            Qwen35GenerationMode::Automatic,
+            draft_dir.as_deref(),
+            on_delta,
+        )
     }
 
     pub fn generate_streaming_with_decoder<F: FnMut(&str) -> bool>(
@@ -1538,6 +1563,9 @@ impl Qwen35Provider {
                         request.max_tokens,
                         &sampling,
                         dflash2_draft_dir.expect("selected DFlash2 has an available checkpoint"),
+                        None,
+                        &[],
+                        false,
                         on_delta,
                     )?
                 }

@@ -1738,6 +1738,34 @@ pub struct Dflash2PromptSnapshot {
 }
 
 impl Dflash2PromptSnapshot {
+    fn capture(
+        target: &Qwen35Model,
+        token_len: usize,
+        hidden_concat: &MlxArray,
+        continuation_logits: &MlxArray,
+        previous: Option<&Self>,
+    ) -> Result<Self, String> {
+        let hidden_rows = mlxcel_core::array_shape(hidden_concat)[1] as usize;
+        let hidden_offset = token_len
+            .checked_sub(hidden_rows)
+            .ok_or_else(|| "DFlash2 hidden context exceeds its target boundary".to_string())?;
+        target.materialize_mtp_cache_state();
+        let target = target
+            .snapshot_sequence_state(
+                SequenceId::from_raw(0),
+                token_len,
+                previous.map(|snapshot| &snapshot.target),
+            )
+            .ok_or_else(|| format!("failed to capture DFlash2 target state at {token_len} tokens"))?;
+        Ok(Self {
+            id: next_dflash2_snapshot_id(),
+            target,
+            hidden_concat: materialize_detached(mlxcel_core::copy(hidden_concat)),
+            hidden_offset,
+            continuation_logits: materialize_detached(mlxcel_core::copy(continuation_logits)),
+        })
+    }
+
     pub fn token_len(&self) -> usize {
         self.target.token_len()
     }
@@ -1797,6 +1825,8 @@ impl Dflash2PromptSnapshot {
                 "DFlash2 portable continuation-logits layout must be [1, 1, vocab]".to_string(),
             );
         }
+        validate_dflash2_portable_float(&hidden_concat)?;
+        validate_dflash2_portable_float(&continuation_logits)?;
         Ok(Self {
             id: next_dflash2_snapshot_id(),
             target,
@@ -1805,6 +1835,30 @@ impl Dflash2PromptSnapshot {
             continuation_logits: array_from_portable(continuation_logits, None)?,
         })
     }
+}
+
+fn validate_dflash2_portable_float(array: &PortableArray) -> Result<(), String> {
+    let finite = match array.dtype {
+        mlxcel_core::dtype::FLOAT32 => array.bytes.chunks_exact(4).all(|bytes| {
+            f32::from_ne_bytes(bytes.try_into().expect("four-byte float")).is_finite()
+        }),
+        mlxcel_core::dtype::FLOAT16 | mlxcel_core::dtype::BFLOAT16 => {
+            let exponent_mask = if array.dtype == mlxcel_core::dtype::FLOAT16 {
+                0x7c00
+            } else {
+                0x7f80
+            };
+            array.bytes.chunks_exact(2).all(|bytes| {
+                u16::from_ne_bytes(bytes.try_into().expect("two-byte float")) & exponent_mask
+                    != exponent_mask
+            })
+        }
+        _ => return Err("DFlash2 hidden context and logits require floating-point arrays".to_string()),
+    };
+    if !finite {
+        return Err("DFlash2 hidden context and logits must be finite".to_string());
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -1867,6 +1921,8 @@ pub(crate) struct Dflash2Generation {
     pub(crate) token_ids: Vec<i32>,
     pub(crate) stats: Dflash2GenerationStats,
     pub(crate) cached_tokens: usize,
+    pub(crate) prompt_snapshots: Vec<Dflash2PromptSnapshot>,
+    pub(crate) final_snapshot: Option<Dflash2PromptSnapshot>,
     pub(crate) stop_reason: GenerationStopReason,
 }
 
@@ -1878,6 +1934,9 @@ fn emit_initial_dflash2_token<F: FnMut(i32) -> bool>(
     history: &mut Vec<i32>,
     on_token: &mut F,
 ) -> (GenerationStopReason, bool) {
+    if max_tokens == 0 {
+        return (GenerationStopReason::MaxTokens, false);
+    }
     if eos_tokens.contains(&bonus) {
         return (GenerationStopReason::Eos, false);
     }
@@ -1891,6 +1950,31 @@ fn emit_initial_dflash2_token<F: FnMut(i32) -> bool>(
             generated.len() < max_tokens,
         )
     }
+}
+
+fn emit_dflash2_walk_tokens<F: FnMut(i32) -> bool>(
+    tokens: &[i32],
+    eos_tokens: &[i32],
+    max_tokens: usize,
+    generated: &mut Vec<i32>,
+    history: &mut Vec<i32>,
+    on_token: &mut F,
+) -> Option<GenerationStopReason> {
+    for &token in tokens {
+        let (reason, keep_going) = emit_initial_dflash2_token(
+            token, eos_tokens, max_tokens, generated, history, on_token,
+        );
+        if !keep_going {
+            return Some(reason);
+        }
+    }
+    None
+}
+
+/// Verify row zero is the already-emitted anchor. Only accepted proposals
+/// actually emitted by the callback join it; a correction remains unforwarded.
+fn committed_dflash2_rows(accepted: usize, emitted: usize) -> usize {
+    1 + accepted.min(emitted)
 }
 
 /// DFlash2 generation driver: prefill → speculative draft/verify rounds.
@@ -1950,16 +2034,101 @@ impl Qwen35Dflash2Generator {
             &self.target_layer_ids,
             self.hidden_limit,
         )?;
-        let target_state = target
-            .snapshot_sequence_state(SequenceId::from_raw(0), prompt_tokens.len(), None)
-            .ok_or_else(|| "failed to capture DFlash2 target prefix state".to_string())?;
-        Ok(Dflash2PromptSnapshot {
-            id: next_dflash2_snapshot_id(),
-            target: target_state,
-            hidden_concat: materialize_detached(mlxcel_core::copy(&prefill.hidden_concat)),
-            hidden_offset: prefill.hidden_offset,
-            continuation_logits: materialize_detached(mlxcel_core::copy(&prefill.first_logits)),
-        })
+        Dflash2PromptSnapshot::capture(
+            target,
+            prompt_tokens.len(),
+            &prefill.hidden_concat,
+            &prefill.first_logits,
+            None,
+        )
+    }
+
+    /// Advance the live target monotonically through requested boundaries.
+    /// Recurrent target state cannot be sliced backwards after prefill.
+    fn prefill_with_checkpoints(
+        &self,
+        target: &Qwen35Model,
+        prompt_tokens: &[i32],
+        reuse: Option<Dflash2PrefixReuse<'_>>,
+        checkpoint_token_lengths: &[usize],
+        retain_hidden: bool,
+    ) -> Result<
+        (
+            Option<UniquePtr<MlxArray>>,
+            UniquePtr<MlxArray>,
+            Vec<Dflash2PromptSnapshot>,
+        ),
+        String,
+    > {
+        let cached_tokens = reuse.map_or(0, |reuse| reuse.cached_tokens);
+        let mut boundaries = checkpoint_token_lengths
+            .iter()
+            .copied()
+            .filter(|&length| length > cached_tokens && length < prompt_tokens.len())
+            .collect::<Vec<_>>();
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        let capture_prompt = cached_tokens < prompt_tokens.len()
+            && checkpoint_token_lengths.contains(&prompt_tokens.len());
+        let mut snapshots = Vec::with_capacity(boundaries.len() + usize::from(capture_prompt));
+        let need_hidden = retain_hidden || !boundaries.is_empty() || capture_prompt;
+        let mut hidden = None;
+        let mut logits = None;
+        if let Some(reuse) = reuse {
+            target.restore_sequence_state(SequenceId::from_raw(0), &reuse.snapshot.target)?;
+            if need_hidden {
+                hidden = Some(mlxcel_core::share(&reuse.snapshot.hidden_concat));
+            }
+            logits = Some(mlxcel_core::share(&reuse.snapshot.continuation_logits));
+        }
+        let mut start = cached_tokens;
+        for token_len in boundaries.into_iter().chain(std::iter::once(prompt_tokens.len())) {
+            if token_len == start {
+                continue;
+            }
+            let input = mlxcel_core::from_slice_i32(
+                &prompt_tokens[start..token_len],
+                &[1, (token_len - start) as i32],
+            );
+            let prefill = if start == 0 {
+                target.forward_dflash_prefill(&input, &self.target_layer_ids, self.hidden_limit)?
+            } else {
+                target.forward_dflash_continuation(
+                    &input,
+                    &self.target_layer_ids,
+                    self.hidden_limit,
+                )?
+            };
+            if need_hidden {
+                hidden = Some(match hidden.take() {
+                    Some(prefix) => {
+                        merge_hidden_context(&prefix, &prefill.hidden_concat, self.hidden_limit)
+                    }
+                    None => prefill.hidden_concat,
+                });
+            }
+            logits = Some(prefill.first_logits);
+            if token_len < prompt_tokens.len() || capture_prompt {
+                let snapshot = Dflash2PromptSnapshot::capture(
+                    target,
+                    token_len,
+                    hidden.as_deref().expect("checkpoints retain hidden context"),
+                    logits.as_deref().expect("prefill produces continuation logits"),
+                    snapshots.last().or_else(|| reuse.map(|reuse| reuse.snapshot)),
+                )?;
+                // Continue from detached immutable boundary rows rather than
+                // retaining the preceding prefill construction graph.
+                hidden = Some(mlxcel_core::share(&snapshot.hidden_concat));
+                logits = Some(mlxcel_core::share(&snapshot.continuation_logits));
+                snapshots.push(snapshot);
+            }
+            start = token_len;
+        }
+        Ok((
+            hidden,
+            logits.ok_or_else(|| "DFlash2 prefill requires at least one token".to_string())?,
+            snapshots,
+        ))
     }
 
     /// Generate greedily with DFlash2 draft verification.
@@ -1970,6 +2139,8 @@ impl Qwen35Dflash2Generator {
         max_tokens: usize,
         sampling: &mlxcel_core::generate::SamplingConfig,
         prefix_reuse: Option<Dflash2PrefixReuse<'_>>,
+        checkpoint_token_lengths: &[usize],
+        capture_final_snapshot: bool,
         mut on_token: F,
     ) -> Result<Dflash2Generation, String> {
         mlxcel_core::generation_policy::seed_rng_if_needed(sampling);
@@ -1977,13 +2148,18 @@ impl Qwen35Dflash2Generator {
             target.eos_token_ids(),
             &sampling.stop_token_ids,
         );
-        if max_tokens == 0 {
+        if max_tokens == 0 && checkpoint_token_lengths.is_empty() && !capture_final_snapshot {
             return Ok(Dflash2Generation {
                 token_ids: Vec::new(),
                 stats: Dflash2GenerationStats::default(),
                 cached_tokens: 0,
+                prompt_snapshots: Vec::new(),
+                final_snapshot: None,
                 stop_reason: GenerationStopReason::MaxTokens,
             });
+        }
+        if prompt_tokens.is_empty() || prompt_tokens.len() > i32::MAX as usize {
+            return Err("DFlash2 prompt length must be in 1..=i32::MAX".to_string());
         }
 
         // Restore an exact target prefix when supplied, then process only the
@@ -1996,7 +2172,24 @@ impl Qwen35Dflash2Generator {
                 && reuse.cached_tokens <= prompt_tokens.len()
         });
         let cached_tokens = reusable.map_or(0, |reuse| reuse.cached_tokens);
+        if let Some(reuse) = reusable {
+            let hidden_shape = mlxcel_core::array_shape(&reuse.snapshot.hidden_concat);
+            let logits_shape = mlxcel_core::array_shape(&reuse.snapshot.continuation_logits);
+            if hidden_shape[2] as usize
+                != self.target_layer_ids.len() * self.model.config.hidden_size
+                || logits_shape[2] as usize != target.vocab_size()
+                || hidden_shape[1] as usize != reuse.cached_tokens.min(self.hidden_limit)
+            {
+                return Err("DFlash2 prefix snapshot does not match the loaded model".to_string());
+            }
+        }
+        // Splitting a suffix at new recurrent checkpoints changes its prefill
+        // execution. Do not reuse or publish projections under an unsplit key.
+        let segmented_prefill = checkpoint_token_lengths
+            .iter()
+            .any(|&length| length > cached_tokens && length < prompt_tokens.len());
         let projected_caches = reusable
+            .filter(|_| !segmented_prefill)
             .and_then(|reuse| {
                 let committed_suffix = &prompt_tokens[reuse.cached_tokens..];
                 self.projected_prefix.as_ref().filter(|projected| {
@@ -2009,56 +2202,25 @@ impl Qwen35Dflash2Generator {
         let projected_cache_hit = projected_caches.is_some();
         self.caches = projected_caches.unwrap_or_else(|| self.model.make_cache());
 
-        let (mut hidden_concat, first_logits, hidden_offset) = if let Some(reuse) = reusable {
-            target.restore_sequence_state(SequenceId::from_raw(0), &reuse.snapshot.target)?;
-            let suffix = &prompt_tokens[cached_tokens..];
-            if suffix.is_empty() {
-                (
-                    (!projected_cache_hit)
-                        .then(|| mlxcel_core::copy(&reuse.snapshot.hidden_concat)),
-                    mlxcel_core::copy(&reuse.snapshot.continuation_logits),
-                    reuse.snapshot.hidden_offset,
-                )
-            } else {
-                let suffix_array = mlxcel_core::from_slice_i32(
-                    suffix,
-                    &[1, i32::try_from(suffix.len()).unwrap_or(i32::MAX)],
-                );
-                let suffix_prefill = target.forward_dflash_continuation(
-                    &suffix_array,
-                    &self.target_layer_ids,
-                    self.hidden_limit,
-                )?;
-                let (hidden, hidden_offset) = if projected_cache_hit {
-                    (None, suffix_prefill.hidden_offset)
-                } else {
-                    let hidden = merge_hidden_context(
-                        &reuse.snapshot.hidden_concat,
-                        &suffix_prefill.hidden_concat,
-                        self.hidden_limit,
-                    );
-                    let rows = mlxcel_core::array_shape(&hidden)[1] as usize;
-                    (Some(hidden), prompt_tokens.len().saturating_sub(rows))
-                };
-                (hidden, suffix_prefill.first_logits, hidden_offset)
-            }
+        let (mut hidden_concat, first_logits, prompt_snapshots) = self.prefill_with_checkpoints(
+            target,
+            prompt_tokens,
+            reusable,
+            checkpoint_token_lengths,
+            !projected_cache_hit || capture_final_snapshot,
+        )?;
+        let mut snapshot_hidden = if capture_final_snapshot {
+            Some(materialize_detached(mlxcel_core::share(
+                hidden_concat.as_deref().expect("final capture retains hidden context"),
+            )))
         } else {
-            let prompt_array = mlxcel_core::from_slice_i32(
-                prompt_tokens,
-                &[1, i32::try_from(prompt_tokens.len()).unwrap_or(i32::MAX)],
-            );
-            let prefill = target.forward_dflash_prefill(
-                &prompt_array,
-                &self.target_layer_ids,
-                self.hidden_limit,
-            )?;
-            (
-                Some(prefill.hidden_concat),
-                prefill.first_logits,
-                prefill.hidden_offset,
-            )
+            None
         };
         if !projected_cache_hit {
+            let hidden_rows = mlxcel_core::array_shape(
+                hidden_concat.as_deref().expect("uncached projections require hidden context"),
+            )[1] as usize;
+            let hidden_offset = prompt_tokens.len() - hidden_rows;
             for cache in self.caches.iter_mut() {
                 match cache {
                     DFlash2KVCache::Full(c) => c.offset = hidden_offset as i32,
@@ -2066,7 +2228,14 @@ impl Qwen35Dflash2Generator {
                 }
             }
         }
-        let mut bonus = {
+        if projected_cache_hit {
+            // Memoized K/V already contains the entire restored prompt suffix.
+            // Raw rows retained for snapshots must not be projected twice.
+            hidden_concat = None;
+        }
+        let mut bonus = if max_tokens == 0 {
+            0
+        } else {
             let (token, _) = mlxcel_core::sampling::sample_token_optimized(
                 &first_logits,
                 sampling,
@@ -2075,6 +2244,8 @@ impl Qwen35Dflash2Generator {
             mlxcel_core::eval(&token);
             mlxcel_core::item_i32(&token)
         };
+        let mut committed_tokens = prompt_tokens.len();
+        let mut terminal_logits = capture_final_snapshot.then_some(first_logits);
         let prefill_time = prefill_start.elapsed();
         let mut generated = Vec::with_capacity(max_tokens);
         let mut history = prompt_tokens.to_vec();
@@ -2095,7 +2266,9 @@ impl Qwen35Dflash2Generator {
         let mut draft_block =
             vec![self.model.config.mask_token_id; DFLASH2_STATIC_VERIFY_WIDTHS[1]];
         let mut projected_prefix_to_capture = reusable
-            .filter(|_| !projected_cache_hit && self.hidden_limit != usize::MAX)
+            .filter(|_| {
+                !projected_cache_hit && !segmented_prefill && self.hidden_limit != usize::MAX
+            })
             .map(|reuse| {
                 (
                     reuse.snapshot.id,
@@ -2188,7 +2361,8 @@ impl Qwen35Dflash2Generator {
 
             // Emit the accepted prefix (and possibly a corrected token).
             let phase_start = Instant::now();
-            let round_stop_reason = crate::qwen3_5_mtp::emit_walk_tokens(
+            let generated_before_round = generated.len();
+            let round_stop_reason = emit_dflash2_walk_tokens(
                 &walk.new_tokens,
                 &eos_tokens,
                 max_tokens,
@@ -2196,16 +2370,46 @@ impl Qwen35Dflash2Generator {
                 &mut history,
                 &mut on_token,
             );
-            if walk.accepted < draft_tokens.len() {
-                target.rollback_mtp_verify(&verify.gdn_states, walk.accepted, bs, false);
+            let emitted = generated.len() - generated_before_round;
+            let committed_rows = committed_dflash2_rows(walk.accepted, emitted);
+            if committed_rows < bs {
+                target.rollback_mtp_verify(&verify.gdn_states, committed_rows - 1, bs, false);
             }
+            committed_tokens += committed_rows;
 
-            // Concatenate only committed rows; rejected verify rows never feed
-            // the next draft round.
-            hidden_concat = Some(concatenate_hiddens(
-                &verify.hidden_by_layer,
-                walk.accepted + 1,
-            ));
+            // The drafter consumes only new committed rows. A separate bounded
+            // window is maintained solely when terminal snapshot capture is on.
+            let committed_hidden = concatenate_hiddens(&verify.hidden_by_layer, committed_rows);
+            if let Some(window) = snapshot_hidden.take() {
+                snapshot_hidden = Some(materialize_detached(merge_hidden_context(
+                    &window,
+                    &committed_hidden,
+                    self.hidden_limit,
+                )));
+            }
+            hidden_concat = Some(committed_hidden);
+            if round_stop_reason.is_some()
+                && capture_final_snapshot
+                && committed_tokens == history.len()
+            {
+                let row = (committed_rows - 1) as i32;
+                terminal_logits = Some(if compact_verify && target.has_compact_dflash_verify_head() {
+                    let shape = mlxcel_core::array_shape(&verify.hidden);
+                    let hidden = mlxcel_core::slice(
+                        &verify.hidden,
+                        &[0, row, 0],
+                        &[shape[0], row + 1, shape[2]],
+                    );
+                    target.project_mtp_continuation_logits(&hidden)
+                } else {
+                    let shape = mlxcel_core::array_shape(&verify.logits);
+                    mlxcel_core::slice(
+                        &verify.logits,
+                        &[0, row, 0],
+                        &[shape[0], row + 1, shape[2]],
+                    )
+                });
+            }
             bonus = *walk
                 .new_tokens
                 .last()
@@ -2225,11 +2429,42 @@ impl Qwen35Dflash2Generator {
                 break;
             }
         }
+        let final_snapshot = if capture_final_snapshot {
+            if committed_tokens < history.len() {
+                // At most one emitted correction/bonus has not entered target
+                // state. Forward that token alone, never replay the prompt.
+                debug_assert_eq!(committed_tokens + 1, history.len());
+                let input = mlxcel_core::from_slice_i32(&history[committed_tokens..], &[1, 1]);
+                let continuation = target.forward_dflash_continuation(
+                    &input,
+                    &self.target_layer_ids,
+                    self.hidden_limit,
+                )?;
+                stats.target_forward_calls += 1;
+                snapshot_hidden = Some(merge_hidden_context(
+                    snapshot_hidden.as_deref().expect("capture retains hidden window"),
+                    &continuation.hidden_concat,
+                    self.hidden_limit,
+                ));
+                terminal_logits = Some(continuation.first_logits);
+            }
+            Some(Dflash2PromptSnapshot::capture(
+                target,
+                history.len(),
+                snapshot_hidden.as_deref().expect("capture retains hidden window"),
+                terminal_logits.as_deref().expect("capture retains continuation logits"),
+                prompt_snapshots.last().or_else(|| reusable.map(|reuse| reuse.snapshot)),
+            )?)
+        } else {
+            None
+        };
         stats.decode_time = decode_start.elapsed();
         Ok(Dflash2Generation {
             token_ids: generated,
             stats,
             cached_tokens,
+            prompt_snapshots,
+            final_snapshot,
             stop_reason,
         })
     }
@@ -2248,6 +2483,15 @@ fn merge_hidden_context(
     suffix: &MlxArray,
     hidden_limit: usize,
 ) -> UniquePtr<MlxArray> {
+    let suffix_shape = mlxcel_core::array_shape(suffix);
+    if suffix_shape[1] as usize >= hidden_limit {
+        let start = suffix_shape[1] - hidden_limit as i32;
+        return mlxcel_core::slice(
+            suffix,
+            &[0, start, 0],
+            &[suffix_shape[0], suffix_shape[1], suffix_shape[2]],
+        );
+    }
     let combined = mlxcel_core::concatenate(prefix, suffix, 1);
     let shape = mlxcel_core::array_shape(&combined);
     if shape[1] as usize <= hidden_limit {
@@ -2673,6 +2917,318 @@ mod tests {
         assert_eq!(generated, [5]);
         assert_eq!(history, [3, 4, 5]);
         assert_eq!(callbacks, 1);
+    }
+
+    #[test]
+    fn stopped_walk_commits_only_emitted_verified_rows() {
+        // The target verified anchor 10 and proposals 11,12,13. Only 11,12
+        // matched; 99 is the correction. Cancellation must not emit 12 or 99
+        // after the consumer declined 11, nor retain their target rows.
+        let verified = [10, 11, 12, 13];
+        let walk = [11, 12, 99];
+        for (eos, budget, cancel_after, expected, reason) in [
+            (Vec::new(), 20, 1, vec![10, 11], GenerationStopReason::CallbackCancelled),
+            (vec![12], 20, usize::MAX, vec![10, 11], GenerationStopReason::Eos),
+            (vec![11], 20, usize::MAX, vec![10], GenerationStopReason::Eos),
+            (Vec::new(), 3, usize::MAX, vec![10, 11, 12], GenerationStopReason::MaxTokens),
+            (Vec::new(), 4, usize::MAX, vec![10, 11, 12, 99], GenerationStopReason::MaxTokens),
+        ] {
+            let mut generated = vec![10];
+            let mut history = vec![7, 10];
+            let mut callbacks = 0;
+            let stopped = emit_dflash2_walk_tokens(
+                &walk,
+                &eos,
+                budget,
+                &mut generated,
+                &mut history,
+                &mut |_| {
+                    callbacks += 1;
+                    callbacks < cancel_after
+                },
+            );
+            assert_eq!(stopped, Some(reason));
+            assert_eq!(generated, expected);
+            assert_eq!(callbacks, expected.len() - 1);
+            assert_eq!(&history[1..], expected);
+            let committed = committed_dflash2_rows(2, generated.len() - 1);
+            assert_eq!(&verified[..committed], &expected[..committed]);
+            assert_eq!(
+                &expected[committed..],
+                if expected.last() == Some(&99) { &[99][..] } else { &[] },
+                "only an emitted correction may remain unforwarded"
+            );
+        }
+    }
+
+    #[test]
+    fn committed_hidden_window_evicts_old_rows_and_excludes_rejections() {
+        let mut window = mlxcel_core::from_slice_f32(&[0.0, 1.0, 2.0, 3.0], &[1, 4, 1]);
+        let verified = vec![mlxcel_core::from_slice_f32(
+            &[4.0, 5.0, 90.0, 91.0],
+            &[1, 4, 1],
+        )];
+        let committed = concatenate_hiddens(&verified, committed_dflash2_rows(3, 1));
+        window = materialize_detached(merge_hidden_context(&window, &committed, 4));
+        assert_eq!(raw_f32(&window), [2.0, 3.0, 4.0, 5.0]);
+        let suffix = mlxcel_core::from_slice_f32(&[6.0, 7.0, 8.0, 9.0, 10.0], &[1, 5, 1]);
+        window = materialize_detached(merge_hidden_context(&window, &suffix, 4));
+        assert_eq!(raw_f32(&window), [7.0, 8.0, 9.0, 10.0]);
+
+        let snapshot = Dflash2PromptSnapshot::from_portable_parts(
+            ModelStateSnapshot::new("qwen3.5", 11),
+            array_to_portable(None, &window),
+            7,
+            array_to_portable(None, &verify_logits(&[2], 3)),
+        )
+        .expect("restore evicted window at its absolute target boundary");
+        assert_eq!(snapshot.hidden_offset, 7);
+        assert_eq!(raw_f32(&snapshot.hidden_concat), [7.0, 8.0, 9.0, 10.0]);
+        let PortablePromptSnapshot::Dflash2 { hidden_offset, hidden_concat, .. } =
+            snapshot.to_portable()
+        else {
+            panic!("DFlash2 snapshot changed family")
+        };
+        assert_eq!(hidden_offset + hidden_concat.shape[1] as usize, 11);
+    }
+
+    #[test]
+    fn portable_dflash_snapshot_rejects_misaligned_nonfinite_and_nonfloat_context() {
+        let hidden = PortableArray {
+            name: None,
+            shape: vec![1, 2, 1],
+            dtype: mlxcel_core::dtype::FLOAT32,
+            bytes: [1.0_f32, 2.0].into_iter().flat_map(f32::to_ne_bytes).collect(),
+        };
+        let logits = PortableArray {
+            shape: vec![1, 1, 2],
+            ..hidden.clone()
+        };
+        let restore = |hidden, offset, logits| {
+            Dflash2PromptSnapshot::from_portable_parts(
+                ModelStateSnapshot::new("qwen3.5", 8),
+                hidden,
+                offset,
+                logits,
+            )
+        };
+        assert!(restore(hidden.clone(), 5, logits.clone()).is_err());
+        assert!(restore(hidden.clone(), usize::MAX, logits.clone()).is_err());
+        let mut wrong_layout = logits.clone();
+        wrong_layout.shape = vec![1, 2, 1];
+        assert!(restore(hidden.clone(), 6, wrong_layout).is_err());
+        let mut empty_hidden = hidden.clone();
+        empty_hidden.shape[2] = 0;
+        assert!(restore(empty_hidden, 6, logits.clone()).is_err());
+
+        for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut invalid_hidden = hidden.clone();
+            invalid_hidden.bytes[..4].copy_from_slice(&invalid.to_ne_bytes());
+            assert!(restore(invalid_hidden, 6, logits.clone()).is_err());
+            let mut invalid_logits = logits.clone();
+            invalid_logits.bytes[..4].copy_from_slice(&invalid.to_ne_bytes());
+            assert!(restore(hidden.clone(), 6, invalid_logits).is_err());
+        }
+        for (dtype, finite, nonfinite) in [
+            (mlxcel_core::dtype::FLOAT16, 0x3c00_u16, 0x7c00_u16),
+            (mlxcel_core::dtype::BFLOAT16, 0x3f80_u16, 0x7fc0_u16),
+        ] {
+            let mut half = hidden.clone();
+            half.dtype = dtype;
+            half.bytes = [finite, finite].into_iter().flat_map(u16::to_ne_bytes).collect();
+            assert!(restore(half.clone(), 6, logits.clone()).is_ok());
+            half.bytes[..2].copy_from_slice(&nonfinite.to_ne_bytes());
+            assert!(restore(half, 6, logits.clone()).is_err());
+        }
+        let mut integer = hidden;
+        integer.dtype = mlxcel_core::dtype::INT32;
+        assert!(restore(integer, 6, logits).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires real QW_MODEL_PATH and QW_DFLASH_DRAFT_MODEL_PATH checkpoints (or their default cache paths)"]
+    fn real_model_dflash2_checkpoints_and_cancelled_portable_resume() {
+        use crate::{ChatMessage, ChatMessageContent, KVCacheMode, PromptSnapshot, Qwen35Provider};
+
+        fn restored(snapshot: PromptSnapshot) -> Dflash2PromptSnapshot {
+            let portable = snapshot.to_portable().expect("encode DFlash2 snapshot");
+            let PromptSnapshot::Dflash2(snapshot) =
+                PromptSnapshot::from_portable(portable).expect("restore portable DFlash2 snapshot")
+            else {
+                panic!("portable DFlash2 snapshot changed family")
+            };
+            snapshot
+        }
+
+        let model_dir = crate::resolve_model_path(None).expect("resolve real target checkpoint");
+        let draft_dir = crate::resolve_dflash2_draft_path(None).expect("resolve real draft checkpoint");
+        let config_json = std::fs::read(draft_dir.join("config.json")).expect("read draft config");
+        let config = DFlash2Config::from_json(
+            &serde_json::from_slice(&config_json).expect("parse draft config"),
+        )
+        .expect("validate draft config");
+        let hidden_limit = config.sliding_window.expect("real sliding-window drafter") - 1;
+        let mut provider = Qwen35Provider::load(&model_dir, KVCacheMode::Turbo4)
+            .expect("load real DFlash2 target");
+        let messages = vec![
+            ChatMessage {
+                role: "system".to_string(),
+                name: None,
+                content: Some(ChatMessageContent::Text(
+                    "Accounts require verification before changing contact information. "
+                        .repeat(hidden_limit / 4 + 32),
+                )),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                name: None,
+                content: Some(ChatMessageContent::Text(
+                    "Explain in three detailed paragraphs how a customer should report a \
+                     lost debit card, protect their account, and obtain a replacement."
+                        .to_string(),
+                )),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            },
+        ];
+        let prompt = provider.tokenize_messages(&messages, &[], None, false)
+            .expect("tokenize long snapshot fixture");
+        assert!(prompt.len() > hidden_limit + 32, "fixture must exercise hidden-window eviction");
+        let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(7));
+        let control = provider.generate_dflash2_baseline_streaming(
+            &prompt, 48, &sampling, &draft_dir, None, &[], false, |_| true,
+        ).expect("uninterrupted uncached generation");
+        assert_eq!(control.token_ids.len(), 48, "fixture must reach the requested token budget");
+        assert!(control.prompt_snapshots.is_empty() && control.final_snapshot.is_none());
+
+        let boundary = prompt.len() - 17;
+        let mut checkpointed = provider.generate_dflash2_baseline_streaming(
+            &prompt,
+            48,
+            &sampling,
+            &draft_dir,
+            None,
+            &[prompt.len(), boundary, 0, boundary, prompt.len() + 1],
+            true,
+            |_| true,
+        ).expect("capture exact structural, prompt, and terminal boundaries");
+        assert_eq!(checkpointed.token_ids, control.token_ids);
+        assert_eq!(checkpointed.cached_tokens, 0);
+        assert_eq!(
+            checkpointed.prompt_snapshots.iter().map(PromptSnapshot::token_len).collect::<Vec<_>>(),
+            [boundary, prompt.len()]
+        );
+        let terminal = checkpointed.final_snapshot.take().expect("terminal snapshot");
+        assert_eq!(terminal.token_len(), prompt.len() + control.token_ids.len());
+        let logical_bytes = checkpointed.prompt_snapshots.iter()
+            .chain(std::iter::once(&terminal))
+            .map(|snapshot| match snapshot {
+                PromptSnapshot::Dflash2(snapshot) => snapshot.nbytes(),
+                _ => panic!("DFlash2 generation donated a foreign snapshot"),
+            })
+            .sum::<usize>();
+        eprintln!("DFlash2 retained snapshots=3 logical_bytes={logical_bytes} hidden_limit={hidden_limit}");
+        for snapshot in checkpointed.prompt_snapshots.iter().chain(std::iter::once(&terminal)) {
+            let PromptSnapshot::Dflash2(snapshot) = snapshot else { unreachable!() };
+            assert_eq!(mlxcel_core::array_shape(&snapshot.hidden_concat)[1] as usize, hidden_limit);
+            assert_eq!(snapshot.hidden_offset, snapshot.token_len() - hidden_limit);
+        }
+        drop(terminal);
+        let mut checkpoints = checkpointed.prompt_snapshots.into_iter();
+        let structural = restored(checkpoints.next().expect("structural checkpoint"));
+        let full_prompt = restored(checkpoints.next().expect("prompt checkpoint"));
+        for repetition in 0..2 {
+            let (warm, stats, cached_tokens) = provider.generate_dflash2_cached_streaming(
+                &prompt,
+                48,
+                &sampling,
+                &draft_dir,
+                Some(Dflash2PrefixReuse { snapshot: &structural, cached_tokens: boundary }),
+                |_| true,
+            ).expect("continue cached prompt suffix");
+            assert_eq!(warm.token_ids, control.token_ids);
+            assert_eq!(cached_tokens, boundary);
+            assert_eq!(stats.projected_context_cache_hits, repetition);
+        }
+        drop(structural);
+
+        // Initial cancellation, cancellation within a verify block, and a
+        // max-token tail each donate exactly the emitted prefix, not a bonus-
+        // shifted state. Later iterations also reuse memoized prompt K/V while
+        // maintaining a raw hidden window for terminal capture.
+        for (stop_after, cancel) in [(1, true), (2, true), (7, true), (5, false)] {
+            let mut callbacks = 0;
+            let mut interrupted = provider.generate_dflash2_baseline_streaming(
+                &prompt,
+                if cancel { 48 } else { stop_after },
+                &sampling,
+                &draft_dir,
+                Some(Dflash2PrefixReuse { snapshot: &full_prompt, cached_tokens: prompt.len() }),
+                &[],
+                true,
+                |_| {
+                    callbacks += 1;
+                    !cancel || callbacks < stop_after
+                },
+            ).expect("stop DFlash2 at an emitted boundary");
+            assert_eq!(interrupted.token_ids, control.token_ids[..stop_after]);
+            assert_eq!(callbacks, stop_after);
+            assert_eq!(interrupted.cached_tokens, prompt.len());
+            assert_eq!(
+                interrupted.finish_outcome,
+                if cancel { GenerationStopReason::CallbackCancelled } else { GenerationStopReason::MaxTokens }
+            );
+            let snapshot = restored(interrupted.final_snapshot.take().expect("stopped snapshot"));
+            let mut resume_prompt = prompt.clone();
+            resume_prompt.extend_from_slice(&interrupted.token_ids);
+            assert_eq!(snapshot.token_len(), resume_prompt.len());
+            assert_eq!(snapshot.hidden_offset, resume_prompt.len() - hidden_limit);
+            let resumed = provider.generate_dflash2_baseline_streaming(
+                &resume_prompt,
+                48 - stop_after,
+                &sampling,
+                &draft_dir,
+                Some(Dflash2PrefixReuse { cached_tokens: snapshot.token_len(), snapshot: &snapshot }),
+                &[],
+                false,
+                |_| true,
+            ).expect("resume portable cancelled/terminal snapshot");
+            assert_eq!(resumed.cached_tokens, resume_prompt.len());
+            let mut combined = interrupted.token_ids;
+            combined.extend_from_slice(&resumed.token_ids);
+            assert_eq!(combined, control.token_ids, "resumed tokens differ at stop={stop_after}");
+        }
+
+        // Turn one of the real verified tokens into a stop token, then remove
+        // that policy on resume. The un-emitted EOS row must not enter state.
+        let eos_index = control.token_ids.iter()
+            .position(|&token| token != control.token_ids[0])
+            .expect("fixture contains a noninitial stop token");
+        for eos_index in [0, eos_index] {
+            let mut eos_sampling = sampling.clone();
+            eos_sampling.stop_token_ids = vec![control.token_ids[eos_index]];
+            let mut stopped = provider.generate_dflash2_baseline_streaming(
+                &prompt, 48, &eos_sampling, &draft_dir,
+                Some(Dflash2PrefixReuse { snapshot: &full_prompt, cached_tokens: prompt.len() }),
+                &[], true, |_| true,
+            ).expect("stop before emitting EOS");
+            assert_eq!(stopped.finish_outcome, GenerationStopReason::Eos);
+            assert_eq!(stopped.token_ids, control.token_ids[..eos_index]);
+            let snapshot = restored(stopped.final_snapshot.take().expect("EOS snapshot"));
+            let mut resume_prompt = prompt.clone();
+            resume_prompt.extend_from_slice(&stopped.token_ids);
+            assert_eq!(snapshot.token_len(), resume_prompt.len());
+            let resumed = provider.generate_dflash2_baseline_streaming(
+                &resume_prompt, 48 - eos_index, &sampling, &draft_dir,
+                Some(Dflash2PrefixReuse { cached_tokens: snapshot.token_len(), snapshot: &snapshot }),
+                &[], false, |_| true,
+            ).expect("resume before the un-emitted EOS token");
+            assert_eq!(resumed.token_ids, control.token_ids[eos_index..]);
+        }
     }
 
     /// Synthetic conv check: with `base_kernel[side][tap=0]` = 1 and

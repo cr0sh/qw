@@ -324,6 +324,8 @@ pub(crate) struct Qwen35MtpVerifyOutput {
 /// which captures the target's hidden states at the draft's configured layer
 /// ids for the next draft round's context.
 pub(crate) struct Qwen35DflashVerifyOutput {
+    /// Final pre-norm hidden rows, retained for single-row terminal projection.
+    pub(crate) hidden: UniquePtr<MlxArray>,
     pub(crate) hidden_by_layer: Vec<UniquePtr<MlxArray>>,
     pub(crate) logits: UniquePtr<MlxArray>,
     pub(crate) gdn_states: Vec<GdnRollbackSnapshot>,
@@ -333,14 +335,11 @@ pub(crate) struct Qwen35DflashVerifyOutput {
 /// DFlash2 prefill output: `hidden_concat` is the per-layer captured hidden
 /// states concatenated along the hidden axis `[1, P', K * hidden]`; the
 /// drafter consumes it as its context buffer. `first_logits` is the last
-/// position's logits (the first sampled token). `hidden_offset` is the number
-/// of leading rows dropped once the captured rows exceeded the drafter's
-/// sliding-window limit (0 when nothing was dropped); the drafter cache
-/// offsets are aligned to it.
+/// position's logits (the first sampled token). Absolute hidden offsets are
+/// derived from the committed target boundary after merging any prefix rows.
 pub(crate) struct Qwen35DflashPrefill {
     pub(crate) hidden_concat: UniquePtr<MlxArray>,
     pub(crate) first_logits: UniquePtr<MlxArray>,
-    pub(crate) hidden_offset: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1480,6 +1479,7 @@ impl Qwen35Model {
             let offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
             (
                 Qwen35DflashVerifyOutput {
+                    hidden,
                     hidden_by_layer,
                     logits,
                     gdn_states,
@@ -1497,8 +1497,7 @@ impl Qwen35Model {
     /// last `hidden_limit` rows per layer (dropping leading rows once over the
     /// limit, as the drafter's sliding window bounds the context the draft
     /// layers can attend to). After all chunks, `hidden_concat` is the
-    /// per-layer hiddens concatenated along `-1`; `hidden_offset` is the number
-    /// of dropped leading rows.
+    /// per-layer hiddens concatenated along `-1`.
     pub(crate) fn forward_dflash_prefill(
         &self,
         input_ids: &MlxArray,
@@ -1613,8 +1612,6 @@ impl Qwen35Model {
         }
         let hidden_concat =
             hidden_concat.expect("DFlash2 prefill captures at least one target layer");
-        let hidden_rows = mlxcel_core::array_shape(&hidden_concat)[1] as usize;
-        let hidden_offset = prompt_len as usize - hidden_rows;
 
         let offset = self
             .sequence_state
@@ -1623,7 +1620,6 @@ impl Qwen35Model {
         Ok(Qwen35DflashPrefill {
             hidden_concat,
             first_logits: first_logits.expect("non-empty prefill produces first_logits"),
-            hidden_offset,
         })
     }
 
