@@ -50,10 +50,6 @@ use crate::specprefill::{
 };
 
 const DEFAULT_MTP_BLOCK_SIZE: usize = 3;
-/// MTP wins the fresh benchmark by 1.413 tok/s while DFlash2 wins at 10k by
-/// 0.950 tok/s. Linear interpolation crosses at 5,980 tokens; use a round,
-/// memorable request-level default.
-pub const DEFAULT_DECODER_CROSSOVER_TOKENS: usize = 6_000;
 
 fn tokens_per_second(tokens: usize, elapsed: Duration) -> f64 {
     let seconds = elapsed.as_secs_f64();
@@ -336,28 +332,21 @@ pub enum Qwen35GenerationMode {
     Dflash2,
 }
 
-/// Resolve one request to an explicit decoder. Explicit modes never consult
-/// context length; `Automatic` selects DFlash2 only for compatible long text
-/// requests and otherwise prefers bundled MTP.
+/// Resolve one request to an explicit decoder. `Automatic` prefers available,
+/// compatible DFlash2, then bundled MTP, then baseline. Explicit modes fail
+/// when the requested decoder is unavailable or incompatible.
 pub fn select_qwen35_decoder(
     mode: Qwen35GenerationMode,
-    prompt_tokens: usize,
-    crossover_tokens: usize,
     mtp_available: bool,
     dflash2_available: bool,
     dflash2_compatible: bool,
 ) -> std::result::Result<Qwen35GenerationMode, String> {
-    if crossover_tokens == 0 {
-        return Err("decoder crossover tokens must be greater than zero".to_string());
-    }
     match mode {
         Qwen35GenerationMode::Automatic => {
-            if dflash2_available && dflash2_compatible && prompt_tokens >= crossover_tokens {
+            if dflash2_available && dflash2_compatible {
                 Ok(Qwen35GenerationMode::Dflash2)
             } else if mtp_available {
                 Ok(Qwen35GenerationMode::Mtp)
-            } else if dflash2_available && dflash2_compatible {
-                Ok(Qwen35GenerationMode::Dflash2)
             } else {
                 Ok(Qwen35GenerationMode::Baseline)
             }
@@ -1493,7 +1482,6 @@ impl Qwen35Provider {
         &mut self,
         request: &GenerationRequest,
         mode: Qwen35GenerationMode,
-        crossover_tokens: usize,
         dflash2_draft_dir: Option<&Path>,
         on_delta: F,
     ) -> Result<GenerationOutput> {
@@ -1502,8 +1490,6 @@ impl Qwen35Provider {
             cfg!(feature = "dflash2") && dflash2_draft_dir.is_some_and(Path::is_dir);
         let decoder = select_qwen35_decoder(
             mode,
-            prompt_ids.len(),
-            crossover_tokens,
             self.mtp_generator.is_some(),
             dflash2_available,
             sampler_is_greedy(&sampling),
@@ -1514,7 +1500,6 @@ impl Qwen35Provider {
             decoder = ?decoder,
             configured_decoder = ?mode,
             prompt_tokens = prompt_ids.len(),
-            crossover_tokens,
             dflash2_available,
         );
         let generation = match decoder {
@@ -1967,126 +1952,63 @@ mod tests {
     }
 
     #[test]
-    fn automatic_decoder_uses_the_measured_context_crossover() {
-        let select = |tokens| {
-            select_qwen35_decoder(
-                Qwen35GenerationMode::Automatic,
-                tokens,
-                DEFAULT_DECODER_CROSSOVER_TOKENS,
-                true,
-                true,
-                true,
-            )
-            .expect("automatic decoder")
-        };
+    fn automatic_decoder_prefers_available_compatible_dflash2() {
         assert_eq!(
-            select(DEFAULT_DECODER_CROSSOVER_TOKENS - 1),
-            Qwen35GenerationMode::Mtp
+            select_qwen35_decoder(Qwen35GenerationMode::Automatic, true, true, true),
+            Ok(Qwen35GenerationMode::Dflash2)
         );
         assert_eq!(
-            select(DEFAULT_DECODER_CROSSOVER_TOKENS),
-            Qwen35GenerationMode::Dflash2
+            select_qwen35_decoder(Qwen35GenerationMode::Automatic, false, true, true),
+            Ok(Qwen35GenerationMode::Dflash2)
         );
     }
 
     #[test]
-    fn explicit_decoder_selection_ignores_context_and_fails_closed() {
-        for tokens in [1, DEFAULT_DECODER_CROSSOVER_TOKENS, 64_000] {
-            assert_eq!(
-                select_qwen35_decoder(
-                    Qwen35GenerationMode::Mtp,
-                    tokens,
-                    DEFAULT_DECODER_CROSSOVER_TOKENS,
-                    true,
-                    true,
-                    true,
-                ),
-                Ok(Qwen35GenerationMode::Mtp)
-            );
-            assert_eq!(
-                select_qwen35_decoder(
-                    Qwen35GenerationMode::Dflash2,
-                    tokens,
-                    DEFAULT_DECODER_CROSSOVER_TOKENS,
-                    true,
-                    true,
-                    true,
-                ),
-                Ok(Qwen35GenerationMode::Dflash2)
-            );
-        }
-        assert!(
-            select_qwen35_decoder(
-                Qwen35GenerationMode::Mtp,
-                1,
-                DEFAULT_DECODER_CROSSOVER_TOKENS,
-                false,
-                true,
-                true,
-            )
-            .is_err()
-        );
-        assert!(
-            select_qwen35_decoder(
-                Qwen35GenerationMode::Dflash2,
-                64_000,
-                DEFAULT_DECODER_CROSSOVER_TOKENS,
-                true,
-                false,
-                true,
-            )
-            .is_err()
-        );
-        assert!(
-            select_qwen35_decoder(
-                Qwen35GenerationMode::Dflash2,
-                64_000,
-                DEFAULT_DECODER_CROSSOVER_TOKENS,
-                true,
-                true,
-                false,
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn automatic_decoder_falls_back_without_changing_exactness_constraints() {
+    fn explicit_decoder_selection_honors_requested_mode_and_fails_closed() {
         assert_eq!(
-            select_qwen35_decoder(
-                Qwen35GenerationMode::Automatic,
-                64_000,
-                DEFAULT_DECODER_CROSSOVER_TOKENS,
-                true,
-                false,
-                true,
-            ),
-            Ok(Qwen35GenerationMode::Mtp)
-        );
-        assert_eq!(
-            select_qwen35_decoder(
-                Qwen35GenerationMode::Automatic,
-                64_000,
-                DEFAULT_DECODER_CROSSOVER_TOKENS,
-                true,
-                true,
-                false,
-            ),
-            Ok(Qwen35GenerationMode::Mtp)
-        );
-        assert_eq!(
-            select_qwen35_decoder(
-                Qwen35GenerationMode::Automatic,
-                64_000,
-                DEFAULT_DECODER_CROSSOVER_TOKENS,
-                false,
-                false,
-                true,
-            ),
+            select_qwen35_decoder(Qwen35GenerationMode::Baseline, true, true, true),
             Ok(Qwen35GenerationMode::Baseline)
         );
+        assert_eq!(
+            select_qwen35_decoder(Qwen35GenerationMode::Baseline, false, false, false),
+            Ok(Qwen35GenerationMode::Baseline)
+        );
+        assert_eq!(
+            select_qwen35_decoder(Qwen35GenerationMode::Mtp, true, true, true),
+            Ok(Qwen35GenerationMode::Mtp)
+        );
+        assert_eq!(
+            select_qwen35_decoder(Qwen35GenerationMode::Dflash2, true, true, true),
+            Ok(Qwen35GenerationMode::Dflash2)
+        );
         assert!(
-            select_qwen35_decoder(Qwen35GenerationMode::Automatic, 1, 0, true, true, true).is_err()
+            select_qwen35_decoder(Qwen35GenerationMode::Mtp, false, true, true).is_err()
+        );
+        assert!(
+            select_qwen35_decoder(Qwen35GenerationMode::Dflash2, true, false, true).is_err()
+        );
+        assert!(
+            select_qwen35_decoder(Qwen35GenerationMode::Dflash2, true, true, false).is_err()
+        );
+    }
+
+    #[test]
+    fn automatic_decoder_falls_back_when_dflash2_is_unavailable_or_incompatible() {
+        assert_eq!(
+            select_qwen35_decoder(Qwen35GenerationMode::Automatic, true, false, true),
+            Ok(Qwen35GenerationMode::Mtp)
+        );
+        assert_eq!(
+            select_qwen35_decoder(Qwen35GenerationMode::Automatic, true, true, false),
+            Ok(Qwen35GenerationMode::Mtp)
+        );
+        assert_eq!(
+            select_qwen35_decoder(Qwen35GenerationMode::Automatic, false, false, true),
+            Ok(Qwen35GenerationMode::Baseline)
+        );
+        assert_eq!(
+            select_qwen35_decoder(Qwen35GenerationMode::Automatic, false, true, false),
+            Ok(Qwen35GenerationMode::Baseline)
         );
     }
 

@@ -39,7 +39,7 @@ pub use provider::{
     BaselineGeneration, ChatContentPart, ChatContentRef, ChatCustomToolCall, ChatFile,
     ChatImageUrl, ChatInputAudio, ChatMessage, ChatMessageContent, ChatPromptCacheBreakpoint,
     ChatTool, ChatToolCall, ChatToolCallFunction, ChatToolFunction,
-    DEFAULT_DECODER_CROSSOVER_TOKENS, GenerationOutput, GenerationRequest, MtpGenerationStats,
+    GenerationOutput, GenerationRequest, MtpGenerationStats,
     MtpPrefixReuse, MtpPromptSnapshot, PreparedMultimodalPrefill, PromptSnapshot,
     Qwen35GenerationMode, Qwen35Provider, select_qwen35_decoder,
 };
