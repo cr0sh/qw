@@ -8,11 +8,15 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from evalscope.api.dataset.dataset import Sample
+from evalscope.api.dataset.dataset import MemoryDataset, Sample
+from evalscope.api.evaluator.cache import CacheManager
+from evalscope.api.evaluator.state import TaskState
+from evalscope.api.metric import SampleScore, Score
 from evalscope.api.messages import ChatMessageAssistant, ChatMessageUser
 from evalscope.api.model import GenerateConfig, ModelOutput, get_model
 from evalscope.constants import EvalType
 from evalscope.models.utils.openai import openai_chat_message
+from evalscope.utils.io_utils import OutputsStructure
 from tau2.data_model.message import AssistantMessage, SystemMessage, UserMessage, ToolCall
 from tau2.data_model.simulation import RewardInfo, SimulationRun
 from tau2.data_model.tasks import Task
@@ -94,6 +98,40 @@ def completion_server(responses):
 def check_email(folder: str) -> str:
     """Read an email folder."""
     raise AssertionError("Generation must not execute simulator tools")
+
+
+def completed_cache_fixture(directory):
+    task = Task(id="cached-zero", user_scenario={"instructions": "Compare available cards."})
+    sample = Sample(id=0, group_id=0, input="Compare available cards.", metadata=task.model_dump())
+    dataset = MemoryDataset([sample, Sample(id=1, group_id=1, input="Pending task", metadata={"id": "pending"})])
+    message = AssistantMessage(
+        role="assistant", content="I still need details.",
+        raw_data={"choices": [{"message": {"content": [
+            {"type": "reasoning", "reasoning": "Need more information."},
+            {"type": "text", "text": "I still need details."},
+        ]}}]},
+    )
+    user_tool = UserMessage(role="user", tool_calls=[ToolCall(id="lookup", name="lookup", arguments={}, requestor="user")])
+    result = SimulationRun(
+        id="cache-fixture", task_id=task.id, start_time="2026-01-01T00:00:00",
+        end_time="2026-01-01T00:00:01", duration=1.0,
+        termination_reason="max_steps", reward_info=RewardInfo(reward=0.0), messages=[message, user_tool],
+    )
+    task_result = {**result.reward_info.model_dump(mode="json"), "status": "completed"}
+    state = TaskState(
+        model="cache-fixture", sample=sample.model_copy(update={"metadata": {**sample.metadata, "task_result": task_result}}),
+        output=ModelOutput.from_content(model="cache-fixture", content=result.model_dump_json()),
+        messages=[tau3_adapter._trajectory_message(item) for item in result.messages], completed=True,
+    )
+    score = SampleScore(
+        sample_id=0, group_id=0, generation_index=0, sample_metadata=state.metadata,
+        score=Score(value={"acc": 0.0}, prediction=result.model_dump_json(), metadata={"task_result": task_result}),
+    )
+    cache = CacheManager(OutputsStructure(directory), "cache-fixture", "tau3_bench")
+    cache.save_prediction_cache("banking_knowledge", state)
+    cache.save_review_cache("banking_knowledge", state, score)
+    cache.close()
+    return cache, dataset
 
 
 
@@ -300,6 +338,68 @@ class Tau3AdapterTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=2)
+
+    def test_native_cache_reuses_completed_zero_reward_max_steps(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache, dataset = completed_cache_fixture(directory)
+            review_path = Path(cache.get_review_cache_path("banking_knowledge"))
+            review = json.loads(review_path.read_text())
+            scored_run = json.loads(review["sample_score"]["score"]["prediction"])
+            scored_run["id"] = "different-report-uuid"
+            scored_run["duration"] = 2.0
+            review["sample_score"]["score"]["prediction"] = json.dumps(scored_run)
+            review_path.write_text(json.dumps(review) + "\n")
+            self.assertEqual(tau3_adapter._validate_cached_records(cache, dataset, "cache-fixture"), (1, 1))
+            restored, remaining = cache.filter_prediction_cache("banking_knowledge", dataset)
+            self.assertEqual([sample.id for sample in remaining], [1])
+            self.assertEqual(SimulationRun.model_validate_json(restored[0].output.message.text).termination_reason, "max_steps")
+            scores, pending_review = cache.filter_review_cache("banking_knowledge", restored)
+            self.assertEqual(scores[0].score.value, {"acc": 0.0})
+            self.assertEqual(pending_review, [])
+
+    def test_resume_rejects_duplicate_or_unproven_cache_records(self):
+        for corruption in ["duplicate_prediction", "invalid_index", "missing_completed_status", "duplicate_review", "orphan_review"]:
+            with self.subTest(corruption=corruption), tempfile.TemporaryDirectory() as directory:
+                cache, dataset = completed_cache_fixture(directory)
+                prediction_path = Path(cache.get_prediction_cache_path("banking_knowledge"))
+                review_path = Path(cache.get_review_cache_path("banking_knowledge"))
+                prediction = json.loads(prediction_path.read_text())
+                review = json.loads(review_path.read_text())
+                if corruption == "duplicate_prediction":
+                    prediction_path.write_text(prediction_path.read_text() * 2)
+                elif corruption == "invalid_index":
+                    prediction["index"] = -1
+                    prediction_path.write_text(json.dumps(prediction) + "\n")
+                elif corruption == "missing_completed_status":
+                    del prediction["metadata"]["task_result"]["status"]
+                    prediction_path.write_text(json.dumps(prediction) + "\n")
+                elif corruption == "duplicate_review":
+                    review_path.write_text(review_path.read_text() * 2)
+                else:
+                    review["index"] = 1
+                    review_path.write_text(json.dumps(review) + "\n")
+                with self.assertRaises(ValueError):
+                    tau3_adapter._validate_cached_records(cache, dataset, "cache-fixture")
+
+    def test_resume_rejects_lost_reasoning_and_mismatched_review(self):
+        for corruption in ["lost_reasoning", "lost_user_tool", "wrong_reward", "wrong_trajectory"]:
+            with self.subTest(corruption=corruption), tempfile.TemporaryDirectory() as directory:
+                cache, dataset = completed_cache_fixture(directory)
+                path = Path(cache.get_prediction_cache_path("banking_knowledge") if corruption in {"lost_reasoning", "lost_user_tool"} else cache.get_review_cache_path("banking_knowledge"))
+                row = json.loads(path.read_text())
+                if corruption == "lost_reasoning":
+                    row["messages"][0]["content"] = [
+                        content for content in row["messages"][0]["content"] if content["type"] != "reasoning"
+                    ]
+                elif corruption == "lost_user_tool":
+                    row["messages"][1]["metadata"] = {}
+                elif corruption == "wrong_reward":
+                    row["sample_score"]["score"]["value"]["acc"] = 1.0
+                else:
+                    row["messages"][0]["content"] = "Unrelated trajectory"
+                path.write_text(json.dumps(row) + "\n")
+                with self.assertRaises(ValueError):
+                    tau3_adapter._validate_cached_records(cache, dataset, "cache-fixture")
 
 
 
