@@ -9,6 +9,7 @@ third-party installation remains untouched.
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -400,6 +401,80 @@ def install() -> None:
 
     generation.predict = predict
     generation.patched_generate = patched_generate
+
+
+def _validate_cached_records(cache, dataset, model_name: str) -> tuple[int, int]:
+    """Validate native cache rows without changing or synthesizing any record."""
+    from evalscope.api.evaluator.cache import ModelResult, ReviewResult
+    from evalscope.utils.io_utils import jsonl_to_list
+    from tau2.data_model.simulation import SimulationRun
+
+    fields = {"role", "content", "tool_calls", "tool_call_id", "metadata"}
+    predictions = {}
+    prediction_path = cache.get_prediction_cache_path("banking_knowledge")
+    for row in jsonl_to_list(prediction_path) if Path(prediction_path).is_file() else []:
+        prediction = ModelResult.model_validate(row)
+        index = prediction.index
+        if type(row["index"]) is not int or not 0 <= index < len(dataset) or index in predictions:
+            raise ValueError("resume prediction has a duplicate or invalid dataset index")
+        sample = dataset[index]
+        metadata = prediction.metadata or {}
+        if sample.id != index or {key: value for key, value in metadata.items() if key != "task_result"} != sample.metadata:
+            raise ValueError(f"resume prediction {index} does not match the current dataset task/order")
+        output = prediction.model_output
+        if prediction.model != model_name or output is None or output.model != model_name or output.error or len(output.choices) != 1:
+            raise ValueError(f"resume prediction {index} is not a successful model report")
+        if output.choices[0].stop_reason != "stop":
+            raise ValueError(f"resume prediction {index} is not the canonical report wrapper")
+        simulation = SimulationRun.model_validate_json(output.choices[0].message.text)
+        if simulation.task_id != sample.metadata["id"] or simulation.reward_info is None:
+            raise ValueError(f"resume prediction {index} lacks its matching canonical task result")
+        reward = simulation.reward_info.reward
+        if not math.isfinite(reward) or not 0 <= reward <= 1:
+            raise ValueError(f"resume prediction {index} has an invalid canonical reward")
+        expected_result = {**simulation.reward_info.model_dump(mode="json"), "status": "completed"}
+        if metadata.get("task_result") != expected_result:
+            raise ValueError(f"resume prediction {index} lacks verified completed-result metadata")
+        raw_messages = simulation.messages or []
+        if len(prediction.messages) != len(raw_messages) or any(
+            saved.model_dump(include=fields, exclude_none=True) != _trajectory_message(raw).model_dump(include=fields, exclude_none=True)
+            for saved, raw in zip(prediction.messages, raw_messages)
+        ):
+            raise ValueError(f"resume prediction {index} has a lossy or mismatched trajectory")
+        predictions[index] = (prediction.to_task_state(dataset), simulation)
+
+    reviewed = set()
+    review_path = cache.get_review_cache_path("banking_knowledge")
+    for row in jsonl_to_list(review_path) if Path(review_path).is_file() else []:
+        review = ReviewResult.model_validate(row)
+        index = review.index
+        if type(row["index"]) is not int or index in reviewed or index not in predictions:
+            raise ValueError("resume review has a duplicate, invalid, or orphan dataset index")
+        state, simulation = predictions[index]
+        sample_score = review.sample_score
+        score = sample_score.score
+        scored_simulation = SimulationRun.model_validate_json(score.prediction)
+        if (
+            review.target != state.target
+            or review.agent_trace != state.agent_trace
+            or [message.model_dump(include=fields, exclude_none=True) for message in review.messages]
+            != [message.model_dump(include=fields, exclude_none=True) for message in state.messages]
+            or sample_score.sample_id != state.sample_id
+            or sample_score.group_id != state.group_id
+            or sample_score.generation_index != 0
+            or sample_score.sample_metadata != state.metadata
+            or score.status != "success"
+            or score.value != {"acc": simulation.reward_info.reward}
+            or score.metadata != {"task_result": state.metadata["task_result"]}
+            or scored_simulation.task_id != simulation.task_id
+            or scored_simulation.termination_reason != simulation.termination_reason
+            or scored_simulation.reward_info != simulation.reward_info
+            or [_trajectory_message(message).model_dump(include=fields, exclude_none=True) for message in scored_simulation.messages or []]
+            != [message.model_dump(include=fields, exclude_none=True) for message in state.messages]
+        ):
+            raise ValueError(f"resume review {index} does not match its canonical scored result")
+        reviewed.add(index)
+    return len(predictions), len(reviewed)
 
 
 __all__ = ["Tau3AdapterError", "configure_capture", "install"]

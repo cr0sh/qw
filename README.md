@@ -143,11 +143,56 @@ The agent is `qwen3.8-27b` at `http://127.0.0.1:8883/v1`; the simulator is
 (the token file defaults to `~/.omp/auth-gateway.token`). No server is started
 by the launcher. Optional `TAU3_DATASET_ID=/path/to/dataset` reuses an existing
 local dataset read-only; otherwise the configured dataset is downloaded into
-the new run's cache. Each invocation chooses a fresh UUID result directory
+the new run's cache. Each fresh invocation chooses a UUID result directory
 under `eval/outputs/`. Opt in to request/response/result capture with
 `--capture /unique/path.jsonl` (or `TAU3_CAPTURE_PATH`); existing capture paths
 are rejected. Use a fresh QW process and prefix-cache directory for a fresh
 scored campaign; do not resume an invalid run as a scored baseline.
+
+To continue verified completed native records after a terminal interruption:
+
+```bash
+python eval/run_tau3_banking.py --run --resume /path/to/outer-UUID/YYYYMMDD_HHMMSS
+```
+
+Pass the exact **inner timestamp directory** containing `configs/`,
+`predictions/`, and `reviews/`, not the outer UUID directory or a JSONL file.
+Its existing `progress.json` must say `error` or `completed` with total count
+97; missing, running (including stale-running), and diagnostic runs are
+rejected. First observe the previous evaluator's exit. Never edit progress to
+make an active or unverifiable run resumable. `--limit` cannot accompany resume.
+
+Before native configuration is overwritten, the launcher checks EvalScope's
+evaluation identity and every cached prediction/review against the current
+97-task banking dataset and canonical Tau2 result. This includes task order,
+model, completed reward metadata, finite rewards (including legitimate zero
+and `max_steps` results), lossless reasoning/user-tool trajectories, and
+matching reviews. Duplicate, orphan, corrupt, and infrastructure-error rows
+fail closed; there is no forced reuse or `rerun_review` bypass.
+
+Completed predictions are reused, missing reviews are computed, and only
+uncached tasks rerun. **Partial trajectories are not restored**: a failed task
+with no completed prediction starts again, so this is not a way to preserve
+its agent prefix or justify blind stochastic retries. A zero-valid-row failed
+campaign has no completed work to preserve. No error is converted to reward
+zero or silently skipped.
+
+Fresh and resumed writers hold the same nonblocking, persistent outer
+`.writer.lock` throughout validation/evaluation; leave that file in place.
+Competing updated launchers fail before writing native run artifacts. Legacy
+launchers do not take this lock: it cannot protect against them, so observed
+legacy evaluator exit remains a procedural prerequisite. Resume uses the
+outer directory's `data-cache/`, just like the original fresh run.
+
+Keep the original local dataset snapshot read-only and unchanged. Native
+identity does not checksum local dataset contents: 97 rows plus matching
+cached metadata cannot establish that uncached task contents are unchanged.
+This resume contract assumes the known read-only snapshot, rather than
+inventing a retroactive checksum. Offline native CLI verification used
+explicitly nonscored fixtures: one complete cache hit, one pending review
+completed, and the next uncached task aborted before inference; a competing
+resume CLI also failed against a fresh writer's lock. This proves resume
+mechanics, not completion or a score for the 97-task benchmark.
 
 Obtain statistics about storage usage and status:
 
