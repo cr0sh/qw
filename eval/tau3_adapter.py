@@ -335,10 +335,8 @@ def predict(model: Any, sample: Any, adapter_instance: Any) -> InferenceResult:
 def install() -> None:
     """Install the repo-owned hooks into the installed τ³ adapter."""
 
-    global _INSTALLED_GENERATION
     from evalscope.benchmarks.tau_bench.tau3_bench import generation
 
-    _INSTALLED_GENERATION = generation
     generation.predict = predict
     generation.patched_generate = patched_generate
 
