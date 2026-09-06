@@ -73,6 +73,10 @@ baseline routing. `--decoder baseline|mtp|dflash` makes an explicit selection.
 Override the draft checkpoint with `--dflash-draft-model` or
 `QW_DFLASH_DRAFT_MODEL_PATH`.
 
+Both speculative decoders verify proposals against the full target vocabulary.
+Compact vocabulary heads are used only to propose draft tokens; they must not
+exclude a target winner during acceptance, correction, or bonus-token selection.
+
 DFlash2 participates in the server's memory and filesystem prefix cache, in a
 separate decoder namespace. Snapshots retain target state at its actual resident
 precision, the bounded drafter hidden window, and continuation logits. Structural
@@ -83,6 +87,45 @@ immediately queued requests can arrive before a preceding snapshot is available.
 Turbo4 speculative regrouping can change floating-point results and greedy token
 choices; byte-preserving snapshots do not promise token-identical continuations
 across different execution groupings.
+
+The server rejects malformed or undeclared generated tool calls and violations
+of `parallel_tool_calls=false`. These output-contract failures return HTTP 422
+with `error.type=model_output_error` and `error.code=invalid_model_output`, rather
+than a retryable server error. Streaming responses use the same error type/code
+in the endpoint's terminal error event after HTTP headers have been sent.
+The error does not include raw generated argument bodies.
+
+For τ³ evaluation, this strict rejection differs from Tau2's live environment,
+which can return unknown-tool feedback to the agent. The banking runner aborts
+on such protocol failures rather than skipping tasks or assigning reward zero;
+an aborted run is not a complete benchmark score.
+The full Tau2 result is the authoritative trajectory. Report-only user tool
+actions retain the user role and exact calls in `tau2_user_tool_calls` metadata;
+tool-only report entries use an empty content list, never invented user text.
+This report representation is not sent to models. Opt-in capture writes the
+completed task result before report conversion.
+
+Run the durable banking launcher from a dedicated worktree using a Python
+environment with EvalScope 1.11.0 and `tau2[knowledge]` v1.0.0 installed:
+
+```bash
+python eval/run_tau3_banking.py                 # validate configuration only
+python eval/run_tau3_banking.py --limit 1 --run # one-task integration diagnostic
+python eval/run_tau3_banking.py --run           # all 97 tasks, one repeat
+```
+
+The agent is `qwen3.8-27b` at `http://127.0.0.1:8883/v1`; the simulator is
+`openai-codex/gpt-5.6-luna`, defaulting to the authenticated gateway at
+`http://127.0.0.1:18766/v1`. Keep QW and the auth services available; configure
+`TAU_SIMULATOR_API_URL` and `TAU_SIMULATOR_TOKEN_FILE` if their defaults differ
+(the token file defaults to `~/.omp/auth-gateway.token`). No server is started
+by the launcher. Optional `TAU3_DATASET_ID=/path/to/dataset` reuses an existing
+local dataset read-only; otherwise the configured dataset is downloaded into
+the new run's cache. Each invocation chooses a fresh UUID result directory
+under `eval/outputs/`. Opt in to request/response/result capture with
+`--capture /unique/path.jsonl` (or `TAU3_CAPTURE_PATH`); existing capture paths
+are rejected. Use a fresh QW process and prefix-cache directory for a fresh
+scored campaign; do not resume an invalid run as a scored baseline.
 
 Obtain statistics about storage usage and status:
 
@@ -143,6 +186,11 @@ optimization runs merged through `7ada6d4`; 64k uses the latest confirmation
 (40.050), not the earlier 40.268 result. Long-context timed DFlash2 repetitions
 reuse the same live prompt snapshot and exact suffix, including projected-context
 cache hits; these are warm-reuse measurements, not cold-request throughput.
+
+These historical speculative-decoder timings predate the full-vocabulary target
+verification correction. They used a restricted target head that could exclude
+ordinary tokens, including parts of function names; do not treat them as current
+correct-decoding throughput or quality baselines.
 
 Automatic routing is capability-based, not calibrated to a prompt-length
 crossover. These historical throughput measurements do not establish an

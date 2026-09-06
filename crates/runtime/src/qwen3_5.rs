@@ -41,10 +41,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 const MTP_DRAFT_PREFIX: i32 = 65_536;
 const MTP_DRAFT_PADDED: i32 = 65_568;
+#[cfg(any(feature = "dflash2", test))]
 pub(crate) const DFLASH_COMPACT_PREFIX: i32 = 80_896;
-const DFLASH_VERIFY_PADDED: i32 = 80_928;
+#[cfg(any(feature = "dflash2", test))]
+const DFLASH_CANDIDATE_PADDED: i32 = 80_928;
 pub(crate) const DFLASH_CONTROL_START: i32 = 248_044;
 pub(crate) const DFLASH_CONTROL_END: i32 = 248_070;
+#[cfg(test)]
 pub(crate) const DFLASH_COMPACT_TOKEN_COUNT: i32 =
     DFLASH_COMPACT_PREFIX + DFLASH_CONTROL_END - DFLASH_CONTROL_START;
 const TURBO4_PACKED_MTP_THRESHOLD_TOKENS: i32 = 2_048;
@@ -324,8 +327,6 @@ pub(crate) struct Qwen35MtpVerifyOutput {
 /// which captures the target's hidden states at the draft's configured layer
 /// ids for the next draft round's context.
 pub(crate) struct Qwen35DflashVerifyOutput {
-    /// Final pre-norm hidden rows, retained for single-row terminal projection.
-    pub(crate) hidden: UniquePtr<MlxArray>,
     pub(crate) hidden_by_layer: Vec<UniquePtr<MlxArray>>,
     pub(crate) logits: UniquePtr<MlxArray>,
     pub(crate) gdn_states: Vec<GdnRollbackSnapshot>,
@@ -1012,7 +1013,8 @@ pub struct Qwen35Model {
     pub(crate) norm: RMSNorm,
     pub(crate) lm_head: Option<UnifiedLinear>,
     compact_draft_head: Option<UnifiedLinear>,
-    compact_dflash_verify_head: Option<UnifiedLinear>,
+    #[cfg(any(feature = "dflash2", test))]
+    compact_dflash_candidate_head: Option<UnifiedLinear>,
     pub(crate) config: Qwen35Config,
     mtp: Option<Qwen35MtpDraftModel>,
     kv_cache_mode: KVCacheMode,
@@ -1055,25 +1057,20 @@ impl Qwen35Model {
             self.embed_tokens.as_linear(hidden)
         }
     }
-    pub(crate) fn project_mtp_continuation_logits(
-        &self,
-        hidden_row: &MlxArray,
-    ) -> UniquePtr<MlxArray> {
-        self.project_logits(&self.norm.forward(hidden_row))
-    }
 
     pub(crate) fn project_draft_logits(&self, hidden: &MlxArray) -> UniquePtr<MlxArray> {
         self.project_compact_logits(hidden, &self.compact_draft_head, MTP_DRAFT_PREFIX)
     }
 
-    /// Project onto the verifier-safe DFlash token domain: ordinary tokenizer
+    /// Project draft candidates onto a restricted DFlash token domain: tokenizer
     /// rows `[0, 80_896)` followed by the 26 target control-token rows
     /// `[248_044, 248_070)`. Falls back to the full target head when the
-    /// quantized compact head is unavailable.
-    pub(crate) fn project_dflash_verify_logits(&self, hidden: &MlxArray) -> UniquePtr<MlxArray> {
+    /// quantized compact head is unavailable. Never use this for verification.
+    #[cfg(any(feature = "dflash2", test))]
+    pub(crate) fn project_dflash_candidate_logits(&self, hidden: &MlxArray) -> UniquePtr<MlxArray> {
         self.project_compact_logits(
             hidden,
-            &self.compact_dflash_verify_head,
+            &self.compact_dflash_candidate_head,
             DFLASH_COMPACT_PREFIX,
         )
     }
@@ -1116,8 +1113,8 @@ impl Qwen35Model {
     }
 
     #[cfg(any(feature = "dflash2", test))]
-    pub(crate) fn has_compact_dflash_verify_head(&self) -> bool {
-        self.compact_dflash_verify_head.is_some()
+    pub(crate) fn has_compact_dflash_candidate_head(&self) -> bool {
+        self.compact_dflash_candidate_head.is_some()
     }
 
     pub(crate) fn map_draft_token(token: i32) -> i32 {
@@ -1134,10 +1131,11 @@ impl Qwen35Model {
         Self::map_compact_control_tail(tokens, MTP_DRAFT_PREFIX)
     }
 
-    /// Map one id in the compact DFlash verifier/candidate domain back to the
+    /// Map one id in the compact DFlash candidate domain back to the
     /// target tokenizer id. The only discontinuity is the control-token tail;
     /// the mask token at `248_070` is deliberately not representable.
-    pub(crate) fn map_dflash_verify_token(token: i32) -> i32 {
+    #[cfg(test)]
+    pub(crate) fn map_dflash_candidate_token(token: i32) -> i32 {
         debug_assert!((0..DFLASH_COMPACT_TOKEN_COUNT).contains(&token));
         if token < DFLASH_COMPACT_PREFIX {
             token
@@ -1146,10 +1144,10 @@ impl Qwen35Model {
         }
     }
 
-    /// Device-side form of [`Self::map_dflash_verify_token`], used to remap a
-    /// complete top-k candidate tensor without a host synchronization.
+    /// Remap a complete top-k candidate tensor to target ids without a host
+    /// synchronization.
     #[cfg(any(feature = "dflash2", test))]
-    pub(crate) fn map_dflash_verify_tokens(tokens: &MlxArray) -> UniquePtr<MlxArray> {
+    pub(crate) fn map_dflash_candidate_tokens(tokens: &MlxArray) -> UniquePtr<MlxArray> {
         Self::map_compact_control_tail(tokens, DFLASH_COMPACT_PREFIX)
     }
 
@@ -1378,14 +1376,6 @@ impl Qwen35Model {
     }
 
     pub(crate) fn forward_mtp_verify(&self, input_ids: &MlxArray) -> Qwen35MtpVerifyOutput {
-        self.forward_mtp_verify_with_compact(input_ids, false)
-    }
-
-    pub(crate) fn forward_mtp_verify_with_compact(
-        &self,
-        input_ids: &MlxArray,
-        compact_logits: bool,
-    ) -> Qwen35MtpVerifyOutput {
         let rope_delta = self.mrope_state.rope_delta();
         let (output, offset) = self.sequence_state.with_internal(|caches| {
             let mut hidden = self.embed_tokens.forward(input_ids);
@@ -1413,11 +1403,9 @@ impl Qwen35Model {
                 );
             }
             let normalized = self.norm.forward(&hidden);
-            let logits = if compact_logits {
-                self.project_dflash_verify_logits(&normalized)
-            } else {
-                self.project_logits(&normalized)
-            };
+            // Only draft proposals may use a restricted vocabulary. Verification
+            // must allow every target token to reject an incorrect proposal.
+            let logits = self.project_logits(&normalized);
             let offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
             (
                 Qwen35MtpVerifyOutput {
@@ -1443,7 +1431,6 @@ impl Qwen35Model {
         &self,
         input_ids: &MlxArray,
         target_layer_ids: &[usize],
-        compact_logits: bool,
     ) -> Qwen35DflashVerifyOutput {
         let rope_delta = self.mrope_state.rope_delta();
         let (output, offset) = self.sequence_state.with_internal(|caches| {
@@ -1476,15 +1463,10 @@ impl Qwen35Model {
                 }
             }
             let normalized = self.norm.forward(&hidden);
-            let logits = if compact_logits {
-                self.project_dflash_verify_logits(&normalized)
-            } else {
-                self.project_logits(&normalized)
-            };
+            let logits = self.project_logits(&normalized);
             let offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
             (
                 Qwen35DflashVerifyOutput {
-                    hidden,
                     hidden_by_layer,
                     logits,
                     gdn_states,
@@ -2273,12 +2255,13 @@ impl Qwen35Model {
         let compact_draft_head = lm_head.as_ref().and_then(|head| {
             compact_head(head, config.vocab_size, MTP_DRAFT_PREFIX, MTP_DRAFT_PADDED)
         });
-        let compact_dflash_verify_head = lm_head.as_ref().and_then(|head| {
+        #[cfg(any(feature = "dflash2", test))]
+        let compact_dflash_candidate_head = lm_head.as_ref().and_then(|head| {
             compact_head(
                 head,
                 config.vocab_size,
                 DFLASH_COMPACT_PREFIX,
-                DFLASH_VERIFY_PADDED,
+                DFLASH_CANDIDATE_PADDED,
             )
         });
         let internal_caches = layers
@@ -2299,7 +2282,8 @@ impl Qwen35Model {
             lm_head,
             initial_prefill_complete: AtomicBool::new(false),
             compact_draft_head,
-            compact_dflash_verify_head,
+            #[cfg(any(feature = "dflash2", test))]
+            compact_dflash_candidate_head,
             config: config.clone(),
             kv_cache_mode,
             mtp: None,
@@ -3211,19 +3195,19 @@ mod tests {
     #[test]
     fn dflash_compact_token_map_is_unique_and_excludes_the_mask() {
         let mapped = (0..DFLASH_COMPACT_TOKEN_COUNT)
-            .map(Qwen35Model::map_dflash_verify_token)
+            .map(Qwen35Model::map_dflash_candidate_token)
             .collect::<BTreeSet<_>>();
         assert_eq!(mapped.len(), DFLASH_COMPACT_TOKEN_COUNT as usize);
         assert_eq!(
-            Qwen35Model::map_dflash_verify_token(DFLASH_COMPACT_PREFIX - 1),
+            Qwen35Model::map_dflash_candidate_token(DFLASH_COMPACT_PREFIX - 1),
             DFLASH_COMPACT_PREFIX - 1
         );
         assert_eq!(
-            Qwen35Model::map_dflash_verify_token(DFLASH_COMPACT_PREFIX),
+            Qwen35Model::map_dflash_candidate_token(DFLASH_COMPACT_PREFIX),
             DFLASH_CONTROL_START
         );
         assert_eq!(
-            Qwen35Model::map_dflash_verify_token(DFLASH_COMPACT_TOKEN_COUNT - 1),
+            Qwen35Model::map_dflash_candidate_token(DFLASH_COMPACT_TOKEN_COUNT - 1),
             DFLASH_CONTROL_END - 1
         );
         assert!(mapped.contains(&248_044));
@@ -3245,7 +3229,7 @@ mod tests {
             ],
             &[4],
         );
-        let mapped = Qwen35Model::map_dflash_verify_tokens(&dflash_ids);
+        let mapped = Qwen35Model::map_dflash_candidate_tokens(&dflash_ids);
         mlxcel_core::eval(&mapped);
         let mapped = mlxcel_core::array_evaluated_bytes(&mapped)
             .chunks_exact(4)

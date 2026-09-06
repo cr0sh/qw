@@ -395,6 +395,7 @@ pub struct CompletionRecord {
 pub enum FailureKind {
     InvalidRequest,
     Server,
+    ModelOutput,
     ResumeMismatch,
     ResumeNotFound,
     ResumeUnsupported,
@@ -971,9 +972,25 @@ impl Engine {
                 {
                     send_failure(
                         &job,
-                        FailureKind::Server,
+                        FailureKind::ModelOutput,
                         "model generated parallel tool calls when parallel_tool_calls was false"
                             .to_string(),
+                        None,
+                    );
+                    continue;
+                }
+                if latest_user.as_deref() == Some("call-tool-invalid") {
+                    let error = parse_assistant_output(
+                        "<tool_call><function=unknown><parameter=secret>private-argument-body</parameter></function></tool_call>",
+                        &["weather"],
+                        8,
+                        job.request.max_tokens,
+                    )
+                    .expect_err("fixture contains an undeclared tool");
+                    send_failure(
+                        &job,
+                        FailureKind::ModelOutput,
+                        format!("generated tool-call output was invalid: {error}"),
                         None,
                     );
                     continue;
@@ -2111,7 +2128,7 @@ impl QwenWorker {
                 Err(error) => {
                     send_failure(
                         &job,
-                        FailureKind::Server,
+                        FailureKind::ModelOutput,
                         format!("generated tool-call output was invalid: {error}"),
                         None,
                     );
@@ -2121,7 +2138,7 @@ impl QwenWorker {
             if !job.request.parallel_tool_calls && parsed.tool_calls.len() > 1 {
                 send_failure(
                     &job,
-                    FailureKind::Server,
+                    FailureKind::ModelOutput,
                     "model generated parallel tool calls when parallel_tool_calls was false"
                         .to_string(),
                     None,

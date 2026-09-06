@@ -1198,7 +1198,6 @@ fn commit_constraint_transaction<T>(
 pub(crate) fn greedy_walk(
     draft_tokens: &[i32],
     verify_logits: &MlxArray,
-    compact_logits: bool,
     sampling: &SamplingConfig,
     committed_history: &[i32],
     max_new_tokens: usize,
@@ -1222,11 +1221,7 @@ pub(crate) fn greedy_walk(
                 &[shape[0], position as i32 + 1],
             );
             let token = mlxcel_core::item_i32(&token);
-            target_tokens.push(if compact_logits {
-                Qwen35Model::map_dflash_verify_token(token)
-            } else {
-                token
-            });
+            target_tokens.push(token);
         }
     } else {
         let mut history = committed_history.to_vec();
@@ -1235,11 +1230,7 @@ pub(crate) fn greedy_walk(
             let (token, _) = sample_token_optimized(&logits, sampling, &history);
             mlxcel_core::eval(&token);
             let token = mlxcel_core::item_i32(&token);
-            target_tokens.push(if compact_logits {
-                Qwen35Model::map_dflash_verify_token(token)
-            } else {
-                token
-            });
+            target_tokens.push(token);
             if position < draft_tokens.len() {
                 history.push(draft_tokens[position]);
             }
@@ -1254,7 +1245,6 @@ pub(crate) fn greedy_walk(
 pub(crate) fn greedy_walk_device_proposals(
     draft_tokens: &MlxArray,
     verify_logits: &MlxArray,
-    compact_logits: bool,
     sampling: &SamplingConfig,
     committed_history: &[i32],
     max_new_tokens: usize,
@@ -1276,7 +1266,6 @@ pub(crate) fn greedy_walk_device_proposals(
         let walk = greedy_walk(
             &draft_tokens,
             verify_logits,
-            compact_logits,
             sampling,
             committed_history,
             max_new_tokens,
@@ -1289,12 +1278,7 @@ pub(crate) fn greedy_walk_device_proposals(
     let targets = mlxcel_core::argmax_last_axis(&biased_logits);
     mlxcel_core::async_eval(&targets);
     let draft_tokens = materialize_ids(draft_tokens);
-    let mut target_tokens = materialize_ids(&targets);
-    if compact_logits {
-        target_tokens
-            .iter_mut()
-            .for_each(|token| *token = Qwen35Model::map_dflash_verify_token(*token));
-    }
+    let target_tokens = materialize_ids(&targets);
     (
         speculative_walk(&draft_tokens, &target_tokens, max_new_tokens),
         draft_tokens,
@@ -2204,7 +2188,6 @@ fn capture_mtp_snapshot_from_verify(
     generated_tokens: usize,
     verify_hidden: &MlxArray,
     verify_logits: &MlxArray,
-    compact_logits: bool,
     emitted_in_round: usize,
     previous: Option<&MtpPromptSnapshot>,
 ) -> Result<MtpPromptSnapshot, String> {
@@ -2219,16 +2202,12 @@ fn capture_mtp_snapshot_from_verify(
         &[0, aligned, 0],
         &[hidden_shape[0], aligned + 1, hidden_shape[2]],
     );
-    let continuation_logits = if compact_logits {
-        model.project_mtp_continuation_logits(&last_hidden)
-    } else {
-        let logits_shape = mlxcel_core::array_shape(verify_logits);
-        mlxcel_core::slice(
-            verify_logits,
-            &[0, aligned, 0],
-            &[logits_shape[0], aligned + 1, logits_shape[2]],
-        )
-    };
+    let logits_shape = mlxcel_core::array_shape(verify_logits);
+    let continuation_logits = mlxcel_core::slice(
+        verify_logits,
+        &[0, aligned, 0],
+        &[logits_shape[0], aligned + 1, logits_shape[2]],
+    );
     model.materialize_mtp_cache_state();
     let target = model
         .snapshot_sequence_state(mlxcel_core::cache::SequenceId::from_raw(0), token_len, None)
@@ -2629,10 +2608,8 @@ impl Qwen35MtpGenerator {
                     &verify_tokens,
                     &[1, i32::try_from(verify_tokens.len()).unwrap_or(i32::MAX)],
                 );
-                let compact_verify =
-                    mtp_greedy_graph_eligible(&sampling, false) && remaining > block_size;
                 let phase_start = Instant::now();
-                let verify = model.forward_mtp_verify_with_compact(&verify_input, compact_verify);
+                let verify = model.forward_mtp_verify(&verify_input);
                 mlxcel_core::eval(&verify.logits);
                 mtp_stats.target_verify_time += phase_start.elapsed();
                 mtp_stats.target_forward_calls += 1;
@@ -2651,7 +2628,6 @@ impl Qwen35MtpGenerator {
                     greedy_walk(
                         &draft_tokens,
                         &verify.logits,
-                        compact_verify,
                         &sampling,
                         &history,
                         remaining,
@@ -2711,7 +2687,6 @@ impl Qwen35MtpGenerator {
                             generated.len(),
                             &verify.hidden,
                             &verify.logits,
-                            compact_verify,
                             emitted_in_round,
                             prompt_snapshots.last(),
                         )

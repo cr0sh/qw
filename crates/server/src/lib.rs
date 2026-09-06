@@ -737,12 +737,14 @@ impl SseState {
                 | FailureKind::ResumeNotFound
                 | FailureKind::ResumeUnsupported => "invalid_request_error",
                 FailureKind::Server => "server_error",
+                FailureKind::ModelOutput => "model_output_error",
             },
             failure.param.as_deref(),
             match failure.kind {
                 FailureKind::ResumeMismatch => Some("resume_mismatch"),
                 FailureKind::ResumeNotFound => Some("resume_not_found"),
                 FailureKind::ResumeUnsupported => Some("resume_unsupported"),
+                FailureKind::ModelOutput => Some("invalid_model_output"),
                 FailureKind::InvalidRequest | FailureKind::Server => None,
             },
         );
@@ -942,6 +944,13 @@ impl ApiError {
         match error.kind {
             FailureKind::InvalidRequest => Self::invalid(error.message, error.param),
             FailureKind::Server => Self::server(error.message),
+            FailureKind::ModelOutput => Self {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                message: error.message,
+                error_type: "model_output_error",
+                param: error.param,
+                code: Some("invalid_model_output"),
+            },
             FailureKind::ResumeMismatch => Self {
                 status: StatusCode::CONFLICT,
                 message: error.message,

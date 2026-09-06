@@ -1164,7 +1164,7 @@ impl CandidateSelector {
 }
 
 /// Select an exact top-k set from either the full target vocabulary or the
-/// compact DFlash verifier domain. Compact indices are remapped only after
+/// compact DFlash candidate domain. Compact indices are remapped only after
 /// gathering their logits, preserving candidate/value alignment on device.
 fn top_k_candidate_logits(
     logits: &MlxArray,
@@ -1190,7 +1190,7 @@ fn top_k_candidate_logits(
     let compact_ids = mlxcel_core::contiguous(&compact_ids, false);
     let values = mlxcel_core::take_along_axis(logits, &compact_ids, -1);
     let target_ids = if compact_domain {
-        Qwen35Model::map_dflash_verify_tokens(&compact_ids)
+        Qwen35Model::map_dflash_candidate_tokens(&compact_ids)
     } else {
         compact_ids
     };
@@ -1318,7 +1318,7 @@ impl DFlash2DraftModel {
         }
     }
 
-    /// Top-K candidates per position via the target's compact verifier head
+    /// Top-K draft candidates per position via the target's compact candidate head
     /// when available (SGLang `compute_candidates`):
     /// `hidden [1, L, H]` → `candidates [1, L, K]` target-token ids + `unary
     /// [1, L, K]` transformed logits. The compact projection contains 80,922
@@ -1328,8 +1328,8 @@ impl DFlash2DraftModel {
         hidden: &MlxArray,
         target: &Qwen35Model,
     ) -> Result<(UniquePtr<MlxArray>, UniquePtr<MlxArray>), String> {
-        let compact_domain = target.has_compact_dflash_verify_head();
-        let logits = target.project_dflash_verify_logits(hidden);
+        let compact_domain = target.has_compact_dflash_candidate_head();
+        let logits = target.project_dflash_candidate_logits(hidden);
         let (candidates, unary) =
             top_k_candidate_logits(&logits, self.candidate_selector.top_k, compact_domain)?;
         Ok((candidates, self.transform_unary_logits(&unary)))
@@ -2343,24 +2343,13 @@ impl Qwen35Dflash2Generator {
             let bonus_input = mlxcel_core::slice(&inputs, &[0, 0], &[1, 1]);
             let verify_input = mlxcel_core::concatenate(&bonus_input, &out.path, 1);
             let phase_start = Instant::now();
-            let compact_verify = sampling.token_bias.is_empty()
-                && sampling.repetition_penalty == 1.0
-                && sampling.dry_multiplier == 0.0
-                && sampling.frequency_penalty == 0.0
-                && sampling.presence_penalty == 0.0
-                && sampling.xtc_probability == 0.0;
-            let verify = target.forward_dflash_verify(
-                &verify_input,
-                &self.target_layer_ids,
-                compact_verify && target.has_compact_dflash_verify_head(),
-            );
+            let verify = target.forward_dflash_verify(&verify_input, &self.target_layer_ids);
             stats.target_forward_calls += 1;
             stats.speculative_rounds += 1;
 
             let (walk, draft_tokens) = crate::qwen3_5_mtp::greedy_walk_device_proposals(
                 &out.path,
                 &verify.logits,
-                compact_verify && target.has_compact_dflash_verify_head(),
                 sampling,
                 &history,
                 remaining,
@@ -2417,24 +2406,12 @@ impl Qwen35Dflash2Generator {
                 && committed_tokens == history.len()
             {
                 let row = (committed_rows - 1) as i32;
-                terminal_logits = Some(
-                    if compact_verify && target.has_compact_dflash_verify_head() {
-                        let shape = mlxcel_core::array_shape(&verify.hidden);
-                        let hidden = mlxcel_core::slice(
-                            &verify.hidden,
-                            &[0, row, 0],
-                            &[shape[0], row + 1, shape[2]],
-                        );
-                        target.project_mtp_continuation_logits(&hidden)
-                    } else {
-                        let shape = mlxcel_core::array_shape(&verify.logits);
-                        mlxcel_core::slice(
-                            &verify.logits,
-                            &[0, row, 0],
-                            &[shape[0], row + 1, shape[2]],
-                        )
-                    },
-                );
+                let shape = mlxcel_core::array_shape(&verify.logits);
+                terminal_logits = Some(mlxcel_core::slice(
+                    &verify.logits,
+                    &[0, row, 0],
+                    &[shape[0], row + 1, shape[2]],
+                ));
             }
             bonus = *walk
                 .new_tokens
@@ -2709,7 +2686,7 @@ mod tests {
 
         let mut full_scores = vec![-2_000.0_f32; 248_320];
         for compact_id in 0..DFLASH_COMPACT_TOKEN_COUNT {
-            let target_id = Qwen35Model::map_dflash_verify_token(compact_id);
+            let target_id = Qwen35Model::map_dflash_candidate_token(compact_id);
             full_scores[target_id as usize] = compact_scores[compact_id as usize];
         }
         let full_logits = mlxcel_core::from_slice_f32(&full_scores, &[1, 1, 248_320]);
@@ -2882,6 +2859,34 @@ mod tests {
     }
 
     #[test]
+    fn target_verification_rejects_drafts_for_winners_outside_candidate_domain() {
+        // Both are ordinary tokenizer rows omitted by the compact candidate
+        // head: "_verification" and "_human". They must still win verification.
+        let proposals = [813, 3208];
+        let target_tokens = [813, 81_336, 83_268];
+        let logits = verify_logits(&target_tokens, 248_320);
+        let sampling = SamplingConfig::greedy();
+        let mtp = crate::qwen3_5_mtp::greedy_walk(&proposals, &logits, &sampling, &[], 3);
+        assert_eq!(mtp.accepted, 1);
+        assert_eq!(mtp.new_tokens, [813, 81_336]);
+        let proposal_array = mlxcel_core::from_slice_i32(&proposals, &[1, 2]);
+        let (dflash, _) = crate::qwen3_5_mtp::greedy_walk_device_proposals(
+            &proposal_array,
+            &logits,
+            &sampling,
+            &[],
+            3,
+        );
+        assert_eq!(dflash.accepted, 1);
+        assert_eq!(dflash.new_tokens, mtp.new_tokens);
+        let accepted = mlxcel_core::from_slice_i32(&target_tokens[..2], &[1, 2]);
+        let (bonus, _) =
+            crate::qwen3_5_mtp::greedy_walk_device_proposals(&accepted, &logits, &sampling, &[], 3);
+        assert_eq!(bonus.accepted, 2);
+        assert_eq!(bonus.new_tokens, target_tokens);
+    }
+
+    #[test]
     fn static_width_and_selector_choices_preserve_exact_target_output() {
         let sampling = SamplingConfig::greedy();
         for &width in &DFLASH2_STATIC_VERIFY_WIDTHS {
@@ -2896,7 +2901,6 @@ mod tests {
                 let (walk, materialized) = crate::qwen3_5_mtp::greedy_walk_device_proposals(
                     &proposal_array,
                     &logits,
-                    false,
                     &sampling,
                     &[],
                     width,
@@ -2916,7 +2920,6 @@ mod tests {
             let (walk, _) = crate::qwen3_5_mtp::greedy_walk_device_proposals(
                 &proposal_array,
                 &logits,
-                false,
                 &sampling,
                 &[],
                 width,
@@ -2927,7 +2930,6 @@ mod tests {
             let (tail, _) = crate::qwen3_5_mtp::greedy_walk_device_proposals(
                 &proposal_array,
                 &logits,
-                false,
                 &sampling,
                 &[],
                 1,
