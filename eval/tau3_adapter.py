@@ -242,9 +242,6 @@ def patched_generate(
             _capture({"event": "error", "kind": "model_output_invalid", "error": "model returned no choices", **attempt_record})
             raise Tau3AdapterError("model_output_invalid", "model returned no choices")
         choice = completion.choices[0]
-        if choice.stop_reason in {"max_tokens", "model_length"}:
-            _capture({"event": "error", "kind": "model_output_invalid", "error": "model response was truncated", **attempt_record})
-            raise Tau3AdapterError("model_output_invalid", "model response was truncated")
         message = choice.message
         if (
             attempt < attempts
