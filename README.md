@@ -73,6 +73,10 @@ baseline routing. `--decoder baseline|mtp|dflash` makes an explicit selection.
 Override the draft checkpoint with `--dflash-draft-model` or
 `QW_DFLASH_DRAFT_MODEL_PATH`.
 
+Both speculative decoders verify proposals against the full target vocabulary.
+Compact vocabulary heads are used only to propose draft tokens; they must not
+exclude a target winner during acceptance, correction, or bonus-token selection.
+
 DFlash2 participates in the server's memory and filesystem prefix cache, in a
 separate decoder namespace. Snapshots retain target state at its actual resident
 precision, the bounded drafter hidden window, and continuation logits. Structural
@@ -143,6 +147,11 @@ optimization runs merged through `7ada6d4`; 64k uses the latest confirmation
 (40.050), not the earlier 40.268 result. Long-context timed DFlash2 repetitions
 reuse the same live prompt snapshot and exact suffix, including projected-context
 cache hits; these are warm-reuse measurements, not cold-request throughput.
+
+These historical speculative-decoder timings predate the full-vocabulary target
+verification correction. They used a restricted target head that could exclude
+ordinary tokens, including parts of function names; do not treat them as current
+correct-decoding throughput or quality baselines.
 
 Automatic routing is capability-based, not calibrated to a prompt-length
 crossover. These historical throughput measurements do not establish an
