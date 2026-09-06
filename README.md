@@ -116,6 +116,16 @@ calls are not eligible; truncation, completion errors, and retry exhaustion
 abort rather than becoming task reward zero. Capture separates original
 `tau_tools` from actual EvalScope-serialized `wire_tools` and `wire_messages`.
 
+The simulator also receives a task-independent clarification that every
+invocation, including after tool results, must produce visible text or a tool
+call; a finished interaction uses the already-specified termination marker.
+This clarifies Tau2's nonempty-step contract but is an explicit simulator-prompt
+deviation, not an unchanged stock-prompt score. The exact text is persisted as
+`simulator_step_protocol` in EvalScope configuration and appears in captured
+wire input. Original Tau2 goals/history remain untouched; agent and judge
+prompts do not receive it. Start a fresh campaign when adopting this policy;
+do not mix records from the earlier prompt configuration.
+
 Run the durable banking launcher from a dedicated worktree using a Python
 environment with EvalScope 1.11.0 and `tau2[knowledge]` v1.0.0 installed:
 

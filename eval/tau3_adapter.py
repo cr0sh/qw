@@ -36,6 +36,12 @@ class Tau3AdapterError(RuntimeError):
         super().__init__(message)
         self.kind = kind
 SIMULATOR_EMPTY_RESPONSE_RETRIES = 3
+SIMULATOR_STEP_PROTOCOL = (
+    "\n\n## Simulation-step response protocol\n"
+    "Each invocation is a new simulation step, including invocations after tool results. "
+    "Return either visible text or at least one tool call on every invocation, never an empty response. "
+    "If the interaction is finished, use the termination marker already specified in these guidelines.\n"
+)
 MODEL_DICT: dict[str, Any] = {"agent": None, "user": None}
 _CAPTURE_PATH: Path | None = None
 _CURRENT_TASK_ID: ContextVar[str | None] = ContextVar("tau3_task_id", default=None)
@@ -194,8 +200,14 @@ def patched_generate(
         raise Tau3AdapterError("adapter_error", f"model {model!r} is not configured")
     request = _request_record(model, messages, tools, tool_choice)
     request["call_name"] = kwargs.get("call_name")
+    simulator = model == "user" and request["call_name"] == "user_simulator_response"
     try:
         model_input = _tau_messages_for_model(messages)
+        if simulator:
+            system = next((message for message in model_input if message.role == "system"), None)
+            if system is None:
+                raise Tau3AdapterError("adapter_error", "user simulator requires its system guidelines")
+            system.content = system.text + SIMULATOR_STEP_PROTOCOL
         request["wire_messages"] = [
             openai_chat_message(message, reasoning_format="reasoning_field")
             for message in model_input
@@ -207,7 +219,6 @@ def patched_generate(
         _capture({"event": "error", "kind": kind, "error_type": type(exc).__name__, "error": str(exc), **request})
         raise Tau3AdapterError(kind, str(exc)) from exc
     generation_tool_choice = tool_choice if tool_choice is not None else ("auto" if tools else None)
-    simulator = model == "user" and request["call_name"] == "user_simulator_response"
     attempts = 1 + SIMULATOR_EMPTY_RESPONSE_RETRIES if simulator else 1
     for attempt in range(1, attempts + 1):
         attempt_record = {**request, "attempt": attempt}
@@ -282,6 +293,8 @@ def _build_model(agent_model: Any, adapter_instance: Any) -> None:
 
     if adapter_instance.extra_params.get("simulator_empty_response_retries", SIMULATOR_EMPTY_RESPONSE_RETRIES) != SIMULATOR_EMPTY_RESPONSE_RETRIES:
         raise Tau3AdapterError("adapter_error", "simulator_empty_response_retries must match the fixed three-retry policy")
+    if adapter_instance.extra_params.get("simulator_step_protocol", SIMULATOR_STEP_PROTOCOL) != SIMULATOR_STEP_PROTOCOL:
+        raise Tau3AdapterError("adapter_error", "simulator_step_protocol must match the fixed step clarification")
 
     user_server = get_model(
         model=adapter_instance.user_model,
@@ -381,6 +394,11 @@ def install() -> None:
         "type": "int",
         "description": "Fixed additional clean-stop empty user-simulator attempts; never agent or judge retries.",
         "value": SIMULATOR_EMPTY_RESPONSE_RETRIES,
+    }
+    BENCHMARK_REGISTRY.get("tau3_bench").extra_params["simulator_step_protocol"] = {
+        "type": "str",
+        "description": "Exact simulator-only clarification of Tau2's nonempty step contract.",
+        "value": SIMULATOR_STEP_PROTOCOL,
     }
 
     generation.predict = predict
