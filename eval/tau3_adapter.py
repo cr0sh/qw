@@ -453,7 +453,6 @@ def _validate_cached_records(cache, dataset, model_name: str) -> tuple[int, int]
         state, simulation = predictions[index]
         sample_score = review.sample_score
         score = sample_score.score
-        scored_simulation = SimulationRun.model_validate_json(score.prediction)
         if (
             review.target != state.target
             or review.agent_trace != state.agent_trace
@@ -466,11 +465,7 @@ def _validate_cached_records(cache, dataset, model_name: str) -> tuple[int, int]
             or score.status != "success"
             or score.value != {"acc": simulation.reward_info.reward}
             or score.metadata != {"task_result": state.metadata["task_result"]}
-            or scored_simulation.task_id != simulation.task_id
-            or scored_simulation.termination_reason != simulation.termination_reason
-            or scored_simulation.reward_info != simulation.reward_info
-            or [_trajectory_message(message).model_dump(include=fields, exclude_none=True) for message in scored_simulation.messages or []]
-            != [message.model_dump(include=fields, exclude_none=True) for message in state.messages]
+            or SimulationRun.model_validate_json(score.prediction).model_dump() != simulation.model_dump()
         ):
             raise ValueError(f"resume review {index} does not match its canonical scored result")
         reviewed.add(index)

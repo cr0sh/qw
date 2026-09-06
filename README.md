@@ -169,6 +169,11 @@ model, completed reward metadata, finite rewards (including legitimate zero
 and `max_steps` results), lossless reasoning/user-tool trajectories, and
 matching reviews. Duplicate, orphan, corrupt, and infrastructure-error rows
 fail closed; there is no forced reuse or `rerun_review` bypass.
+The review's `score.prediction` must parse to the same saved canonical
+`SimulationRun`, including its run identity and timings; it cannot substitute
+a different simulation with the same reward. Regenerated report-message IDs
+and source fields are excluded only from the lossless trajectory projection,
+not from that canonical-result comparison.
 
 Completed predictions are reused, missing reviews are computed, and only
 uncached tasks rerun. **Partial trajectories are not restored**: a failed task
