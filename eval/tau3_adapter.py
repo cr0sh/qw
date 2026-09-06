@@ -43,11 +43,15 @@ def configure_capture(path: str | os.PathLike[str] | None) -> None:
     """Enable opt-in JSONL capture at a unique path."""
 
     global _CAPTURE_PATH
-    _CAPTURE_PATH = Path(path).expanduser() if path else None
-    if _CAPTURE_PATH is not None:
-        if _CAPTURE_PATH.exists():
-            raise ValueError(f"capture path already exists; choose a unique path: {_CAPTURE_PATH}")
-        _CAPTURE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    capture_path = Path(path).expanduser() if path else None
+    if capture_path is not None:
+        capture_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with capture_path.open("x", encoding="utf-8"):
+                pass
+        except FileExistsError as error:
+            raise ValueError(f"capture path already exists; choose a unique path: {capture_path}") from error
+    _CAPTURE_PATH = capture_path
 
 
 def _jsonable(value: Any) -> Any:
