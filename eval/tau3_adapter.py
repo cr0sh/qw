@@ -12,14 +12,16 @@ import json
 import os
 from pathlib import Path
 import sys
-from typing import Any, Iterable
+from contextvars import ContextVar
+from typing import Any
+
+from openai import APIStatusError
 
 from evalscope.api.messages.chat_message import dict_to_chat_message
 from evalscope.api.model.model_output import ChatCompletionChoice, ModelOutput
 from evalscope.api.evaluator import InferenceResult
 from evalscope.api.tool.tool_info import ToolInfo
 from evalscope.constants import EvalType
-from evalscope.models.utils.openai import openai_chat_choices
 from tau2.data_model.message import AssistantMessage, Message, ToolCall
 from tau2.data_model.tasks import Task
 from tau2.environment.tool import Tool
@@ -32,19 +34,19 @@ class Tau3AdapterError(RuntimeError):
     def __init__(self, kind: str, message: str) -> None:
         super().__init__(message)
         self.kind = kind
-
-
 MODEL_DICT: dict[str, Any] = {"agent": None, "user": None}
 _CAPTURE_PATH: Path | None = None
-_INSTALLED_GENERATION: Any = None
+_CURRENT_TASK_ID: ContextVar[str | None] = ContextVar("tau3_task_id", default=None)
 
 
 def configure_capture(path: str | os.PathLike[str] | None) -> None:
-    """Enable opt-in JSONL capture; no API headers or credentials are recorded."""
+    """Enable opt-in JSONL capture at a unique path."""
 
     global _CAPTURE_PATH
     _CAPTURE_PATH = Path(path).expanduser() if path else None
     if _CAPTURE_PATH is not None:
+        if _CAPTURE_PATH.exists():
+            raise ValueError(f"capture path already exists; choose a unique path: {_CAPTURE_PATH}")
         _CAPTURE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 
@@ -57,10 +59,11 @@ def _jsonable(value: Any) -> Any:
         return [_jsonable(v) for v in value]
     return value
 
-
 def _capture(record: dict[str, Any]) -> None:
     if _CAPTURE_PATH is None:
         return
+    if _CURRENT_TASK_ID.get() is not None and "task_id" not in record:
+        record = {**record, "task_id": _CURRENT_TASK_ID.get()}
     with _CAPTURE_PATH.open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(_jsonable(record), ensure_ascii=False) + "\n")
 
@@ -140,20 +143,26 @@ def _request_record(model: str, messages: list[Message], tools: list[Tool] | Non
     }
 
 
-def _classify_exception(exc: Exception) -> str:
-    """Classify only known provider output-contract failures as model errors."""
+def _is_typed_model_output_error(exc: Exception) -> bool:
+    """Recognize only the server's typed non-retryable output-contract error."""
 
-    text = str(exc).lower()
-    if (
-        "generated tool-call output was invalid" in text
-        or "invalid function name" in text
-        or "invalid_model_output" in text
-        or "model_output_error" in text
-    ):
+    if not isinstance(exc, APIStatusError) or getattr(exc, "status_code", None) != 422:
+        return False
+    body = getattr(exc, "body", None)
+    if not isinstance(body, dict):
+        return False
+    error = body.get("error", body)
+    return (
+        isinstance(error, dict)
+        and error.get("type") == "model_output_error"
+        and error.get("code") == "invalid_model_output"
+    )
+
+
+def _classify_exception(exc: Exception) -> str:
+    if _is_typed_model_output_error(exc):
         return "model_output_invalid"
-    if "http" in text or "timeout" in text or "connection" in text:
-        return "infrastructure"
-    return "adapter_error"
+    return "infrastructure"
 
 
 def patched_generate(
@@ -182,31 +191,24 @@ def patched_generate(
         _capture({"event": "error", "kind": kind, "error_type": type(exc).__name__, "error": str(exc), **request})
         raise Tau3AdapterError(kind, str(exc)) from exc
 
+    _capture({"event": "response", "response": completion.model_dump(mode="json", exclude_none=False), **request})
     if not completion.choices:
+        _capture({"event": "error", "kind": "model_output_invalid", "error": "model returned no choices", **request})
         raise Tau3AdapterError("model_output_invalid", "model returned no choices")
     choice = completion.choices[0]
     message = choice.message
     tool_calls = []
     for tool_call in message.tool_calls or []:
         arguments = tool_call.function.arguments
-        if isinstance(arguments, str):
-            try:
-                arguments = json.loads(arguments)
-            except json.JSONDecodeError as exc:
-                raise Tau3AdapterError("model_output_invalid", f"invalid tool arguments: {exc}") from exc
         if not isinstance(arguments, dict):
-            raise Tau3AdapterError(
-                "model_output_invalid",
-                f"tool arguments must be an object, got {type(arguments).__name__}",
-            )
+            _capture({"event": "error", "kind": "model_output_invalid", "error": "EvalScope tool arguments were not an object", **request})
+            raise Tau3AdapterError("model_output_invalid", "EvalScope tool arguments were not an object")
         tool_calls.append(ToolCall(id=tool_call.id, name=tool_call.function.name, arguments=arguments))
     content = message.text
     if not content and not tool_calls:
+        _capture({"event": "error", "kind": "model_output_invalid", "error": "model response had no text or tool calls", **request})
         raise Tau3AdapterError("model_output_invalid", "model response had no text or tool calls")
     raw_data = completion.model_dump(mode="json", exclude_none=False)
-    reasoning = _reasoning_parts(message)
-    if reasoning:
-        raw_data["_tau3_reasoning"] = reasoning
     perf = message.perf_metrics
     if perf is not None:
         raw_data["_perf_metrics"] = perf.model_dump(mode="json")
@@ -230,15 +232,19 @@ def _build_model(agent_model: Any, adapter_instance: Any) -> None:
         base_url=adapter_instance.api_base,
         api_key=adapter_instance.api_key,
         config=GenerateConfig(**adapter_instance.generation_config),
+        model_args={"max_retries": 5},
     )
     MODEL_DICT["user"] = user_server
     MODEL_DICT["agent"] = agent_model
+    original = getattr(tau_llm_utils, "generate", None)
+    if original is None:
+        raise Tau3AdapterError("adapter_error", "tau2.utils.llm_utils.generate not found")
     tau_llm_utils.generate = patched_generate
     for name, module in list(sys.modules.items()):
         if not isinstance(name, str) or not name.startswith("tau2") or module is None:
             continue
         for attr, value in list(vars(module).items()):
-            if value is getattr(tau_llm_utils, "generate", None) or (attr == "generate" and callable(value)):
+            if value is original:
                 try:
                     setattr(module, attr, patched_generate)
                 except Exception:
@@ -252,6 +258,7 @@ def predict(model: Any, sample: Any, adapter_instance: Any) -> InferenceResult:
     domain = sample.subset_key
     task_data = {key: value for key, value in sample.metadata.items() if key != "_domain"}
     task = Task.model_validate(task_data)
+    _CURRENT_TASK_ID.set(task.id)
     from tau2.evaluator.evaluator import EvaluationType
     from tau2.run import run_task
 
