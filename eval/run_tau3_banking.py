@@ -73,7 +73,7 @@ def main() -> int:
     if Path(dataset_id).is_dir():
         os.environ["TAU2_DATA_DIR"] = dataset_id
 
-    from tau3_adapter import SIMULATOR_EMPTY_RESPONSE_RETRIES, configure_capture, install
+    from tau3_adapter import SIMULATOR_EMPTY_RESPONSE_RETRIES, SIMULATOR_STEP_PROTOCOL, configure_capture, install
 
     configure_capture(capture_path)
     install()
@@ -93,6 +93,7 @@ def main() -> int:
                 "extra_params": {
                     "user_model": simulator_model,
                     "simulator_empty_response_retries": SIMULATOR_EMPTY_RESPONSE_RETRIES,
+                    "simulator_step_protocol": SIMULATOR_STEP_PROTOCOL,
                     "api_base": simulator_endpoint,
                     "api_key": None,
                     "generation_config": {
@@ -127,6 +128,7 @@ def main() -> int:
     print("agent=qwen3.8-27b temperature=0 reasoning_effort=medium max_tokens=32768", flush=True)
     print(f"simulator_and_nl_judge={simulator_model} endpoint={simulator_endpoint}", flush=True)
     print(f"simulator_empty_response_retries={SIMULATOR_EMPTY_RESPONSE_RETRIES} (user simulator clean-stop empty responses only)", flush=True)
+    print("simulator_step_protocol=explicit nonempty invocation clarification (simulator-only prompt deviation)", flush=True)
     print(f"work_dir={work_dir} capture={capture_path or 'disabled'} dataset={dataset_id}", flush=True)
     if not args.run:
         print("Configuration validated only; no dataset loaded, server started, or model request made.", flush=True)
