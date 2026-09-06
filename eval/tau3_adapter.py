@@ -254,11 +254,11 @@ def _build_model(agent_model: Any, adapter_instance: Any) -> None:
 def predict(model: Any, sample: Any, adapter_instance: Any) -> InferenceResult:
     """Run Tau2 without converting exceptions into unlabelled reward zeroes."""
 
-    _build_model(model, adapter_instance)
     domain = sample.subset_key
     task_data = {key: value for key, value in sample.metadata.items() if key != "_domain"}
     task = Task.model_validate(task_data)
     _CURRENT_TASK_ID.set(task.id)
+    _build_model(model, adapter_instance)
     from tau2.evaluator.evaluator import EvaluationType
     from tau2.run import run_task
 
