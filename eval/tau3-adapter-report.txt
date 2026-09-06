@@ -1,0 +1,60 @@
+τ³ adapter recovery report
+===========================
+
+Scope
+-----
+Repo-owned EvalScope/Tau2 bridge and guarded launcher. No site-packages files,
+QW Rust sources, auth services, or full campaign state are modified.
+
+Evidence
+--------
+The prior 19-record run contains 5 empty UserMessage failures, 2 empty
+AssistantMessage failures, and 12 server errors. The existing Tau2 UserMessage
+constructor accepts content=None; validation occurs later, so construction order
+is not the cause by itself.
+
+A one-task diagnostic was run with EvalScope 1.11.0/tau2 v1.0.0 using the
+existing local tau3 dataset snapshot, QW at 8883, and the simulator gateway at
+18766. The opt-in capture stream recorded two complete normalized requests and
+responses before the task continued:
+
+* user request: 2 messages, 1 declared tool; response message content was an
+  EvalScope ``content`` list containing ``type=reasoning`` and ``type=text``.
+* agent request: 3 messages, 15 declared tools; response message content was an
+  EvalScope ``content`` list containing ``type=reasoning`` and ``type=text``,
+  plus one parsed KB_search tool call.
+
+This confirms the installed EvalScope ModelOutput schema stores reasoning in
+``choices[0].message.content`` ContentReasoning parts, not a top-level
+``reasoning_content`` field. The adapter extracts that schema, converts it to
+EvalScope's ``reasoning`` field, and relies on the existing OpenAI serializer's
+``reasoning_history=reasoning_field`` path to emit top-level
+``reasoning_content`` on replay. No placeholder content is inserted. Tool-only
+assistant messages use an empty structural content string only when tool_calls
+are present; textless messages without calls are rejected as model-output
+invalid.
+
+The first diagnostic exposed a real adapter bug: EvalScope has already parsed
+ToolCall.function.arguments as a dict, while the old Tau3 generation code
+unconditionally called json.loads. The repo adapter accepts both parsed dicts
+and JSON strings without changing arguments. This is distinct from the server's
+undeclared-tool rejection and was fixed before the corrected diagnostic.
+
+Failure policy
+--------------
+The launcher enables EvalScope ``ignore_errors`` so exceptions are skipped by
+the evaluator rather than converted to unlabelled reward zeroes. Adapter
+captures classify only exact known generated-tool-output/model-output error
+messages as ``model_output_invalid``; transport/timeout/connection failures
+remain ``infrastructure`` and are not silently scored. Legitimate completed
+Tau2 task rewards are unchanged. Opt-in JSONL capture records request bodies
+(messages and declared tools), responses, and errors, but never auth headers or
+credentials.
+
+Verification
+------------
+``python -m unittest eval/test_tau3_adapter.py``: 4 tests passed. The tests
+cover EvalScope reasoning-field replay, empty-message rejection, one-request/
+one-error capture for a typed invalid-model-output failure, and raw ModelOutput
+reasoning preservation. The launcher prepare-only path was exercised with the
+existing local snapshot and made no model request.
