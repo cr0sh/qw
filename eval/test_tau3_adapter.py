@@ -200,9 +200,8 @@ class Tau3AdapterTests(unittest.TestCase):
         with self.assertRaises(tau3_adapter.Tau3AdapterError):
             tau3_adapter._tau_messages_for_model([source])
 
-    def test_simulator_empty_recovery_preserves_payload_and_advances_state_once(self):
-        responses = [chat_response(None), chat_response(" \n"), chat_response(""), chat_response("###STOP###")]
-        with completion_server(responses) as (model, payloads), tempfile.TemporaryDirectory() as directory:
+    def test_simulator_preserves_canonical_prompt_and_advances_state_once(self):
+        with completion_server([chat_response("###STOP###")]) as (model, payloads), tempfile.TemporaryDirectory() as directory:
             tau3_adapter.MODEL_DICT["user"] = model
             capture = Path(directory) / "attempts.jsonl"
             tau3_adapter.configure_capture(capture)
@@ -213,19 +212,17 @@ class Tau3AdapterTests(unittest.TestCase):
                 answer, state = simulator.generate_next_message(incoming, state)
             self.assertEqual(answer.content, "###STOP###")
             self.assertEqual(state.messages, [incoming, answer])
-            self.assertEqual(payloads, [payloads[0]] * 4)
+            self.assertEqual(len(payloads), 1)
             self.assertEqual(state.system_messages[0].content, "Act as the customer.")
-            self.assertEqual(payloads[0]["messages"][0]["content"], state.system_messages[0].content + tau3_adapter.SIMULATOR_STEP_PROTOCOL)
+            self.assertEqual(payloads[0]["messages"][0]["content"], state.system_messages[0].content)
             self.assertEqual(payloads[0]["tools"][0]["function"]["name"], "check_email")
             rows = [json.loads(line) for line in capture.read_text().splitlines()]
             for row, payload in zip([row for row in rows if row["event"] == "request"], payloads):
                 self.assertEqual(row["wire_messages"], payload["messages"])
                 self.assertEqual(row["wire_tools"], payload["tools"])
                 self.assertNotIn("tools", row)
-            self.assertEqual([row["attempt"] for row in rows if row["event"] == "request"], [1, 2, 3, 4])
-            self.assertEqual([row["next_attempt"] for row in rows if row["event"] == "protocol_retry"], [2, 3, 4])
 
-    def test_step_clarification_preserves_task_and_history_and_excludes_agent_judge(self):
+    def test_generation_preserves_task_and_history_for_simulator_agent_and_judge(self):
         messages = [
             SystemMessage(role="system", content="Goal: compare cards; do not submit an application."),
             UserMessage(role="user", content="Which card has no annual fee?"),
@@ -235,34 +232,39 @@ class Tau3AdapterTests(unittest.TestCase):
             with self.subTest(role=role, call_name=call_name), completion_server([chat_response("Continue comparing.")]) as (model, payloads):
                 tau3_adapter.MODEL_DICT[role] = model
                 tau3_adapter.patched_generate(model=role, messages=messages, call_name=call_name)
-                expected_system = messages[0].content
-                if call_name == "user_simulator_response":
-                    expected_system += tau3_adapter.SIMULATOR_STEP_PROTOCOL
+                self.assertEqual(len(payloads), 1)
                 self.assertEqual(payloads[0]["messages"], [
-                    {"role": "system", "content": expected_system},
+                    {"role": "system", "content": messages[0].content},
                     {"role": "user", "content": messages[1].content},
                 ])
                 self.assertEqual([message.model_dump() for message in messages], original)
 
-    def test_empty_recovery_is_bounded_and_never_retries_agent_judge_or_nonstop(self):
+    def test_invalid_simulator_completion_aborts_once_without_user_reply(self):
         cases = [
-            ("user", "user_simulator_response", chat_response(), 4),
-            ("agent", "user_simulator_response", chat_response(), 1),
-            ("user", "judge", chat_response(), 1),
-            ("user", None, chat_response(), 1),
-            ("user", "user_simulator_response", chat_response(finish_reason="length"), 1),
-            ("user", "user_simulator_response", {"choices": []}, 1),
+            chat_response(None),
+            chat_response(" \n"),
+            chat_response(""),
+            chat_response(finish_reason="length"),
+            {"choices": []},
         ]
-        for role, call_name, response, requests in cases:
-            with self.subTest(role=role, call_name=call_name, response=response):
-                with completion_server([response]) as (model, payloads):
-                    tau3_adapter.MODEL_DICT[role] = model
-                    with self.assertRaises(tau3_adapter.Tau3AdapterError):
-                        tau3_adapter.patched_generate(
-                            model=role, call_name=call_name,
-                            messages=[SystemMessage(role="system", content="Act as the customer."), UserMessage(role="user", content="Continue.")],
-                        )
-                    self.assertEqual(len(payloads), requests)
+        for response in cases:
+            with self.subTest(response=response), completion_server([response, chat_response("###STOP###")]) as (model, payloads):
+                tau3_adapter.MODEL_DICT["user"] = model
+                simulator = UserSimulator(llm="user", tools=[Tool(check_email)])
+                state = UserState(
+                    system_messages=[SystemMessage(role="system", content="Act as the customer.")],
+                    messages=[UserMessage(role="user", content="Please check my inbox.")],
+                )
+                original_system = [message.model_dump() for message in state.system_messages]
+                original_history = list(state.messages)
+                incoming = AssistantMessage(role="assistant", content="Your request is complete.")
+                with patch("tau2.user.user_simulator.generate", tau3_adapter.patched_generate):
+                    with self.assertRaises(tau3_adapter.Tau3AdapterError) as ctx:
+                        simulator.generate_next_message(incoming, state)
+                self.assertEqual(ctx.exception.kind, "model_output_invalid")
+                self.assertEqual(len(payloads), 1)
+                self.assertEqual([message.model_dump() for message in state.system_messages], original_system)
+                self.assertEqual(state.messages, original_history + [incoming])
 
     def test_visible_truncated_agent_response_is_preserved_without_retry(self):
         with completion_server([chat_response("Partial visible answer", finish_reason="length")]) as (model, payloads):
@@ -294,16 +296,24 @@ class Tau3AdapterTests(unittest.TestCase):
                     self.assertEqual(answer.tool_calls[0].arguments, {"folder": "spam"})
                 self.assertEqual(len(payloads), 1)
 
-    def test_completion_error_with_visible_content_aborts_without_retry(self):
+    def test_completion_error_with_visible_content_aborts_once_without_user_reply(self):
         completion = ModelOutput.from_content(model="error-diagnostic", content="Visible but failed.", error="upstream failure")
-        with patch.object(tau3_adapter, "MODEL_DICT", {"user": SimpleNamespace(generate=lambda **kwargs: completion)}):
-            with patch.object(tau3_adapter, "_capture") as capture:
-                with self.assertRaises(tau3_adapter.Tau3AdapterError):
-                    tau3_adapter.patched_generate(
-                        model="user", call_name="user_simulator_response",
-                        messages=[SystemMessage(role="system", content="Act as the customer."), UserMessage(role="user", content="Continue.")],
-                    )
-                self.assertEqual([call.args[0]["event"] for call in capture.call_args_list], ["request", "response", "error"])
+        model = SimpleNamespace(generate=lambda **kwargs: completion)
+        simulator = UserSimulator(llm="user")
+        state = UserState(
+            system_messages=[SystemMessage(role="system", content="Act as the customer.")],
+            messages=[UserMessage(role="user", content="Please check my inbox.")],
+        )
+        original_history = list(state.messages)
+        incoming = AssistantMessage(role="assistant", content="Your request is complete.")
+        with patch.object(tau3_adapter, "MODEL_DICT", {"user": model}):
+            with patch.object(model, "generate", wraps=model.generate) as generate:
+                with patch("tau2.user.user_simulator.generate", tau3_adapter.patched_generate):
+                    with self.assertRaises(tau3_adapter.Tau3AdapterError) as ctx:
+                        simulator.generate_next_message(incoming, state)
+                self.assertEqual(ctx.exception.kind, "model_output_invalid")
+                self.assertEqual(generate.call_count, 1)
+                self.assertEqual(state.messages, original_history + [incoming])
 
     def test_typed_422_stops_sdk_retries_after_one_real_http_request(self):
         Typed422Handler.requests = 0
