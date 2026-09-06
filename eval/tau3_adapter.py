@@ -20,7 +20,7 @@ from openai import APIStatusError
 from evalscope.api.evaluator import InferenceResult
 from evalscope.api.messages.chat_message import dict_to_chat_message
 from evalscope.api.model.model_output import ChatCompletionChoice, ModelOutput
-from evalscope.models.utils.openai import openai_chat_message
+from evalscope.models.utils.openai import openai_chat_message, openai_chat_tools
 from evalscope.api.tool.tool_info import ToolInfo
 from evalscope.constants import EvalType
 from tau2.data_model.message import AssistantMessage, Message, ToolCall, UserMessage
@@ -35,6 +35,7 @@ class Tau3AdapterError(RuntimeError):
     def __init__(self, kind: str, message: str) -> None:
         super().__init__(message)
         self.kind = kind
+SIMULATOR_EMPTY_RESPONSE_RETRIES = 3
 MODEL_DICT: dict[str, Any] = {"agent": None, "user": None}
 _CAPTURE_PATH: Path | None = None
 _CURRENT_TASK_ID: ContextVar[str | None] = ContextVar("tau3_task_id", default=None)
@@ -152,7 +153,7 @@ def _request_record(model: str, messages: list[Message], tools: list[Tool] | Non
     return {
         "model": model,
         "tau_messages": payloads,
-        "tools": [tool.openai_schema for tool in tools] if tools else None,
+        "tau_tools": [tool.openai_schema for tool in tools] if tools else None,
         "tool_choice": tool_choice,
     }
 def _is_typed_model_output_error(exc: Exception) -> bool:
@@ -199,38 +200,67 @@ def patched_generate(
             openai_chat_message(message, reasoning_format="reasoning_field")
             for message in model_input
         ]
+        generation_tools = [ToolInfo.model_validate(tool.openai_schema["function"]) for tool in tools] if tools else None
+        request["wire_tools"] = openai_chat_tools(generation_tools) if generation_tools else None
     except Exception as exc:
         kind = _classify_exception(exc)
         _capture({"event": "error", "kind": kind, "error_type": type(exc).__name__, "error": str(exc), **request})
         raise Tau3AdapterError(kind, str(exc)) from exc
-    _capture({"event": "request", **request})
-    try:
-        completion = oa_model.generate(
-            input=model_input,
-            tools=[ToolInfo.model_validate(tool.openai_schema["function"]) for tool in tools] if tools else None,
-            tool_choice=tool_choice if tool_choice is not None else ("auto" if tools else None),
-        )
-    except Exception as exc:
-        kind = _classify_exception(exc)
-        _capture({"event": "error", "kind": kind, "error_type": type(exc).__name__, "error": str(exc), **request})
-        raise Tau3AdapterError(kind, str(exc)) from exc
+    generation_tool_choice = tool_choice if tool_choice is not None else ("auto" if tools else None)
+    simulator = model == "user" and request["call_name"] == "user_simulator_response"
+    attempts = 1 + SIMULATOR_EMPTY_RESPONSE_RETRIES if simulator else 1
+    for attempt in range(1, attempts + 1):
+        attempt_record = {**request, "attempt": attempt}
+        _capture({"event": "request", **attempt_record})
+        try:
+            completion = oa_model.generate(
+                input=model_input,
+                tools=generation_tools,
+                tool_choice=generation_tool_choice,
+            )
+        except Exception as exc:
+            kind = _classify_exception(exc)
+            _capture({"event": "error", "kind": kind, "error_type": type(exc).__name__, "error": str(exc), **attempt_record})
+            raise Tau3AdapterError(kind, str(exc)) from exc
 
-    _capture({"event": "response", "response": completion.model_dump(mode="json", exclude_none=False), **request})
-    if not completion.choices:
-        _capture({"event": "error", "kind": "model_output_invalid", "error": "model returned no choices", **request})
-        raise Tau3AdapterError("model_output_invalid", "model returned no choices")
-    choice = completion.choices[0]
-    message = choice.message
+        _capture({"event": "response", "response": completion.model_dump(mode="json", exclude_none=False), **attempt_record})
+        if completion.error:
+            _capture({"event": "error", "kind": "model_output_invalid", "error": "model completion reported an error", **attempt_record})
+            raise Tau3AdapterError("model_output_invalid", "model completion reported an error")
+        if not completion.choices:
+            _capture({"event": "error", "kind": "model_output_invalid", "error": "model returned no choices", **attempt_record})
+            raise Tau3AdapterError("model_output_invalid", "model returned no choices")
+        choice = completion.choices[0]
+        if choice.stop_reason in {"max_tokens", "model_length"}:
+            _capture({"event": "error", "kind": "model_output_invalid", "error": "model response was truncated", **attempt_record})
+            raise Tau3AdapterError("model_output_invalid", "model response was truncated")
+        message = choice.message
+        if (
+            attempt < attempts
+            and choice.stop_reason == "stop"
+            and not completion.error
+            and not message.text.strip()
+            and not message.tool_calls
+        ):
+            _capture({
+                "event": "protocol_retry",
+                "kind": "simulator_empty_response",
+                "reason": "clean stop without visible text or tool calls",
+                "next_attempt": attempt + 1,
+                **attempt_record,
+            })
+            continue
+        break
     tool_calls = []
     for tool_call in message.tool_calls or []:
         arguments = tool_call.function.arguments
         if not isinstance(arguments, dict):
-            _capture({"event": "error", "kind": "model_output_invalid", "error": "EvalScope tool arguments were not an object", **request})
+            _capture({"event": "error", "kind": "model_output_invalid", "error": "EvalScope tool arguments were not an object", **attempt_record})
             raise Tau3AdapterError("model_output_invalid", "EvalScope tool arguments were not an object")
         tool_calls.append(ToolCall(id=tool_call.id, name=tool_call.function.name, arguments=arguments))
     content = message.text
-    if not content and not tool_calls:
-        _capture({"event": "error", "kind": "model_output_invalid", "error": "model response had no text or tool calls", **request})
+    if not content.strip() and not tool_calls:
+        _capture({"event": "error", "kind": "model_output_invalid", "error": "model response had no text or tool calls", **attempt_record})
         raise Tau3AdapterError("model_output_invalid", "model response had no text or tool calls")
     raw_data = completion.model_dump(mode="json", exclude_none=False)
     perf = message.perf_metrics
@@ -249,6 +279,9 @@ def patched_generate(
 
 def _build_model(agent_model: Any, adapter_instance: Any) -> None:
     from evalscope.api.model import GenerateConfig, get_model
+
+    if adapter_instance.extra_params.get("simulator_empty_response_retries", SIMULATOR_EMPTY_RESPONSE_RETRIES) != SIMULATOR_EMPTY_RESPONSE_RETRIES:
+        raise Tau3AdapterError("adapter_error", "simulator_empty_response_retries must match the fixed three-retry policy")
 
     user_server = get_model(
         model=adapter_instance.user_model,
@@ -341,6 +374,14 @@ def install() -> None:
     """Install the repo-owned hooks into the installed τ³ adapter."""
 
     from evalscope.benchmarks.tau_bench.tau3_bench import generation
+    from evalscope.api.registry import BENCHMARK_REGISTRY
+    from evalscope.benchmarks.tau_bench.tau3_bench import tau3_bench_adapter  # Register metadata before extending it.
+
+    BENCHMARK_REGISTRY.get("tau3_bench").extra_params["simulator_empty_response_retries"] = {
+        "type": "int",
+        "description": "Fixed additional clean-stop empty user-simulator attempts; never agent or judge retries.",
+        "value": SIMULATOR_EMPTY_RESPONSE_RETRIES,
+    }
 
     generation.predict = predict
     generation.patched_generate = patched_generate

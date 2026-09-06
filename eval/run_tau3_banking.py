@@ -73,7 +73,7 @@ def main() -> int:
     if Path(dataset_id).is_dir():
         os.environ["TAU2_DATA_DIR"] = dataset_id
 
-    from tau3_adapter import configure_capture, install
+    from tau3_adapter import SIMULATOR_EMPTY_RESPONSE_RETRIES, configure_capture, install
 
     configure_capture(capture_path)
     install()
@@ -92,6 +92,7 @@ def main() -> int:
                 "subset_list": ["banking_knowledge"],
                 "extra_params": {
                     "user_model": simulator_model,
+                    "simulator_empty_response_retries": SIMULATOR_EMPTY_RESPONSE_RETRIES,
                     "api_base": simulator_endpoint,
                     "api_key": None,
                     "generation_config": {
@@ -125,6 +126,7 @@ def main() -> int:
     print("dataset=tau3_bench subset=banking_knowledge tasks=97 repeats=1 retrieval=bm25", flush=True)
     print("agent=qwen3.8-27b temperature=0 reasoning_effort=medium max_tokens=32768", flush=True)
     print(f"simulator_and_nl_judge={simulator_model} endpoint={simulator_endpoint}", flush=True)
+    print(f"simulator_empty_response_retries={SIMULATOR_EMPTY_RESPONSE_RETRIES} (user simulator clean-stop empty responses only)", flush=True)
     print(f"work_dir={work_dir} capture={capture_path or 'disabled'} dataset={dataset_id}", flush=True)
     if not args.run:
         print("Configuration validated only; no dataset loaded, server started, or model request made.", flush=True)

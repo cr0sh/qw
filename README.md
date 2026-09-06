@@ -105,6 +105,17 @@ tool-only report entries use an empty content list, never invented user text.
 This report representation is not sent to models. Opt-in capture writes the
 completed task result before report conversion.
 
+The runner persists `simulator_empty_response_retries=3`: only a
+`user_simulator_response` from the user model that ends with a clean stop and
+no visible text or tool calls can repeat the identical request, at most three
+extra times. This is a deliberate deviation from stock Tau2's handling of
+empty simulator responses. Each attempt and protocol-retry reason is captured;
+no synthetic STOP, extra simulator turn, or repeated tool execution is added.
+Visible answers, refusals, and tool actions are never resampled. Agent/judge
+calls are not eligible; truncation, completion errors, and retry exhaustion
+abort rather than becoming task reward zero. Capture separates original
+`tau_tools` from actual EvalScope-serialized `wire_tools` and `wire_messages`.
+
 Run the durable banking launcher from a dedicated worktree using a Python
 environment with EvalScope 1.11.0 and `tau2[knowledge]` v1.0.0 installed:
 
