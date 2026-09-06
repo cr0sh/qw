@@ -344,10 +344,7 @@ class Tau3AdapterTests(unittest.TestCase):
             cache, dataset = completed_cache_fixture(directory)
             review_path = Path(cache.get_review_cache_path("banking_knowledge"))
             review = json.loads(review_path.read_text())
-            scored_run = json.loads(review["sample_score"]["score"]["prediction"])
-            scored_run["id"] = "different-report-uuid"
-            scored_run["duration"] = 2.0
-            review["sample_score"]["score"]["prediction"] = json.dumps(scored_run)
+            review["messages"][0]["id"] = "regenerated-report-message-id"
             review_path.write_text(json.dumps(review) + "\n")
             self.assertEqual(tau3_adapter._validate_cached_records(cache, dataset, "cache-fixture"), (1, 1))
             restored, remaining = cache.filter_prediction_cache("banking_knowledge", dataset)
@@ -382,7 +379,7 @@ class Tau3AdapterTests(unittest.TestCase):
                     tau3_adapter._validate_cached_records(cache, dataset, "cache-fixture")
 
     def test_resume_rejects_lost_reasoning_and_mismatched_review(self):
-        for corruption in ["lost_reasoning", "lost_user_tool", "wrong_reward", "wrong_trajectory"]:
+        for corruption in ["lost_reasoning", "lost_user_tool", "wrong_reward", "wrong_trajectory", "different_canonical_run"]:
             with self.subTest(corruption=corruption), tempfile.TemporaryDirectory() as directory:
                 cache, dataset = completed_cache_fixture(directory)
                 path = Path(cache.get_prediction_cache_path("banking_knowledge") if corruption in {"lost_reasoning", "lost_user_tool"} else cache.get_review_cache_path("banking_knowledge"))
@@ -395,6 +392,10 @@ class Tau3AdapterTests(unittest.TestCase):
                     row["messages"][1]["metadata"] = {}
                 elif corruption == "wrong_reward":
                     row["sample_score"]["score"]["value"]["acc"] = 1.0
+                elif corruption == "different_canonical_run":
+                    scored_run = json.loads(row["sample_score"]["score"]["prediction"])
+                    scored_run["seed"] = 43
+                    row["sample_score"]["score"]["prediction"] = json.dumps(scored_run)
                 else:
                     row["messages"][0]["content"] = "Unrelated trajectory"
                 path.write_text(json.dumps(row) + "\n")
