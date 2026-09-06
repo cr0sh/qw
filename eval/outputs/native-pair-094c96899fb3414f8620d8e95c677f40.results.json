@@ -1,0 +1,13 @@
+{
+  "mode": "NONSCORED",
+  "requests": [
+    {
+      "label": "A",
+      "status": 502
+    },
+    {
+      "label": "B",
+      "status": 502
+    }
+  ]
+}

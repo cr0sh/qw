@@ -1,0 +1,166 @@
+{
+  "mode": "NONSCORED exact-pair diagnostic; not benchmark outcomes",
+  "plan": "/Users/namjh/dev/personal/qwr/worktrees/tau3-native-simulator-repair/eval/outputs/native-pair-8be3a8ea0921409abcafc7855d6462d1.plan.json",
+  "native_capture": "/Users/namjh/dev/personal/qwr/worktrees/tau3-native-simulator-repair/eval/outputs/native-pair-8be3a8ea0921409abcafc7855d6462d1.jsonl",
+  "chat_results": "/Users/namjh/dev/personal/qwr/worktrees/tau3-native-simulator-repair/eval/outputs/native-pair-8be3a8ea0921409abcafc7855d6462d1.results.json",
+  "rotation": {
+    "new_authenticated_broker_status": 200,
+    "endpoint": "GET /v1/usage/clients",
+    "old_token_rejection_directly_tested": false,
+    "replacement_source": "auth-broker-cli.ts runServe passes bearerTokens:[token]; token regeneration uses crypto.randomBytes(32) and overwrites chmod0600 file",
+    "broker_pid": 94855,
+    "gateway_pid": 94866,
+    "qw_unchanged_pid": 79597
+  },
+  "prior_instrumentation_failure": {
+    "results": "/Users/namjh/dev/personal/qwr/worktrees/tau3-native-simulator-repair/eval/outputs/native-pair-094c96899fb3414f8620d8e95c677f40.results.json",
+    "http_calls": 2,
+    "native_dispatches": 0,
+    "native_dispatch_evidence": "JSON.parse on zstd body throws before originalFetch; source and synthetic reproduction, no upstream capture",
+    "correction": "Decode zstd capture copy only; synthetic proof original init/body reference and bytes unchanged; cap counts dispatches"
+  },
+  "A": {
+    "native_dispatches": 1,
+    "http_status": 200,
+    "native_output_text_done": [
+      ""
+    ],
+    "native_done_items": [
+      {
+        "id": "msg_0d70b4c33d6ff4b1016a9d06a65db087d099ebd48642911a65",
+        "type": "message",
+        "status": "completed",
+        "content": [
+          {
+            "type": "output_text",
+            "annotations": [],
+            "logprobs": [],
+            "text": ""
+          }
+        ],
+        "internal_chat_message_metadata_passthrough": {
+          "create_time": 1788675749.950108,
+          "turn_id": "65da367c-b67a-4f25-b531-d6f92a991cba"
+        },
+        "phase": "final_answer",
+        "role": "assistant",
+        "metadata": {
+          "turn_id": "65da367c-b67a-4f25-b531-d6f92a991cba"
+        }
+      }
+    ],
+    "native_completed_status": "completed",
+    "native_completed_output": [],
+    "chat_choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": null,
+          "refusal": null
+        },
+        "finish_reason": "stop",
+        "logprobs": null
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 1470,
+      "completion_tokens": 4,
+      "total_tokens": 1474,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    }
+  },
+  "B": {
+    "native_dispatches": 1,
+    "http_status": 200,
+    "native_output_text_done": [
+      "###STOP###"
+    ],
+    "native_done_items": [
+      {
+        "id": "msg_028620fb328c5978016a9d06a92b8487d0b162ecb681bdca55",
+        "type": "message",
+        "status": "completed",
+        "content": [
+          {
+            "type": "output_text",
+            "annotations": [],
+            "logprobs": [],
+            "text": "###STOP###"
+          }
+        ],
+        "internal_chat_message_metadata_passthrough": {
+          "create_time": 1788675752.489402,
+          "turn_id": "f8a01040-3f45-466d-90ec-870298211434"
+        },
+        "phase": "final_answer",
+        "role": "assistant",
+        "metadata": {
+          "turn_id": "f8a01040-3f45-466d-90ec-870298211434"
+        }
+      }
+    ],
+    "native_completed_status": "completed",
+    "native_completed_output": [],
+    "chat_choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "###STOP###",
+          "refusal": null
+        },
+        "finish_reason": "stop",
+        "logprobs": null
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 1596,
+      "completion_tokens": 7,
+      "total_tokens": 1603,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    }
+  },
+  "same_native_fields": {
+    "model": true,
+    "stream": true,
+    "prompt_cache_key": true,
+    "tools": true,
+    "tool_choice": true,
+    "instructions": true,
+    "store": true,
+    "reasoning": true,
+    "include": true
+  },
+  "same_native_session_id": true,
+  "differing_body_top_level_fields": [
+    "input",
+    "client_metadata"
+  ],
+  "client_metadata_differences": [
+    "thread_id",
+    "x-codex-window-id",
+    "turn_id",
+    "x-codex-turn-metadata"
+  ],
+  "selected_account_identity": "Not captured; no claim of confirmed identical account selection",
+  "findings": [
+    "A actual native output_text.done is empty and output_item.done carries empty output_text; no lost visible text at Chat boundary.",
+    "B actual native deltas and done text are ###STOP### and Chat preserves them.",
+    "Both newly observed output items have actual phase final_answer; phase presence alone does not distinguish success from failure. Historical live phases remain unavailable.",
+    "Both response.completed.output arrays are empty, including successful B: completion output array alone is NOT valid evidence of empty generation; inspect streamed items/deltas.",
+    "Same native model/tools/instructions/reasoning/session/cache key; input differs and client turn metadata differs naturally. Native omits Chat temperature and max_tokens as provider contract.",
+    "One pair supports prefix-sensitive generation under these conditions, not reliability or sole-cause proof."
+  ],
+  "proposal_one_variable": {
+    "variable": "Final pre-application agent utterance content",
+    "experiment": "NONSCORED only, subject to approval: replace only A final agent utterance with exact B final agent utterance; hold all other A history, tool call/result, tools/settings/session treatment unchanged. No regenerated agent trajectory, no graft into scored recovery.",
+    "reason": "The last agent utterance differs from recommending Gold to explaining secure application/credit-review completion; the terminal application and result are identical, and final_answer phase is observed for both outcomes. This is one localized context contrast, not established cause."
+  },
+  "benchmark_status": "Still zero valid outcomes from failed campaign; no score/report; pair not scored",
+  "services": "Isolated diagnostic gateway stopped after exactly one actual native dispatch per condition; normal gateway ready; QW unchanged"
+}
