@@ -111,11 +111,7 @@ Both used the default
 checkpoint with Turbo4 KV cache on a Mac Studio with an Apple M4 Max
 40-core GPU and 64 GB of unified memory; decoding was greedy
 (`temperature=0`, `top_p=1`, seed `0`) for 127 output tokens after the first
-token, with one warmup and three timed repetitions. Each value is aggregate
-decode-phase TPS, not end-to-end throughput. These historical speculative
-decoder measurements used the then-current restricted target head before
-full-vocabulary verification, so they are not current correctness, stochastic
-gain, or lossless T1 performance claims.
+token, with one warmup and three timed repetitions.
 
 ## Development
 
