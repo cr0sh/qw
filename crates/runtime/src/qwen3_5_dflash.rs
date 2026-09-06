@@ -2866,21 +2866,22 @@ mod tests {
         let target_tokens = [813, 81_336, 83_268];
         let logits = verify_logits(&target_tokens, 248_320);
         let sampling = SamplingConfig::greedy();
-        let mtp = crate::qwen3_5_mtp::greedy_walk(
-            &proposals, &logits, &sampling, &[], 3,
-        );
+        let mtp = crate::qwen3_5_mtp::greedy_walk(&proposals, &logits, &sampling, &[], 3);
         assert_eq!(mtp.accepted, 1);
         assert_eq!(mtp.new_tokens, [813, 81_336]);
         let proposal_array = mlxcel_core::from_slice_i32(&proposals, &[1, 2]);
         let (dflash, _) = crate::qwen3_5_mtp::greedy_walk_device_proposals(
-            &proposal_array, &logits, &sampling, &[], 3,
+            &proposal_array,
+            &logits,
+            &sampling,
+            &[],
+            3,
         );
         assert_eq!(dflash.accepted, 1);
         assert_eq!(dflash.new_tokens, mtp.new_tokens);
         let accepted = mlxcel_core::from_slice_i32(&target_tokens[..2], &[1, 2]);
-        let (bonus, _) = crate::qwen3_5_mtp::greedy_walk_device_proposals(
-            &accepted, &logits, &sampling, &[], 3,
-        );
+        let (bonus, _) =
+            crate::qwen3_5_mtp::greedy_walk_device_proposals(&accepted, &logits, &sampling, &[], 3);
         assert_eq!(bonus.accepted, 2);
         assert_eq!(bonus.new_tokens, target_tokens);
     }

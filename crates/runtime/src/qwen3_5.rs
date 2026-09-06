@@ -41,7 +41,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 const MTP_DRAFT_PREFIX: i32 = 65_536;
 const MTP_DRAFT_PADDED: i32 = 65_568;
+#[cfg(any(feature = "dflash2", test))]
 pub(crate) const DFLASH_COMPACT_PREFIX: i32 = 80_896;
+#[cfg(any(feature = "dflash2", test))]
 const DFLASH_CANDIDATE_PADDED: i32 = 80_928;
 pub(crate) const DFLASH_CONTROL_START: i32 = 248_044;
 pub(crate) const DFLASH_CONTROL_END: i32 = 248_070;
@@ -1011,6 +1013,7 @@ pub struct Qwen35Model {
     pub(crate) norm: RMSNorm,
     pub(crate) lm_head: Option<UnifiedLinear>,
     compact_draft_head: Option<UnifiedLinear>,
+    #[cfg(any(feature = "dflash2", test))]
     compact_dflash_candidate_head: Option<UnifiedLinear>,
     pub(crate) config: Qwen35Config,
     mtp: Option<Qwen35MtpDraftModel>,
@@ -1063,6 +1066,7 @@ impl Qwen35Model {
     /// rows `[0, 80_896)` followed by the 26 target control-token rows
     /// `[248_044, 248_070)`. Falls back to the full target head when the
     /// quantized compact head is unavailable. Never use this for verification.
+    #[cfg(any(feature = "dflash2", test))]
     pub(crate) fn project_dflash_candidate_logits(&self, hidden: &MlxArray) -> UniquePtr<MlxArray> {
         self.project_compact_logits(
             hidden,
@@ -2251,6 +2255,7 @@ impl Qwen35Model {
         let compact_draft_head = lm_head.as_ref().and_then(|head| {
             compact_head(head, config.vocab_size, MTP_DRAFT_PREFIX, MTP_DRAFT_PADDED)
         });
+        #[cfg(any(feature = "dflash2", test))]
         let compact_dflash_candidate_head = lm_head.as_ref().and_then(|head| {
             compact_head(
                 head,
@@ -2277,6 +2282,7 @@ impl Qwen35Model {
             lm_head,
             initial_prefill_complete: AtomicBool::new(false),
             compact_draft_head,
+            #[cfg(any(feature = "dflash2", test))]
             compact_dflash_candidate_head,
             config: config.clone(),
             kv_cache_mode,
