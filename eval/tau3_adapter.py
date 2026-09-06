@@ -17,6 +17,7 @@ from typing import Any
 
 from openai import APIStatusError
 
+from evalscope.api.evaluator import InferenceResult
 from evalscope.api.messages.chat_message import dict_to_chat_message
 from evalscope.api.model.model_output import ChatCompletionChoice, ModelOutput
 from evalscope.models.utils.openai import openai_chat_message
