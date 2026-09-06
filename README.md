@@ -94,22 +94,28 @@ current build.
 
 ## Historical performance
 
-The latest completed local decode measurements recorded 57.510 / 56.477 /
-40.050 tokens/s for DFlash2 and 57.710 / 53.782 / 36.903 tokens/s for bundled
-MTP at fresh, 10,337-token, and 64,297-token cached contexts, respectively.
-The 64k DFlash2 value is the latest confirmation rather than the earlier
-40.268 peak. It used the default
+Latest completed local decode measurements (tokens/s):
+
+| Context | Bundled MTP reference | DFlash2 |
+|---|---:|---:|
+| Fresh | 57.710 | 57.510 |
+| 10,337-token cached prefix | 53.782 | 56.477 |
+| 64,297-token cached prefix | 36.903 | 40.050 |
+
+The bundled-MTP reference was tested at
+[commit `f4887cb`](https://github.com/cr0sh/qw/commit/f4887cbe3fc6e16fa1035efcf422c055579b34c1);
+the DFlash2 measurements were tested at
+[commit `7ada6d4`](https://github.com/cr0sh/qw/commit/7ada6d4db2d4f23f4867abe968d17d020983a44e).
+Both used the default
 [Jundot/Qwen3.8-27B-oQ4e-fp16-mtp](https://huggingface.co/Jundot/Qwen3.8-27B-oQ4e-fp16-mtp)
 checkpoint with Turbo4 KV cache on a Mac Studio with an Apple M4 Max
 40-core GPU and 64 GB of unified memory; decoding was greedy
 (`temperature=0`, `top_p=1`, seed `0`) for 127 output tokens after the first
-token, with one warmup and three timed repetitions. The benchmark ran at
-[commit `7ada6d4`](https://github.com/cr0sh/qw/commit/7ada6d4db2d4f23f4867abe968d17d020983a44e).
-Each value is aggregate phase TPS over the three timed repetitions, not a
-best-of-run sample or end-to-end throughput. The speculative-decoder rows used
-the then-current restricted target head before full-vocabulary verification;
-they are historical measurements, not current correctness, stochastic-gain, or
-lossless T1 performance claims.
+token, with one warmup and three timed repetitions. Each value is aggregate
+decode-phase TPS, not end-to-end throughput. These historical speculative
+decoder measurements used the then-current restricted target head before
+full-vocabulary verification, so they are not current correctness, stochastic
+gain, or lossless T1 performance claims.
 
 ## Development
 
