@@ -1,0 +1,29 @@
+{
+  "mode": "NONSCORED",
+  "tool_executions": 1,
+  "task_id": "task_001",
+  "initial_state": null,
+  "prior_KB_search_nonmutating": true,
+  "fresh_db_before_sha256": "c0ae8b30331f2907e81b5c3436a00e0a0f17da596c4a1c22a437d62ed2da8e63",
+  "fresh_db_after_sha256": "05923aaf66bb8f9a0481be2ead154339a0147b7e5fe8c414d8fef8269bf98262",
+  "actual_call": {
+    "id": "call_KHDRuyJ7uo7EjYgT0PIpGRuQ|fc_00211832645e509b016a9d0e8854b487d0943c89e1c0d11b2c",
+    "name": "apply_for_credit_card",
+    "arguments": {
+      "card_type": "Gold Rewards Card",
+      "customer_name": "Sarah Bosch",
+      "annual_income": 100000,
+      "rho_bank_subscription": true
+    },
+    "requestor": "user"
+  },
+  "actual_result": {
+    "id": "call_KHDRuyJ7uo7EjYgT0PIpGRuQ|fc_00211832645e509b016a9d0e8854b487d0943c89e1c0d11b2c",
+    "role": "tool",
+    "content": "Credit card application submitted:\nYour application has been successfully submitted. You will receive a decision within 5-7 business days via email.",
+    "requestor": "user",
+    "error": false,
+    "turn_idx": null,
+    "timestamp": "2026-09-06T15:58:40.428953"
+  }
+}

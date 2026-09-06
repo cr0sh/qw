@@ -1,0 +1,31 @@
+{
+  "label": "T",
+  "status": 200,
+  "body": {
+    "id": "chatcmpl-2668070c-e5de-4958-b494-42fa7e7dedbc",
+    "object": "chat.completion",
+    "created": 1788678171,
+    "model": "openai-codex/gpt-5.6-luna",
+    "system_fingerprint": null,
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "###STOP###",
+          "refusal": null
+        },
+        "finish_reason": "stop",
+        "logprobs": null
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 1502,
+      "completion_tokens": 7,
+      "total_tokens": 1509,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    }
+  }
+}
