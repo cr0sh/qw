@@ -1998,6 +1998,55 @@ async fn streamed_responses_closes_preamble_before_function_items() {
 }
 
 #[tokio::test]
+async fn invalid_generated_tools_are_nonretryable_and_never_leak_argument_bodies() {
+    let app = router(Engine::start_fake(Some(MODEL), 8));
+    for endpoint in ["/v1/chat/completions", "/v1/responses"] {
+        for stream in [false, true] {
+            let mut request = if endpoint == "/v1/responses" {
+                let mut request = responses_request("call-tool-invalid");
+                request["tools"] = responses_tools();
+                request
+            } else {
+                chat_tool_request("call-tool-invalid")
+            };
+            request["stream"] = json!(stream);
+            let (status, _, body) = post(app.clone(), endpoint, request).await;
+            assert!(!body.contains("private-argument-body"), "{body}");
+            assert!(!body.contains("<tool_call>"), "{body}");
+            if stream {
+                assert_eq!(status, StatusCode::OK, "{body}");
+                let (frames, done) = parse_sse(&body);
+                assert!(
+                    frames.iter().any(|frame| {
+                        let error = if endpoint == "/v1/responses" {
+                            &frame.data["response"]["error"]
+                        } else {
+                            &frame.data["error"]
+                        };
+                        error["type"] == "model_output_error"
+                            && error["code"] == "invalid_model_output"
+                    }),
+                    "{body}"
+                );
+                if endpoint == "/v1/chat/completions" {
+                    assert!(done, "{body}");
+                } else {
+                    assert_eq!(
+                        frames.last().unwrap().event.as_deref(),
+                        Some("response.failed")
+                    );
+                }
+            } else {
+                assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+                let value: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(value["error"]["type"], "model_output_error");
+                assert_eq!(value["error"]["code"], "invalid_model_output");
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn tool_choice_parallel_policy_and_tool_free_shapes_are_preserved() {
     let app = router(Engine::start_fake(Some(MODEL), 8));
     let mut none = chat_tool_request("call-tool");
@@ -2025,7 +2074,10 @@ async fn tool_choice_parallel_policy_and_tool_free_shapes_are_preserved() {
     let mut violation = chat_tool_request("call-tool-parallel-violation");
     violation["parallel_tool_calls"] = json!(false);
     let (status, _, body) = post(app, "/v1/chat/completions", violation).await;
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let value: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["error"]["type"], "model_output_error");
+    assert_eq!(value["error"]["code"], "invalid_model_output");
 
     let ordinary = router(Engine::start_fake(Some(MODEL), 8));
     let (status, _, body) = post(ordinary, "/v1/chat/completions", chat_request("shape")).await;

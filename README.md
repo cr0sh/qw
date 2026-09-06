@@ -88,6 +88,18 @@ Turbo4 speculative regrouping can change floating-point results and greedy token
 choices; byte-preserving snapshots do not promise token-identical continuations
 across different execution groupings.
 
+The server rejects malformed or undeclared generated tool calls and violations
+of `parallel_tool_calls=false`. These output-contract failures return HTTP 422
+with `error.type=model_output_error` and `error.code=invalid_model_output`, rather
+than a retryable server error. Streaming responses use the same error type/code
+in the endpoint's terminal error event after HTTP headers have been sent.
+The error does not include raw generated argument bodies.
+
+For τ³ evaluation, this strict rejection differs from Tau2's live environment,
+which can return unknown-tool feedback to the agent. The banking runner aborts
+on such protocol failures rather than skipping tasks or assigning reward zero;
+an aborted run is not a complete benchmark score.
+
 Obtain statistics about storage usage and status:
 
 ```bash
