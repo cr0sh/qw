@@ -22,7 +22,7 @@ from evalscope.api.model.model_output import ChatCompletionChoice, ModelOutput
 from evalscope.models.utils.openai import openai_chat_message
 from evalscope.api.tool.tool_info import ToolInfo
 from evalscope.constants import EvalType
-from tau2.data_model.message import AssistantMessage, Message, ToolCall
+from tau2.data_model.message import AssistantMessage, Message, ToolCall, UserMessage
 from tau2.data_model.tasks import Task
 from tau2.environment.tool import Tool
 from tau2.utils import llm_utils as tau_llm_utils
@@ -91,6 +91,22 @@ def _reasoning_from_tau_message(message: Message) -> str | None:
     return None
 
 
+def _preserve_user_tool_calls(source: Message, payload: dict[str, Any]) -> None:
+    """EvalScope has no user-role tool_calls; Tau2 flips these to assistant role."""
+
+    if not isinstance(source, UserMessage) or not source.tool_calls:
+        return
+    payload["role"] = "assistant"
+    payload["content"] = source.content or ""
+    payload["tool_calls"] = [
+        {
+            "id": call.id,
+            "type": "function",
+            "function": {"name": call.name, "arguments": json.dumps(call.arguments)},
+        }
+        for call in source.tool_calls
+    ]
+
 def _tau_messages_for_model(messages: list[Message]) -> list[Any]:
     """Use Tau2's converter, adding EvalScope's explicit reasoning field.
 
@@ -103,6 +119,7 @@ def _tau_messages_for_model(messages: list[Message]) -> list[Any]:
     base_messages = tau_llm_utils.to_litellm_messages(messages)
     converted: list[Any] = []
     for source, payload in zip(messages, base_messages):
+        _preserve_user_tool_calls(source, payload)
         has_calls = bool(payload.get("tool_calls"))
         content = payload.get("content")
         if source.role in {"assistant", "user"} and not has_calls and not (isinstance(content, str) and content.strip()):
@@ -114,8 +131,6 @@ def _tau_messages_for_model(messages: list[Message]) -> list[Any]:
             reasoning = _reasoning_from_tau_message(source)
             if reasoning:
                 payload["reasoning"] = reasoning
-            # OpenAI's typed input accepts an empty string for a tool-only message;
-            # this is structural and does not invent assistant text.
             if content is None and has_calls:
                 payload["content"] = ""
         converted.append(dict_to_chat_message(payload))
@@ -295,12 +310,13 @@ def predict(model: Any, sample: Any, adapter_instance: Any) -> InferenceResult:
     agent_messages = []
     for raw in raw_messages:
         payload = tau_llm_utils.to_litellm_messages([raw])[0]
+        _preserve_user_tool_calls(raw, payload)
         if isinstance(raw, AssistantMessage):
             reasoning = _reasoning_from_tau_message(raw)
             if reasoning:
                 payload["reasoning"] = reasoning
-            if payload.get("content") is None and payload.get("tool_calls"):
-                payload["content"] = ""
+        if payload.get("content") is None and payload.get("tool_calls"):
+            payload["content"] = ""
         try:
             agent_messages.append(dict_to_chat_message(payload))
         except Exception as exc:
