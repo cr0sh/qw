@@ -19,7 +19,7 @@ from openai import APIStatusError
 
 from evalscope.api.messages.chat_message import dict_to_chat_message
 from evalscope.api.model.model_output import ChatCompletionChoice, ModelOutput
-from evalscope.api.evaluator import InferenceResult
+from evalscope.models.utils.openai import openai_chat_message
 from evalscope.api.tool.tool_info import ToolInfo
 from evalscope.constants import EvalType
 from tau2.data_model.message import AssistantMessage, Message, ToolCall
@@ -68,17 +68,6 @@ def _capture(record: dict[str, Any]) -> None:
         stream.write(json.dumps(_jsonable(record), ensure_ascii=False) + "\n")
 
 
-def _reasoning_parts(message: Any) -> list[str]:
-    """Extract reasoning from the actual EvalScope ``ChatMessage`` schema."""
-
-    content = getattr(message, "content", None)
-    if not isinstance(content, list):
-        return []
-    return [
-        str(part.reasoning)
-        for part in content
-        if getattr(part, "type", None) == "reasoning" and getattr(part, "reasoning", None)
-    ]
 
 
 def _reasoning_from_tau_message(message: Message) -> str | None:
@@ -132,17 +121,14 @@ def _tau_messages_for_model(messages: list[Message]) -> list[Any]:
         converted.append(dict_to_chat_message(payload))
     return converted
 
-
 def _request_record(model: str, messages: list[Message], tools: list[Tool] | None, tool_choice: Any) -> dict[str, Any]:
     payloads = tau_llm_utils.to_litellm_messages(messages)
     return {
         "model": model,
-        "messages": payloads,
+        "tau_messages": payloads,
         "tools": [tool.openai_schema for tool in tools] if tools else None,
         "tool_choice": tool_choice,
     }
-
-
 def _is_typed_model_output_error(exc: Exception) -> bool:
     """Recognize only the server's typed non-retryable output-contract error."""
 
@@ -160,6 +146,8 @@ def _is_typed_model_output_error(exc: Exception) -> bool:
 
 
 def _classify_exception(exc: Exception) -> str:
+    if isinstance(exc, Tau3AdapterError):
+        return exc.kind
     if _is_typed_model_output_error(exc):
         return "model_output_invalid"
     return "infrastructure"
@@ -179,10 +167,20 @@ def patched_generate(
         raise Tau3AdapterError("adapter_error", f"model {model!r} is not configured")
     request = _request_record(model, messages, tools, tool_choice)
     request["call_name"] = kwargs.get("call_name")
+    try:
+        model_input = _tau_messages_for_model(messages)
+        request["wire_messages"] = [
+            openai_chat_message(message, reasoning_format="reasoning_field")
+            for message in model_input
+        ]
+    except Exception as exc:
+        kind = _classify_exception(exc)
+        _capture({"event": "error", "kind": kind, "error_type": type(exc).__name__, "error": str(exc), **request})
+        raise Tau3AdapterError(kind, str(exc)) from exc
     _capture({"event": "request", **request})
     try:
         completion = oa_model.generate(
-            input=_tau_messages_for_model(messages),
+            input=model_input,
             tools=[ToolInfo.model_validate(tool.openai_schema["function"]) for tool in tools] if tools else None,
             tool_choice=tool_choice if tool_choice is not None else ("auto" if tools else None),
         )
@@ -258,7 +256,14 @@ def predict(model: Any, sample: Any, adapter_instance: Any) -> InferenceResult:
     task_data = {key: value for key, value in sample.metadata.items() if key != "_domain"}
     task = Task.model_validate(task_data)
     _CURRENT_TASK_ID.set(task.id)
-    _build_model(model, adapter_instance)
+    try:
+        _build_model(model, adapter_instance)
+    except Exception as exc:
+        kind = _classify_exception(exc)
+        _capture({"event": "task_error", "kind": kind, "error_type": type(exc).__name__, "error": str(exc)})
+        if isinstance(exc, Tau3AdapterError):
+            raise
+        raise Tau3AdapterError(kind, str(exc)) from exc
     from tau2.evaluator.evaluator import EvaluationType
     from tau2.run import run_task
 
