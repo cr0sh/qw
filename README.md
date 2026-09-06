@@ -99,6 +99,11 @@ For τ³ evaluation, this strict rejection differs from Tau2's live environment,
 which can return unknown-tool feedback to the agent. The banking runner aborts
 on such protocol failures rather than skipping tasks or assigning reward zero;
 an aborted run is not a complete benchmark score.
+The full Tau2 result is the authoritative trajectory. Report-only user tool
+actions retain the user role and exact calls in `tau2_user_tool_calls` metadata;
+tool-only report entries use an empty content list, never invented user text.
+This report representation is not sent to models. Opt-in capture writes the
+completed task result before report conversion.
 
 Obtain statistics about storage usage and status:
 

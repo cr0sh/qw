@@ -91,21 +91,28 @@ def _reasoning_from_tau_message(message: Message) -> str | None:
     return None
 
 
-def _preserve_user_tool_calls(source: Message, payload: dict[str, Any]) -> None:
-    """EvalScope has no user-role tool_calls; Tau2 flips these to assistant role."""
+def _trajectory_message(source: Message) -> Any:
+    """Build a report artifact without changing the participant's role.
 
-    if not isinstance(source, UserMessage) or not source.tool_calls:
-        return
-    payload["role"] = "assistant"
-    payload["content"] = source.content or ""
-    payload["tool_calls"] = [
-        {
-            "id": call.id,
-            "type": "function",
-            "function": {"name": call.name, "arguments": json.dumps(call.arguments)},
+    EvalScope has no user-role tool-call field. Preserve those actions in
+    metadata, using an empty content list only for a tool-only report message.
+    This representation is never used as model input; the full Tau2 result
+    remains the authoritative trajectory.
+    """
+    payload = tau_llm_utils.to_litellm_messages([source])[0]
+    if isinstance(source, UserMessage) and source.tool_calls:
+        payload["metadata"] = {
+            "tau2_user_tool_calls": [call.model_dump(mode="json") for call in source.tool_calls]
         }
-        for call in source.tool_calls
-    ]
+        if payload.get("content") is None:
+            payload["content"] = []
+    if isinstance(source, AssistantMessage):
+        reasoning = _reasoning_from_tau_message(source)
+        if reasoning:
+            payload["reasoning"] = reasoning
+        if payload.get("content") is None and payload.get("tool_calls"):
+            payload["content"] = ""
+    return dict_to_chat_message(payload)
 
 def _tau_messages_for_model(messages: list[Message]) -> list[Any]:
     """Use Tau2's converter, adding EvalScope's explicit reasoning field.
@@ -119,7 +126,6 @@ def _tau_messages_for_model(messages: list[Message]) -> list[Any]:
     base_messages = tau_llm_utils.to_litellm_messages(messages)
     converted: list[Any] = []
     for source, payload in zip(messages, base_messages):
-        _preserve_user_tool_calls(source, payload)
         has_calls = bool(payload.get("tool_calls"))
         content = payload.get("content")
         if source.role in {"assistant", "user"} and not has_calls and not (isinstance(content, str) and content.strip()):
@@ -303,22 +309,18 @@ def predict(model: Any, sample: Any, adapter_instance: Any) -> InferenceResult:
         _capture({"event": "task_error", "kind": kind, "error_type": type(exc).__name__, "error": str(exc), "task_id": task.id})
         raise Tau3AdapterError(kind, str(exc)) from exc
 
+    # Preserve completed simulation and judge evidence before optional report
+    # projection, so a report-schema failure cannot discard the finished task.
+    _capture({"event": "task_result", "result": result.model_dump(mode="json"), "task_id": task.id})
+
     task_result = result.reward_info.model_dump()
     task_result["status"] = "completed"
     sample.metadata["task_result"] = task_result
     raw_messages = result.messages or []
     agent_messages = []
     for raw in raw_messages:
-        payload = tau_llm_utils.to_litellm_messages([raw])[0]
-        _preserve_user_tool_calls(raw, payload)
-        if isinstance(raw, AssistantMessage):
-            reasoning = _reasoning_from_tau_message(raw)
-            if reasoning:
-                payload["reasoning"] = reasoning
-        if payload.get("content") is None and payload.get("tool_calls"):
-            payload["content"] = ""
         try:
-            agent_messages.append(dict_to_chat_message(payload))
+            agent_messages.append(_trajectory_message(raw))
         except Exception as exc:
             _capture({"event": "trajectory_error", "kind": "adapter_error", "error": str(exc), "task_id": task.id})
             raise Tau3AdapterError("adapter_error", str(exc)) from exc

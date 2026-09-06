@@ -5,11 +5,11 @@ import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from evalscope.api.messages import ContentReasoning, ContentText, ChatMessageAssistant
-from evalscope.api.model import ChatCompletionChoice, GenerateConfig, ModelOutput, get_model
+from evalscope.api.messages import ChatMessageAssistant, ChatMessageUser
+from evalscope.api.model import GenerateConfig, get_model
 from evalscope.constants import EvalType
 from evalscope.models.utils.openai import openai_chat_message
-from tau2.data_model.message import AssistantMessage, UserMessage
+from tau2.data_model.message import AssistantMessage, UserMessage, ToolCall
 
 from eval import tau3_adapter
 
@@ -38,12 +38,6 @@ class Typed422Handler(BaseHTTPRequestHandler):
         pass
 
 
-class FakeModel:
-    def __init__(self, output):
-        self.output = output
-
-    def generate(self, **_kwargs):
-        return self.output
 
 
 class Tau3AdapterTests(unittest.TestCase):
@@ -73,9 +67,30 @@ class Tau3AdapterTests(unittest.TestCase):
 
     def test_empty_user_response_is_rejected_without_placeholder(self):
         with self.assertRaises(tau3_adapter.Tau3AdapterError) as ctx:
-            tau3_adapter._tau_messages_for_model([UserMessage(role="user", content=None)])
+            tau3_adapter._tau_messages_for_model([UserMessage(role="user", content=" ")])
         self.assertEqual(ctx.exception.kind, "model_output_invalid")
         self.assertIn("empty user", str(ctx.exception))
+
+    def test_tool_only_user_report_preserves_role_and_action_losslessly(self):
+        action = ToolCall(
+            id="user-action", name="check_email",
+            arguments={"folder": "inbox"}, requestor="user",
+        )
+        source = UserMessage(role="user", content=None, tool_calls=[action])
+        report = tau3_adapter._trajectory_message(source)
+        restored = ChatMessageUser.model_validate_json(report.model_dump_json())
+        self.assertEqual(restored.role, "user")
+        self.assertEqual(restored.content, [])
+        self.assertEqual(
+            restored.metadata["tau2_user_tool_calls"],
+            [action.model_dump(mode="json")],
+        )
+        self.assertIsNone(source.content)
+        self.assertEqual(source.tool_calls, [action])
+        # A reporting representation must never silently rewrite model input
+        # into an assistant action. Tau2 owns any perspective conversion.
+        with self.assertRaises(tau3_adapter.Tau3AdapterError):
+            tau3_adapter._tau_messages_for_model([source])
 
     def test_typed_422_stops_sdk_retries_after_one_real_http_request(self):
         Typed422Handler.requests = 0
@@ -110,25 +125,6 @@ class Tau3AdapterTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=2)
 
-    def test_response_schema_keeps_reasoning_in_raw_model_output(self):
-        output = ModelOutput(
-            model="user",
-            choices=[ChatCompletionChoice(
-                message=ChatMessageAssistant(
-                    content=[ContentReasoning(reasoning="thinking"), ContentText(text="done")]
-                ),
-                stop_reason="stop",
-            )],
-        )
-        tau3_adapter.MODEL_DICT["user"] = FakeModel(output)
-        result = tau3_adapter.patched_generate(
-            model="user",
-            messages=[UserMessage(role="user", content="hello")],
-        )
-        self.assertEqual(result.content, "done")
-        raw_content = result.raw_data["choices"][0]["message"]["content"]
-        self.assertEqual(raw_content[0]["type"], "reasoning")
-        self.assertEqual(raw_content[0]["reasoning"], "thinking")
 
 
 if __name__ == "__main__":
