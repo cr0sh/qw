@@ -1,0 +1,246 @@
+{
+  "mode": "SOURCE-FIRST investigation only; zero model calls and no implementation",
+  "finding": "Confirmed interoperability information loss across native Codex -> Chat projection and Tau2 simulator role flip. Causal relationship to upstream empties remains unproven.",
+  "native_source_chain": [
+    {
+      "path": "/Users/namjh/.bun/install/global/node_modules/@oh-my-pi/pi-ai/src/providers/openai-codex-responses.ts:2292-2329,2834",
+      "fact": "Clones actual output_item.done into nativeOutputItems; real reasoning item JSON stored in thinkingSignature even when thinking summary is empty; final providerPayload stores native items."
+    },
+    {
+      "path": "/Users/namjh/.bun/install/global/node_modules/@oh-my-pi/pi-ai/src/providers/openai-chat-server.ts:421-440,477-503,609-615,707-710",
+      "fact": "Nonstream Chat flattens thinking text only into reasoning_content; signatures/providerPayload are not emitted. Empty-summary reasoning contributes no field. Streaming emits thinking deltas, discards thinking_end metadata."
+    },
+    {
+      "path": "/Users/namjh/.bun/install/global/node_modules/@oh-my-pi/pi-ai/src/providers/openai-chat-server.ts:129-136,267-309",
+      "fact": "Replayed reasoning_content becomes thinkingSignature literal reasoning_content, not the actual serialized reasoning item; assistant provenance stamped openai-completions/openai with requested model id."
+    },
+    {
+      "path": "/Users/namjh/.bun/install/global/node_modules/@oh-my-pi/pi-ai/src/providers/openai-codex-responses.ts:4353,4398-4449",
+      "fact": "Native replay prefers genuine same-model providerPayload items, otherwise block conversion. No proof native reasoning is mandatory for all tool continuations."
+    },
+    {
+      "path": "/Users/namjh/.bun/install/global/node_modules/@oh-my-pi/pi-ai/src/providers/openai-shared.ts:2005-2015,2034-2039,2058-2072",
+      "fact": "Reasoning block replay requires JSON signature containing actual type=reasoning and id; plain reasoning_content sentinel cannot satisfy parser."
+    },
+    {
+      "path": "/Users/namjh/.bun/install/global/node_modules/@oh-my-pi/pi-ai/src/providers/transform-messages.ts:518-521,683-709",
+      "fact": "Same-model provenance required to keep signed native reasoning, including empty-summary encrypted blocks; cross-API empty thinking is dropped and nonempty foreign thinking may be demoted to text."
+    }
+  ],
+  "simulator_source_chain": {
+    "summary": "Read-only source trace: native Chat response is normalized into EvalScope ContentReasoning/plain text/tool calls, then ModelOutput; frozen adapter stores only that transformed ModelOutput in Tau2 raw_data. Tau2 role-flipping and wire conversion retain visible content/tool calls selectively but discard raw_data and all provider-native metadata. No historical live artifact was inspected or assumed.",
+    "files": [
+      {
+        "path": "worktrees/tau3-banking-eval/eval/.venv/lib/python3.12/site-packages/evalscope/models/openai_compatible.py:102-160",
+        "description": "Builds OpenAI request, receives ChatCompletion, converts via chat_choices_from_completion/model_output_from_openai, and returns ModelOutput; raw response is not attached to output."
+      },
+      {
+        "path": "worktrees/tau3-banking-eval/eval/.venv/lib/python3.12/site-packages/evalscope/models/utils/openai.py:610-635",
+        "description": "Response parser reads only reasoning_content or reasoning, creates ContentReasoning plus ContentText, and parses tool calls."
+      },
+      {
+        "path": "worktrees/tau3-banking-eval/eval/.venv/lib/python3.12/site-packages/evalscope/models/utils/openai.py:638-661",
+        "description": "model_output_from_openai emits only id/model/choices/usage, including reasoning token count from usage when available."
+      },
+      {
+        "path": "worktrees/tau3-banking-eval/eval/.venv/lib/python3.12/site-packages/evalscope/api/model/model_output.py:99-151",
+        "description": "ModelOutput schema has id/model/choices/usage/time/metadata/error; no raw provider-response field."
+      },
+      {
+        "path": "worktrees/tau3-banking-eval/eval/.venv/lib/python3.12/site-packages/evalscope/api/messages/chat_message.py:10-32,88-145",
+        "description": "ChatMessage fields include content/source/metadata/internal/perf_metrics; assistant validator migrates explicit reasoning to ContentReasoning but has no native encrypted/signature field."
+      },
+      {
+        "path": "worktrees/tau3-banking-eval/eval/.venv/lib/python3.12/site-packages/evalscope/models/utils/openai.py:143-212",
+        "description": "OpenAI serializer creates assistant wire payload; reasoning_field emits top-level reasoning_content from last ContentReasoning only."
+      },
+      {
+        "path": "worktrees/tau3-banking-eval/eval/.venv/lib/python3.12/site-packages/evalscope/models/utils/openai.py:302-347",
+        "description": "reasoning_field/none omit reasoning from content; only internal is smuggled through an <internal> base64 tag."
+      },
+      {
+        "path": "worktrees/tau3-banking-eval/eval/.venv/lib/python3.12/site-packages/tau2/data_model/message.py:199-220,276-317",
+        "description": "Tau2 participant messages permit content/tool_calls/raw_data and define is_tool_call; raw_data is generic metadata, not native reasoning semantics."
+      },
+      {
+        "path": "worktrees/tau3-banking-eval/eval/.venv/lib/python3.12/site-packages/tau2/utils/llm_utils.py:160-207",
+        "description": "to_litellm_messages drops raw_data/usage/etc.; UserMessage emits role+content only (also drops user tool_calls), AssistantMessage emits role+content+tool_calls."
+      },
+      {
+        "path": "worktrees/tau3-banking-eval/eval/.venv/lib/python3.12/site-packages/tau2/user/user_simulator.py:231-273",
+        "description": "User simulator appends incoming state, flips roles for next generation, copies generated assistant content/usage/cost/raw_data into UserMessage, then converts generated tool calls to requestor=user."
+      },
+      {
+        "path": "worktrees/tau3-banking-eval/eval/.venv/lib/python3.12/site-packages/tau2/user/user_simulator_base.py:62-105",
+        "description": "flip_roles reconstructs messages with only role/content/tool_calls (or id/role/content for user ToolMessage), dropping raw_data and rejecting assistant tool-call history."
+      },
+      {
+        "path": "worktrees/tau3-banking-eval/eval/.venv/lib/python3.12/site-packages/tau2/agent/llm_agent.py:105-134",
+        "description": "Agent appends incoming message to state then calls generate with system+state messages."
+      },
+      {
+        "path": "worktrees/tau3-verified-resume/eval/tau3_adapter.py:85-153",
+        "description": "Frozen adapter extracts only plain reasoning/reasoning block from Tau2 raw_data, injects payload reasoning, rejects empty participant messages, and converts to EvalScope ChatMessages."
+      },
+      {
+        "path": "worktrees/tau3-verified-resume/eval/tau3_adapter.py:198-285",
+        "description": "patched_generate serializes wire messages, receives ModelOutput, takes message.text/tool calls, and stores completion.model_dump as Tau2 raw_data; tool-only output gets content None."
+      },
+      {
+        "path": "worktrees/tau3-verified-resume/eval/tau3_adapter.py:106-126,362-378",
+        "description": "Report trajectory projection preserves role and user tool-call metadata; assistant projection adds only plain reasoning and is not model-input conversion."
+      },
+      {
+        "path": "worktrees/tau3-verified-resume/eval/test_tau3_adapter.py:107-124",
+        "description": "Synthetic test proves only plain reasoning block round-trips to reasoning_content; this is not historical live evidence."
+      }
+    ],
+    "architecture": "ChatCompletion -> EvalScope OpenAI parser -> ChatMessageAssistant/ContentReasoning + tool calls -> ModelOutput -> frozen patched_generate -> Tau2 AssistantMessage(raw_data=ModelOutput dump) -> Tau2 user simulator state/flip_roles or agent state -> to_litellm_messages -> EvalScope dict_to_chat_message -> openai_chat_message(reasoning_field) -> next Chat wire.",
+    "report": "Exact loss/preservation chain: (1) EvalScope receives a native response in OpenAICompatibleAPI.generate (evalscope/models/openai_compatible.py:102-160). Its parser recognizes only `reasoning_content`/`reasoning` (evalscope/models/utils/openai.py:610-635), turns the value into `ContentReasoning(reasoning=..., reasoning_tokens=...)`, turns visible response into ContentText, and separately parses tool calls. `model_output_from_openai` retains id/model/typed choices/usage only (openai.py:638-661); ModelOutput has no raw provider-response slot (api/model/model_output.py:99-151). Therefore unknown native fields such as thinkingSignature, encrypted reasoning, or providerPayload are not semantically extracted. OpenAI SDK models allow extras (openai/_models.py:116-130), but the EvalScope parser ignores them; no source evidence says they reach ModelOutput.\n\n(2) Frozen adapter receives that ModelOutput. It calls `message.text` and converts EvalScope tool calls; `raw_data` is `completion.model_dump(...)` (tau3_adapter.py:257-285), so it captures the transformed ModelOutput only, not the original HTTP ChatCompletion. `_reasoning_from_tau_message` searches only raw_data choices[0].message content blocks with type=reasoning or a string message.reasoning (tau3_adapter.py:85-105). It does not search signature/thinkingSignature/encrypted/providerPayload. It injects only string `reasoning` into an EvalScope payload (tau3_adapter.py:138-153), and `dict_to_chat_message` makes ContentReasoning (chat_message.py:130-145). \n\n(3) For normal assistant output, Tau2 stores content/tool_calls/raw_data (tau2/data_model/message.py:199-220). For a tool-only response, EvalScope `ChatMessageBase.text` returns only text blocks (chat_message.py:39-58), so frozen adapter sets Tau2 content to None while retaining tool_calls and raw_data (tau3_adapter.py:270-285). The adapter's model-input conversion sets empty assistant content to `''` when tool_calls exist, preserving the action for the next request (tau3_adapter.py:138-153). \n\n(4) Tau2 simulator path: UserSimulator appends incoming message, builds `system + state.flip_roles()`, then calls generate (tau2/user/user_simulator.py:231-249). Its generated EvalScope/Tau2 assistant is wrapped into UserMessage with visible content, usage/cost, and raw_data copied (user_simulator.py:254-261); generated tool calls become requestor=user (user_simulator.py:262-273). On the next simulator request, flip_roles reconstructs UserMessage as AssistantMessage and non-tool AssistantMessage as UserMessage with only role/content/tool_calls; raw_data and reasoning metadata are dropped (user_simulator_base.py:62-105). \n\n(5) Agent path appends incoming message then invokes generate using state messages (tau2/agent/llm_agent.py:105-134). At either next Chat call, Tau2 `to_litellm_messages` keeps only role/content/tool_calls for AssistantMessage, role/content for UserMessage, and role/content/tool_call_id for ToolMessage (tau2/utils/llm_utils.py:160-207). It always drops raw_data, so frozen adapter cannot recover reasoning after this conversion unless it was re-injected before conversion; its re-injection still handles only plain reasoning text. \n\n(6) EvalScope serializer: `openai_chat_message` routes assistant messages to `_openai_assistant_message_param` (evalscope/models/utils/openai.py:143-212). In `reasoning_field` mode it drops reasoning from content and emits only the last ContentReasoning.reasoning as top-level `reasoning_content`; no signature/encrypted/provider payload is emitted. `openai_assistant_content` can preserve EvalScope `.internal` only via a base64 `<internal>` tag (openai.py:302-347), but frozen adapter never populates internal from native fields. \n\nPreserved: visible text (as Tau2 content), parsed tool-call id/name/arguments, usage, generic transformed ModelOutput dump in raw_data until flip_roles/to_litellm conversion, plain reasoning text when frozen adapter's custom extractor sees EvalScope reasoning blocks. Lost/unsupported: original provider response, native thinkingSignature/signature association (response parser does not copy it), encrypted/redacted reasoning payload, providerPayload, and any metadata after Tau2 flip_roles or to_litellm_messages. Tool-only assistant calls are preserved structurally by frozen adapter (content placeholder only on model-input conversion), but a tool-only UserMessage's user tool_calls are not emitted by Tau2's stock to_litellm converter. Source capability statements above are not claims that those fields existed in any historical live output; no historical live artifact was read."
+  },
+  "actual_artifact_facts": {
+    "live_capture": "/Users/namjh/dev/personal/qwr/worktrees/tau3-verified-resume/eval/outputs/tau3-protocol-capture-c9c7ae6790f94a3bb8f7c2258d3b1102.jsonl",
+    "preapplication_request_record_zero_based": 28,
+    "application_response_record_zero_based": 29,
+    "continuation_request_record_zero_based": 30,
+    "application_response_plain_reasoning_chars": 48,
+    "application_response_native_signature": null,
+    "application_wire_fields": [
+      "role",
+      "content",
+      "tool_calls"
+    ],
+    "continuation_contains_reasoning_content": false,
+    "observed_native_final_input_contains_reasoning_item": false,
+    "limits": "No actual native acquisition TOOLCALL response retained for current live history. Chat summary presence is not encrypted-reasoning/phase/signature proof; cannot reconstruct missing items."
+  },
+  "artifact_inventory": {
+    "summary": "Bounded absence: retained native captures in the two requested worktree output directories contain no actual native reasoning/encrypted-content item and no native toolcall response. Native SSE records are empty/text-only message responses; fidelity session-control records retain hashes and empty text events only. Chat tool calls and plain Chat reasoning are present but are explicitly non-native formats.",
+    "files": [
+      {
+        "path": "worktrees/tau3-simulator-wire/eval/outputs/provider-frames-20260906T0437Z-8a650ab1.jsonl",
+        "description": "60 retained provider.sse send/receive records. Receive groups (lines 2-12, 14-24, 27-34, 35-42, 45-52, 53-60) contain response.created/in_progress, message output_item, output_text events, and response.completed only; message items explicitly phase=final_answer. No native reasoning/encrypted-content/toolcall/signature key was found."
+      },
+      {
+        "path": "worktrees/tau3-simulator-wire/eval/outputs/provider-frames-20260906T0430Z-d1aa72f0.jsonl",
+        "description": "8-record native SSE response: response.created/in_progress, message output item with phase=final_answer, empty output_text, content completion, output item completion, response.completed (lines 1-8)."
+      },
+      {
+        "path": "worktrees/tau3-simulator-wire/eval/outputs/provider-frames-20260906T0430Z-bd727c36.jsonl",
+        "description": "Zero-byte provider frame artifact."
+      },
+      {
+        "path": "worktrees/tau3-simulator-wire/eval/outputs/native-provider-comparison.json",
+        "description": "Summary metadata: output_text_done is STOP, STOP, then four empty strings (lines 6-11); declares four native attempts and retry-exhaustion abort (lines 12-13); points to the retained capture/reference/provider-frame paths (lines 14-16)."
+      },
+      {
+        "path": "worktrees/tau3-simulator-wire/eval/outputs/simulator-wire-41b84170bfe3429aa85d87187ca7bff2.json",
+        "description": "Chat gateway artifact, not native SSE. Request history has Chat assistant tool_calls at lines 43-46 and 141-144; resulting chat.completion/evalscope response at lines 212-298 has content STOP, function_call/tool_calls null, metadata/internal null, and reasoning_tokens null."
+      },
+      {
+        "path": "worktrees/tau3-simulator-wire/eval/outputs/simulator-wire-0372a8c3ab894f67b5e0a0e2d81771f7.json",
+        "description": "Chat gateway artifact, not native SSE. Toolcall history at lines 43-46 and 145-148; output summary at lines 242-305 is empty/null Chat content with tool_calls null and reasoning_tokens null."
+      },
+      {
+        "path": "worktrees/tau3-simulator-wire/eval/outputs/simulator-wire-0a04c6bb46174952a62cb25aa2356d42.json",
+        "description": "Chat gateway artifact with the same toolcall-history shape; exact native key/type searches found no native response item."
+      },
+      {
+        "path": "worktrees/tau3-simulator-wire/eval/outputs/simulator-wire-19c0103a15cb4b929f62ee984734035f.json",
+        "description": "Chat gateway artifact with one Chat toolcall history record; no native SSE response item."
+      },
+      {
+        "path": "worktrees/tau3-simulator-wire/eval/outputs/patched-simulator-smoke-b0813ecd5b0b4254afcc4994d39a4f69.jsonl",
+        "description": "Chat request/response/retry/error capture (12 records), with empty Chat responses and simulator retry exhaustion; not native SSE."
+      },
+      {
+        "path": "worktrees/tau3-simulator-wire/eval/outputs/patched-simulator-smoke-b0813ecd5b0b4254afcc4994d39a4f69.jsonl.sent.json",
+        "description": "Pretty-printed sent Chat request history; repeated Chat tool_calls blocks at lines 39, 136, 233, 330. Not native SSE."
+      },
+      {
+        "path": "worktrees/tau3-simulator-wire/eval/outputs/patched-simulator-smoke-8a91b8902782467eb8ffe85ff6eb93e8.jsonl",
+        "description": "Second Chat request/response/retry/error capture (12 records); no native SSE fields."
+      },
+      {
+        "path": "worktrees/tau3-simulator-fidelity/eval/outputs/session-control-native-20260906T0535Z.jsonl",
+        "description": "18 hashed native/session-control records. native_request records at lines 1,4,7,10,11,14 retain SHA-256 metadata and low/auto reasoning request settings; output_text.done is empty at lines 2,5,8,12,15,17; completed records at 3,6,9,13,16,18. No native body, SSE item, toolcall, encrypted content, or actual reasoning."
+      },
+      {
+        "path": "worktrees/tau3-simulator-fidelity/eval/outputs/session-control-native-20260906T0530Z.jsonl",
+        "description": "Zero-byte native session-control artifact."
+      },
+      {
+        "path": "worktrees/tau3-simulator-fidelity/eval/outputs/session-control-native-20260906T0533Z.jsonl",
+        "description": "Zero-byte native session-control artifact."
+      },
+      {
+        "path": "worktrees/tau3-simulator-fidelity/eval/outputs/session-capture-safety-20260906T0530Z.jsonl",
+        "description": "Synthetic model=test hashed native-request safety records; output_text.done contains literal actual text and completed events (lines 1-3), not native reasoning/toolcall evidence."
+      },
+      {
+        "path": "worktrees/tau3-simulator-fidelity/eval/outputs/session-capture-safety-20260906T0533Z.jsonl",
+        "description": "Three synthetic model=test request/output/completed sequences (lines 1-9), text-only and hashed."
+      },
+      {
+        "path": "worktrees/tau3-simulator-fidelity/eval/outputs/session-capture-safety-20260906T0535Z.jsonl",
+        "description": "Four synthetic model=test request/output/completed sequences (lines 1-12), text-only and hashed."
+      },
+      {
+        "path": "worktrees/tau3-simulator-fidelity/eval/outputs/tau3-protocol-capture-368b8c3b22f149d897b46697efc66586.jsonl",
+        "description": "Chat-style event=request/response capture. Response records at lines 4 and 6 use qwen3.8-27b and content items type=reasoning plus type=text; reasoning is plain visible text, signature=null, redacted=false, reasoning_tokens=null. This is not native Codex SSE and does not establish native encrypted metadata or phase."
+      },
+      {
+        "path": "worktrees/tau3-simulator-fidelity/eval/outputs/integrated-native-718139ee86514b90ad7621798180aeae.jsonl; protocol-native-8592d838bdb94b978aa189574e479185.jsonl; protocol-native-719f36b1e7f548fa88c66b5614549d7b.jsonl; protocol-native-d47b1309ca3448f5a187d703d06bd369.jsonl; medium-native-bd27c35dd3d3484f9de14f1e4442a9e6.jsonl; medium-native-e0ec7bcabd644ad58188704a7a59e6a9.jsonl",
+        "description": "Chat-style event=request/response artifacts. Their corresponding .sent.json files retain Chat tool_calls blocks, but the JSONL response records are Chat responses (mostly empty text/retry records), not native SSE."
+      },
+      {
+        "path": "worktrees/tau3-simulator-fidelity/eval/outputs/tau3-protocol-prefix-368b8c3b22f149d897b46697efc66586",
+        "description": "Prefix-cache directory examined: entries are token_ids/namespace/route JSON metadata and blobs are binary cache data. Exact native encrypted-content, reasoning item, toolcall item, phase/signature searches produced no matches."
+      }
+    ],
+    "architecture": "Two distinct retained formats are present. Native provider boundary captures use one JSON record per SSE frame (`provider.sse.send`/`provider.sse.receive`, with response.* frame types). Chat gateway captures use event=request/response records or chat.completion JSON and store assistant `tool_calls` in conversation/request history. Fidelity session-control safety logs intentionally retain hashes and coarse event summaries rather than native bodies. The only explicit native phase observed is phase=final_answer on empty/text message output items; there is no native toolcall phase or signature evidence.",
+    "report": "Evidence and absence boundaries: (1) exact-key/type searches over the two wire provider-frame files found no `\"encrypted_content\":`, `\"reasoning_content\":`, `response.reasoning*`, signature/thought_signature, or native function/custom/computer call item/event. Their receive records are message output items and output_text events only. (2) Exact native-event searches over fidelity JSONL locate native_request records only in session-control-native-20260906T0535Z and the synthetic session-capture-safety files; the former retains hashed request metadata plus empty output_text/completed summaries, while the latter is model=test text-only safety data. The 0530/0533 session-control files are empty. (3) The fidelity protocol capture's visible `type=reasoning` content is a Chat/qwen record with null signature, not a native encrypted item; do not use it to infer native metadata, phases, or continuation signatures. (4) Chat toolcall blocks in wire simulator JSON and fidelity .sent.json are request-history/tool-call records, not native SSE responses. Therefore no exact native pre-application/toolcall reasoning or encrypted-content artifact is available in either requested worktree; the strongest retained native evidence is the empty/text-only SSE/message output and hashed session-control summaries, with `phase=final_answer` only on message items."
+  },
+  "verification": {
+    "compiled_binary": "Read only embedded installed omp openai-chat-server module: 1 thinkingSignature occurrence is sentinel reasoning_content; zero providerPayload occurrences; flatten handles thinking text only, matching installed source",
+    "actual_history_role_flip_smoke": {
+      "source": "actual saved task001 application ModelOutput",
+      "raw_data_before": true,
+      "raw_data_after": false,
+      "actual_tool_calls_preserved": true,
+      "saved_plain_reasoning_chars": 48,
+      "saved_native_signature": null
+    },
+    "prior_native_frame_verification": {
+      "file": "/Users/namjh/dev/personal/qwr/worktrees/tau3-simulator-wire/eval/outputs/provider-frames-20260906T0437Z-8a650ab1.jsonl",
+      "receive_records": 54,
+      "send_records": 6,
+      "receive_reasoning_encrypted_or_function_call_items": 0,
+      "note": "Send-side replayed function_calls exist; not response toolcall evidence"
+    }
+  },
+  "official_guidance": {
+    "url": "https://developers.openai.com/api/docs/guides/reasoning#keeping-reasoning-items-in-context",
+    "quotation": "We highly recommend you pass back any reasoning items returned with the last function call (in addition to the output of your function).",
+    "limits": "Recommendation and stateless encrypted-history guidance support the hypothesis, not a proven requirement of this Codex endpoint or proof of this failure cause."
+  },
+  "responses_endpoint_caveat": {
+    "paths": [
+      "/Users/namjh/.bun/install/global/node_modules/@oh-my-pi/pi-ai/src/providers/openai-responses-server.ts:269-277,408-417,674-686",
+      "/Users/namjh/.bun/install/global/node_modules/@oh-my-pi/pi-ai/src/providers/transform-messages.ts:518-521,683-709"
+    ],
+    "fact": "Responses parser understands actual reasoning JSON, but stamps openai-responses/openai provenance; Codex target has different provenance. Do not assume changing only public endpoint preserves encrypted items. Verify actual outgoing native input."
+  },
+  "bounded_diagnostic_proposal_NOT_AUTHORIZED": {
+    "maximum_native_dispatches": 3,
+    "automatic_retries": 0,
+    "acquisition": "One request: exact frozen PRE-application Chat wire record28, original tools/settings, same Luna LOW. Capture actual native request plus all native output items/deltas and Chat result; hash only selected account id. No prior phase/signature invention.",
+    "feasibility_gate": "Require a real complete application tool call plus actual reasoning/encrypted item(s) sufficient to form contrast; otherwise stop inconclusive with no retry, no fabricated signature and no substituted old toolcall.",
+    "tool_result": "Execute newly acquired actual tool call once in a fresh correctly restored Tau2 banking environment; use that genuine tool result for both continuations, never graft historical/diagnostic STOP.",
+    "continuation_pair": "Two single-dispatch native continuations from the SAME newly acquired response and genuine tool result: P follows the stock Chat/EvalScope/Tau2 projection; N retains the complete actual acquired native output-item metadata including reasoning/encrypted items and any actual phase. Keep pre-acquisition history, tool-call decisions/arguments, result, tools, instructions, LOW settings and account/session treatment identical.",
+    "boundary_safety": "Use proven body-only zstd interception at native dispatch boundary or verified native provider context; structurally check only the declared acquired-metadata projection differs. Do not rely on unverified /responses roundtrip. No production source change.",
+    "interpretation": "Compare actual native stream visible text OR tool calls; no STOP correctness filter. N valid/P empty supports metadata-bundle effect for this fresh acquired prefix, not isolated encrypted-item causality or reliability. Both valid, both empty, absent acquired metadata, unexpected native differences, or account mismatch are inconclusive. Wider fixed-prefix validation required before adoption.",
+    "policy": "No acquisition or continuation model calls authorized yet; no campaign changes, response grafts, agent regeneration, retry increases, or guessed phase/signature."
+  },
+  "benchmark_goal": "Retain simulator LOW and pursue97 valid banking outcomes/full report; none added by this source investigation"
+}
