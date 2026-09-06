@@ -105,6 +105,28 @@ tool-only report entries use an empty content list, never invented user text.
 This report representation is not sent to models. Opt-in capture writes the
 completed task result before report conversion.
 
+Run the durable banking launcher from a dedicated worktree using a Python
+environment with EvalScope 1.11.0 and `tau2[knowledge]` v1.0.0 installed:
+
+```bash
+python eval/run_tau3_banking.py                 # validate configuration only
+python eval/run_tau3_banking.py --limit 1 --run # one-task integration diagnostic
+python eval/run_tau3_banking.py --run           # all 97 tasks, one repeat
+```
+
+The agent is `qwen3.8-27b` at `http://127.0.0.1:8883/v1`; the simulator is
+`openai-codex/gpt-5.6-luna`, defaulting to the authenticated gateway at
+`http://127.0.0.1:18766/v1`. Keep QW and the auth services available; configure
+`TAU_SIMULATOR_API_URL` and `TAU_SIMULATOR_TOKEN_FILE` if their defaults differ
+(the token file defaults to `~/.omp/auth-gateway.token`). No server is started
+by the launcher. Optional `TAU3_DATASET_ID=/path/to/dataset` reuses an existing
+local dataset read-only; otherwise the configured dataset is downloaded into
+the new run's cache. Each invocation chooses a fresh UUID result directory
+under `eval/outputs/`. Opt in to request/response/result capture with
+`--capture /unique/path.jsonl` (or `TAU3_CAPTURE_PATH`); existing capture paths
+are rejected. Use a fresh QW process and prefix-cache directory for a fresh
+scored campaign; do not resume an invalid run as a scored baseline.
+
 Obtain statistics about storage usage and status:
 
 ```bash
