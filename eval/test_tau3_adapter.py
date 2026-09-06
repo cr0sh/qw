@@ -213,7 +213,6 @@ class Tau3AdapterTests(unittest.TestCase):
             ("user", "judge", chat_response(), 1),
             ("user", None, chat_response(), 1),
             ("user", "user_simulator_response", chat_response(finish_reason="length"), 1),
-            ("user", "user_simulator_response", chat_response("Truncated visible answer", finish_reason="length"), 1),
             ("user", "user_simulator_response", {"choices": []}, 1),
         ]
         for role, call_name, response, requests in cases:
@@ -226,6 +225,16 @@ class Tau3AdapterTests(unittest.TestCase):
                             messages=[SystemMessage(role="system", content="Act as the customer."), UserMessage(role="user", content="Continue.")],
                         )
                     self.assertEqual(len(payloads), requests)
+
+    def test_visible_truncated_agent_response_is_preserved_without_retry(self):
+        with completion_server([chat_response("Partial visible answer", finish_reason="length")]) as (model, payloads):
+            tau3_adapter.MODEL_DICT["agent"] = model
+            answer = tau3_adapter.patched_generate(
+                model="agent", call_name="agent_response",
+                messages=[UserMessage(role="user", content="Explain the card options.")],
+            )
+            self.assertEqual(answer.content, "Partial visible answer")
+            self.assertEqual(len(payloads), 1)
 
     def test_visible_response_refusal_and_tool_action_are_not_resampled(self):
         action = {"id": "action-1", "type": "function", "function": {"name": "check_email", "arguments": '{"folder":"spam"}'}}

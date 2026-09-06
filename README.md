@@ -112,8 +112,9 @@ extra times. This is a deliberate deviation from stock Tau2's handling of
 empty simulator responses. Each attempt and protocol-retry reason is captured;
 no synthetic STOP, extra simulator turn, or repeated tool execution is added.
 Visible answers, refusals, and tool actions are never resampled. Agent/judge
-calls are not eligible; truncation, completion errors, and retry exhaustion
-abort rather than becoming task reward zero. Capture separates original
+calls are not eligible. Empty truncated responses, completion errors, and retry
+exhaustion abort rather than becoming task reward zero; nonempty truncated
+responses retain stock Tau2 handling. Capture separates original
 `tau_tools` from actual EvalScope-serialized `wire_tools` and `wire_messages`.
 
 The simulator also receives a task-independent clarification that every
