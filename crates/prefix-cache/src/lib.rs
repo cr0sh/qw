@@ -133,7 +133,26 @@ impl CacheConfig {
 
 pub struct PrefixMatch<'a> {
     pub token_count: usize,
-    pub snapshot: &'a PromptSnapshot,
+    snapshot: MatchedSnapshot<'a>,
+}
+
+enum MatchedSnapshot<'a> {
+    Hot(&'a PromptSnapshot),
+    Restored(PromptSnapshot),
+}
+
+impl PrefixMatch<'_> {
+    pub fn snapshot(&self) -> &PromptSnapshot {
+        match &self.snapshot {
+            MatchedSnapshot::Hot(snapshot) => snapshot,
+            MatchedSnapshot::Restored(snapshot) => snapshot,
+        }
+    }
+}
+
+enum PersistentMatch {
+    Hot,
+    Restored(PromptSnapshot),
 }
 
 pub struct ResumeEntry {
@@ -391,53 +410,17 @@ impl AdaptivePrefixCache {
         self.evict_persistent(self.clock.now_unix_ms());
     }
 
-    pub fn checkpoint_lengths(
-        &mut self,
-        tokens: &[i32],
-        required: &[usize],
-        route: SnapshotRoute,
-    ) -> Vec<usize> {
-        self.drain_put_completions();
-        if tokens.is_empty() {
-            return Vec::new();
-        }
-        let now = self.clock.now_unix_ms();
-        self.expire(now);
-        self.trie
-            .observe(tokens, route, now, now.saturating_add(INITIAL_TTL_MS));
-        let mut lengths = required
-            .iter()
-            .copied()
-            .filter(|length| *length > 0 && *length <= tokens.len())
-            .collect::<Vec<_>>();
-        lengths.push(tokens.len());
-        let structural =
-            self.trie
-                .path(tokens, route)
-                .into_iter()
-                .rev()
-                .find_map(|(node, length)| {
-                    let terminal = self.trie.terminal(node, route)?;
-                    (length < tokens.len()
-                        && terminal.observations >= 2
-                        && terminal.snapshot.is_none()
-                        && terminal.persistent_key.is_none())
-                    .then_some(length)
-                });
-        if let Some(common) = structural {
-            lengths.push(common);
-        }
-        lengths.sort_unstable();
-        lengths.dedup();
-        lengths
-    }
-
     pub fn lookup(&mut self, prompt: &[i32], route: SnapshotRoute) -> Option<PrefixMatch<'_>> {
         self.drain_put_completions();
         let now = self.clock.now_unix_ms();
         self.expire(now);
+        if !prompt.is_empty() {
+            self.trie
+                .observe(prompt, route, now, now.saturating_add(INITIAL_TTL_MS));
+        }
         let candidates = self.trie.path(prompt, route);
         let mut hit = None;
+        let mut restored = None;
         for (node, length) in candidates.into_iter().rev() {
             let has_snapshot = self
                 .trie
@@ -452,7 +435,10 @@ impl AdaptivePrefixCache {
                 .terminal(node, route)
                 .and_then(|terminal| terminal.persistent_key.clone());
             if let Some(key) = key {
-                if self.load_persistent(node, route, &key, now) {
+                if let Some(loaded) = self.load_persistent(node, route, &key, now) {
+                    if let PersistentMatch::Restored(snapshot) = loaded {
+                        restored = Some(snapshot);
+                    }
                     hit = Some((node, length));
                     break;
                 }
@@ -490,7 +476,10 @@ impl AdaptivePrefixCache {
             route = route.as_str(),
             cached_tokens = token_count
         );
-        let snapshot = self.trie.terminal(node, route)?.snapshot.as_ref()?;
+        let snapshot = match restored {
+            Some(snapshot) => MatchedSnapshot::Restored(snapshot),
+            None => MatchedSnapshot::Hot(self.trie.terminal(node, route)?.snapshot.as_ref()?),
+        };
         Some(PrefixMatch {
             token_count,
             snapshot,
@@ -530,6 +519,7 @@ impl AdaptivePrefixCache {
         if metadata.request_fingerprint != request_fingerprint {
             return Err(ResumeLookupError::Mismatch);
         }
+        let mut restored = None;
         if self
             .trie
             .terminal(node, route)
@@ -540,9 +530,13 @@ impl AdaptivePrefixCache {
                 .terminal(node, route)
                 .and_then(|terminal| terminal.persistent_key.clone())
                 .ok_or(ResumeLookupError::NotFound)?;
-            if !self.load_persistent(node, route, &key, now) {
-                self.resumes.remove(response_id);
-                return Err(ResumeLookupError::NotFound);
+            match self.load_persistent(node, route, &key, now) {
+                Some(PersistentMatch::Hot) => {}
+                Some(PersistentMatch::Restored(snapshot)) => restored = Some(snapshot),
+                None => {
+                    self.resumes.remove(response_id);
+                    return Err(ResumeLookupError::NotFound);
+                }
             }
         }
         let terminal = self
@@ -562,7 +556,9 @@ impl AdaptivePrefixCache {
         if let Some(key) = terminal.persistent_key {
             self.queue_remove(key);
         }
-        let snapshot = terminal.snapshot.ok_or(ResumeLookupError::NotFound)?;
+        let snapshot = restored
+            .or(terminal.snapshot)
+            .ok_or(ResumeLookupError::NotFound)?;
         self.rebuild_accounting();
         tracing::debug!(phase = "cache.resume", response_id, route = route.as_str());
         Ok(ResumeEntry {
@@ -638,7 +634,17 @@ impl AdaptivePrefixCache {
             }
             self.rebuild_accounting();
             let bytes = snapshot.nbytes() as u64;
-            let summary = snapshot.storage_summary();
+            let mut summary = snapshot.storage_summary();
+            summary
+                .pages
+                .sort_unstable_by_key(|(identity, _)| *identity);
+            summary.pages.dedup_by_key(|(identity, _)| *identity);
+            let hot_bytes = summary.local_bytes as u64
+                + summary
+                    .pages
+                    .iter()
+                    .map(|(_, page_bytes)| *page_bytes as u64)
+                    .sum::<u64>();
             inserted_logical_bytes = inserted_logical_bytes.saturating_add(bytes);
             inserted_unique_page_bytes = inserted_unique_page_bytes.saturating_add(
                 summary
@@ -730,6 +736,16 @@ impl AdaptivePrefixCache {
                 terminal.blob_refs.clear();
                 terminal.serialized_bytes = 0;
             }
+            // A snapshot that cannot fit alone must not evict viable hot prefixes.
+            // Its portable data still follows the normal asynchronous persistence path.
+            if hot_bytes > self.memory_cap
+                && let Some(terminal) = self.trie.terminal_mut(node, route)
+                && terminal.response_resume.is_none()
+            {
+                terminal.snapshot = None;
+                terminal.page_refs.clear();
+                terminal.local_bytes = 0;
+            }
             tracing::debug!(
                 phase = "cache.insert",
                 route = route.as_str(),
@@ -758,7 +774,7 @@ impl AdaptivePrefixCache {
             .values()
             .map(|(_, bytes)| *bytes)
             .sum();
-        self.evict_memory();
+        self.evict_memory(None);
         self.evict_persistent(now);
         tracing::debug!(
             phase = "cache.insert.summary",
@@ -801,9 +817,9 @@ impl AdaptivePrefixCache {
         route: SnapshotRoute,
         key: &EntryKey,
         now: u64,
-    ) -> bool {
+    ) -> Option<PersistentMatch> {
         let Some(io) = &self.io else {
-            return false;
+            return None;
         };
         let (reply_tx, reply_rx) = mpsc::channel();
         if io
@@ -814,7 +830,7 @@ impl AdaptivePrefixCache {
             })
             .is_err()
         {
-            return false;
+            return None;
         }
         let loaded = match reply_rx.recv() {
             Ok(Ok(Some(loaded))) => loaded,
@@ -825,7 +841,7 @@ impl AdaptivePrefixCache {
                     terminal.serialized_bytes = 0;
                 }
                 self.rebuild_accounting();
-                return false;
+                return None;
             }
             Ok(Err(error)) => {
                 tracing::warn!(phase = "cache.persistence_error", error = %error);
@@ -836,9 +852,9 @@ impl AdaptivePrefixCache {
                 }
                 self.rebuild_accounting();
                 self.remove_persistent_sync(key);
-                return false;
+                return None;
             }
-            Err(_) => return false,
+            Err(_) => return None,
         };
         let namespace = self.namespaces.get(route);
         match decode(namespace, &loaded.manifest, loaded.blobs) {
@@ -852,6 +868,18 @@ impl AdaptivePrefixCache {
                     ) == *key =>
             {
                 let bytes = decoded.snapshot.nbytes() as u64;
+                if bytes > self.memory_cap {
+                    // A disk hit need not fit in the hot tier. Keep this snapshot owned
+                    // by the active request rather than promoting and evicting it before use.
+                    tracing::debug!(
+                        phase = "cache.restore",
+                        tier = "filesystem",
+                        snapshot_bytes = bytes,
+                        hot_capacity_bytes = self.memory_cap,
+                        route = route.as_str(),
+                    );
+                    return Some(PersistentMatch::Restored(decoded.snapshot));
+                }
                 let terminal = self
                     .trie
                     .terminal_mut(node, route)
@@ -862,7 +890,9 @@ impl AdaptivePrefixCache {
                 terminal.local_bytes = summary.local_bytes;
                 terminal.response_resume = decoded.manifest.response_resume;
                 self.memory_bytes = self.memory_bytes.saturating_add(bytes);
-                self.evict_memory();
+                if let Some(snapshot) = self.evict_memory(Some((node, route))) {
+                    return Some(PersistentMatch::Restored(snapshot));
+                }
                 tracing::debug!(
                     phase = "cache.promote",
                     from = "filesystem",
@@ -872,6 +902,7 @@ impl AdaptivePrefixCache {
                 self.trie
                     .terminal(node, route)
                     .is_some_and(|terminal| terminal.snapshot.is_some())
+                    .then_some(PersistentMatch::Hot)
             }
             Ok(_) | Err(_) => {
                 tracing::warn!(
@@ -885,7 +916,7 @@ impl AdaptivePrefixCache {
                 }
                 self.rebuild_accounting();
                 self.remove_persistent_sync(key);
-                false
+                None
             }
         }
     }
@@ -918,7 +949,11 @@ impl AdaptivePrefixCache {
         self.rebuild_accounting();
     }
 
-    fn evict_memory(&mut self) {
+    fn evict_memory(
+        &mut self,
+        retain_for_request: Option<(usize, SnapshotRoute)>,
+    ) -> Option<PromptSnapshot> {
+        let mut retained = None;
         while self.memory_bytes > self.memory_cap {
             let victim = self
                 .trie
@@ -938,7 +973,10 @@ impl AdaptivePrefixCache {
             };
             let before = self.memory_bytes;
             let terminal = self.trie.terminal_mut(node, route).unwrap();
-            terminal.snapshot.take().unwrap();
+            let snapshot = terminal.snapshot.take().unwrap();
+            if retain_for_request == Some((node, route)) {
+                retained = Some(snapshot);
+            }
             terminal.page_refs.clear();
             terminal.local_bytes = 0;
             self.rebuild_accounting();
@@ -951,6 +989,7 @@ impl AdaptivePrefixCache {
             );
         }
         self.rebuild_accounting();
+        retained
     }
 
     fn evict_persistent(&mut self, _now: u64) {

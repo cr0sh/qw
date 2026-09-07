@@ -29,6 +29,8 @@ pub struct ResponseResumeMetadata {
     pub emitted_reasoning_text: String,
     pub emitted_content_text: String,
     pub original_max_tokens: usize,
+    /// An unused RNG branch reserved when this response was interrupted.
+    pub continuation_seed: u64,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

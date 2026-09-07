@@ -1820,6 +1820,7 @@ fn prefill_for_input(
     model: &Qwen35Model,
     drafter: &Qwen35MtpDraftModel,
     prefill_input: MtpPrefill<'_>,
+    finish: bool,
 ) -> Result<crate::qwen3_5::Qwen35MtpPrefill, String> {
     drafter.reset();
     let prompt = prompt_for_prefill(prefill_input);
@@ -1877,6 +1878,9 @@ fn prefill_for_input(
             false,
         );
     }
+    if finish {
+        model.finish_initial_prefill();
+    }
     drafter.materialize_state();
     model.materialize_mtp_cache_state();
     Ok(prefill)
@@ -1901,7 +1905,7 @@ fn prefill_text_with_reuse(
             prompt_tokens,
             &[1, i32::try_from(prompt_tokens.len()).unwrap_or(i32::MAX)],
         );
-        return prefill_for_input(model, drafter, MtpPrefill::Text { prompt: &prompt })
+        return prefill_for_input(model, drafter, MtpPrefill::Text { prompt: &prompt }, false)
             .map(|prefill| (prefill, 0));
     };
     if reuse.cached_tokens == 0 || reuse.cached_tokens > prompt_tokens.len() {
@@ -2057,13 +2061,21 @@ fn prefill_text_with_checkpoints(
         if let Some(previous) = latest_checkpoint.take() {
             snapshots.push(previous);
         }
+        if token_len == prompt_tokens.len() {
+            model.finish_initial_prefill();
+        }
         let requested = checkpoint_token_lengths.binary_search(&token_len).is_ok();
         if requested {
-            let snapshot =
-                capture_mtp_prompt_snapshot(model, drafter, token_len, &prefill, snapshots.last())
-                    .ok_or_else(|| {
-                        format!("failed to capture MTP checkpoint at {token_len} tokens")
-                    })?;
+            let snapshot = capture_mtp_prompt_snapshot(
+                model,
+                drafter,
+                token_len,
+                &prefill,
+                snapshots
+                    .last()
+                    .or_else(|| reuse.map(|value| value.snapshot)),
+            )
+            .ok_or_else(|| format!("failed to capture MTP checkpoint at {token_len} tokens"))?;
             if token_len == prompt_tokens.len() {
                 snapshots.push(snapshot);
             } else {
@@ -2128,7 +2140,7 @@ fn rebuild_mtp_state(
     let first_token = *output
         .first()
         .ok_or_else(|| "cannot rebuild MTP state for an empty output".to_string())?;
-    let prefill = prefill_for_input(model, drafter, prefill_input)?;
+    let prefill = prefill_for_input(model, drafter, prefill_input, true)?;
     let mut next_hidden =
         finish_drafter_prefill(model, drafter, prefill_input, prefill, first_token);
 
@@ -2209,8 +2221,14 @@ fn capture_mtp_snapshot_from_verify(
         &[logits_shape[0], aligned + 1, logits_shape[2]],
     );
     model.materialize_mtp_cache_state();
+    // The predecessor is a committed prompt checkpoint, never a provisional
+    // verification snapshot whose complete pages may contain rejected tokens.
     let target = model
-        .snapshot_sequence_state(mlxcel_core::cache::SequenceId::from_raw(0), token_len, None)
+        .snapshot_sequence_state(
+            mlxcel_core::cache::SequenceId::from_raw(0),
+            token_len,
+            previous.map(MtpPromptSnapshot::target_snapshot),
+        )
         .ok_or_else(|| "failed to capture aligned MTP target state".to_string())?;
     drafter
         .capture_prompt_snapshot(
@@ -2265,8 +2283,9 @@ fn capture_mtp_final_snapshot(
     // here delays the terminal response after streamed output has finished.
     let prefill = match prefix_reuse {
         Some(reuse) => prefill_text_with_reuse(model, drafter, prompt_tokens, Some(reuse))?.0,
-        None => prefill_for_input(model, drafter, prefill_input)?,
+        None => prefill_for_input(model, drafter, prefill_input, false)?,
     };
+    model.finish_initial_prefill();
     if generated.len() == 1 {
         let snapshot = capture_mtp_prompt_snapshot(
             model,
@@ -2322,7 +2341,11 @@ fn capture_mtp_final_snapshot(
     );
     let token_len = prompt_tokens.len() + generated.len() - 1;
     let target = model
-        .snapshot_sequence_state(mlxcel_core::cache::SequenceId::from_raw(0), token_len, None)
+        .snapshot_sequence_state(
+            mlxcel_core::cache::SequenceId::from_raw(0),
+            token_len,
+            prefix_reuse.map(|reuse| reuse.snapshot.target_snapshot()),
+        )
         .ok_or_else(|| "failed to capture aligned MTP target state".to_string())?;
     let snapshot = drafter
         .capture_prompt_snapshot(
@@ -2477,6 +2500,9 @@ impl Qwen35MtpGenerator {
         let continuation_token = final_prefix_reuse.and_then(|reuse| reuse.continuation_token);
         let mut sampling = sampling.clone();
         sampling
+            .prompt_token_count
+            .get_or_insert(prompt_tokens.len());
+        sampling
             .token_bias
             .suppress_tokens(&model.output_suppressed_token_ids());
         seed_rng_if_needed(&sampling);
@@ -2509,7 +2535,7 @@ impl Qwen35MtpGenerator {
                 prefix_reuse,
                 checkpoint_token_lengths,
             ),
-            MtpPrefill::Multimodal { .. } => prefill_for_input(model, drafter, prefill_input)
+            MtpPrefill::Multimodal { .. } => prefill_for_input(model, drafter, prefill_input, true)
                 .map(|prefill| (prefill, 0, Vec::new())),
         }
         .expect("MTP prefill requires valid synchronized chunks");
@@ -2776,6 +2802,9 @@ impl Qwen35MtpGenerator {
             .expect("Qwen35MtpGenerator requires a bundled MTP head");
         let mut sampling = sampling.clone();
         sampling
+            .prompt_token_count
+            .get_or_insert(prompt_tokens.len());
+        sampling
             .token_bias
             .suppress_tokens(&model.output_suppressed_token_ids());
         seed_rng_if_needed(&sampling);
@@ -2811,12 +2840,12 @@ impl Qwen35MtpGenerator {
                         checkpoint_token_lengths,
                     ),
                     MtpPrefill::Multimodal { .. } => {
-                        prefill_for_input(model, drafter, prefill_input)
+                        prefill_for_input(model, drafter, prefill_input, true)
                             .map(|prefill| (prefill, 0, Vec::new()))
                     }
                 }
             } else {
-                prefill_for_input(model, drafter, prefill_input)
+                prefill_for_input(model, drafter, prefill_input, true)
                     .map(|prefill| (prefill, 0, Vec::new()))
             }?;
             cached_tokens = cached_tokens.max(reused);
@@ -3037,7 +3066,7 @@ impl Qwen35MtpGenerator {
             if walk.rebuild {
                 if !terminal || capture_final_snapshot {
                     if generated.is_empty() {
-                        let _ = prefill_for_input(model, drafter, prefill_input)?;
+                        let _ = prefill_for_input(model, drafter, prefill_input, true)?;
                     } else {
                         state = rebuild_mtp_state(model, drafter, prefill_input, &generated)?;
                     }
@@ -3087,7 +3116,7 @@ impl Qwen35MtpGenerator {
                 break;
             }
             if generated.is_empty() {
-                let prefill = prefill_for_input(model, drafter, prefill_input)?;
+                let prefill = prefill_for_input(model, drafter, prefill_input, true)?;
                 let initial = commit_constraint_transaction(constraint, |active| {
                     constrained_initial_step(
                         &prefill.first_logits,
@@ -3159,6 +3188,154 @@ mod tests {
             draft_offset: i32::try_from(token_len.saturating_sub(1)).unwrap(),
             last_hidden: materialize_detached(hidden),
             continuation_logits: materialize_detached(logits),
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the real Qwen3.5 MTP checkpoint at QW_MODEL_PATH or the default model cache path"]
+    fn restored_prefill_finalizes_precision_only_at_full_prompt_boundary() {
+        let model_dir = crate::resolve_model_path(None).expect("real model checkpoint");
+        let tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
+            .expect("checkpoint tokenizer");
+        let seed = tokenizer
+            .encode(
+                "A prefix cache must preserve model state across restored prompt boundaries.",
+                false,
+            )
+            .expect("regression context");
+        let tokens = seed
+            .get_ids()
+            .iter()
+            .copied()
+            .map(|token| token as i32)
+            .cycle()
+            .take(2_050)
+            .collect::<Vec<_>>();
+        let model = Qwen35Model::load(&model_dir, mlxcel_core::cache::KVCacheMode::Turbo4)
+            .expect("load target with configured Turbo4");
+        let drafter = model.mtp().expect("checkpoint MTP weights");
+        let input = mlxcel_core::from_slice_i32(&tokens, &[1, tokens.len() as i32]);
+        let reference_prefill =
+            prefill_for_input(&model, drafter, MtpPrefill::Text { prompt: &input }, true).unwrap();
+        let reference =
+            capture_mtp_prompt_snapshot(&model, drafter, tokens.len(), &reference_prefill, None)
+                .unwrap();
+        let paged_bytes =
+            |snapshot: &ModelStateSnapshot| ModelStateSnapshot::unique_paged_nbytes([snapshot]);
+        let expected_full_bytes = paged_bytes(&reference.target);
+        let (_, _, checkpoints) =
+            prefill_text_with_checkpoints(&model, drafter, &tokens, None, &[3, 2_049, 2_050])
+                .unwrap();
+        let full = checkpoints.last().unwrap();
+        assert_eq!(
+            paged_bytes(&full.target),
+            expected_full_bytes,
+            "a restored short prefix must finalize precision at the full prompt",
+        );
+        let structural = &checkpoints[1];
+        assert!(
+            paged_bytes(&structural.target) > paged_bytes(&full.target),
+            "the structural checkpoint must remain in initial-prefill precision",
+        );
+
+        let exact_tokens = &tokens[..structural.token_len()];
+        let (_, _, exact) = prefill_text_with_checkpoints(
+            &model,
+            drafter,
+            exact_tokens,
+            Some(MtpPrefixReuse {
+                snapshot: structural,
+                cached_tokens: structural.token_len(),
+                continuation_token: None,
+            }),
+            &[structural.token_len()],
+        )
+        .unwrap();
+        let exact_input =
+            mlxcel_core::from_slice_i32(exact_tokens, &[1, exact_tokens.len() as i32]);
+        let exact_reference_prefill = prefill_for_input(
+            &model,
+            drafter,
+            MtpPrefill::Text {
+                prompt: &exact_input,
+            },
+            true,
+        )
+        .unwrap();
+        let exact_reference = capture_mtp_prompt_snapshot(
+            &model,
+            drafter,
+            exact_tokens.len(),
+            &exact_reference_prefill,
+            None,
+        )
+        .unwrap();
+        let expected_exact_bytes = paged_bytes(&exact_reference.target);
+        assert_eq!(
+            paged_bytes(&exact.last().unwrap().target),
+            expected_exact_bytes,
+            "an exact cached prompt must finalize even without a suffix forward",
+        );
+
+        for (prefix, prompt, with_optional_embeddings, expected_bytes) in [
+            (
+                &checkpoints[0],
+                tokens.as_slice(),
+                false,
+                expected_full_bytes,
+            ),
+            (structural, exact_tokens, false, expected_exact_bytes),
+            (structural, exact_tokens, true, expected_exact_bytes),
+        ] {
+            let portable = crate::portable_snapshot::portable_model_state(&prefix.target);
+            let mut source =
+                crate::portable_snapshot::model_from_portable(portable, false, false).unwrap();
+            source.set_continuation_logits(&prefix.continuation_logits);
+            let reuse = Some(mlxcel_core::generate::PrefixReuse {
+                snapshot: &source,
+                cached_tokens: prefix.token_len(),
+            });
+            let mut generator = mlxcel_core::generate::CxxGenerator::new(model.num_layers());
+            if with_optional_embeddings {
+                generator
+                    .generate_streaming_controlled_with_embeddings(
+                        &model,
+                        prompt,
+                        None,
+                        None,
+                        reuse,
+                        1,
+                        &SamplingConfig::greedy(),
+                        None,
+                        |_| true,
+                    )
+                    .unwrap();
+            } else {
+                generator
+                    .generate_streaming_controlled(
+                        &model,
+                        prompt,
+                        reuse,
+                        1,
+                        &SamplingConfig::greedy(),
+                        None,
+                        &[prompt.len()],
+                        |_| true,
+                    )
+                    .unwrap();
+            }
+            let completed = model
+                .snapshot_sequence_state(
+                    mlxcel_core::cache::SequenceId::from_raw(0),
+                    prompt.len(),
+                    None,
+                )
+                .unwrap();
+            assert_eq!(
+                paged_bytes(&completed),
+                expected_bytes,
+                "controlled baseline must finish precision before decode and snapshot",
+            );
         }
     }
 

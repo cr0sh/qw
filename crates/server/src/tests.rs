@@ -1329,6 +1329,83 @@ fn chat_protocol_accepts_nested_reasoning_effort_with_top_level_precedence() {
 }
 
 #[test]
+fn sampling_overrides_are_preserved_and_distinguish_request_identity() {
+    for responses in [false, true] {
+        let request = if responses {
+            json!({"model": "test", "input": "hello"})
+        } else {
+            chat_request("hello")
+        };
+        let parse = |value| {
+            if responses {
+                protocol::parse_responses(value)
+            } else {
+                protocol::parse_chat(value)
+            }
+        };
+        let automatic = parse(request.clone()).expect("automatic request");
+        for (field, value) in [
+            ("temperature", json!(0.0)),
+            ("top_k", json!(1)),
+            ("top_p", json!(1.0)),
+            ("min_p", json!(0.2)),
+            ("presence_penalty", json!(0.0)),
+            ("repetition_penalty", json!(1.2)),
+            ("frequency_penalty", json!(0.3)),
+        ] {
+            let mut explicit = request.clone();
+            explicit[field] = value;
+            let parsed = parse(explicit).expect("sampling override");
+            assert_ne!(
+                protocol::request_fingerprint(&automatic),
+                protocol::request_fingerprint(&parsed)
+            );
+            match field {
+                "temperature" => assert_eq!(parsed.temperature, Some(0.0)),
+                "top_k" => assert_eq!(parsed.top_k, Some(1)),
+                "top_p" => assert_eq!(parsed.top_p, Some(1.0)),
+                "min_p" => assert_eq!(parsed.min_p, Some(0.2)),
+                "presence_penalty" => assert_eq!(parsed.presence_penalty, Some(0.0)),
+                "repetition_penalty" => assert_eq!(parsed.repetition_penalty, Some(1.2)),
+                "frequency_penalty" => assert_eq!(parsed.frequency_penalty, Some(0.3)),
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+
+#[test]
+fn responses_reasoning_and_enabledness_have_independent_precedence() {
+    let mut request = json!({
+        "model": "test", "input": "hello",
+        "reasoning": {"effort": "medium"},
+        "chat_template_kwargs": {"reasoning_effort": "low", "enable_thinking": true}
+    });
+    let thinking = protocol::parse_responses(request.clone()).unwrap();
+    assert_eq!(
+        thinking.reasoning_effort,
+        Some(protocol::ReasoningEffort::Medium)
+    );
+    assert!(thinking.enable_thinking);
+    request["enable_thinking"] = json!(false);
+    let direct = protocol::parse_responses(request.clone()).unwrap();
+    assert_eq!(
+        direct.reasoning_effort,
+        Some(protocol::ReasoningEffort::Medium)
+    );
+    assert!(!direct.enable_thinking);
+    request["reasoning_effort"] = json!("xhigh");
+    let overridden = protocol::parse_responses(request.clone()).unwrap();
+    assert_eq!(
+        overridden.reasoning_effort,
+        Some(protocol::ReasoningEffort::XHigh)
+    );
+    assert!(!overridden.enable_thinking);
+    request["reasoning"] = json!({"effort": "unsupported"});
+    assert!(protocol::parse_responses(request).is_err());
+}
+
+#[test]
 fn chat_protocol_accepts_qwen_thinking_extensions() {
     let mut request = chat_request("hello");
     request["preserve_thinking"] = json!(true);

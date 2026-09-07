@@ -115,7 +115,43 @@ mod tests {
     }
 
     #[test]
-    fn seed_rng_if_needed_accepts_absent_seed() {
-        seed_rng_if_needed(&SamplingConfig::default());
+    fn resumed_rng_is_conditionally_independent_after_an_intervening_seeded_request() {
+        let logits = crate::zeros(&[1, 2], dtype::FLOAT32);
+        let draw = || {
+            let token = crate::fused_sample(&logits, 1.0, 0, 1.0, 0.0);
+            u32::from_ne_bytes(crate::array_to_raw_bytes(&token).try_into().unwrap()) as usize
+        };
+        let mut pairs = [[0usize; 2]; 2];
+        for seed in 0..1024 {
+            let sampling = SamplingConfig {
+                seed: Some(seed),
+                ..Default::default()
+            };
+            seed_rng_if_needed(&sampling);
+            let first = draw();
+            let continuation_seed = crate::random_fork_seed();
+
+            // Another new request may reset the thread-local RNG, even to our seed.
+            seed_rng_if_needed(&sampling);
+            assert_eq!(draw(), first, "a new request must still honor its seed");
+            let _ = draw();
+            seed_rng_if_needed(&SamplingConfig {
+                seed: Some(continuation_seed),
+                ..Default::default()
+            });
+            pairs[first][draw()] += 1;
+        }
+        for row in pairs {
+            let total = row.iter().sum::<usize>();
+            assert!(
+                total > 400,
+                "first-token marginal is not uniform: {pairs:?}"
+            );
+            let conditional = row[1] as f64 / total as f64;
+            assert!(
+                (conditional - 0.5).abs() < 0.09,
+                "resumed token depends on the already emitted token: {pairs:?}"
+            );
+        }
     }
 }

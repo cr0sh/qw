@@ -74,6 +74,11 @@ pub struct CompletionRequest {
     pub max_tokens: usize,
     pub temperature: Option<f32>,
     pub top_p: Option<f32>,
+    pub top_k: Option<i32>,
+    pub min_p: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    pub repetition_penalty: Option<f32>,
+    pub frequency_penalty: Option<f32>,
     pub seed: Option<u64>,
     pub output_format: OutputFormat,
     pub image_params: Vec<String>,
@@ -119,6 +124,11 @@ pub(crate) fn request_fingerprint(request: &CompletionRequest) -> String {
         "max_tokens": request.max_tokens,
         "temperature": request.temperature,
         "top_p": request.top_p,
+        "top_k": request.top_k,
+        "min_p": request.min_p,
+        "presence_penalty": request.presence_penalty,
+        "repetition_penalty": request.repetition_penalty,
+        "frequency_penalty": request.frequency_penalty,
         "seed": request.seed,
         "output_format": output_format,
     });
@@ -206,6 +216,9 @@ struct ChatWire {
     _mcp_timeout: Option<Value>,
     temperature: Option<f32>,
     top_p: Option<f32>,
+    top_k: Option<i32>,
+    min_p: Option<f32>,
+    repetition_penalty: Option<f32>,
     seed: Option<u64>,
     response_format: Option<ChatFormat>,
     #[serde(rename = "n")]
@@ -219,8 +232,7 @@ struct ChatWire {
     function_call: Option<Value>,
     #[serde(rename = "audio")]
     _audio: Option<Value>,
-    #[serde(rename = "frequency_penalty")]
-    _frequency_penalty: Option<f32>,
+    frequency_penalty: Option<f32>,
     #[serde(rename = "logit_bias")]
     _logit_bias: Option<Map<String, Value>>,
     #[serde(rename = "logprobs")]
@@ -235,8 +247,7 @@ struct ChatWire {
     _moderation: Option<Value>,
     #[serde(rename = "prediction")]
     _prediction: Option<Value>,
-    #[serde(rename = "presence_penalty")]
-    _presence_penalty: Option<f32>,
+    presence_penalty: Option<f32>,
     #[serde(rename = "prompt_cache_key")]
     _prompt_cache_key: Option<String>,
     #[serde(rename = "prompt_cache_options")]
@@ -315,10 +326,57 @@ struct ResponsesWire {
     max_output_tokens: Option<usize>,
     temperature: Option<f32>,
     top_p: Option<f32>,
+    top_k: Option<i32>,
+    min_p: Option<f32>,
+    presence_penalty: Option<f32>,
+    repetition_penalty: Option<f32>,
+    frequency_penalty: Option<f32>,
+    seed: Option<u64>,
+    enable_thinking: Option<bool>,
+    reasoning: Option<ResponsesReasoning>,
+    reasoning_effort: Option<String>,
+    chat_template_kwargs: Option<Map<String, Value>>,
     text: Option<ResponsesText>,
     tools: Option<Vec<Value>>,
     tool_choice: Option<Value>,
     parallel_tool_calls: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResponsesReasoning {
+    effort: Option<String>,
+}
+
+fn template_thinking_options(
+    kwargs: Option<&Map<String, Value>>,
+) -> Result<(Option<ReasoningEffort>, Option<bool>), RequestError> {
+    let effort = kwargs
+        .and_then(|kwargs| kwargs.get("reasoning_effort"))
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            let value = value.as_str().ok_or_else(|| {
+                RequestError::at(
+                    "chat_template_kwargs.reasoning_effort must be a string or null",
+                    "chat_template_kwargs.reasoning_effort",
+                )
+            })?;
+            parse_reasoning_effort(Some(value), "chat_template_kwargs.reasoning_effort")
+        })
+        .transpose()?
+        .flatten();
+    let enabled = kwargs
+        .and_then(|kwargs| kwargs.get("enable_thinking"))
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                RequestError::at(
+                    "chat_template_kwargs.enable_thinking must be a boolean",
+                    "chat_template_kwargs.enable_thinking",
+                )
+            })
+        })
+        .transpose()?;
+    Ok((effort, enabled))
 }
 
 #[derive(Deserialize)]
@@ -393,39 +451,9 @@ pub fn parse_chat(value: Value) -> Result<CompletionRequest, RequestError> {
     validate_sampling(max_tokens, wire.temperature, wire.top_p)?;
     let reasoning_effort =
         parse_reasoning_effort(wire.reasoning_effort.as_deref(), "reasoning_effort")?;
-    let template_reasoning_effort = wire
-        .chat_template_kwargs
-        .as_ref()
-        .and_then(|kwargs| kwargs.get("reasoning_effort"))
-        .map(|value| {
-            if value.is_null() {
-                Ok(None)
-            } else {
-                let value = value.as_str().ok_or_else(|| {
-                    RequestError::at(
-                        "chat_template_kwargs.reasoning_effort must be a string or null",
-                        "chat_template_kwargs.reasoning_effort",
-                    )
-                })?;
-                parse_reasoning_effort(Some(value), "chat_template_kwargs.reasoning_effort")
-            }
-        })
-        .transpose()?
-        .flatten();
+    let (template_reasoning_effort, template_enable_thinking) =
+        template_thinking_options(wire.chat_template_kwargs.as_ref())?;
     let reasoning_effort = reasoning_effort.or(template_reasoning_effort);
-    let template_enable_thinking = wire
-        .chat_template_kwargs
-        .as_ref()
-        .and_then(|kwargs| kwargs.get("enable_thinking"))
-        .map(|value| {
-            value.as_bool().ok_or_else(|| {
-                RequestError::at(
-                    "chat_template_kwargs.enable_thinking must be a boolean",
-                    "chat_template_kwargs.enable_thinking",
-                )
-            })
-        })
-        .transpose()?;
     let opencode_enable_thinking = wire
         .thinking
         .map(|thinking| matches!(thinking, ChatThinking::Enabled { .. }));
@@ -463,6 +491,11 @@ pub fn parse_chat(value: Value) -> Result<CompletionRequest, RequestError> {
         max_tokens,
         temperature: wire.temperature,
         top_p: wire.top_p,
+        top_k: wire.top_k,
+        min_p: wire.min_p,
+        presence_penalty: wire.presence_penalty,
+        repetition_penalty: wire.repetition_penalty,
+        frequency_penalty: wire.frequency_penalty,
         seed: wire.seed,
         output_format,
         image_params,
@@ -483,6 +516,21 @@ pub fn parse_responses(value: Value) -> Result<CompletionRequest, RequestError> 
         .map_err(|error| RequestError::new(format!("invalid Responses request: {error}"), None))?;
     let max_tokens = wire.max_output_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
     validate_sampling(max_tokens, wire.temperature, wire.top_p)?;
+    let (template_reasoning_effort, template_enable_thinking) =
+        template_thinking_options(wire.chat_template_kwargs.as_ref())?;
+    let reasoning_effort =
+        parse_reasoning_effort(wire.reasoning_effort.as_deref(), "reasoning_effort")?
+            .or(parse_reasoning_effort(
+                wire.reasoning
+                    .as_ref()
+                    .and_then(|reasoning| reasoning.effort.as_deref()),
+                "reasoning.effort",
+            )?)
+            .or(template_reasoning_effort);
+    let enable_thinking = wire
+        .enable_thinking
+        .or(template_enable_thinking)
+        .unwrap_or(true);
     let output_format = parse_responses_format(wire.text.and_then(|text| text.format))?;
     let tools = parse_tools(
         wire.tools.as_deref().unwrap_or_default(),
@@ -519,15 +567,20 @@ pub fn parse_responses(value: Value) -> Result<CompletionRequest, RequestError> 
         messages,
         tools,
         tool_choice,
-        reasoning_effort: None,
-        enable_thinking: true,
+        reasoning_effort,
+        enable_thinking,
         parallel_tool_calls: wire.parallel_tool_calls.unwrap_or(true),
         stream: wire.stream,
         stream_include_usage: false,
         max_tokens,
         temperature: wire.temperature,
         top_p: wire.top_p,
-        seed: None,
+        top_k: wire.top_k,
+        min_p: wire.min_p,
+        presence_penalty: wire.presence_penalty,
+        repetition_penalty: wire.repetition_penalty,
+        frequency_penalty: wire.frequency_penalty,
+        seed: wire.seed,
         output_format,
         image_params,
         decoded_images: Vec::new(),

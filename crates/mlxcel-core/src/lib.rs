@@ -17,9 +17,19 @@
 //! This crate provides direct bindings to MLX C++ API, bypassing the mlx-c wrapper
 //! for improved performance.
 
+// Copy in Rust so byte exports use one allocation and a bulk copy, rather than
+// crossing the CXX Vec ABI several times for every byte.
+fn copy_bytes_to_vec(bytes: &[u8]) -> Vec<u8> {
+    bytes.to_vec()
+}
+
 #[allow(clippy::missing_safety_doc, clippy::too_many_arguments)]
 #[cxx::bridge(namespace = "mlx_cxx")]
 mod ffi {
+    extern "Rust" {
+        fn copy_bytes_to_vec(bytes: &[u8]) -> Vec<u8>;
+    }
+
     // Opaque types - these are defined in C++ and we just hold pointers to them
     unsafe extern "C++" {
         include!("mlx_cxx_bridge.h");
@@ -536,6 +546,9 @@ mod ffi {
 
         /// Seed the global MLX random number generator
         fn random_seed(seed: u64);
+
+        /// Reserve an unused RNG branch for continuation after other requests or restart.
+        fn random_fork_seed() -> u64;
 
         /// Random categorical sampling
         fn random_categorical(logits: &MlxArray, axis: i32) -> UniquePtr<MlxArray>;
@@ -3276,11 +3289,11 @@ pub mod layers;
 pub mod cache;
 
 // Pure-Rust wrappers around frequently used FFI entry points.
-mod ops;
 pub mod ggml;
+mod ops;
 pub use ggml::{
-    GgmlDispatchStats, GgmlKernelPath, GgmlQType, GgmlQuantError,
-    GgmlQuantizedEmbedding, GgmlQuantizedMatrix,
+    GgmlDispatchStats, GgmlKernelPath, GgmlQType, GgmlQuantError, GgmlQuantizedEmbedding,
+    GgmlQuantizedMatrix,
 };
 
 // Common utility functions

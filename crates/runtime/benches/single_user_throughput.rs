@@ -396,7 +396,15 @@ fn main() {
         .then(|| prepare_decode_fixture(&mut provider));
 
     if let Some(prompt_ids) = fresh_prefill_prompt_ids {
-        let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
+        let sampling = provider.baseline_sampling(
+            true,
+            qw_runtime::SamplingOptions {
+                temperature: Some(0.0),
+                top_p: Some(1.0),
+                seed: Some(0),
+                ..Default::default()
+            },
+        );
         let warmup = provider
             .generate_baseline_streaming(
                 &prompt_ids,
@@ -419,7 +427,15 @@ fn main() {
 
     if selection.includes(LONG_10K_PREFILL) {
         let fixture = long_10k.as_ref().expect("10k fixture was prepared");
-        let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
+        let sampling = provider.baseline_sampling(
+            true,
+            qw_runtime::SamplingOptions {
+                temperature: Some(0.0),
+                top_p: Some(1.0),
+                seed: Some(0),
+                ..Default::default()
+            },
+        );
         black_box(long_prefill_sample(&mut provider, fixture, &sampling));
         measure(
             LONG_10K_PREFILL,
@@ -431,7 +447,15 @@ fn main() {
 
     if selection.includes(LONG_64K_PREFILL) {
         let fixture = long_64k.as_ref().expect("64k fixture was prepared");
-        let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
+        let sampling = provider.baseline_sampling(
+            true,
+            qw_runtime::SamplingOptions {
+                temperature: Some(0.0),
+                top_p: Some(1.0),
+                seed: Some(0),
+                ..Default::default()
+            },
+        );
         black_box(long_prefill_sample(&mut provider, fixture, &sampling));
         measure(
             LONG_64K_PREFILL,
@@ -473,7 +497,15 @@ fn main() {
 
         if selection.includes(LONG_10K_SPECULATIVE) {
             let fixture = long_10k.as_ref().expect("10k fixture was prepared");
-            let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
+            let sampling = provider.baseline_sampling(
+                true,
+                qw_runtime::SamplingOptions {
+                    temperature: Some(0.0),
+                    top_p: Some(1.0),
+                    seed: Some(0),
+                    ..Default::default()
+                },
+            );
             black_box(long_dflash2_sample(
                 &mut provider,
                 fixture,
@@ -490,7 +522,15 @@ fn main() {
 
         if selection.includes(LONG_64K_SPECULATIVE) {
             let fixture = long_64k.as_ref().expect("64k fixture was prepared");
-            let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
+            let sampling = provider.baseline_sampling(
+                true,
+                qw_runtime::SamplingOptions {
+                    temperature: Some(0.0),
+                    top_p: Some(1.0),
+                    seed: Some(0),
+                    ..Default::default()
+                },
+            );
             black_box(long_dflash2_sample(
                 &mut provider,
                 fixture,
@@ -531,7 +571,15 @@ fn main() {
 
         if selection.includes(LONG_10K_SPECULATIVE) {
             let fixture = long_10k.as_ref().expect("10k fixture was prepared");
-            let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
+            let sampling = provider.baseline_sampling(
+                true,
+                qw_runtime::SamplingOptions {
+                    temperature: Some(0.0),
+                    top_p: Some(1.0),
+                    seed: Some(0),
+                    ..Default::default()
+                },
+            );
             black_box(long_mtp_sample(&mut provider, fixture, &sampling));
             measure(
                 LONG_10K_SPECULATIVE,
@@ -543,7 +591,15 @@ fn main() {
 
         if selection.includes(LONG_64K_SPECULATIVE) {
             let fixture = long_64k.as_ref().expect("64k fixture was prepared");
-            let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
+            let sampling = provider.baseline_sampling(
+                true,
+                qw_runtime::SamplingOptions {
+                    temperature: Some(0.0),
+                    top_p: Some(1.0),
+                    seed: Some(0),
+                    ..Default::default()
+                },
+            );
             black_box(long_mtp_sample(&mut provider, fixture, &sampling));
             measure(
                 LONG_64K_SPECULATIVE,

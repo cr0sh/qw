@@ -24,15 +24,32 @@ MODEL_ID = "qwen3.8-27b"
 TERMINATION_BOUND_NS = 1_000_000_000
 DEFAULT_STARTUP_TIMEOUT_SECONDS = 300.0
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 120.0
-CACHE_SETTLE_SECONDS = 0.025
+DEFAULT_SHARED_REPETITIONS = 3_000
+DEFAULT_MIN_CONTEXT_TOKENS = 50_000
+DEFAULT_MAX_CONTEXT_TOKENS = 73_000
 TTFT_DEFINITION = (
     "monotonic time immediately before the HTTP client writes the POST request "
     "through receipt of the first non-empty choices[0].delta.content SSE frame"
+)
+SEMANTIC_TTFT_DEFINITION = (
+    "monotonic time immediately before the HTTP client writes the POST request "
+    "through the first non-empty content, reasoning, or tool-call SSE delta"
 )
 TERMINATION_DEFINITION = (
     "the last non-empty content, reasoning, or tool-call delta to the Chat "
     "finish_reason terminal frame; terminal frame to data: [DONE], data: [DONE] "
     "to HTTP response-body EOF, and terminal frame to EOF are reported separately"
+)
+REQUEST_POLICY_FIELDS = (
+    "enable_thinking",
+    "reasoning_effort",
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "presence_penalty",
+    "repetition_penalty",
+    "seed",
 )
 
 
@@ -52,27 +69,43 @@ def user_message(content: str) -> dict[str, str]:
     return {"role": "user", "content": content}
 
 
-def make_request(messages: list[dict[str, str]], max_tokens: int) -> dict[str, Any]:
-    return {
+def make_request(
+    messages: list[dict[str, Any]],
+    max_tokens: int,
+    controls: dict[str, Any] | None = None,
+    *,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: str | None = None,
+) -> dict[str, Any]:
+    request: dict[str, Any] = {
         "model": MODEL_ID,
         "messages": messages,
         "stream": True,
         "stream_options": {"include_usage": True},
-        "enable_thinking": False,
-        "temperature": 0,
-        "top_p": 1,
         "max_tokens": max_tokens,
     }
+    if controls:
+        for field in REQUEST_POLICY_FIELDS:
+            value = controls.get(field)
+            if value is not None:
+                request[field] = value
+    if tools is not None:
+        request["tools"] = tools
+    if tool_choice is not None:
+        request["tool_choice"] = tool_choice
+    return request
 
 
 def shared_context(repetitions: int) -> str:
     return "\n".join(
-        f"Shared context line {index:03d}: amber birch cobalt delta ember fjord granite harbor."
+        f"Shared context line {index:04d}: amber birch cobalt delta ember fjord granite harbor."
         for index in range(repetitions)
     )
 
 
-def first_turn_request(shared: str, max_tokens: int) -> dict[str, Any]:
+def first_turn_request(
+    shared: str, max_tokens: int, controls: dict[str, Any] | None = None
+) -> dict[str, Any]:
     return make_request(
         [
             {
@@ -84,16 +117,25 @@ def first_turn_request(shared: str, max_tokens: int) -> dict[str, Any]:
             ),
         ],
         max_tokens,
+        controls,
     )
 
 
 def turn_boundary_request(
-    shared: str, first_assistant_text: str, max_tokens: int
+    shared: str,
+    first_assistant_text: str,
+    first_reasoning_text: str,
+    max_tokens: int,
+    controls: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    request = first_turn_request(shared, max_tokens)
+    request = first_turn_request(shared, max_tokens, controls)
     request["messages"].extend(
         [
-            {"role": "assistant", "content": first_assistant_text},
+            {
+                "role": "assistant",
+                "content": first_assistant_text,
+                "reasoning_content": first_reasoning_text,
+            },
             user_message(
                 "This is the next conversational turn. Reply with the single word BOUNDARY."
             ),
@@ -103,7 +145,11 @@ def turn_boundary_request(
 
 
 def intra_turn_request(
-    shared: str, suffix: str, answer: str, max_tokens: int
+    shared: str,
+    suffix: str,
+    answer: str,
+    max_tokens: int,
+    controls: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return make_request(
         [
@@ -116,7 +162,88 @@ def intra_turn_request(
             ),
         ],
         max_tokens,
+        controls,
     )
+
+
+def tool_definitions() -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "Look up a stable acceptance-test value.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"key": {"type": "string"}},
+                    "required": ["key"],
+                    "additionalProperties": False,
+                },
+            },
+        }
+    ]
+
+
+def tool_turn_request(
+    shared: str, max_tokens: int, controls: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    return make_request(
+        [
+            {
+                "role": "system",
+                "content": "Use the tool history, then answer with one uppercase word.",
+            },
+            user_message(
+                f"{shared}\nAsk the lookup tool for the acceptance value, then acknowledge it."
+            ),
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_acceptance_lookup",
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "arguments": '{"key":"acceptance"}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_acceptance_lookup",
+                "content": "stable acceptance value",
+            },
+        ],
+        max_tokens,
+        controls,
+        tools=tool_definitions(),
+        tool_choice="none",
+    )
+
+
+def next_user_turn_request(
+    shared: str,
+    tool_assistant_text: str,
+    tool_assistant_reasoning: str,
+    max_tokens: int,
+    controls: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    request = tool_turn_request(shared, max_tokens, controls)
+    request["messages"].extend(
+        [
+            {
+                "role": "assistant",
+                "content": tool_assistant_text,
+                "reasoning_content": tool_assistant_reasoning,
+            },
+            user_message(
+                "Now answer the next user turn with the single word FOLLOWUP."
+            ),
+        ]
+    )
+    return request
 
 
 class ChatSseAccumulator:
@@ -137,6 +264,7 @@ class ChatSseAccumulator:
         self.finish_reason: str | None = None
         self.usage: dict[str, Any] | None = None
         self.assistant_parts: list[str] = []
+        self.reasoning_parts: list[str] = []
         self.sse_frames = 0
 
     def record_semantic(self, kind: str, received: dict[str, int]) -> None:
@@ -169,6 +297,7 @@ class ChatSseAccumulator:
             reasoning = delta.get("reasoning_content")
             if isinstance(reasoning, str) and reasoning:
                 self.record_semantic("reasoning", received)
+                self.reasoning_parts.append(reasoning)
             tool_calls = delta.get("tool_calls")
             if isinstance(tool_calls, list) and tool_calls:
                 self.record_semantic("tool", received)
@@ -237,11 +366,16 @@ class ChatSseAccumulator:
             return None if value is None else terminal_ns - value
 
         assistant_text = "".join(self.assistant_parts)
+        reasoning_text = "".join(self.reasoning_parts)
         return {
             "response_id": self.response_id,
             "assistant_text": assistant_text,
+            "assistant_reasoning_text": reasoning_text,
             "assistant_text_sha256": hashlib.sha256(
                 assistant_text.encode("utf-8")
+            ).hexdigest(),
+            "assistant_reasoning_sha256": hashlib.sha256(
+                reasoning_text.encode("utf-8")
             ).hexdigest(),
             "finish_reason": self.finish_reason,
             "sse_frames": self.sse_frames,
@@ -263,6 +397,7 @@ class ChatSseAccumulator:
             },
             "latency_ns": {
                 "ttft": since_request("content"),
+                "semantic_ttft": first_any_ns - request_ns,
                 "time_to_first_reasoning": since_request("reasoning"),
                 "time_to_first_tool": since_request("tool"),
                 "last_content_to_terminal": to_terminal("content"),
@@ -371,8 +506,118 @@ def stop_server(process: subprocess.Popen[bytes]) -> None:
         os.killpg(process.pid, signal.SIGKILL)
         process.wait(timeout=10)
 
+def persisted_manifest_state(cache_directory: str) -> dict[str, tuple[int, int]]:
+    root = Path(cache_directory) / "entries"
+    state: dict[str, tuple[int, int]] = {}
+    if not root.is_dir():
+        return state
+    for path in root.rglob("*.json"):
+        try:
+            metadata = path.stat()
+        except OSError:
+            continue
+        state[os.fspath(path)] = (metadata.st_mtime_ns, metadata.st_size)
+    return state
 
-def cache_trace_events(log_path: Path) -> list[dict[str, Any]]:
+
+def wait_for_persisted_manifest(
+    cache_directory: str,
+    previous: dict[str, tuple[int, int]],
+    timeout_seconds: float = 30.0,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        current = persisted_manifest_state(cache_directory)
+        if current != previous:
+            return {
+                "manifest_count": len(current),
+                "manifest_paths": sorted(current),
+            }
+        time.sleep(0.01)
+    raise TimeoutError("cache snapshot was published but no persisted manifest appeared")
+
+
+
+TRACE_FIELDS = {
+    "event",
+    "phase",
+    "response_id",
+    "kind",
+    "source",
+    "hit",
+    "route",
+    "decoder",
+    "configured_decoder",
+    "dflash2_available",
+    "dflash2_compatible",
+    "enable_thinking",
+    "reasoning_effort",
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "presence_penalty",
+    "repetition_penalty",
+    "seed",
+    "prompt_tokens",
+    "cached_tokens",
+    "prefilled_tokens",
+    "completion_tokens",
+    "decoded_tokens",
+    "tps",
+    "prefill_duration_ms",
+    "decode_duration_ms",
+    "elapsed_ms",
+    "duration_ms",
+    "hot_bytes",
+    "reused_tokens",
+    "lookup_duration_ms",
+    "accepted_draft_tokens",
+    "proposed_draft_tokens",
+    "acceptance_percentage",
+    "projected_context_cache_hits",
+    "verify_width_rounds",
+    "verify_width_accepted_draft_tokens",
+    "verify_width_proposed_draft_tokens",
+    "selector_scale_rounds",
+    "selector_scale_accepted_draft_tokens",
+    "selector_scale_proposed_draft_tokens",
+    "stats",
+}
+TRACE_MARKERS = {
+    "prompt.tokenized",
+    "decoder.selected",
+    "cache.lookup",
+    "cache.decision",
+    "cache.published",
+    "prefill.complete",
+    "ttft.prefill",
+    "decode.complete",
+    "dflash2.completed",
+}
+
+
+def _trace_response_id(event: dict[str, Any], fields: dict[str, Any]) -> str | None:
+    response_id = fields.get("response_id")
+    if isinstance(response_id, str):
+        return response_id
+    span_candidates: list[dict[str, Any]] = []
+    span = event.get("span")
+    if isinstance(span, dict):
+        span_candidates.append(span)
+    spans = event.get("spans")
+    if isinstance(spans, list):
+        span_candidates.extend(
+            candidate for candidate in reversed(spans) if isinstance(candidate, dict)
+        )
+    for candidate in span_candidates:
+        response_id = candidate.get("response_id")
+        if isinstance(response_id, str):
+            return response_id
+    return None
+
+
+def server_trace_events(log_path: Path) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
         try:
@@ -382,41 +627,27 @@ def cache_trace_events(log_path: Path) -> list[dict[str, Any]]:
         fields = event.get("fields")
         if not isinstance(fields, dict):
             continue
-        if fields.get("event") == "cache.decision" or fields.get("phase") == "cache.lookup":
-            evidence = {
-                key: fields[key]
-                for key in (
-                    "event",
-                    "phase",
-                    "response_id",
-                    "source",
-                    "reused_tokens",
-                    "cached_tokens",
-                    "prompt_tokens",
-                    "route",
-                    "hit",
-                    "lookup_duration_ms",
-                )
-                if key in fields
-            }
-            evidence["log_timestamp"] = event.get("timestamp")
-            if "response_id" not in evidence:
-                span_candidates = []
-                span = event.get("span")
-                if isinstance(span, dict):
-                    span_candidates.append(span)
-                spans = event.get("spans")
-                if isinstance(spans, list):
-                    span_candidates.extend(
-                        candidate for candidate in reversed(spans) if isinstance(candidate, dict)
-                    )
-                for candidate in span_candidates:
-                    response_id = candidate.get("response_id")
-                    if isinstance(response_id, str):
-                        evidence["response_id"] = response_id
-                        break
-            events.append(evidence)
+        marker = fields.get("event") or fields.get("phase")
+        if marker not in TRACE_MARKERS:
+            continue
+        evidence = {
+            key: fields[key] for key in TRACE_FIELDS if key in fields
+        }
+        response_id = _trace_response_id(event, fields)
+        if response_id is not None:
+            evidence["response_id"] = response_id
+        evidence["log_timestamp"] = event.get("timestamp")
+        events.append(evidence)
     return events
+
+
+def cache_trace_events(log_path: Path) -> list[dict[str, Any]]:
+    return [
+        event
+        for event in server_trace_events(log_path)
+        if event.get("event", "").startswith("cache.")
+        or event.get("phase", "").startswith("cache.")
+    ]
 
 
 def attach_cache_traces(
@@ -427,21 +658,42 @@ def attach_cache_traces(
         scenario["server_cache_trace"] = [
             event for event in events if event.get("response_id") == response_id
         ]
+
+
+def attach_server_traces(
+    scenarios: list[dict[str, Any]], events: list[dict[str, Any]]
+) -> None:
+    for scenario in scenarios:
+        response_id = scenario.get("response_id")
+        traces = [
+            event for event in events if event.get("response_id") == response_id
+        ]
+        scenario["server_trace"] = traces
+        scenario["cache_publication"] = [
+            event for event in traces if event.get("event") == "cache.published"
+        ]
 def validate_cache_traces(scenarios: list[dict[str, Any]]) -> dict[str, bool]:
     expected_hits = {
         "first_turn": False,
         "turn_boundary": True,
-        "intra_turn_discovery": False,
-        "intra_turn_probe": True,
+        "intra_turn_discovery": None,
+        "intra_turn_probe": None,
+        "tool_turn": False,
+        "next_user_turn": True,
+        "filesystem_restore": True,
     }
     checks: dict[str, bool] = {}
     for scenario in scenarios:
         name = scenario["name"]
-        expected_hit = expected_hits[name]
+        if name not in expected_hits:
+            continue
         traces = scenario["server_cache_trace"]
         decisions = [event for event in traces if event.get("event") == "cache.decision"]
         lookups = [event for event in traces if event.get("phase") == "cache.lookup"]
         cached_tokens = scenario["cache_evidence"]["cached_tokens"]
+        expected_hit = expected_hits[name]
+        if expected_hit is None:
+            expected_hit = cached_tokens > 0
         checks[f"{name}_cache_decision"] = (
             len(decisions) == 1
             and decisions[0].get("source")
@@ -462,14 +714,66 @@ def validate_cache_traces(scenarios: list[dict[str, Any]]) -> dict[str, bool]:
     return checks
 
 
+def validate_context_window(
+    scenarios: list[dict[str, Any]], minimum: int, maximum: int
+) -> dict[str, bool]:
+    checks = {
+        f"{scenario['name']}_prompt_in_context_window": minimum
+        <= scenario["cache_evidence"]["prompt_tokens"]
+        <= maximum
+        for scenario in scenarios
+    }
+    failed = [name for name, passed in checks.items() if not passed]
+    if failed:
+        values = {
+            scenario["name"]: scenario["cache_evidence"]["prompt_tokens"]
+            for scenario in scenarios
+        }
+        raise AssertionError(
+            f"prompt token counts outside [{minimum}, {maximum}]: {values}"
+        )
+    return checks
+
+
+def validate_extended_scenarios(
+    scenarios: list[dict[str, Any]]
+) -> dict[str, bool]:
+    by_name = {scenario["name"]: scenario for scenario in scenarios}
+    required = {"tool_turn", "next_user_turn", "filesystem_restore"}
+    if not required <= by_name.keys():
+        raise AssertionError(
+            f"extended scenario set missing: {sorted(required - by_name.keys())}"
+        )
+    checks = {
+        "tool_turn_has_tool_history": by_name["tool_turn"]["message_count"] >= 4,
+        "next_user_retains_tool_history": by_name["next_user_turn"]["message_count"]
+        > by_name["tool_turn"]["message_count"],
+        "next_user_reuses_tool_prefix": by_name["next_user_turn"][
+            "cache_evidence"
+        ]["cached_tokens"]
+        > 0,
+        "filesystem_restore_reuses_prefix": by_name["filesystem_restore"][
+            "cache_evidence"
+        ]["cached_tokens"]
+        > 0,
+        "filesystem_manifest_persisted_before_restart": bool(
+            by_name["next_user_turn"].get("filesystem_persistence")
+        ),
+        "publication_evidence_present": all(
+            by_name[name].get("cache_publication") for name in required
+        ),
+    }
+    failed = [name for name, passed in checks.items() if not passed]
+    if failed:
+        raise AssertionError(f"failed extended scenario checks {failed}")
+    return checks
 
 
 def validate_scenarios(scenarios: list[dict[str, Any]]) -> dict[str, bool]:
     by_name = {scenario["name"]: scenario for scenario in scenarios}
     required = {"first_turn", "turn_boundary", "intra_turn_discovery", "intra_turn_probe"}
-    if by_name.keys() != required:
-        raise AssertionError(f"scenario set differs: {sorted(by_name)}")
-
+    if not required <= by_name.keys():
+        raise AssertionError(f"scenario set missing: {sorted(required - by_name.keys())}")
     first = by_name["first_turn"]
     boundary = by_name["turn_boundary"]
     discovery = by_name["intra_turn_discovery"]
@@ -478,7 +782,6 @@ def validate_scenarios(scenarios: list[dict[str, Any]]) -> dict[str, bool]:
     boundary_cached = boundary["cache_evidence"]["cached_tokens"]
     discovery_cached = discovery["cache_evidence"]["cached_tokens"]
     probe_cached = probe["cache_evidence"]["cached_tokens"]
-
     checks = {
         "isolated_first_turn_cache_miss": first_cached == 0,
         "turn_boundary_partial_prefix_hit": boundary["cache_evidence"][
@@ -486,10 +789,8 @@ def validate_scenarios(scenarios: list[dict[str, Any]]) -> dict[str, bool]:
         ],
         "intra_turn_requests_are_distinct": discovery["request_sha256"]
         != probe["request_sha256"],
-        "intra_turn_checkpoint_increases_reuse": probe_cached > discovery_cached,
-        "intra_turn_probe_partial_prefix_hit": probe["cache_evidence"][
-            "partial_prefix_hit"
-        ],
+        "intra_turn_edit_without_completed_prefix_misses": discovery_cached == 0
+        and probe_cached == 0,
         "all_streams_terminate_under_one_second": all(
             scenario["latency_ns"]["last_semantic_to_eof"] < TERMINATION_BOUND_NS
             for scenario in scenarios
@@ -516,28 +817,99 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="already-built qw binary",
     )
     parser.add_argument("--model", type=Path, help="explicit model checkpoint directory")
+    parser.add_argument(
+        "--dflash-draft-model", type=Path, help="explicit DFlash2 draft checkpoint directory"
+    )
+    parser.add_argument(
+        "--decoder",
+        choices=("auto", "baseline", "mtp", "dflash"),
+        default="auto",
+        help="decoder policy passed to qw serve",
+    )
+    parser.add_argument(
+        "--mtp-k",
+        type=int,
+        default=3,
+        help="MTP verify block size for --decoder mtp (default: 3)",
+    )
+    thinking = parser.add_mutually_exclusive_group()
+    thinking.add_argument(
+        "--enable-thinking",
+        dest="enable_thinking",
+        action="store_true",
+        help="send enable_thinking=true; omitted by default so server defaults apply",
+    )
+    thinking.add_argument(
+        "--disable-thinking",
+        dest="enable_thinking",
+        action="store_false",
+        help="send enable_thinking=false",
+    )
+    parser.set_defaults(enable_thinking=None)
+    parser.add_argument("--reasoning-effort", default="medium")
+    for name, value_type in (
+        ("temperature", float),
+        ("top-p", float),
+        ("top-k", int),
+        ("min-p", float),
+        ("presence-penalty", float),
+        ("repetition-penalty", float),
+        ("seed", int),
+    ):
+        parser.add_argument(
+            f"--{name}",
+            dest=name.replace("-", "_"),
+            type=value_type,
+            help="optional explicit sampling override; omitted fields use runtime defaults",
+        )
     parser.add_argument("--port", type=int, help="isolated TCP port; defaults to an ephemeral port")
     parser.add_argument("--result", type=Path, help="unique JSON result path")
     parser.add_argument(
-        "--startup-timeout",
-        type=float,
-        default=DEFAULT_STARTUP_TIMEOUT_SECONDS,
+        "--startup-timeout", type=float, default=DEFAULT_STARTUP_TIMEOUT_SECONDS
     )
     parser.add_argument(
-        "--request-timeout",
-        type=float,
-        default=DEFAULT_REQUEST_TIMEOUT_SECONDS,
+        "--request-timeout", type=float, default=DEFAULT_REQUEST_TIMEOUT_SECONDS
     )
-    parser.add_argument("--shared-repetitions", type=int, default=96)
+    parser.add_argument(
+        "--shared-repetitions",
+        type=int,
+        default=DEFAULT_SHARED_REPETITIONS,
+        help="repeated shared context lines; default targets a 50–73k token prompt",
+    )
+    parser.add_argument(
+        "--min-context-tokens", type=int, default=DEFAULT_MIN_CONTEXT_TOKENS
+    )
+    parser.add_argument(
+        "--max-context-tokens", type=int, default=DEFAULT_MAX_CONTEXT_TOKENS
+    )
     parser.add_argument("--max-tokens", type=int, default=12)
     args = parser.parse_args(argv)
     if args.shared_repetitions < 2:
         parser.error("--shared-repetitions must be at least 2")
+    if args.mtp_k < 2:
+        parser.error("--mtp-k must be at least 2")
+    if args.min_context_tokens < 1 or args.max_context_tokens < args.min_context_tokens:
+        parser.error("--max-context-tokens must be >= --min-context-tokens >= 1")
     if args.max_tokens < 2:
         parser.error("--max-tokens must be at least 2")
+    if args.reasoning_effort.strip() == "":
+        parser.error("--reasoning-effort must not be empty")
     return args
 
 
+def request_controls(args: argparse.Namespace) -> dict[str, Any]:
+    controls = {
+        "enable_thinking": args.enable_thinking,
+        "reasoning_effort": args.reasoning_effort,
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "top_k": args.top_k,
+        "min_p": args.min_p,
+        "presence_penalty": args.presence_penalty,
+        "repetition_penalty": args.repetition_penalty,
+        "seed": args.seed,
+    }
+    return {key: value for key, value in controls.items() if value is not None}
 def default_result_path() -> Path:
     name = f"multiturn-latency-{time.time_ns()}-{os.getpid()}.json"
     return REPO_ROOT / "outputs" / name
@@ -562,53 +934,101 @@ def main(argv: list[str] | None = None) -> int:
     host = "127.0.0.1"
     port = args.port or reserve_port(host)
     run_started = timestamp()
+    controls = request_controls(args)
     scenarios: list[dict[str, Any]] = []
     report: dict[str, Any] = {
         "status": "running",
         "definitions": {
             "ttft": TTFT_DEFINITION,
+            "semantic_ttft": SEMANTIC_TTFT_DEFINITION,
             "stream_termination": TERMINATION_DEFINITION,
             "strict_termination_bound_ns": TERMINATION_BOUND_NS,
+        },
+        "decoder_policy": args.decoder,
+        "mtp_k": args.mtp_k,
+        "request_controls": controls,
+        "cache_defaults": {
+            "memory_bytes": 2 * 1024 * 1024 * 1024,
+            "filesystem_bytes": 16 * 1024 * 1024 * 1024,
+            "capacity_flags_omitted": True,
         },
         "run_started": run_started,
         "shared_context": {
             "repetitions": args.shared_repetitions,
+            "minimum_prompt_tokens": args.min_context_tokens,
+            "maximum_prompt_tokens": args.max_context_tokens,
         },
         "scenarios": scenarios,
     }
 
     process: subprocess.Popen[bytes] | None = None
+    server_log: Any = None
     exit_code = 1
     with tempfile.TemporaryDirectory(prefix="qw-multiturn-latency-cache-") as cache_directory:
-        command = [
-            os.fspath(GPU_LOCK),
-            "--",
-            os.fspath(binary),
-            "serve",
-            "--bind",
-            f"{host}:{port}",
-            "--model-id",
-            MODEL_ID,
-            "--prefix-cache-directory",
-            cache_directory,
-            "--prefix-cache-memory-bytes",
-            "2GB",
-            "--prefix-cache-filesystem-bytes",
-            "2GB",
-            "--decoder",
-            "mtp",
-            "--no-file-logging",
-            "--output-format",
-            "json",
-        ]
-        if args.model is not None:
-            command.extend(["--model", os.fspath(args.model.expanduser().resolve())])
+        def command_for(run_port: int) -> list[str]:
+            command = [
+                os.fspath(GPU_LOCK),
+                "--",
+                os.fspath(binary),
+                "serve",
+                "--bind",
+                f"{host}:{run_port}",
+                "--model-id",
+                MODEL_ID,
+                "--prefix-cache-directory",
+                cache_directory,
+                "--decoder",
+                args.decoder,
+                "--no-file-logging",
+                "--output-format",
+                "json",
+            ]
+            if args.decoder == "mtp":
+                command.extend(["--mtp-k", str(args.mtp_k)])
+            if args.dflash_draft_model is not None:
+                command.extend(
+                    ["--dflash-draft-model", os.fspath(args.dflash_draft_model.expanduser().resolve())]
+                )
+            if args.model is not None:
+                command.extend(["--model", os.fspath(args.model.expanduser().resolve())])
+            return command
+
+        def launch(run_port: int, append_log: bool) -> tuple[subprocess.Popen[bytes], Any]:
+            mode = "ab" if append_log else "xb"
+            log_handle = log_path.open(mode)
+            try:
+                child = subprocess.Popen(
+                    command_for(run_port),
+                    cwd=REPO_ROOT,
+                    env=os.environ
+                    | {
+                        "RUST_LOG": "info,qw_server=trace,qw_prefix_cache=trace,qw_runtime=debug",
+                        "QW_GPU_LOCK_SESSION": f"multiturn-latency-{os.getpid()}",
+                    },
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+            except BaseException:
+                log_handle.close()
+                raise
+            return child, log_handle
+
+        def record(
+            name: str, request: dict[str, Any], run_port: int
+        ) -> dict[str, Any]:
+            result = post_stream(host, run_port, request, args.request_timeout)
+            result["name"] = name
+            scenarios.append(result)
+            return result
+
         report["server"] = {
-            "command": command,
+            "command": command_for(port),
             "host": host,
             "port": port,
             "cache_directory": cache_directory,
             "log_path": os.fspath(log_path),
+            "capacity_flags_omitted": True,
         }
         shared = shared_context(args.shared_repetitions)
         report["shared_context"]["sha256"] = hashlib.sha256(
@@ -617,72 +1037,95 @@ def main(argv: list[str] | None = None) -> int:
         report["shared_context"]["bytes"] = len(shared.encode("utf-8"))
 
         try:
-            with log_path.open("xb") as server_log:
-                process = subprocess.Popen(
-                    command,
-                    cwd=REPO_ROOT,
-                    env=os.environ
-                    | {
-                        "RUST_LOG": "info,qw_server=trace,qw_prefix_cache=trace,qw_runtime=debug",
-                        "QW_GPU_LOCK_SESSION": f"multiturn-latency-{os.getpid()}",
-                    },
-                    stdout=server_log,
-                    stderr=subprocess.STDOUT,
-                    start_new_session=True,
-                )
-                report["server"]["pid"] = process.pid
-                report["server"]["ready_at"] = wait_until_ready(
-                    process, host, port, args.startup_timeout
-                )
+            process, server_log = launch(port, append_log=False)
+            report["server"]["pid"] = process.pid
+            report["server"]["ready_at"] = wait_until_ready(
+                process, host, port, args.startup_timeout
+            )
 
-                request_plan: list[tuple[str, dict[str, Any]]] = []
-                seed_request = first_turn_request(shared, args.max_tokens)
-                request_plan.append(("first_turn", seed_request))
-                seed = post_stream(host, port, seed_request, args.request_timeout)
-                seed["name"] = "first_turn"
-                scenarios.append(seed)
-                time.sleep(CACHE_SETTLE_SECONDS)
+            request_plan: list[tuple[str, dict[str, Any]]] = []
+            seed_request = first_turn_request(shared, args.max_tokens, controls)
+            request_plan.append(("first_turn", seed_request))
+            seed = record("first_turn", seed_request, port)
 
-                boundary_request = turn_boundary_request(
-                    shared, seed["assistant_text"], args.max_tokens
-                )
-                request_plan.append(("turn_boundary", boundary_request))
-                boundary = post_stream(
-                    host, port, boundary_request, args.request_timeout
-                )
-                boundary["name"] = "turn_boundary"
-                scenarios.append(boundary)
-                time.sleep(CACHE_SETTLE_SECONDS)
+            boundary_request = turn_boundary_request(
+                shared,
+                seed["assistant_text"],
+                seed["assistant_reasoning_text"],
+                args.max_tokens,
+                controls,
+            )
+            request_plan.append(("turn_boundary", boundary_request))
+            boundary = record("turn_boundary", boundary_request, port)
 
-                discovery_request = intra_turn_request(
-                    shared, "structural discovery", "DISCOVERY", args.max_tokens
-                )
-                request_plan.append(("intra_turn_discovery", discovery_request))
-                discovery = post_stream(
-                    host, port, discovery_request, args.request_timeout
-                )
-                discovery["name"] = "intra_turn_discovery"
-                scenarios.append(discovery)
-                time.sleep(CACHE_SETTLE_SECONDS)
+            discovery_request = intra_turn_request(
+                shared, "structural discovery", "DISCOVERY", args.max_tokens, controls
+            )
+            request_plan.append(("intra_turn_discovery", discovery_request))
+            discovery = record("intra_turn_discovery", discovery_request, port)
 
-                probe_request = intra_turn_request(
-                    shared, "structural probe", "PROBE", args.max_tokens
+            probe_request = intra_turn_request(
+                shared, "structural probe", "PROBE", args.max_tokens, controls
+            )
+            request_plan.append(("intra_turn_probe", probe_request))
+            probe = record("intra_turn_probe", probe_request, port)
+
+            tool_request = tool_turn_request(shared, args.max_tokens, controls)
+            request_plan.append(("tool_turn", tool_request))
+            tool_result = record("tool_turn", tool_request, port)
+
+            next_request = next_user_turn_request(
+                shared,
+                tool_result["assistant_text"],
+                tool_result["assistant_reasoning_text"],
+                args.max_tokens,
+                controls,
+            )
+            request_plan.append(("next_user_turn", next_request))
+            manifests_before_restart = persisted_manifest_state(cache_directory)
+            next_result = record("next_user_turn", next_request, port)
+            next_result["filesystem_persistence"] = wait_for_persisted_manifest(
+                cache_directory, manifests_before_restart
+            )
+
+            stop_server(process)
+            server_log.close()
+            process = None
+            server_log = None
+
+            restart_port = reserve_port(host)
+            process, server_log = launch(restart_port, append_log=True)
+            report["server"]["restart"] = {
+                "command": command_for(restart_port),
+                "port": restart_port,
+                "pid": process.pid,
+                "ready_at": wait_until_ready(
+                    process, host, restart_port, args.startup_timeout
+                ),
+            }
+            filesystem_request = next_request
+            request_plan.append(("filesystem_restore", filesystem_request))
+            record("filesystem_restore", filesystem_request, restart_port)
+
+            report["request_plan"] = [
+                {
+                    "name": name,
+                    "sha256": request_digest(request),
+                    "message_count": len(request["messages"]),
+                    "provided_policy_fields": sorted(
+                        key for key in REQUEST_POLICY_FIELDS if key in request
+                    ),
+                }
+                for name, request in request_plan
+            ]
+            report["checks"] = validate_scenarios(scenarios)
+            report["checks"].update(
+                validate_context_window(
+                    scenarios, args.min_context_tokens, args.max_context_tokens
                 )
-                request_plan.append(("intra_turn_probe", probe_request))
-                probe = post_stream(host, port, probe_request, args.request_timeout)
-                probe["name"] = "intra_turn_probe"
-                scenarios.append(probe)
-                report["request_plan"] = [
-                    {
-                        "name": name,
-                        "sha256": request_digest(request),
-                        "message_count": len(request["messages"]),
-                    }
-                    for name, request in request_plan
-                ]
-                report["checks"] = validate_scenarios(scenarios)
-                report["status"] = "passed"
-                exit_code = 0
+            )
+            report["status"] = "passed"
+            exit_code = 0
         except Exception as error:
             report["status"] = "failed"
             report["error"] = f"{type(error).__name__}: {error}"
@@ -690,14 +1133,24 @@ def main(argv: list[str] | None = None) -> int:
             if process is not None:
                 stop_server(process)
                 report["server"]["exit_status"] = process.returncode
+            if server_log is not None:
+                server_log.close()
             report["run_finished"] = timestamp()
 
-    events = cache_trace_events(log_path) if log_path.exists() else []
-    report["server_cache_trace"] = events
-    attach_cache_traces(scenarios, events)
+    events = server_trace_events(log_path) if log_path.exists() else []
+    report["server_trace"] = events
+    report["server_cache_trace"] = [
+        event
+        for event in events
+        if event.get("event", "").startswith("cache.")
+        or event.get("phase", "").startswith("cache.")
+    ]
+    attach_cache_traces(scenarios, report["server_cache_trace"])
+    attach_server_traces(scenarios, events)
     if exit_code == 0:
         try:
             report["checks"].update(validate_cache_traces(scenarios))
+            report["checks"].update(validate_extended_scenarios(scenarios))
         except Exception as error:
             report["status"] = "failed"
             report["error"] = f"{type(error).__name__}: {error}"
@@ -710,6 +1163,7 @@ def main(argv: list[str] | None = None) -> int:
     for scenario in scenarios:
         print(
             f"{scenario['name']}: ttft_ns={scenario['latency_ns']['ttft']} "
+            f"semantic_ttft_ns={scenario['latency_ns']['semantic_ttft']} "
             f"last_semantic_to_terminal_ns={scenario['latency_ns']['last_semantic_to_terminal']} "
             f"terminal_to_done_ns={scenario['latency_ns']['terminal_to_done']} "
             f"done_to_eof_ns={scenario['latency_ns']['done_to_eof']} "

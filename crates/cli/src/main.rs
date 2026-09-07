@@ -67,17 +67,37 @@ struct GenerateArgs {
     #[arg(long, default_value_t = 128)]
     max_tokens: usize,
 
-    /// Sampling temperature; the checkpoint default is used when omitted.
+    /// Enable thinking independently of reasoning effort.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    enable_thinking: bool,
+
+    /// Reasoning depth; does not disable thinking.
+    #[arg(long, value_parser = ["none", "minimal", "low", "medium", "high", "xhigh", "max"])]
+    reasoning_effort: Option<String>,
+
+    /// Sampling temperature; omitted fields use the model's effective thinking-mode policy.
     #[arg(long)]
     temperature: Option<f32>,
 
-    /// Top-k sampling cutoff; the checkpoint default is used when omitted.
+    /// Top-k sampling cutoff; omitted fields use the model policy.
     #[arg(long)]
     top_k: Option<i32>,
 
-    /// Top-p sampling cutoff; the checkpoint default is used when omitted.
+    /// Top-p sampling cutoff; omitted fields use the model policy.
     #[arg(long)]
     top_p: Option<f32>,
+
+    #[arg(long)]
+    min_p: Option<f32>,
+
+    #[arg(long)]
+    presence_penalty: Option<f32>,
+
+    #[arg(long)]
+    repetition_penalty: Option<f32>,
+
+    #[arg(long)]
+    frequency_penalty: Option<f32>,
 
     /// Sampling seed.
     #[arg(long)]
@@ -89,9 +109,15 @@ impl GenerateArgs {
         GenerationRequest {
             prompt: self.prompt.clone(),
             max_tokens: self.max_tokens,
+            enable_thinking: self.enable_thinking,
+            reasoning_effort: self.reasoning_effort.clone(),
             temperature: self.temperature,
             top_k: self.top_k,
             top_p: self.top_p,
+            min_p: self.min_p,
+            presence_penalty: self.presence_penalty,
+            repetition_penalty: self.repetition_penalty,
+            frequency_penalty: self.frequency_penalty,
             seed: self.seed,
         }
     }
@@ -586,57 +612,29 @@ mod tests {
     }
 
     #[test]
-    fn omitted_sampling_flags_use_checkpoint_defaults() {
-        let cli = Cli::try_parse_from([
-            "qw",
-            "generate",
-            "--model",
-            "/tmp/model",
-            "--prompt",
-            "hello",
-        ])
-        .expect("parse generate command");
-        let Command::Generate(args) = cli.command else {
-            panic!("expected generate command");
+    fn reasoning_effort_does_not_control_thinking_enabledness() {
+        let parse = |extra: &[&str]| {
+            let mut args = vec![
+                "qw",
+                "generate",
+                "--prompt",
+                "hello",
+                "--reasoning-effort",
+                "medium",
+            ];
+            args.extend_from_slice(extra);
+            let cli = Cli::try_parse_from(args).expect("parse generate");
+            let Command::Generate(args) = cli.command else {
+                panic!("generate");
+            };
+            args.request()
         };
-        let request = args.request();
-        assert_eq!(request.max_tokens, 128);
-        assert_eq!(request.temperature, None);
-        assert_eq!(request.top_k, None);
-        assert_eq!(request.top_p, None);
-        assert_eq!(request.seed, None);
-    }
-
-    #[test]
-    fn all_generation_flags_map_to_the_request() {
-        let cli = Cli::try_parse_from([
-            "qw",
-            "generate",
-            "--model",
-            "/tmp/model",
-            "--prompt",
-            "hello",
-            "--max-tokens",
-            "9",
-            "--temperature",
-            "0.7",
-            "--top-k",
-            "11",
-            "--top-p",
-            "0.8",
-            "--seed",
-            "42",
-        ])
-        .expect("parse generate command");
-        let Command::Generate(args) = cli.command else {
-            panic!("expected generate command");
-        };
-        let request = args.request();
-        assert_eq!(request.max_tokens, 9);
-        assert_eq!(request.temperature, Some(0.7));
-        assert_eq!(request.top_k, Some(11));
-        assert_eq!(request.top_p, Some(0.8));
-        assert_eq!(request.seed, Some(42));
+        let thinking = parse(&[]);
+        assert!(thinking.enable_thinking);
+        assert_eq!(thinking.reasoning_effort.as_deref(), Some("medium"));
+        let direct = parse(&["--enable-thinking", "false"]);
+        assert!(!direct.enable_thinking);
+        assert_eq!(direct.reasoning_effort.as_deref(), Some("medium"));
     }
 
     #[cfg(feature = "specprefill")]

@@ -25,13 +25,19 @@ pub trait PersistentSnapshotStore: Send {
 }
 pub struct FilesystemSnapshotStore {
     root: PathBuf,
+    #[cfg(all(test, target_vendor = "apple"))]
+    pub(super) before_blob_barrier: Option<Box<dyn FnOnce() -> Result<(), String> + Send>>,
 }
 impl FilesystemSnapshotStore {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self, String> {
         let r = root.into();
         fs::create_dir_all(r.join("entries")).map_err(|e| e.to_string())?;
         fs::create_dir_all(r.join("blobs")).map_err(|e| e.to_string())?;
-        Ok(Self { root: r })
+        Ok(Self {
+            root: r,
+            #[cfg(all(test, target_vendor = "apple"))]
+            before_blob_barrier: None,
+        })
     }
     fn path(&self, k: &EntryKey) -> Result<PathBuf, String> {
         let mut p = k.0.split('/');
@@ -136,14 +142,38 @@ impl PersistentSnapshotStore for FilesystemSnapshotStore {
     fn put(&mut self, e: StoredEntry, _: u64) -> Result<(), String> {
         let p = self.path(&e.key)?;
         fs::create_dir_all(p.parent().unwrap()).map_err(|e| e.to_string())?;
+        #[cfg(target_vendor = "apple")]
+        let mut blob_barrier = None;
         for b in &e.blobs {
             if b.sha256.len() != 64 || !b.sha256.bytes().all(|x| x.is_ascii_hexdigit()) {
                 return Err("invalid blob digest".into());
             }
             let q = self.blob(&b.sha256);
             if !q.exists() {
+                #[cfg(target_vendor = "apple")]
+                {
+                    let blob = write_host_synced_blob(&q, &b.bytes)?;
+                    if blob_barrier.is_none() {
+                        blob_barrier = Some(blob);
+                    }
+                }
+                #[cfg(not(target_vendor = "apple"))]
                 write_synced(&q, &b.bytes)?;
             }
+            #[cfg(target_vendor = "apple")]
+            if blob_barrier.is_none() {
+                // Existing blobs can be orphans from a failed earlier Put.
+                blob_barrier = Some(std::fs::File::open(&q).map_err(|e| e.to_string())?);
+            }
+        }
+        #[cfg(target_vendor = "apple")]
+        if let Some(blob) = blob_barrier {
+            #[cfg(test)]
+            if let Some(before_barrier) = self.before_blob_barrier.take() {
+                before_barrier()?;
+            }
+            // Flush drive buffers after all blob fsyncs and before manifest publication.
+            blob.sync_all().map_err(|e| e.to_string())?;
         }
         let tmp = p.with_extension(format!(
             "tmp-{}",
@@ -182,6 +212,32 @@ fn write_synced(p: &Path, b: &[u8]) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     f.write_all(b).map_err(|e| e.to_string())?;
     f.sync_all().map_err(|e| e.to_string())
+}
+#[cfg(target_vendor = "apple")]
+fn write_host_synced_blob(p: &Path, b: &[u8]) -> Result<std::fs::File, String> {
+    use std::os::fd::AsRawFd;
+
+    unsafe extern "C" {
+        fn fsync(fd: std::ffi::c_int) -> std::ffi::c_int;
+    }
+
+    let mut f = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(p)
+        .map_err(|e| e.to_string())?;
+    f.write_all(b).map_err(|e| e.to_string())?;
+    // Apple's sync_data also requests F_FULLFSYNC, so use ordinary fsync here.
+    loop {
+        // SAFETY: f owns an open descriptor and fsync does not retain it.
+        if unsafe { fsync(f.as_raw_fd()) } == 0 {
+            return Ok(f);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error.to_string());
+        }
+    }
 }
 fn safe(s: &str) -> bool {
     !s.is_empty()

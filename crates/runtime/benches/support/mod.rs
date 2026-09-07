@@ -712,6 +712,12 @@ pub fn request(max_tokens: usize) -> GenerationRequest {
     GenerationRequest {
         prompt: PROMPT.to_owned(),
         max_tokens,
+        enable_thinking: true,
+        reasoning_effort: None,
+        min_p: None,
+        presence_penalty: None,
+        repetition_penalty: None,
+        frequency_penalty: None,
         temperature: Some(0.0),
         top_k: Some(1),
         top_p: Some(1.0),
@@ -920,7 +926,15 @@ fn prepare_long_conversation_fixture_uncached(
     let (prompt_ids, prefix_tokens) =
         long_conversation_token_ids(provider, context_label, min_prefix_tokens);
     let history_ids = &prompt_ids[..prefix_tokens];
-    let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
+    let sampling = provider.baseline_sampling(
+        true,
+        qw_runtime::SamplingOptions {
+            temperature: Some(0.0),
+            top_p: Some(1.0),
+            seed: Some(0),
+            ..Default::default()
+        },
+    );
 
     let mtp_prefix = provider
         .generate_mtp_streaming(

@@ -120,16 +120,13 @@ impl SnapshotPage {
         })
     }
 
-    /// Stable identity for this page during the current process.
-
-    /// Rehydrate a page from Send-safe portable storage without creating an
-    /// MLX handle until the receiving worker explicitly asks for it.
+    /// Rehydrate a page while retaining its validated shared portable storage.
     pub fn from_portable(
         token_start: usize,
         token_end: usize,
         shape: Vec<i32>,
         dtype: i32,
-        bytes: &[u8],
+        bytes: Arc<[u8]>,
     ) -> Result<Arc<Self>, String> {
         let expected = shape
             .iter()
@@ -141,12 +138,18 @@ impl SnapshotPage {
                 bytes.len()
             ));
         }
-        Ok(Self::new(
+        let array = ffi::from_bytes(&bytes, &shape, dtype);
+        Ok(Arc::new(Self {
+            identity: NEXT_SNAPSHOT_PAGE_ID.fetch_add(1, Ordering::Relaxed),
             token_start,
             token_end,
-            ffi::from_bytes(bytes, &shape, dtype),
-        ))
+            shape,
+            dtype,
+            array,
+            portable: OnceLock::from(bytes),
+        }))
     }
+    /// Stable identity for this page during the current process.
     pub fn identity(&self) -> u64 {
         self.identity
     }
@@ -168,26 +171,29 @@ impl SnapshotPage {
 
     /// Materialize this page once as Send-safe shared storage.
     pub fn portable_bytes(&self) -> Arc<[u8]> {
-        self.portable
-            .get_or_init(|| {
-                let trace_enabled = tracing::enabled!(Level::TRACE);
-                let started = trace_enabled.then(Instant::now);
-                ffi::eval(self.array.as_ref().expect("page array"));
-                let bytes = Arc::<[u8]>::from(ffi::array_to_raw_bytes(
-                    self.array.as_ref().expect("page array"),
-                ));
-                if let Some(started) = started {
-                    tracing::trace!(
-                        phase = "snapshot.page_materialize",
-                        token_start = self.token_start,
-                        token_end = self.token_end,
-                        page_bytes = bytes.len(),
-                        duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
-                    );
-                }
-                bytes
-            })
-            .clone()
+        if let Some(bytes) = self.portable.get() {
+            return bytes.clone();
+        }
+        let array = ffi::contiguous(self.array(), false);
+        self.materialize_portable_bytes(&array).clone()
+    }
+
+    fn materialize_portable_bytes(&self, array: &MlxArray) -> &Arc<[u8]> {
+        self.portable.get_or_init(|| {
+            let trace_enabled = tracing::enabled!(Level::TRACE);
+            let started = trace_enabled.then(Instant::now);
+            let bytes = Arc::<[u8]>::from(ffi::array_evaluated_bytes(array));
+            if let Some(started) = started {
+                tracing::trace!(
+                    phase = "snapshot.page_materialize",
+                    token_start = self.token_start,
+                    token_end = self.token_end,
+                    page_bytes = bytes.len(),
+                    duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
+                );
+            }
+            bytes
+        })
     }
 }
 
@@ -250,6 +256,30 @@ impl SnapshotPagedTensor {
         Some(dense)
     }
     pub fn portable_pages(&self) -> impl Iterator<Item = Arc<[u8]>> + '_ {
+        let pending_count = self
+            .pages
+            .iter()
+            .filter(|page| page.portable.get().is_none())
+            .count();
+        if pending_count != 0 {
+            let mut pending = Vec::with_capacity(pending_count);
+            pending.extend(
+                self.pages
+                    .iter()
+                    .filter(|page| page.portable.get().is_none())
+                    .map(|page| (page, ffi::contiguous(page.array(), false))),
+            );
+            let arrays: Vec<*const MlxArray> = pending
+                .iter()
+                .map(|(_, array)| array.as_ref().expect("contiguous page") as *const MlxArray)
+                .collect();
+            // SAFETY: pending owns every contiguous array throughout evaluation.
+            // Evaluate the exact readback views together, not each strided page.
+            unsafe { ffi::eval_all(&arrays) };
+            for (page, array) in pending {
+                page.materialize_portable_bytes(&array);
+            }
+        }
         self.pages.iter().map(|p| p.portable_bytes())
     }
 }
@@ -857,7 +887,8 @@ fn prefill_with_checkpoints<M: LanguageModel + ?Sized>(
             ffi::eval(&logits);
             logits
         };
-        if checkpoint_token_lengths.binary_search(&range_end).is_ok()
+        if range_end < prompt_tokens.len()
+            && checkpoint_token_lengths.binary_search(&range_end).is_ok()
             && let Some(mut snapshot) =
                 model.snapshot_sequence_state(sequence_id, range_end, snapshots.last())
         {
@@ -1415,10 +1446,17 @@ pub struct SamplingConfig {
     pub dry_penalty_last_n: usize,
     /// Token IDs that break DRY matching (e.g., newlines, punctuation)
     pub dry_sequence_breakers: Vec<i32>,
-    /// OpenAI-style frequency penalty: subtract penalty * count(token) from logits (0.0 = disabled)
+    /// OpenAI-style frequency penalty: subtract penalty * generated count(token) (0.0 = disabled)
     pub frequency_penalty: f32,
-    /// OpenAI-style presence penalty: subtract penalty if token appeared at all (0.0 = disabled)
+    /// OpenAI-style presence penalty: subtract penalty if generated this request (0.0 = disabled)
     pub presence_penalty: f32,
+    /// Number of initial prompt tokens in the supplied sampling history.
+    /// Frequency/presence penalties count only the suffix after this boundary;
+    /// repetition penalty still considers the full prompt and generated output.
+    /// Entry points resolve `None` from the full prompt, never the uncached
+    /// prefill suffix. Explicit `Some` survives resuming with replayed output.
+    /// Standalone sampling treats `None` as all-output, as does `Some(0)`.
+    pub prompt_token_count: Option<usize>,
     /// Additional stop token IDs (from generation_config.json or API request)
     /// Merged with model's built-in eos_token_ids during generation
     pub stop_token_ids: Vec<i32>,
@@ -1466,6 +1504,7 @@ impl Default for SamplingConfig {
             dry_sequence_breakers: Vec::new(),
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
+            prompt_token_count: None,
             stop_token_ids: Vec::new(),
             token_bias: TokenBiasMap::default(),
             loop_detection: LoopDetectionConfig::default(),
@@ -1493,6 +1532,7 @@ impl SamplingConfig {
             dry_sequence_breakers: Vec::new(),
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
+            prompt_token_count: None,
             stop_token_ids: Vec::new(),
             token_bias: TokenBiasMap::default(),
             loop_detection: LoopDetectionConfig::default(),
@@ -1656,26 +1696,31 @@ impl CxxGenerator {
         &self.token_bias
     }
 
-    /// Compose the effective sampling config from the cached `token_bias` and
-    /// the caller's [`SamplingConfig`].
+    /// Compose cached token bias and the request's full prompt boundary.
     ///
-    /// # Precedence and bit-exact baseline
-    /// - If the caller already set a non-empty `sampling.token_bias`, the
-    ///   caller's bias wins (returned borrow — zero allocation).
-    /// - If the cached `token_bias` is empty, we borrow the caller's config
-    ///   unchanged. This is the **baseline no-op path** and is bit-exact
-    ///   identical to pre-B8 behavior.
-    /// - Otherwise, clone the caller's config and inject the cached bias.
+    /// An explicit caller bias wins. If no cached bias needs injecting and no
+    /// active output-count penalty needs a new boundary, borrow without cloning.
+    /// Prefix reuse changes prefill work, never this boundary.
     ///
     /// Used by: `generate`, `generate_streaming`, `generate_with_stats`, and
     /// VLM embedding-aware variants so every generation path observes the
     /// cached bias without duplicating the merge logic.
-    fn compose_sampling<'a>(&self, sampling: &'a SamplingConfig) -> Cow<'a, SamplingConfig> {
-        if self.token_bias.is_empty() || !sampling.token_bias.is_empty() {
+    fn compose_sampling<'a>(
+        &self,
+        sampling: &'a SamplingConfig,
+        prompt_token_count: usize,
+    ) -> Cow<'a, SamplingConfig> {
+        let inject_bias = !self.token_bias.is_empty() && sampling.token_bias.is_empty();
+        let set_boundary = (sampling.frequency_penalty != 0.0 || sampling.presence_penalty != 0.0)
+            && sampling.prompt_token_count.is_none();
+        if !inject_bias && !set_boundary {
             Cow::Borrowed(sampling)
         } else {
             let mut cloned = sampling.clone();
-            cloned.token_bias = self.token_bias.clone();
+            cloned.prompt_token_count.get_or_insert(prompt_token_count);
+            if inject_bias {
+                cloned.token_bias = self.token_bias.clone();
+            }
             Cow::Owned(cloned)
         }
     }
@@ -1784,6 +1829,7 @@ impl CxxGenerator {
             .ok_or_else(|| {
                 "constraint rollback snapshot is missing continuation logits".to_string()
             })?;
+        model.after_prefill();
         for &token_id in &self.generated_tokens {
             let input = ffi::from_slice_i32(&[token_id], &[1, 1]);
             logits = model.forward_last_logits(&input, &mut self.caches, None, 0);
@@ -1834,7 +1880,7 @@ impl CxxGenerator {
         self.apply_kv_cache_mode_with_boundary_policy();
         install_thread_local_default_stream(self.generation_stream.as_ref());
 
-        let sampling_cow = self.compose_sampling(sampling);
+        let sampling_cow = self.compose_sampling(sampling, prompt_tokens.len());
         let sampling = sampling_cow.as_ref();
         seed_rng_if_needed(sampling);
         let eos_tokens = merged_eos_token_ids(model.eos_token_ids(), &sampling.stop_token_ids);
@@ -1906,6 +1952,7 @@ impl CxxGenerator {
             (logits, Vec::new())
         };
         ffi::eval(&logits);
+        model.after_prefill();
         if retain_prompt_snapshot
             && prompt_snapshots
                 .iter()
@@ -2140,7 +2187,7 @@ impl CxxGenerator {
         self.apply_kv_cache_mode_with_boundary_policy();
         install_thread_local_default_stream(self.generation_stream.as_ref());
 
-        let sampling_cow = self.compose_sampling(sampling);
+        let sampling_cow = self.compose_sampling(sampling, prompt_tokens.len());
         let sampling = sampling_cow.as_ref();
         seed_rng_if_needed(sampling);
         let eos_tokens = merged_eos_token_ids(model.eos_token_ids(), &sampling.stop_token_ids);
@@ -2190,9 +2237,7 @@ impl CxxGenerator {
             }
         };
         ffi::eval(&logits);
-        if input_embeddings.is_some() {
-            model.after_prefill();
-        }
+        model.after_prefill();
         let retain_prompt_snapshot = constraint.is_some() && model.supports_snapshot_reuse();
         let mut prompt_snapshot = retain_prompt_snapshot
             .then(|| model.snapshot_sequence_state(sequence_id, prompt_tokens.len(), None))
@@ -2369,8 +2414,8 @@ impl CxxGenerator {
 
         // Axis B: merge any generator-cached language-bias map into the
         // sampling config before seeding/penalty evaluation. Empty cached
-        // bias => borrowed unchanged (bit-exact baseline; zero alloc).
-        let sampling_cow = self.compose_sampling(sampling);
+        // bias and no active output-count penalty => borrowed unchanged.
+        let sampling_cow = self.compose_sampling(sampling, prompt_tokens.len());
         let sampling = sampling_cow.as_ref();
 
         // Set random seed if specified (for reproducibility)
@@ -2491,6 +2536,13 @@ impl CxxGenerator {
 
         let mut n = 0;
         loop {
+            // History-dependent sampling cannot run one token ahead of its
+            // history: the current draw is part of the next conditional.
+            let sampled_token = needs_history.then(|| {
+                let token = ffi::item_i32(&y);
+                token_history.push(token);
+                token
+            });
             // Start next step (if not at max)
             let build_start = if profile_pipeline {
                 Some(std::time::Instant::now())
@@ -2613,7 +2665,7 @@ impl CxxGenerator {
             } else {
                 None
             };
-            let token_val = ffi::item_i32(&y);
+            let token_val = sampled_token.unwrap_or_else(|| ffi::item_i32(&y));
             if let Some(ws) = wait_start {
                 wait_ns_total += ws.elapsed().as_nanos();
                 profile_count += 1;
@@ -2625,9 +2677,6 @@ impl CxxGenerator {
             }
 
             self.generated_tokens.push(token_val);
-            if needs_history {
-                token_history.push(token_val);
-            }
 
             // Loop / repetition guard: end generation early when the raw
             // generated stream collapses into a short repeated pattern (e.g.
@@ -2713,7 +2762,7 @@ impl CxxGenerator {
         self.reset_with_model(model);
 
         // Axis B: inject generator-cached language-bias into the sampling config.
-        let sampling_cow = self.compose_sampling(sampling);
+        let sampling_cow = self.compose_sampling(sampling, prompt_tokens.len());
         let sampling = sampling_cow.as_ref();
 
         seed_rng_if_needed(sampling);
@@ -2799,6 +2848,11 @@ impl CxxGenerator {
         // Decode loop — identical to standard generation (no embeddings needed)
         let mut n = 0;
         loop {
+            let sampled_token = needs_history.then(|| {
+                let token = ffi::item_i32(&y);
+                token_history.push(token);
+                token
+            });
             let (next_y, next_logprobs) = if n + 1 < max_tokens {
                 let next_input = ffi::reshape_token_for_forward(&y);
                 let next_logits = model.forward(&next_input, &mut self.caches, None);
@@ -2826,7 +2880,7 @@ impl CxxGenerator {
                 break;
             }
 
-            let token_val = ffi::item_i32(&y);
+            let token_val = sampled_token.unwrap_or_else(|| ffi::item_i32(&y));
 
             // Check EOS before sending to callback (avoid outputting stop tokens)
             if eos_tokens.contains(&token_val) {
@@ -2834,9 +2888,6 @@ impl CxxGenerator {
             }
 
             self.generated_tokens.push(token_val);
-            if needs_history {
-                token_history.push(token_val);
-            }
 
             // Loop / repetition guard: end generation early when the raw
             // generated stream collapses into a short repeated pattern (e.g.
@@ -2891,7 +2942,7 @@ impl CxxGenerator {
         self.reset_with_model(model);
 
         // Axis B: inject generator-cached language-bias into the sampling config.
-        let sampling_cow = self.compose_sampling(sampling);
+        let sampling_cow = self.compose_sampling(sampling, prompt_tokens.len());
         let sampling = sampling_cow.as_ref();
 
         seed_rng_if_needed(sampling);
@@ -2965,6 +3016,11 @@ impl CxxGenerator {
         let decode_start = Instant::now();
         let mut n = 0;
         loop {
+            let sampled_token = needs_history.then(|| {
+                let token = ffi::item_i32(&y);
+                token_history.push(token);
+                token
+            });
             let next_y = if n + 1 < max_tokens {
                 let next_input = ffi::reshape_token_for_forward(&y);
                 let next_logits = model.forward(&next_input, &mut self.caches, None);
@@ -2991,14 +3047,11 @@ impl CxxGenerator {
                 break;
             }
 
-            let token_val = ffi::item_i32(&y);
+            let token_val = sampled_token.unwrap_or_else(|| ffi::item_i32(&y));
             if eos_tokens.contains(&token_val) {
                 break;
             }
             self.generated_tokens.push(token_val);
-            if needs_history {
-                token_history.push(token_val);
-            }
 
             // Loop / repetition guard: end generation early when the raw
             // generated stream collapses into a short repeated pattern (e.g.
@@ -3070,7 +3123,7 @@ impl CxxGenerator {
         self.reset_with_model(model);
 
         // Axis B: inject generator-cached language-bias into the sampling config.
-        let sampling_cow = self.compose_sampling(sampling);
+        let sampling_cow = self.compose_sampling(sampling, prompt_tokens.len());
         let sampling = sampling_cow.as_ref();
 
         // Set random seed if specified (for reproducibility)
@@ -3156,6 +3209,11 @@ impl CxxGenerator {
 
         let mut n = 0;
         loop {
+            let sampled_token = needs_history.then(|| {
+                let token = ffi::item_i32(&y);
+                token_history.push(token);
+                token
+            });
             // Start next step computation (if not at max)
             let next_y = if n + 1 < max_tokens {
                 let next_input = ffi::reshape_token_for_forward(&y);
@@ -3187,7 +3245,7 @@ impl CxxGenerator {
             }
 
             // Extract current token value (syncs y)
-            let token_val = ffi::item_i32(&y);
+            let token_val = sampled_token.unwrap_or_else(|| ffi::item_i32(&y));
 
             // Check EOS before storing (avoid including stop tokens in output)
             if eos_tokens.contains(&token_val) {
@@ -3195,9 +3253,6 @@ impl CxxGenerator {
             }
 
             self.generated_tokens.push(token_val);
-            if needs_history {
-                token_history.push(token_val);
-            }
 
             // Loop / repetition guard: end generation early when the raw
             // generated stream collapses into a short repeated pattern (e.g.
@@ -3496,6 +3551,28 @@ mod tests {
             }
             Ok(())
         }
+    }
+
+    #[test]
+    fn generation_count_penalties_distinguish_prompt_output_and_resume() {
+        let model = StubModel;
+        let mut generator = CxxGenerator::new(1);
+        let mut sampling = SamplingConfig {
+            presence_penalty: 12.0,
+            ..SamplingConfig::greedy()
+        };
+        // Token 1 in the prompt is initially eligible; emitting it then makes
+        // its logit negative and forces a different second token.
+        assert_eq!(generator.generate(&model, &[1], 2, &sampling), vec![1, 0]);
+        // A new request's replayed conversation is all prompt, not output
+        // from this generation, even when it contains the prior response.
+        assert_eq!(generator.generate(&model, &[1, 1], 1, &sampling), vec![1]);
+        // Only true continuation retains the original prompt/output boundary.
+        sampling.prompt_token_count = Some(1);
+        assert_eq!(generator.generate(&model, &[1, 1], 1, &sampling), vec![0]);
+        // An explicit empty prompt boundary is not an "unset" sentinel.
+        sampling.prompt_token_count = Some(0);
+        assert_eq!(generator.generate(&model, &[1], 1, &sampling), vec![0]);
     }
 
     /// Multi-position stub: logits value encodes the sequence position, so a
@@ -4328,34 +4405,6 @@ mod tests {
         m
     }
 
-    /// Default `CxxGenerator` carries an empty token-bias cache and produces
-    /// a bit-exact baseline (`Cow::Borrowed`) from `compose_sampling`.
-    #[test]
-    fn cxx_generator_empty_bias_is_baseline() {
-        let g = CxxGenerator::new(4);
-        assert!(g.token_bias().is_empty());
-        let caller = SamplingConfig::default();
-        let composed = g.compose_sampling(&caller);
-        assert!(matches!(composed, Cow::Borrowed(_)));
-        assert!(composed.token_bias.is_empty());
-    }
-
-    /// `with_token_bias` caches a map and injects it into sampling configs
-    /// that don't already carry a bias (fresh clone — `Cow::Owned`).
-    #[test]
-    fn cxx_generator_with_token_bias_injects_into_sampling() {
-        let bias = make_bias(&[(3, f32::NEG_INFINITY), (5, 1.5)]);
-        let g = CxxGenerator::new(4).with_token_bias(bias.clone());
-        assert_eq!(g.token_bias().len(), 2);
-
-        let caller = SamplingConfig::default();
-        let composed = g.compose_sampling(&caller);
-        assert!(matches!(composed, Cow::Owned(_)));
-        assert_eq!(composed.token_bias.len(), 2);
-        assert!(composed.token_bias.contains(3));
-        assert!(composed.token_bias.contains(5));
-    }
-
     /// An explicit caller-side bias wins over the generator-cached one.
     /// Preserves the "call-site override" contract for tests and API callers.
     #[test]
@@ -4368,7 +4417,7 @@ mod tests {
             token_bias: caller_bias,
             ..SamplingConfig::default()
         };
-        let composed = g.compose_sampling(&caller);
+        let composed = g.compose_sampling(&caller, 0);
 
         // Caller's explicit bias is preserved verbatim, cached bias is ignored.
         assert_eq!(composed.token_bias.len(), 1);

@@ -19,6 +19,43 @@ The server accepts `--prefix-cache-memory-bytes`,
 `--prefix-cache-filesystem-bytes`, and `--prefix-cache-directory` when a
 workload needs different limits or a separate location.
 
+New prompt checkpoints capture the full incoming model prompt, including the
+rendered generation prefix, rather than history-only or adaptive intermediate
+prefixes. Exact output, terminal, and cancellation checkpoints remain available.
+A durable continuation preserves the response identity, delivered prefix,
+original penalty boundary, remaining token budget, and independently saved RNG
+state; an unrelated request must not change its continuation stream.
+
+Snapshot budgets do not bound request latency. Persistence still uses serialized
+I/O; queued writes and large FP16 snapshots can delay a subsequent filesystem
+lookup. Darwin durability barriers are batched, but this does not remove FIFO
+queueing or make checkpoint publication free. Report lookup, uncached prefill,
+decode, and terminal/publication timing separately.
+
+## Generation policy
+
+Qwen3.8 defaults follow the upstream model's mode-dependent policy, not the
+quantized checkpoint's generation configuration. Thinking uses temperature 1.0,
+top-p 0.95, top-k 20, and presence penalty 0.0; non-thinking uses temperature
+0.7, top-p 0.8, top-k 20, and presence penalty 1.5. Both use min-p 0.0,
+repetition penalty 1.0, and frequency penalty 0.0 unless explicitly overridden.
+Stochastic speculative decoding verifies against the full-vocabulary target
+distribution after the configured sampling transforms, not a draft-candidate-only
+renormalization. A seed is not a promise of identical text across decoders.
+
+DFlash's existing selector calibrates only verification widths 4 and 5 (three
+and four proposed draft tokens). Contexts below 64,000 tokens initially prefer
+width 4; longer contexts initially prefer width 5. These are adaptive defaults,
+not fixed-width benchmark claims. `QW_DFLASH2_VERIFY_WIDTH=4` or `=5` can pin a
+controlled experiment; keep production selection unchanged without evidence.
+
+Server decode throughput divides committed output tokens by the runtime's
+post-prefill wall time, not request-to-terminal time or pure GPU compute.
+MTP starts that clock after the first-token callback and stops before final
+snapshot capture; DFlash includes final snapshot capture. Preserve this timing
+scope difference when comparing routes, together with actual token counts,
+stop reasons, cache sources, effective sampling, and separately labeled memory.
+
 ## Shared worktrees
 
 Each worktree must link Cargo's `target/` to the primary repository target:

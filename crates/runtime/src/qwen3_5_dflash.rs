@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! DFlash2 block-diffusion drafter and greedy round loop.
+//! DFlash2 block-diffusion drafter and distribution-preserving round loop.
 //!
 //! Rust port of the SGLang DFlash2 implementation
 //! (`python/sglang/srt/models/dflash.py` at commit cf3813f4 — the
@@ -36,10 +36,9 @@
 //!
 //! The drafter checkpoint ships no `embed_tokens`/`lm_head`: tokens are
 //! embedded with the target's embedding table and candidates are scored
-//! with the target's LM head (SGLang `compute_candidates`). The round loop
-//! below is the B=1 greedy path only (lossless speculative decoding: greedy
-//! output matches the target exactly); the stochastic rejection-sampling
-//! path is intentionally not ported yet.
+//! with the target's LM head (SGLang `compute_candidates`). Stochastic
+//! verification uses modified rejection sampling against the full target
+//! vocabulary; compact draft support never restricts target output support.
 //!
 //! Apple Silicon precision rules apply (see
 //! `docs/apple-silicon-precision.md`): the drafter runs in the checkpoint's
@@ -1041,10 +1040,14 @@ impl DFlash2DecoderLayer {
 // # 5. Candidate selector
 // ---------------------------------------------------------------------------
 
-/// Output of a greedy selector walk.
+/// Output of a conditional selector walk.
 pub struct SelectorOutput {
     /// Draft token ids `[1, L]` int32, one per position after the anchor.
     pub path: UniquePtr<MlxArray>,
+    /// Actual compact proposal distributions, absent on the greedy path.
+    proposal_probs: Vec<UniquePtr<MlxArray>>,
+    /// Target-token IDs aligned with each compact distribution.
+    candidates: UniquePtr<MlxArray>,
 }
 
 /// DFlash2 candidate selector, ported from SGLang `CandidateSelector`
@@ -1059,8 +1062,9 @@ pub struct SelectorOutput {
 /// (SGLang `sample_path` with `greedy_mask` set — the sequential form is
 /// exactly the chain the lattice maps define).
 ///
-/// Greedy-only: the stochastic rejection-sampling branch is intentionally
-/// not implemented; callers must pass `temperature <= 0`.
+/// Stochastic walks retain the exact conditional proposal distribution after
+/// temperature and filters. Target history penalties are applied at verification,
+/// not to compact candidate indices (which are not target token IDs).
 pub struct CandidateSelector {
     pub top_k: usize,
     predecessor_codebook: UniquePtr<MlxArray>, // [vocab, rank]
@@ -1088,7 +1092,7 @@ impl CandidateSelector {
         })
     }
 
-    /// Greedy path walk over the masked block positions.
+    /// Conditional path walk over the masked block positions.
     ///
     /// - `hidden` `[1, L, H]` — the drafter's post-`norm` output for the
     ///   proposal positions (SGLang `pred_hidden`, position 0 = anchor
@@ -1108,6 +1112,7 @@ impl CandidateSelector {
         unary: &MlxArray,
         anchor_ids: &MlxArray,
         edge_scale: f32,
+        sampling: &mlxcel_core::generate::SamplingConfig,
     ) -> Result<SelectorOutput, String> {
         let logits_shape = mlxcel_core::array_shape(unary);
         let batch = logits_shape[0];
@@ -1116,12 +1121,26 @@ impl CandidateSelector {
         let hidden_proj = self.hidden_projection.forward(hidden);
         let rank = mlxcel_core::array_shape(&hidden_proj)[2];
 
-        // Sequential greedy walk (equivalent to following the SGLang lattice
-        // maps `maps[e][path[e]]`). Edges follow the authoritative einsum
-        // `"blpr,blcr->blpc"`: pred*proj(h) dotted with the successor rows.
+        // Edges follow the authoritative einsum "blpr,blcr->blpc".
+        // Each row conditions on the predecessor actually selected.
         let anchor = mlxcel_core::reshape(anchor_ids, &[batch]);
         let mut predecessor = anchor; // [B] int32
         let mut path_rows = Vec::with_capacity(npos as usize);
+        let stochastic = !mlxcel_core::speculative::stochastic_accept::sampler_is_greedy(sampling);
+        let proposal_sampling = mlxcel_core::generate::SamplingConfig {
+            temperature: sampling.temperature,
+            // A cutoff covering the entire compact domain is no filter.
+            // Passing the target-vocabulary cutoff directly can exceed K.
+            top_k: if sampling.top_k > 0 && sampling.top_k < k {
+                sampling.top_k
+            } else {
+                0
+            },
+            top_p: sampling.top_p,
+            min_p: sampling.min_p,
+            ..mlxcel_core::generate::SamplingConfig::default()
+        };
+        let mut proposal_probs = Vec::with_capacity(if stochastic { npos as usize } else { 0 });
         for position in 0..npos {
             let pred_emb = mlxcel_core::embedding(&self.predecessor_codebook, &predecessor); // [B, rank]
             let candidate_slice =
@@ -1149,17 +1168,31 @@ impl CandidateSelector {
             } else {
                 mlxcel_core::add(&unary_row, &multiply_scalar(&edges, edge_scale))
             }; // [B, K]
-            let selected = mlxcel_core::argmax(&scores, -1, false); // [B]
-            let candidate_row =
-                mlxcel_core::slice(candidates, &[0, position, 0], &[batch, position + 1, k]);
-            let selected_emb = mlxcel_core::expand_dims(&selected, -1); // [B, 1]
+            let scores = mlxcel_core::reshape(&scores, &[batch, k]);
+            let selected = if stochastic {
+                let (token, probs) = mlxcel_core::sampling::sample_token_with_distribution(
+                    &scores,
+                    &proposal_sampling,
+                    &[],
+                );
+                proposal_probs.push(probs);
+                token
+            } else {
+                mlxcel_core::argmax(&scores, -1, false)
+            };
+            let candidate_row = mlxcel_core::reshape(&candidate_slice, &[batch, k]);
+            let selected_emb = mlxcel_core::reshape(&selected, &[batch, 1]);
             let selected_id = mlxcel_core::take_along_axis(&candidate_row, &selected_emb, -1); // [B, 1]
             predecessor = mlxcel_core::reshape(&selected_id, &[batch]); // [B]
             path_rows.push(mlxcel_core::share(&predecessor));
         }
         let path_ptrs = path_rows.iter().map(|row| row.as_ptr()).collect::<Vec<_>>();
         let path = mlxcel_core::stack(&path_ptrs, 1);
-        Ok(SelectorOutput { path })
+        Ok(SelectorOutput {
+            path,
+            proposal_probs,
+            candidates: mlxcel_core::share(candidates),
+        })
     }
 }
 
@@ -1336,7 +1369,7 @@ impl DFlash2DraftModel {
     }
 
     /// One masked-forward draft round: hidden → target-head top-K candidates
-    /// → greedy selector path. Returns `[1, bs-1]` draft tokens.
+    /// → conditional selector path. Returns `[1, bs-1]` draft tokens.
     pub fn propose(
         &self,
         inputs: &MlxArray,
@@ -1344,6 +1377,7 @@ impl DFlash2DraftModel {
         caches: &mut [DFlash2KVCache],
         target: &Qwen35Model,
         selector_edge_scale: f32,
+        sampling: &mlxcel_core::generate::SamplingConfig,
     ) -> Result<SelectorOutput, String> {
         let hidden = self.hidden_states(inputs, target_hidden, caches);
         let hidden_shape = mlxcel_core::array_shape(&hidden);
@@ -1362,6 +1396,7 @@ impl DFlash2DraftModel {
             &unary,
             &anchor,
             selector_edge_scale,
+            sampling,
         )
     }
 }
@@ -1717,7 +1752,7 @@ impl Dflash2Calibration {
 }
 
 // ---------------------------------------------------------------------------
-// # 8. Greedy round loop + generator
+// # 8. Distribution-preserving round loop + generator
 // ---------------------------------------------------------------------------
 
 /// Detached target state and target-layer hidden context at an exact prompt
@@ -1982,12 +2017,90 @@ fn committed_dflash2_rows(accepted: usize, emitted: usize) -> usize {
     1 + accepted.min(emitted)
 }
 
+/// Verify only the reachable prefix. The full-vocabulary target distribution
+/// includes every target penalty/filter; q is zero outside its compact support.
+/// Temporarily append accepted tokens to the existing history rather than
+/// copying a long prompt each round. Emission owns the permanent history update.
+fn stochastic_dflash2_walk(
+    proposal: &SelectorOutput,
+    verify_logits: &MlxArray,
+    sampling: &mlxcel_core::generate::SamplingConfig,
+    history: &mut Vec<i32>,
+    eos_tokens: &[i32],
+    max_new_tokens: usize,
+    sampler_state: &mut Option<mlxcel_core::sampling::SamplerState>,
+) -> (mlxcel_core::speculative::mtp::walk::WalkResult, Vec<i32>) {
+    use mlxcel_core::sampling::effective_token_distribution_with_state;
+    use mlxcel_core::speculative::mtp::walk::WalkResult;
+    use mlxcel_core::speculative::stochastic_accept::{
+        AcceptanceRule, DraftVerdict, note_rule, verify_draft_token,
+    };
+
+    note_rule(AcceptanceRule::Stochastic);
+    mlxcel_core::eval(&proposal.path);
+    let draft_tokens = mlxcel_core::array_evaluated_bytes(&proposal.path)
+        .chunks_exact(4)
+        .map(|bytes| i32::from_ne_bytes(bytes.try_into().expect("i32 token bytes")))
+        .collect::<Vec<_>>();
+    let shape = mlxcel_core::array_shape(verify_logits);
+    let candidate_shape = mlxcel_core::array_shape(&proposal.candidates);
+    let initial_history_len = history.len();
+    let mut walk = WalkResult {
+        accepted: 0,
+        new_tokens: Vec::with_capacity((draft_tokens.len() + 1).min(max_new_tokens)),
+    };
+    for position in 0..=draft_tokens.len() {
+        if walk.new_tokens.len() == max_new_tokens {
+            break;
+        }
+        let row = position as i32;
+        let logits = mlxcel_core::slice(verify_logits, &[0, row, 0], &[1, row + 1, shape[2]]);
+        let p = effective_token_distribution_with_state(&logits, sampling, history, sampler_state);
+        if position == draft_tokens.len() {
+            // Sample the already-transformed p, not the logits again: a
+            // randomized preprocessing filter must be evaluated exactly once.
+            let token = mlxcel_core::fused_sample(&mlxcel_core::log(&p), 1.0, 0, 1.0, 0.0);
+            mlxcel_core::eval(&token);
+            walk.new_tokens.push(mlxcel_core::item_i32(&token));
+            break;
+        }
+        let ids = mlxcel_core::slice(
+            &proposal.candidates,
+            &[0, row, 0],
+            &[1, row + 1, candidate_shape[2]],
+        );
+        let ids = mlxcel_core::reshape(&ids, &[1, candidate_shape[2]]);
+        let q = mlxcel_core::put_along_axis(
+            &mlxcel_core::zeros(&[1, shape[2]], mlxcel_core::dtype::FLOAT32),
+            &ids,
+            &proposal.proposal_probs[position],
+            -1,
+        );
+        match verify_draft_token(&p, &q, draft_tokens[position]) {
+            DraftVerdict::Accept => {
+                let token = draft_tokens[position];
+                walk.accepted += 1;
+                walk.new_tokens.push(token);
+                if eos_tokens.contains(&token) {
+                    break;
+                }
+                history.push(token);
+            }
+            DraftVerdict::Reject { replacement } => {
+                walk.new_tokens.push(replacement);
+                break;
+            }
+        }
+    }
+    history.truncate(initial_history_len);
+    (walk, draft_tokens)
+}
+
 /// DFlash2 generation driver: prefill → speculative draft/verify rounds.
 ///
-/// B=1 greedy only: `sampling` must be temperature-0 / top-k-1 (the
-/// stochastic DFlash2 rejection-sampling path is not ported). Lossless by
-/// construction: the greedy walk only accepts draft tokens that match the
-/// target's argmax.
+/// B=1 exact target sampling: greedy comparison for deterministic samplers,
+/// otherwise maximal-coupling acceptance with full-vocabulary correction and
+/// bonus distributions.
 pub struct Qwen35Dflash2Generator {
     model: DFlash2DraftModel,
     caches: Vec<DFlash2KVCache>,
@@ -2099,7 +2212,7 @@ impl Qwen35Dflash2Generator {
                 // A restored standalone prefix may still hold initial FP16
                 // state. Finalization is idempotent for already-finished
                 // prompt and terminal snapshots.
-                target.finish_dflash_prefill();
+                target.finish_initial_prefill();
                 continue;
             }
             let input = mlxcel_core::from_slice_i32(
@@ -2151,7 +2264,7 @@ impl Qwen35Dflash2Generator {
         ))
     }
 
-    /// Generate greedily with DFlash2 draft verification.
+    /// Generate with distribution-preserving DFlash2 draft verification.
     pub fn generate_streaming<F: FnMut(i32) -> bool>(
         &mut self,
         target: &Qwen35Model,
@@ -2163,6 +2276,14 @@ impl Qwen35Dflash2Generator {
         capture_final_snapshot: bool,
         mut on_token: F,
     ) -> Result<Dflash2Generation, String> {
+        let mut resolved_sampling = sampling.clone();
+        resolved_sampling
+            .prompt_token_count
+            .get_or_insert(prompt_tokens.len());
+        resolved_sampling
+            .token_bias
+            .suppress_tokens(&target.output_suppressed_token_ids());
+        let sampling = &resolved_sampling;
         mlxcel_core::generation_policy::seed_rng_if_needed(sampling);
         let eos_tokens = mlxcel_core::generation_policy::merged_eos_token_ids(
             target.eos_token_ids(),
@@ -2289,6 +2410,7 @@ impl Qwen35Dflash2Generator {
         let decode_start = Instant::now();
         let mut draft_block =
             vec![self.model.config.mask_token_id; DFLASH2_STATIC_VERIFY_WIDTHS[1]];
+        let mut sampler_state = None;
         let mut projected_prefix_to_capture = reusable
             .filter(|_| {
                 !projected_cache_hit && !segmented_prefill && self.hidden_limit != usize::MAX
@@ -2319,6 +2441,7 @@ impl Qwen35Dflash2Generator {
                 &mut self.caches,
                 target,
                 policy.selector_edge_scale,
+                sampling,
             )?;
             let pending_projected_prefix =
                 projected_prefix_to_capture
@@ -2347,13 +2470,25 @@ impl Qwen35Dflash2Generator {
             stats.target_forward_calls += 1;
             stats.speculative_rounds += 1;
 
-            let (walk, draft_tokens) = crate::qwen3_5_mtp::greedy_walk_device_proposals(
-                &out.path,
-                &verify.logits,
-                sampling,
-                &history,
-                remaining,
-            );
+            let (walk, draft_tokens) = if out.proposal_probs.is_empty() {
+                crate::qwen3_5_mtp::greedy_walk_device_proposals(
+                    &out.path,
+                    &verify.logits,
+                    sampling,
+                    &history,
+                    remaining,
+                )
+            } else {
+                stochastic_dflash2_walk(
+                    &out,
+                    &verify.logits,
+                    sampling,
+                    &mut history,
+                    &eos_tokens,
+                    remaining,
+                    &mut sampler_state,
+                )
+            };
             if let Some(projected_prefix) = pending_projected_prefix {
                 // The target walk above has synchronized every draft ancestor.
                 // Detaching here retains only the bounded committed K/V, not
@@ -2569,6 +2704,141 @@ mod tests {
             logits[position * vocab + token as usize] = 100.0;
         }
         mlxcel_core::from_slice_f32(&logits, &[1, target_tokens.len() as i32, vocab as i32])
+    }
+
+    #[test]
+    fn stochastic_walk_preserves_history_penalties_and_outside_support_correction() {
+        let proposal = SelectorOutput {
+            path: mlxcel_core::from_slice_i32(&[1, 1], &[1, 2]),
+            candidates: mlxcel_core::from_slice_i32(&[1, 1], &[1, 2, 1]),
+            proposal_probs: vec![
+                mlxcel_core::from_slice_f32(&[1.0], &[1, 1]),
+                mlxcel_core::from_slice_f32(&[1.0], &[1, 1]),
+            ],
+        };
+        let logits = mlxcel_core::from_slice_f32(
+            &[
+                -100.0, 2.0, -100.0, 0.0, -100.0, 2.0, -100.0, 0.0, -100.0, 2.0, -100.0, 0.0,
+            ],
+            &[1, 3, 4],
+        );
+        let sampling = SamplingConfig {
+            temperature: 1.0,
+            top_p: 0.01,
+            presence_penalty: 3.0,
+            prompt_token_count: Some(1),
+            ..Default::default()
+        };
+        let mut history = vec![1];
+        let (walk, _) = stochastic_dflash2_walk(
+            &proposal,
+            &logits,
+            &sampling,
+            &mut history,
+            &[],
+            3,
+            &mut None,
+        );
+        assert_eq!(walk.accepted, 1);
+        assert_eq!(walk.new_tokens, [1, 3]);
+        assert_eq!(history, [1]);
+    }
+
+    #[test]
+    fn stochastic_walk_samples_full_vocabulary_bonus_and_stops_at_budget_or_eos() {
+        let proposal = SelectorOutput {
+            path: mlxcel_core::from_slice_i32(&[1], &[1, 1]),
+            candidates: mlxcel_core::from_slice_i32(&[1], &[1, 1, 1]),
+            proposal_probs: vec![mlxcel_core::from_slice_f32(&[1.0], &[1, 1])],
+        };
+        let logits = verify_logits(&[1, 3], 4);
+        let sampling = SamplingConfig {
+            temperature: 1.0,
+            ..Default::default()
+        };
+        let mut history = vec![0];
+        let (walk, _) = stochastic_dflash2_walk(
+            &proposal,
+            &logits,
+            &sampling,
+            &mut history,
+            &[],
+            2,
+            &mut None,
+        );
+        assert_eq!(walk.accepted, 1);
+        assert_eq!(walk.new_tokens, [1, 3]);
+        for (eos, budget) in [(&[1][..], 2), (&[][..], 1)] {
+            let (walk, _) = stochastic_dflash2_walk(
+                &proposal,
+                &logits,
+                &sampling,
+                &mut history,
+                eos,
+                budget,
+                &mut None,
+            );
+            assert_eq!(walk.accepted, 1);
+            assert_eq!(walk.new_tokens, [1]);
+            assert_eq!(history, [0]);
+        }
+    }
+
+    #[test]
+    fn stochastic_selector_retains_distribution_conditioned_on_sampled_predecessor() {
+        let mut weights = WeightMap::new();
+        weights.insert(
+            "candidate_selector.predecessor_codebook".to_owned(),
+            mlxcel_core::from_slice_f32(&[0.0, 2.0, -2.0, 0.0], &[4, 1]),
+        );
+        weights.insert(
+            "candidate_selector.successor_codebook".to_owned(),
+            mlxcel_core::from_slice_f32(&[0.0, 0.0, 1.0, -1.0], &[4, 1]),
+        );
+        weights.insert(
+            "candidate_selector.hidden_projection.weight".to_owned(),
+            mlxcel_core::from_slice_f32(&[1.0], &[1, 1]),
+        );
+        let selector = CandidateSelector::from_weights(
+            &weights,
+            &DFlash2Config {
+                hidden_size: 1,
+                selector_rank: 1,
+                selector_top_k: 2,
+                ..Default::default()
+            },
+        )
+        .expect("tiny selector");
+        let hidden = mlxcel_core::from_slice_f32(&[1.0, 1.0], &[1, 2, 1]);
+        let candidates = mlxcel_core::from_slice_i32(&[1, 2, 2, 3], &[1, 2, 2]);
+        let unary = mlxcel_core::from_slice_f32(&[0.0; 4], &[1, 2, 2]);
+        let anchor = mlxcel_core::from_slice_i32(&[0], &[1]);
+        let sampling = SamplingConfig {
+            temperature: 1.0,
+            top_k: 20,
+            ..Default::default()
+        };
+        for seed in 0..16 {
+            mlxcel_core::random_seed(seed);
+            let out = selector
+                .select(&hidden, &candidates, &unary, &anchor, 1.0, &sampling)
+                .expect("stochastic selector");
+            let path = raw_i32(&out.path);
+            assert!(matches!(path[0], 1 | 2));
+            assert!(matches!(path[1], 2 | 3));
+            let q0 = raw_f32(&out.proposal_probs[0]);
+            assert_eq!(q0, [0.5, 0.5]);
+            let q1 = raw_f32(&out.proposal_probs[1]);
+            let expected = 1.0
+                / (1.0
+                    + if path[0] == 1 {
+                        (-4.0_f32).exp()
+                    } else {
+                        4.0_f32.exp()
+                    });
+            assert!((q1[0] - expected).abs() < 1e-6);
+            assert!((q1[1] - (1.0 - expected)).abs() < 1e-6);
+        }
     }
 
     fn fixture_config_json() -> Value {
@@ -2849,10 +3119,30 @@ mod tests {
         let anchor = mlxcel_core::from_slice_i32(&[0], &[1]);
 
         let unary_favored = selector
-            .select(&hidden, &candidates, &unary, &anchor, 0.75)
+            .select(
+                &hidden,
+                &candidates,
+                &unary,
+                &anchor,
+                0.75,
+                &mlxcel_core::generate::SamplingConfig {
+                    temperature: 0.0,
+                    ..Default::default()
+                },
+            )
             .expect("low correlation scale");
         let correlation_favored = selector
-            .select(&hidden, &candidates, &unary, &anchor, 1.25)
+            .select(
+                &hidden,
+                &candidates,
+                &unary,
+                &anchor,
+                1.25,
+                &mlxcel_core::generate::SamplingConfig {
+                    temperature: 0.0,
+                    ..Default::default()
+                },
+            )
             .expect("high correlation scale");
         assert_eq!(raw_i32(&unary_favored.path), [1]);
         assert_eq!(raw_i32(&correlation_favored.path), [2]);
@@ -3185,7 +3475,15 @@ mod tests {
             prompt.len() > hidden_limit + 32,
             "fixture must exercise hidden-window eviction"
         );
-        let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(7));
+        let sampling = provider.baseline_sampling(
+            true,
+            crate::SamplingOptions {
+                temperature: Some(0.0),
+                top_p: Some(1.0),
+                seed: Some(7),
+                ..Default::default()
+            },
+        );
         let control = provider
             .generate_dflash2_baseline_streaming(
                 &prompt,

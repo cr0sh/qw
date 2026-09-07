@@ -2,6 +2,7 @@
 // Direct C++ bridge implementation for MLX via cxx
 
 #include "mlx_cxx_internal.h"
+#include "mlxcel-core/src/lib.rs.h"
 
 #include "mlx/primitives.h"
 
@@ -351,12 +352,7 @@ rust::Vec<uint8_t> array_to_raw_bytes(const MlxArray& arr) {
     size_t nbytes = a.nbytes();
     const auto* data = reinterpret_cast<const uint8_t*>(a.data<void>());
 
-    rust::Vec<uint8_t> result;
-    result.reserve(nbytes);
-    for (size_t i = 0; i < nbytes; ++i) {
-        result.push_back(data[i]);
-    }
-    return result;
+    return copy_bytes_to_vec(rust::Slice<const uint8_t>(data, nbytes));
 }
 
 rust::Vec<uint8_t> array_evaluated_bytes(const MlxArray& arr) {
@@ -380,12 +376,7 @@ rust::Vec<uint8_t> array_evaluated_bytes(const MlxArray& arr) {
     size_t nbytes = a.nbytes();
     const auto* data = reinterpret_cast<const uint8_t*>(a.data<void>());
 
-    rust::Vec<uint8_t> result;
-    result.reserve(nbytes);
-    for (size_t i = 0; i < nbytes; ++i) {
-        result.push_back(data[i]);
-    }
-    return result;
+    return copy_bytes_to_vec(rust::Slice<const uint8_t>(data, nbytes));
 }
 
 // Same body as `array_to_raw_bytes`, but declared `-> Result<Vec<u8>>` on the
@@ -402,12 +393,7 @@ rust::Vec<uint8_t> try_array_to_raw_bytes(const MlxArray& arr) {
     size_t nbytes = a.nbytes();
     const auto* data = reinterpret_cast<const uint8_t*>(a.data<void>());
 
-    rust::Vec<uint8_t> result;
-    result.reserve(nbytes);
-    for (size_t i = 0; i < nbytes; ++i) {
-        result.push_back(data[i]);
-    }
-    return result;
+    return copy_bytes_to_vec(rust::Slice<const uint8_t>(data, nbytes));
 }
 
 // Evaluation.
@@ -931,6 +917,15 @@ std::unique_ptr<MlxArray> equal(const MlxArray& a, const MlxArray& b) {
 
 void random_seed(uint64_t seed) {
     mlx::core::random::seed(seed);
+}
+
+uint64_t random_fork_seed() {
+    // Reserve an unused branch, independent of draws already made by this request.
+    // random::key(seed) reconstructs these high/low uint32 words exactly.
+    auto key = mlx::core::random::KeySequence::default_().next();
+    key.eval();
+    const auto* words = key.data<uint32_t>();
+    return (static_cast<uint64_t>(words[0]) << 32) | words[1];
 }
 
 std::unique_ptr<MlxArray> random_categorical(const MlxArray& logits, int32_t axis) {

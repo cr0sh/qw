@@ -20,7 +20,9 @@
 //! `distribution_tests.rs`.
 
 use super::*;
-use crate::sampling::effective_token_distribution;
+use crate::sampling::{
+    SamplerState, effective_token_distribution, effective_token_distribution_with_state,
+};
 
 /// Upper-tail chi-square critical values at alpha = 1e-4.
 ///
@@ -313,17 +315,138 @@ fn effective_distribution_zeroes_the_filtered_tail() {
         top_k: 2,
         ..SamplingConfig::default()
     };
-    let got = to_host(&effective_token_distribution(
-        &logits_tensor(&logits),
-        &config,
-        &[],
-    ));
+    let p = effective_token_distribution(&logits_tensor(&logits), &config, &[]);
+    let got = to_host(&p);
     assert!(got[0] > 0.0 && got[1] > 0.0);
     for (i, &v) in got.iter().enumerate().skip(2) {
         assert_eq!(v, 0.0, "token {i} is outside top-2 and must carry no mass");
     }
     let sum: f32 = got.iter().sum();
     assert!((sum - 1.0).abs() < 1e-5);
+    // Exercise the filter-to-acceptance boundary, not only hand-built zeros.
+    let q = probs_row(&[0.0, 0.0, 1.0, 0.0, 0.0, 0.0]);
+    assert!(!accept_draft_token(&p, &q, 2));
+}
+
+/// Incremental penalties must agree with independently computed penalized
+/// logits, including negative repetition logits, repeated counts, and rollback.
+#[test]
+fn stateful_distribution_preserves_penalties_filters_and_rollback() {
+    let logits = [3.0f32, -0.5, 2.0, 1.0, 0.25];
+    let mut config = SamplingConfig {
+        temperature: 0.7,
+        repetition_penalty: 1.25,
+        frequency_penalty: 0.4,
+        presence_penalty: 1.5,
+        ..SamplingConfig::default()
+    };
+    let mut state: Option<SamplerState> = None;
+    for history in [
+        &[0, 1, 0][..],
+        &[0, 1, 0, 2, 0][..],
+        &[0, 1][..],
+        &[0, 1, 3][..],
+    ] {
+        let penalized: Vec<f32> = logits
+            .iter()
+            .enumerate()
+            .map(|(token, &value)| {
+                let count = history.iter().filter(|&&id| id == token as i32).count();
+                if count == 0 {
+                    value
+                } else {
+                    let repeated = if value < 0.0 {
+                        value * 1.25
+                    } else {
+                        value / 1.25
+                    };
+                    repeated - (0.4 * count as f32 + 1.5)
+                }
+            })
+            .collect();
+        let got = to_host(&effective_token_distribution_with_state(
+            &logits_tensor(&logits),
+            &config,
+            history,
+            &mut state,
+        ));
+        for (actual, expected) in got.iter().zip(softmax(&penalized, config.temperature)) {
+            assert!((f64::from(*actual) - expected).abs() < 1e-5);
+        }
+        // Filters must run after penalties, through the same sampler pipeline.
+        config.top_k = 3;
+        config.top_p = 0.8;
+        config.min_p = 0.1;
+        let filtered = to_host(&effective_token_distribution_with_state(
+            &logits_tensor(&logits),
+            &config,
+            history,
+            &mut state,
+        ));
+        let rebuilt = to_host(&effective_token_distribution(
+            &logits_tensor(&logits),
+            &config,
+            history,
+        ));
+        for (actual, expected) in filtered.iter().zip(rebuilt) {
+            assert!((actual - expected).abs() < 1e-6);
+        }
+        config.top_k = 0;
+        config.top_p = 1.0;
+        config.min_p = 0.0;
+    }
+}
+
+/// Prompt repetition still applies, but only actual output contributes presence
+/// and frequency counts. A rejected speculative suffix must disappear on rollback.
+#[test]
+fn output_count_penalties_exclude_prompt_and_rolled_back_draft_tokens() {
+    let config = SamplingConfig {
+        temperature: 1.0,
+        repetition_penalty: 2.0,
+        presence_penalty: 1.5,
+        frequency_penalty: 0.25,
+        prompt_token_count: Some(3),
+        ..SamplingConfig::default()
+    };
+    let logits = logits_tensor(&[4.0, 2.0, 0.0]);
+    let mut state = None;
+    // Prompt contains token 0 twice, yet its initial logit is only divided by
+    // repetition. Once emitted, its count penalty is 1.5 + 0.25, not 1.5 + 0.75.
+    let steps: &[(&[i32], [f32; 3])] = &[
+        (&[0, 0, 1], [2.0, 1.0, 0.0]),
+        (&[0, 0, 1, 0], [0.25, 1.0, 0.0]),
+        (&[0, 0, 1, 0, 0, 2], [0.0, 1.0, -1.75]),
+        (&[0, 0, 1, 0], [0.25, 1.0, 0.0]),
+        (&[0, 0, 1], [2.0, 1.0, 0.0]),
+        (&[0, 0, 1, 1], [2.0, -0.75, 0.0]),
+    ];
+    for &(history, penalized) in steps {
+        let incremental = to_host(&effective_token_distribution_with_state(
+            &logits, &config, history, &mut state,
+        ));
+        let rebuilt = to_host(&effective_token_distribution(&logits, &config, history));
+        let expected = softmax(&penalized, 1.0);
+        for ((actual, fresh), expected) in incremental.iter().zip(rebuilt).zip(expected) {
+            assert!((f64::from(*actual) - expected).abs() < 1e-5);
+            assert!((f64::from(fresh) - expected).abs() < 1e-5);
+        }
+    }
+    // A rejected token becomes the target's best next token. Ghost output
+    // counts for token 2 would suppress it below the untouched zero logits.
+    let greedy = SamplingConfig {
+        temperature: 0.0,
+        top_k: 1,
+        ..config
+    };
+    let (next, _) = crate::sampling::sample_token_optimized_with_state(
+        &logits_tensor(&[0.0, 0.0, 1.0]),
+        &greedy,
+        &[0, 0, 1],
+        &mut state,
+    );
+    ffi::eval(&next);
+    assert_eq!(ffi::item_i32(&next), 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -416,6 +539,23 @@ fn acceptance_probability_matches_the_min_one_ratio() {
 // ---------------------------------------------------------------------------
 // residual_resample
 // ---------------------------------------------------------------------------
+
+/// A compact proposal scattered at noncontiguous ids must leave the target's
+/// outside-support mass intact. The sole positive residual is token 3, so the
+/// replacement is deterministic despite using the real stochastic sampler.
+#[test]
+fn compact_proposal_residual_recovers_target_mass_outside_candidates() {
+    let p = probs_row(&[0.25, 0.0, 0.25, 0.5]);
+    let candidates = ffi::from_slice_i32(&[0, 2], &[1, 2]);
+    let compact_q = probs_row(&[0.75, 0.25]);
+    let q = ffi::put_along_axis(&probs_row(&[0.0; 4]), &candidates, &compact_q, -1);
+    assert_eq!(to_host(&q), vec![0.75, 0.0, 0.25, 0.0]);
+    // Equal shared mass is accepted, never spuriously sent to the residual.
+    assert!(accept_draft_token(&p, &q, 2));
+    let (replacement, outcome) = residual_resample(&p, &q);
+    assert_eq!(outcome, AcceptanceOutcome::ResidualResample);
+    assert_eq!(replacement, 3);
+}
 
 /// The residual draw must follow `normalize(relu(p - q))`.
 ///

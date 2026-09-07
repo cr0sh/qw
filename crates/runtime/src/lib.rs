@@ -41,7 +41,7 @@ pub use provider::{
     ChatTool, ChatToolCall, ChatToolCallFunction, ChatToolFunction, GenerationOutput,
     GenerationRequest, MtpGenerationStats, MtpPrefixReuse, MtpPromptSnapshot,
     PreparedMultimodalPrefill, PromptSnapshot, Qwen35GenerationMode, Qwen35Provider,
-    select_qwen35_decoder,
+    SamplingOptions, select_qwen35_decoder,
 };
 #[cfg(any(feature = "dflash2", test))]
 pub use provider::{Dflash2GenerationStats, Dflash2PrefixReuse, Dflash2PromptSnapshot};

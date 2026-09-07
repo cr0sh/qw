@@ -379,6 +379,9 @@ std::unique_ptr<MlxArray> equal(const MlxArray& a, const MlxArray& b);
 // Seed the global MLX random number generator
 void random_seed(uint64_t seed);
 
+// Reserve an independent continuation branch from the current thread's RNG.
+uint64_t random_fork_seed();
+
 // Random categorical sampling
 std::unique_ptr<MlxArray> random_categorical(const MlxArray& logits, int32_t axis);
 

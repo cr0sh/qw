@@ -231,14 +231,8 @@ pub fn apply_token_bias(logits: &MlxArray, bias: &TokenBiasMap) -> UniquePtr<Mlx
     *sparse_shape.last_mut().unwrap() = tokens.len() as i32;
     let mut update_shape = shape;
     *update_shape.last_mut().unwrap() = tokens.len() as i32;
-    let indices = ffi::broadcast_to(
-        &ffi::from_slice_i32(&tokens, &sparse_shape),
-        &update_shape,
-    );
-    let values = ffi::broadcast_to(
-        &ffi::from_slice_f32(&biases, &sparse_shape),
-        &update_shape,
-    );
+    let indices = ffi::broadcast_to(&ffi::from_slice_i32(&tokens, &sparse_shape), &update_shape);
+    let values = ffi::broadcast_to(&ffi::from_slice_f32(&biases, &sparse_shape), &update_shape);
     let selected = ffi::take_along_axis(logits, &indices, -1);
     let updated = ffi::add(&selected, &values);
     ffi::put_along_axis(logits, &indices, &updated, -1)
@@ -408,8 +402,15 @@ fn preprocess_logits_for_sampling(
         last_logits
     };
 
+    // OpenAI-style count penalties apply only to output generated this request.
+    // Repetition and DRY above deliberately retain the complete history.
+    let output_start = config
+        .prompt_token_count
+        .unwrap_or(0)
+        .min(token_history.len());
+    let output_history = &token_history[output_start..];
     let last_logits = if (config.frequency_penalty != 0.0 || config.presence_penalty != 0.0)
-        && !token_history.is_empty()
+        && !output_history.is_empty()
     {
         match &mut state {
             Some(s) => s.apply_frequency_presence(
@@ -419,7 +420,7 @@ fn preprocess_logits_for_sampling(
             ),
             None => apply_frequency_presence_penalty(
                 &last_logits,
-                token_history,
+                output_history,
                 config.frequency_penalty,
                 config.presence_penalty,
             ),
@@ -454,8 +455,10 @@ fn preprocess_logits_for_sampling(
 /// indicator at the argmax, which is the correct degenerate proposal
 /// distribution for a greedily-proposing drafter.
 ///
-/// Consumes no randomness: safe to call without perturbing the token stream of
-/// any other sampler on the same RNG key sequence.
+/// Consumes no randomness unless XTC is enabled. With XTC, this performs one
+/// random gate draw and returns the distribution conditional on that gate.
+/// Retain this tensor for acceptance and residual sampling; recomputing it can
+/// choose a different gate and therefore a different distribution.
 ///
 /// Used by: `speculative::stochastic_accept`
 pub fn effective_token_distribution(
@@ -473,14 +476,44 @@ pub fn effective_token_distribution(
     )
 }
 
+/// Stateful counterpart of [`effective_token_distribution`].
+///
+/// Reuses the incremental penalty state from [`sample_token_optimized_with_state`]
+/// instead of rebuilding history counts and full-vocabulary penalty buffers at
+/// each target position. Keep the config fixed while reusing the state, and
+/// reset it when replacing history other than by appending or truncating a suffix.
+/// Preprocessing (including the optional random XTC gate) runs exactly once.
+pub fn effective_token_distribution_with_state(
+    logits: &MlxArray,
+    config: &SamplingConfig,
+    token_history: &[i32],
+    state: &mut Option<SamplerState>,
+) -> UniquePtr<MlxArray> {
+    if state.is_none()
+        && (config.repetition_penalty != 1.0
+            || config.frequency_penalty != 0.0
+            || config.presence_penalty != 0.0)
+    {
+        *state = Some(SamplerState::for_config(config));
+    }
+    let processed = preprocess_logits_for_sampling(logits, config, token_history, state.as_mut());
+    ffi::fused_sample_probs(
+        &processed,
+        config.temperature,
+        config.top_k,
+        config.top_p,
+        config.min_p,
+    )
+}
+
 /// Sample one token *and* return the distribution it was drawn from.
 ///
-/// Equivalent to [`sample_token_optimized`] followed by
-/// [`effective_token_distribution`], but the (potentially expensive) bias and
-/// penalty pre-steps run once instead of twice. The returned token is the same
-/// array [`sample_token_optimized`] returns for the same inputs and RNG state:
-/// the extra distribution tensor is a pure function of the pre-sampler logits
-/// and draws nothing from the RNG stream.
+/// Uses the same pipeline as [`sample_token_optimized`] and
+/// [`effective_token_distribution`], with bias, penalties, and the optional
+/// random XTC gate applied only once. Calling those two APIs separately is not
+/// equivalent when XTC is enabled because they draw independent gates.
+/// The returned token is the same array [`sample_token_optimized`] returns for
+/// the same inputs and RNG state; deriving its distribution draws no extra RNG.
 ///
 /// Returns `(token, probs)` where `probs` is float32 `[batch, vocab]`.
 ///
@@ -947,9 +980,11 @@ pub struct SamplerState {
     track_seen: bool,
     /// Maintain `counts` (frequency or presence penalty is active).
     track_counts: bool,
+    /// Absolute history boundary: prompt ids never contribute output counts.
+    prompt_token_count: usize,
     /// Sorted, deduplicated seen token ids (repetition penalty input).
     seen_sorted: Vec<i32>,
-    /// Per-token occurrence counts (frequency/presence penalty input).
+    /// Per-token generated-output counts (frequency/presence penalty input).
     counts: HashMap<i32, usize>,
     /// Reusable scratch buffer: touched token ids for the sparse penalty.
     sparse_idx: Vec<i32>,
@@ -970,18 +1005,19 @@ impl SamplerState {
         Self {
             track_seen: config.repetition_penalty != 1.0,
             track_counts: config.frequency_penalty != 0.0 || config.presence_penalty != 0.0,
+            prompt_token_count: config.prompt_token_count.unwrap_or(0),
             ..Self::default()
         }
     }
 
     /// Absorb a single newly appended token into the tracked structures.
-    fn absorb_one(&mut self, token: i32) {
+    fn absorb_one(&mut self, token: i32, position: usize) {
         if self.track_seen
             && let Err(pos) = self.seen_sorted.binary_search(&token)
         {
             self.seen_sorted.insert(pos, token);
         }
-        if self.track_counts {
+        if self.track_counts && position >= self.prompt_token_count {
             *self.counts.entry(token).or_insert(0) += 1;
         }
     }
@@ -992,8 +1028,8 @@ impl SamplerState {
     fn rebuild(&mut self, history: &[i32]) {
         self.seen_sorted.clear();
         self.counts.clear();
-        for &t in history {
-            self.absorb_one(t);
+        for (position, &t) in history.iter().enumerate() {
+            self.absorb_one(t, position);
         }
         self.absorbed_len = history.len();
         self.tip_token = history.last().copied().unwrap_or(0);
@@ -1015,8 +1051,8 @@ impl SamplerState {
             self.rebuild(history);
             return;
         }
-        for &t in &history[self.absorbed_len..] {
-            self.absorb_one(t);
+        for (offset, &t) in history[self.absorbed_len..].iter().enumerate() {
+            self.absorb_one(t, self.absorbed_len + offset);
         }
         self.absorbed_len = n;
         if n > 0 {

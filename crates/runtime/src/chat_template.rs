@@ -242,23 +242,6 @@ impl ChatTemplateProcessor {
         })
     }
 
-    pub(crate) fn render_user(&self, prompt: &str) -> Result<String> {
-        self.render_messages(
-            &[ChatMessage {
-                role: "user".to_string(),
-                name: None,
-                content: Some(ChatMessageContent::Text(prompt.to_string())),
-                reasoning_content: None,
-                tool_calls: Vec::new(),
-                tool_call_id: None,
-            }],
-            &[],
-            None,
-            true,
-            true,
-        )
-    }
-
     pub(crate) fn render_messages(
         &self,
         messages: &[ChatMessage],
@@ -634,17 +617,13 @@ assistant:{{ content }}
     }
 
     #[test]
-    fn empty_tools_and_render_user_keep_ordinary_chat() {
+    fn empty_tools_keep_ordinary_chat() {
         let processor = processor();
         let rendered = processor
             .render_messages(&[user("hello")], &[], None, true, true)
             .expect("render without tools");
         assert_eq!(rendered, "user:helloassistant:");
         assert!(!rendered.contains("<tools>"));
-        assert_eq!(
-            processor.render_user("hello").expect("render user"),
-            rendered
-        );
         assert_eq!(
             processor
                 .render_messages(&[user("hello")], &[], None, true, false)

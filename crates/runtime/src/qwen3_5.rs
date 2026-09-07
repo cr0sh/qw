@@ -1175,16 +1175,11 @@ impl Qwen35Model {
             .collect()
     }
 
-    fn finish_initial_prefill(&self) {
+    pub(crate) fn finish_initial_prefill(&self) {
         self.sequence_state.with_internal(|caches| {
             finish_initial_attention_prefill(caches, self.kv_cache_mode);
         });
         self.initial_prefill_complete.store(true, Ordering::Relaxed);
-    }
-
-    #[cfg(any(feature = "dflash2", test))]
-    pub(crate) fn finish_dflash_prefill(&self) {
-        self.finish_initial_prefill();
     }
 
     pub(crate) fn has_mtp(&self) -> bool {
@@ -1311,8 +1306,6 @@ impl Qwen35Model {
             }
             start = end;
         }
-
-        self.finish_initial_prefill();
 
         let offset = self
             .sequence_state
@@ -3391,6 +3384,95 @@ mod tests {
             mlxcel_core::array_to_raw_bytes(&donor_keys),
             mlxcel_core::array_to_raw_bytes(&original_keys)
         );
+    }
+
+    #[test]
+    fn committed_snapshot_survives_speculative_page_boundary_rollback() {
+        let prompt_len = mlxcel_core::generate::SNAPSHOT_PAGE_TOKENS * 2 - 1;
+        let mut live = KVCache::new_with_mode(KVCacheMode::Fp16);
+        let mut control = KVCache::new_with_mode(KVCacheMode::Fp16);
+        for cache in [&mut live, &mut control] {
+            cache.update(
+                test_attention_tensor(prompt_len as i32, 0.01),
+                test_attention_tensor(prompt_len as i32, 0.02),
+            );
+        }
+        let mut committed = ModelStateSnapshot::new("page-boundary-test", prompt_len);
+        assert!(push_attention_snapshot(&mut committed, None, 0, &live));
+
+        live.update(
+            test_attention_tensor(3, 0.25),
+            test_attention_tensor(3, 0.5),
+        );
+        let mut provisional = ModelStateSnapshot::new("page-boundary-test", prompt_len + 3);
+        assert!(push_attention_snapshot(
+            &mut provisional,
+            Some(&committed),
+            0,
+            &live,
+        ));
+        let rejected_full_page =
+            provisional.paged_tensor("layer.0.keys").unwrap().pages()[1].portable_bytes();
+        live.trim(3);
+        for cache in [&mut live, &mut control] {
+            cache.update(
+                test_attention_tensor(1, 0.03),
+                test_attention_tensor(1, 0.04),
+            );
+        }
+
+        // The last snapshot has a full page containing a rejected token.
+        // Only the committed ancestor is a valid source of shared pages.
+        let mut corrected = ModelStateSnapshot::new("page-boundary-test", prompt_len + 1);
+        assert!(push_attention_snapshot(
+            &mut corrected,
+            Some(&committed),
+            0,
+            &live,
+        ));
+        let portable = crate::portable_snapshot::portable_model_state(&corrected);
+        drop(corrected);
+        let snapshot =
+            crate::portable_snapshot::model_from_portable(portable, false, false).unwrap();
+        assert_ne!(
+            snapshot.paged_tensor("layer.0.keys").unwrap().pages()[1].portable_bytes(),
+            rejected_full_page,
+        );
+        let mut restored = KVCache::new_with_mode(KVCacheMode::Fp16);
+        let tensor = |suffix: &str| {
+            snapshot
+                .paged_tensor(&format!("layer.0.{suffix}"))
+                .and_then(|tensor| tensor.materialize())
+                .unwrap()
+        };
+        restored.keys = Some(tensor("keys"));
+        restored.values = Some(tensor("values"));
+        restored.offset = (prompt_len + 1) as i32;
+        for cache in [&mut live, &mut control, &mut restored] {
+            cache.update(
+                test_attention_tensor(1, 0.05),
+                test_attention_tensor(1, 0.06),
+            );
+        }
+        for (actual, expected) in [
+            (
+                restored.keys.as_deref().unwrap(),
+                control.keys.as_deref().unwrap(),
+            ),
+            (
+                restored.values.as_deref().unwrap(),
+                control.values.as_deref().unwrap(),
+            ),
+        ] {
+            let shape = [1, 1, (prompt_len + 2) as i32, 64];
+            let actual = mlxcel_core::slice(actual, &[0, 0, 0, 0], &shape);
+            let expected = mlxcel_core::slice(expected, &[0, 0, 0, 0], &shape);
+            assert_eq!(
+                mlxcel_core::array_to_raw_bytes(&actual),
+                mlxcel_core::array_to_raw_bytes(&expected),
+            );
+        }
+        assert_eq!(restored.offset, control.offset);
     }
 
     #[test]

@@ -56,8 +56,7 @@ fn main() -> Result<()> {
             tool_calls: Vec::new(),
             tool_call_id: None,
         };
-        let rendered_prompt =
-            provider.render_messages(&[message], &[], None, false)?;
+        let rendered_prompt = provider.render_messages(&[message], &[], None, false)?;
         let encoding = provider
             .tokenizer()
             .encode(rendered_prompt.as_str(), true)
@@ -81,9 +80,20 @@ fn main() -> Result<()> {
         .encode(&rendered_prompt[..instruction_end], true)
         .map_err(anyhow::Error::msg)?
         .len();
-    ensure!(prompt.contains(AUTHORITATIVE_CODE), "authoritative record missing");
+    ensure!(
+        prompt.contains(AUTHORITATIVE_CODE),
+        "authoritative record missing"
+    );
 
-    let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
+    let sampling = provider.baseline_sampling(
+        true,
+        qw_runtime::SamplingOptions {
+            temperature: Some(0.0),
+            top_p: Some(1.0),
+            seed: Some(0),
+            ..Default::default()
+        },
+    );
     let dense = provider.generate_baseline_streaming(
         &prompt_ids,
         32,
@@ -120,11 +130,26 @@ fn main() -> Result<()> {
     println!("eligible_target_tokens={}", stats.eligible_target_tokens);
     println!("selected_target_tokens={}", stats.selected_target_tokens);
     println!("keep_ratio={keep_ratio:.4}");
-    println!("draft_scoring_seconds={:.3}", stats.draft_scoring_time.as_secs_f64());
-    println!("target_prefill_seconds={:.3}", stats.target_prefill_time.as_secs_f64());
-    println!("dense_prefill_seconds={:.3}", dense.prefill_time.as_secs_f64());
-    println!("dense_decode_seconds={:.3}", dense.decode_time.as_secs_f64());
-    println!("specprefill_decode_seconds={:.3}", sparse.decode_time.as_secs_f64());
+    println!(
+        "draft_scoring_seconds={:.3}",
+        stats.draft_scoring_time.as_secs_f64()
+    );
+    println!(
+        "target_prefill_seconds={:.3}",
+        stats.target_prefill_time.as_secs_f64()
+    );
+    println!(
+        "dense_prefill_seconds={:.3}",
+        dense.prefill_time.as_secs_f64()
+    );
+    println!(
+        "dense_decode_seconds={:.3}",
+        dense.decode_time.as_secs_f64()
+    );
+    println!(
+        "specprefill_decode_seconds={:.3}",
+        sparse.decode_time.as_secs_f64()
+    );
     println!("dense_output={:?}", dense.text);
     println!("specprefill_output={:?}", sparse.text);
 

@@ -3737,6 +3737,21 @@ fn try_array_to_raw_bytes_round_trips_f32() {
 }
 
 #[test]
+fn raw_byte_exports_preserve_empty_and_strided_values() {
+    let source = from_slice_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[2, 3]);
+    for (array, values) in [
+        (zeros(&[0], dtype::FLOAT32), Vec::new()),
+        (transpose(&source), vec![1.0_f32, 4.0, 2.0, 5.0, 3.0, 6.0]),
+    ] {
+        let expected: Vec<u8> = values.into_iter().flat_map(f32::to_ne_bytes).collect();
+        assert_eq!(array_to_raw_bytes(&array), expected);
+        assert_eq!(try_array_to_raw_bytes(&array).unwrap(), expected);
+        let contiguous_array = contiguous(&array, false);
+        assert_eq!(array_evaluated_bytes(&contiguous_array), expected);
+    }
+}
+
+#[test]
 fn try_async_eval_ok_matches_async_eval() {
     // #822: the batch scheduler's decode-loop lookahead pipeline schedules its
     // sampled tokens through `try_async_eval` so an MLX C++ throw at graph

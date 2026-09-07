@@ -20,7 +20,6 @@ use mlxcel_core::loop_detection::detect_repetition_loop;
 use mlxcel_core::sampling::{
     SamplerState, sample_token_optimized, sample_token_optimized_with_state,
 };
-use mlxcel_core::speculative::stochastic_accept::sampler_is_greedy;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use tokenizers::Tokenizer;
@@ -137,6 +136,9 @@ fn generate_specprefill_tokens<F: FnMut(i32) -> bool>(
 
     let mut effective_sampling = sampling.clone();
     effective_sampling
+        .prompt_token_count
+        .get_or_insert(prompt_ids.len());
+    effective_sampling
         .token_bias
         .suppress_tokens(&model.output_suppressed_token_ids());
     seed_rng_if_needed(&effective_sampling);
@@ -207,9 +209,27 @@ fn generate_specprefill_tokens<F: FnMut(i32) -> bool>(
 pub struct GenerationRequest {
     pub prompt: String,
     pub max_tokens: usize,
+    pub enable_thinking: bool,
+    pub reasoning_effort: Option<String>,
     pub temperature: Option<f32>,
     pub top_k: Option<i32>,
     pub top_p: Option<f32>,
+    pub min_p: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    pub repetition_penalty: Option<f32>,
+    pub frequency_penalty: Option<f32>,
+    pub seed: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SamplingOptions {
+    pub temperature: Option<f32>,
+    pub top_k: Option<i32>,
+    pub top_p: Option<f32>,
+    pub min_p: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    pub repetition_penalty: Option<f32>,
+    pub frequency_penalty: Option<f32>,
     pub seed: Option<u64>,
 }
 
@@ -360,7 +380,7 @@ pub fn select_qwen35_decoder(
             Err("the DFlash2 draft checkpoint is unavailable".to_string())
         }
         Qwen35GenerationMode::Dflash2 if !dflash2_compatible => {
-            Err("DFlash2 supports greedy text generation only".to_string())
+            Err("DFlash2 supports only unconstrained text generation".to_string())
         }
         Qwen35GenerationMode::Dflash2 => Ok(Qwen35GenerationMode::Dflash2),
     }
@@ -384,12 +404,6 @@ pub struct Qwen35Provider {
 struct GenerationConfig {
     #[serde(default)]
     eos_token_id: Option<TokenIds>,
-    #[serde(default)]
-    temperature: Option<f32>,
-    #[serde(default)]
-    top_k: Option<i32>,
-    #[serde(default)]
-    top_p: Option<f32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -401,9 +415,31 @@ enum TokenIds {
 
 struct GenerationDefaults {
     stop_token_ids: Vec<i32>,
-    temperature: f32,
-    top_k: i32,
-    top_p: f32,
+}
+
+impl GenerationDefaults {
+    fn sampling(&self, enable_thinking: bool, options: SamplingOptions) -> SamplingConfig {
+        // Qwen/Qwen3.8-27B README, revision 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0:
+        // https://huggingface.co/Qwen/Qwen3.8-27B/blob/1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0/README.md
+        // Quantized generation_config.json is not the source of this mode-dependent policy.
+        let (temperature, top_p, top_k, presence_penalty) = if enable_thinking {
+            (1.0, 0.95, 20, 0.0)
+        } else {
+            (0.7, 0.8, 20, 1.5)
+        };
+        SamplingConfig {
+            temperature: options.temperature.unwrap_or(temperature),
+            top_k: options.top_k.unwrap_or(top_k),
+            top_p: options.top_p.unwrap_or(top_p),
+            min_p: options.min_p.unwrap_or(0.0),
+            presence_penalty: options.presence_penalty.unwrap_or(presence_penalty),
+            repetition_penalty: options.repetition_penalty.unwrap_or(1.0),
+            frequency_penalty: options.frequency_penalty.unwrap_or(0.0),
+            seed: options.seed,
+            stop_token_ids: self.stop_token_ids.clone(),
+            ..SamplingConfig::default()
+        }
+    }
 }
 
 impl Qwen35Provider {
@@ -737,18 +773,10 @@ impl Qwen35Provider {
 
     pub fn baseline_sampling(
         &self,
-        temperature: Option<f32>,
-        top_p: Option<f32>,
-        seed: Option<u64>,
+        enable_thinking: bool,
+        options: SamplingOptions,
     ) -> SamplingConfig {
-        SamplingConfig {
-            temperature: temperature.unwrap_or(self.defaults.temperature),
-            top_k: self.defaults.top_k,
-            top_p: top_p.unwrap_or(self.defaults.top_p),
-            seed,
-            stop_token_ids: self.defaults.stop_token_ids.clone(),
-            ..SamplingConfig::default()
-        }
+        self.defaults.sampling(enable_thinking, options)
     }
 
     #[tracing::instrument(
@@ -1141,8 +1169,7 @@ impl Qwen35Provider {
     /// `draft_dir`, decoding deltas through the provider tokenizer.
     ///
     /// The generator is constructed lazily on first use and kept for
-    /// subsequent calls. Greedy-only: `request.temperature` must be 0 /
-    /// `top_k` 1.
+    /// subsequent calls, supporting greedy and stochastic sampling.
     #[tracing::instrument(name = "runtime.generate_dflash2", skip_all, fields(max_tokens), err)]
     pub fn generate_dflash2_streaming<F: FnMut(&str) -> bool>(
         &mut self,
@@ -1275,6 +1302,7 @@ impl Qwen35Provider {
         }
         let completion_tokens = generation.token_ids.len();
         let stats = generation.stats;
+        debug!(phase = "dflash2.completed", ?stats);
         let stop_reason = generation.stop_reason;
         log_generation_metrics(
             "dflash2",
@@ -1513,19 +1541,24 @@ impl Qwen35Provider {
         let (prompt_ids, sampling) = self.prepare_generation(request)?;
         let dflash2_available =
             cfg!(feature = "dflash2") && dflash2_draft_dir.is_some_and(Path::is_dir);
-        let decoder = select_qwen35_decoder(
-            mode,
-            self.mtp_generator.is_some(),
-            dflash2_available,
-            sampler_is_greedy(&sampling),
-        )
-        .map_err(anyhow::Error::msg)?;
+        let decoder =
+            select_qwen35_decoder(mode, self.mtp_generator.is_some(), dflash2_available, true)
+                .map_err(anyhow::Error::msg)?;
         debug!(
             phase = "decoder.selected",
             decoder = ?decoder,
             configured_decoder = ?mode,
             prompt_tokens = prompt_ids.len(),
             dflash2_available,
+            enable_thinking = request.enable_thinking,
+            reasoning_effort = ?request.reasoning_effort,
+            temperature = sampling.temperature,
+            top_k = sampling.top_k,
+            top_p = sampling.top_p,
+            min_p = sampling.min_p,
+            presence_penalty = sampling.presence_penalty,
+            repetition_penalty = sampling.repetition_penalty,
+            frequency_penalty = sampling.frequency_penalty,
         );
         let generation = match decoder {
             Qwen35GenerationMode::Baseline => self.generate_baseline_streaming(
@@ -1801,7 +1834,20 @@ impl Qwen35Provider {
             "max_tokens must be greater than zero"
         );
 
-        let rendered = self.chat_template.render_user(&request.prompt)?;
+        let rendered = self.chat_template.render_messages(
+            &[ChatMessage {
+                role: "user".to_string(),
+                name: None,
+                content: Some(ChatMessageContent::Text(request.prompt.clone())),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            }],
+            &[],
+            request.reasoning_effort.as_deref(),
+            request.enable_thinking,
+            true,
+        )?;
         let encoded = self
             .tokenizer
             .encode(rendered, true)
@@ -1817,14 +1863,20 @@ impl Qwen35Provider {
             "rendered prompt tokenized to an empty sequence"
         );
 
-        let sampling = SamplingConfig {
-            temperature: request.temperature.unwrap_or(self.defaults.temperature),
-            top_k: request.top_k.unwrap_or(self.defaults.top_k),
-            top_p: request.top_p.unwrap_or(self.defaults.top_p),
-            seed: request.seed,
-            stop_token_ids: self.defaults.stop_token_ids.clone(),
-            ..SamplingConfig::default()
-        };
+        let mut sampling = self.baseline_sampling(
+            request.enable_thinking,
+            SamplingOptions {
+                temperature: request.temperature,
+                top_k: request.top_k,
+                top_p: request.top_p,
+                min_p: request.min_p,
+                presence_penalty: request.presence_penalty,
+                repetition_penalty: request.repetition_penalty,
+                frequency_penalty: request.frequency_penalty,
+                seed: request.seed,
+            },
+        );
+        sampling.prompt_token_count = Some(prompt_ids.len());
         Ok((prompt_ids, sampling))
     }
 }
@@ -1939,12 +1991,7 @@ fn load_generation_defaults(model_dir: &Path) -> Result<GenerationDefaults> {
         serde_json::from_str::<GenerationConfig>(&text)
             .with_context(|| format!("failed to parse {}", path.display()))?
     } else {
-        GenerationConfig {
-            eos_token_id: None,
-            temperature: None,
-            top_k: None,
-            top_p: None,
-        }
+        GenerationConfig { eos_token_id: None }
     };
     let mut stop_token_ids = match config.eos_token_id {
         Some(TokenIds::One(token)) => vec![token],
@@ -1959,12 +2006,7 @@ fn load_generation_defaults(model_dir: &Path) -> Result<GenerationDefaults> {
         path.display()
     );
 
-    Ok(GenerationDefaults {
-        stop_token_ids,
-        temperature: config.temperature.unwrap_or(1.0),
-        top_k: config.top_k.unwrap_or(20),
-        top_p: config.top_p.unwrap_or(0.95),
-    })
+    Ok(GenerationDefaults { stop_token_ids })
 }
 
 #[cfg(test)]
@@ -1980,58 +2022,34 @@ mod tests {
     }
 
     #[test]
-    fn automatic_decoder_prefers_available_compatible_dflash2() {
+    fn decoder_preference_and_explicit_unavailability() {
+        use Qwen35GenerationMode::*;
         assert_eq!(
-            select_qwen35_decoder(Qwen35GenerationMode::Automatic, true, true, true),
-            Ok(Qwen35GenerationMode::Dflash2)
+            select_qwen35_decoder(Automatic, true, true, true),
+            Ok(Dflash2)
+        );
+        assert_eq!(select_qwen35_decoder(Automatic, true, false, true), Ok(Mtp));
+        assert_eq!(select_qwen35_decoder(Automatic, true, true, false), Ok(Mtp));
+        assert_eq!(
+            select_qwen35_decoder(Automatic, false, true, false),
+            Ok(Baseline)
         );
         assert_eq!(
-            select_qwen35_decoder(Qwen35GenerationMode::Automatic, false, true, true),
-            Ok(Qwen35GenerationMode::Dflash2)
-        );
-    }
-
-    #[test]
-    fn explicit_decoder_selection_honors_requested_mode_and_fails_closed() {
-        assert_eq!(
-            select_qwen35_decoder(Qwen35GenerationMode::Baseline, true, true, true),
-            Ok(Qwen35GenerationMode::Baseline)
+            select_qwen35_decoder(Automatic, false, false, true),
+            Ok(Baseline)
         );
         assert_eq!(
-            select_qwen35_decoder(Qwen35GenerationMode::Baseline, false, false, false),
-            Ok(Qwen35GenerationMode::Baseline)
+            select_qwen35_decoder(Baseline, true, true, true),
+            Ok(Baseline)
         );
+        assert_eq!(select_qwen35_decoder(Mtp, true, true, true), Ok(Mtp));
         assert_eq!(
-            select_qwen35_decoder(Qwen35GenerationMode::Mtp, true, true, true),
-            Ok(Qwen35GenerationMode::Mtp)
+            select_qwen35_decoder(Dflash2, false, true, true),
+            Ok(Dflash2)
         );
-        assert_eq!(
-            select_qwen35_decoder(Qwen35GenerationMode::Dflash2, true, true, true),
-            Ok(Qwen35GenerationMode::Dflash2)
-        );
-        assert!(select_qwen35_decoder(Qwen35GenerationMode::Mtp, false, true, true).is_err());
-        assert!(select_qwen35_decoder(Qwen35GenerationMode::Dflash2, true, false, true).is_err());
-        assert!(select_qwen35_decoder(Qwen35GenerationMode::Dflash2, true, true, false).is_err());
-    }
-
-    #[test]
-    fn automatic_decoder_falls_back_when_dflash2_is_unavailable_or_incompatible() {
-        assert_eq!(
-            select_qwen35_decoder(Qwen35GenerationMode::Automatic, true, false, true),
-            Ok(Qwen35GenerationMode::Mtp)
-        );
-        assert_eq!(
-            select_qwen35_decoder(Qwen35GenerationMode::Automatic, true, true, false),
-            Ok(Qwen35GenerationMode::Mtp)
-        );
-        assert_eq!(
-            select_qwen35_decoder(Qwen35GenerationMode::Automatic, false, false, true),
-            Ok(Qwen35GenerationMode::Baseline)
-        );
-        assert_eq!(
-            select_qwen35_decoder(Qwen35GenerationMode::Automatic, false, true, false),
-            Ok(Qwen35GenerationMode::Baseline)
-        );
+        assert!(select_qwen35_decoder(Mtp, false, true, true).is_err());
+        assert!(select_qwen35_decoder(Dflash2, true, false, true).is_err());
+        assert!(select_qwen35_decoder(Dflash2, true, true, false).is_err());
     }
 
     #[test]
@@ -2129,24 +2147,58 @@ mod tests {
     }
 
     #[test]
-    fn generation_defaults_match_checkpoint_contract() {
-        let fixture = TestDir::new("generation-defaults");
-        let fallback = load_generation_defaults(&fixture.0).expect("fallback defaults");
-        assert_eq!(fallback.stop_token_ids, vec![248044, 248046]);
-        assert_eq!(fallback.temperature, 1.0);
-        assert_eq!(fallback.top_k, 20);
-        assert_eq!(fallback.top_p, 0.95);
-
+    fn qwen38_policy_is_location_independent_and_respects_request_overrides() {
+        let fixture = TestDir::new("sampling-policy");
         std::fs::write(
             fixture.0.join("generation_config.json"),
-            br#"{"eos_token_id":[9,7],"temperature":0.7,"top_k":11,"top_p":0.8}"#,
+            br#"{"eos_token_id":[9,7,9],"temperature":0.2,"top_k":11,"top_p":0.4}"#,
         )
-        .expect("write generation config");
-        let loaded = load_generation_defaults(&fixture.0).expect("checkpoint defaults");
-        assert_eq!(loaded.stop_token_ids, vec![7, 9]);
-        assert_eq!(loaded.temperature, 0.7);
-        assert_eq!(loaded.top_k, 11);
-        assert_eq!(loaded.top_p, 0.8);
+        .expect("write quantization defaults");
+        let defaults = load_generation_defaults(&fixture.0).expect("load policy");
+        for thinking in [true, false] {
+            let automatic = defaults.sampling(thinking, SamplingOptions::default());
+            assert_eq!(automatic.temperature, if thinking { 1.0 } else { 0.7 });
+            assert_eq!(automatic.top_p, if thinking { 0.95 } else { 0.8 });
+            assert_eq!(automatic.top_k, 20);
+            assert_eq!(automatic.min_p, 0.0);
+            assert_eq!(automatic.presence_penalty, if thinking { 0.0 } else { 1.5 });
+            assert_eq!(automatic.repetition_penalty, 1.0);
+            assert_eq!(automatic.frequency_penalty, 0.0);
+            assert_eq!(automatic.stop_token_ids, vec![7, 9]);
+            let partial = defaults.sampling(
+                thinking,
+                SamplingOptions {
+                    temperature: Some(0.0),
+                    presence_penalty: Some(0.0),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(partial.temperature, 0.0);
+            assert_eq!(partial.presence_penalty, 0.0);
+            assert_eq!(partial.top_p, automatic.top_p);
+            assert_eq!(partial.top_k, automatic.top_k);
+            let explicit = defaults.sampling(
+                thinking,
+                SamplingOptions {
+                    temperature: Some(0.6),
+                    top_k: Some(0),
+                    top_p: Some(1.0),
+                    min_p: Some(0.2),
+                    presence_penalty: Some(0.4),
+                    repetition_penalty: Some(1.2),
+                    frequency_penalty: Some(0.3),
+                    seed: Some(7),
+                },
+            );
+            assert_eq!(explicit.temperature, 0.6);
+            assert_eq!(explicit.top_k, 0);
+            assert_eq!(explicit.top_p, 1.0);
+            assert_eq!(explicit.min_p, 0.2);
+            assert_eq!(explicit.presence_penalty, 0.4);
+            assert_eq!(explicit.repetition_penalty, 1.2);
+            assert_eq!(explicit.frequency_penalty, 0.3);
+            assert_eq!(explicit.seed, Some(7));
+        }
     }
 
     #[test]
@@ -2220,6 +2272,12 @@ mod tests {
             prompt: "Continue counting upward from one, writing each integer on its own line without stopping."
                 .to_string(),
             max_tokens: 32,
+            enable_thinking: true,
+            reasoning_effort: None,
+            min_p: None,
+            presence_penalty: None,
+            repetition_penalty: None,
+            frequency_penalty: None,
             temperature: Some(0.0),
             top_k: Some(1),
             top_p: Some(1.0),
@@ -2338,7 +2396,15 @@ mod tests {
             .collect::<Vec<_>>();
         let mut full_ids = base_ids.clone();
         full_ids.extend(suffix.get_ids().iter().map(|&token| token as i32));
-        let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
+        let sampling = provider.baseline_sampling(
+            true,
+            SamplingOptions {
+                temperature: Some(0.0),
+                top_p: Some(1.0),
+                seed: Some(0),
+                ..Default::default()
+            },
+        );
 
         let mut cold_ttft = None;
         let cold_started = Instant::now();
@@ -2472,7 +2538,15 @@ mod tests {
             .expect("QW_MODEL_PATH or the default model cache path must hold a real checkpoint");
         let mut provider = Qwen35Provider::load(&model_dir, KVCacheMode::Turbo4)
             .expect("load real bundled-MTP checkpoint");
-        let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
+        let sampling = provider.baseline_sampling(
+            true,
+            SamplingOptions {
+                temperature: Some(0.0),
+                top_p: Some(1.0),
+                seed: Some(0),
+                ..Default::default()
+            },
+        );
         let user = |content: &str| ChatMessage {
             role: "user".to_string(),
             name: None,
@@ -2608,7 +2682,15 @@ mod tests {
             .iter()
             .map(|&token| token as i32)
             .collect::<Vec<_>>();
-        let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
+        let sampling = provider.baseline_sampling(
+            true,
+            SamplingOptions {
+                temperature: Some(0.0),
+                top_p: Some(1.0),
+                seed: Some(0),
+                ..Default::default()
+            },
+        );
         let mut callback_count = 0;
         let mut last_callback = None;
         let generated = provider
@@ -2666,7 +2748,15 @@ mod tests {
             .iter()
             .map(|&token| token as i32)
             .collect::<Vec<_>>();
-        let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
+        let sampling = provider.baseline_sampling(
+            true,
+            SamplingOptions {
+                temperature: Some(0.0),
+                top_p: Some(1.0),
+                seed: Some(0),
+                ..Default::default()
+            },
+        );
         let mut generator = provider
             .mtp_generator
             .take()
@@ -2751,7 +2841,15 @@ mod tests {
 
         let mut completed_prompt = prompt_ids.clone();
         completed_prompt.extend_from_slice(&stopped.token_ids);
-        let resume_sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(0));
+        let resume_sampling = provider.baseline_sampling(
+            true,
+            SamplingOptions {
+                temperature: Some(0.0),
+                top_p: Some(1.0),
+                seed: Some(0),
+                ..Default::default()
+            },
+        );
         let cold = generator
             .generate_streaming(
                 &provider.model,
@@ -2846,7 +2944,15 @@ mod tests {
         let prompt_ids = provider
             .tokenize_messages(&messages, &[], None, false)
             .expect("tokenize deterministic resume conversation");
-        let sampling = provider.baseline_sampling(Some(0.0), Some(1.0), Some(7));
+        let sampling = provider.baseline_sampling(
+            true,
+            SamplingOptions {
+                temperature: Some(0.0),
+                top_p: Some(1.0),
+                seed: Some(7),
+                ..Default::default()
+            },
+        );
         let mut control = provider
             .generate_mtp_streaming(
                 &prompt_ids,

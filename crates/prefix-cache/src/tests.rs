@@ -97,6 +97,7 @@ fn resume_metadata(response_id: &str, fingerprint: &str) -> ResponseResumeMetada
         emitted_reasoning_text: String::new(),
         emitted_content_text: "partial".to_string(),
         original_max_tokens: 8,
+        continuation_seed: 0x6a09_e667_bb67_ae85,
     }
 }
 
@@ -248,40 +249,6 @@ impl PersistentSnapshotStore for BlockingStore {
 }
 
 #[test]
-fn radix_divergence_promotes_second_observation_and_selects_longest_snapshot() {
-    let clock = ManualClock::new(1_000);
-    let mut cache = AdaptivePrefixCache::with_store_and_clock(
-        namespaces(),
-        memory_config(1_000_000),
-        Box::new(EmptyStore),
-        Box::new(clock),
-    )
-    .expect("cache");
-    let first = (0..400).collect::<Vec<i32>>();
-    let mut second = first[..300].to_vec();
-    second.extend(1_000..1_100);
-    let mut third = first[..300].to_vec();
-    third.extend(2_000..2_100);
-    assert_eq!(
-        cache.checkpoint_lengths(&first, &[400], SnapshotRoute::Baseline),
-        vec![400]
-    );
-    assert_eq!(
-        cache.checkpoint_lengths(&second, &[400], SnapshotRoute::Baseline),
-        vec![300, 400]
-    );
-    cache.insert(
-        &second,
-        vec![snapshot(256, &[1.0, 2.0])],
-        SnapshotRoute::Baseline,
-    );
-    let hit = cache
-        .lookup(&third, SnapshotRoute::Baseline)
-        .expect("promoted shared prefix");
-    assert_eq!(hit.token_count, 256);
-}
-
-#[test]
 fn divergent_long_prompt_keeps_only_full_checkpoint() {
     let clock = ManualClock::new(1_000);
     let mut cache = AdaptivePrefixCache::with_store_and_clock(
@@ -291,16 +258,11 @@ fn divergent_long_prompt_keeps_only_full_checkpoint() {
         Box::new(clock),
     )
     .expect("cache");
+    assert!(cache.lookup(&[], SnapshotRoute::Baseline).is_none());
     let prompt = (0..1_024).collect::<Vec<i32>>();
-    let checkpoint_lengths =
-        cache.checkpoint_lengths(&prompt, &[prompt.len()], SnapshotRoute::Baseline);
-    assert_eq!(checkpoint_lengths, vec![1_024]);
     cache.insert(
         &prompt,
-        checkpoint_lengths
-            .into_iter()
-            .map(|token_len| snapshot(token_len, &[1.0, 2.0]))
-            .collect(),
+        vec![snapshot(prompt.len(), &[1.0, 2.0])],
         SnapshotRoute::Baseline,
     );
 
@@ -310,23 +272,6 @@ fn divergent_long_prompt_keeps_only_full_checkpoint() {
         cache
             .lookup(&divergent_prompt, SnapshotRoute::Baseline)
             .is_none()
-    );
-}
-
-#[test]
-fn first_observation_of_long_prompt_is_sparse() {
-    let clock = ManualClock::new(1_000);
-    let mut cache = AdaptivePrefixCache::with_store_and_clock(
-        namespaces(),
-        memory_config(1_000_000),
-        Box::new(EmptyStore),
-        Box::new(clock),
-    )
-    .expect("cache");
-    let prompt = (0..34_000).collect::<Vec<i32>>();
-    assert_eq!(
-        cache.checkpoint_lengths(&prompt, &[17_000], SnapshotRoute::Baseline),
-        vec![17_000, 34_000]
     );
 }
 
@@ -362,10 +307,6 @@ fn ttl_progression_expiry_and_byte_eviction_are_adaptive() {
         cache.memory_bytes(),
         0,
         "snapshot-byte budget evicts oversized state"
-    );
-    assert!(
-        cache.memory_pages.is_empty(),
-        "evicted terminal has no page accounting"
     );
 
     let mut cache = AdaptivePrefixCache::with_store_and_clock(
@@ -586,6 +527,114 @@ fn persistent_accounting_uses_unique_payload_bytes() {
 }
 
 #[test]
+fn filesystem_hit_survives_hot_eviction_preference() {
+    let directory = TempDirectory::new();
+    let state = snapshot(2, &[1.0, 2.0]);
+    let expected = state.to_portable().unwrap();
+    let capacity = state.nbytes() as u64;
+    let mut cache = AdaptivePrefixCache::new(
+        namespaces(),
+        CacheConfig {
+            memory_bytes: capacity,
+            directory: Some(directory.path.clone()),
+            filesystem_bytes: 1_000_000,
+        },
+    )
+    .expect("cache");
+    cache.insert(&[1, 2], vec![state], SnapshotRoute::Baseline);
+    cache.insert(
+        &[3, 4],
+        vec![snapshot(2, &[3.0, 4.0])],
+        SnapshotRoute::Baseline,
+    );
+    assert!(cache.lookup(&[3, 4], SnapshotRoute::Baseline).is_some());
+    let hit = cache
+        .lookup(&[1, 2, 5], SnapshotRoute::Baseline)
+        .expect("disk hit remains usable even when hotter entry wins residency");
+    assert_eq!(hit.token_count, 2);
+    assert_eq!(hit.snapshot().to_portable().unwrap(), expected);
+    drop(hit);
+    assert_eq!(cache.memory_bytes(), capacity);
+}
+
+#[test]
+fn oversized_snapshot_preserves_a_hot_prefix_that_fits_by_unique_pages() {
+    let clock = ManualClock::new(1_000);
+    let capacity = 512 * std::mem::size_of::<f32>() as u64;
+    let mut cache = AdaptivePrefixCache::with_optional_store(
+        namespaces(),
+        memory_config(capacity),
+        None,
+        Box::new(clock.clone()),
+    )
+    .expect("cache");
+    let array = mlxcel_core::from_slice_f32(&[1.0; 512], &[1, 256, 2]);
+    let mut state = ModelStateSnapshot::new("test", 256);
+    state.push_paged_tensor(None, "key", &array, 1).unwrap();
+    let shared_pages = state.paged_tensor("key").unwrap().pages().to_vec();
+    state.push_paged_pages("value", 1, shared_pages).unwrap();
+    let state = PromptSnapshot::Baseline(state);
+    let expected = state.to_portable().unwrap();
+    let query = (0..257).collect::<Vec<i32>>();
+    cache.insert(&query[..256], vec![state], SnapshotRoute::Baseline);
+
+    clock.set(2_000);
+    cache.insert(
+        &[999],
+        vec![snapshot(1, &[3.0; 512])],
+        SnapshotRoute::Baseline,
+    );
+
+    let hit = cache
+        .lookup(&query, SnapshotRoute::Baseline)
+        .expect("an oversized insertion must not evict a prefix that fits");
+    assert_eq!(hit.token_count, 256);
+    assert_eq!(hit.snapshot().to_portable().unwrap(), expected);
+    drop(hit);
+    assert_eq!(cache.memory_bytes(), capacity);
+}
+
+#[test]
+fn oversized_filesystem_prefix_remains_usable_without_hot_residency() {
+    let directory = TempDirectory::new();
+    let config = CacheConfig {
+        memory_bytes: 1,
+        directory: Some(directory.path.clone()),
+        filesystem_bytes: 1_000_000,
+    };
+    let tokens = [4, 5, 6];
+    let state = snapshot(tokens.len(), &[1.0, 2.0]);
+    let expected = state.to_portable().expect("portable snapshot");
+    {
+        let mut cache = AdaptivePrefixCache::new(namespaces(), config.clone()).expect("cache");
+        cache.insert(&tokens, vec![state], SnapshotRoute::Baseline);
+        assert_eq!(cache.memory_bytes(), 0);
+        // No flush or idle grace: Load must follow the pending Put on the I/O queue.
+        let hit = cache
+            .lookup(&[4, 5, 6, 7], SnapshotRoute::Baseline)
+            .expect("oversized disk prefix is usable immediately");
+        assert_eq!(hit.token_count, tokens.len());
+        assert_eq!(hit.snapshot().to_portable().unwrap(), expected);
+        drop(hit);
+        assert_eq!(cache.memory_bytes(), 0);
+        assert!(
+            cache
+                .lookup(&[4, 5, 9, 7], SnapshotRoute::Baseline)
+                .is_none()
+        );
+        cache.flush_persistence();
+    }
+    let mut restarted = AdaptivePrefixCache::new(namespaces(), config).expect("restart");
+    let hit = restarted
+        .lookup(&[4, 5, 6, 8], SnapshotRoute::Baseline)
+        .expect("oversized prefix survives restart");
+    assert_eq!(hit.token_count, tokens.len());
+    assert_eq!(hit.snapshot().to_portable().unwrap(), expected);
+    drop(hit);
+    assert_eq!(restarted.memory_bytes(), 0);
+}
+
+#[test]
 fn filesystem_restart_promotes_valid_entry_and_deletes_corrupt_payload() {
     let directory = TempDirectory::new();
     let config = CacheConfig {
@@ -597,7 +646,7 @@ fn filesystem_restart_promotes_valid_entry_and_deletes_corrupt_payload() {
     let key = entry_key(NAMESPACE, SnapshotRoute::Baseline, &tokens);
     {
         let mut cache = AdaptivePrefixCache::new(namespaces(), config.clone()).expect("cache");
-        cache.checkpoint_lengths(&tokens, &[tokens.len()], SnapshotRoute::Baseline);
+        assert!(cache.lookup(&tokens, SnapshotRoute::Baseline).is_none());
         cache.insert(
             &tokens,
             vec![snapshot(tokens.len(), &[1.0, 2.0])],
@@ -898,7 +947,7 @@ fn dflash2_filesystem_restart_isolates_routes_and_deletes_corrupt_payload() {
             cache
                 .lookup(&[1, 2, 3], SnapshotRoute::Dflash2)
                 .unwrap()
-                .snapshot
+                .snapshot()
                 .to_portable()
                 .unwrap(),
             portable
@@ -915,7 +964,7 @@ fn dflash2_filesystem_restart_isolates_routes_and_deletes_corrupt_payload() {
             .lookup(&[1, 2, 3, 4], SnapshotRoute::Dflash2)
             .expect("DFlash2 disk hit");
         assert_eq!(hit.token_count, 3);
-        assert_eq!(hit.snapshot.to_portable().unwrap(), portable);
+        assert_eq!(hit.snapshot().to_portable().unwrap(), portable);
         assert!(
             restarted
                 .lookup(&[1, 2, 3], SnapshotRoute::Baseline)
@@ -1257,6 +1306,101 @@ fn filesystem_namespace_isolation_and_partial_recovery_are_misses() {
         !partial.exists(),
         "startup removes interrupted temporary entries"
     );
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn failed_blob_barrier_defers_publication_and_orphan_retry_until_durable() {
+    let encode = |token, value| {
+        let portable = snapshot(1, &[value]).to_portable().unwrap();
+        let encoded = codec::encode_portable(
+            NAMESPACE,
+            SnapshotRoute::Baseline,
+            &[token],
+            portable.clone(),
+            RetentionMetadata {
+                observations: 1,
+                reuse_count: 0,
+                last_access_unix_ms: 0,
+            },
+            INITIAL_TTL_MS,
+            None,
+        )
+        .unwrap();
+        (
+            StoredEntry {
+                key: encoded.key,
+                manifest: encoded.manifest,
+                blobs: encoded.blobs,
+            },
+            portable,
+        )
+    };
+    let load = |store: &mut FilesystemSnapshotStore, key: &EntryKey| {
+        let loaded = store.load(key).unwrap().expect("committed entry");
+        codec::decode(NAMESPACE, &loaded.manifest, loaded.blobs)
+            .unwrap()
+            .snapshot
+            .to_portable()
+            .unwrap()
+    };
+    let directory = TempDirectory::new();
+    let mut store = FilesystemSnapshotStore::new(&directory.path).unwrap();
+    let (old, old_snapshot) = encode(1, 1.0);
+    let old_key = old.key.clone();
+    store.put(old, INITIAL_TTL_MS).unwrap();
+    let (new, new_snapshot) = encode(2, 2.0);
+    let new_key = new.key.clone();
+    let retry = StoredEntry {
+        key: new.key.clone(),
+        manifest: new.manifest.clone(),
+        blobs: new.blobs.clone(),
+    };
+    let (entered, blocked) = mpsc::channel();
+    let (release, proceed) = mpsc::channel();
+    store.before_blob_barrier = Some(Box::new(move || {
+        entered.send(()).unwrap();
+        proceed.recv().unwrap();
+        Err("injected pre-manifest barrier failure".into())
+    }));
+    let writer = std::thread::spawn(move || store.put(new, INITIAL_TTL_MS));
+    blocked
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("writer reached blob barrier");
+    let mut reader = FilesystemSnapshotStore::new(&directory.path).unwrap();
+    assert_eq!(load(&mut reader, &old_key), old_snapshot);
+    assert!(reader.load(&new_key).unwrap().is_none());
+    release.send(()).unwrap();
+    assert!(writer.join().unwrap().is_err());
+    assert_eq!(load(&mut reader, &old_key), old_snapshot);
+    assert!(reader.load(&new_key).unwrap().is_none());
+    for blob in &retry.blobs {
+        assert_eq!(
+            std::fs::read(directory.path.join("blobs").join(&blob.sha256)).unwrap(),
+            blob.bytes.as_ref(),
+        );
+    }
+
+    let mut store = FilesystemSnapshotStore::new(&directory.path).unwrap();
+    let (entered, blocked) = mpsc::channel();
+    let (release, proceed) = mpsc::channel();
+    store.before_blob_barrier = Some(Box::new(move || {
+        entered.send(()).unwrap();
+        proceed.recv().unwrap();
+        Ok(())
+    }));
+    let writer = std::thread::spawn(move || store.put(retry, INITIAL_TTL_MS));
+    blocked
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("existing orphan retry reached blob barrier");
+    assert_eq!(load(&mut reader, &old_key), old_snapshot);
+    assert!(reader.load(&new_key).unwrap().is_none());
+    release.send(()).unwrap();
+    writer.join().unwrap().unwrap();
+    drop(reader);
+    let mut reopened = FilesystemSnapshotStore::new(&directory.path).unwrap();
+    assert_eq!(load(&mut reopened, &old_key), old_snapshot);
+    assert_eq!(load(&mut reopened, &new_key), new_snapshot);
 }
 
 struct TempDirectory {

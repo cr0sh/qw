@@ -5,9 +5,9 @@ use mlxcel_core::generate::{ModelStateSnapshot, SnapshotPage};
 use mlxcel_core::{MlxArray, UniquePtr};
 
 use crate::provider::PromptSnapshot;
-use crate::qwen3_5_mtp::MtpPromptSnapshot;
 #[cfg(any(feature = "dflash2", test))]
 use crate::qwen3_5_dflash::Dflash2PromptSnapshot;
+use crate::qwen3_5_mtp::MtpPromptSnapshot;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PortablePage {
@@ -152,12 +152,13 @@ fn model_to_portable(snapshot: &ModelStateSnapshot) -> PortableModelState {
                         pages: tensor
                             .pages()
                             .iter()
-                            .map(|page| PortablePage {
+                            .zip(tensor.portable_pages())
+                            .map(|(page, bytes)| PortablePage {
                                 token_start: page.token_range().start,
                                 token_end: page.token_range().end,
                                 shape: page.shape().to_vec(),
                                 dtype: page.dtype(),
-                                bytes: page.portable_bytes(),
+                                bytes,
                             })
                             .collect(),
                     })
@@ -211,7 +212,7 @@ pub(crate) fn model_from_portable(
                     page.token_end,
                     page.shape,
                     page.dtype,
-                    &page.bytes,
+                    page.bytes,
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -335,6 +336,40 @@ mod tests {
                 .to_portable()
                 .expect("re-encode baseline");
             assert_eq!(restored, expected);
+        }
+    }
+
+    #[test]
+    fn paged_roundtrip_preserves_strided_pages_when_partial_tail_changes() {
+        let values = |tokens: usize| {
+            (0..2)
+                .flat_map(|head| (0..tokens * 2).map(move |value| (head * 10_000 + value) as f32))
+                .collect::<Vec<_>>()
+        };
+        let original = values(300);
+        let source = mlxcel_core::from_slice_f32(&original, &[2, 300, 2]);
+        let mut first = ModelStateSnapshot::new("paged-portable-test", 300);
+        first.push_paged_tensor(None, "keys", &source, 1).unwrap();
+        let first_portable = model_to_portable(&first);
+
+        let mut updated = values(301);
+        updated[299 * 2] = -1.0;
+        let source = mlxcel_core::from_slice_f32(&updated, &[2, 301, 2]);
+        let mut second = ModelStateSnapshot::new("paged-portable-test", 301);
+        second
+            .push_paged_tensor(Some(&first), "keys", &source, 1)
+            .unwrap();
+        let second_portable = model_to_portable(&second);
+
+        for (portable, expected) in [(first_portable, original), (second_portable, updated)] {
+            let restored = model_from_portable(portable, false, false).unwrap();
+            let array = restored
+                .paged_tensor("keys")
+                .unwrap()
+                .materialize()
+                .unwrap();
+            let expected: Vec<u8> = expected.into_iter().flat_map(f32::to_ne_bytes).collect();
+            assert_eq!(mlxcel_core::array_to_raw_bytes(&array), expected);
         }
     }
 
