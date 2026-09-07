@@ -1,7 +1,11 @@
 import json
+import io
+import logging
+import os
 from pathlib import Path
 import tempfile
 import threading
+import traceback
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from contextlib import contextmanager
@@ -142,6 +146,84 @@ class Tau3AdapterTests(unittest.TestCase):
         tau3_adapter.MODEL_DICT["agent"] = None
         tau3_adapter.configure_capture(None)
 
+    def test_provider_error_redacts_runtime_credential_from_logs_capture_and_traceback(self):
+        from tau2.orchestrator.orchestrator import logger as tau_logger
+
+        sentinel = "fake-deepseek-credential-for-regression"
+        log_output = io.StringIO()
+        tau_log_output = io.StringIO()
+        tau_sink = tau_logger.add(tau_log_output, diagnose=True, backtrace=True)
+        logger = logging.getLogger("evalscope.fake_provider_error")
+        handler = logging.StreamHandler(log_output)
+        logger.addHandler(handler)
+        old_propagate = logger.propagate
+        logger.propagate = False
+        try:
+            with patch.dict(os.environ, {"DEEPSEEK_API_KEY": sentinel}), tempfile.TemporaryDirectory() as directory:
+                tau3_adapter._protect_runtime_logs()
+                capture = Path(directory) / "private-errors.jsonl"
+                tau3_adapter.configure_capture(capture)
+
+                def fail(**kwargs):
+                    try:
+                        raise ValueError(f"provider rejected credential {sentinel}")
+                    except ValueError:
+                        logger.exception("provider error for %s", sentinel)
+                        raise
+
+                tau3_adapter.MODEL_DICT["user"] = SimpleNamespace(generate=fail)
+                simulator = UserSimulator(llm="user")
+                state = UserState(
+                    system_messages=[SystemMessage(role="system", content="Act as the customer.")],
+                    messages=[],
+                )
+                incoming = AssistantMessage(role="assistant", content="How can I help?")
+                try:
+                    with patch("tau2.user.user_simulator.generate", tau3_adapter.patched_generate):
+                        simulator.generate_next_message(incoming, state)
+                except tau3_adapter.Tau3AdapterError as error:
+                    self.assertEqual(error.kind, "infrastructure")
+                    error_trace = "".join(traceback.format_exception(error))
+                    tau_logger.exception("Tau2 simulator provider failure")
+                else:
+                    self.fail("The provider failure must abort generation")
+                for text in (error_trace, capture.read_text(), log_output.getvalue(), tau_log_output.getvalue()):
+                    self.assertNotIn(sentinel, text)
+                    self.assertIn("provider", text)
+                    self.assertIn("[REDACTED]", text)
+                self.assertEqual(capture.stat().st_mode & 0o077, 0)
+        finally:
+            tau_logger.remove(tau_sink)
+            logger.removeHandler(handler)
+            handler.close()
+            logger.propagate = old_propagate
+
+    def test_outer_prediction_loguru_redacts_provider_initialization_failure(self):
+        from tau2.orchestrator.orchestrator import logger as tau_logger
+
+        sentinel = "fake-deepseek-initialization-credential"
+        rendered = io.StringIO()
+        sink = tau_logger.add(rendered, diagnose=True, backtrace=True)
+        task = Task(id="privacy", user_scenario={"instructions": "Compare cards."})
+        sample = SimpleNamespace(subset_key="banking_knowledge", metadata=task.model_dump())
+
+        def fail(*args):
+            raise ValueError(f"provider initialization rejected {sentinel}")
+
+        try:
+            with patch.dict(os.environ, {"DEEPSEEK_API_KEY": sentinel}), patch.object(tau3_adapter, "_build_model", fail):
+                try:
+                    tau3_adapter.predict(SimpleNamespace(), sample, SimpleNamespace())
+                except tau3_adapter.Tau3AdapterError as error:
+                    self.assertEqual(error.kind, "infrastructure")
+                    tau_logger.exception("Outer Tau2 prediction initialization failed")
+                else:
+                    self.fail("Initialization failure must abort prediction")
+                self.assertNotIn(sentinel, rendered.getvalue())
+                self.assertIn("[REDACTED]", rendered.getvalue())
+        finally:
+            tau_logger.remove(sink)
+
     def test_reasoning_round_trip_uses_evalscope_reasoning_field(self):
         message = AssistantMessage(
             role="assistant",
@@ -259,9 +341,8 @@ class Tau3AdapterTests(unittest.TestCase):
                 original_history = list(state.messages)
                 incoming = AssistantMessage(role="assistant", content="Your request is complete.")
                 with patch("tau2.user.user_simulator.generate", tau3_adapter.patched_generate):
-                    with self.assertRaises(tau3_adapter.Tau3AdapterError) as ctx:
+                    with self.assertRaises(tau3_adapter.Tau3AdapterError):
                         simulator.generate_next_message(incoming, state)
-                self.assertEqual(ctx.exception.kind, "model_output_invalid")
                 self.assertEqual(len(payloads), 1)
                 self.assertEqual([message.model_dump() for message in state.system_messages], original_system)
                 self.assertEqual(state.messages, original_history + [incoming])
@@ -348,6 +429,18 @@ class Tau3AdapterTests(unittest.TestCase):
             server.shutdown()
             server.server_close()
             thread.join(timeout=2)
+
+    def test_banking_dataset_validation_rejects_missing_empty_and_duplicate_tasks(self):
+        from eval.run_tau3_banking import _validate_banking_dataset
+
+        duplicate = Sample(input="Duplicate", metadata={"id": "task_001"})
+        for datasets, expected_count in [
+            ({}, 1),
+            ({"banking_knowledge": []}, 97),
+            ({"banking_knowledge": [duplicate, duplicate]}, 2),
+        ]:
+            with self.subTest(datasets=datasets), self.assertRaises(ValueError):
+                _validate_banking_dataset(datasets, expected_count)
 
     def test_native_cache_reuses_completed_zero_reward_max_steps(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -12,6 +12,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import subprocess
 from uuid import uuid4
 
 
@@ -24,6 +25,39 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _load_simulator_credentials() -> None:
+    """Load the primary worktree's private credential only in the evaluator process."""
+    from dotenv import dotenv_values
+
+    common_dir = subprocess.run(
+        ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        cwd=Path(__file__).resolve().parent,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    credential_file = Path(common_dir).parent / "eval" / ".env.local"
+    if not credential_file.is_file() or credential_file.is_symlink():
+        raise SystemExit("primary eval/.env.local must provide the direct simulator credential")
+    if credential_file.stat().st_mode & 0o077:
+        raise SystemExit("primary eval/.env.local must be private (chmod 600)")
+    key = dotenv_values(credential_file, interpolate=False).get("DEEPSEEK_API_KEY")
+    if not isinstance(key, str) or not key.strip():
+        raise SystemExit("primary eval/.env.local must define DEEPSEEK_API_KEY")
+    os.environ["DEEPSEEK_API_KEY"] = key.strip()
+
+
+def _validate_banking_dataset(datasets, expected_count: int):
+    if set(datasets.keys()) != {"banking_knowledge"}:
+        raise ValueError("evaluation requires only the banking_knowledge dataset")
+    dataset = datasets["banking_knowledge"]
+    if len(dataset) != expected_count:
+        raise ValueError(f"expected {expected_count} banking tasks, loaded {len(dataset)}")
+    if len({sample.metadata["id"] for sample in dataset}) != expected_count:
+        raise ValueError("banking dataset has duplicate task identities")
+    return dataset
+
+
 def _validate_resume(config, run_dir: Path) -> tuple[int, int]:
     from evalscope.api.evaluator.cache import CacheManager
     from evalscope.api.registry import get_benchmark
@@ -34,6 +68,8 @@ def _validate_resume(config, run_dir: Path) -> tuple[int, int]:
     from evalscope.utils.io_utils import OutputsStructure
     from tau3_adapter import _validate_cached_records
 
+    if (run_dir / "INVALID.json").exists():
+        raise ValueError("invalidated benchmark runs cannot be resumed or reused")
     if not all((run_dir / name).is_dir() for name in ("configs", "predictions", "reviews")):
         raise ValueError("resume requires the exact inner timestamp run directory containing configs, predictions, and reviews")
     progress_path = run_dir / "progress.json"
@@ -55,12 +91,7 @@ def _validate_resume(config, run_dir: Path) -> tuple[int, int]:
         identity,
         False,
     )
-    datasets = benchmark.load_dataset()
-    if set(datasets.keys()) != {"banking_knowledge"} or len(datasets["banking_knowledge"]) != 97:
-        raise ValueError("resume requires the unchanged complete 97-task banking dataset")
-    dataset = datasets["banking_knowledge"]
-    if len({sample.metadata["id"] for sample in dataset}) != 97:
-        raise ValueError("resume dataset has duplicate task identities")
+    dataset = _validate_banking_dataset(benchmark.load_dataset(), 97)
     cache = CacheManager(outputs, config.model_id, "tau3_bench")
     return _validate_cached_records(cache, dataset, config.model_id)
 
@@ -75,8 +106,7 @@ def main() -> int:
     endpoint = "http://127.0.0.1:8883/v1"
     model = "qwen3.8-27b"
     generation = {
-        "temperature": 0.0,
-        "top_p": 0.95,
+        # Omit sampling controls so the runtime resolves its thinking policy.
         "max_tokens": 32768,
         "reasoning_effort": "medium",
         "reasoning_history": "reasoning_field",
@@ -84,18 +114,11 @@ def main() -> int:
         # Keep the OpenAI client's transport retries, but avoid EvalScope's
         # duplicate outer loop (which retried typed model-output errors).
         "retries": 1,
-        "extra_body": {"chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": True}},
+        "extra_body": {"chat_template_kwargs": {"enable_thinking": True}},
     }
 
-    simulator_model = "openai-codex/gpt-5.6-luna"
-    simulator_endpoint = os.environ.get("TAU_SIMULATOR_API_URL", "http://127.0.0.1:18766/v1")
-    if simulator_endpoint.rstrip("/") == endpoint.rstrip("/"):
-        raise SystemExit("simulator endpoint must be distinct from the QW endpoint")
-    token_file = Path(os.environ.get("TAU_SIMULATOR_TOKEN_FILE", "~/.omp/auth-gateway.token")).expanduser()
-    simulator_key = os.environ.get("TAU_SIMULATOR_API_KEY") or token_file.read_text(encoding="utf-8").strip()
-    if not simulator_key:
-        raise SystemExit("simulator gateway credential must not be empty")
-    os.environ["EVALSCOPE_API_KEY"] = simulator_key
+    simulator_model = "deepseek-v4-pro"
+    simulator_endpoint = "https://api.deepseek.com"
 
     setup_dir = Path(__file__).resolve().parent
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid4().hex
@@ -119,7 +142,7 @@ def main() -> int:
     if Path(dataset_id).is_dir():
         os.environ["TAU2_DATA_DIR"] = dataset_id
 
-    from tau3_adapter import SIMULATOR_EMPTY_RESPONSE_RETRIES, SIMULATOR_STEP_PROTOCOL, configure_capture, install
+    from tau3_adapter import configure_capture, install
 
     install()
     from evalscope import TaskConfig, run_task
@@ -137,15 +160,12 @@ def main() -> int:
                 "subset_list": ["banking_knowledge"],
                 "extra_params": {
                     "user_model": simulator_model,
-                    "simulator_empty_response_retries": SIMULATOR_EMPTY_RESPONSE_RETRIES,
-                    "simulator_step_protocol": SIMULATOR_STEP_PROTOCOL,
                     "api_base": simulator_endpoint,
                     "api_key": None,
                     "generation_config": {
                         "temperature": 0.0,
                         "max_tokens": 32768,
-                        "reasoning_effort": "low",
-                        "reasoning_history": "reasoning_field",
+                        "extra_body": {"thinking": {"type": "disabled"}},
                         "timeout": 7200,
                         "retries": 1,
                     },
@@ -170,10 +190,9 @@ def main() -> int:
     )
 
     print("dataset=tau3_bench subset=banking_knowledge tasks=97 repeats=1 retrieval=bm25", flush=True)
-    print("agent=qwen3.8-27b temperature=0 reasoning_effort=medium max_tokens=32768", flush=True)
+    print("agent=qwen3.8-27b sampling=runtime_policy reasoning_effort=medium thinking=enabled max_tokens=32768", flush=True)
     print(f"simulator_and_nl_judge={simulator_model} endpoint={simulator_endpoint}", flush=True)
-    print(f"simulator_empty_response_retries={SIMULATOR_EMPTY_RESPONSE_RETRIES} (user simulator clean-stop empty responses only)", flush=True)
-    print("simulator_step_protocol=explicit nonempty invocation clarification (simulator-only prompt deviation)", flush=True)
+    print("simulator_thinking=disabled canonical_prompts=true empty_response_retries=0", flush=True)
     print(f"work_dir={work_dir} capture={capture_path or 'disabled'} dataset={dataset_id}", flush=True)
     if not args.run:
         print("Configuration validated only; no dataset loaded, server started, or model request made.", flush=True)
@@ -193,7 +212,15 @@ def main() -> int:
         if args.resume is not None:
             predictions, reviews = _validate_resume(config, work_dir)
             print(f"Verified native resume: {predictions}/97 completed predictions, {reviews}/97 completed reviews.", flush=True)
+        else:
+            from evalscope.api.registry import get_benchmark
+
+            dataset = _validate_banking_dataset(
+                get_benchmark("tau3_bench", config).load_dataset(), args.limit or 97,
+            )
+            print(f"Verified fresh banking dataset: {len(dataset)} unique tasks.", flush=True)
         configure_capture(capture_path)
+        _load_simulator_credentials()
         run_task(config)
     return 0
 

@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import json
 import math
+import logging
 import os
 from pathlib import Path
 import sys
+import traceback
 from contextvars import ContextVar
 from typing import Any
 
@@ -34,13 +36,49 @@ class Tau3AdapterError(RuntimeError):
     """An error with a structured classification for capture/reporting."""
 
     def __init__(self, kind: str, message: str) -> None:
-        super().__init__(message)
+        super().__init__(_redact_runtime_secret(message))
         self.kind = kind
 
 
 MODEL_DICT: dict[str, Any] = {"agent": None, "user": None}
 _CAPTURE_PATH: Path | None = None
 _CURRENT_TASK_ID: ContextVar[str | None] = ContextVar("tau3_task_id", default=None)
+
+
+def _redact_runtime_secret(text: str) -> str:
+    key = os.environ.get("DEEPSEEK_API_KEY")
+    return text.replace(key, "[REDACTED]") if key else text
+
+
+class _RuntimeSecretFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        redacted = _redact_runtime_secret(message)
+        if redacted != message:
+            record.msg, record.args = redacted, ()
+        if record.exc_info:
+            record.exc_text = _redact_runtime_secret("".join(traceback.format_exception(*record.exc_info)))
+            record.exc_info = None
+        elif record.exc_text:
+            record.exc_text = _redact_runtime_secret(record.exc_text)
+        return True
+
+
+_SECRET_FILTER = _RuntimeSecretFilter()
+
+
+def _protect_runtime_logs() -> None:
+    """Protect framework/provider error logs without changing their failure behavior."""
+    loggers = [logging.getLogger(), *(
+        logger for logger in logging.Logger.manager.loggerDict.values()
+        if isinstance(logger, logging.Logger)
+    )]
+    for logger in loggers:
+        if _SECRET_FILTER not in logger.filters:
+            logger.addFilter(_SECRET_FILTER)
+        for handler in logger.handlers:
+            if _SECRET_FILTER not in handler.filters:
+                handler.addFilter(_SECRET_FILTER)
 
 
 def configure_capture(path: str | os.PathLike[str] | None) -> None:
@@ -53,6 +91,7 @@ def configure_capture(path: str | os.PathLike[str] | None) -> None:
         try:
             with capture_path.open("x", encoding="utf-8"):
                 pass
+            capture_path.chmod(0o600)
         except FileExistsError as error:
             raise ValueError(f"capture path already exists; choose a unique path: {capture_path}") from error
     _CAPTURE_PATH = capture_path
@@ -73,7 +112,7 @@ def _capture(record: dict[str, Any]) -> None:
     if _CURRENT_TASK_ID.get() is not None and "task_id" not in record:
         record = {**record, "task_id": _CURRENT_TASK_ID.get()}
     with _CAPTURE_PATH.open("a", encoding="utf-8") as stream:
-        stream.write(json.dumps(_jsonable(record), ensure_ascii=False) + "\n")
+        stream.write(_redact_runtime_secret(json.dumps(_jsonable(record), ensure_ascii=False)) + "\n")
 
 
 
@@ -207,7 +246,8 @@ def patched_generate(
     except Exception as exc:
         kind = _classify_exception(exc)
         _capture({"event": "error", "kind": kind, "error_type": type(exc).__name__, "error": str(exc), **request})
-        raise Tau3AdapterError(kind, str(exc)) from exc
+        safe_message = _redact_runtime_secret(str(exc))
+        raise Tau3AdapterError(kind, safe_message) from None
     generation_tool_choice = tool_choice if tool_choice is not None else ("auto" if tools else None)
     attempt_record = {**request, "attempt": 1}
     _capture({"event": "request", **attempt_record})
@@ -220,7 +260,8 @@ def patched_generate(
     except Exception as exc:
         kind = _classify_exception(exc)
         _capture({"event": "error", "kind": kind, "error_type": type(exc).__name__, "error": str(exc), **attempt_record})
-        raise Tau3AdapterError(kind, str(exc)) from exc
+        safe_message = _redact_runtime_secret(str(exc))
+        raise Tau3AdapterError(kind, safe_message) from None
 
     _capture({"event": "response", "response": completion.model_dump(mode="json", exclude_none=False), **attempt_record})
     if completion.error:
@@ -260,13 +301,19 @@ def patched_generate(
 def _build_model(agent_model: Any, adapter_instance: Any) -> None:
     from evalscope.api.model import GenerateConfig, get_model
 
+    runtime_key = os.environ.get("DEEPSEEK_API_KEY")
+    if not runtime_key:
+        raise Tau3AdapterError("adapter_error", "DEEPSEEK_API_KEY is required in the evaluator process")
+    _protect_runtime_logs()
+
     user_server = get_model(
         model=adapter_instance.user_model,
         eval_type=EvalType.OPENAI_API,
         base_url=adapter_instance.api_base,
-        api_key=adapter_instance.api_key,
+        api_key=runtime_key,
         config=GenerateConfig(**adapter_instance.generation_config),
-        model_args={"max_retries": 0},
+        model_args={"max_retries": 5},
+        memoize=False,
     )
     MODEL_DICT["user"] = user_server
     MODEL_DICT["agent"] = agent_model
@@ -299,7 +346,8 @@ def predict(model: Any, sample: Any, adapter_instance: Any) -> InferenceResult:
         _capture({"event": "task_error", "kind": kind, "error_type": type(exc).__name__, "error": str(exc)})
         if isinstance(exc, Tau3AdapterError):
             raise
-        raise Tau3AdapterError(kind, str(exc)) from exc
+        safe_message = _redact_runtime_secret(str(exc))
+        raise Tau3AdapterError(kind, safe_message) from None
     from tau2.evaluator.evaluator import EvaluationType
     from tau2.run import run_task
 
@@ -322,7 +370,8 @@ def predict(model: Any, sample: Any, adapter_instance: Any) -> InferenceResult:
     except Exception as exc:
         kind = _classify_exception(exc)
         _capture({"event": "task_error", "kind": kind, "error_type": type(exc).__name__, "error": str(exc), "task_id": task.id})
-        raise Tau3AdapterError(kind, str(exc)) from exc
+        safe_message = _redact_runtime_secret(str(exc))
+        raise Tau3AdapterError(kind, safe_message) from None
 
     # Preserve completed simulation and judge evidence before optional report
     # projection, so a report-schema failure cannot discard the finished task.
@@ -338,7 +387,8 @@ def predict(model: Any, sample: Any, adapter_instance: Any) -> InferenceResult:
             agent_messages.append(_trajectory_message(raw))
         except Exception as exc:
             _capture({"event": "trajectory_error", "kind": "adapter_error", "error": str(exc), "task_id": task.id})
-            raise Tau3AdapterError("adapter_error", str(exc)) from exc
+            safe_message = _redact_runtime_secret(str(exc))
+            raise Tau3AdapterError("adapter_error", safe_message) from None
 
     output = ModelOutput(
         model=model.name,
