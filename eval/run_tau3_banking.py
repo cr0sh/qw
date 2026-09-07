@@ -21,6 +21,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run", action="store_true", help="execute the 97-task campaign")
     parser.add_argument("--capture", type=Path, help="opt-in JSONL request/response/error capture path")
     parser.add_argument("--limit", type=int, help="optional bounded diagnostic task count")
+    parser.add_argument("--eval-batch-size", type=int, default=1, help="EvalScope task concurrency (default: 1)")
     parser.add_argument("--resume", type=Path, help="reuse verified completed records from a terminal full 97-task run")
     return parser.parse_args()
 
@@ -100,6 +101,8 @@ def main() -> int:
     args = parse_args()
     if args.limit is not None and args.limit < 1:
         raise SystemExit("--limit must be positive")
+    if args.eval_batch_size < 1:
+        raise SystemExit("--eval-batch-size must be positive")
     if args.resume is not None and args.limit is not None:
         raise SystemExit("--resume is only available for full 97-task runs; do not combine it with --limit")
 
@@ -175,7 +178,7 @@ def main() -> int:
             }
         },
         dataset_dir=str(cache_dir / "evalscope"),
-        eval_batch_size=1,
+        eval_batch_size=args.eval_batch_size,
         limit=args.limit,
         repeats=1,
         seed=42,
@@ -190,6 +193,7 @@ def main() -> int:
     )
 
     print("dataset=tau3_bench subset=banking_knowledge tasks=97 repeats=1 retrieval=bm25", flush=True)
+    print(f"eval_batch_size={args.eval_batch_size} scheduling=independent_tasks gpu_batching=false", flush=True)
     print("agent=qwen3.8-27b sampling=runtime_policy reasoning_effort=medium thinking=enabled max_tokens=32768", flush=True)
     print(f"simulator_and_nl_judge={simulator_model} endpoint={simulator_endpoint}", flush=True)
     print("simulator_thinking=disabled canonical_prompts=true empty_response_retries=0", flush=True)
