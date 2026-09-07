@@ -4020,12 +4020,12 @@ pub fn attention(
     softcap: f32,
     window_size: i32,
 ) -> UniquePtr<MlxArray> {
-    if should_use_metal4_attention() {
-        return metal4_attention(q, k, v, scale, mask, softcap, window_size);
-    }
-
     if let Some(chunk) = materializing_sdpa_query_chunk(q, k, v, softcap) {
         return chunked_query_attention(q, k, v, scale, mask, softcap, chunk);
+    }
+
+    if should_use_metal4_attention() {
+        return metal4_attention(q, k, v, scale, mask, softcap, window_size);
     }
 
     attention_dispatch(q, k, v, scale, mask, softcap)
@@ -4083,45 +4083,54 @@ fn attention_chunk_budget_bytes() -> usize {
     })
 }
 
-/// True when this q/v + softcap combination cannot reach a fused
-/// (memory-linear) SDPA kernel on the CUDA backend, so MLX's fallback would
-/// materialize the full `[B, heads, q_len, k_len]` score matrix.
-///
-/// Mirrors `supports_sdpa_cudnn` in
-/// `mlx/backend/cuda/scaled_dot_product_attention.cpp`: the cuDNN flash SDPA
-/// requires `head_dim % 8 == 0 && head_dim <= 128` for both Q and V and an
-/// f16/bf16 dtype (gemma-3/gemma-4/gemma-3n use head_dim 256 and never
-/// qualify, issue #672). The softcap composite (`compiled_softcap_sdpa*`)
-/// is an explicit op graph and always materializes. `supports_sdpa_vector`
-/// only covers `q_len < 4`, which the chunk gate's own `q_len` threshold
-/// already excludes. Non-CUDA builds return false: Metal has a different
-/// fused-SDPA support matrix and keeps its current behavior.
-fn cuda_sdpa_materializes_scores(q: &MlxArray, v: &MlxArray, softcap: f32) -> bool {
-    if !cfg!(feature = "cuda") {
+/// Whether the backend must materialize attention scores for this inference
+/// geometry. Keep the eligibility rules aligned with MLX's CUDA/Metal SDPA
+/// dispatch, including Metal's distinct full-query and vector kernels.
+fn sdpa_materializes_scores(
+    q_shape: &[i32],
+    k_shape: &[i32],
+    v_shape: &[i32],
+    dtype: i32,
+    softcap: f32,
+) -> bool {
+    if !cfg!(feature = "cuda") && !cfg!(feature = "metal") {
         return false;
     }
     if softcap > 0.0 {
         return true;
     }
-    let q_shape = ffi::array_shape(q);
-    let v_shape = ffi::array_shape(v);
     let (Some(&dq), Some(&dv)) = (q_shape.last(), v_shape.last()) else {
         return false;
     };
-    let dtype = ffi::array_dtype(q);
-    let flash_eligible = dq % 8 == 0
-        && dq <= 128
-        && dv % 8 == 0
-        && dv <= 128
-        && (dtype == crate::dtype::FLOAT16 || dtype == crate::dtype::BFLOAT16);
-    !flash_eligible
+    if cfg!(feature = "cuda") {
+        let flash_eligible = dq % 8 == 0
+            && dq <= 128
+            && dv % 8 == 0
+            && dv <= 128
+            && (dtype == crate::dtype::FLOAT16 || dtype == crate::dtype::BFLOAT16);
+        return !flash_eligible;
+    }
+    if q_shape.len() != 4 || k_shape.len() != 4 || k_shape[1] <= 0 {
+        return false;
+    }
+    let q_len = q_shape[2];
+    let full_eligible = q_len > 8
+        && dq == dv
+        && matches!(dq, 64 | 72 | 80 | 96 | 128);
+    let vector_head_dim = (dq == dv && matches!(dq, 64 | 96 | 128 | 256))
+        || (dq == 192 && dv == 128);
+    let vector_eligible = q_len <= 8
+        && q_len <= k_shape[2]
+        && vector_head_dim
+        && q_len.saturating_mul(q_shape[1] / k_shape[1]) <= 32;
+    !(full_eligible || vector_eligible)
 }
 
 /// Pure chunk-length math for [`materializing_sdpa_query_chunk`].
 ///
 /// Splits `q_len` into the smallest number of near-equal chunks whose
-/// per-chunk score matrix stays within `budget` bytes. Returns `None` when the
-/// full score matrix already fits.
+/// per-chunk score matrix stays within `budget` bytes when at least one row
+/// fits. Otherwise one row is the minimum. Returns `None` when all rows fit.
 fn query_chunk_len(per_row_bytes: usize, q_len: i32, budget: usize) -> Option<i32> {
     if q_len < 2 || per_row_bytes == 0 || budget == 0 {
         return None;
@@ -4130,7 +4139,8 @@ fn query_chunk_len(per_row_bytes: usize, q_len: i32, budget: usize) -> Option<i3
     if scores <= budget {
         return None;
     }
-    let n_chunks = scores.div_ceil(budget).max(2);
+    let rows_per_chunk = (budget / per_row_bytes).max(1);
+    let n_chunks = (q_len as usize).div_ceil(rows_per_chunk).max(2);
     let chunk = (q_len as usize).div_ceil(n_chunks).max(1);
     Some(chunk as i32)
 }
@@ -4138,12 +4148,12 @@ fn query_chunk_len(per_row_bytes: usize, q_len: i32, budget: usize) -> Option<i3
 /// Query-chunk length for a prefill SDPA that would materialize a score
 /// matrix larger than the chunk budget, or `None` to run unchunked.
 ///
-/// gemma-4-31b at a 32768-token single-pass prefill materializes
-/// `32 heads * 32768^2 * 2 B ~= 68 GiB` of scores in the CUDA fallback and
-/// OOMs GB10 (#672). Chunking the query axis bounds the transient to the
-/// budget while leaving per-row results mathematically identical: softmax and
-/// the value matmul are row-independent, and every chunk still sees the full
-/// key axis.
+/// Both CUDA and Metal fall back to explicit score matrices for unsupported
+/// fused-kernel geometry. In particular, Metal full-query SDPA does not support
+/// head dimension 256, even though its small-query vector kernel does.
+/// Chunking bounds the transient while leaving per-row results mathematically
+/// identical: softmax and the value matmul are row-independent, and every
+/// chunk still sees all keys visible to its query rows.
 pub(crate) fn materializing_sdpa_query_chunk(
     q: &MlxArray,
     k: &MlxArray,
@@ -4162,11 +4172,14 @@ pub(crate) fn materializing_sdpa_query_chunk(
     if q_len < 2 {
         return None;
     }
-    if !cuda_sdpa_materializes_scores(q, v, softcap) {
+    let k_shape = ffi::array_shape(k);
+    let v_shape = ffi::array_shape(v);
+    let dtype = ffi::array_dtype(q);
+    if !sdpa_materializes_scores(&q_shape, &k_shape, &v_shape, dtype, softcap) {
         return None;
     }
-    let k_len = ffi::array_shape(k)[2];
-    let bytes = crate::dtype::size_bytes(ffi::array_dtype(q)).unwrap_or(4);
+    let k_len = k_shape[2];
+    let bytes = crate::dtype::size_bytes(dtype).unwrap_or(4);
     let per_row = (q_shape[0].max(1) as usize)
         .saturating_mul(q_shape[1].max(1) as usize)
         .saturating_mul(k_len.max(1) as usize)
@@ -4247,7 +4260,16 @@ fn chunked_query_attention(
         let base_ref: Option<&MlxArray> = sliced.as_deref().or(mask);
         let cast = base_ref.and_then(|m| mask_in_score_dtype(m, q_dtype));
         let mask_ref: Option<&MlxArray> = cast.as_deref().or(base_ref);
-        parts.push(attention_dispatch(&q_c, k, v, scale, mask_ref, softcap));
+        let part = attention_dispatch(&q_c, k, v, scale, mask_ref, softcap);
+        if cfg!(feature = "metal") {
+            // Lazy parts retain all score workspaces until the final concatenate.
+            // Finish and detach each independent result before queuing another tile.
+            ffi::eval(&part);
+            let ptr = part.as_ref().expect("attention output") as *const MlxArray;
+            // SAFETY: this output is exclusively owned here and has been evaluated.
+            unsafe { ffi::detach_all(&[ptr]) };
+        }
+        parts.push(part);
         start = stop;
     }
     let ptrs: Vec<*const MlxArray> = parts
@@ -4259,8 +4281,7 @@ fn chunked_query_attention(
 }
 
 /// Chunked equivalent of the maskless bottom-right-aligned causal SDPA, for
-/// configurations whose CUDA fallback would materialize the full score matrix
-/// (#672).
+/// configurations whose backend fallback would materialize the full score matrix.
 ///
 /// Query chunk `[start, stop)` (global offset `k_len - q_len`) attends keys
 /// `[0, offset + stop)` only, so K/V are sliced to that causal bound and the
@@ -4304,14 +4325,21 @@ pub(crate) fn chunked_causal_attention(
         let mask = crate::utils::create_causal_mask(stop - start, offset + start);
         // Keep the per-chunk mask in the score dtype (see mask_in_score_dtype).
         let mask = mask_in_score_dtype(mask.as_ref().unwrap(), ffi::array_dtype(q)).unwrap_or(mask);
-        parts.push(attention_dispatch(
+        let part = attention_dispatch(
             &q_c,
             &k_c,
             &v_c,
             scale,
             Some(mask.as_ref().unwrap()),
             0.0,
-        ));
+        );
+        if cfg!(feature = "metal") {
+            ffi::eval(&part);
+            let ptr = part.as_ref().expect("attention output") as *const MlxArray;
+            // SAFETY: this output is exclusively owned here and has been evaluated.
+            unsafe { ffi::detach_all(&[ptr]) };
+        }
+        parts.push(part);
         start = stop;
     }
     let ptrs: Vec<*const MlxArray> = parts
@@ -6964,6 +6992,9 @@ mod tests {
         // Every chunk's scores stay within budget.
         let chunk = query_chunk_len(1000, 100, 7000).unwrap();
         assert!(chunk as usize * 1000 <= 7000);
+        // Balancing by total bytes alone can round a tile above its budget.
+        let chunk = query_chunk_len(300, 10, 1000).unwrap();
+        assert!(chunk as usize * 300 <= 1000);
     }
 
     #[test]
@@ -7070,6 +7101,44 @@ mod tests {
                     "q_len={q_len} k_len={k_len} chunk={chunk} diverged from do_causal SDPA by {diff}"
                 );
             }
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_long_context_fallback_requires_a_bounded_query_plan() {
+        let q = [1, 24, 1536, 256];
+        let k = [1, 4, 218_583, 256];
+        assert!(sdpa_materializes_scores(&q, &k, &k, crate::dtype::FLOAT16, 0.0));
+        let per_row = q[1] as usize * k[2] as usize * 2;
+        let budget = 1024 * 1024 * 1024;
+        let chunk = query_chunk_len(per_row, q[2], budget).expect("oversized Metal score matrix");
+        assert!(chunk < q[2]);
+        assert!(chunk as usize * per_row <= budget);
+        // The same target's short verify block still uses native vector SDPA.
+        assert!(!sdpa_materializes_scores(
+            &[1, 24, 5, 256], &k, &k, crate::dtype::FLOAT16, 0.0
+        ));
+        // Standard full-query head geometry must not be demoted to chunked fallback.
+        assert!(!sdpa_materializes_scores(
+            &[1, 24, 1536, 128], &[1, 4, 218_583, 128],
+            &[1, 4, 218_583, 128], crate::dtype::FLOAT16, 0.0
+        ));
+    }
+
+    #[cfg(feature = "metal")]
+    #[test]
+    fn metal_head_dim_256_chunking_preserves_causal_prefix_and_gqa() {
+        let q = ffi::astype(&test_tensor(&[1, 24, 13, 256]), crate::dtype::FLOAT16);
+        let k = ffi::astype(&test_tensor(&[1, 4, 61, 256]), crate::dtype::FLOAT16);
+        let v = ffi::astype(&test_tensor(&[1, 4, 61, 256]), crate::dtype::FLOAT16);
+        let scale = 1.0 / 16.0;
+        let native = ffi::ffi_fast_scaled_dot_product_attention_causal(&q, &k, &v, scale);
+        // Uneven tails exercise native vector SDPA beside materializing chunks.
+        for chunk in [6, 7] {
+            let chunked = chunked_causal_attention(&q, &k, &v, scale, chunk);
+            let diff = max_abs_diff(&native, &chunked);
+            assert!(diff < 5e-3, "head_dim256 causal offset/GQA diverged by {diff}");
         }
     }
 

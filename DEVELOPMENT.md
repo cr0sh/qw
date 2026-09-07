@@ -69,6 +69,20 @@ snapshot capture; DFlash includes final snapshot capture. Preserve this timing
 scope difference when comparing routes, together with actual token counts,
 stop reasons, cache sources, effective sampling, and separately labeled memory.
 
+Attention geometries without a native fused SDPA kernel use query tiling when
+their score matrix exceeds `MLXCEL_ATTENTION_CHUNK_BUDGET_MB` (existing default:
+1024 MiB; 0 disables it). This includes Metal multi-query attention with head
+dimension 256. Each tile retains the same visible key prefix and causal offset;
+Metal evaluates and detaches its output before constructing the next tile so
+lazy graphs do not retain every tile's transient score buffers together.
+The budget covers raw attention scores, not total process or GPU memory.
+
+This workspace scheduling does not truncate model context, change the
+DFlash/GDN prefill chunk boundaries, alter sampling or decoder selection, or
+change caller token budgets. Weights, live/restored KV state, allocator history,
+and driver residency still contribute memory pressure; a fresh-process replay
+does not reproduce all conditions of a long-lived server.
+
 ## Banking evaluation concurrency
 
 `eval/run_tau3_banking.py --eval-batch-size N` exposes EvalScope's existing task
