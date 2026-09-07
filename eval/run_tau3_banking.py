@@ -7,6 +7,7 @@ dataset, server, or model request is touched.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import fcntl
 import json
@@ -22,7 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--capture", type=Path, help="opt-in JSONL request/response/error capture path")
     parser.add_argument("--limit", type=int, help="optional bounded diagnostic task count")
     parser.add_argument("--eval-batch-size", type=int, default=1, help="EvalScope task concurrency (default: 1)")
-    parser.add_argument("--resume", type=Path, help="reuse verified completed records from a terminal full 97-task run")
+    parser.add_argument("--resume", type=Path, help="recover validated native records under the campaign writer lock")
     return parser.parse_args()
 
 
@@ -59,7 +60,35 @@ def _validate_banking_dataset(datasets, expected_count: int):
     return dataset
 
 
-def _validate_resume(config, run_dir: Path) -> tuple[int, int]:
+@contextmanager
+def _campaign_writer(lock_dir: Path):
+    path = lock_dir / ".writer.lock"
+    if path.is_symlink():
+        raise ValueError("campaign writer lock must not be a symlink")
+    with path.open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise SystemExit("another banking evaluator owns this campaign") from error
+        yield lock
+
+
+def _require_campaign_writer(run_dir: Path, lock) -> None:
+    path = run_dir.parent / ".writer.lock"
+    if path.is_symlink():
+        raise ValueError("campaign writer lock must not be a symlink")
+    expected = path.stat()
+    actual = os.fstat(lock.fileno())
+    if (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino):
+        raise ValueError("resume requires the exact campaign writer lock")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as error:
+        raise SystemExit("another banking evaluator owns this campaign") from error
+
+
+def _validate_resume(config, run_dir: Path, writer_lock) -> tuple[int, int]:
+    _require_campaign_writer(run_dir, writer_lock)
     from evalscope.api.evaluator.cache import CacheManager
     from evalscope.api.registry import get_benchmark
     from evalscope.config import load_task_config_snapshot
@@ -67,18 +96,27 @@ def _validate_resume(config, run_dir: Path) -> tuple[int, int]:
         ResolvedBenchmarkSpec, build_evaluation_identity, validate_cached_evaluation_identity,
     )
     from evalscope.utils.io_utils import OutputsStructure
-    from tau3_adapter import _validate_cached_records
+    if __package__:
+        from .tau3_adapter import _recover_cached_records
+    else:
+        from tau3_adapter import _recover_cached_records
 
     if (run_dir / "INVALID.json").exists():
         raise ValueError("invalidated benchmark runs cannot be resumed or reused")
-    if not all((run_dir / name).is_dir() for name in ("configs", "predictions", "reviews")):
-        raise ValueError("resume requires the exact inner timestamp run directory containing configs, predictions, and reviews")
+    if not (run_dir / "configs").is_dir() or (run_dir / "configs").is_symlink():
+        raise ValueError("resume requires the exact inner timestamp run directory with its configuration snapshot")
+    # Native OutputsStructure creates these lazily. Death before the first
+    # review (or prediction) must not invalidate already durable records.
+    for name in ("predictions", "reviews"):
+        path = run_dir / name
+        if path.is_symlink() or (path.exists() and not path.is_dir()):
+            raise ValueError(f"native {name} path must be a directory when present")
     progress_path = run_dir / "progress.json"
-    if not progress_path.is_file():
-        raise ValueError("resume cannot verify a terminal run without its progress.json")
+    if not progress_path.is_file() or progress_path.is_symlink():
+        raise ValueError("resume cannot verify a run without its native progress.json")
     progress = json.loads(progress_path.read_text())
-    if progress.get("status") not in {"error", "completed"} or progress.get("total_count") != 97:
-        raise ValueError("resume requires a terminal full 97-task run; active, stale-running, and diagnostic runs are rejected")
+    if progress.get("status") not in {"running", "error", "completed"} or progress.get("total_count") != 97:
+        raise ValueError("resume requires a full 97-task native run")
     benchmark = get_benchmark("tau3_bench", config)
     meta = benchmark.benchmark_meta
     identity = build_evaluation_identity(
@@ -94,7 +132,7 @@ def _validate_resume(config, run_dir: Path) -> tuple[int, int]:
     )
     dataset = _validate_banking_dataset(benchmark.load_dataset(), 97)
     cache = CacheManager(outputs, config.model_id, "tau3_bench")
-    return _validate_cached_records(cache, dataset, config.model_id)
+    return _recover_cached_records(cache, dataset, config.model_id, run_dir)
 
 
 def main() -> int:
@@ -145,7 +183,10 @@ def main() -> int:
     if Path(dataset_id).is_dir():
         os.environ["TAU2_DATA_DIR"] = dataset_id
 
-    from tau3_adapter import configure_capture, install
+    if __package__:
+        from .tau3_adapter import configure_capture, install
+    else:
+        from tau3_adapter import configure_capture, install
 
     install()
     from evalscope import TaskConfig, run_task
@@ -208,14 +249,10 @@ def main() -> int:
     # Fresh runs use the outer UUID directory; native use_cache points to its
     # inner timestamp directory. Both writers hold the same stable empty lock.
     lock_dir = work_dir.parent if args.resume is not None else work_dir
-    with (lock_dir / ".writer.lock").open("a") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as error:
-            raise SystemExit("another banking evaluator owns this campaign") from error
+    with _campaign_writer(lock_dir) as lock:
         if args.resume is not None:
-            predictions, reviews = _validate_resume(config, work_dir)
-            print(f"Verified native resume: {predictions}/97 completed predictions, {reviews}/97 completed reviews.", flush=True)
+            predictions, reviews = _validate_resume(config, work_dir, lock)
+            print(f"Verified durable native resume: {predictions}/97 predictions, {reviews}/97 reviews; {97 - predictions} unfinished episodes may run again.", flush=True)
         else:
             from evalscope.api.registry import get_benchmark
 

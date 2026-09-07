@@ -8,16 +8,21 @@ third-party installation remains untouched.
 
 from __future__ import annotations
 
+import copy
+import fcntl
 import json
 import math
 import logging
 import os
+import re
+import shutil
 from pathlib import Path
 import sys
 import traceback
 from contextvars import ContextVar
 from threading import Lock
 from typing import Any
+from uuid import uuid4
 
 from openai import APIStatusError
 
@@ -27,6 +32,7 @@ from evalscope.api.model.model_output import ChatCompletionChoice, ModelOutput
 from evalscope.models.utils.openai import openai_chat_message, openai_chat_tools
 from evalscope.api.tool.tool_info import ToolInfo
 from evalscope.constants import EvalType
+from evalscope.utils.io_utils import JsonlWriter as _NativeJsonlWriter
 from tau2.data_model.message import AssistantMessage, Message, ToolCall, UserMessage
 from tau2.data_model.tasks import Task
 from tau2.environment.tool import Tool
@@ -46,6 +52,10 @@ _CAPTURE_PATH: Path | None = None
 _CURRENT_TASK_ID: ContextVar[str | None] = ContextVar("tau3_task_id", default=None)
 _CAPTURE_LOCK = Lock()
 _SETUP_LOCK = Lock()
+_NATIVE_WRITE_LOCK = Lock()
+_NATIVE_DURABILITY_INSTALLED = False
+_NATIVE_REVIEW_COMMIT = None
+_NATIVE_PROGRESS_WRITE = None
 
 
 def _redact_runtime_secret(text: str) -> str:
@@ -426,20 +436,253 @@ def install() -> None:
 
     _install_generation_hook()
     _protect_runtime_logs()
+    _install_native_durability()
     generation.predict = predict
     generation.patched_generate = patched_generate
 
 
+def _sync_directory_tree(directory: Path) -> None:
+    """Persist newly created directory entries through their existing ancestors."""
+    directory = directory.resolve()
+    device = directory.stat().st_dev
+    for path in (directory, *directory.parents):
+        if path.stat().st_dev != device:
+            break
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+
+def _full_sync(descriptor: int) -> None:
+    # Darwin fsync alone need not flush a drive's volatile write cache.
+    if sys.platform == "darwin":
+        fcntl.fcntl(descriptor, fcntl.F_FULLFSYNC)
+
+
+class _DurableJsonlWriter(_NativeJsonlWriter):
+    """Keep native JSONL encoding, but acknowledge only a synchronized record."""
+
+    def __init__(self, path: str) -> None:
+        super().__init__(path)
+        self._directory_synced = False
+
+    def write(self, record: Any) -> None:
+        with _NATIVE_WRITE_LOCK:
+            super().write(record)
+            descriptor = self._file.fileno()
+            os.fsync(descriptor)
+            if not self._directory_synced:
+                _sync_directory_tree(Path(self._path).parent)
+                self._directory_synced = True
+            _full_sync(descriptor)
+
+
+def _publish_native_file(temporary: Path, destination: Path) -> None:
+    """Make complete data durable before atomically publishing its filename."""
+    with temporary.open("r+b") as stream:
+        os.fsync(stream.fileno())
+        os.replace(temporary, destination)
+        _sync_directory_tree(destination.parent)
+        _full_sync(stream.fileno())
+
+
+def _durable_dump_yaml(config, output_dir, generated_metadata=None) -> None:
+    from evalscope.utils.io_utils import dict_to_yaml
+
+    destination = Path(output_dir) / "task_config.yaml"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(f"{destination.name}.rerun-{uuid4().hex}")
+    payload = config.to_dict()
+    if generated_metadata:
+        payload.update(generated_metadata)
+    dict_to_yaml(payload, str(temporary))
+    _publish_native_file(temporary, destination)
+
+
+def _durable_progress_write(tracker, force=True) -> None:
+    # Reuse the native serializer and throttling, without publishing an
+    # unsynchronized replacement over the previous durable progress snapshot.
+    destination = Path(tracker._path)
+    temporary = destination.with_name(f"{destination.name}.rerun-{uuid4().hex}")
+    staged = copy.copy(tracker)
+    staged._path = str(temporary)
+    _NATIVE_PROGRESS_WRITE(staged, force=force)
+    if temporary.exists():
+        _publish_native_file(temporary, destination)
+    tracker._last_write_time = staged._last_write_time
+
+
+def _durable_commit_review_reruns(cache) -> None:
+    destinations = list(cache._review_reruns)
+    for destination in destinations:
+        writer = cache._writers.pop(destination, None)
+        if writer is not None:
+            writer.close()
+    _NATIVE_REVIEW_COMMIT(cache)
+    for destination in destinations:
+        path = Path(destination)
+        if path.is_file():
+            with path.open("r+b") as stream:
+                os.fsync(stream.fileno())
+                _sync_directory_tree(path.parent)
+                _full_sync(stream.fileno())
+
+
+def _retain_interrupted_review_reruns(cache) -> None:
+    # A failed run must not delete already acknowledged native staging rows.
+    for temporary in cache._review_reruns.values():
+        writer = cache._writers.pop(temporary, None)
+        if writer is not None:
+            writer.close()
+    cache._review_reruns.clear()
+
+
+def _install_native_durability() -> None:
+    global _NATIVE_DURABILITY_INSTALLED, _NATIVE_REVIEW_COMMIT, _NATIVE_PROGRESS_WRITE
+    from evalscope import TaskConfig
+    from evalscope.api.evaluator import cache as native_cache
+    from evalscope.utils.tqdm_utils.progress_tracker import ProgressTracker
+
+    with _SETUP_LOCK:
+        if _NATIVE_DURABILITY_INSTALLED:
+            return
+        _NATIVE_REVIEW_COMMIT = native_cache.CacheManager.commit_review_reruns
+        _NATIVE_PROGRESS_WRITE = ProgressTracker._write
+        native_cache.JsonlWriter = _DurableJsonlWriter
+        native_cache.CacheManager.commit_review_reruns = _durable_commit_review_reruns
+        native_cache.CacheManager.discard_review_reruns = _retain_interrupted_review_reruns
+        TaskConfig.dump_yaml = _durable_dump_yaml
+        ProgressTracker._write = _durable_progress_write
+        _NATIVE_DURABILITY_INSTALLED = True
+
+
+def _read_native_rows(path: Path) -> tuple[list[dict[str, Any]], bytes]:
+    if path.is_symlink():
+        raise ValueError(f"native cache source must not be a symlink: {path}")
+    if not path.exists():
+        return [], b""
+    if not path.is_file():
+        raise ValueError(f"native cache source is not a regular file: {path}")
+    payload = path.read_bytes()
+    lines = payload.split(b"\n")
+    trailing = lines.pop()
+    if trailing and trailing != b"{" and not trailing.startswith(b'{"'):
+        raise ValueError(f"unterminated bytes are not a native object append: {path}")
+    rows = []
+    for number, line in enumerate(lines, 1):
+        try:
+            row = json.loads(line)
+        except (ValueError, UnicodeDecodeError) as error:
+            raise ValueError(f"invalid complete native cache record at {path}:{number}") from error
+        if not isinstance(row, dict):
+            raise ValueError(f"native cache record is not an object at {path}:{number}")
+        rows.append(row)
+    return rows, trailing
+
+
+def _native_sources(canonical: Path) -> list[Path]:
+    if canonical.is_symlink():
+        raise ValueError(f"native canonical cache must not be a symlink: {canonical}")
+    staging = []
+    pattern = re.compile(re.escape(canonical.name) + r"\.rerun-[0-9a-f]{32}")
+    for path in sorted(canonical.parent.glob(canonical.name + ".*")):
+        if not pattern.fullmatch(path.name) or path.is_symlink() or not path.is_file():
+            raise ValueError(f"unrecognized native cache staging source: {path}")
+        staging.append(path)
+    return ([canonical] if canonical.exists() else []) + staging
+
+
+def _merged_native_rows(sources: list[Path]) -> tuple[list[dict[str, Any]], bool]:
+    by_index = {}
+    had_fragment = False
+    for source in sources:
+        rows, trailing = _read_native_rows(source)
+        had_fragment |= bool(trailing)
+        local_indices = set()
+        for row in rows:
+            index = row.get("index")
+            if type(index) is not int or index in local_indices:
+                raise ValueError(f"duplicate or invalid native cache index in {source}")
+            local_indices.add(index)
+            if index in by_index and by_index[index] != row:
+                raise ValueError(f"conflicting native cache records for index {index}")
+            by_index[index] = row
+    return list(by_index.values()), had_fragment
+
+
+def _archive_recovery_sources(run_dir: Path, sources: list[Path]) -> None:
+    archive = run_dir / "recovery-evidence" / uuid4().hex
+    for source in sources:
+        if source.is_symlink() or not source.resolve().is_relative_to(run_dir.resolve()):
+            raise ValueError(f"recovery source escapes its native run: {source}")
+        target = archive / source.relative_to(run_dir)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        with target.open("r+b") as stream:
+            os.fsync(stream.fileno())
+            _sync_directory_tree(target.parent)
+            _full_sync(stream.fileno())
+
+
+def _recover_cached_records(cache, dataset, model_name: str, run_dir: Path) -> tuple[int, int]:
+    """Repair only validated native rows, after the launcher owns its writer lock."""
+    paths = [
+        Path(cache.get_prediction_cache_path("banking_knowledge")),
+        Path(cache.get_review_cache_path("banking_knowledge")),
+    ]
+    plans = []
+    for canonical in paths:
+        sources = _native_sources(canonical)
+        rows, fragment = _merged_native_rows(sources)
+        plans.append((canonical, sources, rows, fragment))
+    counts = _validate_cached_rows(plans[0][2], plans[1][2], dataset, model_name)
+    # Preserve the original progress and all repair inputs before changing any
+    # canonical file. Progress remains native; no synthetic error/completion state.
+    _archive_recovery_sources(run_dir, [
+        run_dir / "progress.json",
+        *(source for _, sources, _, _ in plans for source in sources),
+    ])
+    for canonical, sources, rows, fragment in plans:
+        staging = [source for source in sources if source != canonical]
+        if fragment or staging:
+            canonical.parent.mkdir(parents=True, exist_ok=True)
+            temporary = canonical.with_name(f"{canonical.name}.rerun-{uuid4().hex}")
+            with temporary.open("xb") as stream:
+                for row in rows:
+                    stream.write((json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8"))
+            _publish_native_file(temporary, canonical)
+            for source in staging:
+                source.unlink()
+            _sync_directory_tree(canonical.parent)
+        elif canonical.exists():
+            with canonical.open("r+b") as stream:
+                os.fsync(stream.fileno())
+                _sync_directory_tree(canonical.parent)
+                _full_sync(stream.fileno())
+    return counts
+
+
 def _validate_cached_records(cache, dataset, model_name: str) -> tuple[int, int]:
-    """Validate native cache rows without changing or synthesizing any record."""
+    """Validate complete canonical rows without changing or synthesizing them."""
+    prediction_rows, prediction_tail = _read_native_rows(Path(cache.get_prediction_cache_path("banking_knowledge")))
+    review_rows, review_tail = _read_native_rows(Path(cache.get_review_cache_path("banking_knowledge")))
+    if prediction_tail or review_tail:
+        raise ValueError("native cache has an unfinished trailing record; recover under the writer lock")
+    return _validate_cached_rows(prediction_rows, review_rows, dataset, model_name)
+
+
+def _validate_cached_rows(prediction_rows, review_rows, dataset, model_name: str) -> tuple[int, int]:
     from evalscope.api.evaluator.cache import ModelResult, ReviewResult
-    from evalscope.utils.io_utils import jsonl_to_list
     from tau2.data_model.simulation import SimulationRun
 
     fields = {"role", "content", "tool_calls", "tool_call_id", "metadata"}
     predictions = {}
-    prediction_path = cache.get_prediction_cache_path("banking_knowledge")
-    for row in jsonl_to_list(prediction_path) if Path(prediction_path).is_file() else []:
+    # Native to_task_state updates sample.metadata in-place. Validation must
+    # not contaminate the canonical dataset used by later checks/recovery.
+    state_dataset = copy.deepcopy(dataset)
+    for row in prediction_rows:
         prediction = ModelResult.model_validate(row)
         index = prediction.index
         if type(row["index"]) is not int or not 0 <= index < len(dataset) or index in predictions:
@@ -468,11 +711,10 @@ def _validate_cached_records(cache, dataset, model_name: str) -> tuple[int, int]
             for saved, raw in zip(prediction.messages, raw_messages)
         ):
             raise ValueError(f"resume prediction {index} has a lossy or mismatched trajectory")
-        predictions[index] = (prediction.to_task_state(dataset), simulation)
+        predictions[index] = (prediction.to_task_state(state_dataset), simulation)
 
     reviewed = set()
-    review_path = cache.get_review_cache_path("banking_knowledge")
-    for row in jsonl_to_list(review_path) if Path(review_path).is_file() else []:
+    for row in review_rows:
         review = ReviewResult.model_validate(row)
         index = review.index
         if type(row["index"]) is not int or index in reviewed or index not in predictions:

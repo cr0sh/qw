@@ -1,9 +1,13 @@
+import copy
 import json
 import io
 import logging
 import os
+import multiprocessing
 from pathlib import Path
 import tempfile
+import shutil
+import signal
 import threading
 import traceback
 import unittest
@@ -105,10 +109,22 @@ def check_email(folder: str) -> str:
     raise AssertionError("Generation must not execute simulator tools")
 
 
-def completed_cache_fixture(directory):
-    task = Task(id="cached-zero", user_scenario={"instructions": "Compare available cards."})
-    sample = Sample(id=0, group_id=0, input="Compare available cards.", metadata=task.model_dump())
-    dataset = MemoryDataset([sample, Sample(id=1, group_id=1, input="Pending task", metadata={"id": "pending"})])
+def cache_fixture_dataset(count=2):
+    samples = []
+    for index in range(count):
+        task = Task(
+            id="cached-zero" if index == 0 else ("pending" if index == 1 else f"pending-{index}"),
+            user_scenario={"instructions": "Compare available cards." if index == 0 else "Pending task"},
+        )
+        samples.append(Sample(
+            id=index, group_id=index, input="Compare available cards." if index == 0 else "Pending task",
+            subset_key="banking_knowledge", metadata=task.model_dump(),
+        ))
+    return MemoryDataset(samples)
+
+
+def cache_fixture_record(dataset, index=0):
+    sample = dataset[index]
     message = AssistantMessage(
         role="assistant", content="I still need details.",
         raw_data={"choices": [{"message": {"content": [
@@ -118,7 +134,7 @@ def completed_cache_fixture(directory):
     )
     user_tool = UserMessage(role="user", tool_calls=[ToolCall(id="lookup", name="lookup", arguments={}, requestor="user")])
     result = SimulationRun(
-        id="cache-fixture", task_id=task.id, start_time="2026-01-01T00:00:00",
+        id="cache-fixture" if index == 0 else f"cache-fixture-{index}", task_id=sample.metadata["id"], start_time="2026-01-01T00:00:00",
         end_time="2026-01-01T00:00:01", duration=1.0,
         termination_reason="max_steps", reward_info=RewardInfo(reward=0.0), messages=[message, user_tool],
     )
@@ -129,9 +145,15 @@ def completed_cache_fixture(directory):
         messages=[tau3_adapter._trajectory_message(item) for item in result.messages], completed=True,
     )
     score = SampleScore(
-        sample_id=0, group_id=0, generation_index=0, sample_metadata=state.metadata,
+        sample_id=index, group_id=index, generation_index=0, sample_metadata=state.metadata,
         score=Score(value={"acc": 0.0}, prediction=result.model_dump_json(), metadata={"task_result": task_result}),
     )
+    return state, score
+
+
+def completed_cache_fixture(directory):
+    dataset = cache_fixture_dataset()
+    state, score = cache_fixture_record(dataset)
     cache = CacheManager(OutputsStructure(directory), "cache-fixture", "tau3_bench")
     cache.save_prediction_cache("banking_knowledge", state)
     cache.save_review_cache("banking_knowledge", state, score)
@@ -139,10 +161,69 @@ def completed_cache_fixture(directory):
     return cache, dataset
 
 
+def native_resume_fixture(run_dir, dataset):
+    from evalscope import TaskConfig
+    from evalscope.api.registry import get_benchmark
+    from evalscope.benchmarks.tau_bench.tau3_bench.tau3_bench_adapter import Tau3BenchAdapter
+    from evalscope.evaluation_versioning import (
+        ResolvedBenchmarkSpec, build_evaluation_identity, build_generated_evaluation_metadata,
+    )
+
+    config = TaskConfig(
+        model="cache-fixture", api_url="http://unused.invalid/v1", api_key="test",
+        eval_type="openai_api", datasets=["tau3_bench"], eval_batch_size=3,
+        dataset_args={"tau3_bench": {"subset_list": ["banking_knowledge"]}},
+        work_dir=str(run_dir), repeats=1,
+    )
+    # Supply a deterministic dataset, not a network/model-backed loader; native
+    # registry metadata, identity generation and all cache serializers remain real.
+    with patch.object(Tau3BenchAdapter, "_prepare_data_dir"):
+        benchmark = get_benchmark("tau3_bench", config)
+    benchmark.load_dataset = lambda: {"banking_knowledge": dataset}
+    meta = benchmark.benchmark_meta
+    specs = {"tau3_bench": ResolvedBenchmarkSpec.from_meta(meta, config)}
+    identity = build_evaluation_identity(specs, {"tau3_bench": meta.evaluation_version}, config)
+    return config, benchmark, build_generated_evaluation_metadata(specs, identity)
+
+
+def killed_native_writer(run_dir_string, connection):
+    from eval.run_tau3_banking import _campaign_writer
+    from evalscope.utils.tqdm_utils.progress_tracker import ProgressTracker
+
+    tau3_adapter.install()
+    run_dir = Path(run_dir_string)
+    with _campaign_writer(run_dir.parent):
+        dataset = cache_fixture_dataset(97)
+        outputs = OutputsStructure(str(run_dir))
+        config, _, generated = native_resume_fixture(run_dir, dataset)
+        config.dump_yaml(outputs.configs_dir, generated)
+        tracker = ProgressTracker(str(run_dir), pipeline="eval", write_interval=0, total_count=97)
+        cache = CacheManager(outputs, "cache-fixture", "tau3_bench")
+        for index in (0, 1):
+            state, score = cache_fixture_record(dataset, index)
+            cache.save_prediction_cache("banking_knowledge", state)
+            if index == 1:
+                cache.delete_review_cache("banking_knowledge")
+            cache.save_review_cache("banking_knowledge", state, score)
+            tracker.update()
+        prediction = Path(cache.get_prediction_cache_path("banking_knowledge"))
+        staging = Path(next(iter(cache._review_reruns.values())))
+        # A subsequent native append can be interrupted between payload and LF.
+        fragment = b'{"index":2,"unfinished":"\xf0\x9f'
+        for path in (prediction, staging):
+            with path.open("ab") as stream:
+                stream.write(fragment)
+                stream.flush()
+                os.fsync(stream.fileno())
+        connection.send({"staging": str(staging), "fragment": fragment})
+        connection.recv()  # Parent SIGKILLs us: no close(), finalizer, or fake error state.
+
+
 
 
 class Tau3AdapterTests(unittest.TestCase):
     def setUp(self):
+        tau3_adapter.install()
         self.models_token = tau3_adapter._TASK_MODELS.set(None)
         self.task_token = tau3_adapter._CURRENT_TASK_ID.set(None)
 
@@ -150,6 +231,126 @@ class Tau3AdapterTests(unittest.TestCase):
         tau3_adapter._TASK_MODELS.reset(self.models_token)
         tau3_adapter._CURRENT_TASK_ID.reset(self.task_token)
         tau3_adapter.configure_capture(None)
+
+    def test_sigkill_recovers_native_records_staging_and_stale_running_under_lock(self):
+        from eval.run_tau3_banking import _campaign_writer, _validate_resume
+
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "run"
+            context = multiprocessing.get_context("spawn")
+            parent, child_connection = context.Pipe()
+            child = context.Process(target=killed_native_writer, args=(str(run_dir), child_connection))
+            child.start()
+            child_connection.close()
+            try:
+                self.assertTrue(parent.poll(30), "native child did not acknowledge its durable records")
+                ready = parent.recv()
+                before_progress = (run_dir / "progress.json").read_bytes()
+                with self.assertRaises(SystemExit):
+                    with _campaign_writer(run_dir.parent):
+                        self.fail("an active native writer must retain exclusive ownership")
+                self.assertEqual((run_dir / "progress.json").read_bytes(), before_progress)
+                child.kill()
+                child.join(timeout=10)
+                self.assertEqual(child.exitcode, -signal.SIGKILL)
+            finally:
+                if child.is_alive():
+                    child.kill()
+                    child.join(timeout=10)
+                parent.close()
+            self.assertEqual(json.loads(before_progress)["status"], "running")
+            dataset = cache_fixture_dataset(97)
+            original_metadata = [copy.deepcopy(sample.metadata) for sample in dataset]
+            config, benchmark, _ = native_resume_fixture(run_dir, dataset)
+            with _campaign_writer(run_dir.parent) as lock, patch(
+                "evalscope.api.registry.get_benchmark", return_value=benchmark
+            ):
+                self.assertEqual(_validate_resume(config, run_dir, lock), (2, 2))
+                self.assertEqual([sample.metadata for sample in dataset], original_metadata)
+                cache = CacheManager(OutputsStructure(str(run_dir), is_make=False), "cache-fixture", "tau3_bench")
+                restored, remaining = cache.filter_prediction_cache("banking_knowledge", copy.deepcopy(dataset))
+                self.assertEqual({state.sample_id for state in restored}, {0, 1})
+                self.assertEqual({sample.id for sample in remaining}, set(range(2, 97)))
+                scores, pending = cache.filter_review_cache("banking_knowledge", restored)
+                self.assertEqual({score.sample_id for score in scores}, {0, 1})
+                self.assertEqual([score.score.value for score in scores], [{"acc": 0.0}, {"acc": 0.0}])
+                self.assertEqual(pending, [])
+                archived = list(run_dir.glob("recovery-evidence/*/reviews/cache-fixture/" + Path(ready["staging"]).name))
+                self.assertEqual(len(archived), 1)
+                self.assertTrue(archived[0].read_bytes().endswith(ready["fragment"]))
+                self.assertEqual((run_dir / "progress.json").read_bytes(), before_progress)
+                # Simulate death after canonical publication but before source
+                # staging cleanup: an identical surviving stage is idempotent.
+                shutil.copy2(archived[0], ready["staging"])
+                self.assertEqual(_validate_resume(config, run_dir, lock), (2, 2))
+                self.assertEqual(tau3_adapter._validate_cached_records(cache, dataset, "cache-fixture"), (2, 2))
+
+    def test_native_recovery_rejects_middle_corruption_conflicts_orphans_and_unknown_temps(self):
+        from eval.run_tau3_banking import _campaign_writer
+
+        for corruption in ("middle", "conflict", "orphan", "unrelated", "garbage_tail"):
+            with self.subTest(corruption=corruption), tempfile.TemporaryDirectory() as directory:
+                run_dir = Path(directory) / "run"
+                cache, dataset = completed_cache_fixture(str(run_dir))
+                prediction = Path(cache.get_prediction_cache_path("banking_knowledge"))
+                review = Path(cache.get_review_cache_path("banking_knowledge"))
+                if corruption == "middle":
+                    original = prediction.read_bytes()
+                    prediction.write_bytes(original + b'{"index":\n' + original)
+                elif corruption == "garbage_tail":
+                    prediction.write_bytes(prediction.read_bytes() + b"not a native object")
+                elif corruption in {"conflict", "orphan"}:
+                    state, score = cache_fixture_record(dataset, 0 if corruption == "conflict" else 1)
+                    if corruption == "conflict":
+                        score.score.value = {"acc": 1.0}
+                    cache.delete_review_cache("banking_knowledge")
+                    cache.save_review_cache("banking_knowledge", state, score)
+                    cache.close()
+                else:
+                    shutil.copy2(review, str(review) + ".tmp")
+                sources = [prediction, review, *review.parent.glob(review.name + ".*")]
+                before = {path: path.read_bytes() for path in sources}
+                with _campaign_writer(run_dir.parent), self.assertRaises(ValueError):
+                    tau3_adapter._recover_cached_records(cache, dataset, "cache-fixture", run_dir)
+                self.assertEqual({path: path.read_bytes() for path in sources}, before)
+                self.assertFalse((run_dir / "recovery-evidence").exists())
+
+    def test_native_cache_sync_failure_is_not_acknowledged_as_a_saved_prediction(self):
+        from eval.run_tau3_banking import _campaign_writer, _validate_resume
+        from evalscope.utils.tqdm_utils.progress_tracker import ProgressTracker
+
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "run"
+            dataset = cache_fixture_dataset(97)
+            outputs = OutputsStructure(str(run_dir))
+            config, benchmark, generated = native_resume_fixture(run_dir, dataset)
+            config.dump_yaml(outputs.configs_dir, generated)
+            ProgressTracker(str(run_dir), pipeline="eval", total_count=97)
+            cache = CacheManager(outputs, "cache-fixture", "tau3_bench")
+            state, _ = cache_fixture_record(dataset)
+            with patch.object(tau3_adapter.os, "fsync", side_effect=OSError("injected durability failure")):
+                with self.assertRaisesRegex(OSError, "injected durability failure"):
+                    cache.save_prediction_cache("banking_knowledge", state)
+            cache.close()
+            # A complete surviving record can be validated and made durable on
+            # recovery; the original failing save must not silently acknowledge it.
+            with _campaign_writer(run_dir.parent) as lock, patch(
+                "evalscope.api.registry.get_benchmark", return_value=benchmark
+            ):
+                self.assertEqual(_validate_resume(config, run_dir, lock), (1, 0))
+
+    def test_failed_progress_publication_preserves_previous_native_snapshot(self):
+        from evalscope.utils.tqdm_utils.progress_tracker import ProgressTracker
+
+        with tempfile.TemporaryDirectory() as directory:
+            tracker = ProgressTracker(directory, pipeline="eval", total_count=97)
+            path = Path(directory) / "progress.json"
+            before = path.read_bytes()
+            with patch.object(tau3_adapter.os, "fsync", side_effect=OSError("injected metadata failure")):
+                with self.assertRaisesRegex(OSError, "injected metadata failure"):
+                    tracker.set_status("completed")
+            self.assertEqual(path.read_bytes(), before)
+            self.assertEqual(json.loads(before)["status"], "running")
 
     def test_interleaved_predictions_isolate_roles_capture_and_failure_cleanup(self):
         barrier = threading.Barrier(2, timeout=10)
