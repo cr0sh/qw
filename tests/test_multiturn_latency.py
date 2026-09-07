@@ -250,6 +250,34 @@ class ScenarioTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             validate_cache_traces(scenarios)
 
+    def test_cache_lifecycle_correlation_survives_tier_changes_and_unscoped_events(self) -> None:
+        entry_id = "a" * 64
+        fields = [
+            {"phase": "cache.insert", "tier": "memory", "capacity_bytes": 64},
+            {"phase": "cache.insert", "entry_id": entry_id, "token_count": 20},
+            {"phase": "cache.evict", "entry_id": entry_id, "tier": "memory", "reclaimed_bytes": 64},
+            {"phase": "cache.promote", "entry_id": entry_id, "from": "filesystem", "to": "memory"},
+            {"phase": "cache.lookup", "entry_id": entry_id, "hit": True, "cached_tokens": 20},
+            {"phase": "cache.persistence_error", "entry_id": entry_id, "error": "write failed"},
+            {"phase": "cache.expire", "entry_id": entry_id},
+            {"phase": "cache.lookup", "hit": False},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "lifecycle.jsonl"
+            log.write_text("\n".join(json.dumps({"fields": event}) for event in fields))
+            recovered = server_trace_events(log)
+        lifetime = [event for event in recovered if event.get("entry_id") == entry_id]
+        self.assertEqual([event["phase"] for event in lifetime], [
+            "cache.insert", "cache.evict", "cache.promote", "cache.lookup",
+            "cache.persistence_error", "cache.expire",
+        ])
+        self.assertEqual(lifetime[1]["tier"], "memory")
+        self.assertEqual(lifetime[1]["reclaimed_bytes"], 64)
+        self.assertEqual((lifetime[2]["from"], lifetime[2]["to"]), ("filesystem", "memory"))
+        self.assertEqual(lifetime[4]["error"], "write failed")
+        self.assertNotIn("entry_id", recovered[0])
+        self.assertNotIn("entry_id", recovered[-1])
+
 
 
 if __name__ == "__main__":
