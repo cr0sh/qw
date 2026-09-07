@@ -56,6 +56,25 @@ snapshot capture; DFlash includes final snapshot capture. Preserve this timing
 scope difference when comparing routes, together with actual token counts,
 stop reasons, cache sources, effective sampling, and separately labeled memory.
 
+## Banking evaluation concurrency
+
+`eval/run_tau3_banking.py --eval-batch-size N` exposes EvalScope's existing task
+concurrency setting as a positive integer; the default remains 1. Use
+`--eval-batch-size 2` explicitly for a two-task run. This uses the installed
+evaluator's task worker pool, not GPU
+batching or Tau2's separate batch runner. GPU requests remain serialized by the
+runtime worker, but independent tasks can overlap remote simulator/judge work
+with local generation. Measure campaign wall time before claiming a gain.
+The launcher retains the repo-owned adapter installation and banking presets;
+invoking the generic EvalScope CLI without those hooks would bypass the corrected
+reasoning, continuation, and error-reporting behavior.
+
+Each prediction binds its agent and simulator models and capture task identity
+to the executing task, restoring the prior context on success or failure.
+Opt-in capture appends are serialized and retain credential redaction.
+Concurrency does not change canonical scoring, prompts, retry policy, or
+per-task token budgets, and does not promise schedule-independent random output.
+
 ## Shared worktrees
 
 Each worktree must link Cargo's `target/` to the primary repository target:

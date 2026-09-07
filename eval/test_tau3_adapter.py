@@ -9,6 +9,7 @@ import traceback
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from contextlib import contextmanager
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -141,10 +142,90 @@ def completed_cache_fixture(directory):
 
 
 class Tau3AdapterTests(unittest.TestCase):
+    def setUp(self):
+        self.models_token = tau3_adapter._TASK_MODELS.set(None)
+        self.task_token = tau3_adapter._CURRENT_TASK_ID.set(None)
+
     def tearDown(self):
-        tau3_adapter.MODEL_DICT["user"] = None
-        tau3_adapter.MODEL_DICT["agent"] = None
+        tau3_adapter._TASK_MODELS.reset(self.models_token)
+        tau3_adapter._CURRENT_TASK_ID.reset(self.task_token)
         tau3_adapter.configure_capture(None)
+
+    def test_interleaved_predictions_isolate_roles_capture_and_failure_cleanup(self):
+        barrier = threading.Barrier(2, timeout=10)
+        secret = "fake-concurrent-simulator-secret"
+        replies = {"left": "Left account: " + "L" * 20000, "right": "Right account: " + "R" * 20000}
+        observed = {}
+
+        def run_simulation(*, task, **kwargs):
+            barrier.wait()
+            answers = []
+            for role in ("agent", "user"):
+                answer = tau3_adapter.patched_generate(
+                    model=role, messages=[UserMessage(role="user", content=f"{task.id}: {secret}")],
+                )
+                answers.append(answer)
+                barrier.wait()
+            observed[task.id] = [answer.content for answer in answers]
+            if task.id == "left":
+                raise ValueError(f"simulation failed with {secret}")
+            return SimulationRun(
+                id="concurrent-right", task_id=task.id, start_time="2026-01-01T00:00:00",
+                end_time="2026-01-01T00:00:01", duration=1.0,
+                termination_reason="max_steps", reward_info=RewardInfo(reward=0.0), messages=answers,
+            )
+
+        def predict_one(task_id, agent_model):
+            task = Task(id=task_id, user_scenario={"instructions": "Compare cards."})
+            sample = Sample(input="Compare cards.", subset_key="mock", metadata=task.model_dump())
+            instance = SimpleNamespace(
+                user_model="right" if task_id == "left" else "left",
+                api_base="http://unused.invalid", generation_config={},
+            )
+            try:
+                result = tau3_adapter.predict(agent_model, sample, instance)
+                outcome = SimulationRun.model_validate_json(result.output.choices[0].message.text)
+            except tau3_adapter.Tau3AdapterError as error:
+                outcome = error
+            # A worker may serve another sample after success OR failure. Neither
+            # model access nor task attribution may survive the completed call.
+            with self.assertRaises(tau3_adapter.Tau3AdapterError):
+                tau3_adapter.patched_generate(model="agent", messages=[UserMessage(role="user", content="outside task")])
+            tau3_adapter._capture({"event": "worker_released", "worker": task_id})
+            return outcome
+
+        with completion_server([chat_response(replies["left"])]) as (left, _), \
+                completion_server([chat_response(replies["right"])]) as (right, _), \
+                tempfile.TemporaryDirectory() as directory:
+            capture = Path(directory) / "concurrent.jsonl"
+            tau3_adapter.configure_capture(capture)
+            models = {"left": left, "right": right}
+            with patch.dict(os.environ, {"DEEPSEEK_API_KEY": secret}), \
+                    patch("evalscope.api.model.get_model", side_effect=lambda **kwargs: models[kwargs["model"]]), \
+                    patch("tau2.run.run_task", side_effect=run_simulation), \
+                    ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [executor.submit(predict_one, task_id, models[task_id]) for task_id in ("left", "right")]
+                failed, completed = [future.result(timeout=30) for future in futures]
+            self.assertEqual(observed, {
+                "left": [replies["left"], replies["right"]],
+                "right": [replies["right"], replies["left"]],
+            })
+            self.assertIsInstance(failed, tau3_adapter.Tau3AdapterError)
+            self.assertNotIn(secret, str(failed))
+            self.assertEqual(completed.reward_info.reward, 0.0)
+            text = capture.read_text()
+            self.assertNotIn(secret, text)
+            rows = [json.loads(line) for line in text.splitlines()]
+            for task_id in ("left", "right"):
+                responses = [row for row in rows if row.get("task_id") == task_id and row["event"] == "response"]
+                self.assertEqual([ModelOutput.model_validate(row["response"]).choices[0].message.text for row in responses], observed[task_id])
+                requests = [row for row in rows if row.get("task_id") == task_id and row["event"] == "request"]
+                self.assertEqual([row["wire_messages"][0]["content"] for row in requests], [f"{task_id}: [REDACTED]"] * 2)
+            self.assertEqual([row["task_id"] for row in rows if row["event"] == "task_error"], ["left"])
+            self.assertEqual([row["task_id"] for row in rows if row["event"] == "task_result"], ["right"])
+            released = [row for row in rows if row["event"] == "worker_released"]
+            self.assertEqual({row["worker"] for row in released}, {"left", "right"})
+            self.assertTrue(all("task_id" not in row for row in released))
 
     def test_provider_error_redacts_runtime_credential_from_logs_capture_and_traceback(self):
         from tau2.orchestrator.orchestrator import logger as tau_logger
@@ -171,7 +252,7 @@ class Tau3AdapterTests(unittest.TestCase):
                         logger.exception("provider error for %s", sentinel)
                         raise
 
-                tau3_adapter.MODEL_DICT["user"] = SimpleNamespace(generate=fail)
+                tau3_adapter._TASK_MODELS.set({"user": SimpleNamespace(generate=fail)})
                 simulator = UserSimulator(llm="user")
                 state = UserState(
                     system_messages=[SystemMessage(role="system", content="Act as the customer.")],
@@ -284,7 +365,7 @@ class Tau3AdapterTests(unittest.TestCase):
 
     def test_simulator_preserves_canonical_prompt_and_advances_state_once(self):
         with completion_server([chat_response("###STOP###")]) as (model, payloads), tempfile.TemporaryDirectory() as directory:
-            tau3_adapter.MODEL_DICT["user"] = model
+            tau3_adapter._TASK_MODELS.set({"user": model})
             capture = Path(directory) / "attempts.jsonl"
             tau3_adapter.configure_capture(capture)
             simulator = UserSimulator(llm="user", tools=[Tool(check_email)])
@@ -312,7 +393,7 @@ class Tau3AdapterTests(unittest.TestCase):
         original = [message.model_dump() for message in messages]
         for role, call_name in [("user", "user_simulator_response"), ("agent", "agent_response"), ("user", "judge")]:
             with self.subTest(role=role, call_name=call_name), completion_server([chat_response("Continue comparing.")]) as (model, payloads):
-                tau3_adapter.MODEL_DICT[role] = model
+                tau3_adapter._TASK_MODELS.set({role: model})
                 tau3_adapter.patched_generate(model=role, messages=messages, call_name=call_name)
                 self.assertEqual(len(payloads), 1)
                 self.assertEqual(payloads[0]["messages"], [
@@ -331,7 +412,7 @@ class Tau3AdapterTests(unittest.TestCase):
         ]
         for response in cases:
             with self.subTest(response=response), completion_server([response, chat_response("###STOP###")]) as (model, payloads):
-                tau3_adapter.MODEL_DICT["user"] = model
+                tau3_adapter._TASK_MODELS.set({"user": model})
                 simulator = UserSimulator(llm="user", tools=[Tool(check_email)])
                 state = UserState(
                     system_messages=[SystemMessage(role="system", content="Act as the customer.")],
@@ -349,7 +430,7 @@ class Tau3AdapterTests(unittest.TestCase):
 
     def test_visible_truncated_agent_response_is_preserved_without_retry(self):
         with completion_server([chat_response("Partial visible answer", finish_reason="length")]) as (model, payloads):
-            tau3_adapter.MODEL_DICT["agent"] = model
+            tau3_adapter._TASK_MODELS.set({"agent": model})
             answer = tau3_adapter.patched_generate(
                 model="agent", call_name="agent_response",
                 messages=[UserMessage(role="user", content="Explain the card options.")],
@@ -366,7 +447,7 @@ class Tau3AdapterTests(unittest.TestCase):
         ]
         for response, content, has_tool in cases:
             with self.subTest(response=response), completion_server([response]) as (model, payloads):
-                tau3_adapter.MODEL_DICT["user"] = model
+                tau3_adapter._TASK_MODELS.set({"user": model})
                 answer = tau3_adapter.patched_generate(
                     model="user", call_name="user_simulator_response",
                     messages=[SystemMessage(role="system", content="Act as the customer."), UserMessage(role="user", content="Continue.")], tools=[Tool(check_email)],
@@ -387,14 +468,14 @@ class Tau3AdapterTests(unittest.TestCase):
         )
         original_history = list(state.messages)
         incoming = AssistantMessage(role="assistant", content="Your request is complete.")
-        with patch.object(tau3_adapter, "MODEL_DICT", {"user": model}):
-            with patch.object(model, "generate", wraps=model.generate) as generate:
-                with patch("tau2.user.user_simulator.generate", tau3_adapter.patched_generate):
-                    with self.assertRaises(tau3_adapter.Tau3AdapterError) as ctx:
-                        simulator.generate_next_message(incoming, state)
-                self.assertEqual(ctx.exception.kind, "model_output_invalid")
-                self.assertEqual(generate.call_count, 1)
-                self.assertEqual(state.messages, original_history + [incoming])
+        tau3_adapter._TASK_MODELS.set({"user": model})
+        with patch.object(model, "generate", wraps=model.generate) as generate:
+            with patch("tau2.user.user_simulator.generate", tau3_adapter.patched_generate):
+                with self.assertRaises(tau3_adapter.Tau3AdapterError) as ctx:
+                    simulator.generate_next_message(incoming, state)
+            self.assertEqual(ctx.exception.kind, "model_output_invalid")
+            self.assertEqual(generate.call_count, 1)
+            self.assertEqual(state.messages, original_history + [incoming])
 
     def test_typed_422_stops_sdk_retries_after_one_real_http_request(self):
         Typed422Handler.requests = 0
@@ -410,7 +491,7 @@ class Tau3AdapterTests(unittest.TestCase):
                 config=GenerateConfig(retries=1, max_tokens=8),
                 model_args={"max_retries": 5},
             )
-            tau3_adapter.MODEL_DICT["user"] = model
+            tau3_adapter._TASK_MODELS.set({"user": model})
             with tempfile.TemporaryDirectory() as directory:
                 capture = Path(directory) / "capture.jsonl"
                 tau3_adapter.configure_capture(capture)

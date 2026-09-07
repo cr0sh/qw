@@ -16,6 +16,7 @@ from pathlib import Path
 import sys
 import traceback
 from contextvars import ContextVar
+from threading import Lock
 from typing import Any
 
 from openai import APIStatusError
@@ -40,9 +41,11 @@ class Tau3AdapterError(RuntimeError):
         self.kind = kind
 
 
-MODEL_DICT: dict[str, Any] = {"agent": None, "user": None}
+_TASK_MODELS: ContextVar[dict[str, Any] | None] = ContextVar("tau3_models", default=None)
 _CAPTURE_PATH: Path | None = None
 _CURRENT_TASK_ID: ContextVar[str | None] = ContextVar("tau3_task_id", default=None)
+_CAPTURE_LOCK = Lock()
+_SETUP_LOCK = Lock()
 
 
 def _redact_runtime_secret(text: str) -> str:
@@ -69,32 +72,34 @@ _SECRET_FILTER = _RuntimeSecretFilter()
 
 def _protect_runtime_logs() -> None:
     """Protect framework/provider error logs without changing their failure behavior."""
-    loggers = [logging.getLogger(), *(
-        logger for logger in logging.Logger.manager.loggerDict.values()
-        if isinstance(logger, logging.Logger)
-    )]
-    for logger in loggers:
-        if _SECRET_FILTER not in logger.filters:
-            logger.addFilter(_SECRET_FILTER)
-        for handler in logger.handlers:
-            if _SECRET_FILTER not in handler.filters:
-                handler.addFilter(_SECRET_FILTER)
+    with _SETUP_LOCK:
+        loggers = [logging.getLogger(), *(
+            logger for logger in logging.Logger.manager.loggerDict.copy().values()
+            if isinstance(logger, logging.Logger)
+        )]
+        for logger in loggers:
+            if _SECRET_FILTER not in logger.filters:
+                logger.addFilter(_SECRET_FILTER)
+            for handler in logger.handlers:
+                if _SECRET_FILTER not in handler.filters:
+                    handler.addFilter(_SECRET_FILTER)
 
 
 def configure_capture(path: str | os.PathLike[str] | None) -> None:
     """Enable opt-in JSONL capture at a unique path."""
 
     global _CAPTURE_PATH
-    capture_path = Path(path).expanduser() if path else None
-    if capture_path is not None:
-        capture_path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            with capture_path.open("x", encoding="utf-8"):
-                pass
-            capture_path.chmod(0o600)
-        except FileExistsError as error:
-            raise ValueError(f"capture path already exists; choose a unique path: {capture_path}") from error
-    _CAPTURE_PATH = capture_path
+    with _CAPTURE_LOCK:
+        capture_path = Path(path).expanduser() if path else None
+        if capture_path is not None:
+            capture_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with capture_path.open("x", encoding="utf-8"):
+                    pass
+                capture_path.chmod(0o600)
+            except FileExistsError as error:
+                raise ValueError(f"capture path already exists; choose a unique path: {capture_path}") from error
+        _CAPTURE_PATH = capture_path
 
 
 def _jsonable(value: Any) -> Any:
@@ -107,12 +112,13 @@ def _jsonable(value: Any) -> Any:
     return value
 
 def _capture(record: dict[str, Any]) -> None:
-    if _CAPTURE_PATH is None:
-        return
-    if _CURRENT_TASK_ID.get() is not None and "task_id" not in record:
-        record = {**record, "task_id": _CURRENT_TASK_ID.get()}
-    with _CAPTURE_PATH.open("a", encoding="utf-8") as stream:
-        stream.write(_redact_runtime_secret(json.dumps(_jsonable(record), ensure_ascii=False)) + "\n")
+    with _CAPTURE_LOCK:
+        if _CAPTURE_PATH is None:
+            return
+        if _CURRENT_TASK_ID.get() is not None and "task_id" not in record:
+            record = {**record, "task_id": _CURRENT_TASK_ID.get()}
+        with _CAPTURE_PATH.open("a", encoding="utf-8") as stream:
+            stream.write(_redact_runtime_secret(json.dumps(_jsonable(record), ensure_ascii=False)) + "\n")
 
 
 
@@ -230,7 +236,8 @@ def patched_generate(
 ) -> AssistantMessage:
     """Generate one Tau2 response while preserving reasoning and raw evidence."""
 
-    oa_model = MODEL_DICT.get(model) or MODEL_DICT.get("user")
+    models = _TASK_MODELS.get() or {}
+    oa_model = models.get(model) or models.get("user")
     if oa_model is None:
         raise Tau3AdapterError("adapter_error", f"model {model!r} is not configured")
     request = _request_record(model, messages, tools, tool_choice)
@@ -298,7 +305,7 @@ def patched_generate(
     )
 
 
-def _build_model(agent_model: Any, adapter_instance: Any) -> None:
+def _build_model(agent_model: Any, adapter_instance: Any) -> dict[str, Any]:
     from evalscope.api.model import GenerateConfig, get_model
 
     runtime_key = os.environ.get("DEEPSEEK_API_KEY")
@@ -315,32 +322,47 @@ def _build_model(agent_model: Any, adapter_instance: Any) -> None:
         model_args={"max_retries": 5},
         memoize=False,
     )
-    MODEL_DICT["user"] = user_server
-    MODEL_DICT["agent"] = agent_model
-    original = getattr(tau_llm_utils, "generate", None)
-    if original is None:
-        raise Tau3AdapterError("adapter_error", "tau2.utils.llm_utils.generate not found")
-    tau_llm_utils.generate = patched_generate
-    for name, module in list(sys.modules.items()):
-        if not isinstance(name, str) or not name.startswith("tau2") or module is None:
-            continue
-        for attr, value in list(vars(module).items()):
-            if value is original:
-                try:
-                    setattr(module, attr, patched_generate)
-                except Exception:
-                    pass
+    _install_generation_hook()
+    return {"user": user_server, "agent": agent_model}
+
+
+def _install_generation_hook() -> None:
+    with _SETUP_LOCK:
+        original = getattr(tau_llm_utils, "generate", None)
+        if original is None:
+            raise Tau3AdapterError("adapter_error", "tau2.utils.llm_utils.generate not found")
+        if original is patched_generate:
+            return
+        tau_llm_utils.generate = patched_generate
+        for name, module in list(sys.modules.items()):
+            if not isinstance(name, str) or not name.startswith("tau2") or module is None:
+                continue
+            for attr, value in list(vars(module).items()):
+                if value is original:
+                    try:
+                        setattr(module, attr, patched_generate)
+                    except Exception:
+                        pass
 
 
 def predict(model: Any, sample: Any, adapter_instance: Any) -> InferenceResult:
     """Run Tau2 without converting exceptions into unlabelled reward zeroes."""
 
-    domain = sample.subset_key
     task_data = {key: value for key, value in sample.metadata.items() if key != "_domain"}
     task = Task.model_validate(task_data)
-    _CURRENT_TASK_ID.set(task.id)
+    task_token = _CURRENT_TASK_ID.set(task.id)
+    models_token = _TASK_MODELS.set(None)
     try:
-        _build_model(model, adapter_instance)
+        return _predict_task(model, sample, adapter_instance, task)
+    finally:
+        _TASK_MODELS.reset(models_token)
+        _CURRENT_TASK_ID.reset(task_token)
+
+
+def _predict_task(model: Any, sample: Any, adapter_instance: Any, task: Task) -> InferenceResult:
+    domain = sample.subset_key
+    try:
+        _TASK_MODELS.set(_build_model(model, adapter_instance))
     except Exception as exc:
         kind = _classify_exception(exc)
         _capture({"event": "task_error", "kind": kind, "error_type": type(exc).__name__, "error": str(exc)})
@@ -402,6 +424,8 @@ def install() -> None:
 
     from evalscope.benchmarks.tau_bench.tau3_bench import generation
 
+    _install_generation_hook()
+    _protect_runtime_logs()
     generation.predict = predict
     generation.patched_generate = patched_generate
 
