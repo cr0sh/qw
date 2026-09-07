@@ -87,7 +87,7 @@ does not reproduce all conditions of a long-lived server.
 
 `eval/run_tau3_banking.py --eval-batch-size N` exposes EvalScope's existing task
 concurrency setting as a positive integer; the default remains 1. Use
-`--eval-batch-size 2` explicitly for a two-task run. This uses the installed
+`--eval-batch-size 3` explicitly for a three-task run. This uses the installed
 evaluator's task worker pool, not GPU
 batching or Tau2's separate batch runner. GPU requests remain serialized by the
 runtime worker, but independent tasks can overlap remote simulator/judge work
@@ -101,6 +101,33 @@ to the executing task, restoring the prior context on success or failure.
 Opt-in capture appends are serialized and retain credential redaction.
 Concurrency does not change canonical scoring, prompts, retry policy, or
 per-task token budgets, and does not promise schedule-independent random output.
+
+Start a new evaluation without `--resume` to get a fresh UUID directory and no
+reuse of earlier campaign or smoke rows. To continue that same evaluation after
+an interruption, pass `--resume` with its exact inner timestamp run directory.
+The outer directory's stable `.writer.lock` is held for the entire campaign:
+never delete it. An exclusive kernel lock, not a PID guess, permits recovery of
+a stale native `running` state after SIGKILL; an active owner is rejected.
+`INVALID.json`, mismatched evaluation identity, or a different dataset prevents
+reuse regardless of process state.
+
+Native prediction and review JSONL records retain EvalScope's formats. A write
+returns only after its complete LF-terminated record is flushed and fsynced;
+new directory entries are synchronized, with Darwin full-sync barriers.
+Configuration and native progress snapshots are atomically published only
+after their data is synchronized. Native review staging is retained on failure.
+These barriers protect acknowledged records across process/harness termination;
+power-loss behavior also depends on the filesystem and storage honoring them,
+and SIGKILL tests are not physical power-cut certification.
+
+Under the writer lock, recovery validates every complete canonical/staged row
+before publication and archives originals plus progress in `recovery-evidence`.
+Only recognized native `.rerun-<uuid>` staging and complete LF records are reused.
+An unfinished final object append is retained as evidence and excluded; malformed
+complete records, conflicting duplicates, orphan reviews, or unrelated temporary
+files abort recovery. Repeated recovery is idempotent. Unfinished episodes may
+run again explicitly; partial model-output captures never manufacture a native
+completion or zero reward. Opt-in capture remains diagnostic, not resume authority.
 
 ## Shared worktrees
 
