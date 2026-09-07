@@ -971,7 +971,7 @@ impl Engine {
                 if latest_user.as_deref() == Some("call-tool-invalid") {
                     let error = parse_assistant_output(
                         "<tool_call><function=unknown><parameter=secret>private-argument-body</parameter></function></tool_call>",
-                        &["weather"],
+                        &[],
                         8,
                         job.request.max_tokens,
                     )
@@ -1999,13 +1999,9 @@ impl QwenWorker {
             (String::new(), generated.text.clone())
         };
         let (content, tool_calls, finish_reason) = if tool_enabled {
-            let declared_names = effective_tools
-                .iter()
-                .map(|tool| tool.function.name.as_str())
-                .collect::<Vec<_>>();
             let parsed = match parse_assistant_output(
                 &visible_content,
-                &declared_names,
+                effective_tools,
                 generated.completion_tokens,
                 job.request.max_tokens,
             ) {
@@ -2362,8 +2358,19 @@ mod tests {
             split_reasoning_trace(&format!("use the weather tool</think>\n{tool_xml}"));
         assert_eq!(reasoning, "use the weather tool");
         assert_eq!(content, tool_xml);
-        let parsed = parse_assistant_output(&content, &["weather"], 10, 128)
-            .expect("visible tool call parses");
+        let tools = [qw_runtime::ChatTool {
+            tool_type: "function".to_string(),
+            function: qw_runtime::ChatToolFunction {
+                name: "weather".to_string(),
+                description: None,
+                parameters: serde_json::json!({
+                    "type": "object", "properties": {"city": {"type": "string"}}
+                }),
+                strict: None,
+            },
+        }];
+        let parsed =
+            parse_assistant_output(&content, &tools, 10, 128).expect("visible tool call parses");
         assert!(parsed.content.is_empty());
         assert_eq!(parsed.tool_calls.len(), 1);
         assert_eq!(parsed.tool_calls[0].name, "weather");

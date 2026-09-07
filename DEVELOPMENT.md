@@ -83,6 +83,18 @@ change caller token budgets. Weights, live/restored KV state, allocator history,
 and driver residency still contribute memory pressure; a fresh-process replay
 does not reproduce all conditions of a long-lived server.
 
+The Qwen XML tool-call decoder uses each declared function's parameter schema.
+Strings are emitted verbatim by the model template, so JSON-looking strings,
+quoted text, and meaningful whitespace remain strings; only framing newlines
+are removed. Explicit nonstring types decode matching JSON values, with existing
+boolean/null aliases also accepted. Missing or unresolved types, composition-only
+schemas, and unions admitting strings conservatively retain text; explicit
+nonstring `type` arrays decode matching JSON values before aliases. This is
+wire decoding, not full JSON Schema validation or reference resolution.
+Evaluation episodes produced by schema-blind parameter coercion are not
+comparable baselines: a declared JSON string could have reached a tool as an
+object, changing both tool execution and the subsequent conversation.
+
 ## Banking evaluation concurrency
 
 `eval/run_tau3_banking.py --eval-batch-size N` exposes EvalScope's existing task
