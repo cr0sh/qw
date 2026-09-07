@@ -26,6 +26,19 @@ A durable continuation preserves the response identity, delivered prefix,
 original penalty boundary, remaining token budget, and independently saved RNG
 state; an unrelated request must not change its continuation stream.
 
+Ordinary memory and filesystem eviction prefer the least recently used or
+materialized entry; reuse frequency breaks recency ties and still determines
+TTL growth. Merely matching a shorter ancestor does not refresh its materialized
+recency. A successful disk hit becomes recent before hot-tier promotion pressure.
+Oversized ordinary snapshots still cannot displace viable hot prefixes, and
+active continuation protections and tier budgets are unchanged.
+
+Per-entry cache lifecycle traces carry the existing deterministic `entry_id`
+derived from namespace, route, and token prefix. The identity survives hot or
+filesystem removal and persistence failure, including memory-only entries.
+Use it to join insert, hit, restore/promotion, eviction, and expiry evidence;
+capacity setup, genuine misses, and aggregate events do not identify one entry.
+
 Snapshot budgets do not bound request latency. Persistence still uses serialized
 I/O; queued writes and large FP16 snapshots can delay a subsequent filesystem
 lookup. Darwin durability barriers are batched, but this does not remove FIFO

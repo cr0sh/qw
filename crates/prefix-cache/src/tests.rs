@@ -8,15 +8,35 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone)]
-struct InfoCounter(Arc<AtomicUsize>);
+struct InfoCounter(
+    Arc<AtomicUsize>,
+    Option<Arc<Mutex<Vec<HashMap<String, String>>>>>,
+);
+
+#[derive(Default)]
+struct RecordedFields(HashMap<String, String>);
+
+impl tracing::field::Visit for RecordedFields {
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        self.0.insert(field.name().to_string(), value.to_string());
+    }
+
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.insert(field.name().to_string(), format!("{value:?}"));
+    }
+}
 
 impl tracing::Subscriber for InfoCounter {
     fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
-        *metadata.level() <= tracing::Level::INFO
+        self.1.is_some() || *metadata.level() <= tracing::Level::INFO
     }
 
     fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
-        Some(tracing::level_filters::LevelFilter::INFO)
+        Some(if self.1.is_some() {
+            tracing::level_filters::LevelFilter::DEBUG
+        } else {
+            tracing::level_filters::LevelFilter::INFO
+        })
     }
 
     fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
@@ -30,6 +50,11 @@ impl tracing::Subscriber for InfoCounter {
     fn event(&self, event: &tracing::Event<'_>) {
         if *event.metadata().level() == tracing::Level::INFO {
             self.0.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(events) = &self.1 {
+            let mut fields = RecordedFields::default();
+            event.record(&mut fields);
+            events.lock().expect("events lock").push(fields.0);
         }
     }
 
@@ -464,6 +489,11 @@ fn in_flight_persistence_is_reserved_against_the_grace_ceiling() {
 
 #[test]
 fn failed_persistence_clears_metadata_but_keeps_memory_snapshot() {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let _guard = tracing::subscriber::set_default(InfoCounter(
+        Arc::new(AtomicUsize::new(0)),
+        Some(Arc::clone(&events)),
+    ));
     let state = Arc::new(Mutex::new(RecordingState {
         fail_put: true,
         ..RecordingState::default()
@@ -499,6 +529,17 @@ fn failed_persistence_clears_metadata_but_keeps_memory_snapshot() {
     assert!(terminal.blob_refs.is_empty());
     assert_eq!(terminal.serialized_bytes, 0);
     assert_eq!(cache.filesystem_bytes, 0);
+    let expected_id = entry_key(NAMESPACE, SnapshotRoute::Baseline, &[1, 2]).0;
+    let events = events.lock().expect("events lock");
+    for phase in ["cache.insert", "cache.persistence_error", "cache.lookup"] {
+        assert!(
+            events.iter().any(|event| {
+                event.get("phase").is_some_and(|value| value == phase)
+                    && event.get("entry_id") == Some(&expected_id)
+            }),
+            "{phase} must retain the same entry identity after persistence fails"
+        );
+    }
 }
 
 #[test]
@@ -550,11 +591,186 @@ fn filesystem_hit_survives_hot_eviction_preference() {
     assert!(cache.lookup(&[3, 4], SnapshotRoute::Baseline).is_some());
     let hit = cache
         .lookup(&[1, 2, 5], SnapshotRoute::Baseline)
-        .expect("disk hit remains usable even when hotter entry wins residency");
+        .expect("disk hit remains usable under hot-tier promotion pressure");
     assert_eq!(hit.token_count, 2);
     assert_eq!(hit.snapshot().to_portable().unwrap(), expected);
     drop(hit);
     assert_eq!(cache.memory_bytes(), capacity);
+}
+
+#[test]
+fn fresh_boundary_displaces_a_popular_old_prefix_in_memory() {
+    let clock = ManualClock::new(1_000);
+    let old = snapshot(1, &[1.0, 2.0]);
+    let mut cache = AdaptivePrefixCache::with_optional_store(
+        namespaces(),
+        memory_config(old.nbytes() as u64),
+        None,
+        Box::new(clock.clone()),
+    )
+    .expect("cache");
+    cache.insert(&[1], vec![old], SnapshotRoute::Baseline);
+    for _ in 0..8 {
+        assert_eq!(cache.lookup(&[1], SnapshotRoute::Baseline).unwrap().token_count, 1);
+    }
+    clock.set(2_000);
+    cache.insert(&[1, 2], vec![snapshot(2, &[3.0, 4.0])], SnapshotRoute::Baseline);
+    assert_eq!(
+        cache.lookup(&[1, 2, 3], SnapshotRoute::Baseline).unwrap().token_count,
+        2,
+        "a fresh boundary must survive until its first use despite the old prefix's popularity"
+    );
+    assert!(cache.lookup(&[1], SnapshotRoute::Baseline).is_none());
+}
+
+#[test]
+fn longest_hit_does_not_refresh_unused_ancestors_and_upserts_are_recent() {
+    let clock = ManualClock::new(1_000);
+    let old = snapshot(1, &[1.0, 2.0]);
+    let mut cache = AdaptivePrefixCache::with_optional_store(
+        namespaces(),
+        memory_config(2 * old.nbytes() as u64),
+        None,
+        Box::new(clock.clone()),
+    )
+    .expect("cache");
+    cache.insert(&[1], vec![old], SnapshotRoute::Baseline);
+    for _ in 0..8 {
+        drop(cache.lookup(&[1], SnapshotRoute::Baseline).expect("old hit"));
+    }
+    clock.set(2_000);
+    cache.insert(&[1, 2], vec![snapshot(2, &[3.0, 4.0])], SnapshotRoute::Baseline);
+    clock.set(3_000);
+    assert_eq!(cache.lookup(&[1, 2], SnapshotRoute::Baseline).unwrap().token_count, 2);
+    clock.set(4_000);
+    cache.insert(&[9], vec![snapshot(1, &[5.0, 6.0])], SnapshotRoute::Baseline);
+    assert!(cache.lookup(&[1], SnapshotRoute::Baseline).is_none());
+
+    // Materializing an existing terminal is activity even without another hit.
+    clock.set(5_000);
+    cache.insert(&[1, 2], vec![snapshot(2, &[7.0, 8.0])], SnapshotRoute::Baseline);
+    clock.set(6_000);
+    cache.insert(&[8], vec![snapshot(1, &[9.0, 10.0])], SnapshotRoute::Baseline);
+    assert!(cache.lookup(&[9], SnapshotRoute::Baseline).is_none());
+    let hit = cache.lookup(&[1, 2], SnapshotRoute::Baseline).expect("rematerialized boundary");
+    assert_eq!(hit.snapshot().to_portable().unwrap(), snapshot(2, &[7.0, 8.0]).to_portable().unwrap());
+}
+
+#[test]
+fn filesystem_pressure_keeps_the_recent_boundary_and_reports_the_old_victim() {
+    let clock = ManualClock::new(1_000);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let _guard = tracing::subscriber::set_default(InfoCounter(
+        Arc::new(AtomicUsize::new(0)),
+        Some(Arc::clone(&events)),
+    ));
+    let state = Arc::new(Mutex::new(RecordingState::default()));
+    let mut cache = AdaptivePrefixCache::with_store_and_clock(
+        namespaces(),
+        memory_config(1),
+        Box::new(RecordingStore(Arc::clone(&state))),
+        Box::new(clock.clone()),
+    )
+    .expect("cache");
+    cache.insert(&[1], vec![snapshot(1, &[1.0, 2.0])], SnapshotRoute::Baseline);
+    cache.flush_persistence();
+    cache.filesystem_cap = Some(cache.filesystem_bytes * 2);
+    for _ in 0..8 {
+        drop(cache.lookup(&[1], SnapshotRoute::Baseline).expect("old disk hit"));
+    }
+    clock.set(2_000);
+    cache.insert(&[1, 2], vec![snapshot(2, &[3.0, 4.0])], SnapshotRoute::Baseline);
+    cache.flush_persistence();
+    clock.set(3_000);
+    cache.insert(&[9], vec![snapshot(1, &[5.0, 6.0])], SnapshotRoute::Baseline);
+    cache.flush_persistence();
+    assert_eq!(
+        cache.lookup(&[1, 2, 3], SnapshotRoute::Baseline).expect("fresh disk boundary").token_count,
+        2
+    );
+    assert!(cache.lookup(&[1], SnapshotRoute::Baseline).is_none());
+    let old_id = entry_key(NAMESPACE, SnapshotRoute::Baseline, &[1]).0;
+    let boundary_id = entry_key(NAMESPACE, SnapshotRoute::Baseline, &[1, 2]).0;
+    let events = events.lock().expect("events lock");
+    assert!(events.iter().any(|event| {
+        event.get("phase").is_some_and(|value| value == "cache.evict")
+            && event.get("tier").is_some_and(|value| value == "filesystem")
+            && event.get("entry_id") == Some(&old_id)
+    }));
+    assert!(events.iter().any(|event| {
+        event.get("phase").is_some_and(|value| value == "cache.restore")
+            && event.get("entry_id") == Some(&boundary_id)
+    }));
+}
+
+#[test]
+fn disk_hit_becomes_recent_before_hot_promotion_pressure() {
+    let clock = ManualClock::new(1_000);
+    let state = Arc::new(Mutex::new(RecordingState::default()));
+    let old = snapshot(1, &[1.0, 2.0]);
+    let expected = old.to_portable().unwrap();
+    let mut cache = AdaptivePrefixCache::with_store_and_clock(
+        namespaces(),
+        memory_config(old.nbytes() as u64),
+        Box::new(RecordingStore(Arc::clone(&state))),
+        Box::new(clock.clone()),
+    )
+    .expect("cache");
+    cache.insert(&[1], vec![old], SnapshotRoute::Baseline);
+    clock.set(2_000);
+    cache.insert(&[2], vec![snapshot(1, &[3.0, 4.0])], SnapshotRoute::Baseline);
+    cache.flush_persistence();
+    for _ in 0..8 {
+        drop(cache.lookup(&[2], SnapshotRoute::Baseline).expect("popular hot hit"));
+    }
+    clock.set(3_000);
+    let hit = cache.lookup(&[1], SnapshotRoute::Baseline).expect("restored hit");
+    assert_eq!(hit.snapshot().to_portable().unwrap(), expected);
+    drop(hit);
+    state.lock().expect("store lock").entries.remove(&entry_key(NAMESPACE, SnapshotRoute::Baseline, &[1]));
+    assert_eq!(
+        cache.lookup(&[1], SnapshotRoute::Baseline).expect("restored state stays hot without its disk copy").snapshot().to_portable().unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn memory_only_entry_identity_survives_eviction_and_expiry() {
+    let clock = ManualClock::new(1_000);
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let _guard = tracing::subscriber::set_default(InfoCounter(
+        Arc::new(AtomicUsize::new(0)),
+        Some(Arc::clone(&events)),
+    ));
+    let old = snapshot(1, &[1.0, 2.0]);
+    let mut cache = AdaptivePrefixCache::with_optional_store(
+        namespaces(),
+        memory_config(old.nbytes() as u64),
+        None,
+        Box::new(clock.clone()),
+    )
+    .expect("cache");
+    assert!(cache.lookup(&[42], SnapshotRoute::Baseline).is_none());
+    cache.insert(&[1], vec![old], SnapshotRoute::Baseline);
+    drop(cache.lookup(&[1], SnapshotRoute::Baseline).expect("memory hit"));
+    clock.set(2_000);
+    cache.insert(&[9], vec![snapshot(1, &[3.0, 4.0])], SnapshotRoute::Baseline);
+    clock.set(MAX_TTL_MS + 3_000);
+    assert!(cache.lookup(&[9], SnapshotRoute::Baseline).is_none());
+    let id = entry_key(NAMESPACE, SnapshotRoute::Baseline, &[1]).0;
+    let events = events.lock().expect("events lock");
+    for phase in ["cache.insert", "cache.lookup", "cache.evict", "cache.expire"] {
+        assert!(events.iter().any(|event| {
+            event.get("phase").is_some_and(|value| value == phase)
+                && event.get("entry_id") == Some(&id)
+        }), "missing {phase} for memory-only identity");
+    }
+    for event in events.iter().filter(|event| {
+        event.contains_key("capacity_bytes")
+            || event.get("hit").is_some_and(|value| value == "false")
+    }) {
+        assert!(!event.contains_key("entry_id"), "setup and misses have no single entry identity");
+    }
 }
 
 #[test]
@@ -1636,7 +1852,7 @@ fn resume_record_survives_persistent_restart_and_is_removed_on_take() {
 #[test]
 fn cache_block_churn_emits_no_info_events() {
     let info_events = Arc::new(AtomicUsize::new(0));
-    let subscriber = InfoCounter(Arc::clone(&info_events));
+    let subscriber = InfoCounter(Arc::clone(&info_events), None);
 
     tracing::subscriber::with_default(subscriber, || {
         let mut cache =

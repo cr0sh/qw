@@ -10,6 +10,8 @@ pub(crate) struct Terminal {
     pub expires_at_unix_ms: u64,
     pub serialized_bytes: u64,
     pub snapshot: Option<PromptSnapshot>,
+    // Materialized identity survives hot/persistent eviction; structural-only nodes have none.
+    pub entry_id: Option<EntryKey>,
     pub persistent_key: Option<EntryKey>,
     pub response_resume: Option<ResponseResumeMetadata>,
     pub page_refs: Vec<(u64, usize)>,
@@ -26,6 +28,7 @@ impl Terminal {
             expires_at_unix_ms: expires_at,
             serialized_bytes: 0,
             snapshot: None,
+            entry_id: None,
             persistent_key: None,
             response_resume: None,
             page_refs: Vec::new(),
@@ -71,8 +74,9 @@ impl RadixTrie {
         loop {
             if let Some(terminal) = self.terminal_mut(node_id, route) {
                 terminal.observations = terminal.observations.saturating_add(1);
-                terminal.last_access_unix_ms = now;
+                // Matching an ancestor is an observation, not use of its materialized state.
                 if terminal.snapshot.is_none() && terminal.persistent_key.is_none() {
+                    terminal.last_access_unix_ms = now;
                     terminal.expires_at_unix_ms = expires_at;
                 }
             }
