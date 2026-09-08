@@ -87,6 +87,20 @@ Stochastic speculative decoding verifies against the full-vocabulary target
 distribution after the configured sampling transforms, not a draft-candidate-only
 renormalization. A seed is not a promise of identical text across decoders.
 
+Qwen's Metal runtime sets an 8 GiB allowance for reusable free MLX buffers once
+at initialization, before model weights are loaded. `MLXCEL_CACHE_LIMIT`
+overrides this allowance with an unsigned decimal byte count; `0` disables
+free-buffer caching. Invalid explicit values fail initialization rather than
+silently selecting a fallback. The selected allowance is logged at startup.
+This policy does not change the wired-residency or allocation limits, prefix
+snapshot budgets, KV precision, or generation algorithms.
+
+The allocator allowance is not a hard process-memory cap. Live weights, KV,
+workspaces, driver allocations, and host snapshot mirrors are separate, and MLX
+may transiently exceed its free-buffer allowance until a subsequent allocation
+reclaims buffers. Smaller overrides can trade throughput for lower retention;
+compare both prefill and decode before changing the default for a workload.
+
 DFlash's existing selector calibrates only verification widths 4 and 5 (three
 and four proposed draft tokens). Contexts below 64,000 tokens initially prefer
 width 4; longer contexts initially prefer width 5. These are adaptive defaults,
@@ -149,6 +163,19 @@ symlink.
 Sharing `target/` is not race-free. Serialize concurrent Cargo commands that
 write shared artifacts with a separate build lock. The GPU lock below does not
 provide this build serialization.
+
+For baseline/candidate comparisons, use distinct `CARGO_TARGET_DIR` directories
+under the primary `target/` and retain both build logs. A shared output directory
+can reuse a different worktree's executable even when Cargo commands are
+serialized. Verify source identity in the benchmark output and record source,
+model, environment, and fixture hashes; a successful exit alone is insufficient.
+
+The canonical runtime benchmark has separate fresh, 10k, and 64k prefill/decode
+cases, one warmup and three timed repetitions. Preserve its timing definitions
+and output assertions. The default feature uses DFlash2; `--no-default-features`
+uses bundled MTP. Both variants use the same fixture filenames with different
+identities, so pair baseline/candidate runs within one variant before switching,
+and preserve the fixture inputs and `BENCHMARK_RESULT` rows.
 
 ## GPU serialization
 

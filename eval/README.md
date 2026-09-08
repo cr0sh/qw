@@ -47,6 +47,13 @@ use a fresh prefix-cache directory and record the tested binary's commit/hash.
 See [shared worktree and GPU locking rules](../DEVELOPMENT.md#shared-worktrees)
 before building or running GPU work.
 
+The Metal runtime defaults to an 8 GiB reusable allocator-buffer allowance,
+independent of the prefix-cache budgets and not a total-process memory cap.
+Leave `MLXCEL_CACHE_LIMIT` unset to reproduce that default, or explicitly record
+an override in raw decimal bytes (`0` disables free-buffer caching). Tighter
+allowances may trade decode throughput for lower retention; see the
+[runtime policy notes](../DEVELOPMENT.md#generation-policy).
+
 ```bash
 export QW_BIN="$PWD/target/release/qw"  # or the tested frozen binary
 export QW_MODEL="$HOME/.cache/qw/models/Jundot/Qwen3.8-27B-oQ4e-fp16-mtp"
