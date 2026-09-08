@@ -243,12 +243,23 @@ impl StagingBudget {
 }
 impl Reservation {
     fn grow(&mut self, bytes: u64) -> bool {
-        let Ok(previous) = self.budget.used.fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-            used.checked_add(bytes).filter(|sum| *sum <= self.budget.limit)
-        }) else { return false };
+        let Ok(previous) =
+            self.budget
+                .used
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                    used.checked_add(bytes)
+                        .filter(|sum| *sum <= self.budget.limit)
+                })
+        else {
+            return false;
+        };
         self.bytes += bytes;
-        tracing::debug!(phase = "cache.staging.reserve", bytes,
-            staging_bytes = previous + bytes, limit_bytes = self.budget.limit);
+        tracing::debug!(
+            phase = "cache.staging.reserve",
+            bytes,
+            staging_bytes = previous + bytes,
+            limit_bytes = self.budget.limit
+        );
         true
     }
 }
@@ -858,10 +869,7 @@ impl AdaptivePrefixCache {
                 .and_then(|terminal| terminal.entry_id.clone())
                 .unwrap_or_else(|| entry_key(namespace, route, prefix));
             let reservation = (self.io.is_some() && self.can_reserve_persistence(bytes))
-                .then(|| {
-                    self.staging
-                        .reserve(bytes.saturating_mul(2))
-                })
+                .then(|| self.staging.reserve(bytes.saturating_mul(2)))
                 .flatten();
             let persist = reservation.is_some();
             let (observations, reuse_count, last_access) =
@@ -1538,9 +1546,15 @@ fn io_loop(
                     continue;
                 }
                 if !manifest_known {
-                    let Ok(Some(manifest_bytes)) = store.manifest_bytes(&key) else { continue };
-                    let Some(extra) = manifest_bytes.checked_mul(3) else { continue };
-                    let Some(total) = limit.checked_add(manifest_bytes) else { continue };
+                    let Ok(Some(manifest_bytes)) = store.manifest_bytes(&key) else {
+                        continue;
+                    };
+                    let Some(extra) = manifest_bytes.checked_mul(3) else {
+                        continue;
+                    };
+                    let Some(total) = limit.checked_add(manifest_bytes) else {
+                        continue;
+                    };
                     if !reservation.grow(extra) {
                         tracing::debug!(phase = "cache.prefetch.skip", entry_id = %key.0, reason = "manifest_staging_budget");
                         continue;
@@ -1592,16 +1606,21 @@ fn io_loop(
                 mut reservation,
                 publication_id,
             } => {
-                let result = encode_portable(&namespace,
-                route,
-                &token_ids,
-                portable,
-                retention,
-                expires_at_unix_ms,
-                response_resume, |bytes| {
-                    reservation.grow(bytes).then_some(())
-                        .ok_or_else(|| "publication manifest staging budget".to_string())
-                })
+                let result = encode_portable(
+                    &namespace,
+                    route,
+                    &token_ids,
+                    portable,
+                    retention,
+                    expires_at_unix_ms,
+                    response_resume,
+                    |bytes| {
+                        reservation
+                            .grow(bytes)
+                            .then_some(())
+                            .ok_or_else(|| "publication manifest staging budget".to_string())
+                    },
+                )
                 .and_then(|encoded| {
                     let refs = encoded
                         .blobs

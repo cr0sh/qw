@@ -273,11 +273,15 @@ pub fn encode_portable(
     struct ByteCount(u64);
     impl std::io::Write for ByteCount {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            self.0 = self.0.checked_add(bytes.len() as u64)
+            self.0 = self
+                .0
+                .checked_add(bytes.len() as u64)
                 .ok_or_else(|| std::io::Error::other("manifest byte count overflow"))?;
             Ok(bytes.len())
         }
-        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
     let mut count = ByteCount(0);
     serde_json::to_writer(&mut count, &m).map_err(|e| e.to_string())?;

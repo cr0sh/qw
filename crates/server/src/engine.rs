@@ -692,25 +692,46 @@ struct PreparedJob {
     prompt_ids: Option<Vec<i32>>,
 }
 
-fn text_prompt_ids(provider: &Qwen35Provider, request: &CompletionRequest, enable_thinking: bool) -> Result<Vec<i32>> {
+fn text_prompt_ids(
+    provider: &Qwen35Provider,
+    request: &CompletionRequest,
+    enable_thinking: bool,
+) -> Result<Vec<i32>> {
     provider.tokenize_messages(
         &request.messages,
-        if request.tool_choice == ToolChoice::None { &[] } else { &request.tools },
+        if request.tool_choice == ToolChoice::None {
+            &[]
+        } else {
+            &request.tools
+        },
         request.reasoning_effort.map(ReasoningEffort::as_str),
         enable_thinking,
     )
 }
 
-fn lookahead_route(request: &CompletionRequest, cancelled: bool, enabled: bool, decoder: Qwen35GenerationMode, mtp_available: bool, dflash2_available: bool) -> Option<CacheSnapshotRoute> {
-    if !enabled || cancelled || !request.decoded_images.is_empty()
-        || request.resume_response_id.is_some() || !matches!(request.output_format, OutputFormat::Text)
+fn lookahead_route(
+    request: &CompletionRequest,
+    cancelled: bool,
+    enabled: bool,
+    decoder: Qwen35GenerationMode,
+    mtp_available: bool,
+    dflash2_available: bool,
+) -> Option<CacheSnapshotRoute> {
+    if !enabled
+        || cancelled
+        || !request.decoded_images.is_empty()
+        || request.resume_response_id.is_some()
+        || !matches!(request.output_format, OutputFormat::Text)
     {
         return None;
     }
     // Sparse-prefill policy depends on history tokenization. Leave those requests
     // to the ordinary owner-thread preparation rather than guess a namespace.
     #[cfg(feature = "specprefill")]
-    if matches!(decoder, Qwen35GenerationMode::Automatic | Qwen35GenerationMode::Baseline) {
+    if matches!(
+        decoder,
+        Qwen35GenerationMode::Automatic | Qwen35GenerationMode::Baseline
+    ) {
         return None;
     }
     let decoder = select_qwen35_decoder(decoder, mtp_available, dflash2_available, true).ok()?;
@@ -1346,13 +1367,22 @@ impl QwenWorker {
                 job_queue_capacity = JOB_QUEUE_CAPACITY,
             );
         }
-        let batch = batch.into_iter().map(|job| PreparedJob { job, prompt_ids: None }).collect();
+        let batch = batch
+            .into_iter()
+            .map(|job| PreparedJob {
+                job,
+                prompt_ids: None,
+            })
+            .collect();
         process_batch_with_lookahead(batch, |job, next| self.process(job, next));
         self.prefix_cache.clear_prefetch();
     }
 
     fn process(&mut self, prepared: PreparedJob, mut next: Option<&mut PreparedJob>) {
-        let PreparedJob { mut job, prompt_ids: prepared_prompt_ids } = prepared;
+        let PreparedJob {
+            mut job,
+            prompt_ids: prepared_prompt_ids,
+        } = prepared;
         let was_prepared_ahead = prepared_prompt_ids.is_some();
         if prepared_prompt_ids.is_none() || job.cancelled.load(Ordering::Acquire) {
             self.prefix_cache.clear_prefetch();
@@ -1442,9 +1472,10 @@ impl QwenWorker {
         let prompt_ids = if let Some(prefill) = &multimodal_prefill {
             prefill.prompt_ids.clone()
         } else {
-            match prepared_prompt_ids.map(Ok).unwrap_or_else(|| text_prompt_ids(
-                &self.provider, &job.request, enable_thinking,
-            )) {
+            match prepared_prompt_ids
+                .map(Ok)
+                .unwrap_or_else(|| text_prompt_ids(&self.provider, &job.request, enable_thinking))
+            {
                 Ok(tokens) => tokens,
                 Err(error) => {
                     send_failure(
@@ -1688,24 +1719,26 @@ impl QwenWorker {
             _ => None,
         };
         let (prefix_reuse, mtp_prefix_reuse) = match (route, resume_entry.as_ref(), hit.as_ref()) {
-            (QwenGenerationRoute::BaselineText, Some(resume), _) => match resume.snapshot.as_ref() {
-                PromptSnapshot::Baseline(snapshot) => (
-                    Some(PrefixReuse {
-                        snapshot,
-                        cached_tokens: snapshot.token_len(),
-                    }),
-                    None,
-                ),
-                _ => {
-                    send_failure(
-                        &job,
-                        FailureKind::ResumeNotFound,
-                        "response continuation checkpoint was not found".to_string(),
-                        Some("resume_response_id".to_string()),
-                    );
-                    return;
+            (QwenGenerationRoute::BaselineText, Some(resume), _) => {
+                match resume.snapshot.as_ref() {
+                    PromptSnapshot::Baseline(snapshot) => (
+                        Some(PrefixReuse {
+                            snapshot,
+                            cached_tokens: snapshot.token_len(),
+                        }),
+                        None,
+                    ),
+                    _ => {
+                        send_failure(
+                            &job,
+                            FailureKind::ResumeNotFound,
+                            "response continuation checkpoint was not found".to_string(),
+                            Some("resume_response_id".to_string()),
+                        );
+                        return;
+                    }
                 }
-            },
+            }
             (QwenGenerationRoute::MtpText, Some(resume), _) => match resume.snapshot.as_ref() {
                 PromptSnapshot::Mtp(snapshot) => (
                     None,
@@ -1861,7 +1894,11 @@ impl QwenWorker {
                 mtp_available,
                 self.decoder.dflash2_available(),
             ) {
-                if let Ok(tokens) = text_prompt_ids(provider, &next.job.request, next.job.request.enable_thinking) {
+                if let Ok(tokens) = text_prompt_ids(
+                    provider,
+                    &next.job.request,
+                    next.job.request.enable_thinking,
+                ) {
                     if !next.job.cancelled.load(Ordering::Acquire) {
                         cache.prefetch(&tokens, next_route);
                         debug!(
@@ -2276,14 +2313,22 @@ mod tests {
         crate::protocol::parse_chat(serde_json::json!({
             "model": "test",
             "messages": [{"role": "user", "content": "hello"}],
-        })).expect("valid text request")
+        }))
+        .expect("valid text request")
     }
 
     #[test]
     fn lookahead_disabled_cancelled_and_unsupported_requests_fall_back() {
         let request = lookahead_request();
         let route = |request: &CompletionRequest, cancelled, enabled| {
-            lookahead_route(request, cancelled, enabled, Qwen35GenerationMode::Mtp, true, false)
+            lookahead_route(
+                request,
+                cancelled,
+                enabled,
+                Qwen35GenerationMode::Mtp,
+                true,
+                false,
+            )
         };
         assert_eq!(route(&request, false, true), Some(CacheSnapshotRoute::Mtp));
         assert_eq!(route(&request, true, true), None);
@@ -2306,18 +2351,30 @@ mod tests {
 
     #[test]
     fn lookahead_unavailable_decoder_does_not_raise_an_early_error() {
-        assert_eq!(lookahead_route(
-            &lookahead_request(), false, true, Qwen35GenerationMode::Dflash2, false, false,
-        ), None);
+        assert_eq!(
+            lookahead_route(
+                &lookahead_request(),
+                false,
+                true,
+                Qwen35GenerationMode::Dflash2,
+                false,
+                false,
+            ),
+            None
+        );
     }
 
     #[cfg(feature = "specprefill")]
     #[test]
     fn lookahead_does_not_guess_history_dependent_sparse_prefill_namespace() {
-        for decoder in [Qwen35GenerationMode::Automatic, Qwen35GenerationMode::Baseline] {
-            assert_eq!(lookahead_route(
-                &lookahead_request(), false, true, decoder, true, false,
-            ), None);
+        for decoder in [
+            Qwen35GenerationMode::Automatic,
+            Qwen35GenerationMode::Baseline,
+        ] {
+            assert_eq!(
+                lookahead_route(&lookahead_request(), false, true, decoder, true, false,),
+                None
+            );
         }
     }
 
@@ -2327,7 +2384,10 @@ mod tests {
         process_batch_with_lookahead(vec![1, 2, 3, 4], |current, next| {
             observed.push((current, next.copied()));
         });
-        assert_eq!(observed, vec![(1, Some(2)), (2, Some(3)), (3, Some(4)), (4, None)]);
+        assert_eq!(
+            observed,
+            vec![(1, Some(2)), (2, Some(3)), (3, Some(4)), (4, None)]
+        );
     }
 
     #[test]
@@ -2335,12 +2395,22 @@ mod tests {
         let request = lookahead_request();
         let mut observed = Vec::new();
         process_batch_with_lookahead(vec![(1, false), (2, true), (3, false)], |current, next| {
-            let route = next.as_ref().and_then(|next| lookahead_route(
-                &request, next.1, true, Qwen35GenerationMode::Mtp, true, false,
-            ));
+            let route = next.as_ref().and_then(|next| {
+                lookahead_route(
+                    &request,
+                    next.1,
+                    true,
+                    Qwen35GenerationMode::Mtp,
+                    true,
+                    false,
+                )
+            });
             observed.push((current.0, route));
         });
-        assert_eq!(observed, vec![(1, None), (2, Some(CacheSnapshotRoute::Mtp)), (3, None)]);
+        assert_eq!(
+            observed,
+            vec![(1, None), (2, Some(CacheSnapshotRoute::Mtp)), (3, None)]
+        );
     }
 
     #[test]
@@ -2353,14 +2423,27 @@ mod tests {
             for value in 1..=JOB_QUEUE_CAPACITY {
                 jobs.try_send(value).expect("original admission capacity");
             }
-            assert!(matches!(jobs.try_send(99), Err(mpsc::error::TrySendError::Full(99))));
+            assert!(matches!(
+                jobs.try_send(99),
+                Err(mpsc::error::TrySendError::Full(99))
+            ));
         });
         let first = receiver.try_recv().expect("late arrival remains first");
         let next_batch = collect_job_batch_with_wait(first, &mut receiver, |_| {});
         let mut observed = Vec::new();
-        process_batch_with_lookahead(next_batch, |current, next| observed.push((current, next.copied())));
-        assert_eq!(observed, vec![(1, Some(2)), (2, Some(3)), (3, Some(4)), (4, None)]);
-        assert_eq!(receiver.try_recv().expect("batch limit leaves admission queue intact"), 5);
+        process_batch_with_lookahead(next_batch, |current, next| {
+            observed.push((current, next.copied()))
+        });
+        assert_eq!(
+            observed,
+            vec![(1, Some(2)), (2, Some(3)), (3, Some(4)), (4, None)]
+        );
+        assert_eq!(
+            receiver
+                .try_recv()
+                .expect("batch limit leaves admission queue intact"),
+            5
+        );
     }
 
     #[test]

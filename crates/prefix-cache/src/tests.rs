@@ -216,7 +216,12 @@ impl PersistentSnapshotStore for RecordingStore {
         }))
     }
     fn manifest_bytes(&mut self, key: &EntryKey) -> Result<Option<u64>, String> {
-        Ok(self.0.lock().expect("store").entries.get(key)
+        Ok(self
+            .0
+            .lock()
+            .expect("store")
+            .entries
+            .get(key)
             .map(|(manifest, _)| manifest.len() as u64))
     }
 
@@ -1109,17 +1114,20 @@ fn dflash_portable(token_len: usize, hidden_offset: usize) -> PortablePromptSnap
 
 #[cfg(feature = "dflash2")]
 fn encode_dflash(portable: PortablePromptSnapshot) -> Result<codec::EncodedEntry, String> {
-    codec::encode_portable(DFLASH_NAMESPACE,
-    SnapshotRoute::Dflash2,
-    &[1, 2, 3],
-    portable,
-    RetentionMetadata {
-        observations: 1,
-        reuse_count: 0,
-        last_access_unix_ms: 0,
-    },
-    INITIAL_TTL_MS,
-    None, |_| Ok(()))
+    codec::encode_portable(
+        DFLASH_NAMESPACE,
+        SnapshotRoute::Dflash2,
+        &[1, 2, 3],
+        portable,
+        RetentionMetadata {
+            observations: 1,
+            reuse_count: 0,
+            last_access_unix_ms: 0,
+        },
+        INITIAL_TTL_MS,
+        None,
+        |_| Ok(()),
+    )
 }
 
 #[cfg(feature = "dflash2")]
@@ -1468,19 +1476,22 @@ fn dflash2_hidden_and_logits_count_toward_eviction_and_expiry() {
 
 #[test]
 fn strict_manifest_rejects_unknown_fields_and_namespace_mismatch() {
-    let encoded = codec::encode_portable(NAMESPACE,
-    SnapshotRoute::Baseline,
-    &[1],
-    snapshot(1, &[1.0])
-        .to_portable()
-        .expect("portable snapshot"),
-    RetentionMetadata {
-        observations: 1,
-        reuse_count: 0,
-        last_access_unix_ms: 0,
-    },
-    INITIAL_TTL_MS,
-    None, |_| Ok(()))
+    let encoded = codec::encode_portable(
+        NAMESPACE,
+        SnapshotRoute::Baseline,
+        &[1],
+        snapshot(1, &[1.0])
+            .to_portable()
+            .expect("portable snapshot"),
+        RetentionMetadata {
+            observations: 1,
+            reuse_count: 0,
+            last_access_unix_ms: 0,
+        },
+        INITIAL_TTL_MS,
+        None,
+        |_| Ok(()),
+    )
     .expect("encode");
     let mut value: serde_json::Value =
         serde_json::from_slice(&encoded.manifest).expect("manifest JSON");
@@ -1573,17 +1584,20 @@ fn mtp_manifest_round_trip_preserves_route_and_offset_validation() {
         last_hidden: array(vec![0; 8]),
         continuation_logits: array(vec![1; 8]),
     };
-    let encoded = codec::encode_portable(MTP_NAMESPACE,
-    SnapshotRoute::Mtp,
-    &[7],
-    portable,
-    RetentionMetadata {
-        observations: 1,
-        reuse_count: 0,
-        last_access_unix_ms: 0,
-    },
-    INITIAL_TTL_MS,
-    None, |_| Ok(()))
+    let encoded = codec::encode_portable(
+        MTP_NAMESPACE,
+        SnapshotRoute::Mtp,
+        &[7],
+        portable,
+        RetentionMetadata {
+            observations: 1,
+            reuse_count: 0,
+            last_access_unix_ms: 0,
+        },
+        INITIAL_TTL_MS,
+        None,
+        |_| Ok(()),
+    )
     .expect("encode MTP");
     let manifest: serde_json::Value =
         serde_json::from_slice(&encoded.manifest).expect("manifest JSON");
@@ -1673,17 +1687,20 @@ fn filesystem_namespace_isolation_and_partial_recovery_are_misses() {
 fn failed_blob_barrier_defers_publication_and_orphan_retry_until_durable() {
     let encode = |token, value| {
         let portable = snapshot(1, &[value]).to_portable().unwrap();
-        let encoded = codec::encode_portable(NAMESPACE,
-        SnapshotRoute::Baseline,
-        &[token],
-        portable.clone(),
-        RetentionMetadata {
-            observations: 1,
-            reuse_count: 0,
-            last_access_unix_ms: 0,
-        },
-        INITIAL_TTL_MS,
-        None, |_| Ok(()))
+        let encoded = codec::encode_portable(
+            NAMESPACE,
+            SnapshotRoute::Baseline,
+            &[token],
+            portable.clone(),
+            RetentionMetadata {
+                observations: 1,
+                reuse_count: 0,
+                last_access_unix_ms: 0,
+            },
+            INITIAL_TTL_MS,
+            None,
+            |_| Ok(()),
+        )
         .unwrap();
         (
             StoredEntry {
@@ -2095,32 +2112,38 @@ fn prefetch_ready_is_read_only_and_unrelated_lookup_preserves_it() {
 fn prefetch_and_demand_restore_identical_payloads() {
     let (mut cache, state, _) = lookahead_fixture();
     let demand = cache.lookup(&[1, 2, 3], SnapshotRoute::Baseline).unwrap();
-    let expected = codec::encode_portable(NAMESPACE,
-    SnapshotRoute::Baseline,
-    &[1, 2],
-    demand.snapshot().to_portable().unwrap(),
-    codec::RetentionMetadata {
-        observations: 1,
-        reuse_count: 0,
-        last_access_unix_ms: 1,
-    },
-    10_000,
-    None, |_| Ok(()))
+    let expected = codec::encode_portable(
+        NAMESPACE,
+        SnapshotRoute::Baseline,
+        &[1, 2],
+        demand.snapshot().to_portable().unwrap(),
+        codec::RetentionMetadata {
+            observations: 1,
+            reuse_count: 0,
+            last_access_unix_ms: 1,
+        },
+        10_000,
+        None,
+        |_| Ok(()),
+    )
     .unwrap();
     cache.prefetch(&[1, 2, 3], SnapshotRoute::Baseline);
     cache.flush_persistence();
     let hit = cache.lookup(&[1, 2, 3], SnapshotRoute::Baseline).unwrap();
-    let actual = codec::encode_portable(NAMESPACE,
-    SnapshotRoute::Baseline,
-    &[1, 2],
-    hit.snapshot().to_portable().unwrap(),
-    codec::RetentionMetadata {
-        observations: 1,
-        reuse_count: 0,
-        last_access_unix_ms: 1,
-    },
-    10_000,
-    None, |_| Ok(()))
+    let actual = codec::encode_portable(
+        NAMESPACE,
+        SnapshotRoute::Baseline,
+        &[1, 2],
+        hit.snapshot().to_portable().unwrap(),
+        codec::RetentionMetadata {
+            observations: 1,
+            reuse_count: 0,
+            last_access_unix_ms: 1,
+        },
+        10_000,
+        None,
+        |_| Ok(()),
+    )
     .unwrap();
     assert_eq!(actual.manifest, expected.manifest);
     assert_eq!(actual.blobs, expected.blobs);
@@ -2386,17 +2409,20 @@ fn publication_staging_releases_on_success_failure_and_saturation() {
 fn bounded_filesystem_prefetch_rejects_oversized_payloads() {
     let directory = TempDirectory::new();
     let mut store = FilesystemSnapshotStore::new(&directory.path).unwrap();
-    let encoded = codec::encode_portable(NAMESPACE,
-    SnapshotRoute::Baseline,
-    &[1],
-    snapshot(1, &[1., 2.]).to_portable().unwrap(),
-    RetentionMetadata {
-        observations: 1,
-        reuse_count: 0,
-        last_access_unix_ms: 1,
-    },
-    u64::MAX,
-    None, |_| Ok(()))
+    let encoded = codec::encode_portable(
+        NAMESPACE,
+        SnapshotRoute::Baseline,
+        &[1],
+        snapshot(1, &[1., 2.]).to_portable().unwrap(),
+        RetentionMetadata {
+            observations: 1,
+            reuse_count: 0,
+            last_access_unix_ms: 1,
+        },
+        u64::MAX,
+        None,
+        |_| Ok(()),
+    )
     .unwrap();
     let key = encoded.key.clone();
     let size = encoded.manifest.len() as u64
@@ -2571,40 +2597,82 @@ fn multi_megabyte_paged_manifest_uses_exact_combined_prefetch_budget() {
         family: "test".into(),
         token_len,
         tensors: Vec::new(),
-        paged_tensors: (0..16).map(|layer| PortablePagedTensor {
-            name: format!("layers.{layer}.attention.key"),
-            token_axis: 1,
-            token_len,
-            pages: (0..token_len).step_by(32).map(|start| PortablePage {
-                token_start: start,
-                token_end: start + 32,
-                shape: vec![1, 32, 2],
-                dtype: mlxcel_core::dtype::FLOAT32,
-                bytes: Arc::clone(&page_bytes),
-            }).collect(),
-        }).collect(),
-        continuation_logits: None,
+        paged_tensors: (0..16)
+            .map(|layer| PortablePagedTensor {
+                name: format!("layers.{layer}.attention.key"),
+                token_axis: 1,
+                token_len,
+                pages: (0..token_len)
+                    .step_by(32)
+                    .map(|start| PortablePage {
+                        token_start: start,
+                        token_end: start + 32,
+                        shape: vec![1, 32, 2],
+                        dtype: mlxcel_core::dtype::FLOAT32,
+                        bytes: Arc::clone(&page_bytes),
+                    })
+                    .collect(),
+            })
+            .collect(),
+        continuation_logits: Some(qw_runtime::PortableArray {
+            name: None,
+            shape: vec![1, 2],
+            dtype: mlxcel_core::dtype::FLOAT32,
+            bytes: vec![0; 8],
+        }),
     });
-    let encoded = codec::encode_portable(NAMESPACE, SnapshotRoute::Baseline, &tokens,
+    let encoded = codec::encode_portable(
+        NAMESPACE,
+        SnapshotRoute::Baseline,
+        &tokens,
         portable.clone(),
-        RetentionMetadata { observations: 1, reuse_count: 0, last_access_unix_ms: 1 },
-        u64::MAX, None, |_| Ok(())).unwrap();
+        RetentionMetadata {
+            observations: 1,
+            reuse_count: 0,
+            last_access_unix_ms: 1,
+        },
+        u64::MAX,
+        None,
+        |_| Ok(()),
+    )
+    .unwrap();
     let manifest_bytes = encoded.manifest.len() as u64;
-    assert!(manifest_bytes > 2 * 1024 * 1024, "fixture represents long paged-cache manifests");
-    let full_bytes = manifest_bytes + encoded.blobs.iter().map(|blob| blob.bytes.len() as u64).sum::<u64>();
+    assert!(
+        manifest_bytes > 2 * 1024 * 1024,
+        "fixture represents long paged-cache manifests"
+    );
+    let full_bytes = manifest_bytes
+        + encoded
+            .blobs
+            .iter()
+            .map(|blob| blob.bytes.len() as u64)
+            .sum::<u64>();
     let key = encoded.key.clone();
     let directory = TempDirectory::new();
     let mut store = FilesystemSnapshotStore::new(&directory.path).unwrap();
-    store.put(StoredEntry { key: encoded.key, manifest: encoded.manifest, blobs: encoded.blobs }, u64::MAX).unwrap();
+    store
+        .put(
+            StoredEntry {
+                key: encoded.key,
+                manifest: encoded.manifest,
+                blobs: encoded.blobs,
+            },
+            u64::MAX,
+        )
+        .unwrap();
     assert_eq!(store.manifest_bytes(&key).unwrap(), Some(manifest_bytes));
     assert!(store.load_bounded(&key, manifest_bytes - 1).is_err());
     assert!(store.load_bounded(&key, full_bytes - 1).is_err());
     assert!(store.load_bounded(&key, full_bytes).unwrap().is_some());
-    let mut cache = AdaptivePrefixCache::with_store(namespaces(), memory_config(1), Box::new(store)).unwrap();
+    let mut cache =
+        AdaptivePrefixCache::with_store(namespaces(), memory_config(1), Box::new(store)).unwrap();
     cache.prefetch(&tokens, SnapshotRoute::Baseline);
     cache.flush_persistence();
-    assert_eq!(cache.staging.used.load(Ordering::Acquire), 3 * full_bytes,
-        "ready large-manifest prefetch retains its exact combined reservation");
+    assert_eq!(
+        cache.staging.used.load(Ordering::Acquire),
+        3 * full_bytes,
+        "ready large-manifest prefetch retains its exact combined reservation"
+    );
     let hit = cache.lookup(&tokens, SnapshotRoute::Baseline).unwrap();
     assert_eq!(hit.token_count, token_len);
     assert_eq!(hit.snapshot().to_portable().unwrap(), portable);
