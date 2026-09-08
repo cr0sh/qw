@@ -1951,6 +1951,8 @@ impl QwenWorker {
                 &mut emit_delta,
             ),
         };
+        // Release the owner-thread match before publication can evict its entry.
+        drop(hit);
         let mut generated = match generated {
             Ok(generated) => generated,
             Err(generation_error) => {
