@@ -180,6 +180,10 @@ struct RecordingState {
     entries: HashMap<EntryKey, (Vec<u8>, Vec<ContentBlob>)>,
     refreshes: Vec<(EntryKey, u64)>,
     fail_put: bool,
+    demand_loads: usize,
+    prefetch_loads: usize,
+    fail_load: bool,
+    read_gate: Option<Arc<(Mutex<BlockingState>, Condvar)>>,
 }
 
 struct RecordingStore(Arc<Mutex<RecordingState>>);
@@ -199,12 +203,34 @@ impl PersistentSnapshotStore for RecordingStore {
     }
 
     fn load(&mut self, key: &EntryKey) -> Result<Option<StoredEntry>, String> {
-        let state = self.0.lock().expect("recording store lock");
+        let mut state = self.0.lock().expect("recording store lock");
+        state.demand_loads += 1;
+        if state.fail_load { return Err("injected load failure".into()); }
         Ok(state.entries.get(key).map(|(manifest, blobs)| StoredEntry {
             key: key.clone(),
             manifest: manifest.clone(),
             blobs: blobs.clone(),
         }))
+    }
+
+    fn load_bounded(&mut self, key: &EntryKey, limit: u64) -> Result<Option<StoredEntry>, String> {
+        let mut state = self.0.lock().unwrap();
+        state.prefetch_loads += 1;
+        if state.fail_load { return Err("injected load failure".into()); }
+        let Some((manifest, blobs)) = state.entries.get(key) else { return Ok(None) };
+        let bytes = manifest.len() as u64 + blobs.iter().map(|b| b.bytes.len() as u64).sum::<u64>();
+        if bytes > limit { return Err("prefetch byte limit".into()); }
+        let entry = StoredEntry { key: key.clone(), manifest: manifest.clone(), blobs: blobs.clone() };
+        let gate = state.read_gate.clone();
+        drop(state);
+        if let Some(gate) = gate {
+            let (lock, wake) = &*gate;
+            let mut state = lock.lock().expect("read gate");
+            state.entered = true;
+            wake.notify_all();
+            while !state.released { state = wake.wait(state).expect("read gate"); }
+        }
+        Ok(Some(entry))
     }
 
     fn put(&mut self, entry: StoredEntry, _expires_at_unix_ms: u64) -> Result<(), String> {
@@ -1896,4 +1922,323 @@ fn adaptive_memory_accounts_shared_checkpoint_pages_once() {
         3 * 256 * 2 * std::mem::size_of::<f32>() as u64,
         "linear checkpoints charge unique page bytes, not cumulative logical sizes"
     );
+}
+
+fn lookahead_fixture() -> (AdaptivePrefixCache, Arc<Mutex<RecordingState>>, ManualClock) {
+    let state = Arc::new(Mutex::new(RecordingState::default()));
+    let clock = ManualClock::new(1_000);
+    let mut cache = AdaptivePrefixCache::with_store_and_clock(
+        namespaces(), memory_config(0), Box::new(RecordingStore(Arc::clone(&state))),
+        Box::new(clock.clone()),
+    ).unwrap();
+    cache.insert(&[1, 2], vec![snapshot(2, &[1., 2.])], SnapshotRoute::Baseline);
+    cache.flush_persistence();
+    (cache, state, clock)
+}
+
+#[test]
+fn prefetch_ready_is_read_only_and_unrelated_lookup_preserves_it() {
+    let (mut cache, state, _) = lookahead_fixture();
+    let node = cache.trie.path(&[1, 2], SnapshotRoute::Baseline).last().unwrap().0;
+    let before = cache.trie.terminal(node, SnapshotRoute::Baseline).unwrap().reuse_count;
+    cache.prefetch(&[1, 2, 3], SnapshotRoute::Baseline);
+    cache.flush_persistence();
+    assert_eq!(cache.trie.terminal(node, SnapshotRoute::Baseline).unwrap().reuse_count, before);
+    assert!(cache.lookup(&[9], SnapshotRoute::Baseline).is_none());
+    let hit = cache.lookup(&[1, 2, 3], SnapshotRoute::Baseline).unwrap();
+    assert_eq!(hit.token_count, 2);
+    assert_eq!(hit.snapshot().token_len(), 2);
+    assert_eq!(state.lock().unwrap().demand_loads, 0);
+    assert_eq!(cache.staging.used.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn prefetch_and_demand_restore_identical_payloads() {
+    let (mut cache, state, _) = lookahead_fixture();
+    let demand = cache.lookup(&[1, 2, 3], SnapshotRoute::Baseline).unwrap();
+    let expected = codec::encode_portable(NAMESPACE, SnapshotRoute::Baseline, &[1, 2],
+        demand.snapshot().to_portable().unwrap(),
+        codec::RetentionMetadata { observations: 1, reuse_count: 0, last_access_unix_ms: 1 },
+        10_000, None).unwrap();
+    cache.prefetch(&[1, 2, 3], SnapshotRoute::Baseline);
+    cache.flush_persistence();
+    let hit = cache.lookup(&[1, 2, 3], SnapshotRoute::Baseline).unwrap();
+    let actual = codec::encode_portable(NAMESPACE, SnapshotRoute::Baseline, &[1, 2],
+        hit.snapshot().to_portable().unwrap(),
+        codec::RetentionMetadata { observations: 1, reuse_count: 0, last_access_unix_ms: 1 },
+        10_000, None).unwrap();
+    assert_eq!(actual.manifest, expected.manifest);
+    assert_eq!(actual.blobs, expected.blobs);
+    assert_eq!(state.lock().unwrap().demand_loads, 1);
+}
+
+#[test]
+fn cancelled_and_replaced_lookahead_release_and_fall_back() {
+    let (mut cache, state, _) = lookahead_fixture();
+    cache.prefetch(&[1, 2], SnapshotRoute::Baseline);
+    cache.flush_persistence();
+    assert!(cache.staging.used.load(Ordering::Acquire) > 0);
+    cache.clear_prefetch();
+    assert_eq!(cache.staging.used.load(Ordering::Acquire), 0);
+    cache.prefetch(&[1, 2], SnapshotRoute::Baseline);
+    cache.flush_persistence();
+    cache.prefetch(&[9], SnapshotRoute::Baseline);
+    assert_eq!(cache.staging.used.load(Ordering::Acquire), 0);
+    assert_eq!(cache.lookup(&[1, 2], SnapshotRoute::Baseline).unwrap().token_count, 2);
+    assert_eq!(state.lock().unwrap().demand_loads, 1);
+}
+
+#[test]
+fn ready_prefetch_cannot_resurrect_expired_or_replaced_entry() {
+    let (mut cache, state, clock) = lookahead_fixture();
+    cache.prefetch(&[1, 2], SnapshotRoute::Baseline);
+    cache.flush_persistence();
+    clock.set(1_000 + INITIAL_TTL_MS);
+    assert!(cache.lookup(&[1, 2], SnapshotRoute::Baseline).is_none());
+    cache.insert(&[1, 2], vec![snapshot(2, &[7., 8., 9.])], SnapshotRoute::Baseline);
+    cache.flush_persistence();
+    let hit = cache.lookup(&[1, 2], SnapshotRoute::Baseline).unwrap();
+    assert_eq!(hit.snapshot().nbytes(), snapshot(2, &[7., 8., 9.]).nbytes());
+    assert_eq!(state.lock().unwrap().demand_loads, 1);
+    cache.clear_prefetch();
+    assert_eq!(cache.staging.used.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn failed_missing_and_corrupt_prefetch_never_poison_current_entry() {
+    for mode in 0..5 {
+        let (mut cache, state, _) = lookahead_fixture();
+        let original = state.lock().unwrap().entries.clone();
+        {
+            let mut s = state.lock().unwrap();
+            match mode {
+                0 => s.fail_load = true,
+                1 => s.entries.clear(),
+                2 => s.entries.values_mut().next().unwrap().1[0].bytes = Arc::from([0u8]),
+                _ => {
+                    let (bytes, _) = s.entries.values_mut().next().unwrap();
+                    let mut manifest: Manifest = serde_json::from_slice(bytes).unwrap();
+                    if mode == 3 { manifest.namespace = MTP_NAMESPACE.to_string(); }
+                    else { manifest.token_ids = vec![8, 9]; }
+                    *bytes = serde_json::to_vec(&manifest).unwrap();
+                }
+            }
+        }
+        cache.prefetch(&[1, 2], SnapshotRoute::Baseline);
+        cache.flush_persistence();
+        assert_eq!(cache.staging.used.load(Ordering::Acquire), 0);
+        {
+            let mut s = state.lock().unwrap();
+            s.fail_load = false;
+            s.entries = original;
+        }
+        assert_eq!(cache.lookup(&[1, 2], SnapshotRoute::Baseline).unwrap().token_count, 2);
+        assert_eq!(state.lock().unwrap().demand_loads, 1);
+    }
+}
+
+#[test]
+fn prefetch_budget_saturation_does_not_block_demand_and_releases() {
+    let (mut cache, state, _) = lookahead_fixture();
+    let all = cache.staging.reserve(cache.staging.limit).unwrap();
+    cache.prefetch(&[1, 2], SnapshotRoute::Baseline);
+    assert!(cache.prefetch.is_none());
+    assert_eq!(cache.lookup(&[1, 2], SnapshotRoute::Baseline).unwrap().token_count, 2);
+    drop(all);
+    cache.prefetch(&[1, 2], SnapshotRoute::Baseline);
+    cache.flush_persistence();
+    assert_eq!(cache.lookup(&[1, 2], SnapshotRoute::Baseline).unwrap().token_count, 2);
+    assert_eq!(state.lock().unwrap().demand_loads, 1);
+    assert_eq!(cache.staging.used.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn lookahead_revalidates_longest_prefix_and_route() {
+    let (mut cache, state, _) = lookahead_fixture();
+    cache.prefetch(&[1, 2, 3], SnapshotRoute::Baseline);
+    cache.flush_persistence();
+    assert!(cache.lookup(&[1, 2, 3], SnapshotRoute::Mtp).is_none());
+    cache.insert(&[1, 2, 3], vec![snapshot(3, &[3., 4.])], SnapshotRoute::Baseline);
+    cache.flush_persistence();
+    assert_eq!(cache.lookup(&[1, 2, 3, 4], SnapshotRoute::Baseline).unwrap().token_count, 3);
+    assert_eq!(state.lock().unwrap().demand_loads, 1);
+    // The shorter candidate remains usable, not consumed by the longer demand.
+    assert_eq!(cache.lookup(&[1, 2, 9], SnapshotRoute::Baseline).unwrap().token_count, 2);
+    assert_eq!(state.lock().unwrap().demand_loads, 1);
+}
+
+#[test]
+fn owned_hot_match_survives_mutation_without_copying_snapshot() {
+    let mut cache = AdaptivePrefixCache::new(namespaces(), memory_config(1_000)).unwrap();
+    cache.insert(&[1, 2], vec![snapshot(2, &[1.])], SnapshotRoute::Baseline);
+    let first = cache.lookup(&[1, 2], SnapshotRoute::Baseline).unwrap();
+    let second = cache.lookup(&[1, 2], SnapshotRoute::Baseline).unwrap();
+    assert!(std::ptr::eq(first.snapshot(), second.snapshot()));
+    cache.insert(&[1, 2], vec![snapshot(2, &[1., 2.])], SnapshotRoute::Baseline);
+    assert_eq!(first.snapshot().nbytes(), snapshot(2, &[1.]).nbytes());
+    assert_eq!(cache.lookup(&[1, 2], SnapshotRoute::Baseline).unwrap().snapshot().nbytes(),
+        snapshot(2, &[1., 2.]).nbytes());
+}
+
+#[test]
+fn delayed_prefetch_is_nonblocking_and_cancelled_inflight_releases_budget() {
+    let (mut cache, state, _) = lookahead_fixture();
+    let gate = Arc::new((Mutex::new(BlockingState::default()), Condvar::new()));
+    state.lock().expect("store").read_gate = Some(Arc::clone(&gate));
+    cache.prefetch(&[1, 2], SnapshotRoute::Baseline);
+    let (lock, wake) = &*gate;
+    let guard = lock.lock().expect("gate");
+    let (guard, timeout) = wake.wait_timeout_while(guard, std::time::Duration::from_secs(5),
+        |s| !s.entered).expect("gate");
+    let entered = guard.entered && !timeout.timed_out();
+    drop(guard);
+    // Neither an unrelated miss nor cancellation waits for the blocked worker.
+    let missed = cache.lookup(&[9], SnapshotRoute::Baseline).is_none();
+    cache.clear_prefetch();
+    let reserved = cache.staging.used.load(Ordering::Acquire);
+    let mut guard = lock.lock().expect("gate");
+    guard.released = true;
+    wake.notify_all();
+    drop(guard);
+    cache.flush_persistence();
+    assert!(entered);
+    assert!(missed);
+    assert!(reserved > 0, "inflight bytes must stay accounted until IO exits");
+    assert_eq!(cache.staging.used.load(Ordering::Acquire), 0);
+    cache.prefetch(&[1, 2], SnapshotRoute::Baseline);
+    cache.flush_persistence();
+    assert_eq!(cache.lookup(&[1, 2], SnapshotRoute::Baseline).unwrap().token_count, 2);
+    assert_eq!(state.lock().expect("store").demand_loads, 0);
+}
+
+#[test]
+fn publication_staging_releases_on_success_failure_and_saturation() {
+    let state = Arc::new(Mutex::new(RecordingState::default()));
+    let mut cache = AdaptivePrefixCache::with_store(
+        namespaces(), memory_config(1_000), Box::new(RecordingStore(Arc::clone(&state))),
+    ).unwrap();
+    let all = cache.staging.reserve(cache.staging.limit).unwrap();
+    cache.insert(&[1], vec![snapshot(1, &[1.])], SnapshotRoute::Baseline);
+    assert_eq!(cache.lookup(&[1], SnapshotRoute::Baseline).unwrap().token_count, 1);
+    drop(all);
+    cache.flush_persistence();
+    assert!(state.lock().expect("store").entries.is_empty());
+    state.lock().expect("store").fail_put = true;
+    cache.insert(&[2], vec![snapshot(1, &[2.])], SnapshotRoute::Baseline);
+    cache.flush_persistence();
+    assert_eq!(cache.staging.used.load(Ordering::Acquire), 0);
+    assert_eq!(cache.lookup(&[2], SnapshotRoute::Baseline).unwrap().token_count, 1);
+    state.lock().expect("store").fail_put = false;
+    cache.insert(&[2], vec![snapshot(1, &[3.])], SnapshotRoute::Baseline);
+    cache.flush_persistence();
+    assert_eq!(cache.staging.used.load(Ordering::Acquire), 0);
+    cache.memory_cap = 0;
+    cache.evict_memory(None);
+    assert_eq!(cache.lookup(&[2], SnapshotRoute::Baseline).unwrap().snapshot().to_portable().unwrap(),
+        snapshot(1, &[3.]).to_portable().unwrap());
+}
+
+#[test]
+fn bounded_filesystem_prefetch_rejects_oversized_payloads() {
+    let directory = TempDirectory::new();
+    let mut store = FilesystemSnapshotStore::new(&directory.path).unwrap();
+    let encoded = codec::encode_portable(NAMESPACE, SnapshotRoute::Baseline, &[1],
+        snapshot(1, &[1., 2.]).to_portable().unwrap(),
+        RetentionMetadata { observations: 1, reuse_count: 0, last_access_unix_ms: 1 },
+        u64::MAX, None).unwrap();
+    let key = encoded.key.clone();
+    let size = encoded.manifest.len() as u64 + encoded.blobs.iter().map(|b| b.bytes.len() as u64).sum::<u64>();
+    store.put(StoredEntry { key: encoded.key, manifest: encoded.manifest, blobs: encoded.blobs }, u64::MAX).unwrap();
+    assert!(store.load_bounded(&key, size - 1).is_err());
+    let loaded = store.load_bounded(&key, size).unwrap().unwrap();
+    assert_eq!(codec::decode(NAMESPACE, &loaded.manifest, loaded.blobs).unwrap().snapshot.to_portable().unwrap(),
+        snapshot(1, &[1., 2.]).to_portable().unwrap());
+}
+
+#[test]
+fn ready_prefetch_replacement_and_stale_manifest_fall_back_to_current_state() {
+    let (mut cache, state, _) = lookahead_fixture();
+    let original = state.lock().expect("store").entries.clone();
+    {
+        let mut state = state.lock().expect("store");
+        let (bytes, _) = state.entries.values_mut().next().unwrap();
+        let mut manifest: Manifest = serde_json::from_slice(bytes).unwrap();
+        manifest.expires_at_unix_ms = 999;
+        *bytes = serde_json::to_vec(&manifest).unwrap();
+    }
+    cache.prefetch(&[1, 2], SnapshotRoute::Baseline);
+    cache.flush_persistence();
+    state.lock().expect("store").entries = original;
+    assert_eq!(cache.lookup(&[1, 2], SnapshotRoute::Baseline).unwrap().token_count, 2);
+    assert_eq!(state.lock().expect("store").demand_loads, 1);
+    assert_eq!(cache.staging.used.load(Ordering::Acquire), 0);
+    cache.prefetch(&[1, 2], SnapshotRoute::Baseline);
+    cache.flush_persistence();
+    cache.insert(&[1, 2], vec![snapshot(2, &[7., 8., 9.])], SnapshotRoute::Baseline);
+    cache.flush_persistence();
+    assert_eq!(cache.lookup(&[1, 2], SnapshotRoute::Baseline).unwrap().snapshot().to_portable().unwrap(),
+        snapshot(2, &[7., 8., 9.]).to_portable().unwrap());
+    cache.clear_prefetch();
+    assert_eq!(cache.staging.used.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn demand_joins_delayed_prefetch_without_duplicate_store_read() {
+    let (mut cache, state, _) = lookahead_fixture();
+    let gate = Arc::new((Mutex::new(BlockingState::default()), Condvar::new()));
+    state.lock().expect("store").read_gate = Some(Arc::clone(&gate));
+    cache.prefetch(&[1, 2], SnapshotRoute::Baseline);
+    let (joined, joining) = mpsc::channel();
+    cache.prefetch.as_mut().unwrap().demand_join = Some(joined);
+    let release = thread::spawn(move || {
+        let joined = joining.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
+        let (lock, wake) = &*gate;
+        let mut guard = lock.lock().expect("gate");
+        guard.released = true;
+        wake.notify_all();
+        joined
+    });
+    let hit = cache.lookup(&[1, 2], SnapshotRoute::Baseline).unwrap();
+    assert!(release.join().unwrap());
+    assert_eq!(hit.snapshot().to_portable().unwrap(), snapshot(2, &[1., 2.]).to_portable().unwrap());
+    assert_eq!(state.lock().expect("store").prefetch_loads, 1);
+    assert_eq!(state.lock().expect("store").demand_loads, 0);
+    assert_eq!(cache.staging.used.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn bounded_hot_lookahead_survives_current_publication_eviction() {
+    let (mut cache, state, clock) = lookahead_fixture();
+    let capacity = snapshot(2, &[1., 2.]).nbytes() as u64;
+    cache.memory_cap = capacity;
+    let next = cache.lookup(&[1, 2], SnapshotRoute::Baseline).unwrap();
+    let expected = next.snapshot().to_portable().unwrap();
+    drop(next);
+    cache.prefetch(&[1, 2], SnapshotRoute::Baseline);
+    assert_eq!(cache.staging.used.load(Ordering::Acquire), capacity);
+    clock.set(1_001);
+    cache.insert(&[9], vec![snapshot(1, &[9., 8.])], SnapshotRoute::Baseline);
+    cache.flush_persistence();
+    assert!(cache.trie.terminal(cache.trie.path(&[1, 2], SnapshotRoute::Baseline).last().unwrap().0,
+        SnapshotRoute::Baseline).unwrap().snapshot.is_none());
+    let hit = cache.lookup(&[1, 2], SnapshotRoute::Baseline).unwrap();
+    assert_eq!(hit.snapshot().to_portable().unwrap(), expected);
+    assert_eq!(state.lock().expect("store").demand_loads, 1);
+    assert_eq!(cache.staging.used.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn prefetch_after_unflushed_publication_observes_fifo_write_visibility() {
+    let state = Arc::new(Mutex::new(RecordingState::default()));
+    let mut cache = AdaptivePrefixCache::with_store(
+        namespaces(), memory_config(0), Box::new(RecordingStore(Arc::clone(&state))),
+    ).unwrap();
+    cache.insert(&[1, 2], vec![snapshot(2, &[3., 4.])], SnapshotRoute::Baseline);
+    cache.prefetch(&[1, 2], SnapshotRoute::Baseline);
+    let hit = cache.lookup(&[1, 2], SnapshotRoute::Baseline).unwrap();
+    assert_eq!(hit.snapshot().to_portable().unwrap(), snapshot(2, &[3., 4.]).to_portable().unwrap());
+    cache.flush_persistence();
+    assert_eq!(state.lock().expect("store").demand_loads, 0);
+    assert_eq!(cache.pending_filesystem_bytes, 0);
+    assert_eq!(cache.staging.used.load(Ordering::Acquire), 0);
 }

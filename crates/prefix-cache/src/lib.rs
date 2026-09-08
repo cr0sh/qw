@@ -6,7 +6,8 @@ mod trie;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -131,33 +132,25 @@ impl CacheConfig {
     }
 }
 
-pub struct PrefixMatch<'a> {
+/// An owner-thread handle. Holding a match pins its snapshot independently of
+/// cache eviction, without copying MLX handles or portable buffers.
+pub struct PrefixMatch {
     pub token_count: usize,
-    snapshot: MatchedSnapshot<'a>,
+    snapshot: Rc<PromptSnapshot>,
 }
 
-enum MatchedSnapshot<'a> {
-    Hot(&'a PromptSnapshot),
-    Restored(PromptSnapshot),
-}
-
-impl PrefixMatch<'_> {
-    pub fn snapshot(&self) -> &PromptSnapshot {
-        match &self.snapshot {
-            MatchedSnapshot::Hot(snapshot) => snapshot,
-            MatchedSnapshot::Restored(snapshot) => snapshot,
-        }
-    }
+impl PrefixMatch {
+    pub fn snapshot(&self) -> &PromptSnapshot { &self.snapshot }
 }
 
 enum PersistentMatch {
     Hot,
-    Restored(PromptSnapshot),
+    Restored(Rc<PromptSnapshot>),
 }
 
 pub struct ResumeEntry {
     pub token_ids: Vec<i32>,
-    pub snapshot: PromptSnapshot,
+    pub snapshot: Rc<PromptSnapshot>,
     pub metadata: ResponseResumeMetadata,
 }
 
@@ -174,6 +167,8 @@ fn filesystem_hard_cap(capacity: u64) -> u64 {
 }
 
 pub struct AdaptivePrefixCache {
+    publication_id: u64,
+    publications: HashMap<EntryKey, u64>,
     namespaces: CacheNamespaces,
     trie: RadixTrie,
     memory_cap: u64,
@@ -186,6 +181,8 @@ pub struct AdaptivePrefixCache {
     io: Option<CacheIo>,
     clock: Box<dyn Clock>,
     resumes: HashMap<String, (SnapshotRoute, Vec<i32>)>,
+    staging: Arc<StagingBudget>,
+    prefetch: Option<Prefetch>,
 }
 
 struct CacheIo {
@@ -196,18 +193,66 @@ struct CacheIo {
 }
 
 struct PutCompletion {
+    publication_id: u64,
     route: SnapshotRoute,
     token_ids: Vec<i32>,
     key: EntryKey,
     reserved_bytes: u64,
     result: Result<(Vec<(String, u64)>, u64), String>,
 }
+
+// Staged payload limit is max(4 * hot capacity, 64 MiB): a 2 GiB hot cache
+// permits 8 GiB of additional staging. Shared pages are conservatively charged
+// per operation, even while also resident in the hot tier. Publication reserves
+// 2 * logical bytes + 1 MiB before to_portable; read/decode reserves
+// 3 * (disk bytes + 1 MiB), and a hot lookahead pin reserves logical bytes.
+// The filesystem reader separately caps raw manifests at 1 MiB; Rust metadata
+// and channel bookkeeping are additional bounded overhead, not payload bytes.
+// Active request-owned snapshots are not cache staging after demand consumes them.
+struct StagingBudget { limit: u64, used: AtomicU64 }
+struct Reservation { budget: Arc<StagingBudget>, bytes: u64 }
+impl StagingBudget {
+    fn reserve(self: &Arc<Self>, bytes: u64) -> Option<Reservation> {
+        let previous = self.used.fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            used.checked_add(bytes).filter(|sum| *sum <= self.limit)
+        }).ok()?;
+        tracing::debug!(phase = "cache.staging.reserve", bytes, staging_bytes = previous + bytes, limit_bytes = self.limit);
+        Some(Reservation { budget: Arc::clone(self), bytes })
+    }
+}
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        let previous = self.budget.used.fetch_sub(self.bytes, Ordering::AcqRel);
+        tracing::debug!(phase = "cache.staging.release", bytes = self.bytes, staging_bytes = previous - self.bytes);
+    }
+}
+struct Prefetch {
+    key: EntryKey,
+    cancelled: Arc<AtomicBool>,
+    reply: Receiver<(codec::PortableDecodedEntry, Reservation)>,
+    hot: Option<(Rc<PromptSnapshot>, Reservation)>,
+    #[cfg(test)]
+    demand_join: Option<mpsc::Sender<()>>,
+}
+// One FIFO preserves read-after-write, replacement/removal and flush barriers.
+// Demand joins its existing lookahead rather than issuing a duplicate read.
+// We do not preempt an active store operation or let speculative reads overtake
+// writes: those residual waits are unavoidable without a stronger store API.
 enum IoCommand {
     Load {
         key: EntryKey,
         reply: mpsc::Sender<Result<Option<StoredEntry>, String>>,
     },
+    Prefetch {
+        key: EntryKey,
+        namespace: String,
+        limit: u64,
+        cancelled: Arc<AtomicBool>,
+        reservation: Reservation,
+        reply: mpsc::Sender<(codec::PortableDecodedEntry, Reservation)>,
+    },
     Put {
+        publication_id: u64,
         key: EntryKey,
         namespace: String,
         route: SnapshotRoute,
@@ -217,6 +262,7 @@ enum IoCommand {
         retention: RetentionMetadata,
         expires_at_unix_ms: u64,
         response_resume: Option<ResponseResumeMetadata>,
+        reservation: Reservation,
     },
     Remove(EntryKey),
     RemoveSync {
@@ -231,6 +277,7 @@ impl IoCommand {
     fn entry_id(&self) -> Option<&str> {
         match self {
             Self::Load { key, .. }
+            | Self::Prefetch { key, .. }
             | Self::Put { key, .. }
             | Self::Remove(key)
             | Self::RemoveSync { key, .. } => Some(&key.0),
@@ -367,6 +414,13 @@ impl AdaptivePrefixCache {
             io,
             clock,
             resumes,
+            publication_id: 0,
+            publications: HashMap::new(),
+            staging: Arc::new(StagingBudget {
+                limit: config.memory_bytes.saturating_mul(4).max(64 * 1024 * 1024),
+                used: AtomicU64::new(0),
+            }),
+            prefetch: None,
         };
         cache.evict_persistent(now);
         tracing::info!(
@@ -391,6 +445,10 @@ impl AdaptivePrefixCache {
             self.pending_filesystem_bytes = self
                 .pending_filesystem_bytes
                 .saturating_sub(completion.reserved_bytes);
+            if self.publications.get(&completion.key) != Some(&completion.publication_id) {
+                continue;
+            }
+            self.publications.remove(&completion.key);
             let Some((node, _)) = self
                 .trie
                 .path(&completion.token_ids, completion.route)
@@ -424,7 +482,66 @@ impl AdaptivePrefixCache {
         self.evict_persistent(self.clock.now_unix_ms());
     }
 
-    pub fn lookup(&mut self, prompt: &[i32], route: SnapshotRoute) -> Option<PrefixMatch<'_>> {
+    /// Queue one read-only portable lookahead. No observations, expiry, reuse,
+    /// promotion, or MLX operations occur until ordinary demand lookup.
+    pub fn prefetch(&mut self, tokens: &[i32], route: SnapshotRoute) {
+        self.clear_prefetch();
+        let now = self.clock.now_unix_ms();
+        for (node, _) in self.trie.path(tokens, route).into_iter().rev() {
+            let Some(t) = self.trie.terminal(node, route) else { continue };
+            if t.expires_at_unix_ms <= now { continue; }
+            let Some(key) = t.persistent_key.clone() else {
+                if t.snapshot.is_some() { return; }
+                continue;
+            };
+            if let Some(snapshot) = &t.snapshot {
+                let Some(reservation) = self.staging.reserve(snapshot.nbytes() as u64) else {
+                    tracing::debug!(phase = "cache.prefetch.skip", entry_id = %key.0, reason = "hot_pin_budget");
+                    return;
+                };
+                let (_, reply) = mpsc::channel();
+                self.prefetch = Some(Prefetch {
+                    key: key.clone(), cancelled: Arc::new(AtomicBool::new(false)),
+                    #[cfg(test)]
+                    demand_join: None,
+                    reply, hot: Some((Rc::clone(snapshot), reservation)),
+                });
+                tracing::debug!(phase = "cache.prefetch.pin", entry_id = %key.0);
+                return;
+            }
+            // Disk bytes bound the read. Dense expansion is independently checked
+            // by the worker; oversized advisory entries fall back to demand.
+            let logical = t.serialized_bytes;
+            let limit = logical.saturating_add(1024 * 1024);
+            let Some(reservation) = self.staging.reserve(limit.saturating_mul(3)) else {
+                tracing::debug!(phase = "cache.prefetch.skip", entry_id = %key.0, reason = "staging_budget");
+                return;
+            };
+            let (reply, receiver) = mpsc::channel();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            if self.try_io(IoCommand::Prefetch {
+                key: key.clone(), namespace: self.namespaces.get(route).to_string(),
+                limit, cancelled: Arc::clone(&cancelled), reservation, reply,
+            }) {
+                tracing::debug!(phase = "cache.prefetch.admit", entry_id = %key.0, read_limit_bytes = limit);
+                self.prefetch = Some(Prefetch {
+                    key, cancelled, reply: receiver, hot: None,
+                    #[cfg(test)]
+                    demand_join: None,
+                });
+            }
+            return;
+        }
+    }
+
+    pub fn clear_prefetch(&mut self) {
+        if let Some(prefetch) = self.prefetch.take() {
+            prefetch.cancelled.store(true, Ordering::Release);
+            tracing::debug!(phase = "cache.prefetch.clear", entry_id = %prefetch.key.0);
+        }
+    }
+
+    pub fn lookup(&mut self, prompt: &[i32], route: SnapshotRoute) -> Option<PrefixMatch> {
         self.drain_put_completions();
         let now = self.clock.now_unix_ms();
         self.expire(now);
@@ -492,8 +609,8 @@ impl AdaptivePrefixCache {
             cached_tokens = token_count
         );
         let snapshot = match restored {
-            Some(snapshot) => MatchedSnapshot::Restored(snapshot),
-            None => MatchedSnapshot::Hot(self.trie.terminal(node, route)?.snapshot.as_ref()?),
+            Some(snapshot) => snapshot,
+            None => Rc::clone(self.trie.terminal(node, route)?.snapshot.as_ref()?),
         };
         Some(PrefixMatch {
             token_count,
@@ -680,10 +797,13 @@ impl AdaptivePrefixCache {
                 .terminal(node, route)
                 .and_then(|terminal| terminal.entry_id.clone())
                 .unwrap_or_else(|| entry_key(namespace, route, prefix));
-            let persist = self.io.is_some() && self.can_reserve_persistence(bytes);
+            let reservation = (self.io.is_some() && self.can_reserve_persistence(bytes))
+                .then(|| self.staging.reserve(bytes.saturating_mul(2).saturating_add(1024 * 1024)))
+                .flatten();
+            let persist = reservation.is_some();
             let (observations, reuse_count, last_access) =
                 if let Some(terminal) = self.trie.terminal_mut(node, route) {
-                    terminal.snapshot = Some(snapshot);
+                    terminal.snapshot = Some(Rc::new(snapshot));
                     terminal.entry_id = Some(key.clone());
                     terminal.last_access_unix_ms = now;
                     terminal.page_refs = summary.pages.clone();
@@ -711,7 +831,7 @@ impl AdaptivePrefixCache {
                             page_refs: summary.pages.clone(),
                             local_bytes: summary.local_bytes,
                             blob_refs: Vec::new(),
-                            snapshot: Some(snapshot),
+                            snapshot: Some(Rc::new(snapshot)),
                             entry_id: Some(key.clone()),
                             persistent_key: persist.then(|| key.clone()),
                             response_resume: resume.clone(),
@@ -741,6 +861,7 @@ impl AdaptivePrefixCache {
                 })
                 .flatten();
             if let Some(portable) = portable {
+                self.publication_id = self.publication_id.checked_add(1).expect("publication ID exhausted");
                 let queued = self.try_io(IoCommand::Put {
                     key: key.clone(),
                     namespace: self.namespaces.get(route).to_string(),
@@ -748,6 +869,8 @@ impl AdaptivePrefixCache {
                     token_ids: prefix.to_vec(),
                     portable,
                     reserved_bytes: bytes,
+                    reservation: reservation.expect("portable publication reserved"),
+                    publication_id: self.publication_id,
                     retention: RetentionMetadata {
                         observations,
                         reuse_count,
@@ -757,8 +880,12 @@ impl AdaptivePrefixCache {
                     response_resume: resume,
                 });
                 if queued {
+                    self.publications.insert(key.clone(), self.publication_id);
                     self.pending_filesystem_bytes =
                         self.pending_filesystem_bytes.saturating_add(bytes);
+                    // An in-flight write has no blob refs yet, but its logical
+                    // payload is a conservative bounded-read estimate.
+                    self.trie.terminal_mut(node, route).unwrap().serialized_bytes = bytes;
                 } else if let Some(terminal) = self.trie.terminal_mut(node, route) {
                     terminal.persistent_key = None;
                     terminal.blob_refs.clear();
@@ -793,21 +920,6 @@ impl AdaptivePrefixCache {
             );
         }
         self.rebuild_accounting();
-        let mut blobs = HashMap::<String, (usize, u64)>::new();
-        for (node, route) in self.trie.terminal_ids() {
-            if let Some(t) = self.trie.terminal(node, route) {
-                for (digest, bytes) in &t.blob_refs {
-                    let entry = blobs.entry(digest.clone()).or_insert((0, *bytes));
-                    entry.0 += 1;
-                }
-            }
-        }
-        self.filesystem_blobs = blobs;
-        self.filesystem_bytes = self
-            .filesystem_blobs
-            .values()
-            .map(|(_, bytes)| *bytes)
-            .sum();
         self.evict_memory(None);
         self.evict_persistent(now);
         tracing::debug!(
@@ -852,6 +964,33 @@ impl AdaptivePrefixCache {
         key: &EntryKey,
         now: u64,
     ) -> Option<PersistentMatch> {
+        let pinned = self.prefetch.as_mut()
+            .filter(|p| &p.key == key && !p.cancelled.load(Ordering::Acquire))
+            .and_then(|p| p.hot.take());
+        if let Some((snapshot, _reservation)) = pinned {
+            self.clear_prefetch();
+            tracing::debug!(phase = "cache.prefetch.consume", entry_id = %key.0, source = "hot_pin");
+            return Some(PersistentMatch::Restored(snapshot));
+        }
+        let prefetched = self.prefetch.as_ref()
+            .filter(|p| &p.key == key && !p.cancelled.load(Ordering::Acquire))
+            // Demand joins matching work already ordered after prior writes;
+            // an advisory failure disconnects the reply and falls back below.
+            .and_then(|p| {
+                tracing::debug!(phase = "cache.prefetch.join", entry_id = %key.0);
+                #[cfg(test)]
+                if let Some(join) = &p.demand_join { let _ = join.send(()); }
+                p.reply.recv().ok()
+            })
+            .filter(|(decoded, _)| decoded.manifest.expires_at_unix_ms > now
+                && decoded.manifest.route == route
+                && entry_key(self.namespaces.get(route), route, &decoded.manifest.token_ids) == *key)
+            .and_then(|(portable, _reservation)| codec::restore(portable).ok());
+        let decoded = if let Some(snapshot) = prefetched {
+            self.clear_prefetch();
+            tracing::debug!(phase = "cache.prefetch.consume", entry_id = %key.0);
+            Ok(snapshot)
+        } else {
         let Some(io) = &self.io else {
             return None;
         };
@@ -894,8 +1033,10 @@ impl AdaptivePrefixCache {
                 return None;
             }
         };
+        decode(self.namespaces.get(route), &loaded.manifest, loaded.blobs)
+        };
         let namespace = self.namespaces.get(route);
-        match decode(namespace, &loaded.manifest, loaded.blobs) {
+        match decoded {
             Ok(decoded)
                 if decoded.manifest.expires_at_unix_ms > now
                     && decoded.manifest.route == route
@@ -921,14 +1062,14 @@ impl AdaptivePrefixCache {
                         hot_capacity_bytes = self.memory_cap,
                         route = route.as_str(),
                     );
-                    return Some(PersistentMatch::Restored(decoded.snapshot));
+                    return Some(PersistentMatch::Restored(Rc::new(decoded.snapshot)));
                 }
                 let terminal = self
                     .trie
                     .terminal_mut(node, route)
                     .expect("persistent terminal exists");
                 let summary = decoded.snapshot.storage_summary();
-                terminal.snapshot = Some(decoded.snapshot);
+                terminal.snapshot = Some(Rc::new(decoded.snapshot));
                 terminal.page_refs = summary.pages;
                 terminal.local_bytes = summary.local_bytes;
                 terminal.response_resume = decoded.manifest.response_resume;
@@ -1009,7 +1150,7 @@ impl AdaptivePrefixCache {
     fn evict_memory(
         &mut self,
         retain_for_request: Option<(usize, SnapshotRoute)>,
-    ) -> Option<PromptSnapshot> {
+    ) -> Option<Rc<PromptSnapshot>> {
         let mut retained = None;
         while self.memory_bytes > self.memory_cap {
             let victim = self
@@ -1129,7 +1270,10 @@ impl AdaptivePrefixCache {
             }
         }
     }
-    fn queue_remove(&self, key: EntryKey) {
+    fn queue_remove(&mut self, key: EntryKey) {
+        if self.prefetch.as_ref().is_some_and(|prefetch| prefetch.key == key) {
+            self.clear_prefetch();
+        }
         let Some(io) = &self.io else {
             return;
         };
@@ -1290,6 +1434,28 @@ fn io_loop(
                 let _ = reply.send(store.load(&key));
                 continue;
             }
+            IoCommand::Prefetch { key, namespace, limit, cancelled, reservation, reply } => {
+                if cancelled.load(Ordering::Acquire) { continue; }
+                tracing::debug!(phase = "cache.prefetch.start", entry_id = %key.0);
+                let decoded = store.load_bounded(&key, limit)
+                    .and_then(|entry| entry.map(|entry| {
+                        let manifest = parse_manifest(&namespace, &entry.manifest)?;
+                        if entry_key(&namespace, manifest.route, &manifest.token_ids) != key {
+                            return Err("prefetch entry digest mismatch".into());
+                        }
+                        let dense = manifest.arrays.iter().try_fold(0u64, |n, a| n.checked_add(a.byte_len))
+                            .ok_or("prefetch dense byte overflow")?;
+                        if dense > limit { return Err("prefetch dense byte limit".into()); }
+                        codec::decode_portable(&namespace, &entry.manifest, entry.blobs)
+                    }).transpose());
+                if !cancelled.load(Ordering::Acquire) {
+                    if let Ok(Some(decoded)) = decoded {
+                        tracing::debug!(phase = "cache.prefetch.ready", entry_id = %key.0);
+                        let _ = reply.send((decoded, reservation));
+                    }
+                }
+                continue;
+            }
             IoCommand::RemoveSync { key, reply } => {
                 let _ = reply.send(store.remove(&key));
                 continue;
@@ -1304,8 +1470,9 @@ fn io_loop(
                 retention,
                 expires_at_unix_ms,
                 response_resume,
+                reservation: _reservation,
+                publication_id,
             } => {
-                let completion_tokens = token_ids.clone();
                 let result = encode_portable(
                     &namespace,
                     route,
@@ -1338,9 +1505,10 @@ fn io_loop(
                 });
                 let _ = completion_tx.send(PutCompletion {
                     route,
-                    token_ids: completion_tokens,
+                    token_ids,
                     key,
                     reserved_bytes,
+                    publication_id,
                     result,
                 });
                 continue;

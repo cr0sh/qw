@@ -119,6 +119,10 @@ pub struct DecodedEntry {
     pub manifest: Manifest,
     pub snapshot: PromptSnapshot,
 }
+pub struct PortableDecodedEntry {
+    pub manifest: Manifest,
+    pub snapshot: PortablePromptSnapshot,
+}
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
@@ -270,6 +274,19 @@ pub fn encode_portable(
     })
 }
 pub fn decode(ns: &str, b: &[u8], blobs: Vec<ContentBlob>) -> Result<DecodedEntry, String> {
+    let decoded = decode_portable(ns, b, blobs)?;
+    restore(decoded)
+}
+
+pub fn restore(decoded: PortableDecodedEntry) -> Result<DecodedEntry, String> {
+    let s = PromptSnapshot::from_portable(decoded.snapshot)?;
+    if s.token_len() != decoded.manifest.token_len || !decoded.manifest.route.matches(&s) {
+        return Err("restored snapshot does not match manifest".into());
+    }
+    Ok(DecodedEntry { manifest: decoded.manifest, snapshot: s })
+}
+
+pub fn decode_portable(ns: &str, b: &[u8], blobs: Vec<ContentBlob>) -> Result<PortableDecodedEntry, String> {
     let m: Manifest = serde_json::from_slice(b).map_err(|e| e.to_string())?;
     validate_manifest(ns, &m)?;
     let map: HashMap<_, _> = blobs.into_iter().map(|x| (x.sha256, x.bytes)).collect();
@@ -322,7 +339,10 @@ pub fn decode(ns: &str, b: &[u8], blobs: Vec<ContentBlob>) -> Result<DecodedEntr
                                 token_end: p.token_end,
                                 shape: p.shape.clone(),
                                 dtype: p.dtype,
-                                bytes: Arc::from(get(&p.blob_sha256, p.byte_len)?),
+                                bytes: map.get(&p.blob_sha256)
+                                    .filter(|b| b.len() as u64 == p.byte_len)
+                                    .cloned()
+                                    .ok_or("cache descriptor blob is missing or wrong length")?,
                             })
                         })
                         .collect::<Result<Vec<_>, String>>()?,
@@ -331,13 +351,9 @@ pub fn decode(ns: &str, b: &[u8], blobs: Vec<ContentBlob>) -> Result<DecodedEntr
         })
         .collect::<Result<Vec<_>, String>>()?;
     let p = inflate(&m, dense, paged)?;
-    let s = PromptSnapshot::from_portable(p)?;
-    if s.token_len() != m.token_len || !m.route.matches(&s) {
-        return Err("restored snapshot does not match manifest".into());
-    }
-    Ok(DecodedEntry {
+    Ok(PortableDecodedEntry {
         manifest: m,
-        snapshot: s,
+        snapshot: p,
     })
 }
 pub fn parse_manifest(ns: &str, b: &[u8]) -> Result<Manifest, String> {

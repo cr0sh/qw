@@ -19,6 +19,11 @@ pub struct StoredEntry {
 pub trait PersistentSnapshotStore: Send {
     fn scan(&mut self, namespace: &str, now: u64) -> Result<Vec<ScannedEntry>, String>;
     fn load(&mut self, key: &EntryKey) -> Result<Option<StoredEntry>, String>;
+    /// Advisory reads must enforce the byte limit before allocating payload buffers.
+    /// Stores without a bounded reader opt out rather than allocating speculatively.
+    fn load_bounded(&mut self, _key: &EntryKey, _limit: u64) -> Result<Option<StoredEntry>, String> {
+        Ok(None)
+    }
     fn put(&mut self, e: StoredEntry, expires: u64) -> Result<(), String>;
     fn refresh(&mut self, key: &EntryKey, expires: u64) -> Result<(), String>;
     fn remove(&mut self, key: &EntryKey) -> Result<(), String>;
@@ -139,6 +144,26 @@ impl PersistentSnapshotStore for FilesystemSnapshotStore {
             blobs,
         }))
     }
+    fn load_bounded(&mut self, key: &EntryKey, limit: u64) -> Result<Option<StoredEntry>, String> {
+        let path = self.path(key)?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        let manifest = read_bounded(&path, limit.min(1024 * 1024))?;
+        let ns = key.0.split('/').next().ok_or("invalid entry key")?;
+        let parsed = crate::codec::parse_manifest(ns, &manifest)?;
+        let mut remaining = limit.saturating_sub(manifest.len() as u64);
+        let mut blobs = Vec::new();
+        for digest in parsed.blob_sha256 {
+            if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return Err("invalid blob digest".into());
+            }
+            let bytes = read_bounded(&self.blob(&digest), remaining)?;
+            remaining = remaining.checked_sub(bytes.len() as u64).ok_or("prefetch byte limit")?;
+            blobs.push(ContentBlob { sha256: digest, bytes: bytes.into() });
+        }
+        Ok(Some(StoredEntry { key: key.clone(), manifest, blobs }))
+    }
     fn put(&mut self, e: StoredEntry, _: u64) -> Result<(), String> {
         let p = self.path(&e.key)?;
         fs::create_dir_all(p.parent().unwrap()).map_err(|e| e.to_string())?;
@@ -203,6 +228,23 @@ impl PersistentSnapshotStore for FilesystemSnapshotStore {
             Err(e) => Err(e.to_string()),
         }
     }
+}
+
+fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
+    let size = file.metadata().map_err(|e| e.to_string())?.len();
+    if size > limit {
+        return Err("prefetch byte limit".into());
+    }
+    let size = usize::try_from(size).map_err(|e| e.to_string())?;
+    let mut bytes = vec![0; size];
+    file.read_exact(&mut bytes).map_err(|e| e.to_string())?;
+    let mut extra = [0];
+    if file.read(&mut extra).map_err(|e| e.to_string())? != 0 {
+        return Err("cache file changed during bounded read".into());
+    }
+    Ok(bytes)
 }
 fn write_synced(p: &Path, b: &[u8]) -> Result<(), String> {
     let mut f = OpenOptions::new()
