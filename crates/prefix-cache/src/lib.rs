@@ -140,7 +140,9 @@ pub struct PrefixMatch {
 }
 
 impl PrefixMatch {
-    pub fn snapshot(&self) -> &PromptSnapshot { &self.snapshot }
+    pub fn snapshot(&self) -> &PromptSnapshot {
+        &self.snapshot
+    }
 }
 
 enum PersistentMatch {
@@ -198,32 +200,66 @@ struct PutCompletion {
     token_ids: Vec<i32>,
     key: EntryKey,
     reserved_bytes: u64,
-    result: Result<(Vec<(String, u64)>, u64), String>,
+    result: Result<(Vec<(String, u64)>, u64, u64), String>,
 }
 
 // Staged payload limit is max(4 * hot capacity, 64 MiB): a 2 GiB hot cache
 // permits 8 GiB of additional staging. Shared pages are conservatively charged
 // per operation, even while also resident in the hot tier. Publication reserves
-// 2 * logical bytes + 1 MiB before to_portable; read/decode reserves
-// 3 * (disk bytes + 1 MiB), and a hot lookahead pin reserves logical bytes.
-// The filesystem reader separately caps raw manifests at 1 MiB; Rust metadata
-// and channel bookkeeping are additional bounded overhead, not payload bytes.
+// 2 * logical bytes before to_portable, then grows by the exact encoded manifest
+// size on the worker before allocating its serialized buffer; read/decode reserves
+// 3 * (disk blob bytes + exact manifest bytes), and a hot lookahead pin reserves
+// logical bytes. Pending writes discover manifest size and grow the reservation
+// on the worker before allocating any read buffers. Rust metadata and channel
+// bookkeeping are additional bounded overhead, not payload bytes.
 // Active request-owned snapshots are not cache staging after demand consumes them.
-struct StagingBudget { limit: u64, used: AtomicU64 }
-struct Reservation { budget: Arc<StagingBudget>, bytes: u64 }
+struct StagingBudget {
+    limit: u64,
+    used: AtomicU64,
+}
+struct Reservation {
+    budget: Arc<StagingBudget>,
+    bytes: u64,
+}
 impl StagingBudget {
     fn reserve(self: &Arc<Self>, bytes: u64) -> Option<Reservation> {
-        let previous = self.used.fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-            used.checked_add(bytes).filter(|sum| *sum <= self.limit)
-        }).ok()?;
-        tracing::debug!(phase = "cache.staging.reserve", bytes, staging_bytes = previous + bytes, limit_bytes = self.limit);
-        Some(Reservation { budget: Arc::clone(self), bytes })
+        let previous = self
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes).filter(|sum| *sum <= self.limit)
+            })
+            .ok()?;
+        tracing::debug!(
+            phase = "cache.staging.reserve",
+            bytes,
+            staging_bytes = previous + bytes,
+            limit_bytes = self.limit
+        );
+        Some(Reservation {
+            budget: Arc::clone(self),
+            bytes,
+        })
+    }
+}
+impl Reservation {
+    fn grow(&mut self, bytes: u64) -> bool {
+        let Ok(previous) = self.budget.used.fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            used.checked_add(bytes).filter(|sum| *sum <= self.budget.limit)
+        }) else { return false };
+        self.bytes += bytes;
+        tracing::debug!(phase = "cache.staging.reserve", bytes,
+            staging_bytes = previous + bytes, limit_bytes = self.budget.limit);
+        true
     }
 }
 impl Drop for Reservation {
     fn drop(&mut self) {
         let previous = self.budget.used.fetch_sub(self.bytes, Ordering::AcqRel);
-        tracing::debug!(phase = "cache.staging.release", bytes = self.bytes, staging_bytes = previous - self.bytes);
+        tracing::debug!(
+            phase = "cache.staging.release",
+            bytes = self.bytes,
+            staging_bytes = previous - self.bytes
+        );
     }
 }
 struct Prefetch {
@@ -246,6 +282,7 @@ enum IoCommand {
     Prefetch {
         key: EntryKey,
         namespace: String,
+        manifest_known: bool,
         limit: u64,
         cancelled: Arc<AtomicBool>,
         reservation: Reservation,
@@ -369,6 +406,7 @@ impl AdaptivePrefixCache {
                                     last_access_unix_ms: manifest.retention.last_access_unix_ms,
                                     expires_at_unix_ms: manifest.expires_at_unix_ms,
                                     serialized_bytes: manifest.total_bytes,
+                                    manifest_bytes: scanned_entry.manifest.len() as u64,
                                     snapshot: None,
                                     entry_id: Some(scanned_entry.key.clone()),
                                     persistent_key: Some(scanned_entry.key),
@@ -466,9 +504,10 @@ impl AdaptivePrefixCache {
             }
             let terminal = self.trie.terminal_mut(node, completion.route).unwrap();
             match completion.result {
-                Ok((refs, bytes)) => {
+                Ok((refs, bytes, manifest_bytes)) => {
                     terminal.blob_refs = refs;
                     terminal.serialized_bytes = bytes;
+                    terminal.manifest_bytes = manifest_bytes;
                 }
                 Err(error) => {
                     terminal.persistent_key = None;
@@ -488,10 +527,16 @@ impl AdaptivePrefixCache {
         self.clear_prefetch();
         let now = self.clock.now_unix_ms();
         for (node, _) in self.trie.path(tokens, route).into_iter().rev() {
-            let Some(t) = self.trie.terminal(node, route) else { continue };
-            if t.expires_at_unix_ms <= now { continue; }
+            let Some(t) = self.trie.terminal(node, route) else {
+                continue;
+            };
+            if t.expires_at_unix_ms <= now {
+                continue;
+            }
             let Some(key) = t.persistent_key.clone() else {
-                if t.snapshot.is_some() { return; }
+                if t.snapshot.is_some() {
+                    return;
+                }
                 continue;
             };
             if let Some(snapshot) = &t.snapshot {
@@ -501,10 +546,12 @@ impl AdaptivePrefixCache {
                 };
                 let (_, reply) = mpsc::channel();
                 self.prefetch = Some(Prefetch {
-                    key: key.clone(), cancelled: Arc::new(AtomicBool::new(false)),
+                    key: key.clone(),
+                    cancelled: Arc::new(AtomicBool::new(false)),
                     #[cfg(test)]
                     demand_join: None,
-                    reply, hot: Some((Rc::clone(snapshot), reservation)),
+                    reply,
+                    hot: Some((Rc::clone(snapshot), reservation)),
                 });
                 tracing::debug!(phase = "cache.prefetch.pin", entry_id = %key.0);
                 return;
@@ -512,7 +559,7 @@ impl AdaptivePrefixCache {
             // Disk bytes bound the read. Dense expansion is independently checked
             // by the worker; oversized advisory entries fall back to demand.
             let logical = t.serialized_bytes;
-            let limit = logical.saturating_add(1024 * 1024);
+            let limit = logical.saturating_add(t.manifest_bytes);
             let Some(reservation) = self.staging.reserve(limit.saturating_mul(3)) else {
                 tracing::debug!(phase = "cache.prefetch.skip", entry_id = %key.0, reason = "staging_budget");
                 return;
@@ -520,12 +567,20 @@ impl AdaptivePrefixCache {
             let (reply, receiver) = mpsc::channel();
             let cancelled = Arc::new(AtomicBool::new(false));
             if self.try_io(IoCommand::Prefetch {
-                key: key.clone(), namespace: self.namespaces.get(route).to_string(),
-                limit, cancelled: Arc::clone(&cancelled), reservation, reply,
+                key: key.clone(),
+                namespace: self.namespaces.get(route).to_string(),
+                limit,
+                manifest_known: t.manifest_bytes != 0,
+                cancelled: Arc::clone(&cancelled),
+                reservation,
+                reply,
             }) {
                 tracing::debug!(phase = "cache.prefetch.admit", entry_id = %key.0, read_limit_bytes = limit);
                 self.prefetch = Some(Prefetch {
-                    key, cancelled, reply: receiver, hot: None,
+                    key,
+                    cancelled,
+                    reply: receiver,
+                    hot: None,
                     #[cfg(test)]
                     demand_join: None,
                 });
@@ -603,7 +658,11 @@ impl AdaptivePrefixCache {
         }
         tracing::debug!(
             phase = "cache.lookup",
-            entry_id = self.trie.terminal(node, route).and_then(|terminal| terminal.entry_id.as_ref()).map(|key| key.0.as_str()),
+            entry_id = self
+                .trie
+                .terminal(node, route)
+                .and_then(|terminal| terminal.entry_id.as_ref())
+                .map(|key| key.0.as_str()),
             hit = true,
             route = route.as_str(),
             cached_tokens = token_count
@@ -753,6 +812,7 @@ impl AdaptivePrefixCache {
                     let previous_persistent_key = terminal.persistent_key.take();
                     terminal.blob_refs.clear();
                     terminal.serialized_bytes = 0;
+                    terminal.manifest_bytes = 0;
                     (
                         terminal.snapshot.take(),
                         previous_persistent_key,
@@ -798,7 +858,10 @@ impl AdaptivePrefixCache {
                 .and_then(|terminal| terminal.entry_id.clone())
                 .unwrap_or_else(|| entry_key(namespace, route, prefix));
             let reservation = (self.io.is_some() && self.can_reserve_persistence(bytes))
-                .then(|| self.staging.reserve(bytes.saturating_mul(2).saturating_add(1024 * 1024)))
+                .then(|| {
+                    self.staging
+                        .reserve(bytes.saturating_mul(2))
+                })
                 .flatten();
             let persist = reservation.is_some();
             let (observations, reuse_count, last_access) =
@@ -810,6 +873,7 @@ impl AdaptivePrefixCache {
                     terminal.local_bytes = summary.local_bytes;
                     terminal.expires_at_unix_ms = expiry;
                     terminal.serialized_bytes = 0;
+                    terminal.manifest_bytes = 0;
                     terminal.persistent_key = persist.then(|| key.clone());
                     terminal.response_resume = resume.clone();
                     (
@@ -828,6 +892,7 @@ impl AdaptivePrefixCache {
                             last_access_unix_ms: now,
                             expires_at_unix_ms: expiry,
                             serialized_bytes: 0,
+                            manifest_bytes: 0,
                             page_refs: summary.pages.clone(),
                             local_bytes: summary.local_bytes,
                             blob_refs: Vec::new(),
@@ -861,7 +926,10 @@ impl AdaptivePrefixCache {
                 })
                 .flatten();
             if let Some(portable) = portable {
-                self.publication_id = self.publication_id.checked_add(1).expect("publication ID exhausted");
+                self.publication_id = self
+                    .publication_id
+                    .checked_add(1)
+                    .expect("publication ID exhausted");
                 let queued = self.try_io(IoCommand::Put {
                     key: key.clone(),
                     namespace: self.namespaces.get(route).to_string(),
@@ -885,7 +953,10 @@ impl AdaptivePrefixCache {
                         self.pending_filesystem_bytes.saturating_add(bytes);
                     // An in-flight write has no blob refs yet, but its logical
                     // payload is a conservative bounded-read estimate.
-                    self.trie.terminal_mut(node, route).unwrap().serialized_bytes = bytes;
+                    self.trie
+                        .terminal_mut(node, route)
+                        .unwrap()
+                        .serialized_bytes = bytes;
                 } else if let Some(terminal) = self.trie.terminal_mut(node, route) {
                     terminal.persistent_key = None;
                     terminal.blob_refs.clear();
@@ -964,7 +1035,9 @@ impl AdaptivePrefixCache {
         key: &EntryKey,
         now: u64,
     ) -> Option<PersistentMatch> {
-        let pinned = self.prefetch.as_mut()
+        let pinned = self
+            .prefetch
+            .as_mut()
             .filter(|p| &p.key == key && !p.cancelled.load(Ordering::Acquire))
             .and_then(|p| p.hot.take());
         if let Some((snapshot, _reservation)) = pinned {
@@ -972,68 +1045,78 @@ impl AdaptivePrefixCache {
             tracing::debug!(phase = "cache.prefetch.consume", entry_id = %key.0, source = "hot_pin");
             return Some(PersistentMatch::Restored(snapshot));
         }
-        let prefetched = self.prefetch.as_ref()
+        let prefetched = self
+            .prefetch
+            .as_ref()
             .filter(|p| &p.key == key && !p.cancelled.load(Ordering::Acquire))
             // Demand joins matching work already ordered after prior writes;
             // an advisory failure disconnects the reply and falls back below.
             .and_then(|p| {
                 tracing::debug!(phase = "cache.prefetch.join", entry_id = %key.0);
                 #[cfg(test)]
-                if let Some(join) = &p.demand_join { let _ = join.send(()); }
+                if let Some(join) = &p.demand_join {
+                    let _ = join.send(());
+                }
                 p.reply.recv().ok()
             })
-            .filter(|(decoded, _)| decoded.manifest.expires_at_unix_ms > now
-                && decoded.manifest.route == route
-                && entry_key(self.namespaces.get(route), route, &decoded.manifest.token_ids) == *key)
+            .filter(|(decoded, _)| {
+                decoded.manifest.expires_at_unix_ms > now
+                    && decoded.manifest.route == route
+                    && entry_key(
+                        self.namespaces.get(route),
+                        route,
+                        &decoded.manifest.token_ids,
+                    ) == *key
+            })
             .and_then(|(portable, _reservation)| codec::restore(portable).ok());
         let decoded = if let Some(snapshot) = prefetched {
             self.clear_prefetch();
             tracing::debug!(phase = "cache.prefetch.consume", entry_id = %key.0);
             Ok(snapshot)
         } else {
-        let Some(io) = &self.io else {
-            return None;
-        };
-        let (reply_tx, reply_rx) = mpsc::channel();
-        if io
-            .tx
-            .send(IoCommand::Load {
-                key: key.clone(),
-                reply: reply_tx,
-            })
-            .is_err()
-        {
-            tracing::warn!(phase = "cache.persistence_error", entry_id = %key.0, error = "cache I/O thread stopped before loading entry");
-            return None;
-        }
-        let loaded = match reply_rx.recv() {
-            Ok(Ok(Some(loaded))) => loaded,
-            Ok(Ok(None)) => {
-                if let Some(terminal) = self.trie.terminal_mut(node, route) {
-                    terminal.persistent_key = None;
-                    terminal.blob_refs.clear();
-                    terminal.serialized_bytes = 0;
+            let Some(io) = &self.io else {
+                return None;
+            };
+            let (reply_tx, reply_rx) = mpsc::channel();
+            if io
+                .tx
+                .send(IoCommand::Load {
+                    key: key.clone(),
+                    reply: reply_tx,
+                })
+                .is_err()
+            {
+                tracing::warn!(phase = "cache.persistence_error", entry_id = %key.0, error = "cache I/O thread stopped before loading entry");
+                return None;
+            }
+            let loaded = match reply_rx.recv() {
+                Ok(Ok(Some(loaded))) => loaded,
+                Ok(Ok(None)) => {
+                    if let Some(terminal) = self.trie.terminal_mut(node, route) {
+                        terminal.persistent_key = None;
+                        terminal.blob_refs.clear();
+                        terminal.serialized_bytes = 0;
+                    }
+                    self.rebuild_accounting();
+                    return None;
                 }
-                self.rebuild_accounting();
-                return None;
-            }
-            Ok(Err(error)) => {
-                tracing::warn!(phase = "cache.persistence_error", entry_id = %key.0, error = %error);
-                if let Some(terminal) = self.trie.terminal_mut(node, route) {
-                    terminal.persistent_key = None;
-                    terminal.blob_refs.clear();
-                    terminal.serialized_bytes = 0;
+                Ok(Err(error)) => {
+                    tracing::warn!(phase = "cache.persistence_error", entry_id = %key.0, error = %error);
+                    if let Some(terminal) = self.trie.terminal_mut(node, route) {
+                        terminal.persistent_key = None;
+                        terminal.blob_refs.clear();
+                        terminal.serialized_bytes = 0;
+                    }
+                    self.rebuild_accounting();
+                    self.remove_persistent_sync(key);
+                    return None;
                 }
-                self.rebuild_accounting();
-                self.remove_persistent_sync(key);
-                return None;
-            }
-            Err(_) => {
-                tracing::warn!(phase = "cache.persistence_error", entry_id = %key.0, error = "cache I/O thread stopped before reporting entry load");
-                return None;
-            }
-        };
-        decode(self.namespaces.get(route), &loaded.manifest, loaded.blobs)
+                Err(_) => {
+                    tracing::warn!(phase = "cache.persistence_error", entry_id = %key.0, error = "cache I/O thread stopped before reporting entry load");
+                    return None;
+                }
+            };
+            decode(self.namespaces.get(route), &loaded.manifest, loaded.blobs)
         };
         let namespace = self.namespaces.get(route);
         match decoded {
@@ -1181,7 +1264,11 @@ impl AdaptivePrefixCache {
             let reclaimed_bytes = before.saturating_sub(self.memory_bytes);
             tracing::debug!(
                 phase = "cache.evict",
-                entry_id = self.trie.terminal(node, route).and_then(|terminal| terminal.entry_id.as_ref()).map(|key| key.0.as_str()),
+                entry_id = self
+                    .trie
+                    .terminal(node, route)
+                    .and_then(|terminal| terminal.entry_id.as_ref())
+                    .map(|key| key.0.as_str()),
                 tier = "memory",
                 route = route.as_str(),
                 reclaimed_bytes,
@@ -1271,7 +1358,11 @@ impl AdaptivePrefixCache {
         }
     }
     fn queue_remove(&mut self, key: EntryKey) {
-        if self.prefetch.as_ref().is_some_and(|prefetch| prefetch.key == key) {
+        if self
+            .prefetch
+            .as_ref()
+            .is_some_and(|prefetch| prefetch.key == key)
+        {
             self.clear_prefetch();
         }
         let Some(io) = &self.io else {
@@ -1434,20 +1525,48 @@ fn io_loop(
                 let _ = reply.send(store.load(&key));
                 continue;
             }
-            IoCommand::Prefetch { key, namespace, limit, cancelled, reservation, reply } => {
-                if cancelled.load(Ordering::Acquire) { continue; }
+            IoCommand::Prefetch {
+                key,
+                namespace,
+                mut limit,
+                manifest_known,
+                cancelled,
+                mut reservation,
+                reply,
+            } => {
+                if cancelled.load(Ordering::Acquire) {
+                    continue;
+                }
+                if !manifest_known {
+                    let Ok(Some(manifest_bytes)) = store.manifest_bytes(&key) else { continue };
+                    let Some(extra) = manifest_bytes.checked_mul(3) else { continue };
+                    let Some(total) = limit.checked_add(manifest_bytes) else { continue };
+                    if !reservation.grow(extra) {
+                        tracing::debug!(phase = "cache.prefetch.skip", entry_id = %key.0, reason = "manifest_staging_budget");
+                        continue;
+                    }
+                    limit = total;
+                }
                 tracing::debug!(phase = "cache.prefetch.start", entry_id = %key.0);
-                let decoded = store.load_bounded(&key, limit)
-                    .and_then(|entry| entry.map(|entry| {
-                        let manifest = parse_manifest(&namespace, &entry.manifest)?;
-                        if entry_key(&namespace, manifest.route, &manifest.token_ids) != key {
-                            return Err("prefetch entry digest mismatch".into());
-                        }
-                        let dense = manifest.arrays.iter().try_fold(0u64, |n, a| n.checked_add(a.byte_len))
-                            .ok_or("prefetch dense byte overflow")?;
-                        if dense > limit { return Err("prefetch dense byte limit".into()); }
-                        codec::decode_portable(&namespace, &entry.manifest, entry.blobs)
-                    }).transpose());
+                let decoded = store.load_bounded(&key, limit).and_then(|entry| {
+                    entry
+                        .map(|entry| {
+                            let manifest = parse_manifest(&namespace, &entry.manifest)?;
+                            if entry_key(&namespace, manifest.route, &manifest.token_ids) != key {
+                                return Err("prefetch entry digest mismatch".into());
+                            }
+                            let dense = manifest
+                                .arrays
+                                .iter()
+                                .try_fold(0u64, |n, a| n.checked_add(a.byte_len))
+                                .ok_or("prefetch dense byte overflow")?;
+                            if dense > limit {
+                                return Err("prefetch dense byte limit".into());
+                            }
+                            codec::decode_portable(&namespace, &entry.manifest, entry.blobs)
+                        })
+                        .transpose()
+                });
                 if !cancelled.load(Ordering::Acquire) {
                     if let Ok(Some(decoded)) = decoded {
                         tracing::debug!(phase = "cache.prefetch.ready", entry_id = %key.0);
@@ -1470,18 +1589,19 @@ fn io_loop(
                 retention,
                 expires_at_unix_ms,
                 response_resume,
-                reservation: _reservation,
+                mut reservation,
                 publication_id,
             } => {
-                let result = encode_portable(
-                    &namespace,
-                    route,
-                    &token_ids,
-                    portable,
-                    retention,
-                    expires_at_unix_ms,
-                    response_resume,
-                )
+                let result = encode_portable(&namespace,
+                route,
+                &token_ids,
+                portable,
+                retention,
+                expires_at_unix_ms,
+                response_resume, |bytes| {
+                    reservation.grow(bytes).then_some(())
+                        .ok_or_else(|| "publication manifest staging budget".to_string())
+                })
                 .and_then(|encoded| {
                     let refs = encoded
                         .blobs
@@ -1493,6 +1613,7 @@ fn io_loop(
                         .iter()
                         .map(|blob| blob.bytes.len() as u64)
                         .sum();
+                    let manifest_bytes = encoded.manifest.len() as u64;
                     store.put(
                         StoredEntry {
                             key: encoded.key,
@@ -1501,7 +1622,7 @@ fn io_loop(
                         },
                         expires_at_unix_ms,
                     )?;
-                    Ok((refs, bytes))
+                    Ok((refs, bytes, manifest_bytes))
                 });
                 let _ = completion_tx.send(PutCompletion {
                     route,

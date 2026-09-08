@@ -21,7 +21,16 @@ pub trait PersistentSnapshotStore: Send {
     fn load(&mut self, key: &EntryKey) -> Result<Option<StoredEntry>, String>;
     /// Advisory reads must enforce the byte limit before allocating payload buffers.
     /// Stores without a bounded reader opt out rather than allocating speculatively.
-    fn load_bounded(&mut self, _key: &EntryKey, _limit: u64) -> Result<Option<StoredEntry>, String> {
+    fn load_bounded(
+        &mut self,
+        _key: &EntryKey,
+        _limit: u64,
+    ) -> Result<Option<StoredEntry>, String> {
+        Ok(None)
+    }
+    /// Allocation-free manifest sizing for advisory reads queued behind a Put.
+    /// Unknown sizes opt out until publication completion supplies the size.
+    fn manifest_bytes(&mut self, _key: &EntryKey) -> Result<Option<u64>, String> {
         Ok(None)
     }
     fn put(&mut self, e: StoredEntry, expires: u64) -> Result<(), String>;
@@ -144,12 +153,19 @@ impl PersistentSnapshotStore for FilesystemSnapshotStore {
             blobs,
         }))
     }
+    fn manifest_bytes(&mut self, key: &EntryKey) -> Result<Option<u64>, String> {
+        match fs::metadata(self.path(key)?) {
+            Ok(metadata) => Ok(Some(metadata.len())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.to_string()),
+        }
+    }
     fn load_bounded(&mut self, key: &EntryKey, limit: u64) -> Result<Option<StoredEntry>, String> {
         let path = self.path(key)?;
         if !path.exists() {
             return Ok(None);
         }
-        let manifest = read_bounded(&path, limit.min(1024 * 1024))?;
+        let manifest = read_bounded(&path, limit)?;
         let ns = key.0.split('/').next().ok_or("invalid entry key")?;
         let parsed = crate::codec::parse_manifest(ns, &manifest)?;
         let mut remaining = limit.saturating_sub(manifest.len() as u64);
@@ -159,10 +175,19 @@ impl PersistentSnapshotStore for FilesystemSnapshotStore {
                 return Err("invalid blob digest".into());
             }
             let bytes = read_bounded(&self.blob(&digest), remaining)?;
-            remaining = remaining.checked_sub(bytes.len() as u64).ok_or("prefetch byte limit")?;
-            blobs.push(ContentBlob { sha256: digest, bytes: bytes.into() });
+            remaining = remaining
+                .checked_sub(bytes.len() as u64)
+                .ok_or("prefetch byte limit")?;
+            blobs.push(ContentBlob {
+                sha256: digest,
+                bytes: bytes.into(),
+            });
         }
-        Ok(Some(StoredEntry { key: key.clone(), manifest, blobs }))
+        Ok(Some(StoredEntry {
+            key: key.clone(),
+            manifest,
+            blobs,
+        }))
     }
     fn put(&mut self, e: StoredEntry, _: u64) -> Result<(), String> {
         let p = self.path(&e.key)?;

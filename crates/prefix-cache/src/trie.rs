@@ -9,6 +9,7 @@ pub(crate) struct Terminal {
     pub last_access_unix_ms: u64,
     pub expires_at_unix_ms: u64,
     pub serialized_bytes: u64,
+    pub manifest_bytes: u64,
     pub snapshot: Option<std::rc::Rc<PromptSnapshot>>,
     // Materialized identity survives hot/persistent eviction; structural-only nodes have none.
     pub entry_id: Option<EntryKey>,
@@ -27,6 +28,7 @@ impl Terminal {
             last_access_unix_ms: now,
             expires_at_unix_ms: expires_at,
             serialized_bytes: 0,
+            manifest_bytes: 0,
             snapshot: None,
             entry_id: None,
             persistent_key: None,

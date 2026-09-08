@@ -154,6 +154,7 @@ pub fn encode_portable(
     ret: RetentionMetadata,
     exp: u64,
     res: Option<ResponseResumeMetadata>,
+    reserve_manifest: impl FnOnce(u64) -> Result<(), String>,
 ) -> Result<EncodedEntry, String> {
     let len = match &p {
         PortablePromptSnapshot::Baseline(m) => m.token_len,
@@ -267,9 +268,26 @@ pub fn encode_portable(
         total_bytes: total,
     };
     validate_manifest(ns, &m)?;
+    // Count without allocating the serialized buffer, then reserve its exact
+    // bytes before allocation. Both passes stay on the publication worker.
+    struct ByteCount(u64);
+    impl std::io::Write for ByteCount {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.checked_add(bytes.len() as u64)
+                .ok_or_else(|| std::io::Error::other("manifest byte count overflow"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    let mut count = ByteCount(0);
+    serde_json::to_writer(&mut count, &m).map_err(|e| e.to_string())?;
+    reserve_manifest(count.0)?;
+    let size = usize::try_from(count.0).map_err(|e| e.to_string())?;
+    let mut manifest = Vec::with_capacity(size);
+    serde_json::to_writer(&mut manifest, &m).map_err(|e| e.to_string())?;
     Ok(EncodedEntry {
         key: entry_key(ns, r, t),
-        manifest: serde_json::to_vec(&m).map_err(|e| e.to_string())?,
+        manifest,
         blobs,
     })
 }
@@ -283,10 +301,17 @@ pub fn restore(decoded: PortableDecodedEntry) -> Result<DecodedEntry, String> {
     if s.token_len() != decoded.manifest.token_len || !decoded.manifest.route.matches(&s) {
         return Err("restored snapshot does not match manifest".into());
     }
-    Ok(DecodedEntry { manifest: decoded.manifest, snapshot: s })
+    Ok(DecodedEntry {
+        manifest: decoded.manifest,
+        snapshot: s,
+    })
 }
 
-pub fn decode_portable(ns: &str, b: &[u8], blobs: Vec<ContentBlob>) -> Result<PortableDecodedEntry, String> {
+pub fn decode_portable(
+    ns: &str,
+    b: &[u8],
+    blobs: Vec<ContentBlob>,
+) -> Result<PortableDecodedEntry, String> {
     let m: Manifest = serde_json::from_slice(b).map_err(|e| e.to_string())?;
     validate_manifest(ns, &m)?;
     let map: HashMap<_, _> = blobs.into_iter().map(|x| (x.sha256, x.bytes)).collect();
@@ -339,7 +364,8 @@ pub fn decode_portable(ns: &str, b: &[u8], blobs: Vec<ContentBlob>) -> Result<Po
                                 token_end: p.token_end,
                                 shape: p.shape.clone(),
                                 dtype: p.dtype,
-                                bytes: map.get(&p.blob_sha256)
+                                bytes: map
+                                    .get(&p.blob_sha256)
                                     .filter(|b| b.len() as u64 == p.byte_len)
                                     .cloned()
                                     .ok_or("cache descriptor blob is missing or wrong length")?,

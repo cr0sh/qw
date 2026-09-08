@@ -22,7 +22,8 @@ impl tracing::field::Visit for RecordedFields {
     }
 
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-        self.0.insert(field.name().to_string(), format!("{value:?}"));
+        self.0
+            .insert(field.name().to_string(), format!("{value:?}"));
     }
 }
 
@@ -205,22 +206,38 @@ impl PersistentSnapshotStore for RecordingStore {
     fn load(&mut self, key: &EntryKey) -> Result<Option<StoredEntry>, String> {
         let mut state = self.0.lock().expect("recording store lock");
         state.demand_loads += 1;
-        if state.fail_load { return Err("injected load failure".into()); }
+        if state.fail_load {
+            return Err("injected load failure".into());
+        }
         Ok(state.entries.get(key).map(|(manifest, blobs)| StoredEntry {
             key: key.clone(),
             manifest: manifest.clone(),
             blobs: blobs.clone(),
         }))
     }
+    fn manifest_bytes(&mut self, key: &EntryKey) -> Result<Option<u64>, String> {
+        Ok(self.0.lock().expect("store").entries.get(key)
+            .map(|(manifest, _)| manifest.len() as u64))
+    }
 
     fn load_bounded(&mut self, key: &EntryKey, limit: u64) -> Result<Option<StoredEntry>, String> {
         let mut state = self.0.lock().unwrap();
         state.prefetch_loads += 1;
-        if state.fail_load { return Err("injected load failure".into()); }
-        let Some((manifest, blobs)) = state.entries.get(key) else { return Ok(None) };
+        if state.fail_load {
+            return Err("injected load failure".into());
+        }
+        let Some((manifest, blobs)) = state.entries.get(key) else {
+            return Ok(None);
+        };
         let bytes = manifest.len() as u64 + blobs.iter().map(|b| b.bytes.len() as u64).sum::<u64>();
-        if bytes > limit { return Err("prefetch byte limit".into()); }
-        let entry = StoredEntry { key: key.clone(), manifest: manifest.clone(), blobs: blobs.clone() };
+        if bytes > limit {
+            return Err("prefetch byte limit".into());
+        }
+        let entry = StoredEntry {
+            key: key.clone(),
+            manifest: manifest.clone(),
+            blobs: blobs.clone(),
+        };
         let gate = state.read_gate.clone();
         drop(state);
         if let Some(gate) = gate {
@@ -228,7 +245,9 @@ impl PersistentSnapshotStore for RecordingStore {
             let mut state = lock.lock().expect("read gate");
             state.entered = true;
             wake.notify_all();
-            while !state.released { state = wake.wait(state).expect("read gate"); }
+            while !state.released {
+                state = wake.wait(state).expect("read gate");
+            }
         }
         Ok(Some(entry))
     }
@@ -637,12 +656,25 @@ fn fresh_boundary_displaces_a_popular_old_prefix_in_memory() {
     .expect("cache");
     cache.insert(&[1], vec![old], SnapshotRoute::Baseline);
     for _ in 0..8 {
-        assert_eq!(cache.lookup(&[1], SnapshotRoute::Baseline).unwrap().token_count, 1);
+        assert_eq!(
+            cache
+                .lookup(&[1], SnapshotRoute::Baseline)
+                .unwrap()
+                .token_count,
+            1
+        );
     }
     clock.set(2_000);
-    cache.insert(&[1, 2], vec![snapshot(2, &[3.0, 4.0])], SnapshotRoute::Baseline);
+    cache.insert(
+        &[1, 2],
+        vec![snapshot(2, &[3.0, 4.0])],
+        SnapshotRoute::Baseline,
+    );
     assert_eq!(
-        cache.lookup(&[1, 2, 3], SnapshotRoute::Baseline).unwrap().token_count,
+        cache
+            .lookup(&[1, 2, 3], SnapshotRoute::Baseline)
+            .unwrap()
+            .token_count,
         2,
         "a fresh boundary must survive until its first use despite the old prefix's popularity"
     );
@@ -662,24 +694,55 @@ fn longest_hit_does_not_refresh_unused_ancestors_and_upserts_are_recent() {
     .expect("cache");
     cache.insert(&[1], vec![old], SnapshotRoute::Baseline);
     for _ in 0..8 {
-        drop(cache.lookup(&[1], SnapshotRoute::Baseline).expect("old hit"));
+        drop(
+            cache
+                .lookup(&[1], SnapshotRoute::Baseline)
+                .expect("old hit"),
+        );
     }
     clock.set(2_000);
-    cache.insert(&[1, 2], vec![snapshot(2, &[3.0, 4.0])], SnapshotRoute::Baseline);
+    cache.insert(
+        &[1, 2],
+        vec![snapshot(2, &[3.0, 4.0])],
+        SnapshotRoute::Baseline,
+    );
     clock.set(3_000);
-    assert_eq!(cache.lookup(&[1, 2], SnapshotRoute::Baseline).unwrap().token_count, 2);
+    assert_eq!(
+        cache
+            .lookup(&[1, 2], SnapshotRoute::Baseline)
+            .unwrap()
+            .token_count,
+        2
+    );
     clock.set(4_000);
-    cache.insert(&[9], vec![snapshot(1, &[5.0, 6.0])], SnapshotRoute::Baseline);
+    cache.insert(
+        &[9],
+        vec![snapshot(1, &[5.0, 6.0])],
+        SnapshotRoute::Baseline,
+    );
     assert!(cache.lookup(&[1], SnapshotRoute::Baseline).is_none());
 
     // Materializing an existing terminal is activity even without another hit.
     clock.set(5_000);
-    cache.insert(&[1, 2], vec![snapshot(2, &[7.0, 8.0])], SnapshotRoute::Baseline);
+    cache.insert(
+        &[1, 2],
+        vec![snapshot(2, &[7.0, 8.0])],
+        SnapshotRoute::Baseline,
+    );
     clock.set(6_000);
-    cache.insert(&[8], vec![snapshot(1, &[9.0, 10.0])], SnapshotRoute::Baseline);
+    cache.insert(
+        &[8],
+        vec![snapshot(1, &[9.0, 10.0])],
+        SnapshotRoute::Baseline,
+    );
     assert!(cache.lookup(&[9], SnapshotRoute::Baseline).is_none());
-    let hit = cache.lookup(&[1, 2], SnapshotRoute::Baseline).expect("rematerialized boundary");
-    assert_eq!(hit.snapshot().to_portable().unwrap(), snapshot(2, &[7.0, 8.0]).to_portable().unwrap());
+    let hit = cache
+        .lookup(&[1, 2], SnapshotRoute::Baseline)
+        .expect("rematerialized boundary");
+    assert_eq!(
+        hit.snapshot().to_portable().unwrap(),
+        snapshot(2, &[7.0, 8.0]).to_portable().unwrap()
+    );
 }
 
 #[test]
@@ -698,20 +761,39 @@ fn filesystem_pressure_keeps_the_recent_boundary_and_reports_the_old_victim() {
         Box::new(clock.clone()),
     )
     .expect("cache");
-    cache.insert(&[1], vec![snapshot(1, &[1.0, 2.0])], SnapshotRoute::Baseline);
+    cache.insert(
+        &[1],
+        vec![snapshot(1, &[1.0, 2.0])],
+        SnapshotRoute::Baseline,
+    );
     cache.flush_persistence();
     cache.filesystem_cap = Some(cache.filesystem_bytes * 2);
     for _ in 0..8 {
-        drop(cache.lookup(&[1], SnapshotRoute::Baseline).expect("old disk hit"));
+        drop(
+            cache
+                .lookup(&[1], SnapshotRoute::Baseline)
+                .expect("old disk hit"),
+        );
     }
     clock.set(2_000);
-    cache.insert(&[1, 2], vec![snapshot(2, &[3.0, 4.0])], SnapshotRoute::Baseline);
+    cache.insert(
+        &[1, 2],
+        vec![snapshot(2, &[3.0, 4.0])],
+        SnapshotRoute::Baseline,
+    );
     cache.flush_persistence();
     clock.set(3_000);
-    cache.insert(&[9], vec![snapshot(1, &[5.0, 6.0])], SnapshotRoute::Baseline);
+    cache.insert(
+        &[9],
+        vec![snapshot(1, &[5.0, 6.0])],
+        SnapshotRoute::Baseline,
+    );
     cache.flush_persistence();
     assert_eq!(
-        cache.lookup(&[1, 2, 3], SnapshotRoute::Baseline).expect("fresh disk boundary").token_count,
+        cache
+            .lookup(&[1, 2, 3], SnapshotRoute::Baseline)
+            .expect("fresh disk boundary")
+            .token_count,
         2
     );
     assert!(cache.lookup(&[1], SnapshotRoute::Baseline).is_none());
@@ -719,12 +801,16 @@ fn filesystem_pressure_keeps_the_recent_boundary_and_reports_the_old_victim() {
     let boundary_id = entry_key(NAMESPACE, SnapshotRoute::Baseline, &[1, 2]).0;
     let events = events.lock().expect("events lock");
     assert!(events.iter().any(|event| {
-        event.get("phase").is_some_and(|value| value == "cache.evict")
+        event
+            .get("phase")
+            .is_some_and(|value| value == "cache.evict")
             && event.get("tier").is_some_and(|value| value == "filesystem")
             && event.get("entry_id") == Some(&old_id)
     }));
     assert!(events.iter().any(|event| {
-        event.get("phase").is_some_and(|value| value == "cache.restore")
+        event
+            .get("phase")
+            .is_some_and(|value| value == "cache.restore")
             && event.get("entry_id") == Some(&boundary_id)
     }));
 }
@@ -744,18 +830,37 @@ fn disk_hit_becomes_recent_before_hot_promotion_pressure() {
     .expect("cache");
     cache.insert(&[1], vec![old], SnapshotRoute::Baseline);
     clock.set(2_000);
-    cache.insert(&[2], vec![snapshot(1, &[3.0, 4.0])], SnapshotRoute::Baseline);
+    cache.insert(
+        &[2],
+        vec![snapshot(1, &[3.0, 4.0])],
+        SnapshotRoute::Baseline,
+    );
     cache.flush_persistence();
     for _ in 0..8 {
-        drop(cache.lookup(&[2], SnapshotRoute::Baseline).expect("popular hot hit"));
+        drop(
+            cache
+                .lookup(&[2], SnapshotRoute::Baseline)
+                .expect("popular hot hit"),
+        );
     }
     clock.set(3_000);
-    let hit = cache.lookup(&[1], SnapshotRoute::Baseline).expect("restored hit");
+    let hit = cache
+        .lookup(&[1], SnapshotRoute::Baseline)
+        .expect("restored hit");
     assert_eq!(hit.snapshot().to_portable().unwrap(), expected);
     drop(hit);
-    state.lock().expect("store lock").entries.remove(&entry_key(NAMESPACE, SnapshotRoute::Baseline, &[1]));
+    state.lock().expect("store lock").entries.remove(&entry_key(
+        NAMESPACE,
+        SnapshotRoute::Baseline,
+        &[1],
+    ));
     assert_eq!(
-        cache.lookup(&[1], SnapshotRoute::Baseline).expect("restored state stays hot without its disk copy").snapshot().to_portable().unwrap(),
+        cache
+            .lookup(&[1], SnapshotRoute::Baseline)
+            .expect("restored state stays hot without its disk copy")
+            .snapshot()
+            .to_portable()
+            .unwrap(),
         expected
     );
 }
@@ -778,24 +883,43 @@ fn memory_only_entry_identity_survives_eviction_and_expiry() {
     .expect("cache");
     assert!(cache.lookup(&[42], SnapshotRoute::Baseline).is_none());
     cache.insert(&[1], vec![old], SnapshotRoute::Baseline);
-    drop(cache.lookup(&[1], SnapshotRoute::Baseline).expect("memory hit"));
+    drop(
+        cache
+            .lookup(&[1], SnapshotRoute::Baseline)
+            .expect("memory hit"),
+    );
     clock.set(2_000);
-    cache.insert(&[9], vec![snapshot(1, &[3.0, 4.0])], SnapshotRoute::Baseline);
+    cache.insert(
+        &[9],
+        vec![snapshot(1, &[3.0, 4.0])],
+        SnapshotRoute::Baseline,
+    );
     clock.set(MAX_TTL_MS + 3_000);
     assert!(cache.lookup(&[9], SnapshotRoute::Baseline).is_none());
     let id = entry_key(NAMESPACE, SnapshotRoute::Baseline, &[1]).0;
     let events = events.lock().expect("events lock");
-    for phase in ["cache.insert", "cache.lookup", "cache.evict", "cache.expire"] {
-        assert!(events.iter().any(|event| {
-            event.get("phase").is_some_and(|value| value == phase)
-                && event.get("entry_id") == Some(&id)
-        }), "missing {phase} for memory-only identity");
+    for phase in [
+        "cache.insert",
+        "cache.lookup",
+        "cache.evict",
+        "cache.expire",
+    ] {
+        assert!(
+            events.iter().any(|event| {
+                event.get("phase").is_some_and(|value| value == phase)
+                    && event.get("entry_id") == Some(&id)
+            }),
+            "missing {phase} for memory-only identity"
+        );
     }
     for event in events.iter().filter(|event| {
         event.contains_key("capacity_bytes")
             || event.get("hit").is_some_and(|value| value == "false")
     }) {
-        assert!(!event.contains_key("entry_id"), "setup and misses have no single entry identity");
+        assert!(
+            !event.contains_key("entry_id"),
+            "setup and misses have no single entry identity"
+        );
     }
 }
 
@@ -985,19 +1109,17 @@ fn dflash_portable(token_len: usize, hidden_offset: usize) -> PortablePromptSnap
 
 #[cfg(feature = "dflash2")]
 fn encode_dflash(portable: PortablePromptSnapshot) -> Result<codec::EncodedEntry, String> {
-    codec::encode_portable(
-        DFLASH_NAMESPACE,
-        SnapshotRoute::Dflash2,
-        &[1, 2, 3],
-        portable,
-        RetentionMetadata {
-            observations: 1,
-            reuse_count: 0,
-            last_access_unix_ms: 0,
-        },
-        INITIAL_TTL_MS,
-        None,
-    )
+    codec::encode_portable(DFLASH_NAMESPACE,
+    SnapshotRoute::Dflash2,
+    &[1, 2, 3],
+    portable,
+    RetentionMetadata {
+        observations: 1,
+        reuse_count: 0,
+        last_access_unix_ms: 0,
+    },
+    INITIAL_TTL_MS,
+    None, |_| Ok(()))
 }
 
 #[cfg(feature = "dflash2")]
@@ -1346,21 +1468,19 @@ fn dflash2_hidden_and_logits_count_toward_eviction_and_expiry() {
 
 #[test]
 fn strict_manifest_rejects_unknown_fields_and_namespace_mismatch() {
-    let encoded = codec::encode_portable(
-        NAMESPACE,
-        SnapshotRoute::Baseline,
-        &[1],
-        snapshot(1, &[1.0])
-            .to_portable()
-            .expect("portable snapshot"),
-        RetentionMetadata {
-            observations: 1,
-            reuse_count: 0,
-            last_access_unix_ms: 0,
-        },
-        INITIAL_TTL_MS,
-        None,
-    )
+    let encoded = codec::encode_portable(NAMESPACE,
+    SnapshotRoute::Baseline,
+    &[1],
+    snapshot(1, &[1.0])
+        .to_portable()
+        .expect("portable snapshot"),
+    RetentionMetadata {
+        observations: 1,
+        reuse_count: 0,
+        last_access_unix_ms: 0,
+    },
+    INITIAL_TTL_MS,
+    None, |_| Ok(()))
     .expect("encode");
     let mut value: serde_json::Value =
         serde_json::from_slice(&encoded.manifest).expect("manifest JSON");
@@ -1453,19 +1573,17 @@ fn mtp_manifest_round_trip_preserves_route_and_offset_validation() {
         last_hidden: array(vec![0; 8]),
         continuation_logits: array(vec![1; 8]),
     };
-    let encoded = codec::encode_portable(
-        MTP_NAMESPACE,
-        SnapshotRoute::Mtp,
-        &[7],
-        portable,
-        RetentionMetadata {
-            observations: 1,
-            reuse_count: 0,
-            last_access_unix_ms: 0,
-        },
-        INITIAL_TTL_MS,
-        None,
-    )
+    let encoded = codec::encode_portable(MTP_NAMESPACE,
+    SnapshotRoute::Mtp,
+    &[7],
+    portable,
+    RetentionMetadata {
+        observations: 1,
+        reuse_count: 0,
+        last_access_unix_ms: 0,
+    },
+    INITIAL_TTL_MS,
+    None, |_| Ok(()))
     .expect("encode MTP");
     let manifest: serde_json::Value =
         serde_json::from_slice(&encoded.manifest).expect("manifest JSON");
@@ -1555,19 +1673,17 @@ fn filesystem_namespace_isolation_and_partial_recovery_are_misses() {
 fn failed_blob_barrier_defers_publication_and_orphan_retry_until_durable() {
     let encode = |token, value| {
         let portable = snapshot(1, &[value]).to_portable().unwrap();
-        let encoded = codec::encode_portable(
-            NAMESPACE,
-            SnapshotRoute::Baseline,
-            &[token],
-            portable.clone(),
-            RetentionMetadata {
-                observations: 1,
-                reuse_count: 0,
-                last_access_unix_ms: 0,
-            },
-            INITIAL_TTL_MS,
-            None,
-        )
+        let encoded = codec::encode_portable(NAMESPACE,
+        SnapshotRoute::Baseline,
+        &[token],
+        portable.clone(),
+        RetentionMetadata {
+            observations: 1,
+            reuse_count: 0,
+            last_access_unix_ms: 0,
+        },
+        INITIAL_TTL_MS,
+        None, |_| Ok(()))
         .unwrap();
         (
             StoredEntry {
@@ -1928,10 +2044,17 @@ fn lookahead_fixture() -> (AdaptivePrefixCache, Arc<Mutex<RecordingState>>, Manu
     let state = Arc::new(Mutex::new(RecordingState::default()));
     let clock = ManualClock::new(1_000);
     let mut cache = AdaptivePrefixCache::with_store_and_clock(
-        namespaces(), memory_config(0), Box::new(RecordingStore(Arc::clone(&state))),
+        namespaces(),
+        memory_config(1),
+        Box::new(RecordingStore(Arc::clone(&state))),
         Box::new(clock.clone()),
-    ).unwrap();
-    cache.insert(&[1, 2], vec![snapshot(2, &[1., 2.])], SnapshotRoute::Baseline);
+    )
+    .unwrap();
+    cache.insert(
+        &[1, 2],
+        vec![snapshot(2, &[1., 2.])],
+        SnapshotRoute::Baseline,
+    );
     cache.flush_persistence();
     (cache, state, clock)
 }
@@ -1939,11 +2062,27 @@ fn lookahead_fixture() -> (AdaptivePrefixCache, Arc<Mutex<RecordingState>>, Manu
 #[test]
 fn prefetch_ready_is_read_only_and_unrelated_lookup_preserves_it() {
     let (mut cache, state, _) = lookahead_fixture();
-    let node = cache.trie.path(&[1, 2], SnapshotRoute::Baseline).last().unwrap().0;
-    let before = cache.trie.terminal(node, SnapshotRoute::Baseline).unwrap().reuse_count;
+    let node = cache
+        .trie
+        .path(&[1, 2], SnapshotRoute::Baseline)
+        .last()
+        .unwrap()
+        .0;
+    let before = cache
+        .trie
+        .terminal(node, SnapshotRoute::Baseline)
+        .unwrap()
+        .reuse_count;
     cache.prefetch(&[1, 2, 3], SnapshotRoute::Baseline);
     cache.flush_persistence();
-    assert_eq!(cache.trie.terminal(node, SnapshotRoute::Baseline).unwrap().reuse_count, before);
+    assert_eq!(
+        cache
+            .trie
+            .terminal(node, SnapshotRoute::Baseline)
+            .unwrap()
+            .reuse_count,
+        before
+    );
     assert!(cache.lookup(&[9], SnapshotRoute::Baseline).is_none());
     let hit = cache.lookup(&[1, 2, 3], SnapshotRoute::Baseline).unwrap();
     assert_eq!(hit.token_count, 2);
@@ -1956,17 +2095,33 @@ fn prefetch_ready_is_read_only_and_unrelated_lookup_preserves_it() {
 fn prefetch_and_demand_restore_identical_payloads() {
     let (mut cache, state, _) = lookahead_fixture();
     let demand = cache.lookup(&[1, 2, 3], SnapshotRoute::Baseline).unwrap();
-    let expected = codec::encode_portable(NAMESPACE, SnapshotRoute::Baseline, &[1, 2],
-        demand.snapshot().to_portable().unwrap(),
-        codec::RetentionMetadata { observations: 1, reuse_count: 0, last_access_unix_ms: 1 },
-        10_000, None).unwrap();
+    let expected = codec::encode_portable(NAMESPACE,
+    SnapshotRoute::Baseline,
+    &[1, 2],
+    demand.snapshot().to_portable().unwrap(),
+    codec::RetentionMetadata {
+        observations: 1,
+        reuse_count: 0,
+        last_access_unix_ms: 1,
+    },
+    10_000,
+    None, |_| Ok(()))
+    .unwrap();
     cache.prefetch(&[1, 2, 3], SnapshotRoute::Baseline);
     cache.flush_persistence();
     let hit = cache.lookup(&[1, 2, 3], SnapshotRoute::Baseline).unwrap();
-    let actual = codec::encode_portable(NAMESPACE, SnapshotRoute::Baseline, &[1, 2],
-        hit.snapshot().to_portable().unwrap(),
-        codec::RetentionMetadata { observations: 1, reuse_count: 0, last_access_unix_ms: 1 },
-        10_000, None).unwrap();
+    let actual = codec::encode_portable(NAMESPACE,
+    SnapshotRoute::Baseline,
+    &[1, 2],
+    hit.snapshot().to_portable().unwrap(),
+    codec::RetentionMetadata {
+        observations: 1,
+        reuse_count: 0,
+        last_access_unix_ms: 1,
+    },
+    10_000,
+    None, |_| Ok(()))
+    .unwrap();
     assert_eq!(actual.manifest, expected.manifest);
     assert_eq!(actual.blobs, expected.blobs);
     assert_eq!(state.lock().unwrap().demand_loads, 1);
@@ -1984,7 +2139,13 @@ fn cancelled_and_replaced_lookahead_release_and_fall_back() {
     cache.flush_persistence();
     cache.prefetch(&[9], SnapshotRoute::Baseline);
     assert_eq!(cache.staging.used.load(Ordering::Acquire), 0);
-    assert_eq!(cache.lookup(&[1, 2], SnapshotRoute::Baseline).unwrap().token_count, 2);
+    assert_eq!(
+        cache
+            .lookup(&[1, 2], SnapshotRoute::Baseline)
+            .unwrap()
+            .token_count,
+        2
+    );
     assert_eq!(state.lock().unwrap().demand_loads, 1);
 }
 
@@ -1995,7 +2156,11 @@ fn ready_prefetch_cannot_resurrect_expired_or_replaced_entry() {
     cache.flush_persistence();
     clock.set(1_000 + INITIAL_TTL_MS);
     assert!(cache.lookup(&[1, 2], SnapshotRoute::Baseline).is_none());
-    cache.insert(&[1, 2], vec![snapshot(2, &[7., 8., 9.])], SnapshotRoute::Baseline);
+    cache.insert(
+        &[1, 2],
+        vec![snapshot(2, &[7., 8., 9.])],
+        SnapshotRoute::Baseline,
+    );
     cache.flush_persistence();
     let hit = cache.lookup(&[1, 2], SnapshotRoute::Baseline).unwrap();
     assert_eq!(hit.snapshot().nbytes(), snapshot(2, &[7., 8., 9.]).nbytes());
@@ -2018,8 +2183,11 @@ fn failed_missing_and_corrupt_prefetch_never_poison_current_entry() {
                 _ => {
                     let (bytes, _) = s.entries.values_mut().next().unwrap();
                     let mut manifest: Manifest = serde_json::from_slice(bytes).unwrap();
-                    if mode == 3 { manifest.namespace = MTP_NAMESPACE.to_string(); }
-                    else { manifest.token_ids = vec![8, 9]; }
+                    if mode == 3 {
+                        manifest.namespace = MTP_NAMESPACE.to_string();
+                    } else {
+                        manifest.token_ids = vec![8, 9];
+                    }
                     *bytes = serde_json::to_vec(&manifest).unwrap();
                 }
             }
@@ -2032,7 +2200,13 @@ fn failed_missing_and_corrupt_prefetch_never_poison_current_entry() {
             s.fail_load = false;
             s.entries = original;
         }
-        assert_eq!(cache.lookup(&[1, 2], SnapshotRoute::Baseline).unwrap().token_count, 2);
+        assert_eq!(
+            cache
+                .lookup(&[1, 2], SnapshotRoute::Baseline)
+                .unwrap()
+                .token_count,
+            2
+        );
         assert_eq!(state.lock().unwrap().demand_loads, 1);
     }
 }
@@ -2043,11 +2217,23 @@ fn prefetch_budget_saturation_does_not_block_demand_and_releases() {
     let all = cache.staging.reserve(cache.staging.limit).unwrap();
     cache.prefetch(&[1, 2], SnapshotRoute::Baseline);
     assert!(cache.prefetch.is_none());
-    assert_eq!(cache.lookup(&[1, 2], SnapshotRoute::Baseline).unwrap().token_count, 2);
+    assert_eq!(
+        cache
+            .lookup(&[1, 2], SnapshotRoute::Baseline)
+            .unwrap()
+            .token_count,
+        2
+    );
     drop(all);
     cache.prefetch(&[1, 2], SnapshotRoute::Baseline);
     cache.flush_persistence();
-    assert_eq!(cache.lookup(&[1, 2], SnapshotRoute::Baseline).unwrap().token_count, 2);
+    assert_eq!(
+        cache
+            .lookup(&[1, 2], SnapshotRoute::Baseline)
+            .unwrap()
+            .token_count,
+        2
+    );
     assert_eq!(state.lock().unwrap().demand_loads, 1);
     assert_eq!(cache.staging.used.load(Ordering::Acquire), 0);
 }
@@ -2058,12 +2244,28 @@ fn lookahead_revalidates_longest_prefix_and_route() {
     cache.prefetch(&[1, 2, 3], SnapshotRoute::Baseline);
     cache.flush_persistence();
     assert!(cache.lookup(&[1, 2, 3], SnapshotRoute::Mtp).is_none());
-    cache.insert(&[1, 2, 3], vec![snapshot(3, &[3., 4.])], SnapshotRoute::Baseline);
+    cache.insert(
+        &[1, 2, 3],
+        vec![snapshot(3, &[3., 4.])],
+        SnapshotRoute::Baseline,
+    );
     cache.flush_persistence();
-    assert_eq!(cache.lookup(&[1, 2, 3, 4], SnapshotRoute::Baseline).unwrap().token_count, 3);
+    assert_eq!(
+        cache
+            .lookup(&[1, 2, 3, 4], SnapshotRoute::Baseline)
+            .unwrap()
+            .token_count,
+        3
+    );
     assert_eq!(state.lock().unwrap().demand_loads, 1);
     // The shorter candidate remains usable, not consumed by the longer demand.
-    assert_eq!(cache.lookup(&[1, 2, 9], SnapshotRoute::Baseline).unwrap().token_count, 2);
+    assert_eq!(
+        cache
+            .lookup(&[1, 2, 9], SnapshotRoute::Baseline)
+            .unwrap()
+            .token_count,
+        2
+    );
     assert_eq!(state.lock().unwrap().demand_loads, 1);
 }
 
@@ -2074,10 +2276,20 @@ fn owned_hot_match_survives_mutation_without_copying_snapshot() {
     let first = cache.lookup(&[1, 2], SnapshotRoute::Baseline).unwrap();
     let second = cache.lookup(&[1, 2], SnapshotRoute::Baseline).unwrap();
     assert!(std::ptr::eq(first.snapshot(), second.snapshot()));
-    cache.insert(&[1, 2], vec![snapshot(2, &[1., 2.])], SnapshotRoute::Baseline);
+    cache.insert(
+        &[1, 2],
+        vec![snapshot(2, &[1., 2.])],
+        SnapshotRoute::Baseline,
+    );
     assert_eq!(first.snapshot().nbytes(), snapshot(2, &[1.]).nbytes());
-    assert_eq!(cache.lookup(&[1, 2], SnapshotRoute::Baseline).unwrap().snapshot().nbytes(),
-        snapshot(2, &[1., 2.]).nbytes());
+    assert_eq!(
+        cache
+            .lookup(&[1, 2], SnapshotRoute::Baseline)
+            .unwrap()
+            .snapshot()
+            .nbytes(),
+        snapshot(2, &[1., 2.]).nbytes()
+    );
 }
 
 #[test]
@@ -2088,8 +2300,9 @@ fn delayed_prefetch_is_nonblocking_and_cancelled_inflight_releases_budget() {
     cache.prefetch(&[1, 2], SnapshotRoute::Baseline);
     let (lock, wake) = &*gate;
     let guard = lock.lock().expect("gate");
-    let (guard, timeout) = wake.wait_timeout_while(guard, std::time::Duration::from_secs(5),
-        |s| !s.entered).expect("gate");
+    let (guard, timeout) = wake
+        .wait_timeout_while(guard, std::time::Duration::from_secs(5), |s| !s.entered)
+        .expect("gate");
     let entered = guard.entered && !timeout.timed_out();
     drop(guard);
     // Neither an unrelated miss nor cancellation waits for the blocked worker.
@@ -2103,11 +2316,20 @@ fn delayed_prefetch_is_nonblocking_and_cancelled_inflight_releases_budget() {
     cache.flush_persistence();
     assert!(entered);
     assert!(missed);
-    assert!(reserved > 0, "inflight bytes must stay accounted until IO exits");
+    assert!(
+        reserved > 0,
+        "inflight bytes must stay accounted until IO exits"
+    );
     assert_eq!(cache.staging.used.load(Ordering::Acquire), 0);
     cache.prefetch(&[1, 2], SnapshotRoute::Baseline);
     cache.flush_persistence();
-    assert_eq!(cache.lookup(&[1, 2], SnapshotRoute::Baseline).unwrap().token_count, 2);
+    assert_eq!(
+        cache
+            .lookup(&[1, 2], SnapshotRoute::Baseline)
+            .unwrap()
+            .token_count,
+        2
+    );
     assert_eq!(state.lock().expect("store").demand_loads, 0);
 }
 
@@ -2115,11 +2337,20 @@ fn delayed_prefetch_is_nonblocking_and_cancelled_inflight_releases_budget() {
 fn publication_staging_releases_on_success_failure_and_saturation() {
     let state = Arc::new(Mutex::new(RecordingState::default()));
     let mut cache = AdaptivePrefixCache::with_store(
-        namespaces(), memory_config(1_000), Box::new(RecordingStore(Arc::clone(&state))),
-    ).unwrap();
+        namespaces(),
+        memory_config(1_000),
+        Box::new(RecordingStore(Arc::clone(&state))),
+    )
+    .unwrap();
     let all = cache.staging.reserve(cache.staging.limit).unwrap();
     cache.insert(&[1], vec![snapshot(1, &[1.])], SnapshotRoute::Baseline);
-    assert_eq!(cache.lookup(&[1], SnapshotRoute::Baseline).unwrap().token_count, 1);
+    assert_eq!(
+        cache
+            .lookup(&[1], SnapshotRoute::Baseline)
+            .unwrap()
+            .token_count,
+        1
+    );
     drop(all);
     cache.flush_persistence();
     assert!(state.lock().expect("store").entries.is_empty());
@@ -2127,32 +2358,73 @@ fn publication_staging_releases_on_success_failure_and_saturation() {
     cache.insert(&[2], vec![snapshot(1, &[2.])], SnapshotRoute::Baseline);
     cache.flush_persistence();
     assert_eq!(cache.staging.used.load(Ordering::Acquire), 0);
-    assert_eq!(cache.lookup(&[2], SnapshotRoute::Baseline).unwrap().token_count, 1);
+    assert_eq!(
+        cache
+            .lookup(&[2], SnapshotRoute::Baseline)
+            .unwrap()
+            .token_count,
+        1
+    );
     state.lock().expect("store").fail_put = false;
     cache.insert(&[2], vec![snapshot(1, &[3.])], SnapshotRoute::Baseline);
     cache.flush_persistence();
     assert_eq!(cache.staging.used.load(Ordering::Acquire), 0);
     cache.memory_cap = 0;
     cache.evict_memory(None);
-    assert_eq!(cache.lookup(&[2], SnapshotRoute::Baseline).unwrap().snapshot().to_portable().unwrap(),
-        snapshot(1, &[3.]).to_portable().unwrap());
+    assert_eq!(
+        cache
+            .lookup(&[2], SnapshotRoute::Baseline)
+            .unwrap()
+            .snapshot()
+            .to_portable()
+            .unwrap(),
+        snapshot(1, &[3.]).to_portable().unwrap()
+    );
 }
 
 #[test]
 fn bounded_filesystem_prefetch_rejects_oversized_payloads() {
     let directory = TempDirectory::new();
     let mut store = FilesystemSnapshotStore::new(&directory.path).unwrap();
-    let encoded = codec::encode_portable(NAMESPACE, SnapshotRoute::Baseline, &[1],
-        snapshot(1, &[1., 2.]).to_portable().unwrap(),
-        RetentionMetadata { observations: 1, reuse_count: 0, last_access_unix_ms: 1 },
-        u64::MAX, None).unwrap();
+    let encoded = codec::encode_portable(NAMESPACE,
+    SnapshotRoute::Baseline,
+    &[1],
+    snapshot(1, &[1., 2.]).to_portable().unwrap(),
+    RetentionMetadata {
+        observations: 1,
+        reuse_count: 0,
+        last_access_unix_ms: 1,
+    },
+    u64::MAX,
+    None, |_| Ok(()))
+    .unwrap();
     let key = encoded.key.clone();
-    let size = encoded.manifest.len() as u64 + encoded.blobs.iter().map(|b| b.bytes.len() as u64).sum::<u64>();
-    store.put(StoredEntry { key: encoded.key, manifest: encoded.manifest, blobs: encoded.blobs }, u64::MAX).unwrap();
+    let size = encoded.manifest.len() as u64
+        + encoded
+            .blobs
+            .iter()
+            .map(|b| b.bytes.len() as u64)
+            .sum::<u64>();
+    store
+        .put(
+            StoredEntry {
+                key: encoded.key,
+                manifest: encoded.manifest,
+                blobs: encoded.blobs,
+            },
+            u64::MAX,
+        )
+        .unwrap();
     assert!(store.load_bounded(&key, size - 1).is_err());
     let loaded = store.load_bounded(&key, size).unwrap().unwrap();
-    assert_eq!(codec::decode(NAMESPACE, &loaded.manifest, loaded.blobs).unwrap().snapshot.to_portable().unwrap(),
-        snapshot(1, &[1., 2.]).to_portable().unwrap());
+    assert_eq!(
+        codec::decode(NAMESPACE, &loaded.manifest, loaded.blobs)
+            .unwrap()
+            .snapshot
+            .to_portable()
+            .unwrap(),
+        snapshot(1, &[1., 2.]).to_portable().unwrap()
+    );
 }
 
 #[test]
@@ -2169,15 +2441,32 @@ fn ready_prefetch_replacement_and_stale_manifest_fall_back_to_current_state() {
     cache.prefetch(&[1, 2], SnapshotRoute::Baseline);
     cache.flush_persistence();
     state.lock().expect("store").entries = original;
-    assert_eq!(cache.lookup(&[1, 2], SnapshotRoute::Baseline).unwrap().token_count, 2);
+    assert_eq!(
+        cache
+            .lookup(&[1, 2], SnapshotRoute::Baseline)
+            .unwrap()
+            .token_count,
+        2
+    );
     assert_eq!(state.lock().expect("store").demand_loads, 1);
     assert_eq!(cache.staging.used.load(Ordering::Acquire), 0);
     cache.prefetch(&[1, 2], SnapshotRoute::Baseline);
     cache.flush_persistence();
-    cache.insert(&[1, 2], vec![snapshot(2, &[7., 8., 9.])], SnapshotRoute::Baseline);
+    cache.insert(
+        &[1, 2],
+        vec![snapshot(2, &[7., 8., 9.])],
+        SnapshotRoute::Baseline,
+    );
     cache.flush_persistence();
-    assert_eq!(cache.lookup(&[1, 2], SnapshotRoute::Baseline).unwrap().snapshot().to_portable().unwrap(),
-        snapshot(2, &[7., 8., 9.]).to_portable().unwrap());
+    assert_eq!(
+        cache
+            .lookup(&[1, 2], SnapshotRoute::Baseline)
+            .unwrap()
+            .snapshot()
+            .to_portable()
+            .unwrap(),
+        snapshot(2, &[7., 8., 9.]).to_portable().unwrap()
+    );
     cache.clear_prefetch();
     assert_eq!(cache.staging.used.load(Ordering::Acquire), 0);
 }
@@ -2191,7 +2480,9 @@ fn demand_joins_delayed_prefetch_without_duplicate_store_read() {
     let (joined, joining) = mpsc::channel();
     cache.prefetch.as_mut().unwrap().demand_join = Some(joined);
     let release = thread::spawn(move || {
-        let joined = joining.recv_timeout(std::time::Duration::from_secs(5)).is_ok();
+        let joined = joining
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .is_ok();
         let (lock, wake) = &*gate;
         let mut guard = lock.lock().expect("gate");
         guard.released = true;
@@ -2200,7 +2491,10 @@ fn demand_joins_delayed_prefetch_without_duplicate_store_read() {
     });
     let hit = cache.lookup(&[1, 2], SnapshotRoute::Baseline).unwrap();
     assert!(release.join().unwrap());
-    assert_eq!(hit.snapshot().to_portable().unwrap(), snapshot(2, &[1., 2.]).to_portable().unwrap());
+    assert_eq!(
+        hit.snapshot().to_portable().unwrap(),
+        snapshot(2, &[1., 2.]).to_portable().unwrap()
+    );
     assert_eq!(state.lock().expect("store").prefetch_loads, 1);
     assert_eq!(state.lock().expect("store").demand_loads, 0);
     assert_eq!(cache.staging.used.load(Ordering::Acquire), 0);
@@ -2219,8 +2513,22 @@ fn bounded_hot_lookahead_survives_current_publication_eviction() {
     clock.set(1_001);
     cache.insert(&[9], vec![snapshot(1, &[9., 8.])], SnapshotRoute::Baseline);
     cache.flush_persistence();
-    assert!(cache.trie.terminal(cache.trie.path(&[1, 2], SnapshotRoute::Baseline).last().unwrap().0,
-        SnapshotRoute::Baseline).unwrap().snapshot.is_none());
+    assert!(
+        cache
+            .trie
+            .terminal(
+                cache
+                    .trie
+                    .path(&[1, 2], SnapshotRoute::Baseline)
+                    .last()
+                    .unwrap()
+                    .0,
+                SnapshotRoute::Baseline
+            )
+            .unwrap()
+            .snapshot
+            .is_none()
+    );
     let hit = cache.lookup(&[1, 2], SnapshotRoute::Baseline).unwrap();
     assert_eq!(hit.snapshot().to_portable().unwrap(), expected);
     assert_eq!(state.lock().expect("store").demand_loads, 1);
@@ -2231,14 +2539,74 @@ fn bounded_hot_lookahead_survives_current_publication_eviction() {
 fn prefetch_after_unflushed_publication_observes_fifo_write_visibility() {
     let state = Arc::new(Mutex::new(RecordingState::default()));
     let mut cache = AdaptivePrefixCache::with_store(
-        namespaces(), memory_config(0), Box::new(RecordingStore(Arc::clone(&state))),
-    ).unwrap();
-    cache.insert(&[1, 2], vec![snapshot(2, &[3., 4.])], SnapshotRoute::Baseline);
+        namespaces(),
+        memory_config(1),
+        Box::new(RecordingStore(Arc::clone(&state))),
+    )
+    .unwrap();
+    cache.insert(
+        &[1, 2],
+        vec![snapshot(2, &[3., 4.])],
+        SnapshotRoute::Baseline,
+    );
     cache.prefetch(&[1, 2], SnapshotRoute::Baseline);
     let hit = cache.lookup(&[1, 2], SnapshotRoute::Baseline).unwrap();
-    assert_eq!(hit.snapshot().to_portable().unwrap(), snapshot(2, &[3., 4.]).to_portable().unwrap());
+    assert_eq!(
+        hit.snapshot().to_portable().unwrap(),
+        snapshot(2, &[3., 4.]).to_portable().unwrap()
+    );
     cache.flush_persistence();
     assert_eq!(state.lock().expect("store").demand_loads, 0);
     assert_eq!(cache.pending_filesystem_bytes, 0);
+    assert_eq!(cache.staging.used.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn multi_megabyte_paged_manifest_uses_exact_combined_prefetch_budget() {
+    use qw_runtime::{PortableModelState, PortablePage, PortablePagedTensor};
+    let token_len = 29_184;
+    let tokens = vec![1; token_len];
+    let page_bytes: Arc<[u8]> = vec![0; 32 * 2 * 4].into();
+    let portable = PortablePromptSnapshot::Baseline(PortableModelState {
+        family: "test".into(),
+        token_len,
+        tensors: Vec::new(),
+        paged_tensors: (0..16).map(|layer| PortablePagedTensor {
+            name: format!("layers.{layer}.attention.key"),
+            token_axis: 1,
+            token_len,
+            pages: (0..token_len).step_by(32).map(|start| PortablePage {
+                token_start: start,
+                token_end: start + 32,
+                shape: vec![1, 32, 2],
+                dtype: mlxcel_core::dtype::FLOAT32,
+                bytes: Arc::clone(&page_bytes),
+            }).collect(),
+        }).collect(),
+        continuation_logits: None,
+    });
+    let encoded = codec::encode_portable(NAMESPACE, SnapshotRoute::Baseline, &tokens,
+        portable.clone(),
+        RetentionMetadata { observations: 1, reuse_count: 0, last_access_unix_ms: 1 },
+        u64::MAX, None, |_| Ok(())).unwrap();
+    let manifest_bytes = encoded.manifest.len() as u64;
+    assert!(manifest_bytes > 2 * 1024 * 1024, "fixture represents long paged-cache manifests");
+    let full_bytes = manifest_bytes + encoded.blobs.iter().map(|blob| blob.bytes.len() as u64).sum::<u64>();
+    let key = encoded.key.clone();
+    let directory = TempDirectory::new();
+    let mut store = FilesystemSnapshotStore::new(&directory.path).unwrap();
+    store.put(StoredEntry { key: encoded.key, manifest: encoded.manifest, blobs: encoded.blobs }, u64::MAX).unwrap();
+    assert_eq!(store.manifest_bytes(&key).unwrap(), Some(manifest_bytes));
+    assert!(store.load_bounded(&key, manifest_bytes - 1).is_err());
+    assert!(store.load_bounded(&key, full_bytes - 1).is_err());
+    assert!(store.load_bounded(&key, full_bytes).unwrap().is_some());
+    let mut cache = AdaptivePrefixCache::with_store(namespaces(), memory_config(1), Box::new(store)).unwrap();
+    cache.prefetch(&tokens, SnapshotRoute::Baseline);
+    cache.flush_persistence();
+    assert_eq!(cache.staging.used.load(Ordering::Acquire), 3 * full_bytes,
+        "ready large-manifest prefetch retains its exact combined reservation");
+    let hit = cache.lookup(&tokens, SnapshotRoute::Baseline).unwrap();
+    assert_eq!(hit.token_count, token_len);
+    assert_eq!(hit.snapshot().to_portable().unwrap(), portable);
     assert_eq!(cache.staging.used.load(Ordering::Acquire), 0);
 }
