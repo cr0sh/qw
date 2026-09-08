@@ -126,51 +126,80 @@ Evaluation episodes produced by schema-blind parameter coercion are not
 comparable baselines: a declared JSON string could have reached a tool as an
 object, changing both tool execution and the subsequent conversation.
 
-## Banking evaluation concurrency
+## Upstream-native banking evaluation
 
-`eval/run_tau3_banking.py --eval-batch-size N` exposes EvalScope's existing task
-concurrency setting as a positive integer; the default remains 1. Use
-`--eval-batch-size 3` explicitly for a three-task run. This uses the installed
-evaluator's task worker pool, not GPU
-batching or Tau2's separate batch runner. GPU requests remain serialized by the
-runtime worker, but independent tasks can overlap remote simulator/judge work
-with local generation. Measure campaign wall time before claiming a gain.
-The launcher retains the repo-owned adapter installation and banking presets;
-invoking the generic EvalScope CLI without those hooks would bypass the corrected
-reasoning, continuation, and error-reporting behavior.
+The reference launcher `eval/run_tau3_banking.py` only constructs EvalScope
+`TaskConfig` and calls `run_task`. Use pinned EvalScope 1.11.0 and official Tau2
+v1.0.0 (commit `17e07b1da2bbc0cadfddeea36412686e0604127b`) in the fresh
+`eval/.venv-reference` environment, not an older environment with modified
+site-packages. The repository adds no scoring, message conversion, retries,
+termination, capture, or cache/recovery hooks. EvalScope's own native Tau3 bridge
+does patch Tau2 generation internally; that is upstream behavior, not a local
+override. Older custom-adapter runs and their outputs are historical diagnostics,
+not reference results. The older `eval/README.md` describes that retired custom
+path; this section and the native launcher supersede its evaluation instructions.
 
-Each prediction binds its agent and simulator models and capture task identity
-to the executing task, restoring the prior context on success or failure.
-Opt-in capture appends are serialized and retain credential redaction.
-Concurrency does not change canonical scoring, prompts, retry policy, or
-per-task token budgets, and does not promise schedule-independent random output.
+Create or synchronize the separate reference environment using the locked
+dependencies (leave historical environments untouched):
 
-Start a new evaluation without `--resume` to get a fresh UUID directory and no
-reuse of earlier campaign or smoke rows. To continue that same evaluation after
-an interruption, pass `--resume` with its exact inner timestamp run directory.
-The outer directory's stable `.writer.lock` is held for the entire campaign:
-never delete it. An exclusive kernel lock, not a PID guess, permits recovery of
-a stale native `running` state after SIGKILL; an active owner is rejected.
-`INVALID.json`, mismatched evaluation identity, or a different dataset prevents
-reuse regardless of process state.
+```bash
+(cd eval && UV_PROJECT_ENVIRONMENT=.venv-reference uv sync --locked --python 3.12 --no-editable)
+```
 
-Native prediction and review JSONL records retain EvalScope's formats. A write
-returns only after its complete LF-terminated record is flushed and fsynced;
-new directory entries are synchronized, with Darwin full-sync barriers.
-Configuration and native progress snapshots are atomically published only
-after their data is synchronized. Native review staging is retained on failure.
-These barriers protect acknowledged records across process/harness termination;
-power-loss behavior also depends on the filesystem and storage honoring them,
-and SIGKILL tests are not physical power-cut certification.
+From this worktree, use the fresh interpreter explicitly:
 
-Under the writer lock, recovery validates every complete canonical/staged row
-before publication and archives originals plus progress in `recovery-evidence`.
-Only recognized native `.rerun-<uuid>` staging and complete LF records are reused.
-An unfinished final object append is retained as evidence and excluded; malformed
-complete records, conflicting duplicates, orphan reviews, or unrelated temporary
-files abort recovery. Repeated recovery is idempotent. Unfinished episodes may
-run again explicitly; partial model-output captures never manufacture a native
-completion or zero reward. Opt-in capture remains diagnostic, not resume authority.
+```bash
+eval/.venv-reference/bin/python eval/run_tau3_banking.py
+eval/.venv-reference/bin/python eval/run_tau3_banking.py --limit 1 --run
+eval/.venv-reference/bin/python eval/run_tau3_banking.py --run
+```
+
+For the fresh 97-task reference campaign, set `TAU3_DATASET_ID` to the canonical
+read-only banking snapshot before invoking the full-run command:
+
+```bash
+export TAU3_DATASET_ID=/Users/namjh/dev/personal/qwr/worktrees/tau3-banking-eval/eval/outputs/tau3-banking-medium-setup/fresh-harness-20260905T161306Z-08042224b0734ab583180e9451445cfb/data-cache/evalscope/datasets/evalscope--tau3-bench-data/snapshots/master
+```
+
+Without `--run`, only configuration is constructed: no credential loading,
+dataset loading, or model requests. Fresh invocations use unique UUID work
+directories beneath `eval/outputs/tau3-banking-native-*`; omit `--resume` for
+every fresh campaign so smoke or historical rows are not reused.
+
+The target is `qwen3.8-27b` at `http://127.0.0.1:8883/v1`, with thinking enabled,
+medium reasoning effort, and 32768 output tokens. The seven sampler controls are
+omitted so the server resolves them. The simulator and native NL-assertion judge
+use `deepseek-v4-pro` at `https://api.deepseek.com`, temperature 0 and thinking
+disabled. Native retry, termination, scoring, and error handling remain unchanged.
+In particular, the upstream Tau3 bridge strips reasoning when converting model
+output back into Tau2 messages and converts caught task exceptions to reward-zero
+results. This launcher does not promise preserved reasoning history or distinguish
+infrastructure errors with custom scoring.
+
+Only the evaluator process loads `DEEPSEEK_API_KEY` from the primary worktree's
+private, nonsymlink `eval/.env.local` (mode 600) into `OPENAI_API_KEY` and
+`EVALSCOPE_API_KEY` (the native OpenAI-compatible adapter's fallback variable).
+TaskConfig contains target `api_key="EMPTY"` and simulator `api_key=None`;
+the simulator uses upstream environment fallback. Do not insert the real key
+into configuration, commands, or saved artifacts.
+
+`--eval-batch-size N` controls the native task worker pool, default 3, not GPU
+batching or Tau2's separate batch runner. Independent tasks can overlap remote
+simulator/judge work with local generation; there is no schedule-independent
+randomness or wall-time improvement guarantee.
+
+`--resume /path/to/inner-timestamp-run-directory` maps directly to native
+`use_cache`. The upstream cache determines reuse and eligibility; the launcher
+adds no writer lock, stale-state repair, record salvage, synchronized writes, or
+power-loss durability guarantee. Interrupted episodes may execute again and
+native resume may reject interrupted or incompatible runs. Never run multiple
+writers against one output directory. Process supervision is external to Python.
+
+Launcher credential-security regression checks (no model calls):
+
+```bash
+eval/.venv-reference/bin/python -m unittest eval.test_run_tau3_banking
+```
 
 ## Shared worktrees
 
