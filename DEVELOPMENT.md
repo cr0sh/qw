@@ -39,6 +39,37 @@ filesystem removal and persistence failure, including memory-only entries.
 Use it to join insert, hit, restore/promotion, eviction, and expiry evidence;
 capacity setup, genuine misses, and aggregate events do not identify one entry.
 
+The worker prepares the immediate next eligible text request already collected
+in its FIFO batch and starts portable cache prefetch before current generation.
+Successful prompt preparation is reused at that request's turn. Late arrivals,
+response continuations, structured/multimodal requests, and history-dependent
+sparse-prefill configurations retain ordinary lookup behavior. This is not GPU
+batching or a guarantee that every boundary has prefetched state.
+
+Prefetch performs bounded reads and portable validation/decoding on the I/O
+thread; MLX materialization/restoration remains on the generation thread.
+Immutable pages share ownership instead of being deep-copied. An owner-thread
+hot pin protects lookahead from intervening publication eviction. Demand joins
+a matching unfinished read, revalidates the candidate, and falls back normally
+on stale, missing, corrupt, or cancelled work. Publication stays visible before
+response completion; FIFO persistence ordering is preserved.
+
+Additional staging reservations are bounded to four hot-tier capacities with a
+64 MiB floor: 8 GiB with the default 2 GiB hot tier. Publication reserves twice
+the logical snapshot bytes plus exact serialized manifest bytes; settled disk
+lookahead reserves three times combined blob and manifest bytes; a hot pin
+reserves logical snapshot bytes. Pending writes discover and reserve manifest
+size before reading. Budget exhaustion skips optional work rather than growing
+an unbounded queue. These are conservative payload reservations, not measured
+RSS or a total-process limit: metadata, active model/request state, and ordinary
+demand restoration are separate. Reservations release when ownership ends,
+including cancellation/failure; active cancelled I/O retains its reservation
+until it actually finishes.
+
+Use `cache.prefetch` lifecycle and `cache.staging.reserve/release` traces to
+verify overlap and bounded ownership; a queued hint alone is not proof of a
+completed prefetch or a latency improvement.
+
 Snapshot budgets do not bound request latency. Persistence still uses serialized
 I/O; queued writes and large FP16 snapshots can delay a subsequent filesystem
 lookup. Darwin durability barriers are batched, but this does not remove FIFO
