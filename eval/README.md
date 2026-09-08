@@ -1,69 +1,164 @@
 # τ³ banking evaluation
 
-`run_tau3_banking.py` runs the repository-owned adapter against the τ³
-`banking_knowledge` benchmark. The launcher requires `--run` to execute
-anything; without it, configuration is validated and no dataset, server, or
-model request is touched.
+[`run_tau3_banking.py`](run_tau3_banking.py) configures **unmodified EvalScope's
+native τ³ adapter** through `TaskConfig` and `run_task`. It adds no generation,
+message-conversion, retry, scoring, termination, capture, or checkpoint hooks.
+EvalScope's own Tau2 generation bridge is part of the upstream implementation.
+
+All commands below run from the repository/worktree root. They are reproduction
+instructions, not commands to run alongside an already-active campaign.
 
 ## Prerequisites
 
-Use a dedicated worktree and a Python 3.11-or-newer environment containing
-EvalScope 1.11.0 and the τ² knowledge benchmark package. Start QW separately
-before an integration run:
+- Python 3.12 or 3.13; the commands below select 3.12.
+- `uv` and the locked dependencies in [`pyproject.toml`](pyproject.toml) and
+  [`uv.lock`](uv.lock): EvalScope **1.11.0** and `tau2[knowledge]` from official
+  **v1.0.0**, commit `17e07b1da2bbc0cadfddeea36412686e0604127b`.
+  The package is still named `tau2`; do not substitute τ² v0.2.0.
+- On macOS, PortAudio must be available to build the pinned PyAudio dependency.
+  Upstream's text path eagerly imports voice dependencies; the lock includes
+  those required dependencies.
+- A tested QW binary and the Qwen3.8-27B model checkpoint.
+
+Create the isolated reference environment without modifying an older environment:
 
 ```bash
-qw serve --bind 127.0.0.1:8883
+(cd eval && UV_PROJECT_ENVIRONMENT=.venv-reference uv sync --locked --python 3.12 --no-editable)
 ```
 
-The launcher does not start QW. It expects the agent endpoint at
-`http://127.0.0.1:8883/v1` and uses model ID `qwen3.8-27b`.
+Use this interpreter explicitly. Do not install local evaluator patches.
 
-Simulator and natural-language judge configuration is owned by
-[`run_tau3_banking.py`](run_tau3_banking.py). Consult that source for the
-current endpoint and credential setup rather than copying environment details
-into this runbook.
+## Credentials
 
-## Commands
+Store `DEEPSEEK_API_KEY` in the **primary worktree's** private `eval/.env.local`.
+Create/edit that file privately and set its mode to `600`; it must not be a
+symlink. A linked worktree's own `eval/.env.local` is not used.
 
-Validate configuration only, run a bounded diagnostic, or run the complete
-97-task campaign:
+Only an executing evaluator loads the key, exporting it within that process as
+`OPENAI_API_KEY` and `EVALSCOPE_API_KEY`. The latter is EvalScope's native API-key
+fallback. The target's configuration uses `api_key="EMPTY"`; the simulator uses
+`api_key=None` and the environment fallback. Never put a real key in commands,
+TaskConfig, committed files, or shared artifacts.
+
+## Start the model server separately
+
+The launcher does not start, build, stop, or reconfigure QW. For a new campaign,
+use a fresh prefix-cache directory and record the tested binary's commit/hash.
+See [shared worktree and GPU locking rules](../DEVELOPMENT.md#shared-worktrees)
+before building or running GPU work.
 
 ```bash
-python eval/run_tau3_banking.py
-python eval/run_tau3_banking.py --limit 1 --run
-python eval/run_tau3_banking.py --run
+export QW_BIN="$PWD/target/release/qw"  # or the tested frozen binary
+export QW_MODEL="$HOME/.cache/qw/models/Jundot/Qwen3.8-27B-oQ4e-fp16-mtp"
+export QW_PREFIX_CACHE="$PWD/outputs/tau3-prefix-$(date -u +%Y%m%dT%H%M%SZ)"
+
+./gpu-lock -- env -u QW_DFLASH2_VERIFY_WIDTH "$QW_BIN" serve \
+  --bind 127.0.0.1:8883 \
+  --model-id qwen3.8-27b \
+  --model "$QW_MODEL" \
+  --decoder dflash \
+  --prefix-cache-directory "$QW_PREFIX_CACHE"
 ```
 
-A fresh run uses one repeat, seed 42, and BM25 retrieval. Each invocation
-creates a UUID-named result directory below `eval/outputs/`. The optional
-`TAU3_DATASET_ID=/path/to/dataset` environment variable reuses an existing
-local dataset read-only; otherwise the configured dataset is downloaded into
-the run's cache.
+Wait for the server to listen before launching evaluation in another terminal.
+Do not start a second server on the running campaign's port or bypass `gpu-lock`.
 
-Opt in to request, response, and result capture with either
-`--capture /unique/path.jsonl` or `TAU3_CAPTURE_PATH`. Existing capture paths
-are rejected. Capture is disabled by default.
+## Dataset
 
-## Output-contract policy
+By default, the native loader downloads `evalscope/tau3-bench-data` from
+ModelScope into the invocation's data cache. It downloads the full dataset
+repository, not only the selected banking files.
 
-The server rejects malformed or undeclared generated tool calls and violations
-of `parallel_tool_calls=false`. These output-contract failures return HTTP 422
-with `error.type=model_output_error` and `error.code=invalid_model_output`,
-rather than a retryable server error. Streaming responses use the same
-error type and code in the endpoint's terminal error event after HTTP headers
-have been sent. The error does not include raw generated argument bodies.
+To avoid downloading it again, point the launcher at an intact, verified local
+snapshot root containing `tau2/`:
 
-An output-contract failure aborts the banking task rather than being silently
-skipped or converted to reward zero; an aborted run is not a complete
-benchmark score. Treat the full Tau2 result as the authoritative trajectory.
+```bash
+export TAU3_DATASET_ID=/absolute/path/to/snapshots/master
+```
 
-The launcher is deliberately conservative about failures: completion errors and
-retry exhaustion are surfaced to the caller. Review the captured request and
-response artifacts for diagnosis rather than treating a failed task as a
-successful result.
+Use the same frozen snapshot for a campaign and its resumes. Record its source
+and file hashes when sharing results. Reusing dataset assets is distinct from
+reusing predictions or a warmed model prefix cache.
 
-## Result layout
+## Run
 
-Fresh results are written below `eval/outputs/tau3-banking-<timestamp>-<uuid>/`.
-Keep result artifacts and any read-only dataset snapshot intact when sharing a
-diagnostic run.
+Construct configuration without loading credentials, datasets, or invoking models:
+
+```bash
+eval/.venv-reference/bin/python -I -B eval/run_tau3_banking.py
+```
+
+Run one diagnostic episode, or launch a fresh full campaign:
+
+```bash
+eval/.venv-reference/bin/python -I -B eval/run_tau3_banking.py --run --limit 1
+eval/.venv-reference/bin/python -I -B eval/run_tau3_banking.py --run --eval-batch-size 3
+```
+
+The full banking dataset contains **97 tasks**. The launcher uses one repeat,
+seed 42, and BM25 retrieval. `--eval-batch-size` defaults to 3 and controls
+EvalScope's native task worker pool—not GPU batching or token-level interleaving.
+QW serves queued requests at request boundaries.
+
+Each fresh invocation creates a unique directory under
+`eval/outputs/tau3-banking-native-<UTC timestamp>-<uuid>/`; EvalScope adds an inner
+timestamp directory containing configurations, predictions, reviews, logs, and
+reports. The launcher prints `work_dir`, and EvalScope logs the final output
+directory. Do not reuse smoke or historical custom-adapter results for a fresh
+reference campaign.
+
+## Evaluation policy
+
+| Role | Configuration |
+| --- | --- |
+| Agent under test | `qwen3.8-27b`, `http://127.0.0.1:8883/v1`, thinking enabled, medium reasoning effort, 32768 output tokens |
+| User simulator and native NL-assertion judge | `deepseek-v4-pro`, `https://api.deepseek.com`, thinking disabled, temperature 0, 32768 output tokens |
+
+The seven target sampling overrides are omitted so QW resolves its model policy.
+Native retry, termination, scoring, and error handling are unchanged. The
+upstream adapter converts caught task-execution exceptions to **reward-zero
+results** rather than aborting the entire campaign. Include those outcomes in
+native scores and report recorded errors; do not selectively retry model failures.
+The upstream catch also includes some infrastructure failures—there is no local
+scoring policy that separates them.
+
+The native bridge strips reasoning when converting model output back into Tau2
+messages. Thinking is enabled for generation, but **preservation of prior reasoning
+history is not guaranteed**. This run uses DeepSeek as the simulator/judge; it is
+not identical to leaderboard configurations using a different simulator.
+
+Earlier repository-owned-adapter campaigns are diagnostic artifacts, not
+upstream-reference results. The removed `--capture` flag and `TAU3_CAPTURE_PATH`
+are not part of this workflow. Use native artifacts and server logs for diagnosis.
+
+## Resume and supervision
+
+After the previous evaluator has stopped, use its **inner timestamp directory**:
+
+```bash
+eval/.venv-reference/bin/python -I -B eval/run_tau3_banking.py \
+  --run --eval-batch-size 3 \
+  --resume /absolute/path/to/tau3-banking-native-UTC-UUID/INNER_TIMESTAMP
+```
+
+Keep the dataset setting and evaluation configuration unchanged. `--resume` maps
+directly to native `use_cache`; upstream determines which records can be reused.
+Never run multiple evaluators against one output directory.
+
+The launcher adds no writer lock, record salvage, stale-state repair, synchronized
+writes, or power-loss durability guarantee. Native resume may reject an
+interrupted/incompatible run; unfinished episodes may execute again. Do not
+confuse this with retrying a completed reward-zero episode for a better answer.
+
+Supervise long runs externally. The managed reference campaign uses persistent,
+detached model/evaluator services so exiting the assistant harness does not stop
+them. Process persistence does not guarantee checkpoint recovery after an OS or
+storage failure.
+
+## Launcher security checks
+
+These checks do not call either model or modify the running campaign:
+
+```bash
+eval/.venv-reference/bin/python -B -m unittest eval.test_run_tau3_banking
+```

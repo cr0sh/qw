@@ -128,78 +128,15 @@ object, changing both tool execution and the subsequent conversation.
 
 ## Upstream-native banking evaluation
 
-The reference launcher `eval/run_tau3_banking.py` only constructs EvalScope
-`TaskConfig` and calls `run_task`. Use pinned EvalScope 1.11.0 and official Tau2
-v1.0.0 (commit `17e07b1da2bbc0cadfddeea36412686e0604127b`) in the fresh
-`eval/.venv-reference` environment, not an older environment with modified
-site-packages. The repository adds no scoring, message conversion, retries,
-termination, capture, or cache/recovery hooks. EvalScope's own native Tau3 bridge
-does patch Tau2 generation internally; that is upstream behavior, not a local
-override. Older custom-adapter runs and their outputs are historical diagnostics,
-not reference results. The older `eval/README.md` describes that retired custom
-path; this section and the native launcher supersede its evaluation instructions.
+See [the evaluation reproduction runbook](eval/README.md) for the pinned
+environment, credentials, model-server setup, dataset reuse, fresh runs, native
+resume, and verification commands. That file is the canonical operational guide;
+`eval/run_tau3_banking.py` is the configuration-only launcher.
 
-Create or synchronize the separate reference environment using the locked
-dependencies (leave historical environments untouched):
-
-```bash
-(cd eval && UV_PROJECT_ENVIRONMENT=.venv-reference uv sync --locked --python 3.12 --no-editable)
-```
-
-From this worktree, use the fresh interpreter explicitly:
-
-```bash
-eval/.venv-reference/bin/python eval/run_tau3_banking.py
-eval/.venv-reference/bin/python eval/run_tau3_banking.py --limit 1 --run
-eval/.venv-reference/bin/python eval/run_tau3_banking.py --run
-```
-
-For the fresh 97-task reference campaign, set `TAU3_DATASET_ID` to the canonical
-read-only banking snapshot before invoking the full-run command:
-
-```bash
-export TAU3_DATASET_ID=/Users/namjh/dev/personal/qwr/worktrees/tau3-banking-eval/eval/outputs/tau3-banking-medium-setup/fresh-harness-20260905T161306Z-08042224b0734ab583180e9451445cfb/data-cache/evalscope/datasets/evalscope--tau3-bench-data/snapshots/master
-```
-
-Without `--run`, only configuration is constructed: no credential loading,
-dataset loading, or model requests. Fresh invocations use unique UUID work
-directories beneath `eval/outputs/tau3-banking-native-*`; omit `--resume` for
-every fresh campaign so smoke or historical rows are not reused.
-
-The target is `qwen3.8-27b` at `http://127.0.0.1:8883/v1`, with thinking enabled,
-medium reasoning effort, and 32768 output tokens. The seven sampler controls are
-omitted so the server resolves them. The simulator and native NL-assertion judge
-use `deepseek-v4-pro` at `https://api.deepseek.com`, temperature 0 and thinking
-disabled. Native retry, termination, scoring, and error handling remain unchanged.
-In particular, the upstream Tau3 bridge strips reasoning when converting model
-output back into Tau2 messages and converts caught task exceptions to reward-zero
-results. This launcher does not promise preserved reasoning history or distinguish
-infrastructure errors with custom scoring.
-
-Only the evaluator process loads `DEEPSEEK_API_KEY` from the primary worktree's
-private, nonsymlink `eval/.env.local` (mode 600) into `OPENAI_API_KEY` and
-`EVALSCOPE_API_KEY` (the native OpenAI-compatible adapter's fallback variable).
-TaskConfig contains target `api_key="EMPTY"` and simulator `api_key=None`;
-the simulator uses upstream environment fallback. Do not insert the real key
-into configuration, commands, or saved artifacts.
-
-`--eval-batch-size N` controls the native task worker pool, default 3, not GPU
-batching or Tau2's separate batch runner. Independent tasks can overlap remote
-simulator/judge work with local generation; there is no schedule-independent
-randomness or wall-time improvement guarantee.
-
-`--resume /path/to/inner-timestamp-run-directory` maps directly to native
-`use_cache`. The upstream cache determines reuse and eligibility; the launcher
-adds no writer lock, stale-state repair, record salvage, synchronized writes, or
-power-loss durability guarantee. Interrupted episodes may execute again and
-native resume may reject interrupted or incompatible runs. Never run multiple
-writers against one output directory. Process supervision is external to Python.
-
-Launcher credential-security regression checks (no model calls):
-
-```bash
-eval/.venv-reference/bin/python -m unittest eval.test_run_tau3_banking
-```
+The reference workflow uses unmodified EvalScope 1.11.0 and official Tau2 v1.0.0
+(`17e07b1da2bbc0cadfddeea36412686e0604127b`). Repository-owned generation,
+scoring, retry, and persistence hooks are removed. Earlier custom-adapter
+campaigns remain diagnostics, not reference results.
 
 ## Shared worktrees
 
