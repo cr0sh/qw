@@ -1924,11 +1924,36 @@ fn configure_metal_wired_limit_with(
     })
 }
 
+const METAL_CACHE_LIMIT_ENV: &str = "MLXCEL_CACHE_LIMIT";
+const DEFAULT_METAL_CACHE_LIMIT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+// This allowance covers reusable free MLX buffers, not live tensors or prefix
+// cache entries. Parse before changing allocator policy so bad overrides fail
+// initialization rather than silently selecting a different memory budget.
+fn parse_metal_cache_limit(raw: Option<&std::ffi::OsStr>) -> std::result::Result<u64, String> {
+    let Some(raw) = raw else {
+        return Ok(DEFAULT_METAL_CACHE_LIMIT_BYTES);
+    };
+    let value = raw.to_str().ok_or_else(|| {
+        format!("{METAL_CACHE_LIMIT_ENV} must contain a Unicode unsigned byte count")
+    })?;
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(format!(
+            "{METAL_CACHE_LIMIT_ENV} must be an unsigned decimal byte count (0 disables free-buffer caching), got {value:?}"
+        ));
+    }
+    value.parse::<usize>().map(|bytes| bytes as u64).map_err(|error| {
+        format!("{METAL_CACHE_LIMIT_ENV} byte count {value:?} exceeds the allocator's supported range: {error}")
+    })
+}
+
 fn initialize_runtime() -> Result<()> {
     static INITIALIZED: LazyLock<std::result::Result<(), String>> = LazyLock::new(|| {
         if !mlxcel_core::metal_is_available() {
             return Err("the MLX Metal backend is unavailable on this host".to_string());
         }
+        let cache_limit_bytes =
+            parse_metal_cache_limit(std::env::var_os(METAL_CACHE_LIMIT_ENV).as_deref())?;
         let policy = configure_metal_wired_limit_with(
             mlxcel_core::hardware::physical_memory_bytes,
             mlxcel_core::memory::metal_recommended_working_set_size,
@@ -1941,6 +1966,11 @@ fn initialize_runtime() -> Result<()> {
             "configured MLX Metal wired-memory limit"
         );
         mlxcel_core::set_default_device(true);
+        mlxcel_core::memory::set_cache_limit(cache_limit_bytes);
+        info!(
+            cache_limit_bytes,
+            "configured MLX Metal free-buffer cache allowance"
+        );
         Ok(())
     });
     (*INITIALIZED).clone().map_err(anyhow::Error::msg)
@@ -2050,6 +2080,55 @@ mod tests {
         assert!(select_qwen35_decoder(Mtp, false, true, true).is_err());
         assert!(select_qwen35_decoder(Dflash2, true, false, true).is_err());
         assert!(select_qwen35_decoder(Dflash2, true, true, false).is_err());
+    }
+
+    #[test]
+    fn metal_cache_limit_resolves_default_and_explicit_byte_counts() {
+        use std::ffi::OsStr;
+
+        assert_eq!(
+            parse_metal_cache_limit(None).unwrap(),
+            8 * 1024 * 1024 * 1024
+        );
+        assert_eq!(parse_metal_cache_limit(Some(OsStr::new("0"))).unwrap(), 0);
+        assert_eq!(
+            parse_metal_cache_limit(Some(OsStr::new("1048576"))).unwrap(),
+            1048576
+        );
+        assert_eq!(
+            parse_metal_cache_limit(Some(OsStr::new(&usize::MAX.to_string()))).unwrap(),
+            usize::MAX as u64
+        );
+    }
+
+    #[test]
+    fn metal_cache_limit_rejects_invalid_explicit_values_instead_of_defaulting() {
+        use std::ffi::OsStr;
+
+        for value in [
+            "",
+            "-1",
+            "+1",
+            " 1",
+            "1 ",
+            "1.5",
+            "2GiB",
+            "18446744073709551616",
+        ] {
+            assert!(
+                parse_metal_cache_limit(Some(OsStr::new(value))).is_err(),
+                "accepted invalid cache limit {value:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metal_cache_limit_rejects_non_unicode_instead_of_treating_it_as_unset() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        assert!(parse_metal_cache_limit(Some(OsStr::from_bytes(b"\xff"))).is_err());
     }
 
     #[test]
