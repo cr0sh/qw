@@ -3,4 +3,4 @@
 	url = https://github.com/lablup/mlxcel
 [submodule "eval/tau2-bench"]
 	path = eval/tau2-bench
-	url = https://github.com/sierra-research/tau2-bench.git
+	url = git@github.com:cr0sh/tau2-bench.git
