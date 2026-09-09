@@ -22,22 +22,16 @@ instructions, not commands to run alongside an already-active campaign.
   those required dependencies.
 - A tested QW binary and the Qwen3.8-27B model checkpoint.
 
-Initialize the fork in a fresh checkout using anonymous HTTPS:
+Initialize the pinned fork using authenticated SSH:
 
 ```bash
-git submodule init eval/tau2-bench
-git -c credential.helper= clone --no-checkout https://github.com/sierra-research/tau2-bench.git eval/tau2-bench
-git -C eval/tau2-bench fetch origin tag v1.0.1
-git -C eval/tau2-bench bundle verify ../tau2-bench-fork.bundle
-git -C eval/tau2-bench fetch ../tau2-bench-fork.bundle refs/heads/qwr/v1.0.1-pr389-reasoning
-git submodule absorbgitdirs eval/tau2-bench
-git submodule update --checkout --no-fetch eval/tau2-bench
+git submodule sync -- eval/tau2-bench
+git submodule update --init --checkout eval/tau2-bench
 ```
 
-The fork is local, not published on the upstream remote. Its tracked Git bundle
-supplies the commits missing from that remote. Ordinary recursive clones and
-Cargo Git installs cannot fetch this gitlink from upstream; use the bootstrap
-above and install from the local checkout until a hosted fork is published.
+The fork is hosted at `git@github.com:cr0sh/tau2-bench.git`, with the reasoning
+changes on `qwr/v1.0.1-pr389-reasoning`. The gitlink pins the tested commit;
+initialization requires SSH access to GitHub.
 
 Create the isolated reference environment without modifying an older environment:
 
