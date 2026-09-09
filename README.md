@@ -95,19 +95,16 @@ current build.
 
 ## Historical performance
 
-Latest completed local decode measurements (tokens/s):
+Latest complete `cargo bench` decode suites after the Metal allocator-memory
+update (tokens/s):
 
-| Context | Bundled MTP reference | DFlash2 |
+| Context | Bundled MTP (k=3) | DFlash2 |
 |---|---:|---:|
-| Fresh | 57.710 | 57.510 |
-| 10,337-token cached prefix | 53.782 | 56.477 |
-| 64,297-token cached prefix | 36.903 | 40.050 |
+| Fresh | 57.354 | 56.116 |
+| 10,337-token cached prefix | 52.639 | 54.372 |
+| 64,297-token cached prefix | 34.853 | 36.283 |
 
-The bundled-MTP reference was tested at
-[commit `f4887cb`](https://github.com/cr0sh/qw/commit/f4887cbe3fc6e16fa1035efcf422c055579b34c1);
-the DFlash2 measurements were tested at
-[commit `7ada6d4`](https://github.com/cr0sh/qw/commit/7ada6d4db2d4f23f4867abe968d17d020983a44e).
-Both used the default
+Measured at [commit `117fecb`](https://github.com/cr0sh/qw/commit/117fecbc3c0f1be69a44c7bfe274f5f81d7ab24c). Both used the default
 [Jundot/Qwen3.8-27B-oQ4e-fp16-mtp](https://huggingface.co/Jundot/Qwen3.8-27B-oQ4e-fp16-mtp)
 checkpoint with Turbo4 KV cache on a Mac Studio with an Apple M4 Max
 40-core GPU and 64 GB of unified memory; decoding was greedy
