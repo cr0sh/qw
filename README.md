@@ -12,7 +12,8 @@ It is not a general multi-model or CUDA/ROCm runtime.
 
 ## Showcase
 
-[![asciicast demo implementing a QR Code generator webapp](https://asciinema.org/a/x86fzcfENeZzge26.svg)](https://asciinema.org/a/x86fzcfENeZzge26)
+Asciicast demo implementing a QR Code generator webapp(no speedup):
+![asciicast demo implementing a QR Code generator webapp](./static/qrcode-demo.gif)
 
 The Pi agent with QW built this QR-code app in 2m 40s:
 
