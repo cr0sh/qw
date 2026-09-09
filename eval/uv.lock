@@ -626,7 +626,7 @@ requires-dist = [
     { name = "aiohttp", specifier = "==3.14.3" },
     { name = "deepgram-sdk", specifier = "==7.8.1" },
     { name = "elevenlabs", specifier = "==2.66.0" },
-    { name = "evalscope", extras = ["ifbench", "sandbox"], specifier = "==1.11.0" },
+    { name = "evalscope", extras = ["ifbench", "sandbox"], specifier = "==1.11.1" },
     { name = "jiwer", specifier = "==4.0.0" },
     { name = "pyaudio", specifier = "==0.2.14" },
     { name = "pydub", specifier = "==0.25.1" },
@@ -637,7 +637,7 @@ requires-dist = [
 
 [[package]]
 name = "evalscope"
-version = "1.11.0"
+version = "1.11.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
@@ -676,9 +676,9 @@ dependencies = [
     { name = "word2number" },
     { name = "zhconv" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/5b/a7/3278056822eb863a772cc5a06017511de904ce1b3971fdb7d907e992bd37/evalscope-1.11.0.tar.gz", hash = "sha256:35569cbf6454ac3c5898423ccda7f4874d4ba73e9e06ed051ea009a2c7535f41", size = 3380648, upload-time = "2026-08-24T12:25:30.806Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/06/60/bfc86c326be072c15afccf4c1ee04952c08e56a839fe26a9e268a3be00ef/evalscope-1.11.1.tar.gz", hash = "sha256:4a6f4437a37543a608a08f5279eb215a2832d32d1ecc812ba8442a67c3340460", size = 3448280, upload-time = "2026-08-31T09:10:27.138Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d4/88/7c242c44ced34215ba1bf82b9c6058ae50a0c18a1cefe19bd185f7bc2fdb/evalscope-1.11.0-py3-none-any.whl", hash = "sha256:91b1cae1d6372528bfe4b03c4a065a1b5e84795e4ac532119407287251ad37a7", size = 4478564, upload-time = "2026-08-24T12:25:29.097Z" },
+    { url = "https://files.pythonhosted.org/packages/33/19/4915c3012c2245fe8dfd84d2d5af2378f198f6931d9d9677fd59908d642e/evalscope-1.11.1-py3-none-any.whl", hash = "sha256:5058c5112ee0dfff0048a48ee1ff9c6e1ca28bbed39ef5cd34a6a14d3ddf2b66", size = 4572937, upload-time = "2026-08-31T09:10:24.67Z" },
 ]
 
 [package.optional-dependencies]

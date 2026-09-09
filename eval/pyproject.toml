@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "EvalScope benchmarks for the local qw-server"
 requires-python = ">=3.12,<3.14"
 dependencies = [
-    "evalscope[ifbench,sandbox]==1.11.0",
+    "evalscope[ifbench,sandbox]==1.11.1",
     "tau2[knowledge] @ git+https://github.com/sierra-research/tau2-bench@17e07b1da2bbc0cadfddeea36412686e0604127b",
     # Required by upstream tau2 v1.0.0's eager voice imports on text-only paths.
     "pyaudio==0.2.14",
