@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+from importlib.metadata import version
 import os
 from pathlib import Path
 import subprocess
@@ -104,6 +105,7 @@ def main() -> int:
         generation_config={
             "max_tokens": 32768,
             "reasoning_effort": "medium",
+            "reasoning_history": "reasoning_field",
             "timeout": 7200,
             "extra_body": {"chat_template_kwargs": {"enable_thinking": True}},
         },
@@ -111,7 +113,8 @@ def main() -> int:
         work_dir=str(work_dir),
     )
 
-    print("evaluator=evalscope-1.11.0 native tau3_bench subset=banking_knowledge repeats=1 retrieval=bm25", flush=True)
+    print(f"evaluator=evalscope-{version('evalscope')} native tau3_bench subset=banking_knowledge repeats=1 retrieval=bm25", flush=True)
+    print("tau2_source=local_submodule base=v1.0.1 (gitlink pins upstream cherry-pick and compatibility repair)", flush=True)
     print(f"eval_batch_size={args.eval_batch_size} limit={args.limit} native_resume={args.resume is not None}", flush=True)
     print("agent=qwen3.8-27b endpoint=http://127.0.0.1:8883/v1 reasoning_effort=medium thinking=enabled max_tokens=32768", flush=True)
     print("simulator_and_nl_judge=deepseek-v4-pro endpoint=https://api.deepseek.com thinking=disabled temperature=0", flush=True)

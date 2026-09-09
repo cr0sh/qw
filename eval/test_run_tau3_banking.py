@@ -1,4 +1,4 @@
-"""Security boundaries for the configuration-only native launcher."""
+"""Security and reasoning-history boundaries for the native evaluator integration."""
 
 import os
 from pathlib import Path
@@ -60,6 +60,53 @@ class SimulatorCredentialTests(unittest.TestCase):
         self.credential_file.unlink()
         with self.assertRaises(SystemExit):
             _load_simulator_credentials()
+
+
+class NativeReasoningRoundTripTests(unittest.TestCase):
+    def test_private_reasoning_survives_tau_bridge_and_next_tool_turn(self):
+        import json
+        from evalscope.api.messages.chat_message import dict_to_chat_message
+        from evalscope.api.model.model_output import ChatCompletionChoice, ModelOutput
+        from evalscope.models.utils.openai import openai_chat_choices, openai_chat_message
+        from tau2.data_model.message import AssistantMessage, ToolCall
+        from tau2.utils.llm_utils import to_litellm_messages
+
+        reasoning = "\nReasoning retained exactly across a tool turn.\n"
+        message = dict_to_chat_message({
+            "role": "assistant",
+            "content": None,
+            "reasoning": reasoning,
+            "tool_calls": [{
+                "id": "call-search",
+                "type": "function",
+                "function": {"name": "KB_search", "arguments": {"query": "accounts"}},
+            }],
+        })
+        choice = ChatCompletionChoice(message=message, stop_reason="tool_calls")
+        completion = ModelOutput(model="test", choices=[choice])
+        visible = openai_chat_choices(completion.choices, include_reasoning=False)[0].message
+        native = AssistantMessage(
+            role="assistant",
+            content=visible.content,
+            tool_calls=[
+                ToolCall(id=call.id, name=call.function.name,
+                         arguments=json.loads(call.function.arguments))
+                for call in visible.tool_calls
+            ],
+            raw_data=completion.model_dump(),
+        )
+        history = to_litellm_messages([native])
+        wire = openai_chat_message(
+            dict_to_chat_message(history[0]), reasoning_format="reasoning_field"
+        )
+        self.assertEqual(wire["reasoning_content"], reasoning)
+        self.assertNotIn(reasoning, native.content or "")
+        self.assertNotIn(reasoning, wire.get("content") or "")
+        self.assertEqual(wire["tool_calls"][0]["id"], "call-search")
+        self.assertEqual(
+            json.loads(wire["tool_calls"][0]["function"]["arguments"]),
+            {"query": "accounts"},
+        )
 
 
 if __name__ == "__main__":

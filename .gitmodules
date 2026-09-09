@@ -1,3 +1,6 @@
 [submodule "mlxcel"]
 	path = mlxcel
 	url = https://github.com/lablup/mlxcel
+[submodule "eval/tau2-bench"]
+	path = eval/tau2-bench
+	url = https://github.com/sierra-research/tau2-bench.git

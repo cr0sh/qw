@@ -12,13 +12,32 @@ instructions, not commands to run alongside an already-active campaign.
 
 - Python 3.12 or 3.13; the commands below select 3.12.
 - `uv` and the locked dependencies in [`pyproject.toml`](pyproject.toml) and
-  [`uv.lock`](uv.lock): EvalScope **1.11.0** and `tau2[knowledge]` from official
-  **v1.0.0**, commit `17e07b1da2bbc0cadfddeea36412686e0604127b`.
-  The package is still named `tau2`; do not substitute τ² v0.2.0.
+  [`uv.lock`](uv.lock): EvalScope **1.11.1** and `tau2[knowledge]` installed from
+  the local `eval/tau2-bench` submodule. The fork starts at upstream **v1.0.1**
+  (`fc0055dc4e0a316c3f83133267fbd6faaa770992`), cherry-picks
+  `07a202cc9ffb2d73911835dd58c55ea280855935`, then repairs reasoning conversion
+  for native and EvalScope histories. The gitlink pins the complete fork.
 - On macOS, PortAudio must be available to build the pinned PyAudio dependency.
   Upstream's text path eagerly imports voice dependencies; the lock includes
   those required dependencies.
 - A tested QW binary and the Qwen3.8-27B model checkpoint.
+
+Initialize the fork in a fresh checkout using anonymous HTTPS:
+
+```bash
+git submodule init eval/tau2-bench
+git -c credential.helper= clone --no-checkout https://github.com/sierra-research/tau2-bench.git eval/tau2-bench
+git -C eval/tau2-bench fetch origin tag v1.0.1
+git -C eval/tau2-bench bundle verify ../tau2-bench-fork.bundle
+git -C eval/tau2-bench fetch ../tau2-bench-fork.bundle refs/heads/qwr/v1.0.1-pr389-reasoning
+git submodule absorbgitdirs eval/tau2-bench
+git submodule update --checkout --no-fetch eval/tau2-bench
+```
+
+The fork is local, not published on the upstream remote. Its tracked Git bundle
+supplies the commits missing from that remote. Ordinary recursive clones and
+Cargo Git installs cannot fetch this gitlink from upstream; use the bootstrap
+above and install from the local checkout until a hosted fork is published.
 
 Create the isolated reference environment without modifying an older environment:
 
@@ -26,7 +45,9 @@ Create the isolated reference environment without modifying an older environment
 (cd eval && UV_PROJECT_ENVIRONMENT=.venv-reference uv sync --locked --python 3.12 --no-editable)
 ```
 
-Use this interpreter explicitly. Do not install local evaluator patches.
+Use this interpreter explicitly. EvalScope remains unmodified; only the pinned
+Tau2 fork changes history conversion. After updating that fork, reinstall with
+`uv sync --locked --python 3.12 --no-editable --reinstall-package tau2` from `eval/`.
 
 ## Credentials
 
@@ -129,10 +150,20 @@ native scores and report recorded errors; do not selectively retry model failure
 The upstream catch also includes some infrastructure failures—there is no local
 scoring policy that separates them.
 
-The native bridge strips reasoning when converting model output back into Tau2
-messages. Thinking is enabled for generation, but **preservation of prior reasoning
-history is not guaranteed**. This run uses DeepSeek as the simulator/judge; it is
-not identical to leaderboard configurations using a different simulator.
+EvalScope's native bridge strips reasoning from participant-visible messages.
+The Tau2 fork recovers the agent's private reasoning from its stored model output
+and restores it to subsequent model requests. The launcher explicitly selects
+`reasoning_history="reasoning_field"`; Qwen3.8's template defaults to preserving
+that `reasoning_content`. Simulator reasoning is not forwarded to the agent.
+This is unmodified EvalScope with a patched Tau2 dependency, not stock Tau2.
+DeepSeek simulation/judging also differs from other leaderboard configurations.
+
+Before starting a full campaign, require a successful native smoke and verify
+that subsequent SDK requests contain the earlier reasoning traces unchanged.
+Verify positive cache reuse in server `generation.complete` events; for an
+unchanged full prefix, the next request's `cached_tokens` equals the previous
+request's `prompt_tokens + completion_tokens`. Start the full campaign with a
+different, empty prefix-cache directory and a fresh output directory.
 
 Earlier repository-owned-adapter campaigns are diagnostic artifacts, not
 upstream-reference results. The removed `--capture` flag and `TAU3_CAPTURE_PATH`
@@ -162,10 +193,11 @@ detached model/evaluator services so exiting the assistant harness does not stop
 them. Process persistence does not guarantee checkpoint recovery after an OS or
 storage failure.
 
-## Launcher security checks
+## Launcher and reasoning checks
 
 These checks do not call either model or modify the running campaign:
 
 ```bash
 eval/.venv-reference/bin/python -B -m unittest eval.test_run_tau3_banking
+eval/.venv-reference/bin/python -B -m unittest discover -s eval/tau2-bench/tests -p test_reasoning_history.py
 ```
