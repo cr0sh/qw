@@ -1528,6 +1528,7 @@ impl Qwen35Model {
             (0..target_layer_ids.len()).map(|_| None).collect();
         let rope_delta = self.mrope_state.rope_delta();
         let mut first_logits = None;
+        let mut roots = Vec::with_capacity(layer_hiddens.len() + 2);
         let mut start = 0;
         while start < prompt_len {
             let end = (start + chunk_len).min(prompt_len);
@@ -1591,7 +1592,7 @@ impl Qwen35Model {
             // Evaluate the whole backbone and every retained output together
             // before severing any cache roots. In particular, final logits
             // must not replay attention after its cache has been detached.
-            let mut roots = Vec::with_capacity(layer_hiddens.len() + 2);
+            roots.clear();
             roots.push(&*final_hidden as *const MlxArray);
             roots.extend(
                 layer_hiddens
@@ -1599,7 +1600,11 @@ impl Qwen35Model {
                     .filter_map(Option::as_deref)
                     .map(|array| array as *const MlxArray),
             );
-            roots.extend(first_logits.as_deref().map(|array| array as *const MlxArray));
+            roots.extend(
+                first_logits
+                    .as_deref()
+                    .map(|array| array as *const MlxArray),
+            );
             unsafe { mlxcel_core::eval_all(&roots) };
             self.sequence_state.with_internal(|caches| {
                 for cache in caches {
@@ -4079,10 +4084,22 @@ mod tests {
                     ("in_proj_b", [1, 64]),
                     ("out_proj", [64, 32]),
                 ] {
-                    insert(format!("{prefix}.linear_attn.{projection}.weight"), &shape, None);
+                    insert(
+                        format!("{prefix}.linear_attn.{projection}.weight"),
+                        &shape,
+                        None,
+                    );
                 }
-                insert(format!("{prefix}.linear_attn.conv1d.weight"), &[96, 4, 1], None);
-                insert(format!("{prefix}.linear_attn.norm.weight"), &[32], Some(1.0));
+                insert(
+                    format!("{prefix}.linear_attn.conv1d.weight"),
+                    &[96, 4, 1],
+                    None,
+                );
+                insert(
+                    format!("{prefix}.linear_attn.norm.weight"),
+                    &[32],
+                    Some(1.0),
+                );
                 insert(format!("{prefix}.linear_attn.dt_bias"), &[1], Some(0.0));
                 insert(format!("{prefix}.linear_attn.A_log"), &[1], Some(-1.0));
             } else {
@@ -4092,10 +4109,18 @@ mod tests {
                     ("v_proj", [64, 64]),
                     ("o_proj", [64, 64]),
                 ] {
-                    insert(format!("{prefix}.self_attn.{projection}.weight"), &shape, None);
+                    insert(
+                        format!("{prefix}.self_attn.{projection}.weight"),
+                        &shape,
+                        None,
+                    );
                 }
                 for norm in ["q_norm", "k_norm"] {
-                    insert(format!("{prefix}.self_attn.{norm}.weight"), &[64], Some(1.0));
+                    insert(
+                        format!("{prefix}.self_attn.{norm}.weight"),
+                        &[64],
+                        Some(1.0),
+                    );
                 }
             }
         }
@@ -4104,10 +4129,16 @@ mod tests {
     }
 
     fn assert_dflash_prefill_close(actual: &MlxArray, expected: &MlxArray) {
-        assert_eq!(mlxcel_core::array_shape(actual), mlxcel_core::array_shape(expected));
+        assert_eq!(
+            mlxcel_core::array_shape(actual),
+            mlxcel_core::array_shape(expected)
+        );
         let close = mlxcel_core::allclose(actual, expected, 1e-4, 1e-5);
         mlxcel_core::eval(&close);
-        assert!(mlxcel_core::item_bool(&close), "chunk boundaries changed model output");
+        assert!(
+            mlxcel_core::item_bool(&close),
+            "chunk boundaries changed model output"
+        );
     }
 
     #[test]
@@ -4119,10 +4150,14 @@ mod tests {
         // Single-pass ordinary capture is independent of the prefill loop.
         let reference = model.forward_dflash_verify(&input, &[0, 1]);
         let hidden = mlxcel_core::concatenate(
-            &reference.hidden_by_layer[0], &reference.hidden_by_layer[1], -1,
+            &reference.hidden_by_layer[0],
+            &reference.hidden_by_layer[1],
+            -1,
         );
         let logits = mlxcel_core::copy(&mlxcel_core::slice(
-            &reference.logits, &[0, 28, 0], &[1, 29, 32],
+            &reference.logits,
+            &[0, 28, 0],
+            &[1, 29, 32],
         ));
         mlxcel_core::eval(&hidden);
         mlxcel_core::eval(&logits);
@@ -4135,30 +4170,44 @@ mod tests {
                 let resumed = resume_mode != 0;
                 let segment = if resumed {
                     let prefix = mlxcel_core::slice(&input, &[0, 0], &[1, 11]);
-                    let prefix_output = model.forward_dflash_prefill_segment_chunked(
-                        &prefix, &[0, 1], hidden_limit, false, false, 7,
-                    ).expect("multi-chunk prefix");
+                    let prefix_output = model
+                        .forward_dflash_prefill_segment_chunked(
+                            &prefix,
+                            &[0, 1],
+                            hidden_limit,
+                            false,
+                            false,
+                            7,
+                        )
+                        .expect("multi-chunk prefix");
                     drop(prefix_output);
                     if resume_mode == 2 {
-                        let snapshot = model.snapshot_sequence_state(
-                            SequenceId::from_raw(11), 11, None,
-                        ).expect("snapshot unfinished prefix");
+                        let snapshot = model
+                            .snapshot_sequence_state(SequenceId::from_raw(11), 11, None)
+                            .expect("snapshot unfinished prefix");
                         model.reset_runtime_state();
-                        model.restore_sequence_state(SequenceId::from_raw(12), &snapshot)
+                        model
+                            .restore_sequence_state(SequenceId::from_raw(12), &snapshot)
                             .expect("restore unfinished prefix");
                     }
                     mlxcel_core::slice(&input, &[0, 11], &[1, 29])
                 } else {
                     mlxcel_core::share(&input)
                 };
-                let output = model.forward_dflash_prefill_segment_chunked(
-                    &segment, &[0, 1], hidden_limit, false, true, 7,
-                ).expect("multi-chunk prefill");
+                let output = model
+                    .forward_dflash_prefill_segment_chunked(
+                        &segment,
+                        &[0, 1],
+                        hidden_limit,
+                        false,
+                        true,
+                        7,
+                    )
+                    .expect("multi-chunk prefill");
                 let segment_rows = if resumed { 18 } else { 29 };
                 let kept = hidden_limit.min(segment_rows) as i32;
-                let expected_hidden = mlxcel_core::slice(
-                    &hidden, &[0, 29 - kept, 0], &[1, 29, 128],
-                );
+                let expected_hidden =
+                    mlxcel_core::slice(&hidden, &[0, 29 - kept, 0], &[1, 29, 128]);
                 assert_dflash_prefill_close(&output.hidden_concat, &expected_hidden);
                 assert_dflash_prefill_close(&output.first_logits, &logits);
                 model.sequence_state.with_internal(|caches| {
@@ -4177,9 +4226,11 @@ mod tests {
         let ids = (0..2048_i32).map(|i| i * 7 % 32).collect::<Vec<_>>();
         let input = mlxcel_core::from_slice_i32(&ids, &[1, 2048]);
         let warmup = mlxcel_core::slice(&input, &[0, 0], &[1, 64]);
-        drop(model.forward_dflash_prefill_segment_chunked(
-            &warmup, &[0, 1], 31, true, false, 64,
-        ).expect("warm kernels"));
+        drop(
+            model
+                .forward_dflash_prefill_segment_chunked(&warmup, &[0, 1], 31, true, false, 64)
+                .expect("warm kernels"),
+        );
 
         let mut peaks = Vec::new();
         // Explicitly materialized segments provide the same arithmetic/cache
@@ -4192,11 +4243,13 @@ mod tests {
             let segment_len = if explicit_segments { 64 } else { 2048 };
             for start in (0..2048).step_by(segment_len) {
                 let segment = mlxcel_core::slice(
-                    &input, &[0, start as i32], &[1, (start + segment_len) as i32],
+                    &input,
+                    &[0, start as i32],
+                    &[1, (start + segment_len) as i32],
                 );
-                let output = model.forward_dflash_prefill_segment_chunked(
-                    &segment, &[0, 1], 31, false, false, 64,
-                ).expect("measured prefill");
+                let output = model
+                    .forward_dflash_prefill_segment_chunked(&segment, &[0, 1], 31, false, false, 64)
+                    .expect("measured prefill");
                 let roots = [
                     &*output.hidden_concat as *const MlxArray,
                     &*output.first_logits as *const MlxArray,
@@ -4208,7 +4261,10 @@ mod tests {
             mlxcel_core::synchronize_default();
             peaks.push(mlxcel_core::memory::peak_memory().saturating_sub(baseline));
         }
-        eprintln!("DFlash prefill peak bytes: explicit={}, internal={}", peaks[0], peaks[1]);
+        eprintln!(
+            "DFlash prefill peak bytes: explicit={}, internal={}",
+            peaks[0], peaks[1]
+        );
         assert!(
             peaks[1] <= peaks[0] * 2 + 4 * 1024 * 1024,
             "internal chunks retained substantially more than one segment's graph: {peaks:?}",
