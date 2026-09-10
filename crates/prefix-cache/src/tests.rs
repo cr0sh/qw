@@ -2126,7 +2126,72 @@ fn publication_mirrors_cannot_evict_a_smaller_viable_hot_prefix() {
         256
     );
     assert_eq!(state.lock().unwrap().demand_loads, loads + 1);
+    assert_eq!(cache.memory_bytes(), 8);
+    assert_eq!(cache.lookup(&[999], SnapshotRoute::Baseline).unwrap().token_count, 1);
+    assert_eq!(state.lock().unwrap().demand_loads, loads + 1);
     assert!(cache.memory_bytes() <= 3_000);
+}
+
+#[test]
+fn restored_resident_bytes_trigger_eviction_before_returning_a_hit() {
+    let state = Arc::new(Mutex::new(RecordingState::default()));
+    let clock = ManualClock::new(1_000);
+    let mut cache = AdaptivePrefixCache::with_store_and_clock(
+        namespaces(),
+        memory_config(1),
+        Box::new(RecordingStore(Arc::clone(&state))),
+        Box::new(clock.clone()),
+    ).unwrap();
+    let tokens = (0..256).collect::<Vec<i32>>();
+    cache.insert(&tokens, vec![paged_snapshot_chain().remove(0)], SnapshotRoute::Baseline);
+    cache.flush_persistence();
+    cache.memory_cap = 5_000;
+    cache.insert(&[999], vec![snapshot(1, &[7.; 250])], SnapshotRoute::Baseline);
+    clock.set(2_000);
+    let restored = cache.lookup(&tokens, SnapshotRoute::Baseline).unwrap();
+    assert_eq!(restored.token_count, 256);
+    assert_eq!(cache.memory_bytes(), 2 * 2_048 + 4);
+    assert_eq!(state.lock().unwrap().demand_loads, 1);
+}
+
+#[test]
+fn equal_blob_pages_charge_independent_gpu_storage_and_one_shared_host_allocation() {
+    let state = Arc::new(Mutex::new(RecordingState::default()));
+    let page_bytes = 256 * 2 * std::mem::size_of::<f32>() as u64;
+    let mut cache = AdaptivePrefixCache::with_store(
+        namespaces(),
+        memory_config(3 * page_bytes + 4),
+        Box::new(RecordingStore(Arc::clone(&state))),
+    ).unwrap();
+    let array = mlxcel_core::from_slice_f32(&[7.; 1_024], &[1, 512, 2]);
+    let logits = mlxcel_core::from_slice_f32(&[1.], &[1]);
+    let mut source = ModelStateSnapshot::new("test", 512);
+    source.push_paged_tensor(None, "kv", &array, 1).unwrap();
+    source.set_continuation_logits(&logits);
+    let tokens = (0..512).collect::<Vec<i32>>();
+    cache.insert(&tokens, vec![PromptSnapshot::Baseline(source)], SnapshotRoute::Baseline);
+    cache.flush_persistence();
+    // The separately exported equal pages exceed capacity; disk decoding
+    // deduplicates their blob bytes while constructing independent GPU pages.
+    assert_eq!(cache.memory_bytes(), 0);
+    let hit = cache.lookup(&tokens, SnapshotRoute::Baseline).unwrap();
+    let portable = hit.snapshot().to_portable().unwrap();
+    assert_eq!(cache.memory_bytes(), 3 * page_bytes + 4);
+    assert_eq!(state.lock().unwrap().demand_loads, 1);
+
+    cache.memory_cap = 5 * page_bytes + 8;
+    let branch = vec![999; 512];
+    cache.insert(
+        &branch,
+        vec![PromptSnapshot::from_portable(portable.clone()).unwrap()],
+        SnapshotRoute::Baseline,
+    );
+    cache.flush_persistence();
+    assert_eq!(cache.memory_bytes(), 5 * page_bytes + 8);
+    for query in [&tokens, &branch] {
+        assert_eq!(cache.lookup(query, SnapshotRoute::Baseline).unwrap().snapshot().to_portable().unwrap(), portable);
+    }
+    assert_eq!(state.lock().unwrap().demand_loads, 1);
 }
 
 fn lookahead_fixture() -> (AdaptivePrefixCache, Arc<Mutex<RecordingState>>, ManualClock) {

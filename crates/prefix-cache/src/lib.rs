@@ -985,12 +985,7 @@ impl AdaptivePrefixCache {
                 .pages
                 .sort_unstable_by_key(|(identity, _)| *identity);
             resident.pages.dedup_by_key(|(identity, _)| *identity);
-            let hot_bytes = resident.local_bytes as u64
-                + resident
-                    .pages
-                    .iter()
-                    .map(|(_, bytes)| *bytes as u64)
-                    .sum::<u64>();
+            let hot_bytes = resident.resident_nbytes() as u64;
             // A snapshot that cannot fit alone must not evict viable hot prefixes.
             // Its portable data still follows the normal asynchronous persistence path.
             if hot_bytes > self.memory_cap
@@ -1157,7 +1152,8 @@ impl AdaptivePrefixCache {
                     .terminal_mut(node, route)
                     .expect("persistent terminal exists")
                     .last_access_unix_ms = now;
-                let bytes = decoded.snapshot.nbytes() as u64;
+                let summary = decoded.snapshot.storage_summary();
+                let bytes = summary.resident_nbytes() as u64;
                 if bytes > self.memory_cap {
                     // A disk hit need not fit in the hot tier. Keep this snapshot owned
                     // by the active request rather than promoting and evicting it before use.
@@ -1175,12 +1171,11 @@ impl AdaptivePrefixCache {
                     .trie
                     .terminal_mut(node, route)
                     .expect("persistent terminal exists");
-                let summary = decoded.snapshot.storage_summary();
                 terminal.snapshot = Some(Rc::new(decoded.snapshot));
                 terminal.page_refs = summary.pages;
                 terminal.local_bytes = summary.local_bytes;
                 terminal.response_resume = decoded.manifest.response_resume;
-                self.memory_bytes = self.memory_bytes.saturating_add(bytes);
+                self.rebuild_accounting();
                 if let Some(snapshot) = self.evict_memory(Some((node, route))) {
                     tracing::debug!(
                         phase = "cache.restore",
@@ -1437,6 +1432,7 @@ impl AdaptivePrefixCache {
 
     fn rebuild_accounting(&mut self) {
         let mut pages = HashMap::<u64, (usize, u64)>::new();
+        let mut host_pages = HashMap::<usize, usize>::new();
         for (node, route) in self.trie.terminal_ids() {
             let Some(t) = self.trie.terminal_mut(node, route) else {
                 continue;
@@ -1452,6 +1448,9 @@ impl AdaptivePrefixCache {
                 summary.pages.dedup_by_key(|(identity, _)| *identity);
                 t.page_refs = summary.pages;
                 t.local_bytes = summary.local_bytes;
+                for (identity, bytes) in summary.host_pages {
+                    host_pages.entry(identity).or_insert(bytes);
+                }
             }
             for &(id, bytes) in &t.page_refs {
                 let entry = pages.entry(id).or_insert((0, bytes as u64));
@@ -1469,7 +1468,8 @@ impl AdaptivePrefixCache {
                 .terminal_ids()
                 .into_iter()
                 .filter_map(|(n, r)| self.trie.terminal(n, r).map(|t| t.local_bytes as u64))
-                .sum::<u64>();
+                .sum::<u64>()
+            + host_pages.values().map(|bytes| *bytes as u64).sum::<u64>();
         let mut blobs = HashMap::<String, (usize, u64)>::new();
         for (node, route) in self.trie.terminal_ids() {
             if let Some(t) = self.trie.terminal(node, route) {

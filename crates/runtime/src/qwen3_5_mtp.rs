@@ -139,8 +139,15 @@ impl MtpPromptSnapshot {
         let draft = self.draft.storage_summary();
         let mut pages = target.pages;
         pages.extend(draft.pages);
+        pages.sort_unstable_by_key(|(identity, _)| *identity);
+        pages.dedup_by_key(|(identity, _)| *identity);
+        let mut host_pages = target.host_pages;
+        host_pages.extend(draft.host_pages);
+        host_pages.sort_unstable_by_key(|(identity, _)| *identity);
+        host_pages.dedup_by_key(|(identity, _)| *identity);
         mlxcel_core::generate::SnapshotStorageSummary {
             pages,
+            host_pages,
             local_bytes: target.local_bytes
                 + draft.local_bytes
                 + mlxcel_core::array_nbytes(&self.last_hidden)

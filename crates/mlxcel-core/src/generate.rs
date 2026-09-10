@@ -431,26 +431,48 @@ impl ModelStateSnapshot {
 /// Canonical storage accounting for a captured model state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotStorageSummary {
-    /// Shared paged storage, represented as `(identity, bytes)`.
+    /// Unique GPU pages, represented as `(page identity, logical bytes)`.
     pub pages: Vec<(u64, usize)>,
+    /// Unique memoized host allocations, represented as `(allocation address, bytes)`.
+    /// Addresses are identities only while the summarized snapshots remain alive;
+    /// distinct GPU pages may share one host allocation after blob decoding.
+    pub host_pages: Vec<(usize, usize)>,
     /// Dense tensors and terminal-local arrays, never shared across snapshots.
     pub local_bytes: usize,
+}
+
+impl SnapshotStorageSummary {
+    /// Resident payload of this snapshot, with each shared allocation counted once.
+    pub fn resident_nbytes(&self) -> usize {
+        self.local_bytes
+            + self.pages.iter().map(|(_, bytes)| bytes).sum::<usize>()
+            + self.host_pages.iter().map(|(_, bytes)| bytes).sum::<usize>()
+    }
 }
 
 impl ModelStateSnapshot {
     /// Return page identities and terminal-local bytes for accounting.
     pub fn storage_summary(&self) -> SnapshotStorageSummary {
         let mut pages = Vec::new();
+        let mut host_pages = Vec::new();
+        let mut seen_host = HashSet::new();
         let mut seen = HashSet::new();
         for tensor in &self.paged_tensors {
             for page in &tensor.pages {
                 if seen.insert(page.identity()) {
-                    pages.push((page.identity(), page.nbytes() + page.portable_nbytes()));
+                    pages.push((page.identity(), page.nbytes()));
+                    if let Some(bytes) = page.portable.get() {
+                        let identity = bytes.as_ptr() as usize;
+                        if seen_host.insert(identity) {
+                            host_pages.push((identity, bytes.len()));
+                        }
+                    }
                 }
             }
         }
         SnapshotStorageSummary {
             pages,
+            host_pages,
             local_bytes: self
                 .tensors
                 .iter()
