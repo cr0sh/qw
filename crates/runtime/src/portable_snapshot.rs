@@ -149,19 +149,17 @@ fn model_to_portable(snapshot: &ModelStateSnapshot) -> PortableModelState {
         paged_tensors: snapshot
             .paged_tensor_names()
             .filter_map(|name| {
-                snapshot
-                    .paged_tensor(name)
-                    .map(|tensor| {
-                        if started.is_some() {
-                            for page in tensor.pages() {
-                                let cached = page.portable_nbytes();
-                                reused_page_bytes += cached;
-                                if cached == 0 {
-                                    new_page_bytes += page.nbytes();
-                                }
+                snapshot.paged_tensor(name).map(|tensor| {
+                    if started.is_some() {
+                        for page in tensor.pages() {
+                            let cached = page.portable_nbytes();
+                            reused_page_bytes += cached;
+                            if cached == 0 {
+                                new_page_bytes += page.nbytes();
                             }
                         }
-                        PortablePagedTensor {
+                    }
+                    PortablePagedTensor {
                         name: name.to_string(),
                         token_axis: tensor.token_axis(),
                         token_len: tensor.token_len(),
@@ -177,8 +175,8 @@ fn model_to_portable(snapshot: &ModelStateSnapshot) -> PortableModelState {
                                 bytes,
                             })
                             .collect(),
-                        }
-                    })
+                    }
+                })
             })
             .collect(),
         continuation_logits: snapshot
@@ -192,8 +190,15 @@ fn model_to_portable(snapshot: &ModelStateSnapshot) -> PortableModelState {
             token_len = snapshot.token_len(),
             new_page_bytes,
             reused_page_bytes,
-            local_bytes = portable.tensors.iter().map(|array| array.bytes.len()).sum::<usize>()
-                + portable.continuation_logits.as_ref().map_or(0, |array| array.bytes.len()),
+            local_bytes = portable
+                .tensors
+                .iter()
+                .map(|array| array.bytes.len())
+                .sum::<usize>()
+                + portable
+                    .continuation_logits
+                    .as_ref()
+                    .map_or(0, |array| array.bytes.len()),
             duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
         );
     }

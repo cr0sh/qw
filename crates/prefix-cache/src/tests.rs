@@ -2074,7 +2074,9 @@ fn publication_charges_shared_host_pages_after_export_and_preserves_evicted_pins
     let mut snapshots = paged_snapshot_chain();
     let final_snapshot = snapshots.pop().unwrap();
     cache.insert(&tokens[..512], snapshots, SnapshotRoute::Baseline);
-    let pinned = cache.lookup(&tokens[..512], SnapshotRoute::Baseline).unwrap();
+    let pinned = cache
+        .lookup(&tokens[..512], SnapshotRoute::Baseline)
+        .unwrap();
     let expected = pinned.snapshot().to_portable().unwrap();
     cache.insert(&tokens, vec![final_snapshot], SnapshotRoute::Baseline);
     cache.flush_persistence();
@@ -2086,7 +2088,9 @@ fn publication_charges_shared_host_pages_after_export_and_preserves_evicted_pins
     cache.evict_memory(None);
     assert_eq!(cache.memory_bytes(), 0);
     assert_eq!(pinned.snapshot().to_portable().unwrap(), expected);
-    let restored = cache.lookup(&tokens[..512], SnapshotRoute::Baseline).unwrap();
+    let restored = cache
+        .lookup(&tokens[..512], SnapshotRoute::Baseline)
+        .unwrap();
     assert_eq!(restored.snapshot().to_portable().unwrap(), expected);
     assert_eq!(cache.memory_bytes(), 0);
 }
@@ -2106,9 +2110,21 @@ fn publication_mirrors_cannot_evict_a_smaller_viable_hot_prefix() {
     cache.insert(&tokens, vec![first], SnapshotRoute::Baseline);
     cache.flush_persistence();
     let loads = state.lock().unwrap().demand_loads;
-    assert_eq!(cache.lookup(&[999], SnapshotRoute::Baseline).unwrap().token_count, 1);
+    assert_eq!(
+        cache
+            .lookup(&[999], SnapshotRoute::Baseline)
+            .unwrap()
+            .token_count,
+        1
+    );
     assert_eq!(state.lock().unwrap().demand_loads, loads);
-    assert_eq!(cache.lookup(&tokens, SnapshotRoute::Baseline).unwrap().token_count, 256);
+    assert_eq!(
+        cache
+            .lookup(&tokens, SnapshotRoute::Baseline)
+            .unwrap()
+            .token_count,
+        256
+    );
     assert_eq!(state.lock().unwrap().demand_loads, loads + 1);
     assert!(cache.memory_bytes() <= 3_000);
 }

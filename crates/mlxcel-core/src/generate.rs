@@ -495,11 +495,19 @@ impl ModelStateSnapshot {
     /// advances: otherwise retained prefix pages keep historical dense KV
     /// backing alive even after their corresponding cache entries are evicted.
     pub fn materialize(&self) {
-        let mut roots: Vec<*const MlxArray> = self
-            .tensors
+        let page_count: usize = self
+            .paged_tensors
             .iter()
-            .map(|tensor| tensor.array() as *const MlxArray)
-            .collect();
+            .map(|tensor| tensor.pages.len())
+            .sum();
+        let mut roots = Vec::with_capacity(
+            self.tensors.len() + page_count + usize::from(self.continuation_logits.is_some()),
+        );
+        roots.extend(
+            self.tensors
+                .iter()
+                .map(|tensor| tensor.array() as *const MlxArray),
+        );
         roots.extend(
             self.paged_tensors
                 .iter()
@@ -4810,12 +4818,8 @@ mod tests {
         for _ in 0..4 {
             let mut previous = None;
             for page_count in 1..=12 {
-                let source = ffi::from_slice_f32(
-                    &vec![1.0; 16384 * 256],
-                    &[1, 16384, 256],
-                );
-                let mut snapshot =
-                    ModelStateSnapshot::new("backing-lifetime", page_count * 256);
+                let source = ffi::from_slice_f32(&vec![1.0; 16384 * 256], &[1, 16384, 256]);
+                let mut snapshot = ModelStateSnapshot::new("backing-lifetime", page_count * 256);
                 snapshot
                     .push_paged_tensor(previous.as_ref(), "kv", &source, 1)
                     .expect("capture");

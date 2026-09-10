@@ -551,7 +551,10 @@ impl AdaptivePrefixCache {
                 continue;
             };
             if let Some(snapshot) = &t.snapshot {
-                let Some(reservation) = self.staging.reserve((snapshot.nbytes() as u64).saturating_mul(2)) else {
+                let Some(reservation) = self
+                    .staging
+                    .reserve((snapshot.nbytes() as u64).saturating_mul(2))
+                else {
                     tracing::debug!(phase = "cache.prefetch.skip", entry_id = %key.0, reason = "hot_pin_budget");
                     return;
                 };
@@ -970,12 +973,24 @@ impl AdaptivePrefixCache {
                 terminal.serialized_bytes = 0;
             }
             // Export may have added shared host mirrors since initial admission.
-            let mut resident = self.trie.terminal(node, route).unwrap()
-                .snapshot.as_ref().unwrap().storage_summary();
-            resident.pages.sort_unstable_by_key(|(identity, _)| *identity);
+            let mut resident = self
+                .trie
+                .terminal(node, route)
+                .unwrap()
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .storage_summary();
+            resident
+                .pages
+                .sort_unstable_by_key(|(identity, _)| *identity);
             resident.pages.dedup_by_key(|(identity, _)| *identity);
             let hot_bytes = resident.local_bytes as u64
-                + resident.pages.iter().map(|(_, bytes)| *bytes as u64).sum::<u64>();
+                + resident
+                    .pages
+                    .iter()
+                    .map(|(_, bytes)| *bytes as u64)
+                    .sum::<u64>();
             // A snapshot that cannot fit alone must not evict viable hot prefixes.
             // Its portable data still follows the normal asynchronous persistence path.
             if hot_bytes > self.memory_cap
@@ -1431,7 +1446,9 @@ impl AdaptivePrefixCache {
             // insertion, so cached insertion-time sizes are not authoritative.
             if let Some(snapshot) = &t.snapshot {
                 let mut summary = snapshot.storage_summary();
-                summary.pages.sort_unstable_by_key(|(identity, _)| *identity);
+                summary
+                    .pages
+                    .sort_unstable_by_key(|(identity, _)| *identity);
                 summary.pages.dedup_by_key(|(identity, _)| *identity);
                 t.page_refs = summary.pages;
                 t.local_bytes = summary.local_bytes;
