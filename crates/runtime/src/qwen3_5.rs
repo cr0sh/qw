@@ -1490,6 +1490,26 @@ impl Qwen35Model {
         reset: bool,
         finish: bool,
     ) -> std::result::Result<Qwen35DflashPrefill, String> {
+        self.forward_dflash_prefill_segment_chunked(
+            input_ids,
+            target_layer_ids,
+            hidden_limit,
+            reset,
+            finish,
+            mlxcel_core::generate::prefill_chunk_len(),
+        )
+    }
+
+    #[cfg(any(feature = "dflash2", test))]
+    fn forward_dflash_prefill_segment_chunked(
+        &self,
+        input_ids: &MlxArray,
+        target_layer_ids: &[usize],
+        hidden_limit: usize,
+        reset: bool,
+        finish: bool,
+        configured: usize,
+    ) -> std::result::Result<Qwen35DflashPrefill, String> {
         if reset {
             self.reset_runtime_state();
         }
@@ -1498,7 +1518,6 @@ impl Qwen35Model {
         if prompt_len == 0 {
             return Err("DFlash2 prefill requires at least one token".to_owned());
         }
-        let configured = mlxcel_core::generate::prefill_chunk_len();
         let chunk_len =
             mlxcel_core::generate::effective_prefill_chunk(configured, true, prompt_len as usize)
                 .unwrap_or(prompt_len as usize) as i32;
@@ -1525,25 +1544,34 @@ impl Qwen35Model {
                     h = layer.forward(&h, None, cache, position_ids.as_deref());
                     if let Some(capture_idx) = target_layer_ids.iter().position(|&t| t == layer_idx)
                     {
-                        // Accumulate this layer's hidden rows (all positions of
-                        // this chunk row-wise).
-                        let h_rows = mlxcel_core::copy(&h);
-                        let current = layer_hiddens[capture_idx].take();
-                        let mut combined = match current {
-                            Some(prior) => mlxcel_core::concatenate(&prior, &h_rows, 1),
-                            None => h_rows,
+                        // Trim before copying so a short retained window does
+                        // not keep the whole chunk's allocation alive.
+                        let h_shape = mlxcel_core::array_shape(&h);
+                        let keep = (h_shape[1] as usize).min(hidden_limit) as i32;
+                        let h_rows = if keep < h_shape[1] {
+                            mlxcel_core::copy(&mlxcel_core::slice(
+                                &h,
+                                &[0, h_shape[1] - keep, 0],
+                                &[h_shape[0], h_shape[1], h_shape[2]],
+                            ))
+                        } else {
+                            mlxcel_core::share(&h)
                         };
-                        // Keep at most `hidden_limit` rows; drop leading ones.
-                        let combined_shape = mlxcel_core::array_shape(&combined);
-                        let rows = combined_shape[1];
-                        if rows as usize > hidden_limit {
-                            let drop = rows as usize - hidden_limit;
-                            combined = mlxcel_core::slice(
-                                &combined,
-                                &[0, drop as i32, 0],
-                                &[combined_shape[0], rows, combined_shape[2]],
-                            );
-                        }
+                        let current = layer_hiddens[capture_idx].take();
+                        let combined = match current {
+                            Some(prior) if (keep as usize) < hidden_limit => {
+                                let prior_shape = mlxcel_core::array_shape(&prior);
+                                let prior_keep =
+                                    (hidden_limit - keep as usize).min(prior_shape[1] as usize);
+                                let prior = mlxcel_core::slice(
+                                    &prior,
+                                    &[0, prior_shape[1] - prior_keep as i32, 0],
+                                    &prior_shape,
+                                );
+                                mlxcel_core::concatenate(&prior, &h_rows, 1)
+                            }
+                            _ => h_rows,
+                        };
                         layer_hiddens[capture_idx] = Some(combined);
                     }
                 }
@@ -1560,6 +1588,25 @@ impl Qwen35Model {
                 );
                 first_logits = Some(self.project_logits(&self.norm.forward(&last_hidden)));
             }
+            // Evaluate the whole backbone and every retained output together
+            // before severing any cache roots. In particular, final logits
+            // must not replay attention after its cache has been detached.
+            let mut roots = Vec::with_capacity(layer_hiddens.len() + 2);
+            roots.push(&*final_hidden as *const MlxArray);
+            roots.extend(
+                layer_hiddens
+                    .iter()
+                    .filter_map(Option::as_deref)
+                    .map(|array| array as *const MlxArray),
+            );
+            roots.extend(first_logits.as_deref().map(|array| array as *const MlxArray));
+            unsafe { mlxcel_core::eval_all(&roots) };
+            self.sequence_state.with_internal(|caches| {
+                for cache in caches {
+                    cache.materialize_state();
+                }
+            });
+            unsafe { mlxcel_core::detach_all(&roots) };
             start = end;
         }
         if finish {
@@ -3981,6 +4028,191 @@ mod tests {
                 .contains_key("vision_tower.patch_embed.proj.weight")
         );
         assert!(sanitized.target.contains_key("model.embed_tokens.weight"));
+    }
+
+    fn dflash_prefill_test_model() -> Qwen35Model {
+        let config: Qwen35Config = serde_json::from_value(serde_json::json!({
+            "model_type": "qwen3_5_text",
+            "hidden_size": 64,
+            "num_hidden_layers": 2,
+            "intermediate_size": 128,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 64,
+            "full_attention_interval": 2,
+            "linear_num_key_heads": 1,
+            "linear_num_value_heads": 1,
+            "linear_key_head_dim": 32,
+            "linear_value_head_dim": 32,
+            "linear_conv_kernel_dim": 4,
+            "vocab_size": 32,
+            "tie_word_embeddings": true
+        }))
+        .expect("small hybrid config");
+        let mut weights = WeightMap::new();
+        let mut insert = |name: String, shape: &[i32], constant: Option<f32>| {
+            let len = shape.iter().map(|&dim| dim as usize).product();
+            let values = (0..len)
+                .map(|i| constant.unwrap_or_else(|| ((i * 13 + name.len()) as f32).sin() * 0.025))
+                .collect::<Vec<_>>();
+            weights.insert(name, mlxcel_core::from_slice_f32(&values, shape));
+        };
+        insert("model.embed_tokens.weight".into(), &[32, 64], None);
+        insert("model.norm.weight".into(), &[64], Some(1.0));
+        for layer in 0..2 {
+            let prefix = format!("model.layers.{layer}");
+            for norm in ["input_layernorm", "post_attention_layernorm"] {
+                insert(format!("{prefix}.{norm}.weight"), &[64], Some(1.0));
+            }
+            for (projection, shape) in [
+                ("gate_proj", [128, 64]),
+                ("up_proj", [128, 64]),
+                ("down_proj", [64, 128]),
+            ] {
+                insert(format!("{prefix}.mlp.{projection}.weight"), &shape, None);
+            }
+            if layer == 0 {
+                for (projection, shape) in [
+                    ("in_proj_qkv", [96, 64]),
+                    ("in_proj_z", [32, 64]),
+                    ("in_proj_a", [1, 64]),
+                    ("in_proj_b", [1, 64]),
+                    ("out_proj", [64, 32]),
+                ] {
+                    insert(format!("{prefix}.linear_attn.{projection}.weight"), &shape, None);
+                }
+                insert(format!("{prefix}.linear_attn.conv1d.weight"), &[96, 4, 1], None);
+                insert(format!("{prefix}.linear_attn.norm.weight"), &[32], Some(1.0));
+                insert(format!("{prefix}.linear_attn.dt_bias"), &[1], Some(0.0));
+                insert(format!("{prefix}.linear_attn.A_log"), &[1], Some(-1.0));
+            } else {
+                for (projection, shape) in [
+                    ("q_proj", [128, 64]),
+                    ("k_proj", [64, 64]),
+                    ("v_proj", [64, 64]),
+                    ("o_proj", [64, 64]),
+                ] {
+                    insert(format!("{prefix}.self_attn.{projection}.weight"), &shape, None);
+                }
+                for norm in ["q_norm", "k_norm"] {
+                    insert(format!("{prefix}.self_attn.{norm}.weight"), &[64], Some(1.0));
+                }
+            }
+        }
+        Qwen35Model::from_weights(&weights, &config, KVCacheMode::Fp16)
+            .expect("small hybrid weights")
+    }
+
+    fn assert_dflash_prefill_close(actual: &MlxArray, expected: &MlxArray) {
+        assert_eq!(mlxcel_core::array_shape(actual), mlxcel_core::array_shape(expected));
+        let close = mlxcel_core::allclose(actual, expected, 1e-4, 1e-5);
+        mlxcel_core::eval(&close);
+        assert!(mlxcel_core::item_bool(&close), "chunk boundaries changed model output");
+    }
+
+    #[test]
+    fn dflash_prefill_chunks_match_fresh_resumed_and_restored_continuations() {
+        let model = dflash_prefill_test_model();
+        let ids = (0..29_i32).map(|i| i * 7 % 32).collect::<Vec<_>>();
+        let input = mlxcel_core::from_slice_i32(&ids, &[1, 29]);
+        let next = mlxcel_core::from_slice_i32(&[5, 19], &[1, 2]);
+        // Single-pass ordinary capture is independent of the prefill loop.
+        let reference = model.forward_dflash_verify(&input, &[0, 1]);
+        let hidden = mlxcel_core::concatenate(
+            &reference.hidden_by_layer[0], &reference.hidden_by_layer[1], -1,
+        );
+        let logits = mlxcel_core::copy(&mlxcel_core::slice(
+            &reference.logits, &[0, 28, 0], &[1, 29, 32],
+        ));
+        mlxcel_core::eval(&hidden);
+        mlxcel_core::eval(&logits);
+        let continuation = model.forward_dflash_verify(&next, &[0, 1]);
+        mlxcel_core::eval(&continuation.logits);
+
+        for hidden_limit in [5, usize::MAX] {
+            for resume_mode in 0..3 {
+                model.reset_runtime_state();
+                let resumed = resume_mode != 0;
+                let segment = if resumed {
+                    let prefix = mlxcel_core::slice(&input, &[0, 0], &[1, 11]);
+                    let prefix_output = model.forward_dflash_prefill_segment_chunked(
+                        &prefix, &[0, 1], hidden_limit, false, false, 7,
+                    ).expect("multi-chunk prefix");
+                    drop(prefix_output);
+                    if resume_mode == 2 {
+                        let snapshot = model.snapshot_sequence_state(
+                            SequenceId::from_raw(11), 11, None,
+                        ).expect("snapshot unfinished prefix");
+                        model.reset_runtime_state();
+                        model.restore_sequence_state(SequenceId::from_raw(12), &snapshot)
+                            .expect("restore unfinished prefix");
+                    }
+                    mlxcel_core::slice(&input, &[0, 11], &[1, 29])
+                } else {
+                    mlxcel_core::share(&input)
+                };
+                let output = model.forward_dflash_prefill_segment_chunked(
+                    &segment, &[0, 1], hidden_limit, false, true, 7,
+                ).expect("multi-chunk prefill");
+                let segment_rows = if resumed { 18 } else { 29 };
+                let kept = hidden_limit.min(segment_rows) as i32;
+                let expected_hidden = mlxcel_core::slice(
+                    &hidden, &[0, 29 - kept, 0], &[1, 29, 128],
+                );
+                assert_dflash_prefill_close(&output.hidden_concat, &expected_hidden);
+                assert_dflash_prefill_close(&output.first_logits, &logits);
+                model.sequence_state.with_internal(|caches| {
+                    assert!(caches.iter().all(|cache| cache.offset() == 29));
+                });
+                let actual_next = model.forward_dflash_verify(&next, &[0, 1]);
+                assert_dflash_prefill_close(&actual_next.logits, &continuation.logits);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an isolated GPU process: resets global MLX peak-memory counters"]
+    fn dflash_prefill_chunk_peak_tracks_explicit_materialized_segments() {
+        let model = dflash_prefill_test_model();
+        let ids = (0..2048_i32).map(|i| i * 7 % 32).collect::<Vec<_>>();
+        let input = mlxcel_core::from_slice_i32(&ids, &[1, 2048]);
+        let warmup = mlxcel_core::slice(&input, &[0, 0], &[1, 64]);
+        drop(model.forward_dflash_prefill_segment_chunked(
+            &warmup, &[0, 1], 31, true, false, 64,
+        ).expect("warm kernels"));
+
+        let mut peaks = Vec::new();
+        // Explicitly materialized segments provide the same arithmetic/cache
+        // growth with a known bounded graph, independent of the internal loop.
+        for explicit_segments in [true, false] {
+            model.reset_runtime_state();
+            mlxcel_core::synchronize_default();
+            let baseline = mlxcel_core::memory::active_memory();
+            mlxcel_core::memory::reset_peak_memory();
+            let segment_len = if explicit_segments { 64 } else { 2048 };
+            for start in (0..2048).step_by(segment_len) {
+                let segment = mlxcel_core::slice(
+                    &input, &[0, start as i32], &[1, (start + segment_len) as i32],
+                );
+                let output = model.forward_dflash_prefill_segment_chunked(
+                    &segment, &[0, 1], 31, false, false, 64,
+                ).expect("measured prefill");
+                let roots = [
+                    &*output.hidden_concat as *const MlxArray,
+                    &*output.first_logits as *const MlxArray,
+                ];
+                unsafe { mlxcel_core::eval_all(&roots) };
+                model.materialize_mtp_cache_state();
+                unsafe { mlxcel_core::detach_all(&roots) };
+            }
+            mlxcel_core::synchronize_default();
+            peaks.push(mlxcel_core::memory::peak_memory().saturating_sub(baseline));
+        }
+        eprintln!("DFlash prefill peak bytes: explicit={}, internal={}", peaks[0], peaks[1]);
+        assert!(
+            peaks[1] <= peaks[0] * 2 + 4 * 1024 * 1024,
+            "internal chunks retained substantially more than one segment's graph: {peaks:?}",
+        );
     }
 
     #[test]
