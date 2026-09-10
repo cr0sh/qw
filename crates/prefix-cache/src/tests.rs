@@ -104,6 +104,10 @@ fn paged_snapshot_chain() -> Vec<PromptSnapshot> {
     third
         .push_paged_tensor(Some(&second), "kv", &array, 1)
         .expect("third pages");
+    let logits = mlxcel_core::from_slice_f32(&[1.], &[1]);
+    for snapshot in [&mut first, &mut second, &mut third] {
+        snapshot.set_continuation_logits(&logits);
+    }
     vec![
         PromptSnapshot::Baseline(first),
         PromptSnapshot::Baseline(second),
@@ -2052,7 +2056,7 @@ fn adaptive_memory_accounts_shared_checkpoint_pages_once() {
 
     assert_eq!(
         cache.memory_bytes(),
-        3 * 256 * 2 * std::mem::size_of::<f32>() as u64,
+        3 * 256 * 2 * std::mem::size_of::<f32>() as u64 + 3 * 4,
         "linear checkpoints charge unique page bytes, not cumulative logical sizes"
     );
 }
@@ -2075,7 +2079,7 @@ fn publication_charges_shared_host_pages_after_export_and_preserves_evicted_pins
     cache.insert(&tokens, vec![final_snapshot], SnapshotRoute::Baseline);
     cache.flush_persistence();
     let page_bytes = 256 * 2 * std::mem::size_of::<f32>() as u64;
-    assert_eq!(cache.memory_bytes(), 2 * 3 * page_bytes);
+    assert_eq!(cache.memory_bytes(), 2 * 3 * page_bytes + 3 * 4);
     assert_eq!(cache.staging.used.load(Ordering::Acquire), 0);
 
     cache.memory_cap = 0;
