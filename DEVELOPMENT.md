@@ -122,6 +122,12 @@ Metal evaluates and detaches its output before constructing the next tile so
 lazy graphs do not retain every tile's transient score buffers together.
 The budget covers raw attention scores, not total process or GPU memory.
 
+DFlash target prefill also materializes each configured chunk before advancing:
+captured hidden rows and final logits are evaluated before recurrent and attention
+cache state is materialized, then the retained output roots are detached. Hidden
+captures are trimmed to the draft model's required window before copying. This
+bounds cross-chunk lazy-graph retention, not live KV storage or total memory.
+
 This workspace scheduling does not truncate model context, change the
 DFlash/GDN prefill chunk boundaries, alter sampling or decoder selection, or
 change caller token budgets. Weights, live/restored KV state, allocator history,
