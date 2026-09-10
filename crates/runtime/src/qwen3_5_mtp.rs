@@ -19,6 +19,7 @@
 //! Apache-2.0 `mlxcel` Qwen 3.5 implementation.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use crate::portable_snapshot::{
@@ -134,13 +135,25 @@ impl MtpPromptSnapshot {
             + mlxcel_core::array_nbytes(&self.continuation_logits)
     }
 
+    /// Count existing host allocations shared by the target and draft only once.
+    pub fn resident_host_bytes(&self, seen: &mut HashSet<usize>) -> usize {
+        self.target.resident_host_bytes(seen) + self.draft.resident_host_bytes(seen)
+    }
+
     pub fn storage_summary(&self) -> mlxcel_core::generate::SnapshotStorageSummary {
         let target = self.target.storage_summary();
         let draft = self.draft.storage_summary();
         let mut pages = target.pages;
         pages.extend(draft.pages);
+        pages.sort_unstable_by_key(|(identity, _)| *identity);
+        pages.dedup_by_key(|(identity, _)| *identity);
+        let mut host_pages = target.host_pages;
+        host_pages.extend(draft.host_pages);
+        host_pages.sort_unstable_by_key(|(identity, _)| *identity);
+        host_pages.dedup_by_key(|(identity, _)| *identity);
         mlxcel_core::generate::SnapshotStorageSummary {
             pages,
+            host_pages,
             local_bytes: target.local_bytes
                 + draft.local_bytes
                 + mlxcel_core::array_nbytes(&self.last_hidden)
@@ -878,7 +891,9 @@ impl Qwen35MtpDraftModel {
         } else if expected_offset > 0 {
             return None;
         }
-        let detached = |array: &MlxArray| materialize_detached(mlxcel_core::copy(array));
+        draft.materialize();
+        let detached =
+            |array: &MlxArray| materialize_detached(mlxcel_core::contiguous(array, false));
         Some(MtpPromptSnapshot {
             target,
             draft,

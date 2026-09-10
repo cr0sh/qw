@@ -4,7 +4,7 @@ mod store;
 mod tests;
 mod trie;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -209,7 +209,7 @@ struct PutCompletion {
 // 2 * logical bytes before to_portable, then grows by the exact encoded manifest
 // size on the worker before allocating its serialized buffer; read/decode reserves
 // 3 * (disk blob bytes + exact manifest bytes), and a hot lookahead pin reserves
-// logical bytes. Pending writes discover manifest size and grow the reservation
+// 2 * logical bytes including memoized host pages. Pending writes discover manifest size and grow the reservation
 // on the worker before allocating any read buffers. Rust metadata and channel
 // bookkeeping are additional bounded overhead, not payload bytes.
 // Active request-owned snapshots are not cache staging after demand consumes them.
@@ -551,7 +551,10 @@ impl AdaptivePrefixCache {
                 continue;
             };
             if let Some(snapshot) = &t.snapshot {
-                let Some(reservation) = self.staging.reserve(snapshot.nbytes() as u64) else {
+                let Some(reservation) = self
+                    .staging
+                    .reserve((snapshot.nbytes() as u64).saturating_mul(2))
+                else {
                     tracing::debug!(phase = "cache.prefetch.skip", entry_id = %key.0, reason = "hot_pin_budget");
                     return;
                 };
@@ -824,6 +827,8 @@ impl AdaptivePrefixCache {
                     terminal.blob_refs.clear();
                     terminal.serialized_bytes = 0;
                     terminal.manifest_bytes = 0;
+                    terminal.page_refs.clear();
+                    terminal.local_bytes = 0;
                     (
                         terminal.snapshot.take(),
                         previous_persistent_key,
@@ -847,12 +852,6 @@ impl AdaptivePrefixCache {
                 .pages
                 .sort_unstable_by_key(|(identity, _)| *identity);
             summary.pages.dedup_by_key(|(identity, _)| *identity);
-            let hot_bytes = summary.local_bytes as u64
-                + summary
-                    .pages
-                    .iter()
-                    .map(|(_, page_bytes)| *page_bytes as u64)
-                    .sum::<u64>();
             inserted_logical_bytes = inserted_logical_bytes.saturating_add(bytes);
             inserted_unique_page_bytes = inserted_unique_page_bytes.saturating_add(
                 summary
@@ -975,6 +974,20 @@ impl AdaptivePrefixCache {
                 terminal.blob_refs.clear();
                 terminal.serialized_bytes = 0;
             }
+            // Export may have added shared host mirrors since initial admission.
+            let mut resident = self
+                .trie
+                .terminal(node, route)
+                .unwrap()
+                .snapshot
+                .as_ref()
+                .unwrap()
+                .storage_summary();
+            resident
+                .pages
+                .sort_unstable_by_key(|(identity, _)| *identity);
+            resident.pages.dedup_by_key(|(identity, _)| *identity);
+            let hot_bytes = resident.resident_nbytes() as u64;
             // A snapshot that cannot fit alone must not evict viable hot prefixes.
             // Its portable data still follows the normal asynchronous persistence path.
             if hot_bytes > self.memory_cap
@@ -1141,7 +1154,8 @@ impl AdaptivePrefixCache {
                     .terminal_mut(node, route)
                     .expect("persistent terminal exists")
                     .last_access_unix_ms = now;
-                let bytes = decoded.snapshot.nbytes() as u64;
+                let summary = decoded.snapshot.storage_summary();
+                let bytes = summary.resident_nbytes() as u64;
                 if bytes > self.memory_cap {
                     // A disk hit need not fit in the hot tier. Keep this snapshot owned
                     // by the active request rather than promoting and evicting it before use.
@@ -1159,12 +1173,11 @@ impl AdaptivePrefixCache {
                     .trie
                     .terminal_mut(node, route)
                     .expect("persistent terminal exists");
-                let summary = decoded.snapshot.storage_summary();
                 terminal.snapshot = Some(Rc::new(decoded.snapshot));
                 terminal.page_refs = summary.pages;
                 terminal.local_bytes = summary.local_bytes;
                 terminal.response_resume = decoded.manifest.response_resume;
-                self.memory_bytes = self.memory_bytes.saturating_add(bytes);
+                self.rebuild_accounting();
                 if let Some(snapshot) = self.evict_memory(Some((node, route))) {
                     tracing::debug!(
                         phase = "cache.restore",
@@ -1282,7 +1295,6 @@ impl AdaptivePrefixCache {
                 reclaimed_bytes,
             );
         }
-        self.rebuild_accounting();
         retained
     }
 
@@ -1292,7 +1304,6 @@ impl AdaptivePrefixCache {
         };
         self.evict_persistent_to(cap, false);
         self.evict_persistent_to(filesystem_hard_cap(cap), true);
-        self.rebuild_accounting();
     }
 
     fn evict_persistent_to(&mut self, limit: u64, include_resumes: bool) {
@@ -1420,14 +1431,31 @@ impl AdaptivePrefixCache {
     }
 
     fn rebuild_accounting(&mut self) {
-        let mut pages = HashMap::<u64, (usize, u64)>::new();
+        let mut pages = HashMap::<u64, (usize, u64)>::with_capacity(self.memory_pages.len());
+        let mut seen_host = HashSet::with_capacity(self.memory_pages.len());
+        let mut blobs = HashMap::<String, (usize, u64)>::with_capacity(self.filesystem_blobs.len());
+        let mut local_bytes = 0;
+        let mut host_bytes = 0;
         for (node, route) in self.trie.terminal_ids() {
             let Some(t) = self.trie.terminal(node, route) else {
                 continue;
             };
+            // GPU pages and local arrays are immutable while a snapshot is hot.
+            // Shared host mirrors can be initialized by a later publication.
+            if let Some(snapshot) = &t.snapshot {
+                host_bytes += snapshot.resident_host_bytes(&mut seen_host) as u64;
+            }
+            local_bytes += t.local_bytes as u64;
             for &(id, bytes) in &t.page_refs {
                 let entry = pages.entry(id).or_insert((0, bytes as u64));
                 entry.0 += 1;
+            }
+            for (digest, bytes) in &t.blob_refs {
+                if let Some(entry) = blobs.get_mut(digest) {
+                    entry.0 += 1;
+                } else {
+                    blobs.insert(digest.clone(), (1, *bytes));
+                }
             }
         }
         self.memory_pages = pages;
@@ -1436,21 +1464,8 @@ impl AdaptivePrefixCache {
             .values()
             .map(|(_, bytes)| *bytes)
             .sum::<u64>()
-            + self
-                .trie
-                .terminal_ids()
-                .into_iter()
-                .filter_map(|(n, r)| self.trie.terminal(n, r).map(|t| t.local_bytes as u64))
-                .sum::<u64>();
-        let mut blobs = HashMap::<String, (usize, u64)>::new();
-        for (node, route) in self.trie.terminal_ids() {
-            if let Some(t) = self.trie.terminal(node, route) {
-                for (digest, bytes) in &t.blob_refs {
-                    let entry = blobs.entry(digest.clone()).or_insert((0, *bytes));
-                    entry.0 += 1;
-                }
-            }
-        }
+            + local_bytes
+            + host_bytes;
         self.filesystem_blobs = blobs;
         self.filesystem_bytes = self
             .filesystem_blobs

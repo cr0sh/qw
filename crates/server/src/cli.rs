@@ -129,6 +129,7 @@ pub struct ServerArgs {
     disable_prefix_cache: bool,
 
     /// Byte capacity of the in-memory prefix snapshot tier (decimal SI suffixes K-E accepted).
+    /// Includes GPU pages, retained host mirrors, and snapshot-local arrays.
     #[arg(
         long,
         default_value_t = 2 * 1024 * 1024 * 1024_u64,
