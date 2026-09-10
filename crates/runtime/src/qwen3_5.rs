@@ -2937,7 +2937,11 @@ impl LanguageModel for Qwen35Model {
             }
             true
         });
-        complete.then_some(snapshot)
+        if !complete {
+            return None;
+        }
+        snapshot.materialize();
+        Some(snapshot)
     }
 
     fn restore_sequence_state(

@@ -61,11 +61,11 @@ pub struct ModelStateTensor {
 }
 
 impl ModelStateTensor {
-    /// Capture a materialized copy of `array` under `name`.
+    /// Capture a compact copy of `array` under `name`, evaluated with the snapshot.
     pub fn new(name: impl Into<String>, array: &MlxArray) -> Self {
         Self {
             name: name.into(),
-            array: ffi::copy(array),
+            array: ffi::contiguous(array, false),
         }
     }
 
@@ -169,13 +169,17 @@ impl SnapshotPage {
         self.array.as_ref().expect("page array")
     }
 
+    /// Host mirror bytes currently retained alongside the MLX page.
+    pub fn portable_nbytes(&self) -> usize {
+        self.portable.get().map_or(0, |bytes| bytes.len())
+    }
+
     /// Materialize this page once as Send-safe shared storage.
     pub fn portable_bytes(&self) -> Arc<[u8]> {
         if let Some(bytes) = self.portable.get() {
             return bytes.clone();
         }
-        let array = ffi::contiguous(self.array(), false);
-        self.materialize_portable_bytes(&array).clone()
+        self.materialize_portable_bytes(self.array()).clone()
     }
 
     fn materialize_portable_bytes(&self, array: &MlxArray) -> &Arc<[u8]> {
@@ -267,17 +271,18 @@ impl SnapshotPagedTensor {
                 self.pages
                     .iter()
                     .filter(|page| page.portable.get().is_none())
-                    .map(|page| (page, ffi::contiguous(page.array(), false))),
+                    .map(|page| (page, page.array())),
             );
             let arrays: Vec<*const MlxArray> = pending
                 .iter()
-                .map(|(_, array)| array.as_ref().expect("contiguous page") as *const MlxArray)
+                .map(|(_, array)| *array as *const MlxArray)
                 .collect();
-            // SAFETY: pending owns every contiguous array throughout evaluation.
-            // Evaluate the exact readback views together, not each strided page.
+            // SAFETY: self owns every compact page throughout evaluation.
+            // Captured model snapshots are already evaluated; generic callers
+            // can still publish their lazily constructed pages in one batch.
             unsafe { ffi::eval_all(&arrays) };
             for (page, array) in pending {
-                page.materialize_portable_bytes(&array);
+                page.materialize_portable_bytes(array);
             }
         }
         self.pages.iter().map(|p| p.portable_bytes())
@@ -341,7 +346,12 @@ impl ModelStateSnapshot {
                 let mut hi = shape.clone();
                 hi[token_axis] = end as i32;
                 lo[token_axis] = start as i32;
-                let page = SnapshotPage::new(start, end, ffi::slice(array, &lo, &hi));
+                // MLX slice AND copy share their input's backing allocation.
+                // A reused page must not pin a whole historical dense KV cache.
+                // Contiguous compacts strided/oversized backing; materialize()
+                // evaluates all snapshot roots together and severs their graphs.
+                let view = ffi::slice(array, &lo, &hi);
+                let page = SnapshotPage::new(start, end, ffi::contiguous(&view, false));
                 if trace_enabled {
                     new_pages += 1;
                     new_page_bytes += page.nbytes();
@@ -435,7 +445,7 @@ impl ModelStateSnapshot {
         for tensor in &self.paged_tensors {
             for page in &tensor.pages {
                 if seen.insert(page.identity()) {
-                    pages.push((page.identity(), page.nbytes()));
+                    pages.push((page.identity(), page.nbytes() + page.portable_nbytes()));
                 }
             }
         }
@@ -479,6 +489,33 @@ impl ModelStateSnapshot {
         }
     }
 
+    /// Finish capture in one evaluation boundary, releasing source graphs.
+    ///
+    /// In particular, newly captured pages must be compacted before the model
+    /// advances: otherwise retained prefix pages keep historical dense KV
+    /// backing alive even after their corresponding cache entries are evicted.
+    pub fn materialize(&self) {
+        let mut roots: Vec<*const MlxArray> = self
+            .tensors
+            .iter()
+            .map(|tensor| tensor.array() as *const MlxArray)
+            .collect();
+        roots.extend(
+            self.paged_tensors
+                .iter()
+                .flat_map(|tensor| tensor.pages.iter())
+                .map(|page| page.array() as *const MlxArray),
+        );
+        if let Some(logits) = self.continuation_logits() {
+            roots.push(logits as *const MlxArray);
+        }
+        // SAFETY: all roots are owned by this snapshot for both operations.
+        unsafe {
+            ffi::eval_all(&roots);
+            ffi::detach_all(&roots);
+        }
+    }
+
     /// Model-family tag used to reject accidental cross-family restores.
     pub fn family(&self) -> &str {
         &self.family
@@ -507,7 +544,7 @@ impl ModelStateSnapshot {
     /// This is kept outside the model-defined tensor namespace so model restore
     /// validation remains concerned only with recurrent/cache layout.
     pub fn set_continuation_logits(&mut self, logits: &MlxArray) {
-        self.continuation_logits = Some(ffi::copy(logits));
+        self.continuation_logits = Some(ffi::contiguous(logits, false));
     }
 
     /// Borrow the prefill logits associated with this exact prefix.
@@ -4762,6 +4799,61 @@ mod tests {
         assert_eq!(model.embedding_prefills.get(), 0);
         assert!(model.token_forwards.get() > 0);
     }
+    #[test]
+    #[ignore = "requires an isolated GPU process: observes global MLX active memory"]
+    fn paged_snapshot_repeated_capture_restore_and_eviction_bounds_backing() {
+        // Each logical 256-row page used to pin a distinct 16 MiB dense KV
+        // allocation. Keeping only the newest snapshot still retained every
+        // generation through its shared prefix pages.
+        ffi::synchronize_default();
+        let baseline = crate::memory::active_memory();
+        for _ in 0..4 {
+            let mut previous = None;
+            for page_count in 1..=12 {
+                let source = ffi::from_slice_f32(
+                    &vec![1.0; 16384 * 256],
+                    &[1, 16384, 256],
+                );
+                let mut snapshot =
+                    ModelStateSnapshot::new("backing-lifetime", page_count * 256);
+                snapshot
+                    .push_paged_tensor(previous.as_ref(), "kv", &source, 1)
+                    .expect("capture");
+                snapshot.materialize();
+                for page in snapshot.paged_tensor("kv").unwrap().pages() {
+                    assert!(
+                        ffi::array_buffer_nbytes(page.array()) <= page.nbytes() + 64 * 1024,
+                        "a page must not retain its dense source allocation",
+                    );
+                }
+                drop(source);
+                previous = Some(snapshot);
+            }
+            let snapshot = previous.take().expect("latest snapshot");
+            ffi::synchronize_default();
+            let retained = crate::memory::active_memory().saturating_sub(baseline);
+            assert!(
+                retained <= snapshot.nbytes() as u64 + 8 * 1024 * 1024,
+                "logical {} bytes retained {retained} active bytes",
+                snapshot.nbytes(),
+            );
+            let restored = snapshot.paged_tensor("kv").unwrap().materialize().unwrap();
+            let expected = ffi::from_slice_f32(&vec![1.0; 12 * 256 * 256], &[1, 3072, 256]);
+            assert_eq!(
+                ffi::array_to_raw_bytes(&restored),
+                ffi::array_to_raw_bytes(&expected),
+            );
+            drop(restored);
+            drop(expected);
+            drop(snapshot);
+            ffi::synchronize_default();
+            assert!(
+                crate::memory::active_memory().saturating_sub(baseline) <= 8 * 1024 * 1024,
+                "eviction must release all snapshot backing",
+            );
+        }
+    }
+
     #[test]
     fn paged_snapshot_capture_reuses_complete_pages_and_not_partial_tails() {
         let values = (0..768 * 2).map(|i| i as f32).collect::<Vec<_>>();

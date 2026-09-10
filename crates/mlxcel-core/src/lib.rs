@@ -169,6 +169,10 @@ mod ffi {
         /// Get the total size in bytes
         fn array_nbytes(arr: &MlxArray) -> usize;
 
+        /// Physical backing allocation bytes, including storage outside a view.
+        /// The caller must evaluate the array before querying this value.
+        fn array_buffer_nbytes(arr: &MlxArray) -> usize;
+
         // Scalar extraction.
         /// Extract f32 scalar value
         fn item_f32(arr: &MlxArray) -> f32;

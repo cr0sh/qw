@@ -878,7 +878,9 @@ impl Qwen35MtpDraftModel {
         } else if expected_offset > 0 {
             return None;
         }
-        let detached = |array: &MlxArray| materialize_detached(mlxcel_core::copy(array));
+        draft.materialize();
+        let detached =
+            |array: &MlxArray| materialize_detached(mlxcel_core::contiguous(array, false));
         Some(MtpPromptSnapshot {
             target,
             draft,

@@ -327,6 +327,10 @@ size_t array_nbytes(const MlxArray& arr) {
     return arr.inner.nbytes();
 }
 
+size_t array_buffer_nbytes(const MlxArray& arr) {
+    return arr.inner.buffer_size();
+}
+
 // Array data access (scalar extraction).
 float item_f32(const MlxArray& arr) {
     return const_cast<array&>(arr.inner).item<float>();

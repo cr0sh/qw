@@ -1797,9 +1797,12 @@ impl Dflash2PromptSnapshot {
         Ok(Self {
             id: next_dflash2_snapshot_id(),
             target,
-            hidden_concat: materialize_detached(mlxcel_core::copy(hidden_concat)),
+            hidden_concat: materialize_detached(mlxcel_core::contiguous(hidden_concat, false)),
             hidden_offset,
-            continuation_logits: materialize_detached(mlxcel_core::copy(continuation_logits)),
+            continuation_logits: materialize_detached(mlxcel_core::contiguous(
+                continuation_logits,
+                false,
+            )),
         })
     }
 
