@@ -1431,11 +1431,9 @@ impl AdaptivePrefixCache {
     }
 
     fn rebuild_accounting(&mut self) {
-        let mut pages =
-            HashMap::<u64, (usize, u64)>::with_capacity(self.memory_pages.len());
+        let mut pages = HashMap::<u64, (usize, u64)>::with_capacity(self.memory_pages.len());
         let mut seen_host = HashSet::with_capacity(self.memory_pages.len());
-        let mut blobs =
-            HashMap::<String, (usize, u64)>::with_capacity(self.filesystem_blobs.len());
+        let mut blobs = HashMap::<String, (usize, u64)>::with_capacity(self.filesystem_blobs.len());
         let mut local_bytes = 0;
         let mut host_bytes = 0;
         for (node, route) in self.trie.terminal_ids() {
