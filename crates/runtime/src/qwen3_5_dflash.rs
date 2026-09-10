@@ -2633,7 +2633,11 @@ impl Qwen35Dflash2Generator {
         })
     }
 }
-fn context_bounded_verify_width(width: usize, context_tokens: usize, committed_tokens: usize) -> usize {
+fn context_bounded_verify_width(
+    width: usize,
+    context_tokens: usize,
+    committed_tokens: usize,
+) -> usize {
     width.min(context_tokens.saturating_sub(committed_tokens))
 }
 

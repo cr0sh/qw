@@ -166,6 +166,27 @@ throughput rather than merely shifting bytes between counters.
 
 ## Generation policy
 
+Qwen request admission uses the checkpoint's declared
+`max_position_embeddings` as the context limit. The fully rendered prompt
+(including retained reasoning, tool definitions/results, and expanded image
+tokens) plus the effective output-token budget must fit that limit. Equality
+is allowed; arithmetic overflow or an excess is rejected, not truncated.
+For the current 262,144-token checkpoint and a 32,768-token output budget,
+the rendered prompt must contain at most 229,376 tokens.
+
+Over-budget Chat and Responses requests fail with HTTP 400 and
+`context_length_exceeded`, before ordinary prefix-cache restoration or a
+streaming response starts. Prepared lookahead must not prefetch an inadmissible
+request. Durable continuations retain the original total output budget rather
+than obtaining a fresh allowance, and direct runtime generation enforces the
+same bound. Speculative proposals/verification must also stay within the
+context, even if excess proposals would not be emitted.
+
+This is not history compaction, an automatic RoPE extension, or enforcement of
+the 36 GiB physical-memory target. Native Tau3 can record an over-budget model
+request as a reward-zero execution failure; do not silently truncate or
+selectively retry it to improve the score.
+
 Qwen3.8 defaults follow the upstream model's mode-dependent policy, not the
 quantized checkpoint's generation configuration. Thinking uses temperature 1.0,
 top-p 0.95, top-k 20, and presence penalty 0.0; non-thinking uses temperature

@@ -3778,7 +3778,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn outer_qwen35_text_config_and_mixed_quantization_are_accepted() {
         let fixture = TestDir::new("outer-config");
