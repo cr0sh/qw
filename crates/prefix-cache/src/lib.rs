@@ -209,7 +209,7 @@ struct PutCompletion {
 // 2 * logical bytes before to_portable, then grows by the exact encoded manifest
 // size on the worker before allocating its serialized buffer; read/decode reserves
 // 3 * (disk blob bytes + exact manifest bytes), and a hot lookahead pin reserves
-// logical bytes. Pending writes discover manifest size and grow the reservation
+// 2 * logical bytes including memoized host pages. Pending writes discover manifest size and grow the reservation
 // on the worker before allocating any read buffers. Rust metadata and channel
 // bookkeeping are additional bounded overhead, not payload bytes.
 // Active request-owned snapshots are not cache staging after demand consumes them.
@@ -551,7 +551,7 @@ impl AdaptivePrefixCache {
                 continue;
             };
             if let Some(snapshot) = &t.snapshot {
-                let Some(reservation) = self.staging.reserve(snapshot.nbytes() as u64) else {
+                let Some(reservation) = self.staging.reserve((snapshot.nbytes() as u64).saturating_mul(2)) else {
                     tracing::debug!(phase = "cache.prefetch.skip", entry_id = %key.0, reason = "hot_pin_budget");
                     return;
                 };
@@ -847,12 +847,6 @@ impl AdaptivePrefixCache {
                 .pages
                 .sort_unstable_by_key(|(identity, _)| *identity);
             summary.pages.dedup_by_key(|(identity, _)| *identity);
-            let hot_bytes = summary.local_bytes as u64
-                + summary
-                    .pages
-                    .iter()
-                    .map(|(_, page_bytes)| *page_bytes as u64)
-                    .sum::<u64>();
             inserted_logical_bytes = inserted_logical_bytes.saturating_add(bytes);
             inserted_unique_page_bytes = inserted_unique_page_bytes.saturating_add(
                 summary
@@ -975,6 +969,13 @@ impl AdaptivePrefixCache {
                 terminal.blob_refs.clear();
                 terminal.serialized_bytes = 0;
             }
+            // Export may have added shared host mirrors since initial admission.
+            let mut resident = self.trie.terminal(node, route).unwrap()
+                .snapshot.as_ref().unwrap().storage_summary();
+            resident.pages.sort_unstable_by_key(|(identity, _)| *identity);
+            resident.pages.dedup_by_key(|(identity, _)| *identity);
+            let hot_bytes = resident.local_bytes as u64
+                + resident.pages.iter().map(|(_, bytes)| *bytes as u64).sum::<u64>();
             // A snapshot that cannot fit alone must not evict viable hot prefixes.
             // Its portable data still follows the normal asynchronous persistence path.
             if hot_bytes > self.memory_cap
@@ -1422,9 +1423,19 @@ impl AdaptivePrefixCache {
     fn rebuild_accounting(&mut self) {
         let mut pages = HashMap::<u64, (usize, u64)>::new();
         for (node, route) in self.trie.terminal_ids() {
-            let Some(t) = self.trie.terminal(node, route) else {
+            let Some(t) = self.trie.terminal_mut(node, route) else {
                 continue;
             };
+            // Page exports are memoized on immutable pages shared by multiple
+            // terminals. A publication can populate those host mirrors after
+            // insertion, so cached insertion-time sizes are not authoritative.
+            if let Some(snapshot) = &t.snapshot {
+                let mut summary = snapshot.storage_summary();
+                summary.pages.sort_unstable_by_key(|(identity, _)| *identity);
+                summary.pages.dedup_by_key(|(identity, _)| *identity);
+                t.page_refs = summary.pages;
+                t.local_bytes = summary.local_bytes;
+            }
             for &(id, bytes) in &t.page_refs {
                 let entry = pages.entry(id).or_insert((0, bytes as u64));
                 entry.0 += 1;

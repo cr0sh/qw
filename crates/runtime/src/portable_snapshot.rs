@@ -81,7 +81,10 @@ pub(crate) fn array_to_portable(name: Option<String>, array: &MlxArray) -> Porta
         name,
         shape: mlxcel_core::array_shape(array),
         dtype: mlxcel_core::array_dtype(array),
-        bytes: mlxcel_core::array_to_raw_bytes(array),
+        // Snapshot captures are already evaluated. Read their own completion
+        // event rather than enqueueing a new contiguous op on the generation
+        // stream; strided arrays still use the bridge's safe packing fallback.
+        bytes: mlxcel_core::array_evaluated_bytes(array),
     }
 }
 
@@ -125,6 +128,9 @@ pub(crate) fn array_from_portable(
 }
 
 fn model_to_portable(snapshot: &ModelStateSnapshot) -> PortableModelState {
+    let started = tracing::enabled!(tracing::Level::DEBUG).then(std::time::Instant::now);
+    let mut new_page_bytes = 0usize;
+    let mut reused_page_bytes = 0usize;
     let tensors = snapshot
         .tensor_names()
         .map(|name| {
@@ -136,7 +142,7 @@ fn model_to_portable(snapshot: &ModelStateSnapshot) -> PortableModelState {
             )
         })
         .collect();
-    PortableModelState {
+    let portable = PortableModelState {
         family: snapshot.family().to_string(),
         token_len: snapshot.token_len(),
         tensors,
@@ -145,7 +151,17 @@ fn model_to_portable(snapshot: &ModelStateSnapshot) -> PortableModelState {
             .filter_map(|name| {
                 snapshot
                     .paged_tensor(name)
-                    .map(|tensor| PortablePagedTensor {
+                    .map(|tensor| {
+                        if started.is_some() {
+                            for page in tensor.pages() {
+                                let cached = page.portable_nbytes();
+                                reused_page_bytes += cached;
+                                if cached == 0 {
+                                    new_page_bytes += page.nbytes();
+                                }
+                            }
+                        }
+                        PortablePagedTensor {
                         name: name.to_string(),
                         token_axis: tensor.token_axis(),
                         token_len: tensor.token_len(),
@@ -161,13 +177,27 @@ fn model_to_portable(snapshot: &ModelStateSnapshot) -> PortableModelState {
                                 bytes,
                             })
                             .collect(),
+                        }
                     })
             })
             .collect(),
         continuation_logits: snapshot
             .continuation_logits()
             .map(|array| array_to_portable(None, array)),
+    };
+    if let Some(started) = started {
+        tracing::debug!(
+            phase = "snapshot.portable_export",
+            family = snapshot.family(),
+            token_len = snapshot.token_len(),
+            new_page_bytes,
+            reused_page_bytes,
+            local_bytes = portable.tensors.iter().map(|array| array.bytes.len()).sum::<usize>()
+                + portable.continuation_logits.as_ref().map_or(0, |array| array.bytes.len()),
+            duration_ms = started.elapsed().as_secs_f64() * 1_000.0,
+        );
     }
+    portable
 }
 
 pub(crate) fn model_from_portable(
@@ -360,9 +390,30 @@ mod tests {
             .push_paged_tensor(Some(&first), "keys", &source, 1)
             .unwrap();
         let second_portable = model_to_portable(&second);
+        assert!(Arc::ptr_eq(
+            &first_portable.paged_tensors[0].pages[0].bytes,
+            &second_portable.paged_tensors[0].pages[0].bytes,
+        ));
+        assert!(!Arc::ptr_eq(
+            &first_portable.paged_tensors[0].pages[1].bytes,
+            &second_portable.paged_tensors[0].pages[1].bytes,
+        ));
 
         for (portable, expected) in [(first_portable, original), (second_portable, updated)] {
+            let page_bytes = portable.paged_tensors[0]
+                .pages
+                .iter()
+                .map(|page| Arc::clone(&page.bytes))
+                .collect::<Vec<_>>();
             let restored = model_from_portable(portable, false, false).unwrap();
+            // Repeated publication after disk restore must retain one host
+            // allocation per immutable page, not copy the full prefix again.
+            for _ in 0..4 {
+                let exported = model_to_portable(&restored);
+                for (expected, page) in page_bytes.iter().zip(&exported.paged_tensors[0].pages) {
+                    assert!(Arc::ptr_eq(expected, &page.bytes));
+                }
+            }
             let array = restored
                 .paged_tensor("keys")
                 .unwrap()
@@ -371,6 +422,24 @@ mod tests {
             let expected: Vec<u8> = expected.into_iter().flat_map(f32::to_ne_bytes).collect();
             assert_eq!(mlxcel_core::array_to_raw_bytes(&array), expected);
         }
+    }
+
+    #[test]
+    fn local_export_packs_strided_views_without_changing_row_order() {
+        let source = mlxcel_core::from_slice_f32(
+            &[0., 1., 2., 3., 4., 5., 6., 7., 8., 9., 10., 11.],
+            &[3, 4],
+        );
+        let view = mlxcel_core::slice(&source, &[0, 1], &[3, 3]);
+        let portable = array_to_portable(Some("state".into()), &view);
+        assert_eq!(portable.shape, [3, 2]);
+        assert_eq!(
+            portable.bytes,
+            [1_f32, 2., 5., 6., 9., 10.]
+                .into_iter()
+                .flat_map(f32::to_ne_bytes)
+                .collect::<Vec<_>>(),
+        );
     }
 
     #[test]

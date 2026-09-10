@@ -931,7 +931,7 @@ fn memory_only_entry_identity_survives_eviction_and_expiry() {
 #[test]
 fn oversized_snapshot_preserves_a_hot_prefix_that_fits_by_unique_pages() {
     let clock = ManualClock::new(1_000);
-    let capacity = 512 * std::mem::size_of::<f32>() as u64;
+    let capacity = 2 * 512 * std::mem::size_of::<f32>() as u64;
     let mut cache = AdaptivePrefixCache::with_optional_store(
         namespaces(),
         memory_config(capacity),
@@ -952,7 +952,7 @@ fn oversized_snapshot_preserves_a_hot_prefix_that_fits_by_unique_pages() {
     clock.set(2_000);
     cache.insert(
         &[999],
-        vec![snapshot(1, &[3.0; 512])],
+        vec![snapshot(1, &[3.0; 1024])],
         SnapshotRoute::Baseline,
     );
 
@@ -1314,7 +1314,7 @@ fn dflash2_filesystem_restart_isolates_routes_and_deletes_corrupt_payload() {
             vec![PromptSnapshot::from_portable(portable.clone()).unwrap()],
             SnapshotRoute::Dflash2,
         );
-        assert_eq!(cache.memory_bytes(), 64);
+        assert_eq!(cache.memory_bytes(), 88);
         assert_eq!(
             cache
                 .lookup(&[1, 2, 3], SnapshotRoute::Dflash2)
@@ -1391,7 +1391,7 @@ fn dflash2_resume_survives_restart_is_route_safe_and_one_shot() {
         cache.flush_persistence();
         assert_eq!(
             cache.memory_bytes(),
-            64,
+            88,
             "active resume survives memory pressure"
         );
     }
@@ -1428,7 +1428,7 @@ fn dflash2_hidden_and_logits_count_toward_eviction_and_expiry() {
     let portable = dflash_portable(3, 1);
     let mut cache = AdaptivePrefixCache::with_optional_store(
         namespaces(),
-        memory_config(63),
+        memory_config(87),
         None,
         Box::new(clock.clone()),
     )
@@ -1446,7 +1446,7 @@ fn dflash2_hidden_and_logits_count_toward_eviction_and_expiry() {
         CacheConfig {
             filesystem_bytes: 55,
             directory: Some(directory.path.clone()),
-            ..memory_config(64)
+            ..memory_config(88)
         },
         Box::new(FilesystemSnapshotStore::new(&directory.path).unwrap()),
         Box::new(clock.clone()),
@@ -1467,7 +1467,7 @@ fn dflash2_hidden_and_logits_count_toward_eviction_and_expiry() {
             .exists()
     );
     assert_eq!(cache.filesystem_bytes, 0);
-    assert_eq!(cache.memory_bytes(), 64);
+    assert_eq!(cache.memory_bytes(), 88);
     assert!(cache.lookup(&[1, 2, 3], SnapshotRoute::Dflash2).is_some());
     clock.set(10_000 + INITIAL_TTL_MS + 1);
     assert!(cache.lookup(&[1, 2, 3], SnapshotRoute::Dflash2).is_none());
@@ -2057,6 +2057,58 @@ fn adaptive_memory_accounts_shared_checkpoint_pages_once() {
     );
 }
 
+#[test]
+fn publication_charges_shared_host_pages_after_export_and_preserves_evicted_pins() {
+    let state = Arc::new(Mutex::new(RecordingState::default()));
+    let mut cache = AdaptivePrefixCache::with_store(
+        namespaces(),
+        memory_config(1_000_000),
+        Box::new(RecordingStore(Arc::clone(&state))),
+    )
+    .unwrap();
+    let tokens = (0..768).collect::<Vec<i32>>();
+    let mut snapshots = paged_snapshot_chain();
+    let final_snapshot = snapshots.pop().unwrap();
+    cache.insert(&tokens[..512], snapshots, SnapshotRoute::Baseline);
+    let pinned = cache.lookup(&tokens[..512], SnapshotRoute::Baseline).unwrap();
+    let expected = pinned.snapshot().to_portable().unwrap();
+    cache.insert(&tokens, vec![final_snapshot], SnapshotRoute::Baseline);
+    cache.flush_persistence();
+    let page_bytes = 256 * 2 * std::mem::size_of::<f32>() as u64;
+    assert_eq!(cache.memory_bytes(), 2 * 3 * page_bytes);
+    assert_eq!(cache.staging.used.load(Ordering::Acquire), 0);
+
+    cache.memory_cap = 0;
+    cache.evict_memory(None);
+    assert_eq!(cache.memory_bytes(), 0);
+    assert_eq!(pinned.snapshot().to_portable().unwrap(), expected);
+    let restored = cache.lookup(&tokens[..512], SnapshotRoute::Baseline).unwrap();
+    assert_eq!(restored.snapshot().to_portable().unwrap(), expected);
+    assert_eq!(cache.memory_bytes(), 0);
+}
+
+#[test]
+fn publication_mirrors_cannot_evict_a_smaller_viable_hot_prefix() {
+    let state = Arc::new(Mutex::new(RecordingState::default()));
+    let mut cache = AdaptivePrefixCache::with_store(
+        namespaces(),
+        memory_config(3_000),
+        Box::new(RecordingStore(Arc::clone(&state))),
+    )
+    .unwrap();
+    cache.insert(&[999], vec![snapshot(1, &[7.])], SnapshotRoute::Baseline);
+    let first = paged_snapshot_chain().remove(0);
+    let tokens = (0..256).collect::<Vec<i32>>();
+    cache.insert(&tokens, vec![first], SnapshotRoute::Baseline);
+    cache.flush_persistence();
+    let loads = state.lock().unwrap().demand_loads;
+    assert_eq!(cache.lookup(&[999], SnapshotRoute::Baseline).unwrap().token_count, 1);
+    assert_eq!(state.lock().unwrap().demand_loads, loads);
+    assert_eq!(cache.lookup(&tokens, SnapshotRoute::Baseline).unwrap().token_count, 256);
+    assert_eq!(state.lock().unwrap().demand_loads, loads + 1);
+    assert!(cache.memory_bytes() <= 3_000);
+}
+
 fn lookahead_fixture() -> (AdaptivePrefixCache, Arc<Mutex<RecordingState>>, ManualClock) {
     let state = Arc::new(Mutex::new(RecordingState::default()));
     let clock = ManualClock::new(1_000);
@@ -2535,7 +2587,7 @@ fn bounded_hot_lookahead_survives_current_publication_eviction() {
     let expected = next.snapshot().to_portable().unwrap();
     drop(next);
     cache.prefetch(&[1, 2], SnapshotRoute::Baseline);
-    assert_eq!(cache.staging.used.load(Ordering::Acquire), capacity);
+    assert_eq!(cache.staging.used.load(Ordering::Acquire), 2 * capacity);
     clock.set(1_001);
     cache.insert(&[9], vec![snapshot(1, &[9., 8.])], SnapshotRoute::Baseline);
     cache.flush_persistence();
