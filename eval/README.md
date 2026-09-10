@@ -40,8 +40,12 @@ Create the isolated reference environment without modifying an older environment
 ```
 
 Use this interpreter explicitly. EvalScope remains unmodified; only the pinned
-Tau2 fork changes history conversion. After updating that fork, reinstall with
-`uv sync --locked --python 3.12 --no-editable --reinstall-package tau2` from `eval/`.
+Tau2 fork changes history conversion. After updating that fork, reinstall into
+the same reference environment:
+
+```bash
+(cd eval && UV_PROJECT_ENVIRONMENT=.venv-reference uv sync --locked --python 3.12 --no-editable --reinstall-package tau2)
+```
 
 ## Credentials
 
@@ -101,6 +105,10 @@ export TAU3_DATASET_ID=/absolute/path/to/snapshots/master
 Use the same frozen snapshot for a campaign and its resumes. Record its source
 and file hashes when sharing results. Reusing dataset assets is distinct from
 reusing predictions or a warmed model prefix cache.
+If purging a previous run that contains the snapshot, first preserve the complete
+dataset snapshot outside that run's output/cache tree and verify its hashes.
+Set `TAU3_DATASET_ID` to the preserved root, not to its `tau2/` child. Do not copy
+old predictions, reviews, task configurations, or model prefix-cache files.
 
 ## Run
 
@@ -110,17 +118,25 @@ Construct configuration without loading credentials, datasets, or invoking model
 eval/.venv-reference/bin/python -I -B eval/run_tau3_banking.py
 ```
 
-Run one diagnostic episode, or launch a fresh full campaign:
+Run one diagnostic episode, then launch a fresh full campaign with concurrency 2:
 
 ```bash
-eval/.venv-reference/bin/python -I -B eval/run_tau3_banking.py --run --limit 1
-eval/.venv-reference/bin/python -I -B eval/run_tau3_banking.py --run --eval-batch-size 3
+eval/.venv-reference/bin/python -I -B eval/run_tau3_banking.py --run --limit 1 --eval-batch-size 2
+eval/.venv-reference/bin/python -I -B eval/run_tau3_banking.py --run --eval-batch-size 2
 ```
 
 The full banking dataset contains **97 tasks**. The launcher uses one repeat,
 seed 42, and BM25 retrieval. `--eval-batch-size` defaults to 3 and controls
 EvalScope's native task worker pool—not GPU batching or token-level interleaving.
-QW serves queued requests at request boundaries.
+The explicit flag above selects two workers while preserving that general default.
+In EvalScope 1.11.1, `TaskConfig` initialization also synchronizes
+`generation_config.batch_size` to `eval_batch_size`; the native evaluator passes
+`eval_batch_size` as the task pool's `max_workers`. For this fresh campaign both
+values must be 2 in the saved configuration. Use the launcher flag rather than
+loading an old task snapshot or manually overriding either value after construction.
+This limits concurrent episodes to two, not a guarantee of two simultaneous model
+requests: episodes alternate simulator, tool, agent, and judge work, and QW serves
+queued requests at request boundaries.
 
 Each fresh invocation creates a unique directory under
 `eval/outputs/tau3-banking-native-<UTC timestamp>-<uuid>/`; EvalScope adds an inner
@@ -134,7 +150,12 @@ reference campaign.
 | Role | Configuration |
 | --- | --- |
 | Agent under test | `qwen3.8-27b`, `http://127.0.0.1:8883/v1`, thinking enabled, medium reasoning effort, 32768 output tokens |
-| User simulator and native NL-assertion judge | `deepseek-v4-pro`, `https://api.deepseek.com`, thinking disabled, temperature 0, 32768 output tokens |
+| User simulator and native NL-assertion judge | `deepseek-flash` (DeepSeek-V4.1-Flash), `https://api.deepseek.com`, thinking disabled, temperature 0, 32768 output tokens |
+
+DeepSeek's [model documentation](https://api-docs.deepseek.com/quick_start/pricing/)
+maps the API model name `deepseek-flash` to DeepSeek-V4.1-Flash. The literal
+`deepseek-v4.1-flash` is not an accepted API model name. The provider URL and
+credential loading remain unchanged.
 
 The seven target sampling overrides are omitted so QW resolves its model policy.
 Native retry, termination, scoring, and error handling are unchanged. The
@@ -169,13 +190,15 @@ After the previous evaluator has stopped, use its **inner timestamp directory**:
 
 ```bash
 eval/.venv-reference/bin/python -I -B eval/run_tau3_banking.py \
-  --run --eval-batch-size 3 \
+  --run --eval-batch-size 2 \
   --resume /absolute/path/to/tau3-banking-native-UTC-UUID/INNER_TIMESTAMP
 ```
 
 Keep the dataset setting and evaluation configuration unchanged. `--resume` maps
 directly to native `use_cache`; upstream determines which records can be reused.
 Never run multiple evaluators against one output directory.
+The example resumes a concurrency-2 `deepseek-flash` campaign only; the model
+change requires a fresh campaign, not resuming results from a different simulator.
 
 The launcher adds no writer lock, record salvage, stale-state repair, synchronized
 writes, or power-loss durability guarantee. Native resume may reject an

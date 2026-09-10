@@ -383,6 +383,7 @@ pub struct CompletionRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureKind {
     InvalidRequest,
+    ContextLengthExceeded,
     Server,
     ModelOutput,
     ResumeMismatch,
@@ -1488,6 +1489,20 @@ impl QwenWorker {
                 }
             }
         };
+        // The fingerprint includes max_tokens, so a matching continuation carries
+        // this same original budget. Reject before taking/restoring its checkpoint.
+        if let Err(error) = self
+            .provider
+            .validate_context_budget(prompt_ids.len(), job.request.max_tokens)
+        {
+            send_failure(
+                &job,
+                FailureKind::ContextLengthExceeded,
+                error.to_string(),
+                None,
+            );
+            return;
+        }
         let mut sampling = self.provider.baseline_sampling(
             enable_thinking,
             SamplingOptions {
@@ -1637,6 +1652,7 @@ impl QwenWorker {
             if !resume.token_ids.starts_with(&prompt_ids)
                 || resume.metadata.prompt_token_count != prompt_ids.len()
                 || resume.metadata.generated_token_ids.len() >= resume.metadata.original_max_tokens
+                || resume.metadata.original_max_tokens != job.request.max_tokens
             {
                 send_failure(
                     &job,
@@ -1659,11 +1675,21 @@ impl QwenWorker {
             // New requests still use their explicit seed, even when a prompt cache hits.
             sampling.seed = Some(resume.metadata.continuation_seed);
             generation_prompt_ids.extend_from_slice(&resume.metadata.generated_token_ids);
-            max_tokens = resume
-                .metadata
-                .original_max_tokens
-                .saturating_sub(resume.metadata.generated_token_ids.len());
+            max_tokens =
+                resume.metadata.original_max_tokens - resume.metadata.generated_token_ids.len();
             checkpoint_token_lengths.clear();
+        }
+        if let Err(error) = self
+            .provider
+            .validate_context_budget(generation_prompt_ids.len(), max_tokens)
+        {
+            send_failure(
+                &job,
+                FailureKind::ContextLengthExceeded,
+                error.to_string(),
+                None,
+            );
+            return;
         }
         if job
             .events
@@ -1899,7 +1925,11 @@ impl QwenWorker {
                     &next.job.request,
                     next.job.request.enable_thinking,
                 ) {
-                    if !next.job.cancelled.load(Ordering::Acquire) {
+                    if !next.job.cancelled.load(Ordering::Acquire)
+                        && provider
+                            .validate_context_budget(tokens.len(), next.job.request.max_tokens)
+                            .is_ok()
+                    {
                         cache.prefetch(&tokens, next_route);
                         debug!(
                             event = "cache.prefetch.issued",

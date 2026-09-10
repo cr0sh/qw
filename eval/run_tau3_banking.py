@@ -83,7 +83,7 @@ def main() -> int:
                 "dataset_id": dataset_id,
                 "subset_list": ["banking_knowledge"],
                 "extra_params": {
-                    "user_model": "deepseek-v4-pro",
+                    "user_model": "deepseek-flash",
                     "api_base": "https://api.deepseek.com",
                     "api_key": None,
                     "generation_config": {
@@ -117,7 +117,7 @@ def main() -> int:
     print("tau2_source=local_submodule base=v1.0.1 (gitlink pins upstream cherry-pick and compatibility repair)", flush=True)
     print(f"eval_batch_size={args.eval_batch_size} limit={args.limit} native_resume={args.resume is not None}", flush=True)
     print("agent=qwen3.8-27b endpoint=http://127.0.0.1:8883/v1 reasoning_effort=medium thinking=enabled max_tokens=32768", flush=True)
-    print("simulator_and_nl_judge=deepseek-v4-pro endpoint=https://api.deepseek.com thinking=disabled temperature=0", flush=True)
+    print("simulator_and_nl_judge=deepseek-flash model_version=DeepSeek-V4.1-Flash endpoint=https://api.deepseek.com thinking=disabled temperature=0", flush=True)
     print(f"work_dir={work_dir} dataset={dataset_id}", flush=True)
     if not args.run:
         print("Configuration only; no credentials loaded, dataset loaded, or model request made.", flush=True)

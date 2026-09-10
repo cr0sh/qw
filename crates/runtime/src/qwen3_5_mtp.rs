@@ -1136,6 +1136,8 @@ fn trim_draft_cache(cache: &mut KVCache, round_appended: usize, accepted: usize)
 }
 
 fn round_proposal_count(block_size: usize, remaining: usize) -> usize {
+    // The target cache excludes the pending anchor. Verifying that anchor
+    // plus at most `remaining` proposals reaches no further than prompt + max_tokens.
     block_size.saturating_sub(1).min(remaining)
 }
 
@@ -2479,6 +2481,12 @@ impl Qwen35MtpGenerator {
         mut on_token: F,
         capture_final_snapshot: bool,
     ) -> Result<MtpGeneration, String> {
+        crate::provider::validate_context_budget(
+            model.config.max_position_embeddings,
+            prompt_tokens.len(),
+            max_tokens,
+        )
+        .map_err(|error| error.to_string())?;
         assert!(!prompt_tokens.is_empty(), "MTP prompt must not be empty");
         assert!(block_size >= 2, "MTP block size must be at least 2");
         if checkpoint_token_lengths

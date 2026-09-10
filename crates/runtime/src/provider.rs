@@ -50,6 +50,27 @@ use crate::specprefill::{
 
 const DEFAULT_MTP_BLOCK_SIZE: usize = 3;
 
+/// Validate the complete tokenized prompt, including image expansion, without
+/// changing the caller's output budget. Zero output is valid for checkpoint APIs.
+pub(crate) fn validate_context_budget(
+    context_tokens: usize,
+    prompt_tokens: usize,
+    max_tokens: usize,
+) -> Result<()> {
+    ensure!(
+        context_tokens > 0,
+        "invalid model configuration: max_position_embeddings must be a positive integer"
+    );
+    ensure!(
+        prompt_tokens
+            .checked_add(max_tokens)
+            .is_some_and(|total| total <= context_tokens),
+        "context_length_exceeded: prompt has {prompt_tokens} tokens and requested output has \
+         {max_tokens} tokens, exceeding the model context limit of {context_tokens} tokens"
+    );
+    Ok(())
+}
+
 fn tokens_per_second(tokens: usize, elapsed: Duration) -> f64 {
     let seconds = elapsed.as_secs_f64();
     if seconds > 0.0 {
@@ -474,9 +495,15 @@ impl Qwen35Provider {
             "missing tokenizer {}",
             tokenizer_path.display()
         );
-        let tokenizer = Tokenizer::from_file(&tokenizer_path)
+        let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
             .map_err(anyhow::Error::msg)
             .with_context(|| format!("failed to load tokenizer {}", tokenizer_path.display()))?;
+        // Admission must count the full rendered prompt, not a tokenizer's
+        // serialized training-time truncation policy.
+        tokenizer
+            .with_truncation(None)
+            .map_err(anyhow::Error::msg)
+            .context("failed to disable tokenizer truncation")?;
         let chat_template = ChatTemplateProcessor::from_model_path(model_dir)?;
         let defaults = load_generation_defaults(model_dir)?;
         let model = Qwen35Model::load(model_dir, kv_cache_mode)?;
@@ -546,9 +573,14 @@ impl Qwen35Provider {
         self.model.vocab_size()
     }
 
-    #[doc(hidden)]
+    /// Checkpoint-declared context limit, never an inferred or extended window.
     pub fn supported_context_tokens(&self) -> usize {
         self.model.config.max_position_embeddings
+    }
+
+    /// Check the rendered/expanded prompt plus the full requested output budget.
+    pub fn validate_context_budget(&self, prompt_tokens: usize, max_tokens: usize) -> Result<()> {
+        validate_context_budget(self.supported_context_tokens(), prompt_tokens, max_tokens)
     }
 
     pub fn eos_token_id(&self) -> u32 {
@@ -802,6 +834,7 @@ impl Qwen35Provider {
         #[cfg(any(feature = "specprefill", test))] prefill_mode: PrefillMode,
         mut on_delta: F,
     ) -> Result<BaselineGeneration> {
+        self.validate_context_budget(prompt_ids.len(), max_tokens)?;
         #[cfg(any(feature = "specprefill", test))]
         if let PrefillMode::SpecPrefill(config) = prefill_mode {
             config.validate(prompt_ids.len())?;
@@ -1008,6 +1041,7 @@ impl Qwen35Provider {
         constraint: Option<&mut dyn TokenConstraint>,
         mut on_delta: F,
     ) -> Result<BaselineGeneration> {
+        self.validate_context_budget(prefill.prompt_ids.len(), max_tokens)?;
         self.model
             .prepare_mrope(&prefill.position_ids, prefill.rope_delta);
         let buffer_output = constraint.is_some();
@@ -1150,6 +1184,7 @@ impl Qwen35Provider {
         prompt_ids: &[i32],
         draft_dir: &Path,
     ) -> Result<Dflash2PromptSnapshot> {
+        self.validate_context_budget(prompt_ids.len(), 0)?;
         if self.dflash2_generator.is_none() {
             self.dflash2_generator = Some(
                 crate::qwen3_5_dflash::Qwen35Dflash2Generator::new(&self.model, draft_dir)
@@ -1258,6 +1293,7 @@ impl Qwen35Provider {
         capture_final_snapshot: bool,
         mut on_delta: F,
     ) -> Result<(BaselineGeneration, Dflash2GenerationStats)> {
+        self.validate_context_budget(prompt_ids.len(), max_tokens)?;
         if self.dflash2_generator.is_none() {
             self.dflash2_generator = Some(
                 crate::qwen3_5_dflash::Qwen35Dflash2Generator::new(&self.model, draft_dir)
@@ -1364,6 +1400,7 @@ impl Qwen35Provider {
             MtpPrompt::Text { prompt_ids } => prompt_ids.len(),
             MtpPrompt::Multimodal(prefill) => prefill.prompt_ids.len(),
         };
+        self.validate_context_budget(prompt_tokens, max_tokens)?;
         let mut decoder = IncrementalTextDecoder::new(&self.tokenizer);
         let mut decode_error = None;
         let mut callback_active = true;
@@ -2044,6 +2081,31 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Instant;
+
+    #[test]
+    fn context_budget_checks_exact_boundary_overflow_and_checkpoint_only_requests() {
+        assert!(validate_context_budget(262_144, 262_000, 144).is_ok());
+        assert!(validate_context_budget(262_144, 262_000, 145).is_err());
+        assert!(validate_context_budget(usize::MAX, usize::MAX, 1).is_err());
+        assert!(validate_context_budget(8, 8, 0).is_ok());
+        assert!(validate_context_budget(8, 9, 0).is_err());
+        assert!(validate_context_budget(0, 0, 0).is_err());
+    }
+
+    #[test]
+    fn expanded_image_prompt_and_continuation_share_the_original_context_budget() {
+        let mut prompt = vec![1, 100, 103, 101, 42];
+        insert_qwen_vl_image_tokens(&mut prompt, &[(1, 4, 4)], 2, 100, 103)
+            .expect("expand image placeholders");
+        assert!(validate_context_budget(10, prompt.len(), 2).is_ok());
+        assert!(validate_context_budget(10, prompt.len(), 3).is_err());
+
+        // A resumed generation adds emitted tokens to the prompt, but only the
+        // remaining original output budget, never a fresh full output budget.
+        let emitted = 1;
+        assert!(validate_context_budget(10, prompt.len() + emitted, 2 - emitted).is_ok());
+        assert!(validate_context_budget(10, prompt.len() + emitted, 2).is_err());
+    }
 
     #[test]
     fn generation_metric_throughput_uses_elapsed_seconds() {
