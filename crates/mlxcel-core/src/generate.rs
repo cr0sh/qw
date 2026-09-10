@@ -455,6 +455,24 @@ impl SnapshotStorageSummary {
 }
 
 impl ModelStateSnapshot {
+    /// Count initialized host mirrors not yet present in `seen`, without exporting arrays.
+    ///
+    /// Allocation addresses remain identities only while the snapshots stay alive.
+    /// Distinct GPU pages may share one host allocation.
+    pub fn resident_host_bytes(&self, seen: &mut HashSet<usize>) -> usize {
+        let mut total = 0;
+        for tensor in &self.paged_tensors {
+            for page in &tensor.pages {
+                if let Some(bytes) = page.portable.get() {
+                    if seen.insert(bytes.as_ptr() as usize) {
+                        total += bytes.len();
+                    }
+                }
+            }
+        }
+        total
+    }
+
     /// Return page identities and terminal-local bytes for accounting.
     pub fn storage_summary(&self) -> SnapshotStorageSummary {
         let mut pages = Vec::new();

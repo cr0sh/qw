@@ -47,6 +47,7 @@
 //! with inf → NaN). Attention masks are the one exception — additive 0/-inf
 //! f32 sentinels, matching every other mask builder in the repo.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -1819,6 +1820,12 @@ impl Dflash2PromptSnapshot {
             + mlxcel_core::array_nbytes(&self.hidden_concat)
             + mlxcel_core::array_nbytes(&self.continuation_logits)
     }
+
+    /// Count existing shared host allocations without exporting target arrays.
+    pub fn resident_host_bytes(&self, seen: &mut HashSet<usize>) -> usize {
+        self.target.resident_host_bytes(seen)
+    }
+
     pub fn storage_summary(&self) -> mlxcel_core::generate::SnapshotStorageSummary {
         let mut summary = self.target.storage_summary();
         summary.local_bytes += mlxcel_core::array_nbytes(&self.hidden_concat)

@@ -19,6 +19,7 @@
 //! Apache-2.0 `mlxcel` Qwen 3.5 implementation.
 
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use crate::portable_snapshot::{
@@ -132,6 +133,11 @@ impl MtpPromptSnapshot {
             + self.draft.nbytes()
             + mlxcel_core::array_nbytes(&self.last_hidden)
             + mlxcel_core::array_nbytes(&self.continuation_logits)
+    }
+
+    /// Count existing host allocations shared by the target and draft only once.
+    pub fn resident_host_bytes(&self, seen: &mut HashSet<usize>) -> usize {
+        self.target.resident_host_bytes(seen) + self.draft.resident_host_bytes(seen)
     }
 
     pub fn storage_summary(&self) -> mlxcel_core::generate::SnapshotStorageSummary {

@@ -291,6 +291,16 @@ impl PromptSnapshot {
         })
     }
 
+    /// Count existing shared host allocations once across the caller's snapshots.
+    pub fn resident_host_bytes(&self, seen: &mut HashSet<usize>) -> usize {
+        match self {
+            Self::Baseline(snapshot) => snapshot.resident_host_bytes(seen),
+            Self::Mtp(snapshot) => snapshot.resident_host_bytes(seen),
+            #[cfg(any(feature = "dflash2", test))]
+            Self::Dflash2(snapshot) => snapshot.resident_host_bytes(seen),
+        }
+    }
+
     pub fn storage_summary(&self) -> mlxcel_core::generate::SnapshotStorageSummary {
         match self {
             Self::Baseline(snapshot) => snapshot.storage_summary(),
