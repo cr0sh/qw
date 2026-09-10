@@ -733,6 +733,7 @@ impl SseState {
             &failure.message,
             match failure.kind {
                 FailureKind::InvalidRequest
+                | FailureKind::ContextLengthExceeded
                 | FailureKind::ResumeMismatch
                 | FailureKind::ResumeNotFound
                 | FailureKind::ResumeUnsupported => "invalid_request_error",
@@ -741,6 +742,7 @@ impl SseState {
             },
             failure.param.as_deref(),
             match failure.kind {
+                FailureKind::ContextLengthExceeded => Some("context_length_exceeded"),
                 FailureKind::ResumeMismatch => Some("resume_mismatch"),
                 FailureKind::ResumeNotFound => Some("resume_not_found"),
                 FailureKind::ResumeUnsupported => Some("resume_unsupported"),
@@ -943,6 +945,13 @@ impl ApiError {
     fn from_worker(error: WorkerFailure) -> Self {
         match error.kind {
             FailureKind::InvalidRequest => Self::invalid(error.message, error.param),
+            FailureKind::ContextLengthExceeded => Self {
+                status: StatusCode::BAD_REQUEST,
+                message: error.message,
+                error_type: "invalid_request_error",
+                param: error.param,
+                code: Some("context_length_exceeded"),
+            },
             FailureKind::Server => Self::server(error.message),
             FailureKind::ModelOutput => Self {
                 status: StatusCode::UNPROCESSABLE_ENTITY,

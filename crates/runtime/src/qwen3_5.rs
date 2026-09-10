@@ -1914,6 +1914,10 @@ impl Qwen35Model {
                 config_path.display()
             );
         }
+        ensure!(
+            config.max_position_embeddings > 0,
+            "invalid model configuration: max_position_embeddings must be a positive integer"
+        );
         Ok(config)
     }
 
@@ -3147,6 +3151,7 @@ mod tests {
     fn dense_config(quantization: Option<Value>) -> Qwen35Config {
         let mut value = serde_json::json!({
             "model_type": "qwen3_5_text",
+            "max_position_embeddings": 4096,
             "hidden_size": 16,
             "num_hidden_layers": 8,
             "intermediate_size": 32,
@@ -3744,6 +3749,35 @@ mod tests {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
+    #[test]
+    fn checkpoint_context_must_be_declared_and_positive() {
+        let fixture = TestDir::new("context-config");
+        let mut config = serde_json::json!({
+            "model_type": "qwen3_5",
+            "hidden_size": 16,
+            "num_hidden_layers": 8,
+            "intermediate_size": 32,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "full_attention_interval": 4,
+            "vocab_size": 100
+        });
+        let path = fixture.0.join("config.json");
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        assert!(Qwen35Model::parse_config(&fixture.0).is_err());
+        config["max_position_embeddings"] = serde_json::json!(0);
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        assert!(Qwen35Model::parse_config(&fixture.0).is_err());
+        config["max_position_embeddings"] = serde_json::json!(8);
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        assert_eq!(
+            Qwen35Model::parse_config(&fixture.0)
+                .expect("a tiny but explicit context is valid")
+                .max_position_embeddings,
+            8
+        );
+    }
+
 
     #[test]
     fn outer_qwen35_text_config_and_mixed_quantization_are_accepted() {
@@ -3754,6 +3788,7 @@ mod tests {
                 "model_type": "qwen3_5",
                 "text_config": {
                     "model_type": "qwen3_5_text",
+                    "max_position_embeddings": 4096,
                     "hidden_size": 16,
                     "num_hidden_layers": 8,
                     "intermediate_size": 32,
@@ -4042,6 +4077,7 @@ mod tests {
     fn dflash_prefill_test_model() -> Qwen35Model {
         let config: Qwen35Config = serde_json::from_value(serde_json::json!({
             "model_type": "qwen3_5_text",
+            "max_position_embeddings": 4096,
             "hidden_size": 64,
             "num_hidden_layers": 2,
             "intermediate_size": 128,

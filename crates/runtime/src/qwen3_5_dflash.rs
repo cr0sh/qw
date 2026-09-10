@@ -1428,8 +1428,8 @@ pub fn load_draft_weights(dir: &std::path::Path) -> Result<(WeightMap, DFlash2Co
 // The current MLX quantized matmul path has two useful DFlash2 verify shapes.
 // Keeping the controller on this closed set avoids accumulating one compiled
 // graph per tail length while still retaining the measured long-context win of
-// width five. Tail rounds intentionally use a full static width and let exact
-// verification truncate the committed output to the caller's remaining budget.
+// width five. Tail rounds retain a static width when the checkpoint has room;
+// at its context boundary even uncommitted verification rows must fit.
 const DFLASH2_STATIC_VERIFY_WIDTHS: [usize; 2] = [4, 5];
 const DFLASH2_LONG_CONTEXT_TOKENS: usize = 64_000;
 const DFLASH2_SELECTOR_EDGE_SCALES: [f32; 3] = [0.75, 1.0, 1.25];
@@ -2286,6 +2286,12 @@ impl Qwen35Dflash2Generator {
         capture_final_snapshot: bool,
         mut on_token: F,
     ) -> Result<Dflash2Generation, String> {
+        let context_tokens = target
+            .config
+            .max_position_embeddings
+            .min(self.model.config.max_position_embeddings);
+        crate::provider::validate_context_budget(context_tokens, prompt_tokens.len(), max_tokens)
+            .map_err(|error| error.to_string())?;
         let mut resolved_sampling = sampling.clone();
         resolved_sampling
             .prompt_token_count
@@ -2436,13 +2442,13 @@ impl Qwen35Dflash2Generator {
             let remaining = max_tokens - generated.len();
             let round_context_tokens = prompt_tokens.len() + generated.len();
             let policy = self.calibration.policy(round_context_tokens);
-            let bs = policy.width;
+            let bs = context_bounded_verify_width(policy.width, context_tokens, committed_tokens);
             let round_compute_start = Instant::now();
             let phase_start = Instant::now();
 
-            // Reuse one maximum-width host buffer. The only staged values are
-            // the anchor and a static width from `DFLASH2_STATIC_VERIFY_WIDTHS`;
-            // a short final budget never introduces a new compiled MLX shape.
+            // Keep static shapes except at the checkpoint boundary: unused
+            // speculative rows must never evaluate positions outside its window.
+            // The pending anchor plus at least one proposal fit while output remains.
             draft_block[0] = bonus;
             let inputs = mlxcel_core::from_slice_i32(&draft_block[..bs], &[1, bs as i32]);
             let out = self.model.propose(
@@ -2509,13 +2515,15 @@ impl Qwen35Dflash2Generator {
             stats.target_verify_time += phase_start.elapsed();
             let compute_latency = round_compute_start.elapsed();
             stats.record_round(policy, walk.accepted, draft_tokens.len());
-            self.calibration.observe(
-                round_context_tokens,
-                policy,
-                walk.accepted,
-                draft_tokens.len(),
-                compute_latency,
-            );
+            if bs == policy.width {
+                self.calibration.observe(
+                    round_context_tokens,
+                    policy,
+                    walk.accepted,
+                    draft_tokens.len(),
+                    compute_latency,
+                );
+            }
 
             // Emit the accepted prefix (and possibly a corrected token).
             let phase_start = Instant::now();
@@ -2625,6 +2633,10 @@ impl Qwen35Dflash2Generator {
         })
     }
 }
+fn context_bounded_verify_width(width: usize, context_tokens: usize, committed_tokens: usize) -> usize {
+    width.min(context_tokens.saturating_sub(committed_tokens))
+}
+
 fn materialize_detached(array: UniquePtr<MlxArray>) -> UniquePtr<MlxArray> {
     mlxcel_core::eval(&array);
     let ptr = array
@@ -2683,6 +2695,14 @@ mod tests {
     };
     use mlxcel_core::generate::SamplingConfig;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn speculative_verification_stays_inside_checkpoint_context() {
+        assert_eq!(context_bounded_verify_width(5, 16, 11), 5);
+        assert_eq!(context_bounded_verify_width(5, 16, 12), 4);
+        assert_eq!(context_bounded_verify_width(5, 16, 14), 2);
+        assert_eq!(context_bounded_verify_width(5, 16, 16), 0);
+    }
 
     fn raw_i32(array: &MlxArray) -> Vec<i32> {
         mlxcel_core::eval(array);
