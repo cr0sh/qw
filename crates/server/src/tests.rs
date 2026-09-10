@@ -15,6 +15,21 @@ use super::*;
 
 const MODEL: &str = "test-model";
 
+#[tokio::test]
+async fn context_length_failure_is_an_http_bad_request_with_a_stable_code() {
+    let response = ApiError::from_worker(WorkerFailure {
+        kind: FailureKind::ContextLengthExceeded,
+        message: "requested prompt and output exceed the checkpoint context".to_string(),
+        param: None,
+    })
+    .into_response();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let error: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert_eq!(error["error"]["code"], "context_length_exceeded");
+}
+
 async fn post(app: Router, path: &str, body: Value) -> (StatusCode, axum::http::HeaderMap, String) {
     let response = app
         .oneshot(
