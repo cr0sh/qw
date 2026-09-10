@@ -446,7 +446,11 @@ impl SnapshotStorageSummary {
     pub fn resident_nbytes(&self) -> usize {
         self.local_bytes
             + self.pages.iter().map(|(_, bytes)| bytes).sum::<usize>()
-            + self.host_pages.iter().map(|(_, bytes)| bytes).sum::<usize>()
+            + self
+                .host_pages
+                .iter()
+                .map(|(_, bytes)| bytes)
+                .sum::<usize>()
     }
 }
 
@@ -574,7 +578,14 @@ impl ModelStateSnapshot {
     /// This is kept outside the model-defined tensor namespace so model restore
     /// validation remains concerned only with recurrent/cache layout.
     pub fn set_continuation_logits(&mut self, logits: &MlxArray) {
-        self.continuation_logits = Some(ffi::contiguous(logits, false));
+        // Callers attach logits after the model's capture boundary. Finish this
+        // copy now so a small view cannot pin the full forward graph until export.
+        let compact = ffi::contiguous(logits, false);
+        ffi::eval(&compact);
+        let root = compact.as_ref().expect("continuation logits") as *const MlxArray;
+        // SAFETY: compact owns the evaluated root throughout detachment.
+        unsafe { ffi::detach_all(&[root]) };
+        self.continuation_logits = Some(compact);
     }
 
     /// Borrow the prefill logits associated with this exact prefix.
@@ -4878,6 +4889,33 @@ mod tests {
                 "eviction must release all snapshot backing",
             );
         }
+
+        // Continuation logits are attached after the paged capture boundary.
+        // They must release their dense source even if no export ever occurs.
+        let source = ffi::arange_f32(0.0, (4 * 1024 * 1024) as f32, 1.0);
+        ffi::eval(&source);
+        let logits = ffi::slice(&source, &[4 * 1024 * 1024 - 256], &[4 * 1024 * 1024]);
+        let mut snapshot = ModelStateSnapshot::new("continuation-backing", 1);
+        snapshot.set_continuation_logits(&logits);
+        drop(logits);
+        drop(source);
+        ffi::synchronize_default();
+        assert!(
+            crate::memory::active_memory().saturating_sub(baseline) <= 8 * 1024 * 1024,
+            "continuation capture must not retain its dense source before export",
+        );
+        let retained = snapshot.continuation_logits().unwrap();
+        ffi::eval(retained);
+        assert!(ffi::array_buffer_nbytes(retained) <= ffi::array_nbytes(retained) + 64 * 1024);
+        let expected = ffi::arange_f32(
+            (4 * 1024 * 1024 - 256) as f32,
+            (4 * 1024 * 1024) as f32,
+            1.0,
+        );
+        assert_eq!(
+            ffi::array_to_raw_bytes(retained),
+            ffi::array_to_raw_bytes(&expected),
+        );
     }
 
     #[test]
