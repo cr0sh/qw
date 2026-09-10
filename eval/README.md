@@ -150,7 +150,12 @@ reference campaign.
 | Role | Configuration |
 | --- | --- |
 | Agent under test | `qwen3.8-27b`, `http://127.0.0.1:8883/v1`, thinking enabled, medium reasoning effort, 32768 output tokens |
-| User simulator and native NL-assertion judge | `deepseek-v4.1-flash`, `https://api.deepseek.com`, thinking disabled, temperature 0, 32768 output tokens |
+| User simulator and native NL-assertion judge | `deepseek-flash` (DeepSeek-V4.1-Flash), `https://api.deepseek.com`, thinking disabled, temperature 0, 32768 output tokens |
+
+DeepSeek's [model documentation](https://api-docs.deepseek.com/quick_start/pricing/)
+maps the API model name `deepseek-flash` to DeepSeek-V4.1-Flash. The literal
+`deepseek-v4.1-flash` is not an accepted API model name. The provider URL and
+credential loading remain unchanged.
 
 The seven target sampling overrides are omitted so QW resolves its model policy.
 Native retry, termination, scoring, and error handling are unchanged. The
@@ -192,7 +197,7 @@ eval/.venv-reference/bin/python -I -B eval/run_tau3_banking.py \
 Keep the dataset setting and evaluation configuration unchanged. `--resume` maps
 directly to native `use_cache`; upstream determines which records can be reused.
 Never run multiple evaluators against one output directory.
-The example resumes a concurrency-2 `deepseek-v4.1-flash` campaign only; the model
+The example resumes a concurrency-2 `deepseek-flash` campaign only; the model
 change requires a fresh campaign, not resuming results from a different simulator.
 
 The launcher adds no writer lock, record salvage, stale-state repair, synchronized
