@@ -4,7 +4,7 @@ mod store;
 mod tests;
 mod trie;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -827,6 +827,8 @@ impl AdaptivePrefixCache {
                     terminal.blob_refs.clear();
                     terminal.serialized_bytes = 0;
                     terminal.manifest_bytes = 0;
+                    terminal.page_refs.clear();
+                    terminal.local_bytes = 0;
                     (
                         terminal.snapshot.take(),
                         previous_persistent_key,
@@ -1293,7 +1295,6 @@ impl AdaptivePrefixCache {
                 reclaimed_bytes,
             );
         }
-        self.rebuild_accounting();
         retained
     }
 
@@ -1303,7 +1304,6 @@ impl AdaptivePrefixCache {
         };
         self.evict_persistent_to(cap, false);
         self.evict_persistent_to(filesystem_hard_cap(cap), true);
-        self.rebuild_accounting();
     }
 
     fn evict_persistent_to(&mut self, limit: u64, include_resumes: bool) {
@@ -1431,30 +1431,33 @@ impl AdaptivePrefixCache {
     }
 
     fn rebuild_accounting(&mut self) {
-        let mut pages = HashMap::<u64, (usize, u64)>::new();
-        let mut host_pages = HashMap::<usize, usize>::new();
+        let mut pages =
+            HashMap::<u64, (usize, u64)>::with_capacity(self.memory_pages.len());
+        let mut seen_host = HashSet::with_capacity(self.memory_pages.len());
+        let mut blobs =
+            HashMap::<String, (usize, u64)>::with_capacity(self.filesystem_blobs.len());
+        let mut local_bytes = 0;
+        let mut host_bytes = 0;
         for (node, route) in self.trie.terminal_ids() {
-            let Some(t) = self.trie.terminal_mut(node, route) else {
+            let Some(t) = self.trie.terminal(node, route) else {
                 continue;
             };
-            // Page exports are memoized on immutable pages shared by multiple
-            // terminals. A publication can populate those host mirrors after
-            // insertion, so cached insertion-time sizes are not authoritative.
+            // GPU pages and local arrays are immutable while a snapshot is hot.
+            // Shared host mirrors can be initialized by a later publication.
             if let Some(snapshot) = &t.snapshot {
-                let mut summary = snapshot.storage_summary();
-                summary
-                    .pages
-                    .sort_unstable_by_key(|(identity, _)| *identity);
-                summary.pages.dedup_by_key(|(identity, _)| *identity);
-                t.page_refs = summary.pages;
-                t.local_bytes = summary.local_bytes;
-                for (identity, bytes) in summary.host_pages {
-                    host_pages.entry(identity).or_insert(bytes);
-                }
+                host_bytes += snapshot.resident_host_bytes(&mut seen_host) as u64;
             }
+            local_bytes += t.local_bytes as u64;
             for &(id, bytes) in &t.page_refs {
                 let entry = pages.entry(id).or_insert((0, bytes as u64));
                 entry.0 += 1;
+            }
+            for (digest, bytes) in &t.blob_refs {
+                if let Some(entry) = blobs.get_mut(digest) {
+                    entry.0 += 1;
+                } else {
+                    blobs.insert(digest.clone(), (1, *bytes));
+                }
             }
         }
         self.memory_pages = pages;
@@ -1463,22 +1466,8 @@ impl AdaptivePrefixCache {
             .values()
             .map(|(_, bytes)| *bytes)
             .sum::<u64>()
-            + self
-                .trie
-                .terminal_ids()
-                .into_iter()
-                .filter_map(|(n, r)| self.trie.terminal(n, r).map(|t| t.local_bytes as u64))
-                .sum::<u64>()
-            + host_pages.values().map(|bytes| *bytes as u64).sum::<u64>();
-        let mut blobs = HashMap::<String, (usize, u64)>::new();
-        for (node, route) in self.trie.terminal_ids() {
-            if let Some(t) = self.trie.terminal(node, route) {
-                for (digest, bytes) in &t.blob_refs {
-                    let entry = blobs.entry(digest.clone()).or_insert((0, *bytes));
-                    entry.0 += 1;
-                }
-            }
-        }
+            + local_bytes
+            + host_bytes;
         self.filesystem_blobs = blobs;
         self.filesystem_bytes = self
             .filesystem_blobs

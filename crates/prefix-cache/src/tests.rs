@@ -2062,6 +2062,31 @@ fn adaptive_memory_accounts_shared_checkpoint_pages_once() {
 }
 
 #[test]
+fn hot_accounting_refreshes_host_mirrors_initialized_after_insertion() {
+    let mut cache =
+        AdaptivePrefixCache::new(namespaces(), memory_config(1_000_000)).expect("cache");
+    let tokens = (0..768).collect::<Vec<i32>>();
+    cache.insert(&tokens, paged_snapshot_chain(), SnapshotRoute::Baseline);
+    let page_bytes = 256 * 2 * std::mem::size_of::<f32>() as u64;
+    assert_eq!(cache.memory_bytes(), 3 * page_bytes + 3 * 4);
+
+    let pinned = cache
+        .lookup(&tokens[..512], SnapshotRoute::Baseline)
+        .unwrap();
+    // Export through an external pin, after all hot entries were admitted.
+    // The first two pages are shared with other checkpoints; the third
+    // remains GPU-only.
+    let portable = pinned.snapshot().to_portable().unwrap();
+    assert!(cache.lookup(&tokens, SnapshotRoute::Baseline).is_some());
+    assert_eq!(cache.memory_bytes(), 5 * page_bytes + 3 * 4);
+
+    cache.memory_cap = 0;
+    cache.evict_memory(None);
+    assert_eq!(cache.memory_bytes(), 0);
+    assert_eq!(pinned.snapshot().to_portable().unwrap(), portable);
+}
+
+#[test]
 fn publication_charges_shared_host_pages_after_export_and_preserves_evicted_pins() {
     let state = Arc::new(Mutex::new(RecordingState::default()));
     let mut cache = AdaptivePrefixCache::with_store(
