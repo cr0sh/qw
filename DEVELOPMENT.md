@@ -1,8 +1,8 @@
 # Development notes
 
 These notes cover shared local resources used while developing and measuring
-QW. They do not publish performance results; measurements belong in a record
-that identifies the exact source revision and decoding configuration.
+QW. Dated memory measurements below identify their source and configuration;
+performance results belong in a record with the same provenance.
 
 ## Cache layout
 
@@ -75,6 +75,94 @@ I/O; queued writes and large FP16 snapshots can delay a subsequent filesystem
 lookup. Darwin durability barriers are batched, but this does not remove FIFO
 queueing or make checkpoint publication free. Report lookup, uncached prefill,
 decode, and terminal/publication timing separately.
+
+## Long-context memory breakdown
+
+**Advised operating ceiling: 36 GiB of process physical footprint**, including
+model/request state, caches, host allocations, and allocator/driver residency.
+This is a total-process target, not a 36 GiB allowance for each component and
+not an enforced MLX or prefix-cache limit. The measured long-context physical
+peaks below still exceed it. Bounded retention is not evidence that the 36 GiB
+target has been met; do not raise the advised ceiling to match observed peaks.
+
+### Ownership and accounting
+
+| Component | What it contains | Budget / measurement |
+|---|---|---|
+| Live MLX allocations | Target/draft weights, active and restored KV, retained GPU snapshot pages, recurrent state, logits, and temporary workspaces | MLX active bytes; peak bytes include transient allocations missed by settled samples |
+| Reusable MLX buffers | Freed buffers retained for later GPU work | Default 8 GiB allowance; separate from active bytes, and not a hard residency cap |
+| Hot prefix snapshots | Unique GPU pages, unique retained host page mirrors, and snapshot-local arrays | `--prefix-cache-memory-bytes`; overlaps the MLX and host counters rather than adding another independent allocation |
+| Live host heap | Portable snapshot bytes, metadata/indexes, and other CPU allocations | Darwin `malloc_zone_statistics(NULL, ...)` reports live bytes across allocator zones; not exclusively cache payloads |
+| I/O staging and lookahead | Pending publications, portable prefetch, and pinned snapshots | Reservations described above; conservative ownership accounting, not measured physical bytes |
+| Retained allocator space and other residency | Unused heap capacity, driver allocations, mapped/resident pages, and other process overhead | Reserved heap bytes and Darwin physical footprint; neither is interchangeable with live allocation bytes |
+
+Do not sum these rows or independently measured peaks. Hot-tier and staging
+accounting overlap physical allocations; reserved heap bytes include live heap
+bytes, and not all reserved space is physically resident. MLX and heap counters
+are diagnostic views, not an exhaustive additive decomposition of physical
+footprint. These measurements do not isolate weights from live KV/workspaces.
+
+### Recorded characterization — 2026-09-10
+
+Implementation: `d4468dc9df1bf44068d85bb730c62a67df07257c`.
+Integrated into `main` by `9708be1afb813b7499e142d8f4897c470e5cc5b1`.
+Baseline: `b28c5db0e500be5731e52ede55366f8ae351f6f6`.
+Hardware: Apple M4 Max / Metal. Target:
+`Jundot/Qwen3.8-27B-oQ4e-fp16-mtp`; draft:
+`incoai/Qwen3.8-27B-DFlash2`; Turbo4 KV, greedy DFlash2 generation,
+up to 32 generated tokens per request, and the 8 GiB MLX free-buffer allowance.
+Each soak ran 64 requests with short and 1,537-token appended turns.
+All memory figures below use GiB (`2^30` bytes).
+
+| Workload | Hot-tier budget | Maximum prompt tokens | Maximum sampled MLX active | MLX peak | Physical peak |
+|---|---:|---:|---:|---:|---:|
+| One retained long context | 8 | 211,896 | 24.11 | 27.91 | 41.39 |
+| Alternating long contexts with cache pressure | 6 | 204,139 | 23.21 | 30.11 | 49.19 |
+
+Settled checkpoints from the mixed-context run (request counts are one-based):
+
+| After request | MLX active | MLX reusable buffers | Live malloc bytes | Reserved malloc bytes | Physical footprint |
+|---|---:|---:|---:|---:|---:|
+| 8 | 21.87 | 8.08 | 6.29 | 8.91 | 35.96 |
+| 56 | 22.06 | 8.00 | 6.95 | 11.24 | 41.74 |
+| 64 | 22.07 | 8.00 | 3.23 | 11.15 | 39.59 |
+
+The final request has no next-request prefetch, so its lower live heap value is
+not a like-for-like retention comparison with earlier lookahead checkpoints.
+The largest sampled live heap was 6.95 GiB, only 0.66 GiB above request 8.
+After cache/provider teardown and MLX cache clearing, MLX active bytes returned
+to 2 bytes and live malloc usage to 53.41 MiB, while malloc still reserved
+11.09 GiB and process physical footprint remained 4.19 GiB. Reserved or resident
+space must not be mislabeled as live snapshot ownership.
+
+Both soaks completed their restart/teardown checks. All 64 mixed-context output
+sequences matched the baseline when replaying identical prompt hashes and cache
+boundaries. Different hit boundaries can change prefill chunking and subsequent
+outputs; they are not equivalent numerical comparisons. These are finite
+workload measurements, not an indefinite bound or a 36 GiB acceptance pass.
+
+### Memory reduction efforts already made
+
+- Established the default 8 GiB free-buffer allowance and explicit
+  `MLXCEL_CACHE_LIMIT` override; reducing it can trade throughput for retention.
+- Tiled oversized fallback attention score matrices and materialized/detached
+  DFlash prefill chunk outputs to avoid cross-chunk lazy-graph retention.
+- Compacted retained snapshot page backing allocations so small page views do
+  not pin historical full-context buffers; materialized continuation logits
+  before retaining them.
+- Shared memoized portable page mirrors and charged unique host allocations
+  independently of GPU page identities, including mirrors acquired after
+  initial hot-tier admission.
+- Cached immutable page-accounting summaries and refreshed only dynamic host
+  accounting, avoiding redundant export graphs and repeated publication work.
+  Publication remains synchronous; this is optimization, not offloading.
+- Bounded optional publication/lookahead staging and preserved cancellation
+  ownership until I/O actually finishes, as described in the cache section.
+
+These changes do not truncate context or make the hot-tier budget a process
+cap. Further work toward 36 GiB must measure physical footprint as well as MLX
+and host ownership, and preserve output correctness and prefill/decode
+throughput rather than merely shifting bytes between counters.
 
 ## Generation policy
 
