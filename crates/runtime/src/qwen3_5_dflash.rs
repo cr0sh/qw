@@ -1956,12 +1956,20 @@ impl Dflash2GenerationStats {
         }
     }
 
-    fn record_round(&mut self, policy: Dflash2RoundPolicy, accepted: usize, proposed: usize) {
+    fn record_round(
+        &mut self,
+        policy: Dflash2RoundPolicy,
+        actual_width: usize,
+        accepted: usize,
+        proposed: usize,
+    ) {
         self.accepted_draft_tokens += accepted;
         self.proposed_draft_tokens += proposed;
-        self.verify_width_rounds[policy.width_index] += 1;
-        self.verify_width_accepted_draft_tokens[policy.width_index] += accepted;
-        self.verify_width_proposed_draft_tokens[policy.width_index] += proposed;
+        if actual_width == policy.width {
+            self.verify_width_rounds[policy.width_index] += 1;
+            self.verify_width_accepted_draft_tokens[policy.width_index] += accepted;
+            self.verify_width_proposed_draft_tokens[policy.width_index] += proposed;
+        }
         self.selector_scale_rounds[policy.selector_arm] += 1;
         self.selector_scale_accepted_draft_tokens[policy.selector_arm] += accepted;
         self.selector_scale_proposed_draft_tokens[policy.selector_arm] += proposed;
@@ -2514,7 +2522,7 @@ impl Qwen35Dflash2Generator {
             }
             stats.target_verify_time += phase_start.elapsed();
             let compute_latency = round_compute_start.elapsed();
-            stats.record_round(policy, walk.accepted, draft_tokens.len());
+            stats.record_round(policy, bs, walk.accepted, draft_tokens.len());
             if bs == policy.width {
                 self.calibration.observe(
                     round_context_tokens,
