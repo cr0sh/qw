@@ -1301,7 +1301,11 @@ impl Qwen35Provider {
             None,
             &[],
             false,
-            Some((&prefill.input_embeddings, &prefill.position_ids, prefill.rope_delta)),
+            Some((
+                &prefill.input_embeddings,
+                &prefill.position_ids,
+                prefill.rope_delta,
+            )),
             on_delta,
         )
         .map(|(generation, _)| generation)

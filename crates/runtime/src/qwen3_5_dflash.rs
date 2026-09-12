@@ -2295,8 +2295,15 @@ impl Qwen35Dflash2Generator {
         on_token: F,
     ) -> Result<Dflash2Generation, String> {
         self.generate_streaming_with_prefill(
-            target, prompt_tokens, max_tokens, sampling, prefix_reuse,
-            checkpoint_token_lengths, capture_final_snapshot, None, on_token,
+            target,
+            prompt_tokens,
+            max_tokens,
+            sampling,
+            prefix_reuse,
+            checkpoint_token_lengths,
+            capture_final_snapshot,
+            None,
+            on_token,
         )
     }
 
@@ -2387,13 +2394,21 @@ impl Qwen35Dflash2Generator {
 
         let (mut hidden_concat, first_logits, prompt_snapshots) =
             if let Some((embeddings, positions, delta)) = multimodal {
-                let input = mlxcel_core::from_slice_i32(
-                    prompt_tokens, &[1, prompt_tokens.len() as i32],
-                );
+                let input =
+                    mlxcel_core::from_slice_i32(prompt_tokens, &[1, prompt_tokens.len() as i32]);
                 let prefill = target.forward_dflash_multimodal_prefill(
-                    &input, embeddings, positions, delta, &self.target_layer_ids, self.hidden_limit,
+                    &input,
+                    embeddings,
+                    positions,
+                    delta,
+                    &self.target_layer_ids,
+                    self.hidden_limit,
                 )?;
-                (Some(prefill.hidden_concat), prefill.first_logits, Vec::new())
+                (
+                    Some(prefill.hidden_concat),
+                    prefill.first_logits,
+                    Vec::new(),
+                )
             } else {
                 self.prefill_with_checkpoints(
                     target,

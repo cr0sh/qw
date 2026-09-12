@@ -1568,8 +1568,9 @@ impl Qwen35Model {
                         &[0, 0, start],
                         &[3, shape[0], end],
                     )),
-                    None => rope_delta
-                        .map(|delta| decode_rope_positions(cache_offset, seq_len, delta)),
+                    None => {
+                        rope_delta.map(|delta| decode_rope_positions(cache_offset, seq_len, delta))
+                    }
                 };
                 let mut h = match multimodal {
                     Some((embeddings, _, _)) => mlxcel_core::slice(
@@ -4252,7 +4253,10 @@ mod tests {
                 });
             }
             let last = mlxcel_core::slice(&hidden, &[0, 28, 0], &[1, 29, 64]);
-            (captured.unwrap(), model.project_logits(&model.norm.forward(&last)))
+            (
+                captured.unwrap(),
+                model.project_logits(&model.norm.forward(&last)),
+            )
         });
         mlxcel_core::eval(&hidden);
         mlxcel_core::eval(&logits);
@@ -4265,10 +4269,17 @@ mod tests {
         mlxcel_core::eval(&continuation.logits);
 
         for limit in [5, usize::MAX] {
-            let output = model.forward_dflash_prefill_segment_chunked(
-                &input, &[0, 1], limit, true, true, 7,
-                Some((&embeddings, &positions, delta)),
-            ).expect("chunked image prefill");
+            let output = model
+                .forward_dflash_prefill_segment_chunked(
+                    &input,
+                    &[0, 1],
+                    limit,
+                    true,
+                    true,
+                    7,
+                    Some((&embeddings, &positions, delta)),
+                )
+                .expect("chunked image prefill");
             let keep = limit.min(29) as i32;
             let expected = mlxcel_core::slice(&hidden, &[0, 29 - keep, 0], &[1, 29, 128]);
             assert_dflash_prefill_close(&output.hidden_concat, &expected);
@@ -4284,10 +4295,12 @@ mod tests {
         }
 
         // A new text request must discard the image delta and all target state.
-        let text = model.forward_dflash_prefill_segment(&input, &[0, 1], 5, true, true)
+        let text = model
+            .forward_dflash_prefill_segment(&input, &[0, 1], 5, true, true)
             .expect("text after image");
         let fresh = dflash_prefill_test_model();
-        let expected = fresh.forward_dflash_prefill_segment(&input, &[0, 1], 5, true, true)
+        let expected = fresh
+            .forward_dflash_prefill_segment(&input, &[0, 1], 5, true, true)
             .expect("fresh text");
         assert_dflash_prefill_close(&text.first_logits, &expected.first_logits);
         assert_dflash_prefill_close(&text.hidden_concat, &expected.hidden_concat);
@@ -4402,7 +4415,15 @@ mod tests {
                     &[1, (start + segment_len) as i32],
                 );
                 let output = model
-                    .forward_dflash_prefill_segment_chunked(&segment, &[0, 1], 31, false, false, 64, None)
+                    .forward_dflash_prefill_segment_chunked(
+                        &segment,
+                        &[0, 1],
+                        31,
+                        false,
+                        false,
+                        64,
+                        None,
+                    )
                     .expect("measured prefill");
                 let roots = [
                     &*output.hidden_concat as *const MlxArray,
