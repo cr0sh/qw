@@ -1,0 +1,91 @@
+{
+  "paths_relative_to": "tests/fixtures/images",
+  "retrieved_on": "2026-09-12",
+  "generation": "swift tests/fixtures/images/generate_ocr.swift (macOS AppKit + Menlo; committed PNG bytes are canonical; rasterization may differ across OS/font versions).",
+  "fetch": "python3 tests/fixtures/images/fetch_sources.py --accept-source-rights",
+  "fixtures": [
+    {
+      "id": "ocr_multiline",
+      "kind": "generated_ocr",
+      "path": "ocr_multiline.png",
+      "dimensions": [
+        1200,
+        480
+      ],
+      "font_size": 32,
+      "ocr_ground_truth": "FIELD NOTES: PLATFORM 7\nDeparture: 08:45 / Gate B-12\nBring 2 maps, 3 pens & a blue notebook.\nThe quick brown fox jumps over 13 logs.\nReference: QWR-2026-0912",
+      "prompt": "Transcribe all text exactly, preserving line breaks, capitalization, numbers and punctuation. Return only the transcription.",
+      "semantic_checks": [
+        "Exact transcription after trimming outer whitespace; preserve internal spaces and line breaks."
+      ],
+      "attribution": "Original synthetic text and layout created for qwr; rendered using macOS Menlo.",
+      "rights_status": "Original fixture content distributed under the repository license.",
+      "source_url": null,
+      "sha256": "88dbee9db878dea6c8a3de79df89d96cea6bd739d96cecce0fbe15e6b9427c53",
+      "media_type": "image/png"
+    },
+    {
+      "id": "ocr_receipt",
+      "kind": "generated_ocr",
+      "path": "ocr_receipt.png",
+      "dimensions": [
+        960,
+        720
+      ],
+      "font_size": 28,
+      "ocr_ground_truth": "HARBOR CAFE\nReceipt #0042 | 2026-09-12\nITEM              QTY   PRICE   TOTAL\nTea                 2   $3.25   $6.50\nBagel               3   $2.40   $7.20\nJam                 1   $0.80   $0.80\nSubtotal                       $14.50\nTax (8%)                        $1.16\nTOTAL                          $15.66\nPaid: $20.00  Change: $4.34",
+      "prompt": "Transcribe the receipt exactly, preserving lines, columns, numbers, currency symbols and punctuation. Return only the transcription.",
+      "semantic_checks": [
+        "Exact text and row order; column padding may be normalized for semantic scoring.",
+        "Subtotal 14.50 + tax 1.16 = total 15.66; paid 20.00 minus total = change 4.34."
+      ],
+      "attribution": "Original synthetic text and layout created for qwr; rendered using macOS Menlo.",
+      "rights_status": "Original fixture content distributed under the repository license.",
+      "source_url": null,
+      "sha256": "56e62219e2b502c175e4a422f28d1f6e830d3f8804a3593458352398a18e68ee",
+      "media_type": "image/png"
+    },
+    {
+      "id": "krispy_kreme_dozen",
+      "kind": "source_photo",
+      "path": "local/krispy_kreme_original_glazed_dozen.webp",
+      "source_page": "https://www.krispykreme.co.uk/original-glazed-dozen.html",
+      "source_url": "https://www.krispykreme.co.uk/media/catalog/product/o/r/original_glazed_dozen_-_with_lip_result.png",
+      "attribution": "Krispy Kreme UK official Original Glazed Dozen product photograph; photographer not credited.",
+      "rights_status": "Redistribution permission not established. Copyrighted commercial product image; locally fetched only, excluded from git. No redistribution license granted by this manifest.",
+      "prompt": "Describe the contents of this box, the brand if visible, and how many doughnuts are packed inside.",
+      "semantic_checks": [
+        "Open Krispy Kreme branded box containing a dozen (12) glazed ring doughnuts.",
+        "Plain Original Glazed doughnuts, not mixed toppings or filled doughnuts."
+      ],
+      "dimensions": [
+        1200,
+        1200
+      ],
+      "media_type": "image/webp",
+      "sha256": "9b0b868e78816435227894c9901a972f17e0b5f1fa826e14cdacf48154e56f63"
+    },
+    {
+      "id": "audrey_hepburn_karsh",
+      "kind": "source_photo",
+      "path": "local/audrey_hepburn_yousuf_karsh_1956.jpg",
+      "source_page": "https://karsh.org/photographs/audrey-hepburn/",
+      "source_url": "https://i0.wp.com/karsh.org/wp-content/uploads/2016/10/Yousuf-Karsh-Audrey-Hepburn-1956.jpg?fit=960%2C1208&strip=none&ssl=1",
+      "attribution": "Audrey Hepburn, 1956, \u00a9 Yousuf Karsh. Estate archive, sitting 11315, March 23, 1956.",
+      "rights_status": "Copyright \u00a9 Yousuf Karsh. Licensing required; locally fetched only, excluded from git. No redistribution license granted by this manifest.",
+      "rights_url": "https://karsh.org/inquiries/",
+      "prompt": "Describe this black-and-white portrait: pose, clothing, lighting, and background.",
+      "semantic_checks": [
+        "Black-and-white close-up portrait of a woman in profile facing image left, eyes lowered.",
+        "Dark high-neck sweater, swept-back hair in a bun, plain light gray background; face softly lit."
+      ],
+      "provenance_check": "Official estate archive identifies the subject as Audrey Hepburn and photographer as Yousuf Karsh (1956); not an identity-recognition requirement for the model.",
+      "dimensions": [
+        960,
+        1208
+      ],
+      "media_type": "image/jpeg",
+      "sha256": "807bbb13be7902cd5dfbd83440ec7cb30ed757c26c8be633ad2a5659ecb452ef"
+    }
+  ]
+}
