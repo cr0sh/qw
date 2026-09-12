@@ -138,14 +138,14 @@ than redistributed; see the manifest's source and rights information.
 
 ## Historical performance
 
-Latest supplied `cargo bench` results (tokens/s), measured at
-[commit `aad83fe`](https://github.com/cr0sh/qw/commit/aad83fe7928e5f9eee065d8c71538f06f832ae54):
+Latest complete `cargo bench` results (tokens/s), with the implementation at
+[commit `db04cb2`](https://github.com/cr0sh/qw/commit/db04cb2cf094fe0be18600a21c724f6fbfc13033):
 
 | Context | Target prefill | DFlash2 decode |
 |---|---:|---:|
-| Fresh | 254.016 | 56.486 |
-| 10,337-token cached prefix | 232.616 | 54.527 |
-| 64,297-token cached prefix | 154.353 | 36.656 |
+| Fresh | 253.941 | 56.798 |
+| 10,337-token cached prefix | 232.541 | 54.910 |
+| 64,297-token cached prefix | 154.739 | 36.948 |
 
 Fresh prefill processes 4,341 prompt tokens; cached-prefix prefill processes
 only the 288 newly appended tokens, not the cached prefix. Decode excludes

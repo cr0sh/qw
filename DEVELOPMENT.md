@@ -332,6 +332,46 @@ uses bundled MTP. Both variants use the same fixture filenames with different
 identities, so pair baseline/candidate runs within one variant before switching,
 and preserve the fixture inputs and `BENCHMARK_RESULT` rows.
 
+## DFlash2 optimization trials — 2026-09-12
+
+Baseline runtime: `aad83fe7928e5f9eee065d8c71538f06f832ae54` (documentation
+base `980fe9561b4176f136e800e88aac8378a1e9c253`). Accepted implementation:
+`db04cb2cf094fe0be18600a21c724f6fbfc13033`. Hardware and checkpoint are the
+README benchmark configuration. Each run used one warmup, three timed
+repetitions, and the existing deterministic-output assertions.
+
+Only the five-row, head-dimension-256 Turbo4 attention path now stages 32
+tokens instead of 16. Four-row verification retains 16-token stages; per-head
+arithmetic, block decomposition, quantization, and decoder selection are
+unchanged. The regression checks bitwise grouped-versus-rowwise attention
+parity for Qwen's 24-query/4-KV-head geometry at ragged long prefixes and a
+65,536-token reduction-tier crossing.
+
+| 64k trial | Decode tokens/s | Decision |
+|---|---:|---|
+| Baseline, adaptive ABBA endpoints | 36.446 / 36.271 | Reference |
+| 32-token stages only at width 5, adaptive ABBA middle runs | 36.782 / 36.915 | Accepted; pooled improvement about 1.35% |
+| Two heads per SIMDgroup instead of three | 33.694 | Rejected |
+| Six heads per SIMDgroup instead of three | 28.268 | Rejected |
+| Eight-token stages | 35.921 | Rejected |
+| Partial fusion of compatible GDN auxiliary projections | 36.561 / 36.635 | No repeatable 64k gain; not integrated |
+
+Using 32-token stages at both widths initially improved fixed-width-5 ABBA
+throughput from 36.603/36.682 to 37.086/37.012 tokens/s, but regressed
+fixed-width-4 from 36.552 to 36.190. This motivated the width-specific
+specialization, not a change to the adaptive width policy. Disabling grouped
+attention measured 24.867 tokens/s and is not an optimization.
+
+The accepted full suite measured prefill 253.941/232.541/154.739 and decode
+56.798/54.910/36.948 tokens/s for fresh/10k/64k. These modest gains do not
+establish a practical route to the idealized bandwidth ceiling. Draft/verify
+profile intervals are asynchronous wall-time accounting: verification drains
+pending draft GPU work, so they are not isolated GPU phase measurements.
+
+Local build logs, benchmark rows, fixture/model hashes, and source provenance
+are retained under `target/dflash2-opt-20260912-151310/`. Rejected candidates
+remain on trial branches, not in the integrated runtime.
+
 ## GPU serialization
 
 GPU tests, benchmarks, and smoke commands from concurrent worktrees must use
