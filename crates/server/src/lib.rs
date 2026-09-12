@@ -34,6 +34,10 @@ use engine::{
 pub use engine::{DecoderConfig, Engine, SubmitError};
 use protocol::{Endpoint, RequestError};
 
+// A 64 MiB image source expands to about 86 MiB of base64. Bound the complete
+// JSON body while allowing that image plus text and request metadata.
+const MAX_REQUEST_BODY_BYTES: usize = 128 * 1024 * 1024;
+
 #[derive(Clone)]
 struct AppState {
     engine: Engine,
@@ -43,6 +47,7 @@ pub fn router(engine: Engine) -> Router {
     Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(responses))
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(AppState { engine })
 }
 

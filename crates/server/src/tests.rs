@@ -2324,6 +2324,44 @@ fn tiny_png_data_uri() -> &'static str {
 }
 
 #[tokio::test]
+async fn image_requests_larger_than_two_mib_reach_both_endpoints() {
+    let mut noise = 0x1234_5678_u32;
+    let image = image::RgbImage::from_fn(768, 768, |_, _| {
+        noise ^= noise << 13;
+        noise ^= noise >> 17;
+        noise ^= noise << 5;
+        let bytes = noise.to_le_bytes();
+        image::Rgb([bytes[0], bytes[1], bytes[2]])
+    });
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(image)
+        .write_to(&mut png, image::ImageFormat::Png)
+        .expect("encode noisy image");
+    let encoded =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, png.into_inner());
+    assert!(encoded.len() > 2 * 1024 * 1024);
+    let uri = format!("data:image/png;base64,{encoded}");
+    let app = router(Engine::start_fake(Some(MODEL), 8));
+    for (endpoint, request) in [
+        (
+            "/v1/chat/completions",
+            json!({"model":MODEL,"messages":[{"role":"user","content":[
+                {"type":"image_url","image_url":{"url":uri}}
+            ]}]}),
+        ),
+        (
+            "/v1/responses",
+            json!({"model":MODEL,"input":[{"role":"user","content":[
+                {"type":"input_image","image_url":uri}
+            ]}]}),
+        ),
+    ] {
+        let (status, _, body) = post(app.clone(), endpoint, request).await;
+        assert_eq!(status, StatusCode::OK, "{endpoint}: {body}");
+    }
+}
+
+#[tokio::test]
 async fn chat_and_responses_preserve_mixed_image_order_buffered_and_streamed() {
     let app = router(Engine::start_fake(Some(MODEL), 8));
     let chat = json!({

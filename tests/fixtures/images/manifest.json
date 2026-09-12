@@ -48,7 +48,7 @@
     {
       "id": "krispy_kreme_dozen",
       "kind": "source_photo",
-      "path": "local/krispy_kreme_original_glazed_dozen.webp",
+      "path": "local/krispy_kreme_original_glazed_dozen.png",
       "source_page": "https://www.krispykreme.co.uk/original-glazed-dozen.html",
       "source_url": "https://www.krispykreme.co.uk/media/catalog/product/o/r/original_glazed_dozen_-_with_lip_result.png",
       "attribution": "Krispy Kreme UK official Original Glazed Dozen product photograph; photographer not credited.",
@@ -62,7 +62,7 @@
         1200,
         1200
       ],
-      "media_type": "image/webp",
+      "media_type": "image/png",
       "sha256": "9b0b868e78816435227894c9901a972f17e0b5f1fa826e14cdacf48154e56f63"
     },
     {
