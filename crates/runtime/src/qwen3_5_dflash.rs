@@ -2283,30 +2283,6 @@ impl Qwen35Dflash2Generator {
     }
 
     /// Generate with distribution-preserving DFlash2 draft verification.
-    pub fn generate_streaming<F: FnMut(i32) -> bool>(
-        &mut self,
-        target: &Qwen35Model,
-        prompt_tokens: &[i32],
-        max_tokens: usize,
-        sampling: &mlxcel_core::generate::SamplingConfig,
-        prefix_reuse: Option<Dflash2PrefixReuse<'_>>,
-        checkpoint_token_lengths: &[usize],
-        capture_final_snapshot: bool,
-        on_token: F,
-    ) -> Result<Dflash2Generation, String> {
-        self.generate_streaming_with_prefill(
-            target,
-            prompt_tokens,
-            max_tokens,
-            sampling,
-            prefix_reuse,
-            checkpoint_token_lengths,
-            capture_final_snapshot,
-            None,
-            on_token,
-        )
-    }
-
     pub(crate) fn generate_streaming_with_prefill<F: FnMut(i32) -> bool>(
         &mut self,
         target: &Qwen35Model,

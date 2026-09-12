@@ -4244,7 +4244,7 @@ mod tests {
         // Independent single-pass target execution, not the chunked prefill.
         let (hidden, logits) = model.sequence_state.with_internal(|caches| {
             let mut hidden = mlxcel_core::share(&embeddings);
-            let mut captured = None;
+            let mut captured: Option<UniquePtr<MlxArray>> = None;
             for (layer, cache) in model.layers.iter().zip(caches.iter_mut()) {
                 hidden = layer.forward(&hidden, None, cache, Some(&positions));
                 captured = Some(match captured {
