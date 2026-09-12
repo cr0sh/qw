@@ -121,9 +121,16 @@ multiple images. PNG, JPEG, and WebP must be supplied as base64 data URIs;
 remote image URLs are not fetched. Limits are 16 images per request, 64 MiB of
 source bytes per image, and 128 MiB for the complete JSON request body.
 
-Image requests do not use prefix snapshots or response continuation checkpoints.
+Requests containing images anywhere in the conversation do not use prefix
+snapshots or response continuation checkpoints.
 DFlash2 does not support token-constrained output; use baseline/MTP or automatic
 decoder selection for those requests.
+
+Rust callers can submit `protocol::parse_chat` or `protocol::parse_responses`
+results directly to `Engine::submit`. Submission validates and decodes the current
+image sources before queue admission, replacing any previously decoded pixels.
+Invalid images or inconsistent image metadata return `SubmitError::InvalidRequest`,
+which the HTTP handlers expose as a structured 400 response.
 
 OCR fixtures and the source-photo manifest are in `tests/fixtures/images`.
 The copyrighted Krispy Kreme and Yousuf Karsh photos are fetched locally rather

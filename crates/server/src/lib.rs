@@ -107,7 +107,7 @@ async fn handle_inner(
         Endpoint::Chat => protocol::parse_chat(value),
         Endpoint::Responses => protocol::parse_responses(value),
     };
-    let mut request = match request {
+    let request = match request {
         Ok(request) => request,
         Err(request_error) => {
             warn!(
@@ -151,17 +151,6 @@ async fn handle_inner(
             validation_elapsed_ms = request_started.elapsed().as_secs_f64() * 1_000.0,
         );
     }
-    if !request.image_params.is_empty() && !state.engine.supports_image_inputs() {
-        warn!(
-            phase = "request.capability_rejected",
-            capability = "image_inputs",
-        );
-        return ApiError::invalid(
-            "model does not support image inputs",
-            request.image_params.first().cloned(),
-        )
-        .into_response();
-    }
     if state
         .engine
         .configured_model_id()
@@ -170,19 +159,19 @@ async fn handle_inner(
         warn!(phase = "request.model_rejected");
         return ApiError::model_not_found(&request.model).into_response();
     }
-    if let Err(decode_error) = media::decode_request_images(&mut request) {
-        warn!(
-            phase = "request.media_failed",
-            parameter = decode_error.param.as_deref(),
-            error = %decode_error.message,
-        );
-        return ApiError::from_request(decode_error).into_response();
-    }
     let stream_requested = request.stream;
     let response_model = request.model.clone();
     debug!(phase = "dispatch.started");
     let submission = match state.engine.submit(request) {
         Ok(submission) => submission,
+        Err(SubmitError::InvalidRequest(request_error)) => {
+            warn!(
+                phase = "request.media_failed",
+                parameter = request_error.param.as_deref(),
+                error = %request_error.message,
+            );
+            return ApiError::from_request(request_error).into_response();
+        }
         Err(SubmitError::Full) => {
             warn!(phase = "dispatch.rejected", reason = "queue_full");
             return ApiError::queue_full().into_response();

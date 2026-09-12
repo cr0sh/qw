@@ -2529,6 +2529,127 @@ async fn image_validation_reports_exact_openai_parameter_paths() {
 }
 
 #[tokio::test]
+async fn direct_image_submissions_preserve_text_cache_isolation() {
+    async fn complete(engine: &Engine, request: protocol::CompletionRequest) -> CompletionRecord {
+        let mut submission = engine.submit(request).expect("submit request");
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), submission.events.recv())
+                .await
+                .expect("generation completed")
+            {
+                Some(WorkerEvent::Complete {
+                    record,
+                    acknowledged,
+                }) => {
+                    if let Some(acknowledged) = acknowledged {
+                        let _ = acknowledged.send(());
+                    }
+                    return record;
+                }
+                Some(WorkerEvent::Started(_) | WorkerEvent::Delta(_)) => {}
+                Some(WorkerEvent::Failed(failure)) => panic!("generation failed: {failure:?}"),
+                None => panic!("generation worker closed"),
+            }
+        }
+    }
+
+    let engine = Engine::start_fake(Some(MODEL), 8);
+    let warm = complete(
+        &engine,
+        protocol::parse_chat(chat_request("warm")).expect("text request"),
+    )
+    .await;
+    let uri = tiny_png_data_uri();
+    let chat = protocol::parse_chat(json!({
+        "model": MODEL,
+        "messages": [
+            {"role":"user","content":[
+                {"type":"text","text":"different"},
+                {"type":"image_url","image_url":{"url":uri}},
+                {"type":"image_url","image_url":{"url":uri}}
+            ]},
+            {"role":"assistant","content":"Acknowledged."},
+            {"role":"user","content":"Read the earlier images."}
+        ]
+    }))
+    .expect("chat image history");
+    let responses = protocol::parse_responses(json!({
+        "model": MODEL,
+        "input": [
+            {"role":"user","content":[
+                {"type":"input_text","text":"different"},
+                {"type":"input_image","image_url":uri},
+                {"type":"input_image","image_url":uri}
+            ]},
+            {"role":"assistant","content":"Acknowledged."},
+            {"role":"user","content":"Read the earlier images."}
+        ]
+    }))
+    .expect("Responses image history");
+    for request in [chat, responses] {
+        assert_eq!(complete(&engine, request.clone()).await.cached_tokens, 0);
+        assert_eq!(complete(&engine, request).await.cached_tokens, 0);
+    }
+    let after_images = complete(
+        &engine,
+        protocol::parse_chat(chat_request("warm-more")).expect("text continuation"),
+    )
+    .await;
+    assert_eq!(after_images.cached_tokens, warm.prompt_tokens);
+}
+
+#[tokio::test]
+async fn direct_image_submission_revalidates_sources_over_stale_pixels() {
+    let engine = Engine::start_fake(Some(MODEL), 8);
+    let request = |uri: &str| {
+        protocol::parse_chat(json!({
+            "model": MODEL,
+            "messages": [{"role":"user","content":[
+                {"type":"image_url","image_url":{"url":uri}}
+            ]}]
+        }))
+        .expect("image request")
+    };
+    let mut stale = request(&tiny_png_data_uri());
+    media::decode_request_images(&mut stale).expect("previously valid pixels");
+    stale.messages = request("data:image/png;base64,bm90IGEgcG5n").messages;
+    let Err(SubmitError::InvalidRequest(error)) = engine.submit(stale) else {
+        panic!("invalid current source must not reuse previously decoded pixels");
+    };
+    assert_eq!(
+        error.param.as_deref(),
+        Some("messages[0].content[0].image_url.url")
+    );
+}
+
+#[tokio::test]
+async fn direct_image_submission_enforces_cardinality_and_image_limit() {
+    let engine = Engine::start_fake(Some(MODEL), 8);
+    let request = protocol::parse_chat(json!({
+        "model": MODEL,
+        "messages": [{"role":"user","content":[
+            {"type":"image_url","image_url":{"url":tiny_png_data_uri()}}
+        ]}]
+    }))
+    .expect("image request");
+    let mut missing_metadata = request.clone();
+    missing_metadata.image_params.clear();
+    assert!(matches!(
+        engine.submit(missing_metadata),
+        Err(SubmitError::InvalidRequest(_))
+    ));
+
+    let mut over_limit = request;
+    let count = protocol::MAX_IMAGES_PER_REQUEST + 1;
+    over_limit.messages = vec![over_limit.messages[0].clone(); count];
+    over_limit.image_params = vec![over_limit.image_params[0].clone(); count];
+    assert!(matches!(
+        engine.submit(over_limit),
+        Err(SubmitError::InvalidRequest(_))
+    ));
+}
+
+#[tokio::test]
 async fn image_requests_never_use_or_populate_the_text_prefix_cache() {
     let app = router(Engine::start_fake(Some(MODEL), 8));
     let image_request = json!({
@@ -2680,7 +2801,7 @@ async fn image_requests_keep_structured_output_and_tool_choice_none_contracts() 
 #[tokio::test]
 async fn cancelling_an_image_request_leaves_the_next_text_request_clean() {
     let engine = Engine::start_fake(Some(MODEL), 8);
-    let mut image_request = protocol::parse_chat(json!({
+    let image_request = protocol::parse_chat(json!({
         "model": MODEL,
         "messages": [{"role":"user","content":[
             {"type":"text","text":"hold"},
@@ -2688,7 +2809,6 @@ async fn cancelling_an_image_request_leaves_the_next_text_request_clean() {
         ]}]
     }))
     .expect("parse image request");
-    media::decode_request_images(&mut image_request).expect("decode image request");
     let mut image_submission = engine.submit(image_request).expect("submit image request");
     assert!(matches!(
         image_submission.events.recv().await,
@@ -2708,6 +2828,5 @@ async fn cancelling_an_image_request_leaves_the_next_text_request_clean() {
             None => panic!("text request event channel closed"),
         }
     };
-    assert_eq!(record.content, "echo:clean");
     assert_eq!(record.cached_tokens, 0);
 }

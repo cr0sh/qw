@@ -31,7 +31,8 @@ use crate::grammar::GrammarFactory;
 use crate::media::DecodedImage;
 
 use crate::protocol::{
-    CompletionRequest, Endpoint, OutputFormat, ReasoningEffort, ToolChoice, request_fingerprint,
+    CompletionRequest, Endpoint, OutputFormat, ReasoningEffort, RequestError, ToolChoice,
+    request_fingerprint,
 };
 use crate::tool_calls::{ToolCallGate, parse_assistant_output};
 
@@ -822,7 +823,22 @@ impl Engine {
     pub fn supports_image_inputs(&self) -> bool {
         self.supports_image_inputs
     }
-    pub fn submit(&self, request: CompletionRequest) -> Result<Submission, SubmitError> {
+    /// Validate and decode image sources before admitting a request to the worker.
+    ///
+    /// Previously decoded pixels are replaced from the current message sources.
+    pub fn submit(&self, mut request: CompletionRequest) -> Result<Submission, SubmitError> {
+        if !self.supports_image_inputs
+            && request
+                .messages
+                .iter()
+                .any(|message| message.image_urls().next().is_some())
+        {
+            return Err(SubmitError::InvalidRequest(RequestError::new(
+                "model does not support image inputs",
+                request.image_params.first().cloned(),
+            )));
+        }
+        crate::media::decode_request_images(&mut request).map_err(SubmitError::InvalidRequest)?;
         let admission = new_admission(request.endpoint);
         let span = info_span!(
             "generation",
@@ -1161,7 +1177,9 @@ impl Engine {
                     debug!(phase = "generation.cancelled");
                     continue;
                 }
-                cached_prompt = (!has_images && prompt.len() <= 16).then_some(prompt.clone());
+                if !has_images {
+                    cached_prompt = (prompt.len() <= 16).then_some(prompt.clone());
+                }
                 let completion_tokens = if let Some(checkpoint) = &resumed {
                     checkpoint.completion_tokens
                         + content.len().saturating_sub(checkpoint.completion_tokens)
@@ -1215,10 +1233,11 @@ impl Engine {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum SubmitError {
     Full,
     Closed,
+    InvalidRequest(RequestError),
 }
 
 struct QwenWorker {
@@ -2008,13 +2027,14 @@ impl QwenWorker {
                 &mut emit_delta,
             ),
             #[cfg(feature = "dflash2")]
-            QwenGenerationRoute::Dflash2Multimodal => provider.generate_dflash2_multimodal_streaming(
-                multimodal_prefill.expect("multimodal route requires prepared embeddings"),
-                max_tokens,
-                &sampling,
-                &self.decoder.dflash2_draft_model,
-                &mut emit_delta,
-            ),
+            QwenGenerationRoute::Dflash2Multimodal => provider
+                .generate_dflash2_multimodal_streaming(
+                    multimodal_prefill.expect("multimodal route requires prepared embeddings"),
+                    max_tokens,
+                    &sampling,
+                    &self.decoder.dflash2_draft_model,
+                    &mut emit_delta,
+                ),
             QwenGenerationRoute::BaselineText => provider.generate_baseline_streaming(
                 &generation_prompt_ids,
                 max_tokens,

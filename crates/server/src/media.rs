@@ -57,6 +57,15 @@ pub fn decode_request_images(request: &mut CompletionRequest) -> Result<(), Requ
             None,
         ));
     }
+    if image_urls.len() > crate::protocol::MAX_IMAGES_PER_REQUEST {
+        return Err(RequestError::at(
+            format!(
+                "requests may contain at most {} images",
+                crate::protocol::MAX_IMAGES_PER_REQUEST
+            ),
+            &request.image_params[crate::protocol::MAX_IMAGES_PER_REQUEST],
+        ));
+    }
 
     let mut decoded = Vec::with_capacity(image_urls.len());
     for (url, param) in image_urls.into_iter().zip(&request.image_params) {
