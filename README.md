@@ -138,16 +138,25 @@ than redistributed; see the manifest's source and rights information.
 
 ## Historical performance
 
-Latest complete `cargo bench` decode suites after the Metal allocator-memory
-update (tokens/s):
+Latest supplied `cargo bench` results (tokens/s), measured at
+[commit `aad83fe`](https://github.com/cr0sh/qw/commit/aad83fe7928e5f9eee065d8c71538f06f832ae54):
 
-| Context | Bundled MTP (k=3) | DFlash2 |
+| Context | Target prefill | DFlash2 decode |
 |---|---:|---:|
-| Fresh | 57.354 | 56.116 |
-| 10,337-token cached prefix | 52.639 | 54.372 |
-| 64,297-token cached prefix | 34.853 | 36.283 |
+| Fresh | 254.016 | 56.486 |
+| 10,337-token cached prefix | 232.616 | 54.527 |
+| 64,297-token cached prefix | 154.353 | 36.656 |
 
-Measured at [commit `117fecb`](https://github.com/cr0sh/qw/commit/117fecbc3c0f1be69a44c7bfe274f5f81d7ab24c). Both used the default
+Fresh prefill processes 4,341 prompt tokens; cached-prefix prefill processes
+only the 288 newly appended tokens, not the cached prefix. Decode excludes
+prefill and measures 127 output tokens after the first token.
+
+Earlier bundled-MTP (k=3) decode results at
+[commit `117fecb`](https://github.com/cr0sh/qw/commit/117fecbc3c0f1be69a44c7bfe274f5f81d7ab24c)
+were 57.354, 52.639, and 34.853 tokens/s for fresh, 10k, and 64k respectively;
+these are historical measurements, not a same-revision decoder comparison.
+
+Both runs used the default
 [Jundot/Qwen3.8-27B-oQ4e-fp16-mtp](https://huggingface.co/Jundot/Qwen3.8-27B-oQ4e-fp16-mtp)
 checkpoint with Turbo4 KV cache on a Mac Studio with an Apple M4 Max
 40-core GPU and 64 GB of unified memory; decoding was greedy
