@@ -255,6 +255,46 @@ Evaluation episodes produced by schema-blind parameter coercion are not
 comparable baselines: a declared JSON string could have reached a tool as an
 object, changing both tool execution and the subsequent conversation.
 
+## DFlash2 image verification
+
+The DFlash2 image path uses the existing vision processor and merged embeddings,
+then captures selected target-layer hidden states during chunked multimodal
+prefill. Each chunk slices the same image embeddings and three-axis positions.
+Decode and speculative rollback retain the image RoPE delta; a fresh text
+request clears it. The draft/verify/sampling loop is shared with text generation.
+Image requests deliberately bypass prefix and continuation snapshots.
+
+The deterministic OCR PNGs in `tests/fixtures/images` are committed. Their
+manifest includes exact transcriptions, photo provenance, hashes, and semantic
+checks. The photo files are git-ignored; after reviewing their rights, fetch
+the exact originals with:
+
+```bash
+python3 tests/fixtures/images/fetch_sources.py --accept-source-rights
+```
+
+Focused regressions (also included in the ordinary test suite):
+
+```bash
+./gpu-lock -- cargo test -p qw-runtime qwen3_5::tests::dflash_multimodal_chunks_and_rollback_preserve_image_context -- --exact
+./gpu-lock -- cargo test -p qw-server tests::image_requests_larger_than_two_mib_reach_both_endpoints -- --exact
+```
+
+The first checks image-conditioned hidden states and logits against an independent
+target forward, chunk boundaries, partial speculative rollback, and image-to-text
+state reset. The second submits a valid PNG beyond Axum's former implicit 2 MiB
+body limit through both HTTP endpoints; the server now explicitly caps JSON at
+128 MiB.
+
+For real-model verification, compare baseline and DFlash2 on all four fixtures
+with greedy sampling and thinking disabled. Check OCR against the manifest
+(receipt column padding may be normalized), and compare complete generated text
+between decoders. Also exercise Chat/Responses streaming, a multi-image prompt
+longer than the prefill chunk, cancellation followed by a new request, and text
+prefix reuse across automatic-decoder image requests. DFlash2 logs must show
+`Dflash2Multimodal` and actual proposed/accepted draft tokens, not a fallback.
+Use the paired canonical text benchmarks below to check throughput regressions.
+
 ## Upstream-native banking evaluation
 
 See [the evaluation reproduction runbook](eval/README.md) for the pinned

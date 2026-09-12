@@ -246,6 +246,8 @@ enum QwenGenerationRoute {
     MtpMultimodal,
     #[cfg(feature = "dflash2")]
     Dflash2Text,
+    #[cfg(feature = "dflash2")]
+    Dflash2Multimodal,
 }
 
 fn qwen_generation_route(decoder: Qwen35GenerationMode, has_images: bool) -> QwenGenerationRoute {
@@ -256,14 +258,13 @@ fn qwen_generation_route(decoder: Qwen35GenerationMode, has_images: bool) -> Qwe
         (Qwen35GenerationMode::Mtp, true) => QwenGenerationRoute::MtpMultimodal,
         #[cfg(feature = "dflash2")]
         (Qwen35GenerationMode::Dflash2, false) => QwenGenerationRoute::Dflash2Text,
+        #[cfg(feature = "dflash2")]
+        (Qwen35GenerationMode::Dflash2, true) => QwenGenerationRoute::Dflash2Multimodal,
         (Qwen35GenerationMode::Automatic, _) => {
             unreachable!("request decoder must be resolved before route construction")
         }
-        (Qwen35GenerationMode::Dflash2, true) => {
-            unreachable!("DFlash2 compatibility rejects multimodal requests")
-        }
         #[cfg(not(feature = "dflash2"))]
-        (Qwen35GenerationMode::Dflash2, false) => {
+        (Qwen35GenerationMode::Dflash2, _) => {
             unreachable!("DFlash2 is unavailable without its build feature")
         }
     }
@@ -276,6 +277,8 @@ fn cache_snapshot_route(route: QwenGenerationRoute) -> Option<CacheSnapshotRoute
         QwenGenerationRoute::BaselineMultimodal | QwenGenerationRoute::MtpMultimodal => None,
         #[cfg(feature = "dflash2")]
         QwenGenerationRoute::Dflash2Text => Some(CacheSnapshotRoute::Dflash2),
+        #[cfg(feature = "dflash2")]
+        QwenGenerationRoute::Dflash2Multimodal => None,
     }
 }
 
@@ -1519,7 +1522,7 @@ impl QwenWorker {
         sampling.prompt_token_count = Some(prompt_ids.len());
         let mtp_available =
             self.provider.has_mtp() && std::env::var_os("QW_BENCH_DISABLE_MTP").is_none();
-        let dflash2_compatible = !has_images && constraint.is_none();
+        let dflash2_compatible = constraint.is_none();
         let routed_decoder = match select_qwen35_decoder(
             self.decoder.mode,
             mtp_available,
@@ -2002,6 +2005,14 @@ impl QwenWorker {
                 dflash2_prefix_reuse,
                 &checkpoint_token_lengths,
                 cache_behavior.capture_final_snapshot(),
+                &mut emit_delta,
+            ),
+            #[cfg(feature = "dflash2")]
+            QwenGenerationRoute::Dflash2Multimodal => provider.generate_dflash2_multimodal_streaming(
+                multimodal_prefill.expect("multimodal route requires prepared embeddings"),
+                max_tokens,
+                &sampling,
+                &self.decoder.dflash2_draft_model,
                 &mut emit_delta,
             ),
             QwenGenerationRoute::BaselineText => provider.generate_baseline_streaming(
@@ -2844,39 +2855,6 @@ mod tests {
     }
 
     #[test]
-    fn explicit_decoder_routes_preserve_text_and_multimodal_semantics() {
-        for (decoder, has_images, expected) in [
-            (
-                Qwen35GenerationMode::Baseline,
-                false,
-                QwenGenerationRoute::BaselineText,
-            ),
-            (
-                Qwen35GenerationMode::Baseline,
-                true,
-                QwenGenerationRoute::BaselineMultimodal,
-            ),
-            (
-                Qwen35GenerationMode::Mtp,
-                false,
-                QwenGenerationRoute::MtpText,
-            ),
-            (
-                Qwen35GenerationMode::Mtp,
-                true,
-                QwenGenerationRoute::MtpMultimodal,
-            ),
-        ] {
-            assert_eq!(qwen_generation_route(decoder, has_images), expected);
-        }
-        #[cfg(feature = "dflash2")]
-        assert_eq!(
-            qwen_generation_route(Qwen35GenerationMode::Dflash2, false),
-            QwenGenerationRoute::Dflash2Text
-        );
-    }
-
-    #[test]
     fn disabled_prefix_cache_removes_lookup_persistence_and_snapshot_ownership() {
         for route in [
             QwenGenerationRoute::BaselineText,
@@ -2885,6 +2863,8 @@ mod tests {
             QwenGenerationRoute::MtpMultimodal,
             #[cfg(feature = "dflash2")]
             QwenGenerationRoute::Dflash2Text,
+            #[cfg(feature = "dflash2")]
+            QwenGenerationRoute::Dflash2Multimodal,
         ] {
             let behavior = cache_behavior(
                 route,
