@@ -121,6 +121,12 @@ shared lock file.
 
 ## Evaluation
 
+Qwen3.8-27B (medium reasoning) achieved **43.3% Pass@1** on τ³-Banking (**42/97
+tasks**, one trial per task), compared with **47.4%** reported by Artificial
+Analysis as an average over five runs. Our single-run result may be affected by
+sampling variability. The evaluation took approximately 26 hours on a single
+M4 Max machine, so we did not run additional trials.
+
 The τ³ banking evaluation launch and capture rules are documented in
 [`eval/README.md`](eval/README.md).
 
