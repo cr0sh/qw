@@ -93,6 +93,42 @@ The `dflash` option requires a build with the `dflash2` feature and an
 available draft checkpoint. Use `--help` for the options enabled by the
 current build.
 
+## Image inputs
+
+Vision-capable checkpoints accept image inputs with baseline, MTP, and DFlash2
+decoding. `--decoder auto` prefers an available DFlash2 drafter for unconstrained
+image requests, just as it does for text. DFlash2 verifies its proposals against
+the image-conditioned target; it does not fall back to text-only inference.
+
+Use `image_url` parts in user messages on `/v1/chat/completions`:
+
+```json
+{
+  "model": "qwen3.8-27b",
+  "messages": [{
+    "role": "user",
+    "content": [
+      {"type": "text", "text": "Describe this image."},
+      {"type": "image_url", "image_url": {"url": "data:image/png;base64,<base64 PNG bytes>"}}
+    ]
+  }]
+}
+```
+
+The `/v1/responses` equivalent is an `input_image` part whose `image_url` is the
+data URI string. Both endpoints support buffered and streaming responses and
+multiple images. PNG, JPEG, and WebP must be supplied as base64 data URIs;
+remote image URLs are not fetched. Limits are 16 images per request, 64 MiB of
+source bytes per image, and 128 MiB for the complete JSON request body.
+
+Image requests do not use prefix snapshots or response continuation checkpoints.
+DFlash2 does not support token-constrained output; use baseline/MTP or automatic
+decoder selection for those requests.
+
+OCR fixtures and the source-photo manifest are in `tests/fixtures/images`.
+The copyrighted Krispy Kreme and Yousuf Karsh photos are fetched locally rather
+than redistributed; see the manifest's source and rights information.
+
 ## Historical performance
 
 Latest complete `cargo bench` decode suites after the Metal allocator-memory
