@@ -401,7 +401,7 @@ pub fn select_qwen35_decoder(
             Err("the DFlash2 draft checkpoint is unavailable".to_string())
         }
         Qwen35GenerationMode::Dflash2 if !dflash2_compatible => {
-            Err("DFlash2 supports only unconstrained text generation".to_string())
+            Err("DFlash2 supports only unconstrained generation".to_string())
         }
         Qwen35GenerationMode::Dflash2 => Ok(Qwen35GenerationMode::Dflash2),
     }
@@ -1242,6 +1242,7 @@ impl Qwen35Provider {
             prefix_reuse,
             &[],
             false,
+            None,
             on_delta,
         )
         .map(|(generation, stats)| {
@@ -1276,6 +1277,31 @@ impl Qwen35Provider {
             prefix_reuse,
             checkpoint_token_lengths,
             capture_final_snapshot,
+            None,
+            on_delta,
+        )
+        .map(|(generation, _)| generation)
+    }
+
+    /// Image requests use DFlash2 without prefix reuse or snapshot publication.
+    #[cfg(any(feature = "dflash2", test))]
+    pub fn generate_dflash2_multimodal_streaming<F: FnMut(&str) -> bool>(
+        &mut self,
+        prefill: PreparedMultimodalPrefill,
+        max_tokens: usize,
+        sampling: &SamplingConfig,
+        draft_dir: &Path,
+        on_delta: F,
+    ) -> Result<BaselineGeneration> {
+        self.generate_dflash2_cached_generation(
+            &prefill.prompt_ids,
+            max_tokens,
+            sampling,
+            draft_dir,
+            None,
+            &[],
+            false,
+            Some((&prefill.input_embeddings, &prefill.position_ids, prefill.rope_delta)),
             on_delta,
         )
         .map(|(generation, _)| generation)
@@ -1291,6 +1317,7 @@ impl Qwen35Provider {
         prefix_reuse: Option<Dflash2PrefixReuse<'_>>,
         checkpoint_token_lengths: &[usize],
         capture_final_snapshot: bool,
+        multimodal: Option<(&MlxArray, &MlxArray, i32)>,
         mut on_delta: F,
     ) -> Result<(BaselineGeneration, Dflash2GenerationStats)> {
         self.validate_context_budget(prompt_ids.len(), max_tokens)?;
@@ -1308,7 +1335,7 @@ impl Qwen35Provider {
         let mut callback_active = true;
         let mut decode_error = None;
         let generation = generator
-            .generate_streaming(
+            .generate_streaming_with_prefill(
                 &self.model,
                 prompt_ids,
                 max_tokens,
@@ -1316,6 +1343,7 @@ impl Qwen35Provider {
                 prefix_reuse,
                 checkpoint_token_lengths,
                 capture_final_snapshot,
+                multimodal,
                 |token_id| match decoder.push(token_id) {
                     Ok(delta) => {
                         callback_active = on_delta(&delta);
