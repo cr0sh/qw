@@ -163,6 +163,11 @@ checkpoint with Turbo4 KV cache on a Mac Studio with an Apple M4 Max
 (`temperature=0`, `top_p=1`, seed `0`) for 127 output tokens after the first
 token, with one warmup and three timed repetitions.
 
+The subsequent [64k bottleneck investigation](DEVELOPMENT.md#dflash2-deep-bottleneck-investigation)
+did **not** reach 60 tokens/s. Its accepted-runtime control measured 36.698
+tokens/s; none of the additional candidates improved it. A bandwidth-only
+ceiling is not a demonstrated or predicted achievable decode rate.
+
 ## Development
 
 Cache layout, GPU serialization, and benchmark commands are collected in
