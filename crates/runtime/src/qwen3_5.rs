@@ -1497,6 +1497,28 @@ impl Qwen35Model {
             reset,
             finish,
             mlxcel_core::generate::prefill_chunk_len(),
+            None,
+        )
+    }
+
+    #[cfg(any(feature = "dflash2", test))]
+    pub(crate) fn forward_dflash_multimodal_prefill(
+        &self,
+        input_ids: &MlxArray,
+        input_embeddings: &MlxArray,
+        position_ids: &MlxArray,
+        rope_delta: i32,
+        target_layer_ids: &[usize],
+        hidden_limit: usize,
+    ) -> std::result::Result<Qwen35DflashPrefill, String> {
+        self.forward_dflash_prefill_segment_chunked(
+            input_ids,
+            target_layer_ids,
+            hidden_limit,
+            true,
+            true,
+            mlxcel_core::generate::prefill_chunk_len(),
+            Some((input_embeddings, position_ids, rope_delta)),
         )
     }
 
@@ -1509,6 +1531,7 @@ impl Qwen35Model {
         reset: bool,
         finish: bool,
         configured: usize,
+        multimodal: Option<(&MlxArray, &MlxArray, i32)>,
     ) -> std::result::Result<Qwen35DflashPrefill, String> {
         if reset {
             self.reset_runtime_state();
@@ -1517,6 +1540,10 @@ impl Qwen35Model {
         let prompt_len = shape[1];
         if prompt_len == 0 {
             return Err("DFlash2 prefill requires at least one token".to_owned());
+        }
+        if let Some((_, positions, delta)) = multimodal {
+            self.mrope_state.prepare(positions, delta);
+            self.mrope_state.activate_prepared()?;
         }
         let chunk_len =
             mlxcel_core::generate::effective_prefill_chunk(configured, true, prompt_len as usize)
@@ -1532,13 +1559,29 @@ impl Qwen35Model {
         let mut start = 0;
         while start < prompt_len {
             let end = (start + chunk_len).min(prompt_len);
-            let ids = mlxcel_core::slice(input_ids, &[0, start], &[shape[0], end]);
             let final_hidden = self.sequence_state.with_internal(|caches| {
                 let cache_offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
                 let seq_len = end - start;
-                let position_ids =
-                    rope_delta.map(|delta| decode_rope_positions(cache_offset, seq_len, delta));
-                let mut h = self.embed_tokens.forward(&ids);
+                let position_ids = match multimodal {
+                    Some((_, positions, _)) => Some(mlxcel_core::slice(
+                        positions,
+                        &[0, 0, start],
+                        &[3, shape[0], end],
+                    )),
+                    None => rope_delta
+                        .map(|delta| decode_rope_positions(cache_offset, seq_len, delta)),
+                };
+                let mut h = match multimodal {
+                    Some((embeddings, _, _)) => mlxcel_core::slice(
+                        embeddings,
+                        &[0, start, 0],
+                        &[shape[0], end, self.config.hidden_size as i32],
+                    ),
+                    None => {
+                        let ids = mlxcel_core::slice(input_ids, &[0, start], &[shape[0], end]);
+                        self.embed_tokens.forward(&ids)
+                    }
+                };
                 for (layer_idx, (layer, cache)) in
                     self.layers.iter().zip(caches.iter_mut()).enumerate()
                 {
@@ -1634,6 +1677,9 @@ impl Qwen35Model {
             .sequence_state
             .with_internal(|caches| caches.first().map(Qwen3NextCache::offset).unwrap_or(0));
         self.mrope_state.set_position(offset);
+        if multimodal.is_some() {
+            self.mrope_state.finish_prefill();
+        }
         Ok(Qwen35DflashPrefill {
             hidden_concat,
             first_logits: first_logits.expect("non-empty prefill produces first_logits"),
@@ -4181,6 +4227,73 @@ mod tests {
     }
 
     #[test]
+    fn dflash_multimodal_chunks_and_rollback_preserve_image_context() {
+        let model = dflash_prefill_test_model();
+        let input = mlxcel_core::from_slice_i32(&[3; 29], &[1, 29]);
+        // Deliberately unrelated to token embeddings, with distinct spatial axes.
+        let values = (0..29 * 64)
+            .map(|i| (i as f32 * 0.17).cos() * 0.1)
+            .collect::<Vec<_>>();
+        let embeddings = mlxcel_core::from_slice_f32(&values, &[1, 29, 64]);
+        let positions = (0..3)
+            .flat_map(|axis| (0..29).map(move |row| row / (axis + 1)))
+            .collect::<Vec<i32>>();
+        let positions = mlxcel_core::from_slice_i32(&positions, &[3, 1, 29]);
+        let delta = -11;
+        // Independent single-pass target execution, not the chunked prefill.
+        let (hidden, logits) = model.sequence_state.with_internal(|caches| {
+            let mut hidden = mlxcel_core::share(&embeddings);
+            let mut captured = None;
+            for (layer, cache) in model.layers.iter().zip(caches.iter_mut()) {
+                hidden = layer.forward(&hidden, None, cache, Some(&positions));
+                captured = Some(match captured {
+                    None => mlxcel_core::share(&hidden),
+                    Some(prior) => mlxcel_core::concatenate(&prior, &hidden, -1),
+                });
+            }
+            let last = mlxcel_core::slice(&hidden, &[0, 28, 0], &[1, 29, 64]);
+            (captured.unwrap(), model.project_logits(&model.norm.forward(&last)))
+        });
+        mlxcel_core::eval(&hidden);
+        mlxcel_core::eval(&logits);
+        model.mrope_state.restore(29, None, Some(delta));
+        let accepted = mlxcel_core::from_slice_i32(&[5, 19], &[1, 2]);
+        let reference = model.forward_dflash_verify(&accepted, &[0, 1]);
+        mlxcel_core::eval(&reference.logits);
+        let next = mlxcel_core::from_slice_i32(&[7], &[1, 1]);
+        let continuation = model.forward_dflash_verify(&next, &[0, 1]);
+        mlxcel_core::eval(&continuation.logits);
+
+        for limit in [5, usize::MAX] {
+            let output = model.forward_dflash_prefill_segment_chunked(
+                &input, &[0, 1], limit, true, true, 7,
+                Some((&embeddings, &positions, delta)),
+            ).expect("chunked image prefill");
+            let keep = limit.min(29) as i32;
+            let expected = mlxcel_core::slice(&hidden, &[0, 29 - keep, 0], &[1, 29, 128]);
+            assert_dflash_prefill_close(&output.hidden_concat, &expected);
+            assert_dflash_prefill_close(&output.first_logits, &logits);
+            let block = mlxcel_core::from_slice_i32(&[5, 19, 23, 11], &[1, 4]);
+            let verify = model.forward_dflash_verify(&block, &[0, 1]);
+            mlxcel_core::eval(&verify.logits);
+            let accepted_logits = mlxcel_core::slice(&verify.logits, &[0, 0, 0], &[1, 2, 32]);
+            assert_dflash_prefill_close(&accepted_logits, &reference.logits);
+            model.rollback_mtp_verify(&verify.gdn_states, 1, 4, true);
+            let actual = model.forward_dflash_verify(&next, &[0, 1]);
+            assert_dflash_prefill_close(&actual.logits, &continuation.logits);
+        }
+
+        // A new text request must discard the image delta and all target state.
+        let text = model.forward_dflash_prefill_segment(&input, &[0, 1], 5, true, true)
+            .expect("text after image");
+        let fresh = dflash_prefill_test_model();
+        let expected = fresh.forward_dflash_prefill_segment(&input, &[0, 1], 5, true, true)
+            .expect("fresh text");
+        assert_dflash_prefill_close(&text.first_logits, &expected.first_logits);
+        assert_dflash_prefill_close(&text.hidden_concat, &expected.hidden_concat);
+    }
+
+    #[test]
     fn dflash_prefill_chunks_match_fresh_resumed_and_restored_continuations() {
         let model = dflash_prefill_test_model();
         let ids = (0..29_i32).map(|i| i * 7 % 32).collect::<Vec<_>>();
@@ -4217,6 +4330,7 @@ mod tests {
                             false,
                             false,
                             7,
+                            None,
                         )
                         .expect("multi-chunk prefix");
                     drop(prefix_output);
@@ -4241,6 +4355,7 @@ mod tests {
                         false,
                         true,
                         7,
+                        None,
                     )
                     .expect("multi-chunk prefill");
                 let segment_rows = if resumed { 18 } else { 29 };
@@ -4267,7 +4382,7 @@ mod tests {
         let warmup = mlxcel_core::slice(&input, &[0, 0], &[1, 64]);
         drop(
             model
-                .forward_dflash_prefill_segment_chunked(&warmup, &[0, 1], 31, true, false, 64)
+                .forward_dflash_prefill_segment_chunked(&warmup, &[0, 1], 31, true, false, 64, None)
                 .expect("warm kernels"),
         );
 
@@ -4287,7 +4402,7 @@ mod tests {
                     &[1, (start + segment_len) as i32],
                 );
                 let output = model
-                    .forward_dflash_prefill_segment_chunked(&segment, &[0, 1], 31, false, false, 64)
+                    .forward_dflash_prefill_segment_chunked(&segment, &[0, 1], 31, false, false, 64, None)
                     .expect("measured prefill");
                 let roots = [
                     &*output.hidden_concat as *const MlxArray,

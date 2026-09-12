@@ -2292,6 +2292,24 @@ impl Qwen35Dflash2Generator {
         prefix_reuse: Option<Dflash2PrefixReuse<'_>>,
         checkpoint_token_lengths: &[usize],
         capture_final_snapshot: bool,
+        on_token: F,
+    ) -> Result<Dflash2Generation, String> {
+        self.generate_streaming_with_prefill(
+            target, prompt_tokens, max_tokens, sampling, prefix_reuse,
+            checkpoint_token_lengths, capture_final_snapshot, None, on_token,
+        )
+    }
+
+    pub(crate) fn generate_streaming_with_prefill<F: FnMut(i32) -> bool>(
+        &mut self,
+        target: &Qwen35Model,
+        prompt_tokens: &[i32],
+        max_tokens: usize,
+        sampling: &mlxcel_core::generate::SamplingConfig,
+        prefix_reuse: Option<Dflash2PrefixReuse<'_>>,
+        checkpoint_token_lengths: &[usize],
+        capture_final_snapshot: bool,
+        multimodal: Option<(&MlxArray, &MlxArray, i32)>,
         mut on_token: F,
     ) -> Result<Dflash2Generation, String> {
         let context_tokens = target
@@ -2367,13 +2385,24 @@ impl Qwen35Dflash2Generator {
         let projected_cache_hit = projected_caches.is_some();
         self.caches = projected_caches.unwrap_or_else(|| self.model.make_cache());
 
-        let (mut hidden_concat, first_logits, prompt_snapshots) = self.prefill_with_checkpoints(
-            target,
-            prompt_tokens,
-            reusable,
-            checkpoint_token_lengths,
-            !projected_cache_hit || capture_final_snapshot,
-        )?;
+        let (mut hidden_concat, first_logits, prompt_snapshots) =
+            if let Some((embeddings, positions, delta)) = multimodal {
+                let input = mlxcel_core::from_slice_i32(
+                    prompt_tokens, &[1, prompt_tokens.len() as i32],
+                );
+                let prefill = target.forward_dflash_multimodal_prefill(
+                    &input, embeddings, positions, delta, &self.target_layer_ids, self.hidden_limit,
+                )?;
+                (Some(prefill.hidden_concat), prefill.first_logits, Vec::new())
+            } else {
+                self.prefill_with_checkpoints(
+                    target,
+                    prompt_tokens,
+                    reusable,
+                    checkpoint_token_lengths,
+                    !projected_cache_hit || capture_final_snapshot,
+                )?
+            };
         let mut snapshot_hidden = if capture_final_snapshot {
             Some(materialize_detached(mlxcel_core::share(
                 hidden_concat
