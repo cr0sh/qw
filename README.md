@@ -159,14 +159,7 @@ these are historical measurements, not a same-revision decoder comparison.
 Both runs used the default
 [Jundot/Qwen3.8-27B-oQ4e-fp16-mtp](https://huggingface.co/Jundot/Qwen3.8-27B-oQ4e-fp16-mtp)
 checkpoint with Turbo4 KV cache on a Mac Studio with an Apple M4 Max
-40-core GPU and 64 GB of unified memory; decoding was greedy
-(`temperature=0`, `top_p=1`, seed `0`) for 127 output tokens after the first
-token, with one warmup and three timed repetitions.
-
-The separate [64k bottleneck investigation](DEVELOPMENT.md#dflash2-deep-bottleneck-investigation)
-did **not** reach 60 tokens/s. Its accepted-runtime control measured 36.698
-tokens/s; none of the additional candidates improved it. A bandwidth-only
-ceiling is not a demonstrated or predicted achievable decode rate.
+40-core GPU and 64 GB of unified memory.
 
 ## Development
 
