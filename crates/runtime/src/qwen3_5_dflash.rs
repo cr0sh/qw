@@ -2240,6 +2240,7 @@ impl Qwen35Dflash2Generator {
         prompt_hidden: UniquePtr<MlxArray>,
         prompt_logits: UniquePtr<MlxArray>,
         prompt_snapshots: Vec<Dflash2PromptSnapshot>,
+        reusable: Option<Dflash2PrefixReuse<'_>>,
         cached_tokens: usize,
         capture_final_snapshot: bool,
         prefill_start: Instant,
@@ -2248,13 +2249,32 @@ impl Qwen35Dflash2Generator {
         use crate::qwen3_5_mtp::{
             constrained_greedy_walk, constrained_initial_step, constrained_stochastic_walk,
         };
-        let base = Dflash2PromptSnapshot::capture(
-            target,
-            prompt.len(),
-            &prompt_hidden,
-            &prompt_logits,
-            prompt_snapshots.last(),
-        )?;
+        // Exact checkpoints already own detached immutable target/hidden state.
+        // A shorter prefix cannot anchor replay at the full prompt boundary.
+        let existing_base = prompt_snapshots
+            .last()
+            .filter(|snapshot| snapshot.token_len() == prompt.len())
+            .or_else(|| {
+                reusable
+                    .filter(|reuse| reuse.cached_tokens == prompt.len())
+                    .map(|reuse| reuse.snapshot)
+            });
+        let captured_base;
+        let base = match existing_base {
+            Some(snapshot) => snapshot,
+            None => {
+                captured_base = Dflash2PromptSnapshot::capture(
+                    target,
+                    prompt.len(),
+                    &prompt_hidden,
+                    &prompt_logits,
+                    prompt_snapshots
+                        .last()
+                        .or_else(|| reusable.map(|reuse| reuse.snapshot)),
+                )?;
+                &captured_base
+            }
+        };
         let mut hidden = mlxcel_core::share(&base.hidden_concat);
         let mut window = mlxcel_core::share(&base.hidden_concat);
         let mut logits = mlxcel_core::share(&base.continuation_logits);
@@ -2362,6 +2382,7 @@ impl Qwen35Dflash2Generator {
                         // An atomic parser splice cannot be partially committed.
                         // Restore the already-published sequence before stopping.
                         target.restore_sequence_state(SequenceId::from_raw(0), &base.target)?;
+                        target.finish_initial_prefill();
                         window = mlxcel_core::share(&base.hidden_concat);
                         logits = mlxcel_core::share(&base.continuation_logits);
                         if !output.is_empty() {
@@ -2408,6 +2429,9 @@ impl Qwen35Dflash2Generator {
                 // Recurrent rows cannot be rewound arbitrarily. Replay only
                 // generated text from an immutable image-aware prompt boundary.
                 target.restore_sequence_state(SequenceId::from_raw(0), &base.target)?;
+                // Standalone reusable prefixes can still contain initial FP16
+                // attention state. Restore also resets prefill completion.
+                target.finish_initial_prefill();
                 window = mlxcel_core::share(&base.hidden_concat);
                 logits = mlxcel_core::share(&base.continuation_logits);
                 if !output.is_empty() {
@@ -2481,7 +2505,7 @@ impl Qwen35Dflash2Generator {
                 prompt.len() + output.len(),
                 &window,
                 &logits,
-                Some(&base),
+                Some(base),
             )?)
         } else {
             None
@@ -2770,6 +2794,7 @@ impl Qwen35Dflash2Generator {
                 hidden_concat.expect("constrained replay retains prompt hidden"),
                 first_logits,
                 prompt_snapshots,
+                reusable,
                 cached_tokens,
                 capture_final_snapshot,
                 prefill_start,
@@ -4078,6 +4103,100 @@ mod tests {
         let mut integer = hidden;
         integer.dtype = mlxcel_core::dtype::INT32;
         assert!(restore(integer, 6, logits).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires real QW_MODEL_PATH and QW_DFLASH_DRAFT_MODEL_PATH checkpoints"]
+    fn real_model_constrained_prompt_bases_restore_after_splice_and_rollback() {
+        use mlxcel_core::generate::ConstraintCommit;
+
+        let model_dir = crate::resolve_model_path(None).expect("resolve target");
+        let draft_dir = crate::resolve_dflash2_draft_path(None).expect("resolve drafter");
+        let target = Qwen35Model::load(&model_dir, crate::KVCacheMode::Fp16)
+            .expect("load target");
+        let mut generator = Qwen35Dflash2Generator::new(&target, &draft_dir)
+            .expect("load drafter");
+        let prompt = [1, 2, 3];
+        let sampling = SamplingConfig::greedy();
+        target.reset_runtime_state();
+        let standalone = generator
+            .capture_prompt_snapshot(&target, &prompt)
+            .expect("capture extendable full prefix");
+
+        // Compare an owned replay base, a borrowed exact prompt checkpoint,
+        // and a borrowed still-extendable prefix. Both parser outcomes restore
+        // the base; the accepted splice additionally replays committed tokens.
+        for budget in [1, 2] {
+            let mut reference = None;
+            for source in 0..3 {
+                for _ in 0..2 {
+                    target.reset_runtime_state();
+                    let mut constraint = PathConstraint {
+                        path: vec![4],
+                        committed: Vec::new(),
+                        saved: None,
+                        splice: None,
+                        replacement: Some(ConstraintCommit {
+                            backtrack: 0,
+                            tokens: vec![6, 7],
+                            accept: true,
+                        }),
+                    };
+                    let reuse = (source == 2).then_some(Dflash2PrefixReuse {
+                        snapshot: &standalone,
+                        cached_tokens: prompt.len(),
+                    });
+                    let checkpoints = if source == 1 {
+                        vec![prompt.len()]
+                    } else {
+                        Vec::new()
+                    };
+                    let generated = generator
+                        .generate_streaming_with_prefill(
+                            &target,
+                            &prompt,
+                            budget,
+                            &sampling,
+                            reuse,
+                            &checkpoints,
+                            true,
+                            None,
+                            Some(&mut constraint),
+                            |_, _| true,
+                        )
+                        .expect("restore parser boundary and capture aligned final state");
+                    let expected: &[i32] = if budget == 1 { &[] } else { &[6, 7] };
+                    assert_eq!(generated.token_ids, expected);
+                    assert_eq!(constraint.committed, expected);
+                    let final_snapshot = generated.final_snapshot.expect("final snapshot");
+                    let mut continuation_prompt = prompt.to_vec();
+                    continuation_prompt.extend_from_slice(expected);
+                    assert_eq!(final_snapshot.token_len(), continuation_prompt.len());
+                    let resumed = generator
+                        .generate_streaming_with_prefill(
+                            &target,
+                            &continuation_prompt,
+                            8,
+                            &sampling,
+                            Some(Dflash2PrefixReuse {
+                                snapshot: &final_snapshot,
+                                cached_tokens: continuation_prompt.len(),
+                            }),
+                            &[],
+                            false,
+                            None,
+                            None,
+                            |_, _| true,
+                        )
+                        .expect("generate after parser replay or rollback");
+                    if let Some(reference) = &reference {
+                        assert_eq!(&resumed.token_ids, reference);
+                    } else {
+                        reference = Some(resumed.token_ids);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
