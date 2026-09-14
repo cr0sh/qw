@@ -313,6 +313,39 @@ and deep-clones that zero-output parser state for each request. Schema changes
 replace the template; mutable parser state is never shared between requests.
 A cold schema still pays compilation and initial-mask computation costs.
 
+On the M4 Max with the Qwen3.8-27B oQ4e target and DFlash2 draft, the verified
+structured-output gate allows TTFT regression of `max(5%, 5 ms)` and at most 5%
+loss in prefill or decode throughput. TTFT starts before schema compilation and
+ends at the first nonempty content delta, not a role/header event. The paired
+matrix uses one warmup and three timed AB/BA repetitions, 128 output tokens,
+greedy sampling, and the normal presence/frequency penalties of 1.5/0.5.
+This is a text-schema provider probe with terminal snapshot capture disabled;
+the combined image/cache/HTTP paths are verified separately.
+
+| Prompt case | TTFT off → on (ms) | Prefill off → on (tokens/s) | Decode off → on (tokens/s) |
+| --- | ---: | ---: | ---: |
+| Fully cached, 52 tokens | 6.41 → 7.34 | No new prompt tokens | 37.70 → 37.83 |
+| Fresh, 4,179 tokens | 16,447.08 → 16,445.76 | 254.09 → 254.11 | 40.14 → 39.17 |
+| 10,580 tokens, 10,337 cached | 1,113.53 → 1,112.35 | 218.23 → 218.46 | 38.96 → 38.34 |
+| 64,540 tokens, 64,297 cached | 1,631.06 → 1,635.47 | 148.99 → 148.59 | 22.27 → 21.79 |
+
+All four cases pass that gate. The absolute TTFT allowance is material only for
+the fully cached case (+0.93 ms); the other cases also pass a relative-only 5%
+TTFT limit. All measured outputs were schema-valid prefixes and streamed bytes
+matched canonical decoding. Fresh and 64k runs can differ in token sequence
+because packed-cache verification regrouping changes floating-point evaluation;
+these figures are representative measurements, not a guarantee for every schema
+or output distribution. Cold schema compilation is not amortized away from
+individual request timing, but the table reports warmed repetitions.
+
+The separate standard unconstrained throughput benchmark remains within 5% of
+the preserved pre-change baseline: prefill changes range from -0.05% to +0.22%,
+and decode changes from +0.22% to +1.03% across fresh, 10k, and 64k contexts.
+Final Chat Completions and Responses SSE checks preserve JSON and UTF-8 output.
+Repeated red images reuse all 61 prompt tokens; changed blue pixels miss;
+an appended blue-image turn reuses 108 tokens. Restarting with automatic decoder
+selection restores the red image's 61-token prefix from persistent storage.
+
 ## DFlash2 image verification
 
 The DFlash2 image path uses the existing vision processor and merged embeddings,
