@@ -1,6 +1,6 @@
 use qw_runtime::PromptSnapshot;
 
-use crate::{EntryKey, ResponseResumeMetadata, SnapshotRoute};
+use crate::{EntryKey, ImageIdentity, PromptKey, ResponseResumeMetadata, SnapshotRoute};
 
 pub(crate) struct Terminal {
     pub route: SnapshotRoute,
@@ -49,6 +49,9 @@ struct Node {
 
 pub(crate) struct RadixTrie {
     nodes: Vec<Option<Node>>,
+    // Each root represents only images fully contained in a snapshot prefix,
+    // not the request's entire image list. Token fragments remain plain i32s.
+    roots: std::collections::HashMap<Vec<ImageIdentity>, usize>,
 }
 
 impl RadixTrie {
@@ -60,18 +63,37 @@ impl RadixTrie {
                 children: Vec::new(),
                 terminals: Vec::new(),
             })],
+            roots: std::collections::HashMap::from([(Vec::new(), 0)]),
         }
+    }
+
+    fn root(&mut self, images: &[ImageIdentity]) -> usize {
+        if images.is_empty() {
+            return 0;
+        }
+        if let Some(root) = self.roots.get(images) {
+            return *root;
+        }
+        let root = self.push_node(Node {
+            fragment: Vec::new(),
+            parent: None,
+            children: Vec::new(),
+            terminals: Vec::new(),
+        });
+        self.roots.insert(images.to_vec(), root);
+        root
     }
 
     pub fn observe(
         &mut self,
-        tokens: &[i32],
+        key: PromptKey<'_>,
         route: SnapshotRoute,
         now: u64,
         expires_at: u64,
     ) -> usize {
+        let tokens = key.token_ids;
         assert!(!tokens.is_empty());
-        let mut node_id = 0;
+        let mut node_id = self.root(key.images);
         let mut consumed = 0;
         loop {
             if let Some(terminal) = self.terminal_mut(node_id, route) {
@@ -137,8 +159,8 @@ impl RadixTrie {
         }
     }
 
-    pub fn ensure(&mut self, tokens: &[i32], route: SnapshotRoute, terminal: Terminal) -> usize {
-        let id = self.ensure_node(tokens);
+    pub fn ensure(&mut self, key: PromptKey<'_>, route: SnapshotRoute, terminal: Terminal) -> usize {
+        let id = self.ensure_node(key);
         if let Some(existing) = self.terminal_mut(id, route) {
             *existing = terminal;
         } else {
@@ -147,9 +169,10 @@ impl RadixTrie {
         id
     }
 
-    pub fn ensure_node(&mut self, tokens: &[i32]) -> usize {
+    pub fn ensure_node(&mut self, key: PromptKey<'_>) -> usize {
+        let tokens = key.token_ids;
         assert!(!tokens.is_empty());
-        let mut node_id = 0;
+        let mut node_id = self.root(key.images);
         let mut consumed = 0;
         loop {
             if consumed == tokens.len() {
@@ -199,12 +222,34 @@ impl RadixTrie {
         }
     }
 
-    pub fn path(&self, prompt: &[i32], route: SnapshotRoute) -> Vec<(usize, usize)> {
+    pub fn path(&self, key: PromptKey<'_>, route: SnapshotRoute) -> Vec<(usize, usize)> {
         let mut output = Vec::new();
-        let mut node_id = 0;
+        if key.images.is_empty() {
+            self.path_from(key.token_ids, route, 0, 0, &mut output);
+            return output;
+        }
+        for count in 0..=key.images.len() {
+            let Some(&root) = self.roots.get(&key.images[..count]) else {
+                continue;
+            };
+            let end = key.images.get(count).map_or(key.token_ids.len(), |image| image.token_start);
+            let start = count.checked_sub(1).map_or(0, |i| key.images[i].token_end);
+            self.path_from(&key.token_ids[..end], route, root, start, &mut output);
+        }
+        output
+    }
+
+    fn path_from(
+        &self,
+        prompt: &[i32],
+        route: SnapshotRoute,
+        mut node_id: usize,
+        minimum: usize,
+        output: &mut Vec<(usize, usize)>,
+    ) {
         let mut consumed = 0;
         loop {
-            if self.terminal(node_id, route).is_some() {
+            if consumed >= minimum && self.terminal(node_id, route).is_some() {
                 output.push((node_id, consumed));
             }
             if consumed == prompt.len() {
@@ -226,7 +271,6 @@ impl RadixTrie {
             consumed += fragment.len();
             node_id = child;
         }
-        output
     }
 
     pub fn terminal(&self, node: usize, route: SnapshotRoute) -> Option<&Terminal> {
@@ -289,7 +333,7 @@ impl RadixTrie {
     }
 
     fn prune(&mut self, mut node_id: usize) {
-        while node_id != 0 {
+        while self.node(node_id).parent.is_some() {
             let (parent, empty, only_child) = {
                 let node = self.node(node_id);
                 (
@@ -322,6 +366,10 @@ impl RadixTrie {
             } else {
                 break;
             }
+        }
+        if node_id != 0 && self.node(node_id).children.is_empty() && self.node(node_id).terminals.is_empty() {
+            self.roots.retain(|_, root| *root != node_id);
+            self.nodes[node_id] = None;
         }
     }
 

@@ -1,4 +1,4 @@
-use crate::{EntryKey, SnapshotRoute};
+use crate::{EntryKey, ImageIdentity, PromptKey, SnapshotRoute};
 use qw_runtime::{
     PortableArray, PortableModelState, PortablePage, PortablePagedTensor, PortablePromptSnapshot,
     PromptSnapshot,
@@ -38,6 +38,8 @@ pub struct Manifest {
     pub namespace: String,
     pub route: SnapshotRoute,
     pub token_ids: Vec<i32>,
+    pub images: Vec<ImageIdentity>,
+    pub prompt_sha256: String,
     pub token_len: usize,
     pub family: String,
     #[serde(deserialize_with = "required_option")]
@@ -129,14 +131,28 @@ fn hex(b: &[u8]) -> String {
 fn digest(b: &[u8]) -> String {
     hex(&Sha256::digest(b))
 }
-pub fn entry_key(ns: &str, r: SnapshotRoute, t: &[i32]) -> EntryKey {
+pub fn entry_key(ns: &str, r: SnapshotRoute, key: PromptKey<'_>) -> EntryKey {
     let mut h = Sha256::new();
     h.update(ns.as_bytes());
     h.update([r as u8]);
-    for x in t {
-        h.update(x.to_le_bytes())
-    }
+    h.update(prompt_digest(key));
     EntryKey(format!("{ns}/{}", hex(&h.finalize())))
+}
+
+fn prompt_digest(key: PromptKey<'_>) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"qw-prefix-prompt-images");
+    h.update((key.token_ids.len() as u64).to_le_bytes());
+    for token in key.token_ids {
+        h.update(token.to_le_bytes());
+    }
+    h.update((key.images.len() as u64).to_le_bytes());
+    for image in key.images {
+        h.update((image.token_start as u64).to_le_bytes());
+        h.update((image.token_end as u64).to_le_bytes());
+        h.update(image.digest.as_bytes());
+    }
+    h.finalize().into()
 }
 pub fn namespace_hash(p: &[&[u8]]) -> String {
     let mut h = Sha256::new();
@@ -149,13 +165,17 @@ pub fn namespace_hash(p: &[&[u8]]) -> String {
 pub fn encode_portable(
     ns: &str,
     r: SnapshotRoute,
-    t: &[i32],
+    key: PromptKey<'_>,
     p: PortablePromptSnapshot,
     ret: RetentionMetadata,
     exp: u64,
     res: Option<ResponseResumeMetadata>,
     reserve_manifest: impl FnOnce(u64) -> Result<(), String>,
 ) -> Result<EncodedEntry, String> {
+    if !key.valid() {
+        return Err("invalid image identity".into());
+    }
+    let t = key.token_ids;
     let len = match &p {
         PortablePromptSnapshot::Baseline(m) => m.token_len,
         PortablePromptSnapshot::Mtp { target, .. } => target.token_len,
@@ -253,6 +273,8 @@ pub fn encode_portable(
         namespace: ns.into(),
         route: r,
         token_ids: t.to_vec(),
+        images: key.images.to_vec(),
+        prompt_sha256: hex(&prompt_digest(key)),
         token_len: len,
         family: f,
         draft_family: df,
@@ -290,7 +312,7 @@ pub fn encode_portable(
     let mut manifest = Vec::with_capacity(size);
     serde_json::to_writer(&mut manifest, &m).map_err(|e| e.to_string())?;
     Ok(EncodedEntry {
-        key: entry_key(ns, r, t),
+        key: entry_key(ns, r, key),
         manifest,
         blobs,
     })
@@ -392,6 +414,10 @@ pub fn parse_manifest(ns: &str, b: &[u8]) -> Result<Manifest, String> {
     Ok(m)
 }
 fn validate_manifest(ns: &str, m: &Manifest) -> Result<(), String> {
+    let key = PromptKey::new(&m.token_ids, &m.images);
+    if !key.valid() || m.prompt_sha256 != hex(&prompt_digest(key)) {
+        return Err("cache manifest prompt identity is invalid".into());
+    }
     if m.namespace != ns || m.token_ids.is_empty() || m.token_ids.len() != m.token_len {
         return Err("cache manifest namespace or token length is invalid".into());
     }

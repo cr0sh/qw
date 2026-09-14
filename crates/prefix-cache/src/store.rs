@@ -137,7 +137,11 @@ impl PersistentSnapshotStore for FilesystemSnapshotStore {
         let Ok(manifest) = fs::read(&p) else {
             return Ok(None);
         };
-        let m: crate::Manifest = serde_json::from_slice(&manifest).map_err(|e| e.to_string())?;
+        let ns = k.0.split('/').next().ok_or("invalid entry key")?;
+        let m = crate::codec::parse_manifest(ns, &manifest)?;
+        if crate::codec::entry_key(ns, m.route, crate::PromptKey::new(&m.token_ids, &m.images)) != *k {
+            return Err("cache entry digest mismatch".into());
+        }
         let mut blobs = Vec::new();
         for d in m.blob_sha256 {
             let b = fs::read(self.blob(&d))
@@ -168,6 +172,9 @@ impl PersistentSnapshotStore for FilesystemSnapshotStore {
         let manifest = read_bounded(&path, limit)?;
         let ns = key.0.split('/').next().ok_or("invalid entry key")?;
         let parsed = crate::codec::parse_manifest(ns, &manifest)?;
+        if crate::codec::entry_key(ns, parsed.route, crate::PromptKey::new(&parsed.token_ids, &parsed.images)) != *key {
+            return Err("cache entry digest mismatch".into());
+        }
         let mut remaining = limit.saturating_sub(manifest.len() as u64);
         let mut blobs = Vec::new();
         for digest in parsed.blob_sha256 {
