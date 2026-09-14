@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::LazyLock;
 #[cfg(test)]
 use std::cell::Cell;
+use std::sync::LazyLock;
 
 use cxx::UniquePtr;
 

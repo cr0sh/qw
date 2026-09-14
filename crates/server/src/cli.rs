@@ -153,7 +153,7 @@ pub struct ServerArgs {
     #[arg(long = "mtp-k", default_value_t = 3)]
     mtp_k: usize,
 
-    /// Decoder policy. Auto prefers available, compatible DFlash2, then available MTP, then baseline.
+    /// Decoder policy. Auto prefers available DFlash2, then available MTP, then baseline.
     #[arg(long, value_enum, default_value = "auto")]
     decoder: Decoder,
 

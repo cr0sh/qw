@@ -711,6 +711,34 @@ pub trait TokenConstraint {
 
     fn rollback_transaction(&mut self);
 
+    /// A borrowed, stable byte prefix of the committed canonical output.
+    ///
+    /// Once exposed, bytes must never be retracted or changed by later commits,
+    /// backtracking, or rollback. An active transaction must expose only its
+    /// previously committed state, never tentative bytes. The prefix may end
+    /// inside a UTF-8 code point; consumers must buffer incomplete code points.
+    ///
+    /// `None` means no safe byte stream is available: consumers must buffer
+    /// output until final canonical decoding rather than stream token decodes.
+    fn committed_bytes(&self) -> Option<&[u8]> {
+        None
+    }
+
+    /// Optionally validate an unmasked greedy winner without building a full mask.
+    ///
+    /// `Some(true)` must mean `compute_mask` would allow this token for the same
+    /// logits, history, and active transaction. Validation must not commit output.
+    /// Return `None` for unsupported checks or pending splice/accept transitions;
+    /// `Some(false)` rejects the candidate. Both use the ordinary mask path.
+    fn validate_greedy_token(
+        &mut self,
+        _token_id: i32,
+        _logits: &MlxArray,
+        _token_history: &[i32],
+    ) -> Result<Option<bool>, String> {
+        Ok(None)
+    }
+
     fn compute_mask(
         &mut self,
         logits: &MlxArray,

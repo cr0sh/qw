@@ -2650,7 +2650,8 @@ async fn direct_image_submission_enforces_cardinality_and_image_limit() {
 }
 
 #[tokio::test]
-async fn image_requests_never_use_or_populate_the_text_prefix_cache() {
+async fn baseline_fake_image_requests_do_not_use_or_populate_text_prefix_cache() {
+    // The decoder-free fake models baseline image behavior, not DFlash generation.
     let app = router(Engine::start_fake(Some(MODEL), 8));
     let image_request = json!({
         "model": MODEL,

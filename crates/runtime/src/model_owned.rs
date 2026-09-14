@@ -33,4 +33,3 @@ impl<T> ModelOwnedSequenceState<T> {
         f(&mut self.internal.borrow_mut())
     }
 }
-

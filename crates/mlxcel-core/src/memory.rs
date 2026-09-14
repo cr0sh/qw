@@ -183,10 +183,7 @@ pub fn set_wired_limit(bytes: u64) -> Result<u64, String> {
 /// overflow-free across the full `u64` input range. Integer division rounds
 /// fractional bytes down.
 #[must_use]
-pub fn recommended_wired_limit(
-    system_memory_bytes: u64,
-    metal_recommended_bytes: u64,
-) -> u64 {
+pub fn recommended_wired_limit(system_memory_bytes: u64, metal_recommended_bytes: u64) -> u64 {
     let system_cap = u128::from(system_memory_bytes) * 80 / 100;
     let metal_cap = u128::from(metal_recommended_bytes) * 110 / 100;
     // `system_cap` is at most 80% of u64::MAX, so the selected minimum always
@@ -323,10 +320,7 @@ mod tests {
     #[test]
     fn wired_limit_uses_one_hundred_ten_percent_of_metal_recommendation() {
         const GIB: u64 = 1024 * 1024 * 1024;
-        assert_eq!(
-            recommended_wired_limit(64 * GIB, 40 * GIB),
-            44 * GIB
-        );
+        assert_eq!(recommended_wired_limit(64 * GIB, 40 * GIB), 44 * GIB);
     }
 
     #[test]

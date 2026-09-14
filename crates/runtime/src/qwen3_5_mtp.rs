@@ -251,9 +251,9 @@ pub struct MtpPrefixReuse<'a> {
     pub continuation_token: Option<i32>,
 }
 
-struct MtpProposal {
-    token: i32,
-    proposal_probs: UniquePtr<MlxArray>,
+pub(crate) struct MtpProposal {
+    pub(crate) token: i32,
+    pub(crate) proposal_probs: UniquePtr<MlxArray>,
 }
 
 struct Qwen35MtpDraftState {
@@ -1179,6 +1179,128 @@ fn constraint_step(
     }
 }
 
+enum ConstraintSelection {
+    Token(i32),
+    Splice(ConstraintCommit),
+    Accept,
+}
+
+fn constrained_greedy_mask_safe(
+    logits: &MlxArray,
+    sampling: &SamplingConfig,
+    history_len: usize,
+) -> bool {
+    let shape = mlxcel_core::array_shape(logits);
+    let Some(&vocab_size) = shape.last() else {
+        return false;
+    };
+    // Token-wise finite penalties preserve forbidden -inf entries. Keep DRY
+    // and random filtering on the canonical masked path.
+    sampler_is_greedy(sampling)
+        && sampling.xtc_probability == 0.0
+        && sampling.dry_multiplier == 0.0
+        && sampling.repetition_penalty > 0.0
+        && sampling.repetition_penalty.is_finite()
+        && (sampling.presence_penalty.abs() + sampling.frequency_penalty.abs() * history_len as f32)
+            .is_finite()
+        && !sampling.token_bias.iter().any(|(&token, &bias)| {
+            token >= 0 && token < vocab_size && (bias.is_nan() || bias == f32::INFINITY)
+        })
+}
+
+fn constrained_greedy_candidates(
+    logits: &MlxArray,
+    sampling: &SamplingConfig,
+    history: &mut Vec<i32>,
+    draft_tokens: &[i32],
+) -> Option<Vec<i32>> {
+    if !constrained_greedy_mask_safe(
+        logits,
+        sampling,
+        history.len().checked_add(draft_tokens.len())?,
+    ) {
+        return None;
+    }
+    if mtp_greedy_graph_eligible(sampling, true) {
+        let biased = mlxcel_core::sampling::apply_token_bias(logits, &sampling.token_bias);
+        let targets = mlxcel_core::argmax_last_axis(&biased);
+        mlxcel_core::eval(&targets);
+        return Some(evaluated_i32_values(&targets));
+    }
+    // Until the first rejection or splice, canonical history is exactly the
+    // accepted draft prefix. Construct those rows together without copying
+    // history, then restore it before consulting the constraint.
+    let history_len = history.len();
+    let mut targets = Vec::with_capacity(draft_tokens.len() + 1);
+    for position in 0..=draft_tokens.len() {
+        let row = logits_at(logits, position);
+        let (token, _) = sample_token_optimized(&row, sampling, history);
+        targets.push(token);
+        if let Some(&token) = draft_tokens.get(position) {
+            history.push(token);
+        }
+    }
+    history.truncate(history_len);
+    let roots = targets
+        .iter()
+        .map(|token| token.as_ref().expect("sampled target") as *const MlxArray)
+        .collect::<Vec<_>>();
+    // Every root remains owned by `targets` throughout synchronous evaluation.
+    unsafe { mlxcel_core::eval_all(&roots) };
+    Some(
+        targets
+            .iter()
+            .map(|token| mlxcel_core::item_i32(token))
+            .collect(),
+    )
+}
+
+fn constrained_selection(
+    logits: &MlxArray,
+    sampling: &SamplingConfig,
+    history: &[i32],
+    constraint: &mut dyn TokenConstraint,
+    candidate: Option<i32>,
+) -> Result<ConstraintSelection, String> {
+    let candidate = candidate.or_else(|| {
+        if !constrained_greedy_mask_safe(logits, sampling, history.len()) {
+            return None;
+        }
+        let (token, _) = sample_token_optimized(logits, sampling, history);
+        mlxcel_core::eval(&token);
+        Some(mlxcel_core::item_i32(&token))
+    });
+    if let Some(candidate) = candidate
+        && constraint.validate_greedy_token(candidate, logits, history)? == Some(true)
+    {
+        return Ok(ConstraintSelection::Token(candidate));
+    }
+    match constraint.compute_mask(logits, history)? {
+        ConstraintMask::Allow(allowed) => {
+            if let Some(candidate) = candidate {
+                let shape = mlxcel_core::array_shape(logits);
+                // Validate the entire mask before using a winner. Delegate
+                // malformed masks to the canonical masking routine for errors.
+                if shape.last().is_some_and(|&vocab_size| {
+                    !allowed.is_empty()
+                        && allowed
+                            .iter()
+                            .all(|&token| token >= 0 && token < vocab_size)
+                }) && allowed.contains(&candidate)
+                {
+                    return Ok(ConstraintSelection::Token(candidate));
+                }
+            }
+            let masked = mask_logits_to_allowed(logits, &allowed)?;
+            let (token, _) = sample_token_optimized(&masked, sampling, history);
+            mlxcel_core::eval(&token);
+            Ok(ConstraintSelection::Token(mlxcel_core::item_i32(&token)))
+        }
+        ConstraintMask::Splice(commit) => Ok(ConstraintSelection::Splice(commit)),
+        ConstraintMask::Accept => Ok(ConstraintSelection::Accept),
+    }
+}
+
 fn rebuild_history(prompt_tokens: &[i32], output: &[i32], history: &mut Vec<i32>) {
     history.clear();
     history.extend_from_slice(prompt_tokens);
@@ -1352,15 +1474,15 @@ fn stochastic_walk(
     }
 }
 
-struct ConstrainedWalk {
-    accepted: usize,
-    new_tokens: Vec<i32>,
-    output: Vec<i32>,
-    rebuild: bool,
-    stop_reason: Option<GenerationStopReason>,
+pub(crate) struct ConstrainedWalk {
+    pub(crate) accepted: usize,
+    pub(crate) new_tokens: Vec<i32>,
+    pub(crate) output: Vec<i32>,
+    pub(crate) rebuild: bool,
+    pub(crate) stop_reason: Option<GenerationStopReason>,
 }
 #[allow(clippy::too_many_arguments)]
-fn constrained_initial_step(
+pub(crate) fn constrained_initial_step(
     logits: &MlxArray,
     sampling: &SamplingConfig,
     prompt_tokens: &[i32],
@@ -1372,19 +1494,12 @@ fn constrained_initial_step(
     let mut output = committed_output.to_vec();
     let mut history = Vec::with_capacity(prompt_tokens.len() + output.len() + 1);
     rebuild_history(prompt_tokens, &output, &mut history);
-    let step = constraint_step(logits, constraint, &history)?;
-    let logits_for_sample = match &step {
-        ConstraintStepLogits::Masked(logits) => logits
-            .as_ref()
-            .expect("masked constraint logits must not be null"),
-        ConstraintStepLogits::Splice(commit) => {
-            let stop_reason = apply_walk_splice(
-                commit.clone(),
-                prompt_tokens,
-                &mut output,
-                &mut history,
-                max_tokens,
-            )?;
+    let step = constrained_selection(logits, sampling, &history, constraint, None)?;
+    let token = match step {
+        ConstraintSelection::Token(token) => token,
+        ConstraintSelection::Splice(commit) => {
+            let stop_reason =
+                apply_walk_splice(commit, prompt_tokens, &mut output, &mut history, max_tokens)?;
             return Ok(ConstrainedWalk {
                 accepted: 0,
                 new_tokens: Vec::new(),
@@ -1393,7 +1508,7 @@ fn constrained_initial_step(
                 stop_reason,
             });
         }
-        ConstraintStepLogits::Accept => {
+        ConstraintSelection::Accept => {
             return Ok(ConstrainedWalk {
                 accepted: 0,
                 new_tokens: Vec::new(),
@@ -1403,9 +1518,6 @@ fn constrained_initial_step(
             });
         }
     };
-    let (token, _) = sample_token_optimized(logits_for_sample, sampling, &history);
-    mlxcel_core::eval(&token);
-    let token = mlxcel_core::item_i32(&token);
     if eos_tokens.contains(&token) {
         return Ok(ConstrainedWalk {
             accepted: 0,
@@ -1479,7 +1591,7 @@ fn apply_walk_splice(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn constrained_greedy_walk(
+pub(crate) fn constrained_greedy_walk(
     draft_tokens: &[i32],
     verify_logits: &MlxArray,
     sampling: &SamplingConfig,
@@ -1495,17 +1607,23 @@ fn constrained_greedy_walk(
     rebuild_history(prompt_tokens, &output, &mut history);
     let mut accepted = 0;
     let mut new_tokens = Vec::with_capacity(draft_tokens.len() + 1);
+    let candidates =
+        constrained_greedy_candidates(verify_logits, sampling, &mut history, draft_tokens);
 
     for position in 0..=draft_tokens.len() {
         let logits = logits_at(verify_logits, position);
-        let step = constraint_step(&logits, constraint, &history)?;
-        let logits_for_sample = match &step {
-            ConstraintStepLogits::Masked(logits) => logits
-                .as_ref()
-                .expect("masked constraint logits must not be null"),
-            ConstraintStepLogits::Splice(commit) => {
+        let step = constrained_selection(
+            &logits,
+            sampling,
+            &history,
+            constraint,
+            candidates.as_ref().map(|tokens| tokens[position]),
+        )?;
+        let target_token = match step {
+            ConstraintSelection::Token(token) => token,
+            ConstraintSelection::Splice(commit) => {
                 let stop_reason = apply_walk_splice(
-                    commit.clone(),
+                    commit,
                     prompt_tokens,
                     &mut output,
                     &mut history,
@@ -1519,7 +1637,7 @@ fn constrained_greedy_walk(
                     stop_reason,
                 });
             }
-            ConstraintStepLogits::Accept => {
+            ConstraintSelection::Accept => {
                 return Ok(ConstrainedWalk {
                     accepted,
                     new_tokens,
@@ -1529,9 +1647,6 @@ fn constrained_greedy_walk(
                 });
             }
         };
-        let (token_array, _) = sample_token_optimized(logits_for_sample, sampling, &history);
-        mlxcel_core::eval(&token_array);
-        let target_token = mlxcel_core::item_i32(&token_array);
         new_tokens.push(target_token);
         if eos_tokens.contains(&target_token) {
             return Ok(ConstrainedWalk {
@@ -1571,7 +1686,7 @@ fn constrained_greedy_walk(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn constrained_stochastic_walk(
+pub(crate) fn constrained_stochastic_walk(
     proposals: &[MtpProposal],
     verify_logits: &MlxArray,
     sampling: &SamplingConfig,
@@ -3195,6 +3310,158 @@ impl Qwen35MtpGenerator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn canonical_masked_tokens_match_initial_and_verified_paths() {
+        let rows: &[&[f32]] = &[
+            &[1.0, 6.0, 5.0, 0.0],
+            &[1.0, 6.0, 5.0, 0.0],
+            &[1.0, 5.0, 5.0, 0.0],
+        ];
+        let mut biased = SamplingConfig::greedy();
+        biased.token_bias.insert(2, 1.0);
+        biased.token_bias.suppress_tokens(&[3]);
+        let mut penalty = SamplingConfig::greedy();
+        penalty.repetition_penalty = 2.0;
+        let mut history_penalty = SamplingConfig::greedy();
+        history_penalty.presence_penalty = 1.5;
+        history_penalty.frequency_penalty = 0.5;
+        let mut infinite_bias = SamplingConfig::greedy();
+        infinite_bias.token_bias.insert(3, f32::INFINITY);
+        for sampling in [
+            SamplingConfig::greedy(),
+            biased,
+            penalty,
+            history_penalty,
+            infinite_bias,
+        ] {
+            let masks = vec![vec![1, 2], vec![0, 2], vec![2, 1]];
+            let logits = logits_rows(rows);
+            let mut history = vec![1];
+            let mut expected = Vec::new();
+            for (position, mask) in masks.iter().enumerate() {
+                let row = logits_at(&logits, position);
+                let masked = mask_logits_to_allowed(&row, mask).unwrap();
+                let (token, _) = sample_token_optimized(&masked, &sampling, &history);
+                mlxcel_core::eval(&token);
+                let token = mlxcel_core::item_i32(&token);
+                expected.push(token);
+                history.push(token);
+            }
+            let mut constraint = recording_constraint(3, 4);
+            constraint.masks = masks.clone();
+            let initial = constrained_initial_step(
+                &logits_at(&logits, 0),
+                &sampling,
+                &[1],
+                &[],
+                &[],
+                8,
+                &mut constraint,
+            )
+            .unwrap();
+            assert_eq!(initial.output, expected[..1]);
+
+            let mut constraint = recording_constraint(3, 4);
+            constraint.masks = masks.clone();
+            let full = constrained_greedy_walk(
+                &expected[..2],
+                &logits,
+                &sampling,
+                &[1],
+                &[],
+                &[],
+                8,
+                &mut constraint,
+            )
+            .unwrap();
+            assert_eq!(full.output, expected);
+            assert_eq!(full.accepted, 2);
+
+            let mut constraint = recording_constraint(3, 4);
+            constraint.masks = masks;
+            let correction = constrained_greedy_walk(
+                &[expected[0], (expected[1] + 1) % 4],
+                &logits,
+                &sampling,
+                &[1],
+                &[],
+                &[],
+                8,
+                &mut constraint,
+            )
+            .unwrap();
+            assert_eq!(correction.output, expected[..2]);
+            assert_eq!(correction.accepted, 1);
+        }
+    }
+
+    #[test]
+    fn invalid_masks_rollback_even_when_the_winner_is_present() {
+        let sampling = SamplingConfig::greedy();
+        let logits = logits_rows(&[&[0.0, 10.0, 0.0], &[0.0, 10.0, 0.0]]);
+        for mask in [vec![], vec![1, -1], vec![1, 3]] {
+            let row = logits_at(&logits, 1);
+            let canonical_error = mask_logits_to_allowed(&row, &mask).err().unwrap();
+            let mut constraint = recording_constraint(2, 3);
+            constraint.masks[1] = mask.clone();
+            let result = commit_constraint_transaction(&mut constraint, |active| {
+                constrained_greedy_walk(&[1], &logits, &sampling, &[], &[], &[], 8, active)
+            });
+            assert_eq!(result.err().unwrap(), canonical_error);
+            assert!(constraint.committed.is_empty());
+            assert!(constraint.transaction.is_none());
+
+            constraint.masks[0] = mask;
+            let result =
+                constrained_initial_step(&row, &sampling, &[], &[], &[], 8, &mut constraint);
+            assert_eq!(result.err().unwrap(), canonical_error);
+            assert!(constraint.committed.is_empty());
+        }
+    }
+
+    #[test]
+    fn greedy_splice_stops_batched_candidates_and_rolls_back_failed_commit() {
+        let sampling = SamplingConfig::greedy();
+        let logits = logits_rows(&[&[0.0, 10.0, 0.0], &[0.0, 0.0, 10.0], &[10.0, 0.0, 0.0]]);
+        let mut constraint = recording_constraint(3, 3);
+        constraint.splice_on = Some((
+            2,
+            ConstraintCommit {
+                backtrack: 1,
+                tokens: vec![0, 2],
+                accept: true,
+            },
+        ));
+        let walk = commit_constraint_transaction(&mut constraint, |active| {
+            constrained_greedy_walk(&[1, 2], &logits, &sampling, &[], &[], &[], 8, active)
+        })
+        .unwrap();
+        assert_eq!(walk.accepted, 2);
+        assert_eq!(walk.new_tokens, vec![1, 2]);
+        assert_eq!(walk.output, vec![0, 2]);
+        assert!(walk.rebuild);
+        assert_eq!(
+            walk.stop_reason,
+            Some(GenerationStopReason::ConstraintAccepted)
+        );
+
+        let mut constraint = recording_constraint(3, 3);
+        constraint.splice_on = Some((
+            2,
+            ConstraintCommit {
+                backtrack: 2,
+                tokens: vec![0],
+                accept: false,
+            },
+        ));
+        let result = commit_constraint_transaction(&mut constraint, |active| {
+            constrained_greedy_walk(&[1, 2], &logits, &sampling, &[], &[], &[], 8, active)
+        });
+        assert!(result.is_err());
+        assert!(constraint.committed.is_empty());
+        assert!(constraint.transaction.is_none());
+    }
+
     use crate::gated_delta::GatedDeltaCache;
     use crate::qwen_mrope_state::MRopeState;
     use crate::qwen3_5::rollback_plan;

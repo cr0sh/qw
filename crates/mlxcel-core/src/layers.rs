@@ -4114,11 +4114,9 @@ fn sdpa_materializes_scores(
         return false;
     }
     let q_len = q_shape[2];
-    let full_eligible = q_len > 8
-        && dq == dv
-        && matches!(dq, 64 | 72 | 80 | 96 | 128);
-    let vector_head_dim = (dq == dv && matches!(dq, 64 | 96 | 128 | 256))
-        || (dq == 192 && dv == 128);
+    let full_eligible = q_len > 8 && dq == dv && matches!(dq, 64 | 72 | 80 | 96 | 128);
+    let vector_head_dim =
+        (dq == dv && matches!(dq, 64 | 96 | 128 | 256)) || (dq == 192 && dv == 128);
     let vector_eligible = q_len <= 8
         && q_len <= k_shape[2]
         && vector_head_dim
@@ -4325,14 +4323,7 @@ pub(crate) fn chunked_causal_attention(
         let mask = crate::utils::create_causal_mask(stop - start, offset + start);
         // Keep the per-chunk mask in the score dtype (see mask_in_score_dtype).
         let mask = mask_in_score_dtype(mask.as_ref().unwrap(), ffi::array_dtype(q)).unwrap_or(mask);
-        let part = attention_dispatch(
-            &q_c,
-            &k_c,
-            &v_c,
-            scale,
-            Some(mask.as_ref().unwrap()),
-            0.0,
-        );
+        let part = attention_dispatch(&q_c, &k_c, &v_c, scale, Some(mask.as_ref().unwrap()), 0.0);
         if cfg!(feature = "metal") {
             ffi::eval(&part);
             let ptr = part.as_ref().expect("attention output") as *const MlxArray;
@@ -7109,7 +7100,13 @@ mod tests {
     fn metal_long_context_fallback_requires_a_bounded_query_plan() {
         let q = [1, 24, 1536, 256];
         let k = [1, 4, 218_583, 256];
-        assert!(sdpa_materializes_scores(&q, &k, &k, crate::dtype::FLOAT16, 0.0));
+        assert!(sdpa_materializes_scores(
+            &q,
+            &k,
+            &k,
+            crate::dtype::FLOAT16,
+            0.0
+        ));
         let per_row = q[1] as usize * k[2] as usize * 2;
         let budget = 1024 * 1024 * 1024;
         let chunk = query_chunk_len(per_row, q[2], budget).expect("oversized Metal score matrix");
@@ -7117,12 +7114,19 @@ mod tests {
         assert!(chunk as usize * per_row <= budget);
         // The same target's short verify block still uses native vector SDPA.
         assert!(!sdpa_materializes_scores(
-            &[1, 24, 5, 256], &k, &k, crate::dtype::FLOAT16, 0.0
+            &[1, 24, 5, 256],
+            &k,
+            &k,
+            crate::dtype::FLOAT16,
+            0.0
         ));
         // Standard full-query head geometry must not be demoted to chunked fallback.
         assert!(!sdpa_materializes_scores(
-            &[1, 24, 1536, 128], &[1, 4, 218_583, 128],
-            &[1, 4, 218_583, 128], crate::dtype::FLOAT16, 0.0
+            &[1, 24, 1536, 128],
+            &[1, 4, 218_583, 128],
+            &[1, 4, 218_583, 128],
+            crate::dtype::FLOAT16,
+            0.0
         ));
     }
 
@@ -7138,7 +7142,10 @@ mod tests {
         for chunk in [6, 7] {
             let chunked = chunked_causal_attention(&q, &k, &v, scale, chunk);
             let diff = max_abs_diff(&native, &chunked);
-            assert!(diff < 5e-3, "head_dim256 causal offset/GQA diverged by {diff}");
+            assert!(
+                diff < 5e-3,
+                "head_dim256 causal offset/GQA diverged by {diff}"
+            );
         }
     }
 

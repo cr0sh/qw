@@ -22,9 +22,11 @@ workload needs different limits or a separate location.
 New prompt checkpoints capture the full incoming model prompt, including the
 rendered generation prefix, rather than history-only or adaptive intermediate
 prefixes. Exact output, terminal, and cancellation checkpoints remain available.
-A durable continuation preserves the response identity, delivered prefix,
-original penalty boundary, remaining token budget, and independently saved RNG
-state; an unrelated request must not change its continuation stream.
+A durable response continuation is available for unconstrained text only. It
+preserves the response identity, delivered prefix, original penalty boundary,
+remaining token budget, and independently saved RNG state; an unrelated request
+must not change its continuation stream. Image and constrained requests use
+ordinary prefix snapshots, not serialized parser or response continuations.
 
 Ordinary memory and filesystem eviction prefer the least recently used or
 materialized entry; reuse frequency breaks recency ties and still determines
@@ -34,8 +36,9 @@ Oversized ordinary snapshots still cannot displace viable hot prefixes, and
 active continuation protections and tier budgets are unchanged.
 
 Per-entry cache lifecycle traces carry the existing deterministic `entry_id`
-derived from namespace, route, and token prefix. The identity survives hot or
-filesystem removal and persistence failure, including memory-only entries.
+derived from namespace, route, token prefix, and ordered image identities. The
+identity survives hot or filesystem removal and persistence failure, including
+memory-only entries.
 Use it to join insert, hit, restore/promotion, eviction, and expiry evidence;
 capacity setup, genuine misses, and aggregate events do not identify one entry.
 
@@ -222,6 +225,11 @@ MTP starts that clock after the first-token callback and stops before final
 snapshot capture; DFlash includes final snapshot capture. Preserve this timing
 scope difference when comparing routes, together with actual token counts,
 stop reasons, cache sources, effective sampling, and separately labeled memory.
+These phase clocks are distinct from content TTFT: measure the latter through
+the first nonempty generated content delta, never an HTTP header or SSE role
+event. The canonical benchmark excludes the first output token from its decode
+numerator. Report schema compilation and cache state when comparing constrained
+and unconstrained requests.
 
 Attention geometries without a native fused SDPA kernel use query tiling when
 their score matrix exceeds `MLXCEL_ATTENTION_CHUNK_BUDGET_MB` (existing default:
@@ -255,6 +263,89 @@ Evaluation episodes produced by schema-blind parameter coercion are not
 comparable baselines: a declared JSON string could have reached a tool as an
 object, changing both tool execution and the subsequent conversation.
 
+## DFlash2 constrained decoding
+
+With a DFlash2 draft available, explicit and automatic decoder selection support
+JSON Schema, images, and their combination. Constraints apply to target
+verification; stochastic rejection retains the original draft probabilities
+rather than renormalizing proposals over the grammar's allowed tokens.
+
+Parser transactions commit canonical accepted output only. Backtracks and
+speculative splice rebuilds restore an immutable prompt base, including prefill
+and RoPE state. An append-only fast-forward at a fully committed target boundary
+continues from the live state and evaluates only its new suffix. An atomic splice
+that exceeds the output budget is rolled back, not partially published.
+Exact prompt checkpoints and full reused prefixes can
+supply that base without an extra snapshot. Otherwise, a transient checkpoint
+reuses existing attention pages or retains compact immutable tensors instead of
+allocating new persistent pages. It is frozen before the first target mutation,
+not before first-token sampling; its cost remains inside the unchanged phase
+timers. Published cache snapshots remain paged. Constrained rounds use the same
+adaptive verification-width calibration and asynchronous draft launch as
+unconstrained rounds. Full hidden-context windows are maintained only when
+terminal snapshot capture requires them.
+
+Eligible constrained requests populate and reuse the same exact-prompt projected
+drafter K/V memo as unconstrained requests; no unconstrained warmup is required.
+The key binds the reusable snapshot identity and complete prompt suffix, and
+excludes segmented or new-image prefills. Cold priming projects immutable prompt
+hiddens before any generated rows enter the drafter cache. Replay restores that
+projected base and supplies only generated rows while the prompt boundary remains
+inside the retained window. Evicted boundaries and unbounded attention use the
+raw-context rebuild path. Attention masks use the full visible context and its
+logical ring order, never unused backing capacity.
+
+Greedy selection can reuse an already-allowed unmasked winner only when the
+sampling transforms preserve equivalence to canonical masked selection.
+Verification rows can be sampled together. History-dependent transforms use the
+hypothetical accepted draft prefix for each row; candidates after the first
+rejection or splice are discarded.
+Guidance can validate ordinary greedy candidates directly when no forced token,
+token-healing prefix, or pending stop requires canonical mask computation.
+Forbidden winners, unsupported validation, and unsafe sampling transforms retain
+full masking and the canonical sampler.
+
+Streaming publishes the parser's committed, never-retractable byte prefix, not
+tentative speculative tokens. The provider buffers incomplete UTF-8 boundaries
+and reconciles the final canonical token sequence with previously emitted bytes.
+The grammar factory retains at most one compiled schema with its initial mask
+and deep-clones that zero-output parser state for each request. Schema changes
+replace the template; mutable parser state is never shared between requests.
+A cold schema still pays compilation and initial-mask computation costs.
+
+On the M4 Max with the Qwen3.8-27B oQ4e target and DFlash2 draft, the verified
+structured-output gate allows TTFT regression of `max(5%, 5 ms)` and at most 5%
+loss in prefill or decode throughput. TTFT starts before schema compilation and
+ends at the first nonempty content delta, not a role/header event. The paired
+matrix uses one warmup and three timed AB/BA repetitions, 128 output tokens,
+greedy sampling, and the normal presence/frequency penalties of 1.5/0.5.
+This is a text-schema provider probe with terminal snapshot capture disabled;
+the combined image/cache/HTTP paths are verified separately.
+
+| Prompt case | TTFT off → on (ms) | Prefill off → on (tokens/s) | Decode off → on (tokens/s) |
+| --- | ---: | ---: | ---: |
+| Fully cached, 52 tokens | 6.41 → 7.34 | No new prompt tokens | 37.70 → 37.83 |
+| Fresh, 4,179 tokens | 16,447.08 → 16,445.76 | 254.09 → 254.11 | 40.14 → 39.17 |
+| 10,580 tokens, 10,337 cached | 1,113.53 → 1,112.35 | 218.23 → 218.46 | 38.96 → 38.34 |
+| 64,540 tokens, 64,297 cached | 1,631.06 → 1,635.47 | 148.99 → 148.59 | 22.27 → 21.79 |
+
+All four cases pass that gate. The absolute TTFT allowance is material only for
+the fully cached case (+0.93 ms); the other cases also pass a relative-only 5%
+TTFT limit. All measured outputs were schema-valid prefixes and streamed bytes
+matched canonical decoding. Fresh and 64k runs can differ in token sequence
+because packed-cache verification regrouping changes floating-point evaluation;
+these figures are representative measurements, not a guarantee for every schema
+or output distribution. Cold schema compilation is not amortized away from
+individual request timing, but the table reports warmed repetitions.
+
+The separate standard unconstrained throughput benchmark remains within 5% of
+the preserved pre-change baseline: prefill changes range from -0.05% to +0.22%,
+and decode changes from +0.22% to +1.03% across fresh, 10k, and 64k contexts.
+Final Chat Completions and Responses SSE checks preserve JSON and UTF-8 output.
+Repeated red images reuse all 61 prompt tokens; changed blue pixels miss;
+an appended blue-image turn reuses 108 tokens. Restarting with automatic decoder
+selection restores the red image's 61-token prefix from persistent storage.
+
 ## DFlash2 image verification
 
 The DFlash2 image path uses the existing vision processor and merged embeddings,
@@ -262,7 +353,15 @@ then captures selected target-layer hidden states during chunked multimodal
 prefill. Each chunk slices the same image embeddings and three-axis positions.
 Decode and speculative rollback retain the image RoPE delta; a fresh text
 request clears it. The draft/verify/sampling loop is shared with text generation.
-Image requests deliberately bypass prefix and continuation snapshots.
+Image-aware prompt keys bind each image's ordered token span to a SHA-256 digest
+of decoded RGB pixels and dimensions. A lookup never ends inside an image span.
+Appending another image can reuse the earlier covered images; changed pixels
+invalidate reuse across that image even when text tokens and dimensions match.
+Both hot and persistent DFlash2 prefix snapshots preserve multimodal state.
+Persistent manifests bind the actual token/image content to the entry identity;
+inconsistent bindings are rejected rather than reused as text-only prefixes.
+Image and constrained completions, including cancellation, can publish ordinary
+prefix snapshots. Durable response continuation remains unconstrained text only.
 
 The deterministic OCR PNGs in `tests/fixtures/images` are committed. Their
 manifest includes exact transcriptions, photo provenance, hashes, and semantic

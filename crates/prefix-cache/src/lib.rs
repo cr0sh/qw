@@ -45,6 +45,60 @@ impl Clock for SystemClock {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct EntryKey(pub String);
 
+/// Identity of decoded image pixels and the model-token rows they occupy.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImageIdentity {
+    pub token_start: usize,
+    pub token_end: usize,
+    pub digest: String,
+}
+
+/// Borrowed prompt identity. Images must be ordered, non-overlapping spans with
+/// canonical lowercase SHA256 digests. Invalid identities are cache misses.
+#[derive(Debug, Clone, Copy)]
+pub struct PromptKey<'a> {
+    token_ids: &'a [i32],
+    images: &'a [ImageIdentity],
+}
+
+impl<'a> PromptKey<'a> {
+    pub fn new(token_ids: &'a [i32], images: &'a [ImageIdentity]) -> Self {
+        Self { token_ids, images }
+    }
+
+    pub fn text(token_ids: &'a [i32]) -> Self {
+        Self::new(token_ids, &[])
+    }
+
+    fn valid(self) -> bool {
+        let mut end = 0;
+        self.images.iter().all(|image| {
+            let valid = image.token_start >= end
+                && image.token_start < image.token_end
+                && image.token_end <= self.token_ids.len()
+                && image.digest.len() == 64
+                && image
+                    .digest
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+            end = image.token_end;
+            valid
+        })
+    }
+
+    // A snapshot inside an image is never publishable: rows can depend on the
+    // entire image, and restoration must not resume midway through its span.
+    fn prefix(self, len: usize) -> Option<Self> {
+        let tokens = self.token_ids.get(..len)?;
+        let count = self.images.partition_point(|image| image.token_start < len);
+        if count > 0 && self.images[count - 1].token_end > len {
+            return None;
+        }
+        Some(Self::new(tokens, &self.images[..count]))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[repr(u8)]
@@ -152,6 +206,7 @@ enum PersistentMatch {
 
 pub struct ResumeEntry {
     pub token_ids: Vec<i32>,
+    pub images: Vec<ImageIdentity>,
     pub snapshot: Rc<PromptSnapshot>,
     pub metadata: ResponseResumeMetadata,
 }
@@ -182,7 +237,7 @@ pub struct AdaptivePrefixCache {
     filesystem_blobs: HashMap<String, (usize, u64)>,
     io: Option<CacheIo>,
     clock: Box<dyn Clock>,
-    resumes: HashMap<String, (SnapshotRoute, Vec<i32>)>,
+    resumes: HashMap<String, (SnapshotRoute, Vec<i32>, Vec<ImageIdentity>)>,
     staging: Arc<StagingBudget>,
     prefetch: Option<Prefetch>,
 }
@@ -198,6 +253,7 @@ struct PutCompletion {
     publication_id: u64,
     route: SnapshotRoute,
     token_ids: Vec<i32>,
+    images: Vec<ImageIdentity>,
     key: EntryKey,
     reserved_bytes: u64,
     result: Result<(Vec<(String, u64)>, u64, u64), String>,
@@ -306,6 +362,7 @@ enum IoCommand {
         route: SnapshotRoute,
         reserved_bytes: u64,
         token_ids: Vec<i32>,
+        images: Vec<ImageIdentity>,
         portable: PortablePromptSnapshot,
         retention: RetentionMetadata,
         expires_at_unix_ms: u64,
@@ -390,8 +447,11 @@ impl AdaptivePrefixCache {
                             if manifest.expires_at_unix_ms > now
                                 && manifest.route == expected_route =>
                         {
-                            let expected_key =
-                                entry_key(namespace, manifest.route, &manifest.token_ids);
+                            let expected_key = entry_key(
+                                namespace,
+                                manifest.route,
+                                PromptKey::new(&manifest.token_ids, &manifest.images),
+                            );
                             if expected_key != scanned_entry.key {
                                 tracing::warn!(
                                     phase = "cache.persistence_error",
@@ -408,7 +468,7 @@ impl AdaptivePrefixCache {
                             filesystem_bytes =
                                 filesystem_bytes.saturating_add(manifest.total_bytes);
                             trie.ensure(
-                                &manifest.token_ids,
+                                PromptKey::new(&manifest.token_ids, &manifest.images),
                                 manifest.route,
                                 Terminal {
                                     route: manifest.route,
@@ -430,7 +490,7 @@ impl AdaptivePrefixCache {
                             if let Some(resume) = manifest.response_resume {
                                 resumes.insert(
                                     resume.response_id,
-                                    (manifest.route, manifest.token_ids),
+                                    (manifest.route, manifest.token_ids, manifest.images),
                                 );
                             }
                         }
@@ -500,7 +560,10 @@ impl AdaptivePrefixCache {
             self.publications.remove(&completion.key);
             let Some((node, _)) = self
                 .trie
-                .path(&completion.token_ids, completion.route)
+                .path(
+                    PromptKey::new(&completion.token_ids, &completion.images),
+                    completion.route,
+                )
                 .into_iter()
                 .last()
             else {
@@ -534,8 +597,11 @@ impl AdaptivePrefixCache {
 
     /// Queue one read-only portable lookahead. No observations, expiry, reuse,
     /// promotion, or MLX operations occur until ordinary demand lookup.
-    pub fn prefetch(&mut self, tokens: &[i32], route: SnapshotRoute) {
+    pub fn prefetch(&mut self, tokens: PromptKey<'_>, route: SnapshotRoute) {
         self.clear_prefetch();
+        if !tokens.valid() {
+            return;
+        }
         let now = self.clock.now_unix_ms();
         for (node, _) in self.trie.path(tokens, route).into_iter().rev() {
             let Some(t) = self.trie.terminal(node, route) else {
@@ -610,11 +676,14 @@ impl AdaptivePrefixCache {
         }
     }
 
-    pub fn lookup(&mut self, prompt: &[i32], route: SnapshotRoute) -> Option<PrefixMatch> {
+    pub fn lookup(&mut self, prompt: PromptKey<'_>, route: SnapshotRoute) -> Option<PrefixMatch> {
+        if !prompt.valid() {
+            return None;
+        }
         self.drain_put_completions();
         let now = self.clock.now_unix_ms();
         self.expire(now);
-        if !prompt.is_empty() {
+        if !prompt.token_ids.is_empty() {
             self.trie
                 .observe(prompt, route, now, now.saturating_add(INITIAL_TTL_MS));
         }
@@ -700,7 +769,7 @@ impl AdaptivePrefixCache {
         self.drain_put_completions();
         let now = self.clock.now_unix_ms();
         self.expire(now);
-        let (route, token_ids) = self
+        let (route, token_ids, images) = self
             .resumes
             .get(response_id)
             .cloned()
@@ -708,7 +777,12 @@ impl AdaptivePrefixCache {
         if route != expected_route {
             return Err(ResumeLookupError::NotFound);
         }
-        let Some((node, length)) = self.trie.path(&token_ids, route).into_iter().last() else {
+        let Some((node, length)) = self
+            .trie
+            .path(PromptKey::new(&token_ids, &images), route)
+            .into_iter()
+            .last()
+        else {
             self.resumes.remove(response_id);
             return Err(ResumeLookupError::NotFound);
         };
@@ -773,23 +847,29 @@ impl AdaptivePrefixCache {
         );
         Ok(ResumeEntry {
             token_ids,
+            images,
             snapshot,
             metadata,
         })
     }
 
-    pub fn insert(&mut self, tokens: &[i32], snapshots: Vec<PromptSnapshot>, route: SnapshotRoute) {
+    pub fn insert(
+        &mut self,
+        tokens: PromptKey<'_>,
+        snapshots: Vec<PromptSnapshot>,
+        route: SnapshotRoute,
+    ) {
         self.insert_snapshots(tokens, snapshots, route, None);
     }
 
     pub fn insert_resume(
         &mut self,
-        tokens: &[i32],
+        tokens: PromptKey<'_>,
         snapshot: PromptSnapshot,
         route: SnapshotRoute,
         metadata: ResponseResumeMetadata,
     ) {
-        if let Err(error) = validate_resume_metadata(tokens, Some(&metadata)) {
+        if let Err(error) = validate_resume_metadata(tokens.token_ids, Some(&metadata)) {
             tracing::warn!(phase = "cache.persistence_error", error = %error);
             return;
         }
@@ -798,11 +878,14 @@ impl AdaptivePrefixCache {
 
     fn insert_snapshots(
         &mut self,
-        tokens: &[i32],
+        tokens: PromptKey<'_>,
         snapshots: Vec<PromptSnapshot>,
         route: SnapshotRoute,
         response_resume: Option<ResponseResumeMetadata>,
     ) {
+        if !tokens.valid() {
+            return;
+        }
         self.drain_put_completions();
         let now = self.clock.now_unix_ms();
         let filesystem_before = self.filesystem_bytes;
@@ -811,11 +894,13 @@ impl AdaptivePrefixCache {
         self.expire(now);
         for snapshot in snapshots {
             let token_len = snapshot.token_len();
-            if token_len == 0 || token_len > tokens.len() || !route.matches(&snapshot) {
+            if token_len == 0 || token_len > tokens.token_ids.len() || !route.matches(&snapshot) {
                 continue;
             }
-            let prefix = &tokens[..token_len];
-            let resume = (token_len == tokens.len())
+            let Some(prefix) = tokens.prefix(token_len) else {
+                continue;
+            };
+            let resume = (token_len == tokens.token_ids.len())
                 .then(|| response_resume.clone())
                 .flatten();
             let node = self.trie.ensure_node(prefix);
@@ -913,8 +998,10 @@ impl AdaptivePrefixCache {
                 };
             self.memory_bytes = self.memory_bytes.saturating_add(bytes);
             if let Some(resume) = resume.clone() {
-                self.resumes
-                    .insert(resume.response_id.clone(), (route, prefix.to_vec()));
+                self.resumes.insert(
+                    resume.response_id.clone(),
+                    (route, prefix.token_ids.to_vec(), prefix.images.to_vec()),
+                );
             }
             // MLX array handles are thread-bound and !Send, so materialize only after the
             // hot snapshot is installed, then hand portable bytes to the I/O thread.
@@ -941,7 +1028,8 @@ impl AdaptivePrefixCache {
                     key: key.clone(),
                     namespace: self.namespaces.get(route).to_string(),
                     route,
-                    token_ids: prefix.to_vec(),
+                    token_ids: prefix.token_ids.to_vec(),
+                    images: prefix.images.to_vec(),
                     portable,
                     reserved_bytes: bytes,
                     reservation: reservation.expect("portable publication reserved"),
@@ -1086,7 +1174,7 @@ impl AdaptivePrefixCache {
                     && entry_key(
                         self.namespaces.get(route),
                         route,
-                        &decoded.manifest.token_ids,
+                        PromptKey::new(&decoded.manifest.token_ids, &decoded.manifest.images),
                     ) == *key
             })
             .and_then(|(portable, _reservation)| codec::restore(portable).ok());
@@ -1147,7 +1235,7 @@ impl AdaptivePrefixCache {
                     && entry_key(
                         namespace,
                         decoded.manifest.route,
-                        &decoded.manifest.token_ids,
+                        PromptKey::new(&decoded.manifest.token_ids, &decoded.manifest.images),
                     ) == *key =>
             {
                 self.trie
@@ -1581,7 +1669,12 @@ fn io_loop(
                     entry
                         .map(|entry| {
                             let manifest = parse_manifest(&namespace, &entry.manifest)?;
-                            if entry_key(&namespace, manifest.route, &manifest.token_ids) != key {
+                            if entry_key(
+                                &namespace,
+                                manifest.route,
+                                PromptKey::new(&manifest.token_ids, &manifest.images),
+                            ) != key
+                            {
                                 return Err("prefetch entry digest mismatch".into());
                             }
                             let dense = manifest
@@ -1614,6 +1707,7 @@ fn io_loop(
                 route,
                 reserved_bytes,
                 token_ids,
+                images,
                 portable,
                 retention,
                 expires_at_unix_ms,
@@ -1624,7 +1718,7 @@ fn io_loop(
                 let result = encode_portable(
                     &namespace,
                     route,
-                    &token_ids,
+                    PromptKey::new(&token_ids, &images),
                     portable,
                     retention,
                     expires_at_unix_ms,
@@ -1661,6 +1755,7 @@ fn io_loop(
                 let _ = completion_tx.send(PutCompletion {
                     route,
                     token_ids,
+                    images,
                     key,
                     reserved_bytes,
                     publication_id,
