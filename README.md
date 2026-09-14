@@ -96,9 +96,9 @@ current build.
 ## Image inputs
 
 Vision-capable checkpoints accept image inputs with baseline, MTP, and DFlash2
-decoding. `--decoder auto` prefers an available DFlash2 drafter for unconstrained
-image requests, just as it does for text. DFlash2 verifies its proposals against
-the image-conditioned target; it does not fall back to text-only inference.
+decoding. `--decoder auto` prefers an available DFlash2 drafter for image and
+text requests, including structured output. DFlash2 verifies its proposals
+against the image-conditioned target; it does not fall back to text-only inference.
 
 Use `image_url` parts in user messages on `/v1/chat/completions`:
 
@@ -121,10 +121,15 @@ multiple images. PNG, JPEG, and WebP must be supplied as base64 data URIs;
 remote image URLs are not fetched. Limits are 16 images per request, 64 MiB of
 source bytes per image, and 128 MiB for the complete JSON request body.
 
-Requests containing images anywhere in the conversation do not use prefix
-snapshots or response continuation checkpoints.
-DFlash2 does not support token-constrained output; use baseline/MTP or automatic
-decoder selection for those requests.
+DFlash2 supports image-aware prefix caching in memory and on disk. Cache
+identity includes decoded image content, dimensions, order, and token spans;
+adding another image or conversation turn can reuse an earlier matching prefix.
+Reuse skips cached target-model prefill, not image validation or vision encoding.
+Baseline and MTP image requests still do not use prefix snapshots.
+
+Response continuation checkpoints remain limited to unconstrained text requests.
+Image and structured-output requests can reuse prefixes in new requests, but
+cannot resume an interrupted response through `resume_response_id`.
 
 Rust callers can submit `protocol::parse_chat` or `protocol::parse_responses`
 results directly to `Engine::submit`. Submission validates and decodes the current
@@ -135,6 +140,38 @@ which the HTTP handlers expose as a structured 400 response.
 OCR fixtures and the source-photo manifest are in `tests/fixtures/images`.
 The copyrighted Krispy Kreme and Yousuf Karsh photos are fetched locally rather
 than redistributed; see the manifest's source and rights information.
+
+## Structured output
+
+Baseline, MTP, and DFlash2 support JSON-object and JSON Schema constraints,
+including requests with images. Explicit `--decoder dflash` and automatic
+selection retain DFlash2 for constrained requests.
+
+Add `response_format` to a `/v1/chat/completions` request:
+
+```json
+{
+  "response_format": {
+    "type": "json_schema",
+    "json_schema": {
+      "name": "result",
+      "strict": true,
+      "schema": {
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+        "additionalProperties": false
+      }
+    }
+  }
+}
+```
+
+For `/v1/responses`, put `type`, `name`, `strict`, and `schema` directly under
+`text.format`. Both buffered and streaming endpoints enforce the constraints.
+An output-token limit can still stop generation before the JSON is complete;
+check the response's finish status. DFlash2 applies parser-forced token splices
+atomically and stops before a splice that cannot fit the remaining budget.
 
 ## Historical performance
 

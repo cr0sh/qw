@@ -297,6 +297,8 @@ pub struct BaselineGeneration {
 
 pub struct PreparedMultimodalPrefill {
     pub prompt_ids: Vec<i32>,
+    /// Expanded image-token spans in the order of the prepared images.
+    pub image_token_ranges: Vec<std::ops::Range<usize>>,
     input_embeddings: UniquePtr<MlxArray>,
     position_ids: UniquePtr<MlxArray>,
     rope_delta: i32,
@@ -373,18 +375,17 @@ pub enum Qwen35GenerationMode {
     Dflash2,
 }
 
-/// Resolve one request to an explicit decoder. `Automatic` prefers available,
-/// compatible DFlash2, then bundled MTP, then baseline. Explicit modes fail
-/// when the requested decoder is unavailable or incompatible.
+/// Resolve one request to an explicit decoder. `Automatic` prefers available
+/// DFlash2, then bundled MTP, then baseline. Explicit modes fail when the
+/// requested decoder is unavailable.
 pub fn select_qwen35_decoder(
     mode: Qwen35GenerationMode,
     mtp_available: bool,
     dflash2_available: bool,
-    dflash2_compatible: bool,
 ) -> std::result::Result<Qwen35GenerationMode, String> {
     match mode {
         Qwen35GenerationMode::Automatic => {
-            if dflash2_available && dflash2_compatible {
+            if dflash2_available {
                 Ok(Qwen35GenerationMode::Dflash2)
             } else if mtp_available {
                 Ok(Qwen35GenerationMode::Mtp)
@@ -399,9 +400,6 @@ pub fn select_qwen35_decoder(
         }
         Qwen35GenerationMode::Dflash2 if !dflash2_available => {
             Err("the DFlash2 draft checkpoint is unavailable".to_string())
-        }
-        Qwen35GenerationMode::Dflash2 if !dflash2_compatible => {
-            Err("DFlash2 supports only unconstrained generation".to_string())
         }
         Qwen35GenerationMode::Dflash2 => Ok(Qwen35GenerationMode::Dflash2),
     }
@@ -793,6 +791,7 @@ impl Qwen35Provider {
         );
         Ok(PreparedMultimodalPrefill {
             prompt_ids,
+            image_token_ranges: expansion.image_token_ranges,
             input_embeddings,
             position_ids,
             rope_delta: positions.rope_delta,
@@ -1243,6 +1242,7 @@ impl Qwen35Provider {
             &[],
             false,
             None,
+            None,
             on_delta,
         )
         .map(|(generation, stats)| {
@@ -1267,6 +1267,7 @@ impl Qwen35Provider {
         prefix_reuse: Option<Dflash2PrefixReuse<'_>>,
         checkpoint_token_lengths: &[usize],
         capture_final_snapshot: bool,
+        constraint: Option<&mut dyn TokenConstraint>,
         on_delta: F,
     ) -> Result<BaselineGeneration> {
         self.generate_dflash2_cached_generation(
@@ -1278,12 +1279,13 @@ impl Qwen35Provider {
             checkpoint_token_lengths,
             capture_final_snapshot,
             None,
+            constraint,
             on_delta,
         )
         .map(|(generation, _)| generation)
     }
 
-    /// Image requests use DFlash2 without prefix reuse or snapshot publication.
+    /// Generate from image-conditioned embeddings with reusable target prefixes.
     #[cfg(any(feature = "dflash2", test))]
     pub fn generate_dflash2_multimodal_streaming<F: FnMut(&str) -> bool>(
         &mut self,
@@ -1291,6 +1293,10 @@ impl Qwen35Provider {
         max_tokens: usize,
         sampling: &SamplingConfig,
         draft_dir: &Path,
+        prefix_reuse: Option<Dflash2PrefixReuse<'_>>,
+        checkpoint_token_lengths: &[usize],
+        capture_final_snapshot: bool,
+        constraint: Option<&mut dyn TokenConstraint>,
         on_delta: F,
     ) -> Result<BaselineGeneration> {
         self.generate_dflash2_cached_generation(
@@ -1298,14 +1304,15 @@ impl Qwen35Provider {
             max_tokens,
             sampling,
             draft_dir,
-            None,
-            &[],
-            false,
+            prefix_reuse,
+            checkpoint_token_lengths,
+            capture_final_snapshot,
             Some((
                 &prefill.input_embeddings,
                 &prefill.position_ids,
                 prefill.rope_delta,
             )),
+            constraint,
             on_delta,
         )
         .map(|(generation, _)| generation)
@@ -1322,6 +1329,7 @@ impl Qwen35Provider {
         checkpoint_token_lengths: &[usize],
         capture_final_snapshot: bool,
         multimodal: Option<(&MlxArray, &MlxArray, i32)>,
+        constraint: Option<&mut dyn TokenConstraint>,
         mut on_delta: F,
     ) -> Result<(BaselineGeneration, Dflash2GenerationStats)> {
         self.validate_context_budget(prompt_ids.len(), max_tokens)?;
@@ -1335,6 +1343,7 @@ impl Qwen35Provider {
             .dflash2_generator
             .as_mut()
             .expect("DFlash2 generator was initialized");
+        let buffer_output = constraint.is_some();
         let mut decoder = IncrementalTextDecoder::new(&self.tokenizer);
         let mut callback_active = true;
         let mut decode_error = None;
@@ -1348,14 +1357,21 @@ impl Qwen35Provider {
                 checkpoint_token_lengths,
                 capture_final_snapshot,
                 multimodal,
-                |token_id| match decoder.push(token_id) {
-                    Ok(delta) => {
-                        callback_active = on_delta(&delta);
-                        callback_active
+                constraint,
+                |token_id| {
+                    if buffer_output {
+                        callback_active = on_delta("");
+                        return callback_active;
                     }
-                    Err(error) => {
-                        decode_error = Some(error);
-                        false
+                    match decoder.push(token_id) {
+                        Ok(delta) => {
+                            callback_active = on_delta(&delta);
+                            callback_active
+                        }
+                        Err(error) => {
+                            decode_error = Some(error);
+                            false
+                        }
                     }
                 },
             )
@@ -1364,9 +1380,19 @@ impl Qwen35Provider {
         if let Some(error) = decode_error {
             return Err(error);
         }
-        let final_delta = decoder.finish()?;
-        if callback_active && !final_delta.is_empty() {
-            let _ = on_delta(&final_delta);
+        if buffer_output {
+            for &token_id in &generation.token_ids {
+                let _ = decoder.push(token_id)?;
+            }
+            let _ = decoder.finish()?;
+            if callback_active && !decoder.emitted.is_empty() {
+                let _ = on_delta(&decoder.emitted);
+            }
+        } else {
+            let final_delta = decoder.finish()?;
+            if callback_active && !final_delta.is_empty() {
+                let _ = on_delta(&final_delta);
+            }
         }
         let completion_tokens = generation.token_ids.len();
         let stats = generation.stats;
@@ -1610,9 +1636,8 @@ impl Qwen35Provider {
         let (prompt_ids, sampling) = self.prepare_generation(request)?;
         let dflash2_available =
             cfg!(feature = "dflash2") && dflash2_draft_dir.is_some_and(Path::is_dir);
-        let decoder =
-            select_qwen35_decoder(mode, self.mtp_generator.is_some(), dflash2_available, true)
-                .map_err(anyhow::Error::msg)?;
+        let decoder = select_qwen35_decoder(mode, self.mtp_generator.is_some(), dflash2_available)
+            .map_err(anyhow::Error::msg)?;
         debug!(
             phase = "decoder.selected",
             decoder = ?decoder,
@@ -1668,6 +1693,7 @@ impl Qwen35Provider {
                         None,
                         &[],
                         false,
+                        None,
                         on_delta,
                     )?
                 }
@@ -2148,32 +2174,15 @@ mod tests {
     #[test]
     fn decoder_preference_and_explicit_unavailability() {
         use Qwen35GenerationMode::*;
-        assert_eq!(
-            select_qwen35_decoder(Automatic, true, true, true),
-            Ok(Dflash2)
-        );
-        assert_eq!(select_qwen35_decoder(Automatic, true, false, true), Ok(Mtp));
-        assert_eq!(select_qwen35_decoder(Automatic, true, true, false), Ok(Mtp));
-        assert_eq!(
-            select_qwen35_decoder(Automatic, false, true, false),
-            Ok(Baseline)
-        );
-        assert_eq!(
-            select_qwen35_decoder(Automatic, false, false, true),
-            Ok(Baseline)
-        );
-        assert_eq!(
-            select_qwen35_decoder(Baseline, true, true, true),
-            Ok(Baseline)
-        );
-        assert_eq!(select_qwen35_decoder(Mtp, true, true, true), Ok(Mtp));
-        assert_eq!(
-            select_qwen35_decoder(Dflash2, false, true, true),
-            Ok(Dflash2)
-        );
-        assert!(select_qwen35_decoder(Mtp, false, true, true).is_err());
-        assert!(select_qwen35_decoder(Dflash2, true, false, true).is_err());
-        assert!(select_qwen35_decoder(Dflash2, true, true, false).is_err());
+        assert_eq!(select_qwen35_decoder(Automatic, true, true), Ok(Dflash2));
+        assert_eq!(select_qwen35_decoder(Automatic, true, false), Ok(Mtp));
+        assert_eq!(select_qwen35_decoder(Automatic, false, true), Ok(Dflash2));
+        assert_eq!(select_qwen35_decoder(Automatic, false, false), Ok(Baseline));
+        assert_eq!(select_qwen35_decoder(Baseline, true, true), Ok(Baseline));
+        assert_eq!(select_qwen35_decoder(Mtp, true, true), Ok(Mtp));
+        assert_eq!(select_qwen35_decoder(Dflash2, false, true), Ok(Dflash2));
+        assert!(select_qwen35_decoder(Mtp, false, true).is_err());
+        assert!(select_qwen35_decoder(Dflash2, true, false).is_err());
     }
 
     #[test]
