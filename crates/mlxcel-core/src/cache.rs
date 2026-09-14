@@ -3584,19 +3584,10 @@ impl KVCache {
                     &[0, 0, row, 0],
                     &[q_shape[0], q_shape[1], row + 1, q_shape[3]],
                 );
-                let Some(output) = self.turbo4_fused_attention_prefix(
-                    &q_row,
-                    old_offset + row + 1,
-                    scale,
-                    true,
-                ) else {
-                    return self.turbo4_dequant_sdpa_prefix(
-                        q,
-                        self.offset,
-                        scale,
-                        None,
-                        true,
-                    );
+                let Some(output) =
+                    self.turbo4_fused_attention_prefix(&q_row, old_offset + row + 1, scale, true)
+                else {
+                    return self.turbo4_dequant_sdpa_prefix(q, self.offset, scale, None, true);
                 };
                 rows.push(output);
             }
@@ -4785,7 +4776,7 @@ impl RotatingKVCache {
                 &[batch, heads, 1, value_head_dim],
             );
 
-            self.offset = 1;
+            self.offset += 1;
             self.idx = 1;
             self.keys = Some(ffi::contiguous(&k, false));
             self.values = Some(ffi::contiguous(&v, false));
