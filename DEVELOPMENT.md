@@ -332,6 +332,131 @@ uses bundled MTP. Both variants use the same fixture filenames with different
 identities, so pair baseline/candidate runs within one variant before switching,
 and preserve the fixture inputs and `BENCHMARK_RESULT` rows.
 
+## DFlash2 optimization trials — 2026-09-12
+
+Baseline runtime: `aad83fe7928e5f9eee065d8c71538f06f832ae54` (documentation
+base `980fe9561b4176f136e800e88aac8378a1e9c253`). Accepted implementation:
+`db04cb2cf094fe0be18600a21c724f6fbfc13033`. Hardware and checkpoint are the
+README benchmark configuration. Each run used one warmup, three timed
+repetitions, and the existing deterministic-output assertions.
+
+Only the five-row, head-dimension-256 Turbo4 attention path now stages 32
+tokens instead of 16. Four-row verification retains 16-token stages; per-head
+arithmetic, block decomposition, quantization, and decoder selection are
+unchanged. The regression checks bitwise grouped-versus-rowwise attention
+parity for Qwen's 24-query/4-KV-head geometry at ragged long prefixes and a
+65,536-token reduction-tier crossing.
+
+| 64k trial | Decode tokens/s | Decision |
+|---|---:|---|
+| Baseline, adaptive ABBA endpoints | 36.446 / 36.271 | Reference |
+| 32-token stages only at width 5, adaptive ABBA middle runs | 36.782 / 36.915 | Accepted; pooled improvement about 1.35% |
+| Two heads per SIMDgroup instead of three | 33.694 | Rejected |
+| Six heads per SIMDgroup instead of three | 28.268 | Rejected |
+| Eight-token stages | 35.921 | Rejected |
+| Partial fusion of compatible GDN auxiliary projections | 36.561 / 36.635 | No repeatable 64k gain; not integrated |
+
+Using 32-token stages at both widths initially improved fixed-width-5 ABBA
+throughput from 36.603/36.682 to 37.086/37.012 tokens/s, but regressed
+fixed-width-4 from 36.552 to 36.190. This motivated the width-specific
+specialization, not a change to the adaptive width policy. Disabling grouped
+attention measured 24.867 tokens/s and is not an optimization.
+
+The accepted full suite measured prefill 253.941/232.541/154.739 and decode
+56.798/54.910/36.948 tokens/s for fresh/10k/64k. These modest gains do not
+establish a practical route to the idealized bandwidth ceiling. Draft/verify
+profile intervals are asynchronous wall-time accounting: verification drains
+pending draft GPU work, so they are not isolated GPU phase measurements.
+
+Local build logs, benchmark rows, fixture/model hashes, and source provenance
+are retained under `target/dflash2-opt-20260912-151310/`. Rejected candidates
+were not integrated; their trial branches and worktrees were removed.
+
+## DFlash2 deep bottleneck investigation
+
+The follow-up investigation did **not** reach the 60-token/s target. No runtime
+candidate from this investigation was integrated. The earlier bandwidth-only
+roofline must not be read as a practical throughput prediction.
+
+All candidates forked documentation base `5a4cd8a`, retaining the accepted
+`db04cb2` runtime. The same cached 64k fixture, default adaptive width policy,
+one warmup, three timed repetitions, and exact deterministic-output assertions
+were used. GPU commands were serialized through `gpu-lock`; Cargo builds used
+isolated artifact directories and the shared build lock.
+
+| 64k experiment | Decode tokens/s | Decision |
+|---|---:|---|
+| Accepted-runtime contemporaneous control | 36.698 | Reference |
+| 512 attention partitions above 32k (`35708f3`) | 36.619 | No improvement |
+| Blocking draft evaluation (`c0bcdfd`) | 35.687 | Rejected |
+| Detached committed hidden buffer (`2f1756f`) | 36.519 | No improvement |
+| Existing dequantized native SDPA control | 28.192 | Rejected |
+| Packed SIMDgroup-matrix QK/PV (`c3eda55`) | 24.097 | Rejected |
+| Dequantized QK/PV with GQA folded into 24/30 query rows (`b385df0`) | 21.575 | Rejected |
+
+The two dequantized controls set `MLXCEL_TURBO4_FUSED_ATTENTION=0`; other rows
+used default dispatch. All listed runs passed the existing output assertions.
+This is fixture-level correctness evidence, not proof of arbitrary-input
+numerical equivalence.
+
+### Attribution and the required latency reduction
+
+The accepted-runtime control generated 381 timed tokens in 10.382 seconds,
+over 88 verification rounds. Its asynchronous verification interval accounted
+for 9.351 seconds (90.1% of decode). Reaching 60 tokens/s requires completing
+the same work in 6.350 seconds: a **38.8% total latency reduction**. Holding
+other intervals and the round schedule fixed would require reducing the
+verification interval from 106.27 to 60.45 ms/round, or **43.1%**. This interval
+also drains pending draft GPU work, so it is not a pure target-GPU measurement.
+
+A separate diagnostic drained inputs and evaluated outputs at every attention
+and MLP sublayer for one five-row verification round. Summed wall times were:
+
+| Sublayers | Synchronized time |
+|---|---:|
+| 48 GDN sublayers, including their projections | 31.410 ms |
+| 16 full-attention sublayers, including their projections | 44.416 ms |
+| 64 MLP sublayers | 48.869 ms |
+
+These measurements include added synchronization overhead and are not GPU
+counters or an additive decomposition of normal asynchronous decode latency.
+Two Metal System Trace attempts failed to finalize after the target exited;
+neither supplied usable hardware attribution.
+
+### Quantized projection experiments
+
+The target's actual affine sidecars and runtime activations are FP16, despite
+its config advertising BF16. Real-weight probes therefore used FP16 inputs,
+affine group size 64, and the checkpoint's 4/5-bit packed weights. The initial
+BF16-input probe promoted outputs to FP32 and was discarded as unrepresentative.
+
+MLX already shares weight reads across four/five verification rows through
+its wide affine QMV. Padding to 16/32 rows to force matrix dispatch was slower.
+Three additional kernels were implemented and exercised on the actual fused
+MLP gate/up, MLP down, GDN QKV/output, and vocabulary projection weights:
+
+- An 8-by-32 SIMDgroup matrix tile with in-kernel dequantization.
+- Wide vector kernels using 16 and 32 K lanes rather than the native mapping.
+
+None beat stock MLX across the tested four/five-row cases. For five-row MLP
+down projection, stock measured 343/342 microseconds before/after the trials,
+versus 1,232/478/655 microseconds respectively. For the vocabulary projection,
+stock measured 2,663/2,701 microseconds versus 5,643/3,145/4,861. Probe argmaxes
+matched, but changed accumulation orders were not bitwise equivalent. Slower
+projection candidates were not routed into the full decoder.
+
+The measurements establish substantial projection cost alongside attention;
+they do not establish that 60 tokens/s is impossible, or that it is achievable
+with another kernel. No model precision reduction, context truncation, or
+timing-boundary change was used to manufacture a gain.
+
+Logs, source/binary hashes, numerical probe rows, and the latency calculation
+are retained in `target/dflash2-deep-20260912/results-and-provenance.json` and
+its neighboring logs. Experimental branches and worktrees were removed without
+integrating their sources. The later physical-counter measurement artifacts
+remain under `target/dflash2-physical-20260912/`; diagnostic branches and
+worktrees were also removed.
+
 ## GPU serialization
 
 GPU tests, benchmarks, and smoke commands from concurrent worktrees must use

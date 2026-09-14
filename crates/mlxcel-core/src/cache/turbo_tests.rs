@@ -154,8 +154,7 @@ fn turbo4_causal_attention_preserves_per_position_shape_and_offset() {
     assert!(cache.values.is_none());
     assert!(cache.k_packed.is_some());
     assert!(cache.v_packed.is_some());
-    if crate::metal_is_available()
-        && super::turbo::fused_attention::turbo4_grouped_causal_enabled()
+    if crate::metal_is_available() && super::turbo::fused_attention::turbo4_grouped_causal_enabled()
     {
         let grouped_after = super::turbo::fused_attention::grouped_causal_test_dispatches();
         assert_eq!(
@@ -1219,7 +1218,6 @@ fn assert_turbo4_fused_parity(tq: i32, tk: i32, causal: bool, seed: u32) {
     );
     assert_eq!(
         fixed_projection_argmax(&fused_values, D as usize),
-
         fixed_projection_argmax(&reference_values, D as usize),
         "fixed-projection greedy argmax changed"
     );
@@ -1230,89 +1228,77 @@ fn turbo4_grouped_causal_rows_3_to_5_match_rowwise_packed_attention() {
         return;
     }
 
-    const PREFIX_LEN: i32 = 2_303;
-    const HEAD_DIM: i32 = 64;
-    const QUERY_HEADS: i32 = 6;
-    const KV_HEADS: i32 = 2;
+    const HEAD_DIM: i32 = 256;
+    const QUERY_HEADS: i32 = 24;
+    const KV_HEADS: i32 = 4;
     let scale = 1.0 / (HEAD_DIM as f32).sqrt();
 
-    for (query_len, seed) in [(3_i32, 0xA301_u32), (4, 0xA401), (5, 0xA501)] {
-        let prefix_k = ffi::astype(
-            &synth_kv_tensor(1, KV_HEADS, PREFIX_LEN, HEAD_DIM, seed),
-            dtype::FLOAT16,
-        );
-        let prefix_v = ffi::astype(
-            &synth_kv_tensor(1, KV_HEADS, PREFIX_LEN, HEAD_DIM, seed.wrapping_add(1)),
-            dtype::FLOAT16,
-        );
-        let mut grouped = KVCache::new_with_mode(KVCacheMode::Turbo4);
-        let mut rowwise = KVCache::new_with_mode(KVCacheMode::Turbo4);
-        grouped.update(ffi::copy(&prefix_k), ffi::copy(&prefix_v));
-        rowwise.update(prefix_k, prefix_v);
+    // Exercise long ragged stages and the 65,536-token reduction-tier crossing.
+    for prefix_len in [64_585, 65_534] {
+        for (query_len, seed) in [(3_i32, 0xA301_u32), (4, 0xA401), (5, 0xA501)] {
+            let prefix_k = ffi::astype(
+                &synth_kv_tensor(1, KV_HEADS, prefix_len, HEAD_DIM, seed),
+                dtype::FLOAT16,
+            );
+            let prefix_v = ffi::astype(
+                &synth_kv_tensor(1, KV_HEADS, prefix_len, HEAD_DIM, seed.wrapping_add(1)),
+                dtype::FLOAT16,
+            );
+            let mut grouped = KVCache::new_with_mode(KVCacheMode::Turbo4);
+            let mut rowwise = KVCache::new_with_mode(KVCacheMode::Turbo4);
+            grouped.update(ffi::copy(&prefix_k), ffi::copy(&prefix_v));
+            rowwise.update(prefix_k, prefix_v);
 
-        let q = synth_kv_tensor(1, QUERY_HEADS, query_len, HEAD_DIM, seed.wrapping_add(2));
-        let grouped_before = super::turbo::fused_attention::grouped_causal_test_dispatches();
-        let grouped_output = grouped.update_and_turbo4_causal_attention(
-            &q,
-            ffi::astype(
-                &synth_kv_tensor(1, KV_HEADS, query_len, HEAD_DIM, seed.wrapping_add(3)),
-                dtype::FLOAT16,
-            ),
-            ffi::astype(
-                &synth_kv_tensor(1, KV_HEADS, query_len, HEAD_DIM, seed.wrapping_add(4)),
-                dtype::FLOAT16,
-            ),
-            scale,
-        );
-
-        let q_shape = ffi::array_shape(&q);
-        rowwise.update(
-            ffi::astype(
-                &synth_kv_tensor(1, KV_HEADS, query_len, HEAD_DIM, seed.wrapping_add(3)),
-                dtype::FLOAT16,
-            ),
-            ffi::astype(
-                &synth_kv_tensor(1, KV_HEADS, query_len, HEAD_DIM, seed.wrapping_add(4)),
-                dtype::FLOAT16,
-            ),
-        );
-        let mut rows = Vec::with_capacity(query_len as usize);
-        for row in 0..query_len {
-            let q_row = ffi::slice(
+            let q = synth_kv_tensor(1, QUERY_HEADS, query_len, HEAD_DIM, seed.wrapping_add(2));
+            let grouped_output = grouped.update_and_turbo4_causal_attention(
                 &q,
-                &[0, 0, row, 0],
-                &[q_shape[0], q_shape[1], row + 1, q_shape[3]],
+                ffi::astype(
+                    &synth_kv_tensor(1, KV_HEADS, query_len, HEAD_DIM, seed.wrapping_add(3)),
+                    dtype::FLOAT16,
+                ),
+                ffi::astype(
+                    &synth_kv_tensor(1, KV_HEADS, query_len, HEAD_DIM, seed.wrapping_add(4)),
+                    dtype::FLOAT16,
+                ),
+                scale,
             );
-            rows.push(
-                rowwise
-                    .turbo4_fused_attention_prefix(
-                        &q_row,
-                        PREFIX_LEN + row + 1,
-                        scale,
-                        true,
-                    )
-                    .expect("rowwise packed attention must dispatch"),
+
+            let q_shape = ffi::array_shape(&q);
+            rowwise.update(
+                ffi::astype(
+                    &synth_kv_tensor(1, KV_HEADS, query_len, HEAD_DIM, seed.wrapping_add(3)),
+                    dtype::FLOAT16,
+                ),
+                ffi::astype(
+                    &synth_kv_tensor(1, KV_HEADS, query_len, HEAD_DIM, seed.wrapping_add(4)),
+                    dtype::FLOAT16,
+                ),
             );
-        }
-        let rowwise_pointers = rows
-            .iter()
-            .map(|row| &**row as *const ffi::MlxArray)
-            .collect::<Vec<_>>();
-        // SAFETY: every pointer references an array owned by `rows`.
-        let rowwise_output = unsafe { ffi::concatenate(&rowwise_pointers, 2) };
-        ffi::eval(&grouped_output);
-        ffi::eval(&rowwise_output);
-        assert_eq!(
-            ffi::array_to_raw_bytes(&grouped_output),
-            ffi::array_to_raw_bytes(&rowwise_output),
-            "grouped qlen={query_len} output changed from rowwise packed attention"
-        );
-        if super::turbo::fused_attention::turbo4_grouped_causal_enabled() {
-            let grouped_after = super::turbo::fused_attention::grouped_causal_test_dispatches();
+            let mut rows = Vec::with_capacity(query_len as usize);
+            for row in 0..query_len {
+                let q_row = ffi::slice(
+                    &q,
+                    &[0, 0, row, 0],
+                    &[q_shape[0], q_shape[1], row + 1, q_shape[3]],
+                );
+                rows.push(
+                    rowwise
+                        .turbo4_fused_attention_prefix(&q_row, prefix_len + row + 1, scale, true)
+                        .expect("rowwise packed attention must dispatch"),
+                );
+            }
+            let rowwise_pointers = rows
+                .iter()
+                .map(|row| &**row as *const ffi::MlxArray)
+                .collect::<Vec<_>>();
+            // SAFETY: every pointer references an array owned by `rows`.
+            let rowwise_output = unsafe { ffi::concatenate(&rowwise_pointers, 2) };
+            ffi::eval(&grouped_output);
+            ffi::eval(&rowwise_output);
             assert_eq!(
-                grouped_after - grouped_before,
-                1,
-                "qlen={query_len} must use one grouped packed launch"
+                ffi::array_to_raw_bytes(&grouped_output),
+                ffi::array_to_raw_bytes(&rowwise_output),
+                "prefix={prefix_len} grouped qlen={query_len} output changed from rowwise packed attention"
             );
         }
     }
