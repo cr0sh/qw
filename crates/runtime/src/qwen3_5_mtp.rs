@@ -251,9 +251,9 @@ pub struct MtpPrefixReuse<'a> {
     pub continuation_token: Option<i32>,
 }
 
-struct MtpProposal {
-    token: i32,
-    proposal_probs: UniquePtr<MlxArray>,
+pub(crate) struct MtpProposal {
+    pub(crate) token: i32,
+    pub(crate) proposal_probs: UniquePtr<MlxArray>,
 }
 
 struct Qwen35MtpDraftState {
@@ -1352,15 +1352,15 @@ fn stochastic_walk(
     }
 }
 
-struct ConstrainedWalk {
-    accepted: usize,
-    new_tokens: Vec<i32>,
-    output: Vec<i32>,
-    rebuild: bool,
-    stop_reason: Option<GenerationStopReason>,
+pub(crate) struct ConstrainedWalk {
+    pub(crate) accepted: usize,
+    pub(crate) new_tokens: Vec<i32>,
+    pub(crate) output: Vec<i32>,
+    pub(crate) rebuild: bool,
+    pub(crate) stop_reason: Option<GenerationStopReason>,
 }
 #[allow(clippy::too_many_arguments)]
-fn constrained_initial_step(
+pub(crate) fn constrained_initial_step(
     logits: &MlxArray,
     sampling: &SamplingConfig,
     prompt_tokens: &[i32],
@@ -1479,7 +1479,7 @@ fn apply_walk_splice(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn constrained_greedy_walk(
+pub(crate) fn constrained_greedy_walk(
     draft_tokens: &[i32],
     verify_logits: &MlxArray,
     sampling: &SamplingConfig,
@@ -1571,7 +1571,7 @@ fn constrained_greedy_walk(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn constrained_stochastic_walk(
+pub(crate) fn constrained_stochastic_walk(
     proposals: &[MtpProposal],
     verify_logits: &MlxArray,
     sampling: &SamplingConfig,

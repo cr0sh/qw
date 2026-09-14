@@ -2114,6 +2114,56 @@ fn stochastic_dflash2_walk(
     (walk, draft_tokens)
 }
 
+fn expand_dflash2_proposals(
+    proposal: &SelectorOutput,
+    tokens: &[i32],
+    vocab: usize,
+) -> Vec<crate::qwen3_5_mtp::MtpProposal> {
+    let shape = mlxcel_core::array_shape(&proposal.candidates);
+    tokens.iter().enumerate().map(|(position, &token)| {
+        let row = position as i32;
+        let ids = mlxcel_core::slice(
+            &proposal.candidates, &[0, row, 0], &[1, row + 1, shape[2]],
+        );
+        let ids = mlxcel_core::reshape(&ids, &[1, shape[2]]);
+        crate::qwen3_5_mtp::MtpProposal {
+            token,
+            // q is exactly the distribution used by the selector, not a
+            // grammar-renormalized approximation of that distribution.
+            proposal_probs: mlxcel_core::put_along_axis(
+                &mlxcel_core::zeros(&[1, vocab as i32], mlxcel_core::dtype::FLOAT32),
+                &ids, &proposal.proposal_probs[position], -1,
+            ),
+        }
+    }).collect()
+}
+
+/// A parser splice is atomic: if it does not fit the remaining output budget,
+/// stop before the transition rather than truncating tokens behind the parser.
+fn finish_dflash_constraint_transaction(
+    constraint: &mut dyn mlxcel_core::generate::TokenConstraint,
+    result: Result<crate::qwen3_5_mtp::ConstrainedWalk, String>,
+    max_tokens: usize,
+) -> Result<Option<crate::qwen3_5_mtp::ConstrainedWalk>, String> {
+    match result {
+        Ok(walk) if walk.output.len() <= max_tokens => {
+            if let Err(error) = constraint.commit_transaction() {
+                constraint.rollback_transaction();
+                return Err(error);
+            }
+            Ok(Some(walk))
+        }
+        Ok(_) => {
+            constraint.rollback_transaction();
+            Ok(None)
+        }
+        Err(error) => {
+            constraint.rollback_transaction();
+            Err(error)
+        }
+    }
+}
+
 /// DFlash2 generation driver: prefill → speculative draft/verify rounds.
 ///
 /// B=1 exact target sampling: greedy comparison for deterministic samplers,
@@ -2150,6 +2200,210 @@ impl Qwen35Dflash2Generator {
             calibration,
             target_layer_ids: config.target_layer_ids.clone(),
             hidden_limit,
+        })
+    }
+
+    /// Constrained verification shares MTP's parser transitions, but keeps the
+    /// DFlash block proposal and its original (unmasked) proposal distribution.
+    fn generate_constrained<F: FnMut(i32) -> bool>(
+        &mut self,
+        target: &Qwen35Model,
+        prompt: &[i32],
+        max_tokens: usize,
+        sampling: &mlxcel_core::generate::SamplingConfig,
+        eos: &[i32],
+        constraint: &mut dyn mlxcel_core::generate::TokenConstraint,
+        prompt_hidden: UniquePtr<MlxArray>,
+        prompt_logits: UniquePtr<MlxArray>,
+        prompt_snapshots: Vec<Dflash2PromptSnapshot>,
+        cached_tokens: usize,
+        capture_final_snapshot: bool,
+        prefill_time: Duration,
+        mut on_token: F,
+    ) -> Result<Dflash2Generation, String> {
+        use crate::qwen3_5_mtp::{
+            constrained_greedy_walk, constrained_initial_step, constrained_stochastic_walk,
+        };
+        let base = Dflash2PromptSnapshot::capture(
+            target, prompt.len(), &prompt_hidden, &prompt_logits, prompt_snapshots.last(),
+        )?;
+        let mut hidden = mlxcel_core::share(&base.hidden_concat);
+        let mut window = mlxcel_core::share(&base.hidden_concat);
+        let mut logits = mlxcel_core::share(&base.continuation_logits);
+        let mut output = Vec::with_capacity(max_tokens);
+        let mut pending = None;
+        let mut committed = prompt.len();
+        let mut stats = Dflash2GenerationStats { prefill_time, ..Default::default() };
+        let decode_start = Instant::now();
+        let mut stop = GenerationStopReason::MaxTokens;
+        self.caches = self.model.make_cache();
+        let offset = prompt.len() - mlxcel_core::array_shape(&hidden)[1] as usize;
+        for cache in &mut self.caches {
+            match cache {
+                DFlash2KVCache::Full(cache) => cache.offset = offset as i32,
+                DFlash2KVCache::Sliding(cache) => cache.offset = offset as i32,
+            }
+        }
+        while output.len() < max_tokens {
+            let mut verify_state = None;
+            let walk_result = if let Some(anchor) = pending {
+                let policy = self.calibration.policy(prompt.len() + output.len());
+                let width = context_bounded_verify_width(
+                    policy.width,
+                    target.config.max_position_embeddings.min(self.model.config.max_position_embeddings),
+                    committed,
+                );
+                let mut block = vec![self.model.config.mask_token_id; width];
+                block[0] = anchor;
+                let input = mlxcel_core::from_slice_i32(&block, &[1, width as i32]);
+                let draft_start = Instant::now();
+                let proposal = self.model.propose(
+                    &input, Some(&hidden), &mut self.caches, target,
+                    policy.selector_edge_scale, sampling,
+                )?;
+                stats.draft_time += draft_start.elapsed();
+                let anchor = mlxcel_core::slice(&input, &[0, 0], &[1, 1]);
+                let input = mlxcel_core::concatenate(&anchor, &proposal.path, 1);
+                let verify_start = Instant::now();
+                let verify = target.forward_dflash_verify(&input, &self.target_layer_ids);
+                stats.target_forward_calls += 1;
+                stats.speculative_rounds += 1;
+                mlxcel_core::eval(&proposal.path);
+                let tokens = mlxcel_core::array_evaluated_bytes(&proposal.path)
+                    .chunks_exact(4)
+                    .map(|bytes| i32::from_ne_bytes(bytes.try_into().expect("token bytes")))
+                    .collect::<Vec<_>>();
+                // Reserve one output position for the correction/bonus. This
+                // lets atomic splices be checked before committing the parser.
+                let count = tokens.len().min(max_tokens - output.len() - 1);
+                constraint.begin_transaction()?;
+                let result = if proposal.proposal_probs.is_empty() {
+                    constrained_greedy_walk(
+                        &tokens[..count], &verify.logits, sampling, prompt, &output,
+                        eos, usize::MAX, constraint,
+                    )
+                } else {
+                    let proposals = expand_dflash2_proposals(&proposal, &tokens[..count], target.vocab_size());
+                    constrained_stochastic_walk(
+                        &proposals, &verify.logits, sampling, prompt, &output,
+                        eos, usize::MAX, constraint,
+                    )
+                };
+                stats.target_verify_time += verify_start.elapsed();
+                if let Ok(walk) = &result {
+                    stats.record_round(policy, width, walk.accepted, tokens.len());
+                }
+                verify_state = Some((verify, width));
+                result
+            } else {
+                constraint.begin_transaction()?;
+                constrained_initial_step(
+                    &logits, sampling, prompt, &output, eos, usize::MAX, constraint,
+                )
+            };
+            let walk = match finish_dflash_constraint_transaction(constraint, walk_result, max_tokens)? {
+                Some(walk) => walk,
+                None => {
+                    // An atomic parser splice cannot be partially committed.
+                    // Restore the already-published sequence before stopping.
+                    target.restore_sequence_state(SequenceId::from_raw(0), &base.target)?;
+                    window = mlxcel_core::share(&base.hidden_concat);
+                    logits = mlxcel_core::share(&base.continuation_logits);
+                    if !output.is_empty() {
+                        let input = mlxcel_core::from_slice_i32(&output, &[1, output.len() as i32]);
+                        let replay = target.forward_dflash_continuation(
+                            &input, &self.target_layer_ids, self.hidden_limit,
+                        )?;
+                        window = merge_hidden_context(&window, &replay.hidden_concat, self.hidden_limit);
+                        logits = replay.first_logits;
+                        stats.target_forward_calls += 1;
+                    }
+                    committed = prompt.len() + output.len();
+                    break;
+                }
+            };
+            let previous_len = output.len();
+            let common = output.iter().zip(&walk.output).take_while(|(a, b)| a == b).count();
+            let mut cancelled = false;
+            // The provider buffers constrained text. Finish this transaction's
+            // accepted output even if cancellation arrives midway through it.
+            for &token in &walk.output[common..] {
+                if !on_token(token) {
+                    cancelled = true;
+                }
+            }
+            output = walk.output;
+            let reason = if cancelled {
+                Some(GenerationStopReason::CallbackCancelled)
+            } else {
+                walk.stop_reason.or_else(|| (output.len() == max_tokens).then_some(GenerationStopReason::MaxTokens))
+            };
+            if walk.rebuild {
+                // Recurrent rows cannot be rewound arbitrarily. Replay only
+                // generated text from an immutable image-aware prompt boundary.
+                target.restore_sequence_state(SequenceId::from_raw(0), &base.target)?;
+                window = mlxcel_core::share(&base.hidden_concat);
+                logits = mlxcel_core::share(&base.continuation_logits);
+                if !output.is_empty() {
+                    let input = mlxcel_core::from_slice_i32(&output, &[1, output.len() as i32]);
+                    let replay = target.forward_dflash_continuation(
+                        &input, &self.target_layer_ids, self.hidden_limit,
+                    )?;
+                    window = merge_hidden_context(&window, &replay.hidden_concat, self.hidden_limit);
+                    logits = replay.first_logits;
+                    stats.target_forward_calls += 1;
+                }
+                window = materialize_detached(window);
+                hidden = mlxcel_core::share(&window);
+                committed = prompt.len() + output.len();
+                pending = None;
+                self.caches = self.model.make_cache();
+                let offset = committed - mlxcel_core::array_shape(&hidden)[1] as usize;
+                for cache in &mut self.caches {
+                    match cache {
+                        DFlash2KVCache::Full(cache) => cache.offset = offset as i32,
+                        DFlash2KVCache::Sliding(cache) => cache.offset = offset as i32,
+                    }
+                }
+            } else if let Some((verify, width)) = verify_state {
+                let rows = committed_dflash2_rows(walk.accepted, output.len() - previous_len);
+                if rows < width {
+                    target.rollback_mtp_verify(&verify.gdn_states, rows - 1, width, false);
+                }
+                committed += rows;
+                hidden = concatenate_hiddens(&verify.hidden_by_layer, rows);
+                window = materialize_detached(merge_hidden_context(&window, &hidden, self.hidden_limit));
+                let shape = mlxcel_core::array_shape(&verify.logits);
+                logits = mlxcel_core::slice(&verify.logits, &[0, rows as i32 - 1, 0], &[1, rows as i32, shape[2]]);
+                pending = (committed < prompt.len() + output.len()).then(|| *output.last().expect("pending output"));
+                for cache in &mut self.caches {
+                    cache.trim_to_committed((prompt.len() + output.len()) as i32);
+                }
+            } else {
+                pending = (committed < prompt.len() + output.len()).then(|| *output.last().expect("initial output"));
+            }
+            if let Some(reason) = reason {
+                stop = reason;
+                break;
+            }
+        }
+        let final_snapshot = if capture_final_snapshot {
+            if committed < prompt.len() + output.len() {
+                let suffix = &output[committed - prompt.len()..];
+                let input = mlxcel_core::from_slice_i32(suffix, &[1, suffix.len() as i32]);
+                let tail = target.forward_dflash_continuation(&input, &self.target_layer_ids, self.hidden_limit)?;
+                window = merge_hidden_context(&window, &tail.hidden_concat, self.hidden_limit);
+                logits = tail.first_logits;
+                stats.target_forward_calls += 1;
+            }
+            Some(Dflash2PromptSnapshot::capture(
+                target, prompt.len() + output.len(), &window, &logits, Some(&base),
+            )?)
+        } else { None };
+        stats.decode_time = decode_start.elapsed();
+        Ok(Dflash2Generation {
+            token_ids: output, stats, cached_tokens, prompt_snapshots, final_snapshot,
+            stop_reason: stop,
         })
     }
     /// Capture an extendable prefix without finalizing initial prefill.
@@ -2192,6 +2446,7 @@ impl Qwen35Dflash2Generator {
         reuse: Option<Dflash2PrefixReuse<'_>>,
         checkpoint_token_lengths: &[usize],
         retain_hidden: bool,
+        multimodal: Option<(&MlxArray, &MlxArray, i32)>,
     ) -> Result<
         (
             Option<UniquePtr<MlxArray>>,
@@ -2237,13 +2492,39 @@ impl Qwen35Dflash2Generator {
                 &prompt_tokens[start..token_len],
                 &[1, (token_len - start) as i32],
             );
-            let prefill = target.forward_dflash_prefill_segment(
-                &input,
-                &self.target_layer_ids,
-                self.hidden_limit,
-                start == 0,
-                token_len == prompt_tokens.len(),
-            )?;
+            let prefill = if let Some((embeddings, positions, delta)) = multimodal {
+                let embedding_shape = mlxcel_core::array_shape(embeddings);
+                let embeddings = mlxcel_core::slice(
+                    embeddings, &[0, start as i32, 0],
+                    &[embedding_shape[0], token_len as i32, embedding_shape[2]],
+                );
+                let positions = mlxcel_core::slice(
+                    positions, &[0, 0, start as i32], &[3, 1, token_len as i32],
+                );
+                // Intermediate checkpoints must retain their own continuation
+                // delta, not the delta of a later image in the full prompt.
+                let boundary_delta = if token_len == prompt_tokens.len() {
+                    delta
+                } else {
+                    mlxcel_core::eval(&positions);
+                    let maximum = mlxcel_core::array_evaluated_bytes(&positions)
+                        .chunks_exact(4)
+                        .map(|bytes| i32::from_ne_bytes(bytes.try_into().expect("position bytes")))
+                        .max().expect("non-empty position segment");
+                    maximum + 1 - token_len as i32
+                };
+                target.forward_dflash_prefill_segment_chunked(
+                    &input, &self.target_layer_ids, self.hidden_limit,
+                    start == 0, token_len == prompt_tokens.len(),
+                    mlxcel_core::generate::prefill_chunk_len(),
+                    Some((&embeddings, &positions, boundary_delta)),
+                )?
+            } else {
+                target.forward_dflash_prefill_segment(
+                    &input, &self.target_layer_ids, self.hidden_limit,
+                    start == 0, token_len == prompt_tokens.len(),
+                )?
+            };
             if need_hidden {
                 hidden = Some(match hidden.take() {
                     Some(prefix) => {
@@ -2293,6 +2574,7 @@ impl Qwen35Dflash2Generator {
         checkpoint_token_lengths: &[usize],
         capture_final_snapshot: bool,
         multimodal: Option<(&MlxArray, &MlxArray, i32)>,
+        constraint: Option<&mut dyn mlxcel_core::generate::TokenConstraint>,
         mut on_token: F,
     ) -> Result<Dflash2Generation, String> {
         let context_tokens = target
@@ -2355,7 +2637,7 @@ impl Qwen35Dflash2Generator {
             .iter()
             .any(|&length| length > cached_tokens && length < prompt_tokens.len());
         let projected_caches = reusable
-            .filter(|_| !segmented_prefill)
+            .filter(|_| !segmented_prefill && multimodal.is_none())
             .and_then(|reuse| {
                 let committed_suffix = &prompt_tokens[reuse.cached_tokens..];
                 self.projected_prefix.as_ref().filter(|projected| {
@@ -2369,31 +2651,19 @@ impl Qwen35Dflash2Generator {
         self.caches = projected_caches.unwrap_or_else(|| self.model.make_cache());
 
         let (mut hidden_concat, first_logits, prompt_snapshots) =
-            if let Some((embeddings, positions, delta)) = multimodal {
-                let input =
-                    mlxcel_core::from_slice_i32(prompt_tokens, &[1, prompt_tokens.len() as i32]);
-                let prefill = target.forward_dflash_multimodal_prefill(
-                    &input,
-                    embeddings,
-                    positions,
-                    delta,
-                    &self.target_layer_ids,
-                    self.hidden_limit,
-                )?;
-                (
-                    Some(prefill.hidden_concat),
-                    prefill.first_logits,
-                    Vec::new(),
-                )
-            } else {
-                self.prefill_with_checkpoints(
-                    target,
-                    prompt_tokens,
-                    reusable,
-                    checkpoint_token_lengths,
-                    !projected_cache_hit || capture_final_snapshot,
-                )?
-            };
+            self.prefill_with_checkpoints(
+                target, prompt_tokens, reusable, checkpoint_token_lengths,
+                !projected_cache_hit || capture_final_snapshot || constraint.is_some(),
+                multimodal,
+            )?;
+        if let Some(constraint) = constraint {
+            return self.generate_constrained(
+                target, prompt_tokens, max_tokens, sampling, &eos_tokens, constraint,
+                hidden_concat.expect("constrained replay retains prompt hidden"),
+                first_logits, prompt_snapshots, cached_tokens, capture_final_snapshot,
+                prefill_start.elapsed(), on_token,
+            );
+        }
         let mut snapshot_hidden = if capture_final_snapshot {
             Some(materialize_detached(mlxcel_core::share(
                 hidden_concat
@@ -2457,7 +2727,8 @@ impl Qwen35Dflash2Generator {
         let mut sampler_state = None;
         let mut projected_prefix_to_capture = reusable
             .filter(|_| {
-                !projected_cache_hit && !segmented_prefill && self.hidden_limit != usize::MAX
+                !projected_cache_hit && !segmented_prefill && multimodal.is_none()
+                    && self.hidden_limit != usize::MAX
             })
             .map(|reuse| {
                 (
@@ -2734,6 +3005,126 @@ mod tests {
         assert_eq!(context_bounded_verify_width(5, 16, 12), 4);
         assert_eq!(context_bounded_verify_width(5, 16, 14), 2);
         assert_eq!(context_bounded_verify_width(5, 16, 16), 0);
+    }
+
+    struct PathConstraint {
+        path: Vec<i32>,
+        committed: Vec<i32>,
+        saved: Option<Vec<i32>>,
+        splice: Option<mlxcel_core::generate::ConstraintCommit>,
+        replacement: Option<mlxcel_core::generate::ConstraintCommit>,
+    }
+
+    impl mlxcel_core::generate::TokenConstraint for PathConstraint {
+        fn begin_transaction(&mut self) -> Result<(), String> {
+            self.saved = Some(self.committed.clone());
+            Ok(())
+        }
+        fn commit_transaction(&mut self) -> Result<(), String> {
+            self.saved = None;
+            Ok(())
+        }
+        fn rollback_transaction(&mut self) {
+            self.committed = self.saved.take().expect("active transaction");
+        }
+        fn compute_mask(&mut self, _: &MlxArray, _: &[i32]) -> Result<mlxcel_core::generate::ConstraintMask, String> {
+            use mlxcel_core::generate::ConstraintMask;
+            if let Some(splice) = &self.splice {
+                splice.apply_to(&mut self.committed)?;
+                return Ok(ConstraintMask::Splice(splice.clone()));
+            }
+            Ok(match self.path.get(self.committed.len()) {
+                Some(&token) => ConstraintMask::Allow(vec![token]),
+                None => ConstraintMask::Accept,
+            })
+        }
+        fn commit_token(&mut self, token: i32) -> Result<mlxcel_core::generate::ConstraintCommit, String> {
+            assert_eq!(self.path[self.committed.len()], token);
+            if let Some(commit) = &self.replacement {
+                commit.apply_to(&mut self.committed)?;
+                return Ok(commit.clone());
+            }
+            self.committed.push(token);
+            Ok(mlxcel_core::generate::ConstraintCommit::token(token))
+        }
+    }
+
+    #[test]
+    fn constrained_dflash_rejection_masks_target_not_original_proposal() {
+        use mlxcel_core::generate::TokenConstraint;
+        let proposal = SelectorOutput {
+            path: mlxcel_core::from_slice_i32(&[1, 1], &[1, 2]),
+            candidates: mlxcel_core::from_slice_i32(&[1, 2, 1, 2], &[1, 2, 2]),
+            proposal_probs: vec![
+                mlxcel_core::from_slice_f32(&[0.75, 0.25], &[1, 2]),
+                mlxcel_core::from_slice_f32(&[0.5, 0.5], &[1, 2]),
+            ],
+        };
+        let expanded = expand_dflash2_proposals(&proposal, &[1, 1], 4);
+        assert_eq!(raw_f32(&expanded[0].proposal_probs), [0.0, 0.75, 0.25, 0.0]);
+        let mut constraint = PathConstraint { path: vec![3], committed: vec![], saved: None, splice: None, replacement: None };
+        constraint.begin_transaction().unwrap();
+        let result = crate::qwen3_5_mtp::constrained_stochastic_walk(
+            &expanded, &verify_logits(&[1, 1, 1], 4),
+            &SamplingConfig { temperature: 1.0, ..Default::default() },
+            &[0], &[], &[], usize::MAX, &mut constraint,
+        );
+        let walk = finish_dflash_constraint_transaction(&mut constraint, result, 1).unwrap().unwrap();
+        assert_eq!(walk.accepted, 0);
+        assert_eq!(walk.output, [3]);
+        assert_eq!(constraint.committed, walk.output);
+    }
+
+    #[test]
+    fn constrained_dflash_accepts_blocks_and_rolls_back_oversized_splices() {
+        use mlxcel_core::generate::{ConstraintCommit, TokenConstraint};
+        let mut constraint = PathConstraint { path: vec![1, 2], committed: vec![], saved: None, splice: None, replacement: None };
+        constraint.begin_transaction().unwrap();
+        let result = crate::qwen3_5_mtp::constrained_greedy_walk(
+            &[1, 2], &verify_logits(&[1, 2, 3], 4), &SamplingConfig::greedy(),
+            &[0], &[], &[], usize::MAX, &mut constraint,
+        );
+        let walk = finish_dflash_constraint_transaction(&mut constraint, result, 2).unwrap().unwrap();
+        assert_eq!(walk.accepted, 2);
+        assert_eq!(walk.output, [1, 2]);
+        assert_eq!(walk.stop_reason, Some(GenerationStopReason::ConstraintAccepted));
+        constraint.splice = Some(ConstraintCommit { backtrack: 1, tokens: vec![3, 0], accept: true });
+        constraint.begin_transaction().unwrap();
+        let result = crate::qwen3_5_mtp::constrained_initial_step(
+            &verify_logits(&[1], 4), &SamplingConfig::greedy(), &[0], &walk.output,
+            &[], usize::MAX, &mut constraint,
+        );
+        assert!(finish_dflash_constraint_transaction(&mut constraint, result, 2).unwrap().is_none());
+        assert_eq!(constraint.committed, [1, 2]);
+        constraint.begin_transaction().unwrap();
+        let result = crate::qwen3_5_mtp::constrained_initial_step(
+            &verify_logits(&[1], 4), &SamplingConfig::greedy(), &[0], &walk.output,
+            &[], usize::MAX, &mut constraint,
+        );
+        let spliced = finish_dflash_constraint_transaction(&mut constraint, result, 3).unwrap().unwrap();
+        assert!(spliced.rebuild);
+        assert_eq!(spliced.output, [1, 3, 0]);
+        assert_eq!(constraint.committed, spliced.output);
+    }
+
+    #[test]
+    fn constrained_dflash_commit_backtracks_before_rejected_suffix() {
+        use mlxcel_core::generate::{ConstraintCommit, TokenConstraint};
+        let mut constraint = PathConstraint {
+            path: vec![1, 2], committed: vec![1], saved: None, splice: None,
+            replacement: Some(ConstraintCommit { backtrack: 1, tokens: vec![3], accept: true }),
+        };
+        constraint.begin_transaction().unwrap();
+        let result = crate::qwen3_5_mtp::constrained_greedy_walk(
+            &[2, 0], &verify_logits(&[2, 0, 0], 4), &SamplingConfig::greedy(),
+            &[0], &[1], &[], usize::MAX, &mut constraint,
+        );
+        let walk = finish_dflash_constraint_transaction(&mut constraint, result, 2).unwrap().unwrap();
+        assert!(walk.rebuild);
+        assert_eq!(walk.output, [3]);
+        assert_eq!(constraint.committed, [3]);
+        assert_eq!(walk.new_tokens, [2]);
+        assert_eq!(walk.stop_reason, Some(GenerationStopReason::ConstraintAccepted));
     }
 
     fn raw_i32(array: &MlxArray) -> Vec<i32> {
@@ -3555,6 +3946,7 @@ mod tests {
                 None,
                 &[],
                 false,
+                None,
                 |_| true,
             )
             .expect("uninterrupted uncached generation");
@@ -3576,6 +3968,7 @@ mod tests {
                 None,
                 &[prompt.len()],
                 true,
+                None,
                 |_| true,
             )
             .expect("capture full prompt and terminal without structural segmentation");
@@ -3608,6 +4001,7 @@ mod tests {
                 None,
                 &[prompt.len(), boundary, 0, boundary, prompt.len() + 1],
                 true,
+                None,
                 |_| true,
             )
             .expect("capture exact structural, prompt, and terminal boundaries");
@@ -3697,6 +4091,7 @@ mod tests {
                     }),
                     &[],
                     true,
+                    None,
                     |_| {
                         callbacks += 1;
                         !cancel || callbacks < stop_after
@@ -3731,6 +4126,7 @@ mod tests {
                     }),
                     &[],
                     false,
+                    None,
                     |_| true,
                 )
                 .expect("resume portable cancelled/terminal snapshot");
@@ -3765,6 +4161,7 @@ mod tests {
                     }),
                     &[],
                     true,
+                    None,
                     |_| true,
                 )
                 .expect("stop before emitting EOS");
@@ -3786,6 +4183,7 @@ mod tests {
                     }),
                     &[],
                     false,
+                    None,
                     |_| true,
                 )
                 .expect("resume before the un-emitted EOS token");

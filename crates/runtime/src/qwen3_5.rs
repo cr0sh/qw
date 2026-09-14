@@ -1501,29 +1501,9 @@ impl Qwen35Model {
         )
     }
 
-    #[cfg(any(feature = "dflash2", test))]
-    pub(crate) fn forward_dflash_multimodal_prefill(
-        &self,
-        input_ids: &MlxArray,
-        input_embeddings: &MlxArray,
-        position_ids: &MlxArray,
-        rope_delta: i32,
-        target_layer_ids: &[usize],
-        hidden_limit: usize,
-    ) -> std::result::Result<Qwen35DflashPrefill, String> {
-        self.forward_dflash_prefill_segment_chunked(
-            input_ids,
-            target_layer_ids,
-            hidden_limit,
-            true,
-            true,
-            mlxcel_core::generate::prefill_chunk_len(),
-            Some((input_embeddings, position_ids, rope_delta)),
-        )
-    }
 
     #[cfg(any(feature = "dflash2", test))]
-    fn forward_dflash_prefill_segment_chunked(
+    pub(crate) fn forward_dflash_prefill_segment_chunked(
         &self,
         input_ids: &MlxArray,
         target_layer_ids: &[usize],
@@ -1541,9 +1521,8 @@ impl Qwen35Model {
         if prompt_len == 0 {
             return Err("DFlash2 prefill requires at least one token".to_owned());
         }
-        if let Some((_, positions, delta)) = multimodal {
-            self.mrope_state.prepare(positions, delta);
-            self.mrope_state.activate_prepared()?;
+        if let Some((_, _, delta)) = multimodal {
+            self.mrope_state.restore(0, None, Some(delta));
         }
         let chunk_len =
             mlxcel_core::generate::effective_prefill_chunk(configured, true, prompt_len as usize)
@@ -4304,6 +4283,59 @@ mod tests {
             .expect("fresh text");
         assert_dflash_prefill_close(&text.first_logits, &expected.first_logits);
         assert_dflash_prefill_close(&text.hidden_concat, &expected.hidden_concat);
+    }
+
+    #[test]
+    fn dflash_image_prefix_restore_extends_with_new_positions_and_continuation_delta() {
+        let model = dflash_prefill_test_model();
+        let input = mlxcel_core::from_slice_i32(&[3; 12], &[1, 12]);
+        let values = (0..12 * 64).map(|i| (i as f32 * 0.13).sin() * 0.1).collect::<Vec<_>>();
+        let embeddings = mlxcel_core::from_slice_f32(&values, &[1, 12, 64]);
+        let position_values = [0, 1, 2, 2, 3, 3, 4, 5, 5, 6, 6, 6];
+        let positions = mlxcel_core::from_slice_i32(&position_values.repeat(3), &[3, 1, 12]);
+        let full = model.forward_dflash_prefill_segment_chunked(
+            &input, &[0, 1], 6, true, true, 6,
+            Some((&embeddings, &positions, -5)),
+        ).unwrap();
+        let next = mlxcel_core::from_slice_i32(&[7], &[1, 1]);
+        let expected_next = model.forward_dflash_verify(&next, &[0, 1]);
+        mlxcel_core::eval(&expected_next.logits);
+        let prefix_ids = mlxcel_core::slice(&input, &[0, 0], &[1, 6]);
+        let prefix_embeddings = mlxcel_core::slice(&embeddings, &[0, 0, 0], &[1, 6, 64]);
+        let prefix_positions = mlxcel_core::slice(&positions, &[0, 0, 0], &[3, 1, 6]);
+        let prefix = model.forward_dflash_prefill_segment_chunked(
+            &prefix_ids, &[0, 1], 6, true, false, 6,
+            Some((&prefix_embeddings, &prefix_positions, -2)),
+        ).unwrap();
+        let snapshot = model.snapshot_sequence_state(SequenceId::from_raw(0), 6, None).unwrap();
+        let text = model.forward_dflash_continuation(&next, &[0, 1], 6).unwrap();
+        model.reset_runtime_state();
+        model.restore_sequence_state(SequenceId::from_raw(0), &snapshot).unwrap();
+        assert_eq!(model.mrope_state.position(), 6);
+        assert_eq!(model.mrope_state.rope_delta(), Some(-2));
+        let restored_text = model.forward_dflash_continuation(&next, &[0, 1], 6).unwrap();
+        assert_dflash_prefill_close(&restored_text.first_logits, &text.first_logits);
+        assert_dflash_prefill_close(&restored_text.hidden_concat, &text.hidden_concat);
+        model.restore_sequence_state(SequenceId::from_raw(0), &snapshot).unwrap();
+        let suffix_ids = mlxcel_core::slice(&input, &[0, 6], &[1, 12]);
+        let suffix_embeddings = mlxcel_core::slice(&embeddings, &[0, 6, 0], &[1, 12, 64]);
+        let suffix_positions = mlxcel_core::slice(&positions, &[0, 0, 6], &[3, 1, 12]);
+        let extended = model.forward_dflash_prefill_segment_chunked(
+            &suffix_ids, &[0, 1], 6, false, true, 6,
+            Some((&suffix_embeddings, &suffix_positions, -5)),
+        ).unwrap();
+        assert_dflash_prefill_close(&extended.first_logits, &full.first_logits);
+        assert_dflash_prefill_close(&extended.hidden_concat, &full.hidden_concat);
+        assert_eq!(model.mrope_state.position(), 12);
+        assert_eq!(model.mrope_state.rope_delta(), Some(-5));
+        let actual_next = model.forward_dflash_verify(&next, &[0, 1]);
+        assert_dflash_prefill_close(&actual_next.logits, &expected_next.logits);
+        let fresh_prefix = model.forward_dflash_prefill_segment_chunked(
+            &prefix_ids, &[0, 1], 6, true, false, 6,
+            Some((&prefix_embeddings, &prefix_positions, -2)),
+        ).unwrap();
+        assert_dflash_prefill_close(&prefix.first_logits, &fresh_prefix.first_logits);
+        assert_dflash_prefill_close(&prefix.hidden_concat, &fresh_prefix.hidden_concat);
     }
 
     #[test]
