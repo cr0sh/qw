@@ -367,6 +367,26 @@ fn advance_decoded_text(emitted: &mut String, decoded: &str, final_chunk: bool) 
     Ok(delta)
 }
 
+#[cfg(any(feature = "dflash2", test))]
+fn advance_committed_bytes(emitted: &mut String, bytes: &[u8]) -> Result<String> {
+    ensure!(
+        bytes.starts_with(emitted.as_bytes()),
+        "constraint changed bytes already emitted"
+    );
+    let remaining = &bytes[emitted.len()..];
+    let stable = match std::str::from_utf8(remaining) {
+        Ok(text) => text,
+        Err(error) if error.error_len().is_none() => {
+            std::str::from_utf8(&remaining[..error.valid_up_to()])
+                .expect("UTF-8 validation identified a valid prefix")
+        }
+        Err(error) => return Err(error).context("constraint committed invalid UTF-8"),
+    };
+    let delta = stable.to_owned();
+    emitted.push_str(stable);
+    Ok(delta)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Qwen35GenerationMode {
     Automatic,
@@ -1343,7 +1363,7 @@ impl Qwen35Provider {
             .dflash2_generator
             .as_mut()
             .expect("DFlash2 generator was initialized");
-        let buffer_output = constraint.is_some();
+        let constrained = constraint.is_some();
         let mut decoder = IncrementalTextDecoder::new(&self.tokenizer);
         let mut callback_active = true;
         let mut decode_error = None;
@@ -1358,12 +1378,17 @@ impl Qwen35Provider {
                 capture_final_snapshot,
                 multimodal,
                 constraint,
-                |token_id| {
-                    if buffer_output {
+                |token_id, committed_bytes| {
+                    let delta = if let Some(bytes) = committed_bytes {
+                        advance_committed_bytes(&mut decoder.emitted, bytes)
+                    } else if constrained {
+                        // Custom constraints without stable bytes may retokenize prior output.
                         callback_active = on_delta("");
                         return callback_active;
-                    }
-                    match decoder.push(token_id) {
+                    } else {
+                        decoder.push(token_id)
+                    };
+                    match delta {
                         Ok(delta) => {
                             callback_active = on_delta(&delta);
                             callback_active
@@ -1380,19 +1405,18 @@ impl Qwen35Provider {
         if let Some(error) = decode_error {
             return Err(error);
         }
-        if buffer_output {
-            for &token_id in &generation.token_ids {
-                let _ = decoder.push(token_id)?;
-            }
-            let _ = decoder.finish()?;
-            if callback_active && !decoder.emitted.is_empty() {
-                let _ = on_delta(&decoder.emitted);
-            }
-        } else {
-            let final_delta = decoder.finish()?;
-            if callback_active && !final_delta.is_empty() {
-                let _ = on_delta(&final_delta);
-            }
+        if constrained {
+            decoder.token_ids = generation
+                .token_ids
+                .iter()
+                .map(|&token_id| {
+                    u32::try_from(token_id).context("generated a negative token identifier")
+                })
+                .collect::<Result<_>>()?;
+        }
+        let final_delta = decoder.finish()?;
+        if callback_active && !final_delta.is_empty() {
+            let _ = on_delta(&final_delta);
         }
         let completion_tokens = generation.token_ids.len();
         let stats = generation.stats;
@@ -2442,6 +2466,33 @@ mod tests {
         deltas.push(final_delta);
         assert_eq!(deltas.concat(), "Hello, world!");
         assert_eq!(emitted, "Hello, world!");
+    }
+
+    #[test]
+    fn committed_byte_stream_preserves_split_utf8_and_final_decode() {
+        let mut emitted = String::new();
+        let bytes = "A你B".as_bytes();
+        let deltas: Vec<_> = (1..=bytes.len())
+            .map(|end| advance_committed_bytes(&mut emitted, &bytes[..end]).unwrap())
+            .collect();
+        assert_eq!(deltas, ["A", "", "", "你", "B"]);
+        assert!(
+            advance_committed_bytes(&mut emitted, bytes)
+                .unwrap()
+                .is_empty()
+        );
+        let final_delta = advance_decoded_text(&mut emitted, "A你B!", true).unwrap();
+        assert_eq!(final_delta, "!");
+        assert_eq!(emitted, "A你B!");
+    }
+
+    #[test]
+    fn committed_byte_stream_rejects_rewrites_and_invalid_utf8_without_publication() {
+        let mut emitted = String::from("A");
+        assert!(advance_committed_bytes(&mut emitted, b"Bx").is_err());
+        assert_eq!(emitted, "A");
+        assert!(advance_committed_bytes(&mut emitted, b"Aok\xff").is_err());
+        assert_eq!(emitted, "A");
     }
     #[test]
     #[ignore = "requires the real bundled-MTP checkpoint at QW_MODEL_PATH or the default model cache path"]

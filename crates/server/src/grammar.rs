@@ -7,9 +7,7 @@ use llguidance::{Constraint, ParserFactory, token_bytes_from_tokenizer_json};
 use mlxcel_core::generate::{ConstraintCommit, ConstraintMask, TokenConstraint};
 use serde_json::{Map, Value};
 use tokenizers::Tokenizer;
-use toktrie::{
-    InferenceCapabilities, TokEnv, TokRxInfo, TokTrie, TokenId, TokenizerEnv,
-};
+use toktrie::{InferenceCapabilities, TokEnv, TokRxInfo, TokTrie, TokenId, TokenizerEnv};
 
 use crate::protocol::OutputFormat;
 
@@ -74,8 +72,7 @@ impl GrammarFactory {
             tok_end_of_turn: None,
         };
         let tokenizer = Tokenizer::from_bytes(
-            serde_json::to_vec(tokenizer_json)
-                .context("failed to serialize tokenizer.json")?,
+            serde_json::to_vec(tokenizer_json).context("failed to serialize tokenizer.json")?,
         )
         .map_err(anyhow::Error::msg)
         .context("failed to initialize canonical structured-output tokenizer")?;
@@ -184,6 +181,12 @@ impl TokenConstraint for GuidanceConstraint {
         self.transaction = None;
     }
 
+    fn committed_bytes(&self) -> Option<&[u8]> {
+        // Match llguidance's streaming Reporter: bytes_since excludes hidden
+        // parser bytes that may still be retracted, unlike final_bytes.
+        Some(self.inner.parser.bytes_since(0))
+    }
+
     fn compute_mask(
         &mut self,
         _logits: &mlxcel_core::MlxArray,
@@ -209,10 +212,7 @@ impl TokenConstraint for GuidanceConstraint {
         guidance_commit(result, accepting).map(ConstraintMask::Splice)
     }
 
-    fn commit_token(
-        &mut self,
-        token_id: i32,
-    ) -> std::result::Result<ConstraintCommit, String> {
+    fn commit_token(&mut self, token_id: i32) -> std::result::Result<ConstraintCommit, String> {
         let token = u32::try_from(token_id)
             .map_err(|_| "structured-output grammar received a negative token".to_string())?;
         let active = self.active();
@@ -246,19 +246,65 @@ fn validate_schema_node(value: &mut Value, property_map: bool) -> Result<()> {
     }
 
     const KEYWORDS: &[&str] = &[
-        "$schema", "$id", "$ref", "$defs", "definitions", "title", "description",
-        "default", "examples", "deprecated", "readOnly", "writeOnly", "type", "enum",
-        "const", "multipleOf", "maximum", "exclusiveMaximum", "minimum",
-        "exclusiveMinimum", "maxLength", "minLength", "pattern", "format", "contentEncoding",
-        "contentMediaType", "maxItems", "minItems", "uniqueItems", "maxContains",
-        "minContains", "items", "prefixItems", "contains", "maxProperties", "minProperties",
-        "required", "properties", "patternProperties", "additionalProperties", "propertyNames",
-        "dependentRequired", "dependentSchemas", "allOf", "anyOf", "oneOf", "not", "if",
-        "then", "else", "unevaluatedItems", "unevaluatedProperties",
+        "$schema",
+        "$id",
+        "$ref",
+        "$defs",
+        "definitions",
+        "title",
+        "description",
+        "default",
+        "examples",
+        "deprecated",
+        "readOnly",
+        "writeOnly",
+        "type",
+        "enum",
+        "const",
+        "multipleOf",
+        "maximum",
+        "exclusiveMaximum",
+        "minimum",
+        "exclusiveMinimum",
+        "maxLength",
+        "minLength",
+        "pattern",
+        "format",
+        "contentEncoding",
+        "contentMediaType",
+        "maxItems",
+        "minItems",
+        "uniqueItems",
+        "maxContains",
+        "minContains",
+        "items",
+        "prefixItems",
+        "contains",
+        "maxProperties",
+        "minProperties",
+        "required",
+        "properties",
+        "patternProperties",
+        "additionalProperties",
+        "propertyNames",
+        "dependentRequired",
+        "dependentSchemas",
+        "allOf",
+        "anyOf",
+        "oneOf",
+        "not",
+        "if",
+        "then",
+        "else",
+        "unevaluatedItems",
+        "unevaluatedProperties",
     ];
     let known: BTreeSet<&str> = KEYWORDS.iter().copied().collect();
     for key in object.keys() {
-        ensure!(known.contains(key.as_str()), "unknown JSON Schema keyword {key:?}");
+        ensure!(
+            known.contains(key.as_str()),
+            "unknown JSON Schema keyword {key:?}"
+        );
     }
 
     if let Some(reference) = object.get("$ref").and_then(Value::as_str) {
@@ -271,8 +317,16 @@ fn validate_schema_node(value: &mut Value, property_map: bool) -> Result<()> {
         ensure!(
             matches!(
                 format,
-                "date-time" | "time" | "date" | "duration" | "email" | "hostname"
-                    | "ipv4" | "ipv6" | "uuid" | "uri"
+                "date-time"
+                    | "time"
+                    | "date"
+                    | "duration"
+                    | "email"
+                    | "hostname"
+                    | "ipv4"
+                    | "ipv6"
+                    | "uuid"
+                    | "uri"
             ),
             "unsupported JSON Schema format {format:?}"
         );
@@ -284,7 +338,9 @@ fn validate_schema_node(value: &mut Value, property_map: bool) -> Result<()> {
         .get("additionalProperties")
         .is_some_and(|value| value.is_object())
     {
-        bail!("schema-valued additionalProperties requires property-name uniqueness that cannot be enforced");
+        bail!(
+            "schema-valued additionalProperties requires property-name uniqueness that cannot be enforced"
+        );
     }
     if object
         .get("patternProperties")
@@ -298,9 +354,7 @@ fn validate_schema_node(value: &mut Value, property_map: bool) -> Result<()> {
     }
 
     if let Some(one_of) = object.remove("oneOf") {
-        let branches = one_of
-            .as_array()
-            .context("oneOf must contain an array")?;
+        let branches = one_of.as_array().context("oneOf must contain an array")?;
         ensure!(!branches.is_empty(), "oneOf must not be empty");
         let mut types = BTreeSet::new();
         for branch in branches {
@@ -328,8 +382,16 @@ fn validate_schema_node(value: &mut Value, property_map: bool) -> Result<()> {
         }
     }
     for key in [
-        "items", "contains", "additionalProperties", "propertyNames", "not", "if", "then",
-        "else", "unevaluatedItems", "unevaluatedProperties",
+        "items",
+        "contains",
+        "additionalProperties",
+        "propertyNames",
+        "not",
+        "if",
+        "then",
+        "else",
+        "unevaluatedItems",
+        "unevaluatedProperties",
     ] {
         if let Some(child) = object.get_mut(key) {
             validate_schema_node(child, false)?;
@@ -400,6 +462,94 @@ mod tests {
     }
 
     #[test]
+    fn guidance_committed_bytes_survive_transactions_and_split_utf8() {
+        let factory = GrammarFactory::single_byte().expect("single-byte grammar");
+        let mut constraint = factory
+            .compile(&OutputFormat::JsonSchema {
+                name: "string".to_string(),
+                schema: json!({"type":"string"}),
+            })
+            .expect("compile grammar")
+            .expect("constraint");
+        let logits = mlxcel_core::from_slice_f32(&[0.0; 262], &[1, 1, 262]);
+        let expected = "\"éx\"".as_bytes();
+        let mut output = Vec::new();
+        let mut saw_split_utf8 = false;
+
+        for _ in 0..16 {
+            let previous = constraint.committed_bytes().expect("stable bytes").to_vec();
+            let mut proposed = output.clone();
+            constraint.begin_transaction().expect("begin proposal");
+            let mask = constraint.compute_mask(&logits, &output).expect("mask");
+            let signature = mask_signature(match &mask {
+                ConstraintMask::Allow(tokens) => ConstraintMask::Allow(tokens.clone()),
+                ConstraintMask::Splice(commit) => ConstraintMask::Splice(commit.clone()),
+                ConstraintMask::Accept => ConstraintMask::Accept,
+            });
+            let commit = match mask {
+                ConstraintMask::Allow(allowed) => {
+                    let token = i32::from(expected[output.len()]);
+                    assert!(allowed.contains(&token));
+                    constraint.commit_token(token).expect("commit token")
+                }
+                ConstraintMask::Splice(commit) => commit,
+                ConstraintMask::Accept => {
+                    constraint.rollback_transaction();
+                    break;
+                }
+            };
+            commit.apply_to(&mut proposed).expect("apply proposal");
+            assert_eq!(constraint.committed_bytes(), Some(previous.as_slice()));
+            constraint.rollback_transaction();
+            assert_eq!(constraint.committed_bytes(), Some(previous.as_slice()));
+
+            constraint.begin_transaction().expect("begin accepted path");
+            let replay = constraint
+                .compute_mask(&logits, &output)
+                .expect("replay mask");
+            match replay {
+                ConstraintMask::Allow(allowed) => {
+                    assert_eq!(signature, mask_signature(ConstraintMask::Allow(allowed)));
+                    constraint
+                        .commit_token(i32::from(expected[output.len()]))
+                        .expect("replay token")
+                        .apply_to(&mut output)
+                        .expect("apply accepted token");
+                }
+                ConstraintMask::Splice(replayed_commit) => {
+                    assert_eq!(commit, replayed_commit);
+                    replayed_commit
+                        .apply_to(&mut output)
+                        .expect("apply accepted splice");
+                }
+                ConstraintMask::Accept => panic!("rollback changed parser acceptance"),
+            }
+            assert_eq!(output, proposed);
+            assert_eq!(constraint.committed_bytes(), Some(previous.as_slice()));
+            constraint
+                .commit_transaction()
+                .expect("commit accepted path");
+            let stable = constraint.committed_bytes().expect("stable bytes");
+            assert!(stable.starts_with(&previous));
+            assert!(expected.starts_with(stable));
+            saw_split_utf8 |= std::str::from_utf8(stable).is_err();
+            if commit.accept {
+                break;
+            }
+        }
+
+        assert_eq!(constraint.committed_bytes(), Some(expected));
+        assert!(saw_split_utf8, "byte tokenizer exposes incomplete UTF-8");
+        assert_eq!(
+            output,
+            expected
+                .iter()
+                .map(|&byte| i32::from(byte))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn guidance_fast_forward_produces_schema_valid_json() {
         let factory = GrammarFactory::single_byte().expect("single-byte grammar");
         let mut constraint = factory
@@ -413,6 +563,9 @@ mod tests {
         let mut output = Vec::new();
 
         for _ in 0..16 {
+            let previous = constraint.committed_bytes().expect("stable bytes").to_vec();
+            constraint.begin_transaction().expect("begin transaction");
+            let mut accepting = false;
             match constraint
                 .compute_mask(&logits, &output)
                 .expect("constraint mask")
@@ -430,13 +583,22 @@ mod tests {
                         .expect("apply token commit");
                 }
                 ConstraintMask::Splice(commit) => {
-                    let accept = commit.accept;
+                    accepting = commit.accept;
                     commit.apply_to(&mut output).expect("apply fast-forward");
-                    if accept {
-                        break;
-                    }
+                    assert_eq!(constraint.committed_bytes(), Some(previous.as_slice()));
                 }
-                ConstraintMask::Accept => break,
+                ConstraintMask::Accept => accepting = true,
+            }
+            assert_eq!(constraint.committed_bytes(), Some(previous.as_slice()));
+            constraint.commit_transaction().expect("commit transaction");
+            assert!(
+                constraint
+                    .committed_bytes()
+                    .expect("stable bytes")
+                    .starts_with(&previous)
+            );
+            if accepting {
+                break;
             }
         }
 
@@ -444,6 +606,7 @@ mod tests {
             .into_iter()
             .map(|token| u8::try_from(token).expect("single-byte token"))
             .collect::<Vec<_>>();
+        assert_eq!(constraint.committed_bytes(), Some(bytes.as_slice()));
         let value: Value = serde_json::from_slice(&bytes).expect("valid JSON");
         assert_eq!(value, json!(1));
     }

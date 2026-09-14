@@ -711,6 +711,19 @@ pub trait TokenConstraint {
 
     fn rollback_transaction(&mut self);
 
+    /// A borrowed, stable byte prefix of the committed canonical output.
+    ///
+    /// Once exposed, bytes must never be retracted or changed by later commits,
+    /// backtracking, or rollback. An active transaction must expose only its
+    /// previously committed state, never tentative bytes. The prefix may end
+    /// inside a UTF-8 code point; consumers must buffer incomplete code points.
+    ///
+    /// `None` means no safe byte stream is available: consumers must buffer
+    /// output until final canonical decoding rather than stream token decodes.
+    fn committed_bytes(&self) -> Option<&[u8]> {
+        None
+    }
+
     fn compute_mask(
         &mut self,
         logits: &MlxArray,
