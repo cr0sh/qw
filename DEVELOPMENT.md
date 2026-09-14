@@ -270,10 +270,12 @@ JSON Schema, images, and their combination. Constraints apply to target
 verification; stochastic rejection retains the original draft probabilities
 rather than renormalizing proposals over the grammar's allowed tokens.
 
-Parser transactions commit canonical accepted output only. Splice/backtrack
-replays an immutable prompt base and restores the target's prefill and RoPE
-state; an atomic splice that exceeds the output budget is rolled back, not
-partially published. Exact prompt checkpoints and full reused prefixes can
+Parser transactions commit canonical accepted output only. Backtracks and
+speculative splice rebuilds restore an immutable prompt base, including prefill
+and RoPE state. An append-only fast-forward at a fully committed target boundary
+continues from the live state and evaluates only its new suffix. An atomic splice
+that exceeds the output budget is rolled back, not partially published.
+Exact prompt checkpoints and full reused prefixes can
 supply that base without an extra snapshot. Otherwise, a transient checkpoint
 reuses existing attention pages or retains compact immutable tensors instead of
 allocating new persistent pages. It is frozen before the first target mutation,

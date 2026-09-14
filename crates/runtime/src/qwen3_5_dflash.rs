@@ -2441,6 +2441,10 @@ impl Qwen35Dflash2Generator {
                     }
                 };
             let previous_len = output.len();
+            let append_only_rebuild = walk.rebuild
+                && verify_state.is_none()
+                && committed == prompt.len() + previous_len
+                && walk.output.starts_with(&output);
             if decode_start.is_none() && !walk.output.is_empty() {
                 // Match unconstrained timing: the prompt forward pass and
                 // first-token selection finish before decoding is timed.
@@ -2462,16 +2466,22 @@ impl Qwen35Dflash2Generator {
             };
             if walk.rebuild {
                 let base = get_base()?;
-                // Recurrent rows cannot be rewound arbitrarily. Replay only
-                // generated text from an immutable image-aware prompt boundary.
-                target.restore_sequence_state(SequenceId::from_raw(0), &base.target)?;
-                // Standalone reusable prefixes can still contain initial FP16
-                // attention state. Restore also resets prefill completion.
+                let replay_start = if append_only_rebuild {
+                    // No verification advanced the target, and the canonical
+                    // prefix is unchanged. Keep its live recurrent/KV state.
+                    previous_len
+                } else {
+                    // A backtrack or speculative verification needs the
+                    // immutable image-aware prompt boundary.
+                    target.restore_sequence_state(SequenceId::from_raw(0), &base.target)?;
+                    hidden = mlxcel_core::share(&base.hidden_concat);
+                    logits = mlxcel_core::share(&base.continuation_logits);
+                    0
+                };
                 target.finish_initial_prefill();
-                hidden = mlxcel_core::share(&base.hidden_concat);
-                logits = mlxcel_core::share(&base.continuation_logits);
-                if !output.is_empty() {
-                    let input = mlxcel_core::from_slice_i32(&output, &[1, output.len() as i32]);
+                if replay_start < output.len() {
+                    let suffix = &output[replay_start..];
+                    let input = mlxcel_core::from_slice_i32(suffix, &[1, suffix.len() as i32]);
                     let replay = target.forward_dflash_continuation(
                         &input,
                         &self.target_layer_ids,
@@ -4164,7 +4174,22 @@ mod tests {
         let target =
             Qwen35Model::load(&model_dir, crate::KVCacheMode::Turbo4).expect("load target");
         let mut generator = Qwen35Dflash2Generator::new(&target, &draft_dir).expect("load drafter");
-        let prompt = [1, 2, 3];
+        let tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
+            .expect("load target tokenizer");
+        let prompt = tokenizer
+            .encode(
+                format!(
+                    "{}Explain the next recovery steps in detail:\n",
+                    "Account recovery requires verifying identity and protecting sensitive information. "
+                        .repeat(256)
+                ),
+                false,
+            )
+            .expect("tokenize packed-cache fixture")
+            .get_ids()
+            .iter()
+            .map(|&token| token as i32)
+            .collect::<Vec<_>>();
         let sampling = SamplingConfig::greedy();
         target.reset_runtime_state();
         let standalone = generator
@@ -4172,22 +4197,22 @@ mod tests {
             .expect("capture extendable full prefix");
 
         // Compare an owned replay base, a borrowed exact prompt checkpoint,
-        // and a borrowed still-extendable prefix. Both parser outcomes restore
-        // the base; the accepted splice additionally replays committed tokens.
-        for budget in [1, 2] {
+        // and a borrowed still-extendable prefix. Consecutive appends must
+        // preserve live state; an oversized later splice must roll back.
+        for budget in [1, 3, 5] {
             let mut reference = None;
             for source in 0..3 {
                 for _ in 0..2 {
                     target.reset_runtime_state();
                     let mut constraint = PathConstraint {
-                        path: vec![4],
+                        path: vec![4; 4],
                         committed: Vec::new(),
                         saved: None,
                         splice: None,
                         replacement: Some(ConstraintCommit {
                             backtrack: 0,
                             tokens: vec![6, 7],
-                            accept: true,
+                            accept: false,
                         }),
                     };
                     let reuse = (source == 2).then_some(Dflash2PrefixReuse {
@@ -4213,10 +4238,24 @@ mod tests {
                             |_, _| true,
                         )
                         .expect("restore parser boundary and capture aligned final state");
-                    let expected: &[i32] = if budget == 1 { &[] } else { &[6, 7] };
+                    let expected: &[i32] = match budget {
+                        1 => &[],
+                        3 => &[6, 7],
+                        5 => &[6, 7, 6, 7],
+                        _ => unreachable!(),
+                    };
                     assert_eq!(generated.token_ids, expected);
                     assert_eq!(constraint.committed, expected);
                     let final_snapshot = generated.final_snapshot.expect("final snapshot");
+                    assert!(
+                        (0..target.config.num_hidden_layers).any(|index| {
+                            final_snapshot
+                                .target
+                                .paged_tensor(&format!("layer.{index}.k_packed"))
+                                .is_some()
+                        }),
+                        "fixture must exercise packed Turbo4 attention"
+                    );
                     let mut continuation_prompt = prompt.to_vec();
                     continuation_prompt.extend_from_slice(expected);
                     assert_eq!(final_snapshot.token_len(), continuation_prompt.len());
