@@ -2169,6 +2169,25 @@ fn finish_dflash_constraint_transaction(
     }
 }
 
+/// Publish only committed parser output. Cancellation stops notifications, not
+/// the atomic output block that the parser and target snapshot must retain.
+fn emit_committed_dflash2_walk<F: FnMut(i32, Option<&[u8]>) -> bool>(
+    output: &mut Vec<i32>,
+    next_output: Vec<i32>,
+    committed_bytes: Option<&[u8]>,
+    on_token: &mut F,
+) -> bool {
+    let common = output
+        .iter()
+        .zip(&next_output)
+        .take_while(|(a, b)| a == b)
+        .count();
+    *output = next_output;
+    output[common..]
+        .iter()
+        .all(|&token| on_token(token, committed_bytes))
+}
+
 /// DFlash2 generation driver: prefill → speculative draft/verify rounds.
 ///
 /// B=1 exact target sampling: greedy comparison for deterministic samplers,
@@ -2210,7 +2229,7 @@ impl Qwen35Dflash2Generator {
 
     /// Constrained verification shares MTP's parser transitions, but keeps the
     /// DFlash block proposal and its original (unmasked) proposal distribution.
-    fn generate_constrained<F: FnMut(i32) -> bool>(
+    fn generate_constrained<F: FnMut(i32, Option<&[u8]>) -> bool>(
         &mut self,
         target: &Qwen35Model,
         prompt: &[i32],
@@ -2366,26 +2385,18 @@ impl Qwen35Dflash2Generator {
                     }
                 };
             let previous_len = output.len();
-            let common = output
-                .iter()
-                .zip(&walk.output)
-                .take_while(|(a, b)| a == b)
-                .count();
             if decode_start.is_none() && !walk.output.is_empty() {
                 // Match unconstrained timing: include prompt materialization
                 // and first-token selection in prefill, then time decoding.
                 stats.prefill_time = prefill_start.elapsed();
                 decode_start = Some(Instant::now());
             }
-            let mut cancelled = false;
-            // The provider buffers constrained text. Finish this transaction's
-            // accepted output even if cancellation arrives midway through it.
-            for &token in &walk.output[common..] {
-                if !on_token(token) {
-                    cancelled = true;
-                }
-            }
-            output = walk.output;
+            let cancelled = !emit_committed_dflash2_walk(
+                &mut output,
+                walk.output,
+                constraint.committed_bytes(),
+                &mut on_token,
+            );
             let reason = if cancelled {
                 Some(GenerationStopReason::CallbackCancelled)
             } else {
@@ -2654,7 +2665,7 @@ impl Qwen35Dflash2Generator {
     }
 
     /// Generate with distribution-preserving DFlash2 draft verification.
-    pub(crate) fn generate_streaming_with_prefill<F: FnMut(i32) -> bool>(
+    pub(crate) fn generate_streaming_with_prefill<F: FnMut(i32, Option<&[u8]>) -> bool>(
         &mut self,
         target: &Qwen35Model,
         prompt_tokens: &[i32],
@@ -2765,6 +2776,7 @@ impl Qwen35Dflash2Generator {
                 on_token,
             );
         }
+        let mut on_token = |token| on_token(token, None);
         let mut snapshot_hidden = if capture_final_snapshot {
             Some(materialize_detached(mlxcel_core::share(
                 hidden_concat
@@ -3877,6 +3889,26 @@ mod tests {
         assert_eq!(generated, [5]);
         assert_eq!(history, [3, 4, 5]);
         assert_eq!(callbacks, 1);
+    }
+
+    #[test]
+    fn constrained_cancellation_retains_atomic_splice_without_more_callbacks() {
+        let mut output = vec![1, 2];
+        let mut observed = Vec::new();
+        let keep_going = emit_committed_dflash2_walk(
+            &mut output,
+            vec![1, 3, 4],
+            Some(b"stable"),
+            &mut |token, bytes| {
+                observed.push((token, bytes.unwrap().to_vec()));
+                false
+            },
+        );
+        assert!(!keep_going);
+        assert_eq!(observed, [(3, b"stable".to_vec())]);
+        // Token 4 belongs to the committed splice even though cancellation
+        // suppressed its notification; snapshot alignment uses this full block.
+        assert_eq!(output, [1, 3, 4]);
     }
 
     #[test]
