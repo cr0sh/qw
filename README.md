@@ -139,13 +139,13 @@ than redistributed; see the manifest's source and rights information.
 ## Historical performance
 
 Latest complete `cargo bench` results (tokens/s), with the implementation at
-[commit `db04cb2`](https://github.com/cr0sh/qw/commit/db04cb2cf094fe0be18600a21c724f6fbfc13033):
+[commit `7894f5d`](https://github.com/cr0sh/qw/commit/7894f5d7cd5f34096fc1bb544f5124920a6c923d):
 
 | Context | Target prefill | DFlash2 decode |
 |---|---:|---:|
-| Fresh | 253.941 | 56.798 |
-| 10,337-token cached prefix | 232.541 | 54.910 |
-| 64,297-token cached prefix | 154.739 | 36.948 |
+| Fresh | 253.955 | 55.936 |
+| 10,337-token cached prefix | 232.401 | 54.412 |
+| 64,297-token cached prefix | 154.698 | 36.252 |
 
 Fresh prefill processes 4,341 prompt tokens; cached-prefix prefill processes
 only the 288 newly appended tokens, not the cached prefix. Decode excludes
@@ -163,7 +163,7 @@ checkpoint with Turbo4 KV cache on a Mac Studio with an Apple M4 Max
 (`temperature=0`, `top_p=1`, seed `0`) for 127 output tokens after the first
 token, with one warmup and three timed repetitions.
 
-The subsequent [64k bottleneck investigation](DEVELOPMENT.md#dflash2-deep-bottleneck-investigation)
+The separate [64k bottleneck investigation](DEVELOPMENT.md#dflash2-deep-bottleneck-investigation)
 did **not** reach 60 tokens/s. Its accepted-runtime control measured 36.698
 tokens/s; none of the additional candidates improved it. A bandwidth-only
 ceiling is not a demonstrated or predicted achievable decode rate.
