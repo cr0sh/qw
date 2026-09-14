@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, ensure};
 use mlxcel_core::generate::{GenerationStopReason, PrefixReuse};
 use qw_prefix_cache::{
-    AdaptivePrefixCache, CacheConfig, CacheNamespaces, ResponseResumeMetadata, ResumeLookupError,
+    AdaptivePrefixCache, CacheConfig, CacheNamespaces, ImageIdentity, PromptKey, ResponseResumeMetadata, ResumeLookupError,
     SnapshotRoute as CacheSnapshotRoute, namespace_hash,
 };
 #[cfg(test)]
@@ -277,10 +277,19 @@ fn cache_snapshot_route(route: QwenGenerationRoute) -> Option<CacheSnapshotRoute
         QwenGenerationRoute::MtpText => Some(CacheSnapshotRoute::Mtp),
         QwenGenerationRoute::BaselineMultimodal | QwenGenerationRoute::MtpMultimodal => None,
         #[cfg(feature = "dflash2")]
-        QwenGenerationRoute::Dflash2Text => Some(CacheSnapshotRoute::Dflash2),
-        #[cfg(feature = "dflash2")]
-        QwenGenerationRoute::Dflash2Multimodal => None,
+        QwenGenerationRoute::Dflash2Text | QwenGenerationRoute::Dflash2Multimodal => {
+            Some(CacheSnapshotRoute::Dflash2)
+        }
     }
+}
+
+fn decoded_image_digest(width: u32, height: u32, rgb: &[u8]) -> String {
+    namespace_hash(&[
+        b"qw-decoded-rgb-image",
+        &width.to_le_bytes(),
+        &height.to_le_bytes(),
+        rgb,
+    ])
 }
 
 fn cache_lookup_route(
@@ -739,7 +748,7 @@ fn lookahead_route(
     ) {
         return None;
     }
-    let decoder = select_qwen35_decoder(decoder, mtp_available, dflash2_available, true).ok()?;
+    let decoder = select_qwen35_decoder(decoder, mtp_available, dflash2_available).ok()?;
     cache_snapshot_route(qwen_generation_route(decoder, false))
 }
 
@@ -1125,7 +1134,10 @@ impl Engine {
                 .unwrap_or_default();
                 let generated_text = format!("{reasoning}{THINK_CLOSE}\n\n{content}");
                 let interrupt =
-                    resumed.is_none() && latest_user.as_deref() == Some("resume-interrupt");
+                    resumed.is_none()
+                        && !has_images
+                        && matches!(job.request.output_format, OutputFormat::Text)
+                        && latest_user.as_deref() == Some("resume-interrupt");
                 let emitted_text = if interrupt {
                     format!("{THINK_CLOSE}\n\necho:resume-")
                 } else if let Some(checkpoint) = &resumed {
@@ -1295,7 +1307,6 @@ impl QwenWorker {
             decoder.mode,
             provider.has_mtp(),
             decoder.dflash2_available(),
-            true,
         )
         .map_err(anyhow::Error::msg)?;
         ensure!(
@@ -1446,7 +1457,9 @@ impl QwenWorker {
             return;
         }
         let mut prepared_images = Vec::with_capacity(job.request.decoded_images.len());
+        let mut image_digests = Vec::with_capacity(job.request.decoded_images.len());
         for image in std::mem::take(&mut job.request.decoded_images) {
+            image_digests.push(decoded_image_digest(image.width, image.height, &image.rgb));
             match self
                 .provider
                 .prepare_image(image.width, image.height, image.rgb)
@@ -1492,6 +1505,18 @@ impl QwenWorker {
         } else {
             None
         };
+        let image_identities: Vec<ImageIdentity> = multimodal_prefill
+            .as_ref()
+            .map(|prefill| {
+                prefill.image_token_ranges.iter().zip(image_digests).map(|(range, digest)| {
+                    ImageIdentity {
+                        token_start: range.start,
+                        token_end: range.end,
+                        digest,
+                    }
+                }).collect()
+            })
+            .unwrap_or_default();
         let prompt_ids = if let Some(prefill) = &multimodal_prefill {
             prefill.prompt_ids.clone()
         } else {
@@ -1541,12 +1566,10 @@ impl QwenWorker {
         sampling.prompt_token_count = Some(prompt_ids.len());
         let mtp_available =
             self.provider.has_mtp() && std::env::var_os("QW_BENCH_DISABLE_MTP").is_none();
-        let dflash2_compatible = constraint.is_none();
         let routed_decoder = match select_qwen35_decoder(
             self.decoder.mode,
             mtp_available,
             self.decoder.dflash2_available(),
-            dflash2_compatible,
         ) {
             Ok(decoder) => decoder,
             Err(error) => {
@@ -1609,7 +1632,7 @@ impl QwenWorker {
         };
         let route = qwen_generation_route(decoder, has_images);
         let mut checkpoint_token_lengths = Vec::new();
-        if self.prefix_cache_enabled && !has_images && cache_snapshot_route(route).is_some() {
+        if self.prefix_cache_enabled && cache_snapshot_route(route).is_some() {
             checkpoint_token_lengths.push(prompt_ids.len());
         }
         debug!(
@@ -1736,7 +1759,7 @@ impl QwenWorker {
             );
         }
         let hit = if resume_entry.is_none() {
-            lookup_cache_route.and_then(|route| cache.lookup(&generation_prompt_ids, route))
+            lookup_cache_route.and_then(|route| cache.lookup(PromptKey::new(&generation_prompt_ids, &image_identities), route))
         } else {
             None
         };
@@ -1757,7 +1780,7 @@ impl QwenWorker {
                     return;
                 }
             },
-            (QwenGenerationRoute::Dflash2Text, None, Some(hit)) => match hit.snapshot() {
+            (QwenGenerationRoute::Dflash2Text | QwenGenerationRoute::Dflash2Multimodal, None, Some(hit)) => match hit.snapshot() {
                 PromptSnapshot::Dflash2(snapshot) => Some(Dflash2PrefixReuse {
                     snapshot,
                     cached_tokens: hit.token_count,
@@ -1952,7 +1975,7 @@ impl QwenWorker {
                             .validate_context_budget(tokens.len(), next.job.request.max_tokens)
                             .is_ok()
                     {
-                        cache.prefetch(&tokens, next_route);
+                        cache.prefetch(PromptKey::text(&tokens), next_route);
                         debug!(
                             event = "cache.prefetch.issued",
                             response_id = %job.admission.response_id,
@@ -2024,6 +2047,9 @@ impl QwenWorker {
                 dflash2_prefix_reuse,
                 &checkpoint_token_lengths,
                 cache_behavior.capture_final_snapshot(),
+                constraint
+                    .as_mut()
+                    .map(|value| value as &mut dyn mlxcel_core::generate::TokenConstraint),
                 &mut emit_delta,
             ),
             #[cfg(feature = "dflash2")]
@@ -2033,6 +2059,12 @@ impl QwenWorker {
                     max_tokens,
                     &sampling,
                     &self.decoder.dflash2_draft_model,
+                    dflash2_prefix_reuse,
+                    &checkpoint_token_lengths,
+                    cache_behavior.capture_final_snapshot(),
+                    constraint
+                        .as_mut()
+                        .map(|value| value as &mut dyn mlxcel_core::generate::TokenConstraint),
                     &mut emit_delta,
                 ),
             QwenGenerationRoute::BaselineText => provider.generate_baseline_streaming(
@@ -2116,7 +2148,7 @@ impl QwenWorker {
                     (completed_tokens.len() == final_snapshot.token_len())
                         .then_some((completed_tokens, final_snapshot))
                 });
-                let metadata = final_work.as_ref().map(|_| ResponseResumeMetadata {
+                let metadata = final_work.as_ref().filter(|_| !has_images && constraint.is_none()).map(|_| ResponseResumeMetadata {
                     response_id: job.admission.response_id.clone(),
                     message_id: job.admission.message_id.clone(),
                     created_unix_seconds: job.admission.created,
@@ -2137,17 +2169,15 @@ impl QwenWorker {
                 });
                 if !prompt_snapshots.is_empty() {
                     self.prefix_cache
-                        .insert(&generation_prompt_ids, prompt_snapshots, cache_route);
+                        .insert(PromptKey::new(&generation_prompt_ids, &image_identities), prompt_snapshots, cache_route);
                 }
-                if let (Some((completed_tokens, final_snapshot)), Some(metadata)) =
-                    (final_work, metadata)
-                {
-                    self.prefix_cache.insert_resume(
-                        &completed_tokens,
-                        final_snapshot,
-                        cache_route,
-                        metadata,
-                    );
+                if let Some((completed_tokens, final_snapshot)) = final_work {
+                    let key = PromptKey::new(&completed_tokens, &image_identities);
+                    if let Some(metadata) = metadata {
+                        self.prefix_cache.insert_resume(key, final_snapshot, cache_route, metadata);
+                    } else {
+                        self.prefix_cache.insert(key, vec![final_snapshot], cache_route);
+                    }
                 }
                 trace!(
                     event = "cache.published",
@@ -2278,11 +2308,11 @@ impl QwenWorker {
             // an empty cache. Disk I/O remains asynchronous inside the prefix cache.
             if !prompt_snapshots.is_empty() {
                 self.prefix_cache
-                    .insert(&generation_prompt_ids, prompt_snapshots, cache_route);
+                    .insert(PromptKey::new(&generation_prompt_ids, &image_identities), prompt_snapshots, cache_route);
             }
             if let Some((completed_tokens, final_snapshot)) = final_work {
                 self.prefix_cache
-                    .insert(&completed_tokens, vec![final_snapshot], cache_route);
+                    .insert(PromptKey::new(&completed_tokens, &image_identities), vec![final_snapshot], cache_route);
             }
             trace!(
                 event = "cache.published",
@@ -2436,6 +2466,42 @@ mod tests {
                 lookahead_route(&lookahead_request(), false, true, decoder, true, false,),
                 None
             );
+        }
+    }
+
+    #[test]
+    fn decoded_image_identity_tracks_pixels_and_dimensions_not_encoding() {
+        let rgb = [1, 2, 3, 4, 5, 6];
+        let digest = decoded_image_digest(2, 1, &rgb);
+        assert_eq!(digest, decoded_image_digest(2, 1, &rgb.to_vec()));
+        assert_ne!(digest, decoded_image_digest(1, 2, &rgb));
+        assert_ne!(digest, decoded_image_digest(2, 1, &[1, 2, 3, 4, 5, 7]));
+    }
+
+    #[cfg(feature = "dflash2")]
+    #[test]
+    fn dflash_image_routes_own_reusable_snapshots() {
+        for mode in [Qwen35GenerationMode::Automatic, Qwen35GenerationMode::Dflash2] {
+            let decoder = select_qwen35_decoder(mode, true, true).expect("available DFlash");
+            let route = qwen_generation_route(decoder, true);
+            assert_eq!(route, QwenGenerationRoute::Dflash2Multimodal);
+            let behavior = cache_behavior(
+                route,
+                true,
+                #[cfg(feature = "specprefill")]
+                true,
+                #[cfg(feature = "specprefill")]
+                false,
+            );
+            assert_eq!(behavior.lookup_route, Some(CacheSnapshotRoute::Dflash2));
+            assert_eq!(behavior.snapshot_route, Some(CacheSnapshotRoute::Dflash2));
+            assert!(behavior.capture_final_snapshot());
+            let mut checkpoints = vec![128];
+            behavior.apply_checkpoint_policy(&mut checkpoints);
+            assert_eq!(checkpoints, [128]);
+        }
+        for mode in [Qwen35GenerationMode::Baseline, Qwen35GenerationMode::Mtp] {
+            assert_eq!(cache_snapshot_route(qwen_generation_route(mode, true)), None);
         }
     }
 
