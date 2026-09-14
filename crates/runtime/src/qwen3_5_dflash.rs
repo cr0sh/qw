@@ -761,6 +761,45 @@ impl DFlash2Attention {
         })
     }
 
+    fn append_context(
+        &self,
+        x_ctx: &MlxArray,
+        cache: &mut DFlash2KVCache,
+    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>, i32, i32) {
+        let ctx_shape = mlxcel_core::array_shape(x_ctx);
+        let b = ctx_shape[0];
+        let mut s = ctx_shape[1];
+        let mut x_ctx = mlxcel_core::copy(x_ctx);
+        if self.is_sliding && s > self.sliding_window - 1 {
+            let skip = s - (self.sliding_window - 1);
+            x_ctx = mlxcel_core::slice(&x_ctx, &[0, skip, 0], &[b, s, ctx_shape[2]]);
+            s = self.sliding_window - 1;
+            if let DFlash2KVCache::Sliding(cache) = cache {
+                cache.offset += skip;
+            }
+        }
+
+        let past_offset = cache.offset();
+        let ctx_keys = self.k_proj.forward(&x_ctx);
+        let ctx_values = self.v_proj.forward(&x_ctx);
+        let ctx_keys = mlxcel_core::reshape(&ctx_keys, &[b, s, self.n_kv_heads, self.head_dim]);
+        let ctx_values = mlxcel_core::reshape(&ctx_values, &[b, s, self.n_kv_heads, self.head_dim]);
+        let ctx_keys = self.k_norm.forward(&ctx_keys);
+        let ctx_keys = mlxcel_core::transpose_axes(&ctx_keys, &[0, 2, 1, 3]);
+        let ctx_values = mlxcel_core::transpose_axes(&ctx_values, &[0, 2, 1, 3]);
+        let ctx_keys = mlxcel_core::fast_rope(
+            &ctx_keys,
+            self.head_dim,
+            false,
+            self.rope_base,
+            1.0,
+            past_offset,
+        );
+        let (keys, values) = cache.update_and_fetch(ctx_keys, ctx_values);
+        let context_len = mlxcel_core::array_shape(&keys)[2];
+        (keys, values, context_len, past_offset + s)
+    }
+
     /// Forward with split projections.
     ///
     /// - `x` — proposal sequence `[B, L, hidden_size]`.
@@ -796,37 +835,7 @@ impl DFlash2Attention {
         let prop_values = mlxcel_core::transpose_axes(&prop_values, &[0, 2, 1, 3]);
 
         let (keys, values, s, proposal_offset) = if let Some(x_ctx) = x_ctx {
-            let ctx_shape = mlxcel_core::array_shape(x_ctx);
-            let mut s = ctx_shape[1];
-            let mut x_ctx = mlxcel_core::copy(x_ctx);
-            if self.is_sliding && s > self.sliding_window - 1 {
-                let skip = s - (self.sliding_window - 1);
-                x_ctx = mlxcel_core::slice(&x_ctx, &[0, skip, 0], &[b, s, ctx_shape[2]]);
-                s = self.sliding_window - 1;
-                if let DFlash2KVCache::Sliding(cache) = cache {
-                    cache.offset += skip;
-                }
-            }
-
-            let past_offset = cache.offset();
-            let ctx_keys = self.k_proj.forward(&x_ctx);
-            let ctx_values = self.v_proj.forward(&x_ctx);
-            let ctx_keys = mlxcel_core::reshape(&ctx_keys, &[b, s, self.n_kv_heads, self.head_dim]);
-            let ctx_values =
-                mlxcel_core::reshape(&ctx_values, &[b, s, self.n_kv_heads, self.head_dim]);
-            let ctx_keys = self.k_norm.forward(&ctx_keys);
-            let ctx_keys = mlxcel_core::transpose_axes(&ctx_keys, &[0, 2, 1, 3]);
-            let ctx_values = mlxcel_core::transpose_axes(&ctx_values, &[0, 2, 1, 3]);
-            let ctx_keys = mlxcel_core::fast_rope(
-                &ctx_keys,
-                self.head_dim,
-                false,
-                self.rope_base,
-                1.0,
-                past_offset,
-            );
-            let (keys, values) = cache.update_and_fetch(ctx_keys, ctx_values);
-            (keys, values, s, past_offset + s)
+            self.append_context(x_ctx, cache)
         } else {
             // A no-context call is valid only immediately after restoring the
             // reusable projected prefix. Its sliding snapshots are captured in
@@ -834,19 +843,24 @@ impl DFlash2Attention {
             let DFlash2KVCache::Sliding(cache) = cache else {
                 unreachable!("only sliding DFlash2 caches have projected-prefix snapshots");
             };
-            let keys = mlxcel_core::share(
+            let s = cache.visible_len();
+            let visible_shape = [b, self.n_kv_heads, s, self.head_dim];
+            let keys = mlxcel_core::slice(
                 cache
                     .keys
-                    .as_ref()
+                    .as_deref()
                     .expect("projected DFlash2 prefix must contain keys"),
+                &[0, 0, 0, 0],
+                &visible_shape,
             );
-            let values = mlxcel_core::share(
+            let values = mlxcel_core::slice(
                 cache
                     .values
-                    .as_ref()
+                    .as_deref()
                     .expect("projected DFlash2 prefix must contain values"),
+                &[0, 0, 0, 0],
+                &visible_shape,
             );
-            let s = mlxcel_core::array_shape(&keys)[2];
             (keys, values, s, cache.offset)
         };
 
@@ -869,7 +883,13 @@ impl DFlash2Attention {
         let keys_combined = mlxcel_core::concatenate(&keys, &prop_keys, 2);
         let values_combined = mlxcel_core::concatenate(&values, &prop_values, 2);
 
-        let mask = self.build_mask(l, s, &keys_combined);
+        let context_start = match cache {
+            DFlash2KVCache::Sliding(cache) if self.is_sliding && s + l > self.sliding_window => {
+                cache.logical_start()
+            }
+            _ => 0,
+        };
+        let mask = self.build_mask(l, s, context_start, &keys_combined);
         let mask_ptr = mask
             .as_ref()
             .map(|m| &**m as *const MlxArray)
@@ -892,7 +912,13 @@ impl DFlash2Attention {
     /// Additive `[1, 1, L, total]` f32 mask (0.0 = attend, -inf = block),
     /// or `None` when no key needs masking. `keys_combined` is
     /// `[B, H, total, D]`; `S` is the context length after trimming.
-    fn build_mask(&self, l: i32, s: i32, keys_combined: &MlxArray) -> Option<UniquePtr<MlxArray>> {
+    fn build_mask(
+        &self,
+        l: i32,
+        s: i32,
+        context_start: i32,
+        keys_combined: &MlxArray,
+    ) -> Option<UniquePtr<MlxArray>> {
         let total = mlxcel_core::array_shape(keys_combined)[2];
         let need_mask = self.is_causal || (self.is_sliding && s + l > self.sliding_window);
         if !need_mask {
@@ -903,7 +929,14 @@ impl DFlash2Attention {
             for key in 0..total {
                 let visible = if self.is_sliding {
                     let in_context = key < s;
-                    let within_window = (s + q - key) < self.sliding_window;
+                    // Single-row updates may return a wrapped physical ring.
+                    // Align the mask without copying/reordering its K/V.
+                    let context_position = if key < context_start {
+                        key + s - context_start
+                    } else {
+                        key - context_start
+                    };
+                    let within_window = (s + q - context_position) < self.sliding_window;
                     let in_block = key >= s;
                     let block_ok = !self.is_causal || (key <= q + s);
                     (in_context && within_window) || (in_block && block_ok)
@@ -1311,6 +1344,19 @@ impl DFlash2DraftModel {
             .collect()
     }
 
+    fn project_context(&self, target_hidden: &MlxArray) -> UniquePtr<MlxArray> {
+        let fc_out = self.fc.forward(target_hidden);
+        self.hidden_norm.forward(&fc_out)
+    }
+
+    /// Populate committed context K/V without evaluating proposal queries.
+    fn cache_context(&self, target_hidden: &MlxArray, caches: &mut [DFlash2KVCache]) {
+        let projected_context = self.project_context(target_hidden);
+        for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
+            layer.self_attn.append_context(&projected_context, cache);
+        }
+    }
+
     /// Backbone forward over the masked draft block, returning the final
     /// normalized hidden states `[1, bs, H]` (SGLang `DFlashDraftModel.forward`
     /// + `norm`).
@@ -1324,10 +1370,7 @@ impl DFlash2DraftModel {
         caches: &mut [DFlash2KVCache],
     ) -> UniquePtr<MlxArray> {
         let mut h = self.embed_tokens.forward(inputs);
-        let projected_context = target_hidden.map(|target_hidden| {
-            let fc_out = self.fc.forward(target_hidden);
-            self.hidden_norm.forward(&fc_out)
-        });
+        let projected_context = target_hidden.map(|hidden| self.project_context(hidden));
         for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
             h = layer.forward(&h, projected_context.as_deref(), cache);
         }
@@ -2243,6 +2286,8 @@ impl Qwen35Dflash2Generator {
         prompt_snapshots: Vec<Dflash2PromptSnapshot>,
         reusable: Option<Dflash2PrefixReuse<'_>>,
         cached_tokens: usize,
+        projected_cache_hit: bool,
+        projected_key: Option<(u64, &[i32])>,
         capture_final_snapshot: bool,
         prefill_start: Instant,
         mut on_token: F,
@@ -2294,17 +2339,17 @@ impl Qwen35Dflash2Generator {
         let mut output = Vec::with_capacity(max_tokens);
         let mut pending = None;
         let mut committed = prompt.len();
-        let mut stats = Dflash2GenerationStats::default();
+        let mut stats = Dflash2GenerationStats {
+            projected_context_cache_hits: usize::from(projected_cache_hit),
+            ..Dflash2GenerationStats::default()
+        };
         let mut decode_start = None;
         let mut stop = GenerationStopReason::MaxTokens;
-        self.caches = self.model.make_cache();
-        let offset = prompt.len() - mlxcel_core::array_shape(&hidden)[1] as usize;
-        for cache in &mut self.caches {
-            match cache {
-                DFlash2KVCache::Full(cache) => cache.offset = offset as i32,
-                DFlash2KVCache::Sliding(cache) => cache.offset = offset as i32,
-            }
-        }
+        let mut projected_base = projected_cache_hit.then(|| {
+            Dflash2SlidingCacheSnapshot::capture(&self.caches)
+                .expect("restored prefix contains sliding K/V")
+        });
+        let mut rebuild_draft_context = true;
         while output.len() < max_tokens {
             let mut verify_state = None;
             let walk_result = if let Some(anchor) = pending {
@@ -2329,9 +2374,74 @@ impl Qwen35Dflash2Generator {
                 block[0] = anchor;
                 let input = mlxcel_core::from_slice_i32(&block, &[1, width as i32]);
                 let draft_start = Instant::now();
+                // A replay leaves a complete raw window, not just new rows.
+                // Restore immutable prompt projections and append only the
+                // generated suffix while that boundary remains in the window.
+                let restore_projection = rebuild_draft_context
+                    && self.hidden_limit != usize::MAX
+                    && committed - prompt.len() < mlxcel_core::array_shape(&hidden)[1] as usize;
+                if restore_projection {
+                    if projected_base.is_none() {
+                        self.caches = self.model.make_cache();
+                        let offset = prompt.len()
+                            - mlxcel_core::array_shape(&base.hidden_concat)[1] as usize;
+                        for cache in &mut self.caches {
+                            match cache {
+                                DFlash2KVCache::Full(cache) => cache.offset = offset as i32,
+                                DFlash2KVCache::Sliding(cache) => cache.offset = offset as i32,
+                            }
+                        }
+                        // Prime before projecting any generated rows, including
+                        // an initial grammar fast-forward. Otherwise a memo
+                        // keyed by the prompt would contain generated context.
+                        self.model
+                            .cache_context(&base.hidden_concat, &mut self.caches);
+                        let snapshots = Dflash2SlidingCacheSnapshot::capture(&self.caches)
+                            .expect("bounded DFlash context uses sliding K/V");
+                        Dflash2SlidingCacheSnapshot::materialize_and_detach_all(&snapshots);
+                        if let Some((snapshot_id, committed_suffix)) = projected_key {
+                            self.projected_prefix = Some(Dflash2ProjectedPrefix {
+                                snapshot_id,
+                                committed_suffix: committed_suffix.to_vec(),
+                                caches: Dflash2SlidingCacheSnapshot::capture(&self.caches)
+                                    .expect("primed sliding context contains K/V"),
+                            });
+                        }
+                        projected_base = Some(snapshots);
+                    }
+                    self.caches = Dflash2SlidingCacheSnapshot::restore_all(
+                        projected_base
+                            .as_deref()
+                            .expect("prompt projections are ready"),
+                    )?;
+                } else if rebuild_draft_context {
+                    self.caches = self.model.make_cache();
+                    let offset = committed - mlxcel_core::array_shape(&hidden)[1] as usize;
+                    for cache in &mut self.caches {
+                        match cache {
+                            DFlash2KVCache::Full(cache) => cache.offset = offset as i32,
+                            DFlash2KVCache::Sliding(cache) => cache.offset = offset as i32,
+                        }
+                    }
+                }
+                let hidden_suffix;
+                let draft_hidden = if restore_projection {
+                    let rows = committed - prompt.len();
+                    if rows == 0 {
+                        None
+                    } else {
+                        let shape = mlxcel_core::array_shape(&hidden);
+                        hidden_suffix =
+                            mlxcel_core::slice(&hidden, &[0, shape[1] - rows as i32, 0], &shape);
+                        Some(&*hidden_suffix)
+                    }
+                } else {
+                    Some(&*hidden)
+                };
+                rebuild_draft_context = false;
                 let proposal = self.model.propose(
                     &input,
-                    Some(&hidden),
+                    draft_hidden,
                     &mut self.caches,
                     target,
                     policy.selector_edge_scale,
@@ -2498,14 +2608,7 @@ impl Qwen35Dflash2Generator {
                 window = capture_final_snapshot.then(|| mlxcel_core::share(&hidden));
                 committed = prompt.len() + output.len();
                 pending = None;
-                self.caches = self.model.make_cache();
-                let offset = committed - mlxcel_core::array_shape(&hidden)[1] as usize;
-                for cache in &mut self.caches {
-                    match cache {
-                        DFlash2KVCache::Full(cache) => cache.offset = offset as i32,
-                        DFlash2KVCache::Sliding(cache) => cache.offset = offset as i32,
-                    }
-                }
+                rebuild_draft_context = true;
             } else if let Some((verify, width)) = verify_state {
                 let rows = committed_dflash2_rows(walk.accepted, output.len() - previous_len);
                 if rows < width {
@@ -2823,8 +2926,7 @@ impl Qwen35Dflash2Generator {
             .iter()
             .any(|&length| length > cached_tokens && length < prompt_tokens.len());
         let projected_caches = reusable
-            // Constrained replay initializes fresh drafter state from raw hiddens.
-            .filter(|_| !segmented_prefill && multimodal.is_none() && constraint.is_none())
+            .filter(|_| !segmented_prefill && multimodal.is_none())
             .and_then(|reuse| {
                 let committed_suffix = &prompt_tokens[reuse.cached_tokens..];
                 self.projected_prefix.as_ref().filter(|projected| {
@@ -2846,6 +2948,11 @@ impl Qwen35Dflash2Generator {
             multimodal,
         )?;
         if let Some(constraint) = constraint {
+            let projected_key = reusable
+                .filter(|_| {
+                    !segmented_prefill && multimodal.is_none() && self.hidden_limit != usize::MAX
+                })
+                .map(|reuse| (reuse.snapshot.id, &prompt_tokens[reuse.cached_tokens..]));
             return self.generate_constrained(
                 target,
                 prompt_tokens,
@@ -2858,6 +2965,8 @@ impl Qwen35Dflash2Generator {
                 prompt_snapshots,
                 reusable,
                 cached_tokens,
+                projected_cache_hit,
+                projected_key,
                 capture_final_snapshot,
                 prefill_start,
                 on_token,
@@ -3414,6 +3523,92 @@ mod tests {
             .chunks_exact(4)
             .map(|bytes| i32::from_ne_bytes(bytes.try_into().expect("i32 bytes")))
             .collect()
+    }
+
+    fn assert_projected_attention_matches_raw(window: i32, context_rows: i32, prefix_rows: i32) {
+        let mut weights = WeightMap::new();
+        for name in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+            weights.insert(
+                format!("attention.{name}.weight"),
+                mlxcel_core::identity(64, mlxcel_core::dtype::FLOAT32),
+            );
+        }
+        for name in ["q_norm", "k_norm"] {
+            weights.insert(
+                format!("attention.{name}.weight"),
+                mlxcel_core::ones(&[64], mlxcel_core::dtype::FLOAT32),
+            );
+        }
+        let attention = DFlash2Attention::from_weights(
+            &weights,
+            "attention",
+            &DFlash2Config {
+                hidden_size: 64,
+                num_attention_heads: 1,
+                num_key_value_heads: 1,
+                head_dim: 64,
+                rms_norm_eps: 1e-6,
+                rope_theta: 10_000.0,
+                layer_types: vec!["sliding_attention".to_owned()],
+                sliding_window: Some(window as usize),
+                is_causal: Some(true),
+                ..Default::default()
+            },
+            0,
+        )
+        .expect("small causal sliding attention");
+        let context_values = (0..context_rows * 64)
+            .map(|index| ((index * 17 + 11) % 101) as f32 / 50.0 - 1.0)
+            .collect::<Vec<_>>();
+        let context = mlxcel_core::from_slice_f32(&context_values, &[1, context_rows, 64]);
+        let proposal_values = (0..3 * 64)
+            .map(|index| ((index * 19 + 23) % 97) as f32 / 48.0 - 1.0)
+            .collect::<Vec<_>>();
+        let proposals = mlxcel_core::from_slice_f32(&proposal_values, &[1, 3, 64]);
+        let make_cache = || DFlash2KVCache::Sliding(RotatingKVCache::new(window - 1));
+        let expected = raw_f32(&attention.forward(&proposals, Some(&context), &mut make_cache()));
+        let prefix = mlxcel_core::slice(&context, &[0, 0, 0], &[1, prefix_rows, 64]);
+        let mut primed = vec![make_cache()];
+        attention.append_context(&prefix, &mut primed[0]);
+        let snapshots = Dflash2SlidingCacheSnapshot::capture(&primed).expect("primed context");
+        Dflash2SlidingCacheSnapshot::materialize_and_detach_all(&snapshots);
+        let suffix = (prefix_rows < context_rows)
+            .then(|| mlxcel_core::slice(&context, &[0, prefix_rows, 0], &[1, context_rows, 64]));
+        // A second restore must remain equivalent after the first live cache
+        // appends into its buffers.
+        for _ in 0..2 {
+            let mut restored =
+                Dflash2SlidingCacheSnapshot::restore_all(&snapshots).expect("restore context");
+            let actual =
+                raw_f32(&attention.forward(&proposals, suffix.as_deref(), &mut restored[0]));
+            assert_eq!(actual.len(), expected.len());
+            for (index, (&actual, &expected)) in actual.iter().zip(&expected).enumerate() {
+                assert!(
+                    (actual - expected).abs() <= 1e-5,
+                    "projected attention differs at {index}: {actual} versus {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn projected_context_append_preserves_causal_attention() {
+        assert_projected_attention_matches_raw(16, 6, 4);
+    }
+
+    #[test]
+    fn projected_single_row_excludes_unused_cache_slots() {
+        assert_projected_attention_matches_raw(16, 1, 1);
+    }
+
+    #[test]
+    fn projected_single_row_append_preserves_sliding_order() {
+        assert_projected_attention_matches_raw(4, 4, 3);
+    }
+
+    #[test]
+    fn projected_single_row_preserves_clipped_absolute_positions() {
+        assert_projected_attention_matches_raw(2, 4, 4);
     }
 
     fn raw_f32(array: &MlxArray) -> Vec<f32> {
@@ -4195,6 +4390,50 @@ mod tests {
         let standalone = generator
             .capture_prompt_snapshot(&target, &prompt)
             .expect("capture extendable full prefix");
+
+        if generator.hidden_limit != usize::MAX {
+            // Priming must preserve the actual draft backbone output, not
+            // merely populate cache fields. Both paths use identical absolute
+            // positions and the same immutable prompt hiddens.
+            let input = mlxcel_core::from_slice_i32(
+                &[
+                    4,
+                    generator.model.config.mask_token_id,
+                    generator.model.config.mask_token_id,
+                ],
+                &[1, 3],
+            );
+            let mut direct_caches = generator.model.make_cache();
+            let mut primed_caches = generator.model.make_cache();
+            for cache in direct_caches.iter_mut().chain(primed_caches.iter_mut()) {
+                match cache {
+                    DFlash2KVCache::Full(cache) => cache.offset = standalone.hidden_offset as i32,
+                    DFlash2KVCache::Sliding(cache) => {
+                        cache.offset = standalone.hidden_offset as i32
+                    }
+                }
+            }
+            let direct = generator.model.hidden_states(
+                &input,
+                Some(&standalone.hidden_concat),
+                &mut direct_caches,
+            );
+            let direct = raw_f32(&mlxcel_core::astype(&direct, mlxcel_core::dtype::FLOAT32));
+            generator
+                .model
+                .cache_context(&standalone.hidden_concat, &mut primed_caches);
+            let snapshots = Dflash2SlidingCacheSnapshot::capture(&primed_caches)
+                .expect("capture independently primed prompt");
+            Dflash2SlidingCacheSnapshot::materialize_and_detach_all(&snapshots);
+            let mut restored = Dflash2SlidingCacheSnapshot::restore_all(&snapshots)
+                .expect("restore independently primed prompt");
+            let primed = generator.model.hidden_states(&input, None, &mut restored);
+            let primed = raw_f32(&mlxcel_core::astype(&primed, mlxcel_core::dtype::FLOAT32));
+            assert_eq!(
+                primed, direct,
+                "context priming must preserve draft hidden states"
+            );
+        }
 
         // Compare an owned replay base, a borrowed exact prompt checkpoint,
         // and a borrowed still-extendable prefix. Consecutive appends must

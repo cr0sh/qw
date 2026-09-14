@@ -285,6 +285,16 @@ adaptive verification-width calibration and asynchronous draft launch as
 unconstrained rounds. Full hidden-context windows are maintained only when
 terminal snapshot capture requires them.
 
+Eligible constrained requests populate and reuse the same exact-prompt projected
+drafter K/V memo as unconstrained requests; no unconstrained warmup is required.
+The key binds the reusable snapshot identity and complete prompt suffix, and
+excludes segmented or new-image prefills. Cold priming projects immutable prompt
+hiddens before any generated rows enter the drafter cache. Replay restores that
+projected base and supplies only generated rows while the prompt boundary remains
+inside the retained window. Evicted boundaries and unbounded attention use the
+raw-context rebuild path. Attention masks use the full visible context and its
+logical ring order, never unused backing capacity.
+
 Greedy selection can reuse an already-allowed unmasked winner only when the
 sampling transforms preserve equivalence to canonical masked selection.
 Verification rows can be sampled together. History-dependent transforms use the
