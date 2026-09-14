@@ -38,6 +38,8 @@ impl TokenizerEnv for LocalTokenizerEnv {
 
 pub struct GrammarFactory {
     parser: ParserFactory,
+    // Bound compilation reuse to one immutable, never-advanced parser template.
+    compiled: std::sync::Mutex<Option<(Value, Constraint)>>,
 }
 
 impl GrammarFactory {
@@ -82,14 +84,20 @@ impl GrammarFactory {
         });
         let parser = constraint_parser_factory(&env)
             .context("failed to initialize structured-output parser")?;
-        Ok(Self { parser })
+        Ok(Self {
+            parser,
+            compiled: std::sync::Mutex::new(None),
+        })
     }
 
     #[cfg(test)]
     pub fn single_byte() -> Result<Self> {
         let env = toktrie::ApproximateTokEnv::single_byte_env();
         let parser = constraint_parser_factory(&env)?;
-        Ok(Self { parser })
+        Ok(Self {
+            parser,
+            compiled: std::sync::Mutex::new(None),
+        })
     }
 
     pub fn compile(&self, format: &OutputFormat) -> Result<Option<GuidanceConstraint>> {
@@ -98,20 +106,38 @@ impl GrammarFactory {
             OutputFormat::JsonObject => Value::Object(Map::new()),
             OutputFormat::JsonSchema { schema, .. } => validate_and_normalize_schema(schema)?,
         };
-        let grammar = TopLevelGrammar {
-            grammars: vec![GrammarWithLexer {
-                name: None,
-                json_schema: Some(schema),
-                lark_grammar: None,
-            }],
-            max_tokens: None,
-        };
-        let parser = self
-            .parser
-            .create_parser(grammar)
-            .context("failed to compile structured-output grammar")?;
+        let mut compiled = self
+            .compiled
+            .lock()
+            .map_err(|_| anyhow::anyhow!("structured-output grammar cache lock poisoned"))?;
+        if !compiled
+            .as_ref()
+            .is_some_and(|(cached_schema, _)| cached_schema == &schema)
+        {
+            let grammar = TopLevelGrammar {
+                grammars: vec![GrammarWithLexer {
+                    name: None,
+                    json_schema: Some(schema.clone()),
+                    lark_grammar: None,
+                }],
+                max_tokens: None,
+            };
+            let parser = self
+                .parser
+                .create_parser(grammar)
+                .context("failed to compile structured-output grammar")?;
+            let mut initial = Constraint::new(parser);
+            initial
+                .compute_mask()
+                .context("failed to initialize structured-output grammar")?;
+            *compiled = Some((schema, initial));
+        }
         Ok(Some(GuidanceConstraint {
-            inner: Constraint::new(parser),
+            inner: compiled
+                .as_ref()
+                .expect("requested grammar was compiled")
+                .1
+                .deep_clone(),
             transaction: None,
         }))
     }
@@ -187,13 +213,61 @@ impl TokenConstraint for GuidanceConstraint {
         Some(self.inner.parser.bytes_since(0))
     }
 
+    fn validate_greedy_token(
+        &mut self,
+        token_id: i32,
+        _logits: &mlxcel_core::MlxArray,
+        _token_history: &[i32],
+    ) -> std::result::Result<Option<bool>, String> {
+        let Ok(token) = u32::try_from(token_id) else {
+            return Ok(None);
+        };
+        let active = self.active();
+        let trie = active.tok_trie();
+        if trie.token(token).is_empty()
+            || trie.is_special_token(token)
+            || trie.eos_tokens().contains(&token)
+            || active.has_pending_stop()
+            || active.step_result().is_stop()
+        {
+            return Ok(None);
+        }
+        if let Some(mask) = active.step_result().sample_mask.as_ref()
+            && !mask.is_zero()
+        {
+            return Ok(Some(mask.is_allowed(token)));
+        }
+        // Raw validation accepts noncanonical tokenizations. Use it only when
+        // no forced token or token-healing prefix restricts the canonical mask.
+        if !active.parser.compute_ff_tokens().is_empty()
+            || !active.parser.parser.currently_forced_bytes().is_empty()
+        {
+            return Ok(None);
+        }
+        active
+            .validate_tokens_raw(&[token])
+            .map(|accepted| Some(accepted == 1))
+            .map_err(|error| error.to_string())
+    }
+
     fn compute_mask(
         &mut self,
         _logits: &mlxcel_core::MlxArray,
         _token_history: &[i32],
     ) -> std::result::Result<ConstraintMask, String> {
         let active = self.active();
-        let step = active.compute_mask().map_err(|error| error.to_string())?;
+        if active.step_result().is_stop() {
+            return Ok(ConstraintMask::Accept);
+        }
+        if active
+            .step_result()
+            .sample_mask
+            .as_ref()
+            .is_none_or(|mask| mask.is_zero())
+        {
+            active.compute_mask().map_err(|error| error.to_string())?;
+        }
+        let step = active.step_result();
         if step.is_stop() {
             return Ok(ConstraintMask::Accept);
         }
@@ -480,6 +554,13 @@ mod tests {
             let previous = constraint.committed_bytes().expect("stable bytes").to_vec();
             let mut proposed = output.clone();
             constraint.begin_transaction().expect("begin proposal");
+            assert_ne!(
+                constraint
+                    .validate_greedy_token(0, &logits, &output)
+                    .unwrap(),
+                Some(true),
+                "JSON never admits an unescaped NUL byte"
+            );
             let mask = constraint.compute_mask(&logits, &output).expect("mask");
             let signature = mask_signature(match &mask {
                 ConstraintMask::Allow(tokens) => ConstraintMask::Allow(tokens.clone()),
@@ -504,25 +585,38 @@ mod tests {
             assert_eq!(constraint.committed_bytes(), Some(previous.as_slice()));
 
             constraint.begin_transaction().expect("begin accepted path");
-            let replay = constraint
-                .compute_mask(&logits, &output)
-                .expect("replay mask");
-            match replay {
-                ConstraintMask::Allow(allowed) => {
-                    assert_eq!(signature, mask_signature(ConstraintMask::Allow(allowed)));
-                    constraint
-                        .commit_token(i32::from(expected[output.len()]))
-                        .expect("replay token")
-                        .apply_to(&mut output)
-                        .expect("apply accepted token");
+            let token = i32::from(expected[output.len()]);
+            if constraint
+                .validate_greedy_token(token, &logits, &output)
+                .expect("validate replay token")
+                == Some(true)
+            {
+                constraint
+                    .commit_token(token)
+                    .expect("commit validated token")
+                    .apply_to(&mut output)
+                    .expect("apply validated token");
+            } else {
+                let replay = constraint
+                    .compute_mask(&logits, &output)
+                    .expect("replay mask");
+                match replay {
+                    ConstraintMask::Allow(allowed) => {
+                        assert_eq!(signature, mask_signature(ConstraintMask::Allow(allowed)));
+                        constraint
+                            .commit_token(token)
+                            .expect("replay token")
+                            .apply_to(&mut output)
+                            .expect("apply accepted token");
+                    }
+                    ConstraintMask::Splice(replayed_commit) => {
+                        assert_eq!(commit, replayed_commit);
+                        replayed_commit
+                            .apply_to(&mut output)
+                            .expect("apply accepted splice");
+                    }
+                    ConstraintMask::Accept => panic!("rollback changed parser acceptance"),
                 }
-                ConstraintMask::Splice(replayed_commit) => {
-                    assert_eq!(commit, replayed_commit);
-                    replayed_commit
-                        .apply_to(&mut output)
-                        .expect("apply accepted splice");
-                }
-                ConstraintMask::Accept => panic!("rollback changed parser acceptance"),
             }
             assert_eq!(output, proposed);
             assert_eq!(constraint.committed_bytes(), Some(previous.as_slice()));
@@ -552,62 +646,67 @@ mod tests {
     #[test]
     fn guidance_fast_forward_produces_schema_valid_json() {
         let factory = GrammarFactory::single_byte().expect("single-byte grammar");
-        let mut constraint = factory
-            .compile(&OutputFormat::JsonSchema {
-                name: "one".to_string(),
-                schema: json!({"type":"integer","const":1}),
-            })
-            .expect("compile grammar")
-            .expect("constraint");
-        let logits = mlxcel_core::from_slice_f32(&[0.0; 262], &[1, 1, 262]);
-        let mut output = Vec::new();
+        // Reuse a completed session's schema, replace the bounded template,
+        // then return to the earlier schema. Every parser must start fresh.
+        for expected in [1, 1, 2, 1] {
+            let mut constraint = factory
+                .compile(&OutputFormat::JsonSchema {
+                    name: "one".to_string(),
+                    schema: json!({"type":"integer","const":expected}),
+                })
+                .expect("compile grammar")
+                .expect("constraint");
+            let logits = mlxcel_core::from_slice_f32(&[0.0; 262], &[1, 1, 262]);
+            let mut output = Vec::new();
 
-        for _ in 0..16 {
-            let previous = constraint.committed_bytes().expect("stable bytes").to_vec();
-            constraint.begin_transaction().expect("begin transaction");
-            let mut accepting = false;
-            match constraint
-                .compute_mask(&logits, &output)
-                .expect("constraint mask")
-            {
-                ConstraintMask::Allow(allowed) => {
-                    let token = if allowed.contains(&(b'1' as i32)) {
-                        b'1' as i32
-                    } else {
-                        *allowed.first().expect("non-empty allowed set")
-                    };
+            for _ in 0..16 {
+                let previous = constraint.committed_bytes().expect("stable bytes").to_vec();
+                constraint.begin_transaction().expect("begin transaction");
+                let mut accepting = false;
+                match constraint
+                    .compute_mask(&logits, &output)
+                    .expect("constraint mask")
+                {
+                    ConstraintMask::Allow(allowed) => {
+                        let desired = i32::from(b'0' + expected);
+                        let token = if allowed.contains(&desired) {
+                            desired
+                        } else {
+                            *allowed.first().expect("non-empty allowed set")
+                        };
+                        constraint
+                            .commit_token(token)
+                            .expect("commit allowed token")
+                            .apply_to(&mut output)
+                            .expect("apply token commit");
+                    }
+                    ConstraintMask::Splice(commit) => {
+                        accepting = commit.accept;
+                        commit.apply_to(&mut output).expect("apply fast-forward");
+                        assert_eq!(constraint.committed_bytes(), Some(previous.as_slice()));
+                    }
+                    ConstraintMask::Accept => accepting = true,
+                }
+                assert_eq!(constraint.committed_bytes(), Some(previous.as_slice()));
+                constraint.commit_transaction().expect("commit transaction");
+                assert!(
                     constraint
-                        .commit_token(token)
-                        .expect("commit allowed token")
-                        .apply_to(&mut output)
-                        .expect("apply token commit");
+                        .committed_bytes()
+                        .expect("stable bytes")
+                        .starts_with(&previous)
+                );
+                if accepting {
+                    break;
                 }
-                ConstraintMask::Splice(commit) => {
-                    accepting = commit.accept;
-                    commit.apply_to(&mut output).expect("apply fast-forward");
-                    assert_eq!(constraint.committed_bytes(), Some(previous.as_slice()));
-                }
-                ConstraintMask::Accept => accepting = true,
             }
-            assert_eq!(constraint.committed_bytes(), Some(previous.as_slice()));
-            constraint.commit_transaction().expect("commit transaction");
-            assert!(
-                constraint
-                    .committed_bytes()
-                    .expect("stable bytes")
-                    .starts_with(&previous)
-            );
-            if accepting {
-                break;
-            }
-        }
 
-        let bytes = output
-            .into_iter()
-            .map(|token| u8::try_from(token).expect("single-byte token"))
-            .collect::<Vec<_>>();
-        assert_eq!(constraint.committed_bytes(), Some(bytes.as_slice()));
-        let value: Value = serde_json::from_slice(&bytes).expect("valid JSON");
-        assert_eq!(value, json!(1));
+            let bytes = output
+                .into_iter()
+                .map(|token| u8::try_from(token).expect("single-byte token"))
+                .collect::<Vec<_>>();
+            assert_eq!(constraint.committed_bytes(), Some(bytes.as_slice()));
+            let value: Value = serde_json::from_slice(&bytes).expect("valid JSON");
+            assert_eq!(value, json!(expected));
+        }
     }
 }

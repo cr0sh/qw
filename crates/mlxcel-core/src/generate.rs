@@ -724,6 +724,21 @@ pub trait TokenConstraint {
         None
     }
 
+    /// Optionally validate an unmasked greedy winner without building a full mask.
+    ///
+    /// `Some(true)` must mean `compute_mask` would allow this token for the same
+    /// logits, history, and active transaction. Validation must not commit output.
+    /// Return `None` for unsupported checks or pending splice/accept transitions;
+    /// `Some(false)` rejects the candidate. Both use the ordinary mask path.
+    fn validate_greedy_token(
+        &mut self,
+        _token_id: i32,
+        _logits: &MlxArray,
+        _token_history: &[i32],
+    ) -> Result<Option<bool>, String> {
+        Ok(None)
+    }
+
     fn compute_mask(
         &mut self,
         logits: &MlxArray,

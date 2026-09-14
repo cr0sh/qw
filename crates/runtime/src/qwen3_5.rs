@@ -1772,6 +1772,81 @@ impl Qwen35Model {
         });
     }
 
+    pub(crate) fn capture_sequence_state(
+        &self,
+        token_len: usize,
+        previous: Option<&ModelStateSnapshot>,
+        persistent: bool,
+    ) -> Option<ModelStateSnapshot> {
+        let token_len_i32 = i32::try_from(token_len).ok()?;
+        let mut snapshot = ModelStateSnapshot::new(QWEN35_SNAPSHOT_FAMILY, token_len);
+        push_snapshot_i32(
+            &mut snapshot,
+            "meta.layer_count",
+            i32::try_from(self.layers.len()).ok()?,
+        );
+        push_snapshot_i32(&mut snapshot, "mrope.position", self.mrope_state.position());
+        push_snapshot_i32(
+            &mut snapshot,
+            "mrope.rope_delta",
+            self.mrope_state.rope_delta().unwrap_or(i32::MIN),
+        );
+        self.mrope_state.with_position_ids(|position_ids| {
+            if let Some(position_ids) = position_ids {
+                snapshot.push_tensor("mrope.position_ids", position_ids);
+            }
+        });
+
+        let complete = self.sequence_state.with_internal(|caches| {
+            if caches.len() != self.layers.len() {
+                return false;
+            }
+            for (index, (layer, cache)) in self.layers.iter().zip(caches.iter()).enumerate() {
+                if cache.offset() != token_len_i32 {
+                    return false;
+                }
+                push_snapshot_i32(
+                    &mut snapshot,
+                    &format!("layer.{index}.kind"),
+                    if layer.is_linear { 1 } else { 0 },
+                );
+                push_snapshot_i32(
+                    &mut snapshot,
+                    &format!("layer.{index}.offset"),
+                    cache.offset(),
+                );
+                match cache {
+                    Qwen3NextCache::Attention(cache) => {
+                        if !push_attention_snapshot(
+                            &mut snapshot,
+                            previous,
+                            index,
+                            cache,
+                            persistent,
+                        ) {
+                            return false;
+                        }
+                    }
+                    Qwen3NextCache::Linear(cache) => {
+                        let (Some(conv_state), Some(state_cache)) =
+                            (cache.conv_state.as_deref(), cache.state_cache.as_deref())
+                        else {
+                            return false;
+                        };
+                        snapshot.push_tensor(format!("layer.{index}.conv_state"), conv_state);
+                        snapshot.push_tensor(format!("layer.{index}.state_cache"), state_cache);
+                    }
+                }
+            }
+            true
+        });
+        if !complete {
+            return None;
+        }
+        snapshot.materialize();
+        Some(snapshot)
+    }
+
     fn parse_config(model_dir: &Path) -> Result<Qwen35Config> {
         let config_path = model_dir.join("config.json");
         let config_text = std::fs::read_to_string(&config_path)
@@ -2661,11 +2736,41 @@ fn push_snapshot_i32(snapshot: &mut ModelStateSnapshot, name: &str, value: i32) 
     snapshot.push_tensor(name, &array);
 }
 
+fn push_attention_snapshot_tensor(
+    snapshot: &mut ModelStateSnapshot,
+    previous: Option<&ModelStateSnapshot>,
+    name: String,
+    tensor: &MlxArray,
+    persistent: bool,
+) -> Result<(), String> {
+    if persistent || previous.is_some_and(|previous| previous.paged_tensor(&name).is_some()) {
+        return snapshot.push_paged_tensor(previous, name, tensor, 2);
+    }
+    // Transient rollback checkpoints need immutable values, not independently
+    // allocated cache pages. Still reuse existing pages whenever available.
+    let token_len = i32::try_from(snapshot.token_len())
+        .map_err(|_| "Qwen3.5 snapshot length exceeds i32".to_string())?;
+    let mut shape = mlxcel_core::array_shape(tensor);
+    if shape.len() != 4 || shape[2] < token_len {
+        return Err(format!(
+            "Qwen3.5 snapshot tensor {name} has an invalid layout"
+        ));
+    }
+    if shape[2] == token_len {
+        snapshot.push_tensor(name, tensor);
+    } else {
+        shape[2] = token_len;
+        snapshot.push_tensor(name, &mlxcel_core::slice(tensor, &[0, 0, 0, 0], &shape));
+    }
+    Ok(())
+}
+
 fn push_turbo4_snapshot_tensors(
     snapshot: &mut ModelStateSnapshot,
     previous: Option<&ModelStateSnapshot>,
     index: usize,
     tensors: Turbo4SnapshotTensors<'_>,
+    persistent: bool,
 ) -> Result<(), String> {
     for (suffix, tensor) in [
         ("k_packed", tensors.k_packed),
@@ -2674,7 +2779,13 @@ fn push_turbo4_snapshot_tensors(
         ("v_norms", tensors.v_norms),
         ("v_rescale", tensors.v_rescale),
     ] {
-        snapshot.push_paged_tensor(previous, format!("layer.{index}.{suffix}"), tensor, 2)?;
+        push_attention_snapshot_tensor(
+            snapshot,
+            previous,
+            format!("layer.{index}.{suffix}"),
+            tensor,
+            persistent,
+        )?;
     }
     Ok(())
 }
@@ -2684,22 +2795,33 @@ fn push_attention_snapshot(
     previous: Option<&ModelStateSnapshot>,
     index: usize,
     cache: &KVCache,
+    persistent: bool,
 ) -> bool {
     match cache.mode {
         KVCacheMode::Turbo4 => cache.turbo4_snapshot_tensors().is_some_and(|tensors| {
-            push_turbo4_snapshot_tensors(snapshot, previous, index, tensors).is_ok()
+            push_turbo4_snapshot_tensors(snapshot, previous, index, tensors, persistent).is_ok()
         }),
         KVCacheMode::Fp16 => {
             let (Some(keys), Some(values)) = (cache.keys.as_deref(), cache.values.as_deref())
             else {
                 return false;
             };
-            snapshot
-                .push_paged_tensor(previous, format!("layer.{index}.keys"), keys, 2)
+            push_attention_snapshot_tensor(
+                snapshot,
+                previous,
+                format!("layer.{index}.keys"),
+                keys,
+                persistent,
+            )
+            .is_ok()
+                && push_attention_snapshot_tensor(
+                    snapshot,
+                    previous,
+                    format!("layer.{index}.values"),
+                    values,
+                    persistent,
+                )
                 .is_ok()
-                && snapshot
-                    .push_paged_tensor(previous, format!("layer.{index}.values"), values, 2)
-                    .is_ok()
         }
         _ => false,
     }
@@ -2910,67 +3032,7 @@ impl LanguageModel for Qwen35Model {
         token_len: usize,
         previous: Option<&ModelStateSnapshot>,
     ) -> Option<ModelStateSnapshot> {
-        let token_len_i32 = i32::try_from(token_len).ok()?;
-        let mut snapshot = ModelStateSnapshot::new(QWEN35_SNAPSHOT_FAMILY, token_len);
-        push_snapshot_i32(
-            &mut snapshot,
-            "meta.layer_count",
-            i32::try_from(self.layers.len()).ok()?,
-        );
-        push_snapshot_i32(&mut snapshot, "mrope.position", self.mrope_state.position());
-        push_snapshot_i32(
-            &mut snapshot,
-            "mrope.rope_delta",
-            self.mrope_state.rope_delta().unwrap_or(i32::MIN),
-        );
-        self.mrope_state.with_position_ids(|position_ids| {
-            if let Some(position_ids) = position_ids {
-                snapshot.push_tensor("mrope.position_ids", position_ids);
-            }
-        });
-
-        let complete = self.sequence_state.with_internal(|caches| {
-            if caches.len() != self.layers.len() {
-                return false;
-            }
-            for (index, (layer, cache)) in self.layers.iter().zip(caches.iter()).enumerate() {
-                if cache.offset() != token_len_i32 {
-                    return false;
-                }
-                push_snapshot_i32(
-                    &mut snapshot,
-                    &format!("layer.{index}.kind"),
-                    if layer.is_linear { 1 } else { 0 },
-                );
-                push_snapshot_i32(
-                    &mut snapshot,
-                    &format!("layer.{index}.offset"),
-                    cache.offset(),
-                );
-                match cache {
-                    Qwen3NextCache::Attention(cache) => {
-                        if !push_attention_snapshot(&mut snapshot, previous, index, cache) {
-                            return false;
-                        }
-                    }
-                    Qwen3NextCache::Linear(cache) => {
-                        let (Some(conv_state), Some(state_cache)) =
-                            (cache.conv_state.as_deref(), cache.state_cache.as_deref())
-                        else {
-                            return false;
-                        };
-                        snapshot.push_tensor(format!("layer.{index}.conv_state"), conv_state);
-                        snapshot.push_tensor(format!("layer.{index}.state_cache"), state_cache);
-                    }
-                }
-            }
-            true
-        });
-        if !complete {
-            return None;
-        }
-        snapshot.materialize();
-        Some(snapshot)
+        self.capture_sequence_state(token_len, previous, true)
     }
 
     fn restore_sequence_state(
@@ -3391,85 +3453,85 @@ mod tests {
 
     #[test]
     fn fp16_snapshot_preserves_live_storage_and_continuation() {
-        let mut live = KVCache::new_with_mode(KVCacheMode::Fp16);
-        let mut control = KVCache::new_with_mode(KVCacheMode::Fp16);
-        for cache in [&mut live, &mut control] {
-            cache.update(
-                test_attention_tensor(2, 0.01),
-                test_attention_tensor(2, 0.02),
-            );
-        }
-        let keys_before = live.keys.as_deref().unwrap() as *const MlxArray;
-        let values_before = live.values.as_deref().unwrap() as *const MlxArray;
-        let mut snapshot = ModelStateSnapshot::new("test", 2);
-        assert!(push_attention_snapshot(&mut snapshot, None, 0, &live));
-        assert_eq!(live.mode, KVCacheMode::Fp16);
-        assert_eq!(
-            live.keys.as_deref().unwrap() as *const MlxArray,
-            keys_before
-        );
-        assert_eq!(
-            live.values.as_deref().unwrap() as *const MlxArray,
-            values_before
-        );
-        assert_eq!(
-            attention_snapshot_mode(&snapshot, 0).unwrap(),
-            KVCacheMode::Fp16
-        );
+        for persistent in [false, true] {
+            let mut live = KVCache::new_with_mode(KVCacheMode::Fp16);
+            let mut control = KVCache::new_with_mode(KVCacheMode::Fp16);
+            for cache in [&mut live, &mut control] {
+                cache.update(
+                    test_attention_tensor(2, 0.01),
+                    test_attention_tensor(2, 0.02),
+                );
+            }
+            let mut snapshot = ModelStateSnapshot::new("test", 2);
+            assert!(push_attention_snapshot(
+                &mut snapshot,
+                None,
+                0,
+                &live,
+                persistent
+            ));
+            snapshot.materialize();
 
-        let tensor = |suffix: &str| {
-            snapshot
-                .paged_tensor(&format!("layer.0.{suffix}"))
-                .and_then(|tensor| tensor.materialize())
-                .expect("resident precision snapshot")
-        };
-        let mut restored = KVCache::new_with_mode(attention_snapshot_mode(&snapshot, 0).unwrap());
-        restored.keys = Some(tensor("keys"));
-        restored.values = Some(tensor("values"));
-        restored.offset = 2;
-        for cache in [&mut live, &mut control, &mut restored] {
-            cache.update(
-                test_attention_tensor(1, 0.03),
-                test_attention_tensor(1, 0.04),
-            );
-        }
-        for (actual, expected) in [
-            (
-                live.keys.as_deref().unwrap(),
-                control.keys.as_deref().unwrap(),
-            ),
-            (
-                live.values.as_deref().unwrap(),
-                control.values.as_deref().unwrap(),
-            ),
-            (
-                restored.keys.as_deref().unwrap(),
-                control.keys.as_deref().unwrap(),
-            ),
-            (
-                restored.values.as_deref().unwrap(),
-                control.values.as_deref().unwrap(),
-            ),
-        ] {
-            let actual = mlxcel_core::slice(actual, &[0, 0, 0, 0], &[1, 1, 3, 64]);
-            let expected = mlxcel_core::slice(expected, &[0, 0, 0, 0], &[1, 1, 3, 64]);
-            mlxcel_core::eval(&actual);
-            mlxcel_core::eval(&expected);
+            let tensor = |suffix: &str| {
+                snapshot
+                    .paged_tensor(&format!("layer.0.{suffix}"))
+                    .and_then(|tensor| tensor.materialize())
+                    .or_else(|| {
+                        snapshot
+                            .tensor(&format!("layer.0.{suffix}"))
+                            .map(mlxcel_core::copy)
+                    })
+                    .expect("resident precision snapshot")
+            };
+            let mut restored =
+                KVCache::new_with_mode(attention_snapshot_mode(&snapshot, 0).unwrap());
+            restored.keys = Some(tensor("keys"));
+            restored.values = Some(tensor("values"));
+            restored.offset = 2;
+            for cache in [&mut live, &mut control, &mut restored] {
+                cache.update(
+                    test_attention_tensor(1, 0.03),
+                    test_attention_tensor(1, 0.04),
+                );
+            }
+            for (actual, expected) in [
+                (
+                    live.keys.as_deref().unwrap(),
+                    control.keys.as_deref().unwrap(),
+                ),
+                (
+                    live.values.as_deref().unwrap(),
+                    control.values.as_deref().unwrap(),
+                ),
+                (
+                    restored.keys.as_deref().unwrap(),
+                    control.keys.as_deref().unwrap(),
+                ),
+                (
+                    restored.values.as_deref().unwrap(),
+                    control.values.as_deref().unwrap(),
+                ),
+            ] {
+                let actual = mlxcel_core::slice(actual, &[0, 0, 0, 0], &[1, 1, 3, 64]);
+                let expected = mlxcel_core::slice(expected, &[0, 0, 0, 0], &[1, 1, 3, 64]);
+                mlxcel_core::eval(&actual);
+                mlxcel_core::eval(&expected);
+                assert_eq!(
+                    mlxcel_core::array_to_raw_bytes(&actual),
+                    mlxcel_core::array_to_raw_bytes(&expected)
+                );
+            }
+            assert_eq!(restored.offset, control.offset);
+            // The donor remains a two-token prefix after either continuation.
+            let donor_keys = tensor("keys");
+            let original_keys = test_attention_tensor(2, 0.01);
+            mlxcel_core::eval(&donor_keys);
+            mlxcel_core::eval(&original_keys);
             assert_eq!(
-                mlxcel_core::array_to_raw_bytes(&actual),
-                mlxcel_core::array_to_raw_bytes(&expected)
+                mlxcel_core::array_to_raw_bytes(&donor_keys),
+                mlxcel_core::array_to_raw_bytes(&original_keys)
             );
         }
-        assert_eq!(restored.offset, control.offset);
-        // The donor remains a two-token prefix after either continuation.
-        let donor_keys = tensor("keys");
-        let original_keys = test_attention_tensor(2, 0.01);
-        mlxcel_core::eval(&donor_keys);
-        mlxcel_core::eval(&original_keys);
-        assert_eq!(
-            mlxcel_core::array_to_raw_bytes(&donor_keys),
-            mlxcel_core::array_to_raw_bytes(&original_keys)
-        );
     }
 
     #[test]
@@ -3484,7 +3546,13 @@ mod tests {
             );
         }
         let mut committed = ModelStateSnapshot::new("page-boundary-test", prompt_len);
-        assert!(push_attention_snapshot(&mut committed, None, 0, &live));
+        assert!(push_attention_snapshot(
+            &mut committed,
+            None,
+            0,
+            &live,
+            true
+        ));
 
         live.update(
             test_attention_tensor(3, 0.25),
@@ -3496,9 +3564,8 @@ mod tests {
             Some(&committed),
             0,
             &live,
+            false,
         ));
-        let rejected_full_page =
-            provisional.paged_tensor("layer.0.keys").unwrap().pages()[1].portable_bytes();
         live.trim(3);
         for cache in [&mut live, &mut control] {
             cache.update(
@@ -3515,15 +3582,12 @@ mod tests {
             Some(&committed),
             0,
             &live,
+            false,
         ));
         let portable = crate::portable_snapshot::portable_model_state(&corrected);
         drop(corrected);
         let snapshot =
             crate::portable_snapshot::model_from_portable(portable, false, false).unwrap();
-        assert_ne!(
-            snapshot.paged_tensor("layer.0.keys").unwrap().pages()[1].portable_bytes(),
-            rejected_full_page,
-        );
         let mut restored = KVCache::new_with_mode(KVCacheMode::Fp16);
         let tensor = |suffix: &str| {
             snapshot

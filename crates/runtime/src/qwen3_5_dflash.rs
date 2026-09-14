@@ -1780,6 +1780,7 @@ impl Dflash2PromptSnapshot {
         hidden_concat: &MlxArray,
         continuation_logits: &MlxArray,
         previous: Option<&Self>,
+        persistent: bool,
     ) -> Result<Self, String> {
         let hidden_rows = mlxcel_core::array_shape(hidden_concat)[1] as usize;
         let hidden_offset = token_len
@@ -1787,10 +1788,10 @@ impl Dflash2PromptSnapshot {
             .ok_or_else(|| "DFlash2 hidden context exceeds its target boundary".to_string())?;
         target.materialize_mtp_cache_state();
         let target = target
-            .snapshot_sequence_state(
-                SequenceId::from_raw(0),
+            .capture_sequence_state(
                 token_len,
                 previous.map(|snapshot| &snapshot.target),
+                persistent,
             )
             .ok_or_else(|| {
                 format!("failed to capture DFlash2 target state at {token_len} tokens")
@@ -2240,6 +2241,7 @@ impl Qwen35Dflash2Generator {
         prompt_hidden: UniquePtr<MlxArray>,
         prompt_logits: UniquePtr<MlxArray>,
         prompt_snapshots: Vec<Dflash2PromptSnapshot>,
+        reusable: Option<Dflash2PrefixReuse<'_>>,
         cached_tokens: usize,
         capture_final_snapshot: bool,
         prefill_start: Instant,
@@ -2248,16 +2250,47 @@ impl Qwen35Dflash2Generator {
         use crate::qwen3_5_mtp::{
             constrained_greedy_walk, constrained_initial_step, constrained_stochastic_walk,
         };
-        let base = Dflash2PromptSnapshot::capture(
-            target,
-            prompt.len(),
-            &prompt_hidden,
-            &prompt_logits,
-            prompt_snapshots.last(),
-        )?;
-        let mut hidden = mlxcel_core::share(&base.hidden_concat);
-        let mut window = mlxcel_core::share(&base.hidden_concat);
-        let mut logits = mlxcel_core::share(&base.continuation_logits);
+        // Exact checkpoints already own detached immutable target/hidden state.
+        // A shorter prefix cannot anchor replay at the full prompt boundary.
+        let existing_base = prompt_snapshots
+            .last()
+            .filter(|snapshot| snapshot.token_len() == prompt.len())
+            .or_else(|| {
+                reusable
+                    .filter(|reuse| reuse.cached_tokens == prompt.len())
+                    .map(|reuse| reuse.snapshot)
+            });
+        // The first token uses prefill logits, not the packed target cache.
+        // Freeze an owned rollback base only before the first target mutation,
+        // after real content can be emitted. All capture work remains timed.
+        let captured_base = std::cell::OnceCell::new();
+        let get_base = || -> Result<&Dflash2PromptSnapshot, String> {
+            if let Some(snapshot) = existing_base {
+                return Ok(snapshot);
+            }
+            captured_base
+                .get_or_init(|| {
+                    Dflash2PromptSnapshot::capture(
+                        target,
+                        prompt.len(),
+                        &prompt_hidden,
+                        &prompt_logits,
+                        prompt_snapshots
+                            .last()
+                            .or_else(|| reusable.map(|reuse| reuse.snapshot)),
+                        false,
+                    )
+                })
+                .as_ref()
+                .map_err(Clone::clone)
+        };
+        let mut hidden = mlxcel_core::share(
+            existing_base.map_or(&prompt_hidden, |snapshot| &snapshot.hidden_concat),
+        );
+        let mut window = capture_final_snapshot.then(|| mlxcel_core::share(&hidden));
+        let mut logits = mlxcel_core::share(
+            existing_base.map_or(&prompt_logits, |snapshot| &snapshot.continuation_logits),
+        );
         let mut output = Vec::with_capacity(max_tokens);
         let mut pending = None;
         let mut committed = prompt.len();
@@ -2275,7 +2308,14 @@ impl Qwen35Dflash2Generator {
         while output.len() < max_tokens {
             let mut verify_state = None;
             let walk_result = if let Some(anchor) = pending {
-                let policy = self.calibration.policy(prompt.len() + output.len());
+                let initialize_base = existing_base.is_none() && captured_base.get().is_none();
+                let base = get_base()?;
+                if initialize_base {
+                    hidden = mlxcel_core::share(&base.hidden_concat);
+                    window = capture_final_snapshot.then(|| mlxcel_core::share(&hidden));
+                }
+                let round_context_tokens = prompt.len() + output.len();
+                let policy = self.calibration.policy(round_context_tokens);
                 let width = context_bounded_verify_width(
                     policy.width,
                     target
@@ -2284,6 +2324,7 @@ impl Qwen35Dflash2Generator {
                         .min(self.model.config.max_position_embeddings),
                     committed,
                 );
+                let round_compute_start = Instant::now();
                 let mut block = vec![self.model.config.mask_token_id; width];
                 block[0] = anchor;
                 let input = mlxcel_core::from_slice_i32(&block, &[1, width as i32]);
@@ -2296,6 +2337,7 @@ impl Qwen35Dflash2Generator {
                     policy.selector_edge_scale,
                     sampling,
                 )?;
+                mlxcel_core::async_eval(&proposal.path);
                 stats.draft_time += draft_start.elapsed();
                 let anchor = mlxcel_core::slice(&input, &[0, 0], &[1, 1]);
                 let input = mlxcel_core::concatenate(&anchor, &proposal.path, 1);
@@ -2340,6 +2382,15 @@ impl Qwen35Dflash2Generator {
                 stats.target_verify_time += verify_start.elapsed();
                 if let Ok(walk) = &result {
                     stats.record_round(policy, width, walk.accepted, tokens.len());
+                    if width == policy.width {
+                        self.calibration.observe(
+                            round_context_tokens,
+                            policy,
+                            walk.accepted,
+                            tokens.len(),
+                            round_compute_start.elapsed(),
+                        );
+                    }
                 }
                 verify_state = Some((verify, width));
                 result
@@ -2361,8 +2412,11 @@ impl Qwen35Dflash2Generator {
                     None => {
                         // An atomic parser splice cannot be partially committed.
                         // Restore the already-published sequence before stopping.
+                        let base = get_base()?;
                         target.restore_sequence_state(SequenceId::from_raw(0), &base.target)?;
-                        window = mlxcel_core::share(&base.hidden_concat);
+                        target.finish_initial_prefill();
+                        window =
+                            capture_final_snapshot.then(|| mlxcel_core::share(&base.hidden_concat));
                         logits = mlxcel_core::share(&base.continuation_logits);
                         if !output.is_empty() {
                             let input =
@@ -2372,11 +2426,13 @@ impl Qwen35Dflash2Generator {
                                 &self.target_layer_ids,
                                 self.hidden_limit,
                             )?;
-                            window = merge_hidden_context(
-                                &window,
-                                &replay.hidden_concat,
-                                self.hidden_limit,
-                            );
+                            if let Some(prefix) = window.take() {
+                                window = Some(merge_hidden_context(
+                                    &prefix,
+                                    &replay.hidden_concat,
+                                    self.hidden_limit,
+                                ));
+                            }
                             logits = replay.first_logits;
                             stats.target_forward_calls += 1;
                         }
@@ -2386,8 +2442,8 @@ impl Qwen35Dflash2Generator {
                 };
             let previous_len = output.len();
             if decode_start.is_none() && !walk.output.is_empty() {
-                // Match unconstrained timing: include prompt materialization
-                // and first-token selection in prefill, then time decoding.
+                // Match unconstrained timing: the prompt forward pass and
+                // first-token selection finish before decoding is timed.
                 stats.prefill_time = prefill_start.elapsed();
                 decode_start = Some(Instant::now());
             }
@@ -2405,10 +2461,14 @@ impl Qwen35Dflash2Generator {
                 })
             };
             if walk.rebuild {
+                let base = get_base()?;
                 // Recurrent rows cannot be rewound arbitrarily. Replay only
                 // generated text from an immutable image-aware prompt boundary.
                 target.restore_sequence_state(SequenceId::from_raw(0), &base.target)?;
-                window = mlxcel_core::share(&base.hidden_concat);
+                // Standalone reusable prefixes can still contain initial FP16
+                // attention state. Restore also resets prefill completion.
+                target.finish_initial_prefill();
+                hidden = mlxcel_core::share(&base.hidden_concat);
                 logits = mlxcel_core::share(&base.continuation_logits);
                 if !output.is_empty() {
                     let input = mlxcel_core::from_slice_i32(&output, &[1, output.len() as i32]);
@@ -2417,13 +2477,15 @@ impl Qwen35Dflash2Generator {
                         &self.target_layer_ids,
                         self.hidden_limit,
                     )?;
-                    window =
-                        merge_hidden_context(&window, &replay.hidden_concat, self.hidden_limit);
+                    hidden =
+                        merge_hidden_context(&hidden, &replay.hidden_concat, self.hidden_limit);
                     logits = replay.first_logits;
                     stats.target_forward_calls += 1;
                 }
-                window = materialize_detached(window);
-                hidden = mlxcel_core::share(&window);
+                if capture_final_snapshot {
+                    hidden = materialize_detached(hidden);
+                }
+                window = capture_final_snapshot.then(|| mlxcel_core::share(&hidden));
                 committed = prompt.len() + output.len();
                 pending = None;
                 self.caches = self.model.make_cache();
@@ -2441,8 +2503,13 @@ impl Qwen35Dflash2Generator {
                 }
                 committed += rows;
                 hidden = concatenate_hiddens(&verify.hidden_by_layer, rows);
-                window =
-                    materialize_detached(merge_hidden_context(&window, &hidden, self.hidden_limit));
+                if let Some(prefix) = window.take() {
+                    window = Some(materialize_detached(merge_hidden_context(
+                        &prefix,
+                        &hidden,
+                        self.hidden_limit,
+                    )));
+                }
                 let shape = mlxcel_core::array_shape(&verify.logits);
                 logits = mlxcel_core::slice(
                     &verify.logits,
@@ -2464,6 +2531,7 @@ impl Qwen35Dflash2Generator {
             }
         }
         let final_snapshot = if capture_final_snapshot {
+            let base = get_base()?;
             if committed < prompt.len() + output.len() {
                 let suffix = &output[committed - prompt.len()..];
                 let input = mlxcel_core::from_slice_i32(suffix, &[1, suffix.len() as i32]);
@@ -2472,16 +2540,21 @@ impl Qwen35Dflash2Generator {
                     &self.target_layer_ids,
                     self.hidden_limit,
                 )?;
-                window = merge_hidden_context(&window, &tail.hidden_concat, self.hidden_limit);
+                window = Some(merge_hidden_context(
+                    window.as_deref().expect("capture retains hidden window"),
+                    &tail.hidden_concat,
+                    self.hidden_limit,
+                ));
                 logits = tail.first_logits;
                 stats.target_forward_calls += 1;
             }
             Some(Dflash2PromptSnapshot::capture(
                 target,
                 prompt.len() + output.len(),
-                &window,
+                window.as_deref().expect("capture retains hidden window"),
                 &logits,
-                Some(&base),
+                Some(base),
+                true,
             )?)
         } else {
             None
@@ -2528,6 +2601,7 @@ impl Qwen35Dflash2Generator {
             &prefill.hidden_concat,
             &prefill.first_logits,
             None,
+            true,
         )
     }
 
@@ -2648,6 +2722,7 @@ impl Qwen35Dflash2Generator {
                     snapshots
                         .last()
                         .or_else(|| reuse.map(|reuse| reuse.snapshot)),
+                    true,
                 )?;
                 // Continue from detached immutable boundary rows rather than
                 // retaining the preceding prefill construction graph.
@@ -2738,7 +2813,8 @@ impl Qwen35Dflash2Generator {
             .iter()
             .any(|&length| length > cached_tokens && length < prompt_tokens.len());
         let projected_caches = reusable
-            .filter(|_| !segmented_prefill && multimodal.is_none())
+            // Constrained replay initializes fresh drafter state from raw hiddens.
+            .filter(|_| !segmented_prefill && multimodal.is_none() && constraint.is_none())
             .and_then(|reuse| {
                 let committed_suffix = &prompt_tokens[reuse.cached_tokens..];
                 self.projected_prefix.as_ref().filter(|projected| {
@@ -2770,6 +2846,7 @@ impl Qwen35Dflash2Generator {
                 hidden_concat.expect("constrained replay retains prompt hidden"),
                 first_logits,
                 prompt_snapshots,
+                reusable,
                 cached_tokens,
                 capture_final_snapshot,
                 prefill_start,
@@ -3032,6 +3109,7 @@ impl Qwen35Dflash2Generator {
                 prompt_snapshots
                     .last()
                     .or_else(|| reusable.map(|reuse| reuse.snapshot)),
+                true,
             )?)
         } else {
             None
@@ -3895,15 +3973,11 @@ mod tests {
     fn constrained_cancellation_retains_atomic_splice_without_more_callbacks() {
         let mut output = vec![1, 2];
         let mut observed = Vec::new();
-        let keep_going = emit_committed_dflash2_walk(
-            &mut output,
-            vec![1, 3, 4],
-            None,
-            &mut |token, _| {
+        let keep_going =
+            emit_committed_dflash2_walk(&mut output, vec![1, 3, 4], None, &mut |token, _| {
                 observed.push(token);
                 false
-            },
-        );
+            });
         assert!(!keep_going);
         assert_eq!(observed, [3]);
         // Token 4 belongs to the committed splice even though cancellation
@@ -4078,6 +4152,99 @@ mod tests {
         let mut integer = hidden;
         integer.dtype = mlxcel_core::dtype::INT32;
         assert!(restore(integer, 6, logits).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires real QW_MODEL_PATH and QW_DFLASH_DRAFT_MODEL_PATH checkpoints"]
+    fn real_model_constrained_prompt_bases_restore_after_splice_and_rollback() {
+        use mlxcel_core::generate::ConstraintCommit;
+
+        let model_dir = crate::resolve_model_path(None).expect("resolve target");
+        let draft_dir = crate::resolve_dflash2_draft_path(None).expect("resolve drafter");
+        let target =
+            Qwen35Model::load(&model_dir, crate::KVCacheMode::Turbo4).expect("load target");
+        let mut generator = Qwen35Dflash2Generator::new(&target, &draft_dir).expect("load drafter");
+        let prompt = [1, 2, 3];
+        let sampling = SamplingConfig::greedy();
+        target.reset_runtime_state();
+        let standalone = generator
+            .capture_prompt_snapshot(&target, &prompt)
+            .expect("capture extendable full prefix");
+
+        // Compare an owned replay base, a borrowed exact prompt checkpoint,
+        // and a borrowed still-extendable prefix. Both parser outcomes restore
+        // the base; the accepted splice additionally replays committed tokens.
+        for budget in [1, 2] {
+            let mut reference = None;
+            for source in 0..3 {
+                for _ in 0..2 {
+                    target.reset_runtime_state();
+                    let mut constraint = PathConstraint {
+                        path: vec![4],
+                        committed: Vec::new(),
+                        saved: None,
+                        splice: None,
+                        replacement: Some(ConstraintCommit {
+                            backtrack: 0,
+                            tokens: vec![6, 7],
+                            accept: true,
+                        }),
+                    };
+                    let reuse = (source == 2).then_some(Dflash2PrefixReuse {
+                        snapshot: &standalone,
+                        cached_tokens: prompt.len(),
+                    });
+                    let checkpoints = if source == 1 {
+                        vec![prompt.len()]
+                    } else {
+                        Vec::new()
+                    };
+                    let generated = generator
+                        .generate_streaming_with_prefill(
+                            &target,
+                            &prompt,
+                            budget,
+                            &sampling,
+                            reuse,
+                            &checkpoints,
+                            true,
+                            None,
+                            Some(&mut constraint),
+                            |_, _| true,
+                        )
+                        .expect("restore parser boundary and capture aligned final state");
+                    let expected: &[i32] = if budget == 1 { &[] } else { &[6, 7] };
+                    assert_eq!(generated.token_ids, expected);
+                    assert_eq!(constraint.committed, expected);
+                    let final_snapshot = generated.final_snapshot.expect("final snapshot");
+                    let mut continuation_prompt = prompt.to_vec();
+                    continuation_prompt.extend_from_slice(expected);
+                    assert_eq!(final_snapshot.token_len(), continuation_prompt.len());
+                    let resumed = generator
+                        .generate_streaming_with_prefill(
+                            &target,
+                            &continuation_prompt,
+                            8,
+                            &sampling,
+                            Some(Dflash2PrefixReuse {
+                                snapshot: &final_snapshot,
+                                cached_tokens: continuation_prompt.len(),
+                            }),
+                            &[],
+                            false,
+                            None,
+                            None,
+                            |_, _| true,
+                        )
+                        .expect("generate after parser replay or rollback");
+                    if let Some(reference) = &reference {
+                        assert_eq!(&resumed.token_ids, reference);
+                    } else {
+                        reference = Some(resumed.token_ids);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
