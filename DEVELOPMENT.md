@@ -370,7 +370,7 @@ pending draft GPU work, so they are not isolated GPU phase measurements.
 
 Local build logs, benchmark rows, fixture/model hashes, and source provenance
 are retained under `target/dflash2-opt-20260912-151310/`. Rejected candidates
-remain on trial branches, not in the integrated runtime.
+were not integrated; their trial branches and worktrees were removed.
 
 ## DFlash2 deep bottleneck investigation
 
@@ -452,8 +452,10 @@ timing-boundary change was used to manufacture a gain.
 
 Logs, source/binary hashes, numerical probe rows, and the latency calculation
 are retained in `target/dflash2-deep-20260912/results-and-provenance.json` and
-its neighboring logs. Experimental sources remain committed on their trial
-branches, separate from the accepted runtime.
+its neighboring logs. Experimental branches and worktrees were removed without
+integrating their sources. The later physical-counter measurement artifacts
+remain under `target/dflash2-physical-20260912/`; diagnostic branches and
+worktrees were also removed.
 
 ## GPU serialization
 
