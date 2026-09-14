@@ -10,6 +10,13 @@ model is
 [Jundot/Qwen3.8-27B-oQ4e-fp16-mtp](https://huggingface.co/Jundot/Qwen3.8-27B-oQ4e-fp16-mtp).
 It is not a general multi-model or CUDA/ROCm runtime.
 
+QW also supports:
+
+- MTP with included heads in the default model checkpoint
+- DFlash2 speculative decoding (depends on `--features dflash2`, enabled by default)
+- Image vision
+- Grammar constrained decoding
+
 ## Showcase
 
 Asciicast demo implementing a QR Code generator webapp(no speedup):
@@ -93,96 +100,16 @@ The `dflash` option requires a build with the `dflash2` feature and an
 available draft checkpoint. Use `--help` for the options enabled by the
 current build.
 
-## Image inputs
-
-Vision-capable checkpoints accept image inputs with baseline, MTP, and DFlash2
-decoding. `--decoder auto` prefers an available DFlash2 drafter for image and
-text requests, including structured output. DFlash2 verifies its proposals
-against the image-conditioned target; it does not fall back to text-only inference.
-
-Use `image_url` parts in user messages on `/v1/chat/completions`:
-
-```json
-{
-  "model": "qwen3.8-27b",
-  "messages": [{
-    "role": "user",
-    "content": [
-      {"type": "text", "text": "Describe this image."},
-      {"type": "image_url", "image_url": {"url": "data:image/png;base64,<base64 PNG bytes>"}}
-    ]
-  }]
-}
-```
-
-The `/v1/responses` equivalent is an `input_image` part whose `image_url` is the
-data URI string. Both endpoints support buffered and streaming responses and
-multiple images. PNG, JPEG, and WebP must be supplied as base64 data URIs;
-remote image URLs are not fetched. Limits are 16 images per request, 64 MiB of
-source bytes per image, and 128 MiB for the complete JSON request body.
-
-DFlash2 supports image-aware prefix caching in memory and on disk. Cache
-identity includes decoded image content, dimensions, order, and token spans;
-adding another image or conversation turn can reuse an earlier matching prefix.
-Reuse skips cached target-model prefill, not image validation or vision encoding.
-Baseline and MTP image requests still do not use prefix snapshots.
-
-Response continuation checkpoints remain limited to unconstrained text requests.
-Image and structured-output requests can reuse prefixes in new requests, but
-cannot resume an interrupted response through `resume_response_id`.
-
-Rust callers can submit `protocol::parse_chat` or `protocol::parse_responses`
-results directly to `Engine::submit`. Submission validates and decodes the current
-image sources before queue admission, replacing any previously decoded pixels.
-Invalid images or inconsistent image metadata return `SubmitError::InvalidRequest`,
-which the HTTP handlers expose as a structured 400 response.
-
-OCR fixtures and the source-photo manifest are in `tests/fixtures/images`.
-The copyrighted Krispy Kreme and Yousuf Karsh photos are fetched locally rather
-than redistributed; see the manifest's source and rights information.
-
-## Structured output
-
-Baseline, MTP, and DFlash2 support JSON-object and JSON Schema constraints,
-including requests with images. Explicit `--decoder dflash` and automatic
-selection retain DFlash2 for constrained requests.
-
-Add `response_format` to a `/v1/chat/completions` request:
-
-```json
-{
-  "response_format": {
-    "type": "json_schema",
-    "json_schema": {
-      "name": "result",
-      "strict": true,
-      "schema": {
-        "type": "object",
-        "properties": {"answer": {"type": "string"}},
-        "required": ["answer"],
-        "additionalProperties": false
-      }
-    }
-  }
-}
-```
-
-For `/v1/responses`, put `type`, `name`, `strict`, and `schema` directly under
-`text.format`. Both buffered and streaming endpoints enforce the constraints.
-An output-token limit can still stop generation before the JSON is complete;
-check the response's finish status. DFlash2 applies parser-forced token splices
-atomically and stops before a splice that cannot fit the remaining budget.
-
 ## Historical performance
 
 Latest complete `cargo bench` results (tokens/s), with the implementation at
 [commit `7894f5d`](https://github.com/cr0sh/qw/commit/7894f5d7cd5f34096fc1bb544f5124920a6c923d):
 
-| Context | Target prefill | DFlash2 decode |
-|---|---:|---:|
-| Fresh | 253.955 | 55.936 |
-| 10,337-token cached prefix | 232.401 | 54.412 |
-| 64,297-token cached prefix | 154.698 | 36.252 |
+| Context                    | Target prefill | DFlash2 decode |
+| -------------------------- | -------------: | -------------: |
+| Fresh                      |        253.955 |         55.936 |
+| 10,337-token cached prefix |        232.401 |         54.412 |
+| 64,297-token cached prefix |        154.698 |         36.252 |
 
 Fresh prefill processes 4,341 prompt tokens; cached-prefix prefill processes
 only the 288 newly appended tokens, not the cached prefix. Decode excludes
@@ -204,7 +131,6 @@ Cache layout, GPU serialization, and benchmark commands are collected in
 [`DEVELOPMENT.md`](DEVELOPMENT.md). When running GPU work from more than one
 worktree, always invoke it through `./gpu-lock -- ...`; do not delete the
 shared lock file.
-
 
 ## Evaluation
 
