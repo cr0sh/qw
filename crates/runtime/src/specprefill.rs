@@ -15,8 +15,7 @@ use mlxcel_core::{MlxArray, UniquePtr};
 
 use crate::qwen3_5::Qwen35Model;
 
-pub const SPECPREFILL_DRAFT_MODEL_IDENTIFIER: &str =
-    "mlx-community/Qwen3.5-0.8B-MLX-8bit";
+pub const SPECPREFILL_DRAFT_MODEL_IDENTIFIER: &str = "mlx-community/Qwen3.5-0.8B-MLX-8bit";
 
 const LOOKAHEAD_TOKENS: usize = 8;
 const POOL_WIDTH: i32 = 13;
@@ -45,7 +44,10 @@ impl Default for SpecPrefillConfig {
 
 impl SpecPrefillConfig {
     pub(crate) fn validate(self, prompt_len: usize) -> Result<()> {
-        ensure!(self.min_tokens > 0, "SpecPrefill min_tokens must be greater than zero");
+        ensure!(
+            self.min_tokens > 0,
+            "SpecPrefill min_tokens must be greater than zero"
+        );
         ensure!(
             self.keep_rate.is_finite() && self.keep_rate > 0.0 && self.keep_rate <= 1.0,
             "SpecPrefill keep_rate must be in (0, 1]"
@@ -172,10 +174,18 @@ fn compute_importance(
         let transposed_keys = mlxcel_core::transpose_axes(keys, &[0, 1, 3, 2]);
         let grouped_keys = mlxcel_core::expand_dims(&transposed_keys, 2);
         let scores = mlxcel_core::matmul(&grouped_queries, &grouped_keys);
-        let scale = mlxcel_core::full_f32(&[1], 1.0 / (key_shape[3] as f32).sqrt(), mlxcel_core::dtype::FLOAT32);
-        let scores = mlxcel_core::multiply(&mlxcel_core::astype(&scores, mlxcel_core::dtype::FLOAT32), &scale);
+        let scale = mlxcel_core::full_f32(
+            &[1],
+            1.0 / (key_shape[3] as f32).sqrt(),
+            mlxcel_core::dtype::FLOAT32,
+        );
+        let scores = mlxcel_core::multiply(
+            &mlxcel_core::astype(&scores, mlxcel_core::dtype::FLOAT32),
+            &scale,
+        );
         let weights = mlxcel_core::softmax_precise(&scores, -1);
-        let weights = mlxcel_core::reshape(&weights, &[-1, LOOKAHEAD_TOKENS as i32, prompt_len as i32]);
+        let weights =
+            mlxcel_core::reshape(&weights, &[-1, LOOKAHEAD_TOKENS as i32, prompt_len as i32]);
         all_scores = Some(match all_scores {
             Some(existing) => mlxcel_core::concatenate(&existing, &weights, 0),
             None => weights,
@@ -272,31 +282,67 @@ mod tests {
         assert_eq!(SpecPrefillConfig::default().keep_rate, 0.25);
         assert_eq!(SpecPrefillConfig::default().keep_first_tokens, 256);
         assert_eq!(SpecPrefillConfig::default().keep_last_tokens, 256);
-        assert!(SpecPrefillConfig { min_tokens: 0, ..Default::default() }.validate(10).is_err());
-        assert!(SpecPrefillConfig { keep_rate: 0.0, ..Default::default() }.validate(10).is_err());
-        assert!(SpecPrefillConfig { keep_rate: 1.01, ..Default::default() }.validate(10).is_err());
-        assert!(SpecPrefillConfig { protected_prefix_tokens: 11, ..Default::default() }.validate(10).is_err());
-        assert!(SpecPrefillConfig {
-            min_tokens: 1,
-            keep_rate: 1.0,
-            protected_prefix_tokens: 10,
-            keep_first_tokens: 0,
-            keep_last_tokens: 0,
-        }
-        .validate(10)
-        .is_ok());
+        assert!(
+            SpecPrefillConfig {
+                min_tokens: 0,
+                ..Default::default()
+            }
+            .validate(10)
+            .is_err()
+        );
+        assert!(
+            SpecPrefillConfig {
+                keep_rate: 0.0,
+                ..Default::default()
+            }
+            .validate(10)
+            .is_err()
+        );
+        assert!(
+            SpecPrefillConfig {
+                keep_rate: 1.01,
+                ..Default::default()
+            }
+            .validate(10)
+            .is_err()
+        );
+        assert!(
+            SpecPrefillConfig {
+                protected_prefix_tokens: 11,
+                ..Default::default()
+            }
+            .validate(10)
+            .is_err()
+        );
+        assert!(
+            SpecPrefillConfig {
+                min_tokens: 1,
+                keep_rate: 1.0,
+                protected_prefix_tokens: 10,
+                keep_first_tokens: 0,
+                keep_last_tokens: 0,
+            }
+            .validate(10)
+            .is_ok()
+        );
     }
 
     #[test]
     fn threshold_equality_stays_dense() {
-        let config = SpecPrefillConfig { min_tokens: 8, ..Default::default() };
+        let config = SpecPrefillConfig {
+            min_tokens: 8,
+            ..Default::default()
+        };
         assert!(!should_activate(8, config));
         assert!(should_activate(9, config));
     }
 
     #[test]
     fn cached_and_protected_prefix_take_the_larger_boundary() {
-        let config = SpecPrefillConfig { protected_prefix_tokens: 40, ..Default::default() };
+        let config = SpecPrefillConfig {
+            protected_prefix_tokens: 40,
+            ..Default::default()
+        };
         assert_eq!(dense_prefix_end(20, config), 40);
         assert_eq!(dense_prefix_end(60, config), 60);
     }
@@ -311,16 +357,14 @@ mod tests {
     #[test]
     fn mandatory_disjoint_ends_are_selected_exactly() {
         let importance = vec![0.0; 1024];
-        let selected =
-            select_target_indices(&importance, 7, 1031, selection_config(0.01));
+        let selected = select_target_indices(&importance, 7, 1031, selection_config(0.01));
         let expected = (7..263).chain(775..1031).collect::<Vec<_>>();
         assert_eq!(selected, expected);
     }
 
     #[test]
     fn overlapping_mandatory_ends_select_every_token_once() {
-        let selected =
-            select_target_indices(&vec![0.0; 400], 10, 410, selection_config(0.01));
+        let selected = select_target_indices(&vec![0.0; 400], 10, 410, selection_config(0.01));
         assert_eq!(selected, (10..410).collect::<Vec<_>>());
     }
 
@@ -328,8 +372,7 @@ mod tests {
     fn partial_ranked_chunk_joins_mandatory_ends() {
         let mut importance = vec![0.0; 525];
         importance[256..288].fill(1.0);
-        let selected =
-            select_target_indices(&importance, 5, 530, selection_config(0.01));
+        let selected = select_target_indices(&importance, 5, 530, selection_config(0.01));
         assert_eq!(selected, (5..530).collect::<Vec<_>>());
     }
 
@@ -337,8 +380,7 @@ mod tests {
     fn mandatory_ends_can_exceed_budget_and_are_sorted_unique() {
         let mut importance = vec![0.0; 1024];
         importance[512..544].fill(1.0);
-        let selected =
-            select_target_indices(&importance, 7, 1031, selection_config(0.01));
+        let selected = select_target_indices(&importance, 7, 1031, selection_config(0.01));
         assert_eq!(selected.len(), 2 * 256 + CHUNK_TOKENS);
         assert!(selected.windows(2).all(|pair| pair[0] < pair[1]));
         assert_eq!(selected.first(), Some(&7));
@@ -363,8 +405,7 @@ mod tests {
 
     #[test]
     fn complete_keep_rate_selects_every_eligible_token() {
-        let selected =
-            select_target_indices(&vec![0.0; 65], 35, 100, selection_config(1.0));
+        let selected = select_target_indices(&vec![0.0; 65], 35, 100, selection_config(1.0));
         assert_eq!(selected, (35..100).collect::<Vec<_>>());
     }
 }

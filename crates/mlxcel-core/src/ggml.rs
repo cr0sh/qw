@@ -93,7 +93,9 @@ pub enum GgmlQuantError {
     UnsupportedQType(u32),
     #[error("packed GGML dimensions must be positive")]
     EmptyShape,
-    #[error("packed GGML input width {width} is not aligned to qtype {qtype:?} block size {block_elements}")]
+    #[error(
+        "packed GGML input width {width} is not aligned to qtype {qtype:?} block size {block_elements}"
+    )]
     UnalignedWidth {
         qtype: GgmlQType,
         width: usize,
@@ -264,7 +266,10 @@ impl GgmlQuantizedMatrix {
         }
         let input_rows = i32::try_from(input_rows).map_err(|_| GgmlQuantError::Overflow)?;
         let input_dtype = crate::array_dtype(input);
-        if !matches!(input_dtype, dtype::FLOAT16 | dtype::FLOAT32 | dtype::BFLOAT16) {
+        if !matches!(
+            input_dtype,
+            dtype::FLOAT16 | dtype::FLOAT32 | dtype::BFLOAT16
+        ) {
             return Err(GgmlQuantError::InputDType(input_dtype));
         }
         crate::ggml_packed_matmul(
@@ -283,7 +288,11 @@ impl GgmlQuantizedMatrix {
         if input_rows == 0 {
             return Err(GgmlQuantError::EmptyShape);
         }
-        let rows_per_group = if input_rows == 1 { 1 } else { input_rows.min(4) };
+        let rows_per_group = if input_rows == 1 {
+            1
+        } else {
+            input_rows.min(4)
+        };
         let groups = input_rows
             .checked_add(rows_per_group - 1)
             .and_then(|rows| rows.checked_div(rows_per_group))
@@ -325,12 +334,7 @@ impl GgmlQuantizedEmbedding {
         vocab_size: usize,
     ) -> Result<Self, GgmlQuantError> {
         Ok(Self {
-            matrix: GgmlQuantizedMatrix::from_bytes(
-                bytes,
-                qtype_id,
-                embedding_dim,
-                vocab_size,
-            )?,
+            matrix: GgmlQuantizedMatrix::from_bytes(bytes, qtype_id, embedding_dim, vocab_size)?,
         })
     }
 
@@ -383,7 +387,10 @@ impl GgmlQuantizedEmbedding {
         self.matrix.forward(input)
     }
 
-    pub fn dispatch_stats(&self, selected_rows: usize) -> Result<GgmlDispatchStats, GgmlQuantError> {
+    pub fn dispatch_stats(
+        &self,
+        selected_rows: usize,
+    ) -> Result<GgmlDispatchStats, GgmlQuantError> {
         if selected_rows == 0 {
             return Err(GgmlQuantError::EmptyIndices);
         }
@@ -413,7 +420,8 @@ fn validate_device_buffers(
     let packed = packed.as_ref().ok_or(GgmlQuantError::InvalidTable)?;
     if crate::array_dtype(packed) != dtype::UINT8
         || crate::array_nbytes(packed) != expected_bytes
-        || crate::array_shape(packed) != [i32::try_from(expected_bytes).map_err(|_| GgmlQuantError::Overflow)?]
+        || crate::array_shape(packed)
+            != [i32::try_from(expected_bytes).map_err(|_| GgmlQuantError::Overflow)?]
     {
         return Err(GgmlQuantError::ByteLength {
             expected: expected_bytes,

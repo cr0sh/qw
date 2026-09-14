@@ -55,7 +55,6 @@ impl GatedDeltaCache {
     pub fn advance(&mut self, step: i32) {
         self.offset += step;
     }
-
 }
 
 impl Default for GatedDeltaCache {
@@ -691,4 +690,3 @@ fn precise_swiglu_gate(x: &MlxArray, gate: &MlxArray, target_dtype: i32) -> Uniq
     let product = mlxcel_core::multiply(&gate_silu, &x_f32);
     restore_dtype(product, target_dtype)
 }
-

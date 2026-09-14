@@ -29,14 +29,11 @@ pub(crate) fn merge_llava(
     let flat_features =
         mlxcel_core::astype(&flat_features, mlxcel_core::array_dtype(input_embeddings));
 
-    let image_token =
-        mlxcel_core::full_f32(&[1], image_token_id as f32, mlxcel_core::dtype::INT32);
+    let image_token = mlxcel_core::full_f32(&[1], image_token_id as f32, mlxcel_core::dtype::INT32);
     let image_token = mlxcel_core::astype(&image_token, mlxcel_core::dtype::INT32);
     let is_image = mlxcel_core::equal(input_ids, &image_token);
-    let image_count = mlxcel_core::sum_all(&mlxcel_core::astype(
-        &is_image,
-        mlxcel_core::dtype::INT32,
-    ));
+    let image_count =
+        mlxcel_core::sum_all(&mlxcel_core::astype(&is_image, mlxcel_core::dtype::INT32));
     mlxcel_core::eval(&image_count);
     ensure!(
         mlxcel_core::item_i32(&image_count) == feature_rows,
