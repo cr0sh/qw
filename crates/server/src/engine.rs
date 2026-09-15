@@ -1970,21 +1970,21 @@ impl QwenWorker {
         // evict its staged result. Tokenization is CPU-only and uses exactly the
         // ordinary request path; failures are retried/reported only at its turn.
         cache.clear_prefetch();
-        if let Some(next) = next.as_deref_mut() {
-            if let Some(next_route) = lookahead_route(
+        if let Some(next) = next.as_deref_mut()
+            && let Some(next_route) = lookahead_route(
                 &next.job.request,
                 next.job.cancelled.load(Ordering::Acquire),
                 self.prefix_cache_enabled,
                 self.decoder.mode,
                 mtp_available,
                 self.decoder.dflash2_available(),
-            ) {
-                if let Ok(tokens) = text_prompt_ids(
+            )
+                && let Ok(tokens) = text_prompt_ids(
                     provider,
                     &next.job.request,
                     next.job.request.enable_thinking,
-                ) {
-                    if !next.job.cancelled.load(Ordering::Acquire)
+                )
+                    && !next.job.cancelled.load(Ordering::Acquire)
                         && provider
                             .validate_context_budget(tokens.len(), next.job.request.max_tokens)
                             .is_ok()
@@ -1999,15 +1999,11 @@ impl QwenWorker {
                         );
                         next.prompt_ids = Some(tokens);
                     }
-                }
-            }
-        }
         let mut emit_delta = |fragment: &str| {
-            if let Some(next) = next.as_deref_mut() {
-                if next.job.cancelled.load(Ordering::Acquire) && next.prompt_ids.take().is_some() {
+            if let Some(next) = next.as_deref_mut()
+                && next.job.cancelled.load(Ordering::Acquire) && next.prompt_ids.take().is_some() {
                     cache.clear_prefetch();
                 }
-            }
             if job.cancelled.load(Ordering::Acquire) {
                 return false;
             }

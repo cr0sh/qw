@@ -464,11 +464,10 @@ fn validate_manifest(ns: &str, m: &Manifest) -> Result<(), String> {
         {
             return Err("cache array descriptor is invalid".into());
         }
-        if let Some(old) = sizes.insert(a.blob_sha256.clone(), a.byte_len) {
-            if old != a.byte_len {
+        if let Some(old) = sizes.insert(a.blob_sha256.clone(), a.byte_len)
+            && old != a.byte_len {
                 return Err("cache blob descriptor sizes disagree".into());
             }
-        }
     }
     for t in &m.paged_tensors {
         let mut end = 0;
@@ -482,11 +481,10 @@ fn validate_manifest(ns: &str, m: &Manifest) -> Result<(), String> {
                 return Err("cache page descriptor is invalid".into());
             }
             end = p.token_end;
-            if let Some(old) = sizes.insert(p.blob_sha256.clone(), p.byte_len) {
-                if old != p.byte_len {
+            if let Some(old) = sizes.insert(p.blob_sha256.clone(), p.byte_len)
+                && old != p.byte_len {
                     return Err("cache blob descriptor sizes disagree".into());
                 }
-            }
         }
         if t.name.is_empty() || t.token_len == 0 || end != t.token_len {
             return Err("cache pages do not cover token length".into());

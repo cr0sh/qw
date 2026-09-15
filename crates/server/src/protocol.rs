@@ -468,7 +468,7 @@ pub fn parse_chat(value: Value) -> Result<CompletionRequest, RequestError> {
         wire.functions
             .unwrap_or_default()
             .into_iter()
-            .map(|function| json_object_tool(function)),
+            .map(json_object_tool),
     );
     let tools = parse_tools(&tool_values, ToolDialect::Chat)?;
     let tool_choice = parse_tool_choice(wire.tool_choice.as_ref().or(wire.function_call.as_ref()))?;

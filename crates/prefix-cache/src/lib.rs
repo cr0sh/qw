@@ -698,15 +698,14 @@ impl AdaptivePrefixCache {
                 .trie
                 .terminal(node, route)
                 .and_then(|terminal| terminal.persistent_key.clone());
-            if let Some(key) = key {
-                if let Some(loaded) = self.load_persistent(node, route, &key, now) {
+            if let Some(key) = key
+                && let Some(loaded) = self.load_persistent(node, route, &key, now) {
                     if let PersistentMatch::Restored(snapshot) = loaded {
                         restored = Some(snapshot);
                     }
                     hit = Some((node, length));
                     break;
                 }
-            }
         }
         let Some((node, token_count)) = hit else {
             tracing::debug!(phase = "cache.lookup", hit = false, route = route.as_str());
@@ -1308,8 +1307,7 @@ impl AdaptivePrefixCache {
                 .trie
                 .terminal(node, route)
                 .is_some_and(|terminal| terminal.expires_at_unix_ms <= now)
-            {
-                if let Some(terminal) = self.trie.remove_terminal(node, route) {
+                && let Some(terminal) = self.trie.remove_terminal(node, route) {
                     if let Some(resume) = &terminal.response_resume {
                         self.resumes.remove(&resume.response_id);
                     }
@@ -1329,7 +1327,6 @@ impl AdaptivePrefixCache {
                         route = route.as_str()
                     );
                 }
-            }
         }
         self.rebuild_accounting();
     }
@@ -1684,12 +1681,11 @@ fn io_loop(
                         })
                         .transpose()
                 });
-                if !cancelled.load(Ordering::Acquire) {
-                    if let Ok(Some(decoded)) = decoded {
+                if !cancelled.load(Ordering::Acquire)
+                    && let Ok(Some(decoded)) = decoded {
                         tracing::debug!(phase = "cache.prefetch.ready", entry_id = %key.0);
                         let _ = reply.send((decoded, reservation));
                     }
-                }
                 continue;
             }
             IoCommand::RemoveSync { key, reply } => {

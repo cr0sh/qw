@@ -79,11 +79,10 @@ impl FilesystemSnapshotStore {
                             let _ = fs::remove_file(path);
                             continue;
                         }
-                        if let Ok(bytes) = fs::read(&path) {
-                            if let Ok(m) = serde_json::from_slice::<crate::Manifest>(&bytes) {
+                        if let Ok(bytes) = fs::read(&path)
+                            && let Ok(m) = serde_json::from_slice::<crate::Manifest>(&bytes) {
                                 refs.extend(m.blob_sha256);
                             }
-                        }
                     }
                 }
             }
