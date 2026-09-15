@@ -93,9 +93,7 @@ impl FilesystemSnapshotStore {
                 let Some(name) = path.file_name().and_then(|x| x.to_str()) else {
                     continue;
                 };
-                if name.starts_with(".tmp-") || name.contains(".tmp-") {
-                    let _ = fs::remove_file(path);
-                } else if !refs.contains(name) {
+                if name.contains(".tmp-") || !refs.contains(name) {
                     let _ = fs::remove_file(path);
                 }
             }
