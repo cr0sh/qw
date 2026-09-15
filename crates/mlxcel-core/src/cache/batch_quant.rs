@@ -297,11 +297,7 @@ impl BatchKvQuantConfig {
         if !self.skip_last_layer || n_layers == 0 {
             return modes;
         }
-        // Force the last layer to Fp16. We also leave the policy inert
-        // when nominal is already Fp16 (no quantization to skip).
-        if nominal != KVCacheMode::Fp16 {
-            modes[n_layers - 1] = KVCacheMode::Fp16;
-        }
+        modes[n_layers - 1] = KVCacheMode::Fp16;
         modes
     }
 

@@ -29,8 +29,7 @@ pub(crate) fn merge_llava(
     let flat_features =
         mlxcel_core::astype(&flat_features, mlxcel_core::array_dtype(input_embeddings));
 
-    let image_token = mlxcel_core::full_f32(&[1], image_token_id as f32, mlxcel_core::dtype::INT32);
-    let image_token = mlxcel_core::astype(&image_token, mlxcel_core::dtype::INT32);
+    let image_token = mlxcel_core::from_slice_i32(&[image_token_id], &[1]);
     let is_image = mlxcel_core::equal(input_ids, &image_token);
     let image_count =
         mlxcel_core::sum_all(&mlxcel_core::astype(&is_image, mlxcel_core::dtype::INT32));
@@ -60,11 +59,9 @@ fn masked_scatter(
     let mask = mlxcel_core::flatten(expanded_mask);
     let mask_i32 = mlxcel_core::astype(&mask, mlxcel_core::dtype::INT32);
     let cumulative = mlxcel_core::cumsum(&mask_i32, 0, false, true);
-    let one = mlxcel_core::full_f32(&[1], 1.0, mlxcel_core::dtype::INT32);
-    let one = mlxcel_core::astype(&one, mlxcel_core::dtype::INT32);
+    let one = mlxcel_core::from_slice_i32(&[1], &[1]);
     let indices = mlxcel_core::subtract(&cumulative, &one);
-    let zero = mlxcel_core::full_f32(&[1], 0.0, mlxcel_core::dtype::INT32);
-    let zero = mlxcel_core::astype(&zero, mlxcel_core::dtype::INT32);
+    let zero = mlxcel_core::from_slice_i32(&[0], &[1]);
     let indices = mlxcel_core::maximum(&indices, &zero);
     let gathered = mlxcel_core::take(&features, &indices, 0);
     let output = mlxcel_core::where_cond(&mask, &gathered, &embeddings);
@@ -85,10 +82,12 @@ mod tests {
 
     #[test]
     fn scatters_multiple_image_features_in_token_order() {
-        let ids = mlxcel_core::from_slice_i32(&[5, 9, 6, 9], &[1, 4]);
+        // This valid i32 token ID cannot round-trip through f32.
+        let image_token = 16_777_217;
+        let ids = mlxcel_core::from_slice_i32(&[5, image_token, 6, image_token], &[1, 4]);
         let text = mlxcel_core::from_slice_f32(&[0.0; 8], &[1, 4, 2]);
         let vision = mlxcel_core::from_slice_f32(&[1.0, 2.0, 3.0, 4.0], &[2, 2]);
-        let merged = merge_llava(9, &vision, &text, &ids).expect("merge features");
+        let merged = merge_llava(image_token, &vision, &text, &ids).expect("merge features");
         assert_eq!(
             values(&merged),
             vec![0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 3.0, 4.0]

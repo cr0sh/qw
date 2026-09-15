@@ -124,13 +124,13 @@ pub fn gated_delta_step(
 
     // Decay: state = state * g
     let g_ndim = mlxcel_core::array_ndim(g);
-    let decay = if g_ndim == 2 {
-        let g1 = mlxcel_core::expand_dims(g, -1);
-        mlxcel_core::expand_dims(&g1, -1)
-    } else if g_ndim == 3 {
-        mlxcel_core::expand_dims(g, -2)
-    } else {
-        panic!("Unsupported gating shape");
+    let decay = match g_ndim {
+        2 => {
+            let g1 = mlxcel_core::expand_dims(g, -1);
+            mlxcel_core::expand_dims(&g1, -1)
+        }
+        3 => mlxcel_core::expand_dims(g, -2),
+        _ => panic!("Unsupported gating shape"),
     };
 
     let mut new_state = mlxcel_core::multiply(state, &decay);
@@ -290,7 +290,8 @@ pub fn gated_delta_ops(
     // no mask routes through the chunked parallel scan below; vectorized gating
     // ([B, T, Hv, Dk]) or an explicit batch-recovery mask falls through to the
     // sequential reference loop that follows.
-    if mask.is_none() && mlxcel_core::array_ndim(g) == 3 {
+    let g_ndim = mlxcel_core::array_ndim(g);
+    if mask.is_none() && g_ndim == 3 {
         return gated_delta_chunked(
             q_ref,
             k_ref,
@@ -335,7 +336,6 @@ pub fn gated_delta_ops(
             1,
         );
 
-        let g_ndim = mlxcel_core::array_ndim(g);
         let g_t = if g_ndim == 4 {
             mlxcel_core::squeeze_axis(
                 &mlxcel_core::slice(

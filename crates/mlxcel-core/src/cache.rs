@@ -509,30 +509,7 @@ impl std::fmt::Debug for PagedBacking {
 impl KVCache {
     /// Create a new empty KV cache with default step size (256) and FP16 mode.
     pub fn new() -> Self {
-        Self {
-            keys: None,
-            values: None,
-            offset: 0,
-            live_start: 0,
-            step: 256,
-            mode: KVCacheMode::Fp16,
-            key_scales: None,
-            val_scales: None,
-            v_packed: None,
-            v_norms: None,
-            v_rescale: None,
-            k_packed: None,
-            k_rescale: None,
-            turbo_params: None,
-            turbo3_params: None,
-            turbo_seed: TURBO_DEFAULT_SEED,
-            fp16_v_quantize_on_write: false,
-            cold_offset: 0,
-            hot_threshold: turbo::DELEGATED_HOT_THRESHOLD,
-            delegated_fp16_fast_path: turbo::delegated_fp16_fast_path_enabled(),
-            delegated_fp16_sidecar_policy: turbo::delegated_fp16_sidecar_policy(),
-            paged_backing: None,
-        }
+        Self::new_with_mode_and_seed(KVCacheMode::Fp16, TURBO_DEFAULT_SEED)
     }
 
     /// Create a new empty KV cache with the specified quantization mode.
@@ -2293,13 +2270,12 @@ impl KVCache {
         // Turbo4Delegated: hot-first trim. Tokens to remove from cold = max(0, n - hot_len).
         // We adjust cold_offset and offset, then fall through to the per-mode buffer slicing
         // logic below to keep the buffers consistent with the new offsets.
-        let mut hot_trim = 0_i32;
-        let mut cold_trim = 0_i32;
-        if self.mode == KVCacheMode::Turbo4Delegated {
+        let cold_trim = if self.mode == KVCacheMode::Turbo4Delegated {
             let hot_len = self.offset - self.cold_offset;
-            hot_trim = n.min(hot_len);
-            cold_trim = (n - hot_trim).max(0);
-        }
+            (n - n.min(hot_len)).max(0)
+        } else {
+            0
+        };
         self.offset -= n;
         if self.mode == KVCacheMode::Turbo4Delegated {
             self.cold_offset -= cold_trim;
@@ -2388,11 +2364,7 @@ impl KVCache {
                         &[vr_shape[0], vr_shape[1], self.cold_offset, 1],
                     ));
                 }
-                // retired the cold-V dequant memo — nothing to
-                // drop when the cold V body shrinks.
             }
-            // Suppress unused-variable warnings in non-delegated branches.
-            let _ = hot_trim;
         } else {
             // Non-delegated modes: simple buffer-prefix trim.
             // The slice upper bound is the post-trim *live* window length

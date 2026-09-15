@@ -254,18 +254,18 @@ impl Qwen3NextAttention {
 
         let captured_query = capture_query.then(|| mlxcel_core::share(&queries));
 
-        // Symmetric Turbo4 reads packed K/V directly only for the specialized
-        // long-context MTP verify envelope. Other multi-token calls retain
-        // bottom-right causal metadata and use the exact dequant-SDPA fallback.
+        let causal_attention = l > 1 && mask.is_none();
+        // Packed Turbo4 is specialized for long-context MTP verification;
+        // other multi-token calls retain bottom-right causal SDPA semantics.
         let attn_out = if cache.mode == KVCacheMode::Turbo4 {
-            if l > 1 && mask.is_none() {
+            if causal_attention {
                 cache.update_and_turbo4_causal_attention(&queries, keys, values, self.scale)
             } else {
                 cache.update_and_turbo4_attention(&queries, keys, values, self.scale, mask)
             }
         } else {
             let (cache_k, cache_v) = cache.update_and_fetch(keys, values);
-            if l > 1 && mask.is_none() {
+            if causal_attention {
                 mlxcel_core::causal_attention(&queries, &cache_k, &cache_v, self.scale, 0.0, 0)
             } else {
                 let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
@@ -318,6 +318,7 @@ impl Qwen3NextAttention {
             .ok_or_else(|| format!("Missing k_norm weight: {}", prefix))?;
 
         let head_dim = config.head_dim as i32;
+        let rope_dims = config.rope_dims();
 
         Ok(Self {
             qkv_proj,
@@ -328,10 +329,10 @@ impl Qwen3NextAttention {
             num_kv_heads: config.num_key_value_heads as i32,
             head_dim,
             scale: 1.0 / (head_dim as f32).sqrt(),
-            rope_dims: config.rope_dims(),
+            rope_dims,
             rope_base: config.rope_theta,
             mrope: InterleavedMRoPE::new(
-                config.rope_dims() as usize,
+                rope_dims as usize,
                 config.rope_theta,
                 config.mrope_section.clone(),
             ),

@@ -340,12 +340,10 @@ impl TacticStore {
     /// panics. On rename failure the temporary file is removed so no orphaned
     /// `.tmp.<pid>` files accumulate.
     pub fn save(&self, key: &TuneKey, record: &TacticRecord) -> std::io::Result<()> {
-        let Some(dir) = self.dir.clone() else {
+        let Some(dir) = self.dir.as_ref() else {
             return Ok(());
         };
-        let Some(path) = self.record_file(key) else {
-            return Ok(());
-        };
+        let path = dir.join(format!("{}.json", key.hash()));
         std::fs::create_dir_all(&dir)?;
         let body = serde_json::to_string_pretty(record)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;

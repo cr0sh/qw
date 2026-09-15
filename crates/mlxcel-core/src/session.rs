@@ -222,10 +222,7 @@ impl MlxInferenceSession {
     /// prefill through the `*_with_embeddings` methods.
     #[must_use]
     pub fn capabilities(&self) -> SessionCapabilities {
-        SessionCapabilities {
-            multimodal: true,
-            ..SessionCapabilities::single_sequence()
-        }
+        SessionCapabilities::single_sequence().with_multimodal()
     }
 
     /// Reset generator-owned and model-owned caches for a fresh prefill.

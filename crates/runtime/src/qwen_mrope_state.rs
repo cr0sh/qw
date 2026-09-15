@@ -58,9 +58,7 @@ impl MRopeState {
     }
 
     pub(crate) fn clear(&self) {
-        let mut entry = self.fallback.borrow_mut();
-        entry.position_ids = None;
-        entry.rope_deltas = None;
+        *self.fallback.borrow_mut() = MRopeEntry::empty();
         self.position.set(0);
     }
 

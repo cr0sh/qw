@@ -77,23 +77,8 @@ pub(crate) fn apply_multimodal_rotary_pos_emb(
     let rotate = |array: &MlxArray| {
         mlxcel_core::add(
             &mlxcel_core::multiply(array, &cosine),
-            &mlxcel_core::multiply(&rotate_half(array), &sine),
+            &mlxcel_core::multiply(&crate::qwen_vision_rope::rotate_half(array), &sine),
         )
     };
     (rotate(queries), rotate(keys))
-}
-
-fn rotate_half(array: &MlxArray) -> UniquePtr<MlxArray> {
-    let shape = mlxcel_core::array_shape(array);
-    let rank = shape.len();
-    let half = shape[rank - 1] / 2;
-    let starts = vec![0; rank];
-    let mut stops = shape.clone();
-    stops[rank - 1] = half;
-    let first = mlxcel_core::slice(array, &starts, &stops);
-    let mut starts = starts;
-    starts[rank - 1] = half;
-    stops[rank - 1] = shape[rank - 1];
-    let second = mlxcel_core::slice(array, &starts, &stops);
-    mlxcel_core::concatenate(&mlxcel_core::negative(&second), &first, rank as i32 - 1)
 }

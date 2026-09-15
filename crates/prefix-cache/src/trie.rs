@@ -358,9 +358,8 @@ impl RadixTrie {
                 self.nodes[node_id] = None;
                 node_id = parent;
             } else if let Some(child) = only_child {
-                let fragment = self.node(node_id).fragment.clone();
-                let child_fragment = self.node(child).fragment.clone();
-                self.node_mut(child).fragment = [fragment, child_fragment].concat();
+                let prefix = self.node(node_id).fragment.clone();
+                self.node_mut(child).fragment.splice(0..0, prefix);
                 self.node_mut(child).parent = Some(parent);
                 let position = self
                     .node(parent)

@@ -350,7 +350,7 @@ void GatherMM::eval_gpu(const std::vector<array>& inputs, array& out) {
 
   // We are walking a in order and b is also in order so we can batch up the
   // matmuls and reuse reading a and b.
-  if (M == 1 && right_sorted_ == true) {
+  if (M == 1 && right_sorted_) {
     gather_mm_rhs(a, b, rhs_indices, out, encoder, s);
     return;
   }

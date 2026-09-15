@@ -94,26 +94,9 @@ else()
   FetchContent_Declare(
     mlx
     GIT_REPOSITORY "https://github.com/ml-explore/mlx.git"
-    # SINGLE SOURCE OF TRUTH for the pinned MLX commit, issue #1047. No other
-    # file stores this value. Two parsers read this exact line, both scoped to
-    # this declaration by the GIT_REPOSITORY URL just above it:
-    #   src/lib/mlxcel-core/build_support/mlx_pin.rs, used by mlxcel-core's
-    #     build.rs for cache purging, the fetched-HEAD check and the
-    #     MLXCEL_MLX_COMMIT env baked into the binary
-    #   scripts/ci/mlx_pinned_commit.sh, used by release.yml
-    # The awk scan in mlx_pinned_commit.sh is the stricter of the two parsers,
-    # so keeping its shape satisfies both:
-    #   * GIT_TAG must be the first token on its line (leading whitespace is
-    #     fine; nothing else may precede it), followed by a bare or quoted
-    #     40-character lowercase hex sha, e.g. `GIT_TAG 2c46b95...` or
-    #     `GIT_TAG "2c46b95..."`.
-    #   * That line must come after the GIT_REPOSITORY line above naming
-    #     ml-explore/mlx, inside this same FetchContent_Declare(...) call.
-    #   * No line containing a closing paren `)` may appear between the
-    #     GIT_REPOSITORY line and the GIT_TAG line; the awk scan treats any
-    #     `)` as ending the declaration, so one there would hide the tag
-    #     instead of being read past.
-    # Both parsers fail loudly rather than guess when the shape does not hold.
+    # Keep this GIT_TAG as the single source of truth for the MLX pin. The
+    # dependency-free parser in crates/mlxcel-core/build_support/mlx_pin.rs reads
+    # this FetchContent declaration and requires one full 40-character commit SHA.
     GIT_TAG 3a6219917e4535575ce5bce2fc2ba27a483a709b)
 
   # Use FetchContent_Populate + add_subdirectory so we can apply source
@@ -131,9 +114,6 @@ mlx_apply_source_overlays("${mlx_SOURCE_DIR}")
 set(_deprecated_patterns
     "d\\.get_command_encoder("
     "d\\.new_command_buffer(")
-foreach(_patch_file ${_metal_patch_files_global})
-  # _metal_patch_files is function-local; re-glob here
-endforeach()
 file(GLOB_RECURSE _all_patches
      "${CMAKE_CURRENT_SOURCE_DIR}/patches/mlx/backend/metal/*.cpp")
 foreach(_pf ${_all_patches})
