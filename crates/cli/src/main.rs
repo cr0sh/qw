@@ -375,7 +375,7 @@ fn download_snapshot(identifier: &str) -> Result<(), Box<dyn std::error::Error>>
         })?;
 
     let mut jobs = Vec::with_capacity(siblings.len());
-    let mut seen = HashSet::with_capacity(siblings.len());
+    let mut seen = HashSet::<&str>::with_capacity(siblings.len());
     for sibling in siblings {
         let filename = sibling
             .get("rfilename")
@@ -384,7 +384,7 @@ fn download_snapshot(identifier: &str) -> Result<(), Box<dyn std::error::Error>>
                 Error::other("Hugging Face model API returned a sibling without `rfilename`")
             })?;
         let file_path = sibling_path(&destination, filename)?;
-        if !seen.insert(file_path.clone()) {
+        if !seen.insert(filename) {
             continue;
         }
         if file_path.is_file() {
@@ -420,15 +420,10 @@ fn resolve_download_identifier(identifier: Option<&str>) -> &str {
     identifier.unwrap_or(DEFAULT_MODEL_IDENTIFIER)
 }
 
-fn download_model(identifier: &str) -> Result<(), Box<dyn std::error::Error>> {
-    validate_identifier(identifier)?;
-    download_snapshot(identifier)
-}
-
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::Download(args) => {
-            download_model(resolve_download_identifier(args.identifier.as_deref()))?;
+            download_snapshot(resolve_download_identifier(args.identifier.as_deref()))?;
         }
         Command::Stats => {
             print!("{}", stats_report()?);

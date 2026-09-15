@@ -259,16 +259,11 @@ struct PutCompletion {
     result: Result<(Vec<(String, u64)>, u64, u64), String>,
 }
 
-// Staged payload limit is max(4 * hot capacity, 64 MiB): a 2 GiB hot cache
-// permits 8 GiB of additional staging. Shared pages are conservatively charged
-// per operation, even while also resident in the hot tier. Publication reserves
-// 2 * logical bytes before to_portable, then grows by the exact encoded manifest
-// size on the worker before allocating its serialized buffer; read/decode reserves
-// 3 * (disk blob bytes + exact manifest bytes), and a hot lookahead pin reserves
-// 2 * logical bytes including memoized host pages. Pending writes discover manifest size and grow the reservation
-// on the worker before allocating any read buffers. Rust metadata and channel
-// bookkeeping are additional bounded overhead, not payload bytes.
-// Active request-owned snapshots are not cache staging after demand consumes them.
+// Staging limit is max(4 * hot capacity, 64 MiB). Reservations conservatively
+// charge publication 2 * logical bytes, reads 3 * (disk blobs + manifest), and
+// hot pins 2 * logical bytes, including shared host mirrors. Publications and
+// pending reads grow reservations after manifest sizing, before allocation;
+// active request-owned snapshots are not staging.
 struct StagingBudget {
     limit: u64,
     used: AtomicU64,
