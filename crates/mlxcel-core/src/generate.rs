@@ -41,6 +41,7 @@ use crate::utils::{align_to_na_tile, create_padded_prefill_mask};
 use cxx::UniquePtr;
 use std::borrow::Cow;
 use std::collections::HashSet;
+use std::rc::Rc;
 use std::sync::{
     Arc, OnceLock,
     atomic::{AtomicU64, Ordering},
@@ -95,7 +96,8 @@ static NEXT_SNAPSHOT_PAGE_ID: AtomicU64 = AtomicU64::new(1);
 ///
 /// The MLX handle deliberately remains inside this non-`Send` type. A page's
 /// raw representation can be moved between worker threads only through
-/// [`SnapshotPage::portable_bytes`].
+/// [`SnapshotPage::portable_bytes`], so pages are shared within a thread with
+/// [`Rc`] rather than [`Arc`].
 pub struct SnapshotPage {
     identity: u64,
     token_start: usize,
@@ -107,9 +109,9 @@ pub struct SnapshotPage {
 }
 
 impl SnapshotPage {
-    fn new(token_start: usize, token_end: usize, array: UniquePtr<MlxArray>) -> Arc<Self> {
+    fn new(token_start: usize, token_end: usize, array: UniquePtr<MlxArray>) -> Rc<Self> {
         let view = array.as_ref().expect("snapshot page must not be null");
-        Arc::new(Self {
+        Rc::new(Self {
             identity: NEXT_SNAPSHOT_PAGE_ID.fetch_add(1, Ordering::Relaxed),
             token_start,
             token_end,
@@ -127,7 +129,7 @@ impl SnapshotPage {
         shape: Vec<i32>,
         dtype: i32,
         bytes: Arc<[u8]>,
-    ) -> Result<Arc<Self>, String> {
+    ) -> Result<Rc<Self>, String> {
         let expected = shape
             .iter()
             .try_fold(1usize, |n, &d| n.checked_mul(usize::try_from(d).ok()?))
@@ -139,7 +141,7 @@ impl SnapshotPage {
             ));
         }
         let array = ffi::from_bytes(&bytes, &shape, dtype);
-        Ok(Arc::new(Self {
+        Ok(Rc::new(Self {
             identity: NEXT_SNAPSHOT_PAGE_ID.fetch_add(1, Ordering::Relaxed),
             token_start,
             token_end,
@@ -206,7 +208,7 @@ pub struct SnapshotPagedTensor {
     name: String,
     token_axis: usize,
     token_len: usize,
-    pages: Vec<Arc<SnapshotPage>>,
+    pages: Vec<Rc<SnapshotPage>>,
 }
 
 impl SnapshotPagedTensor {
@@ -219,7 +221,7 @@ impl SnapshotPagedTensor {
     pub fn token_axis(&self) -> usize {
         self.token_axis
     }
-    pub fn pages(&self) -> &[Arc<SnapshotPage>] {
+    pub fn pages(&self) -> &[Rc<SnapshotPage>] {
         &self.pages
     }
     pub fn nbytes(&self) -> usize {
@@ -409,7 +411,7 @@ impl ModelStateSnapshot {
         &mut self,
         name: impl Into<String>,
         token_axis: usize,
-        pages: Vec<Arc<SnapshotPage>>,
+        pages: Vec<Rc<SnapshotPage>>,
     ) -> Result<(), String> {
         if pages.is_empty() {
             return Err("snapshot paged tensor must contain at least one page".to_string());
