@@ -39,6 +39,25 @@ pub fn model_cache_path(home: &Path, identifier: &str) -> Result<PathBuf> {
     Ok(destination)
 }
 
+/// Resolve a checkpoint path from explicit overrides or its default cache identifier.
+fn resolve_path(
+    cli_override: Option<&Path>,
+    env_override: Option<&Path>,
+    home: Option<&Path>,
+    default_identifier: &str,
+) -> Result<PathBuf> {
+    if let Some(path) = cli_override {
+        return Ok(path.to_path_buf());
+    }
+    if let Some(path) = env_override {
+        return Ok(path.to_path_buf());
+    }
+    let Some(home) = home else {
+        bail!("HOME is not set");
+    };
+    model_cache_path(home, default_identifier)
+}
+
 /// Resolve the checkpoint directory to load, honoring (in order) the CLI
 /// override, the `QW_MODEL_PATH` environment override, then the default cache
 /// path for `DEFAULT_MODEL_IDENTIFIER`. Pure: reads no environment itself.
@@ -47,16 +66,7 @@ pub fn resolve_model_dir(
     env_override: Option<&Path>,
     home: Option<&Path>,
 ) -> Result<PathBuf> {
-    if let Some(c) = cli_override {
-        return Ok(c.to_path_buf());
-    }
-    if let Some(e) = env_override {
-        return Ok(e.to_path_buf());
-    }
-    let Some(h) = home else {
-        bail!("HOME is not set");
-    };
-    model_cache_path(h, DEFAULT_MODEL_IDENTIFIER)
+    resolve_path(cli_override, env_override, home, DEFAULT_MODEL_IDENTIFIER)
 }
 
 /// Convenience wrapper around `resolve_model_dir` that reads `QW_MODEL_PATH`
@@ -77,16 +87,12 @@ fn resolve_specprefill_draft_dir(
     env_override: Option<&Path>,
     home: Option<&Path>,
 ) -> Result<PathBuf> {
-    if let Some(path) = cli_override {
-        return Ok(path.to_path_buf());
-    }
-    if let Some(path) = env_override {
-        return Ok(path.to_path_buf());
-    }
-    let Some(home) = home else {
-        bail!("HOME is not set");
-    };
-    model_cache_path(home, DEFAULT_SPECPREFILL_DRAFT_MODEL_IDENTIFIER)
+    resolve_path(
+        cli_override,
+        env_override,
+        home,
+        DEFAULT_SPECPREFILL_DRAFT_MODEL_IDENTIFIER,
+    )
 }
 
 #[cfg(any(feature = "specprefill", test))]
@@ -106,16 +112,12 @@ fn resolve_dflash2_draft_dir(
     env_override: Option<&Path>,
     home: Option<&Path>,
 ) -> Result<PathBuf> {
-    if let Some(path) = cli_override {
-        return Ok(path.to_path_buf());
-    }
-    if let Some(path) = env_override {
-        return Ok(path.to_path_buf());
-    }
-    let Some(home) = home else {
-        bail!("HOME is not set");
-    };
-    model_cache_path(home, DEFAULT_DFLASH2_DRAFT_MODEL_IDENTIFIER)
+    resolve_path(
+        cli_override,
+        env_override,
+        home,
+        DEFAULT_DFLASH2_DRAFT_MODEL_IDENTIFIER,
+    )
 }
 
 #[cfg(any(feature = "dflash2", test))]

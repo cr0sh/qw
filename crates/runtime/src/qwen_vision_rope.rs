@@ -69,7 +69,7 @@ pub(crate) fn apply_rotary_pos_emb_vision(
     mlxcel_core::astype(&output, original_dtype)
 }
 
-fn rotate_half(array: &MlxArray) -> UniquePtr<MlxArray> {
+pub(crate) fn rotate_half(array: &MlxArray) -> UniquePtr<MlxArray> {
     let shape = mlxcel_core::array_shape(array);
     let half = shape[shape.len() - 1] / 2;
     let rank = shape.len();
