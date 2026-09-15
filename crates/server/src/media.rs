@@ -203,7 +203,14 @@ mod tests {
         )
         .expect("decode fixture");
         assert_eq!((decoded.width, decoded.height), (56, 56));
-        assert!(decoded.rgb.chunks_exact(3).all(|pixel| pixel == [7, 8, 9]));
+        assert!(
+            decoded
+                .rgb
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .all(|pixel| *pixel == [7, 8, 9])
+        );
     }
 
     #[test]

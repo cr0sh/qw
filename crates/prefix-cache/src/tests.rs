@@ -2177,7 +2177,7 @@ fn adaptive_memory_accounts_shared_checkpoint_pages_once() {
         AdaptivePrefixCache::new(namespaces(), memory_config(1_000_000)).expect("cache");
     let snapshots = paged_snapshot_chain();
     cache.insert(
-        PromptKey::text(&(0..768).map(|i| i as i32).collect::<Vec<_>>()),
+        PromptKey::text(&(0..768).collect::<Vec<_>>()),
         snapshots,
         SnapshotRoute::Baseline,
     );

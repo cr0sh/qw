@@ -285,7 +285,9 @@ fn flatten_f32(arr: &MlxArray) -> Vec<f32> {
     let a = astype(arr, dtype::FLOAT32);
     eval(&a);
     array_to_raw_bytes(&a)
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }

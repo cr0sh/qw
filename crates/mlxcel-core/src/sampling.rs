@@ -751,7 +751,9 @@ pub fn batched_fused_sample(logits: &MlxArray, params: &FusedSampleParams) -> Ve
 fn token_ids_to_host(tokens: &MlxArray) -> Vec<i32> {
     let bytes = ffi::array_to_raw_bytes(tokens);
     bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| i32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }
@@ -2087,8 +2089,10 @@ mod tests {
         ffi::eval(a);
         let bytes = ffi::array_to_raw_bytes(a);
         bytes
-            .chunks_exact(4)
-            .map(|b| f32::from_ne_bytes(b.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_ne_bytes(*b))
             .collect()
     }
 

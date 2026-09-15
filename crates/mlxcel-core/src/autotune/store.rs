@@ -344,7 +344,7 @@ impl TacticStore {
             return Ok(());
         };
         let path = dir.join(format!("{}.json", key.hash()));
-        std::fs::create_dir_all(&dir)?;
+        std::fs::create_dir_all(dir)?;
         let body = serde_json::to_string_pretty(record)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         let tmp = dir.join(format!("{}.json.tmp.{}", key.hash(), std::process::id()));

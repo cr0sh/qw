@@ -256,7 +256,7 @@ struct PutCompletion {
     images: Vec<ImageIdentity>,
     key: EntryKey,
     reserved_bytes: u64,
-    result: Result<(Vec<(String, u64)>, u64, u64), String>,
+    result: Result<PublicationResult, String>,
 }
 
 // Staging limit is max(4 * hot capacity, 64 MiB). Reservations conservatively

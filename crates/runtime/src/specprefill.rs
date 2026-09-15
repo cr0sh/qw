@@ -203,8 +203,10 @@ fn compute_importance(
         "SpecPrefill importance vector has an unexpected byte length"
     );
     Ok(bytes
-        .chunks_exact(4)
-        .map(|bytes| f32::from_ne_bytes(bytes.try_into().expect("four-byte f32")))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|bytes| f32::from_ne_bytes(*bytes))
         .collect())
 }
 

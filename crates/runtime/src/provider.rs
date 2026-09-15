@@ -136,9 +136,11 @@ fn generate_specprefill_tokens<F: FnMut(i32) -> bool>(
             && (reuse.cached_tokens < prompt_ids.len()
                 || reuse.snapshot.continuation_logits().is_some())
     });
-    let admitted_cached_tokens = structurally_reusable
-        .then_some(requested_cached_tokens)
-        .unwrap_or(0);
+    let admitted_cached_tokens = if structurally_reusable {
+        requested_cached_tokens
+    } else {
+        0
+    };
     let dense_end = dense_prefix_end(admitted_cached_tokens, config);
     let eligible = &prompt_ids[dense_end..];
 
@@ -877,8 +879,7 @@ impl Qwen35Provider {
                     && (reuse.cached_tokens < prompt_ids.len()
                         || reuse.snapshot.continuation_logits().is_some())
             });
-            let dense_end =
-                dense_prefix_end(reusable.then_some(requested_cached).unwrap_or(0), config);
+            let dense_end = dense_prefix_end(if reusable { requested_cached } else { 0 }, config);
             if should_activate(prompt_ids.len() - dense_end, config) {
                 let mut decoder = IncrementalTextDecoder::new(&self.tokenizer);
                 let mut decode_error = None;

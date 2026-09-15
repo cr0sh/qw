@@ -2610,7 +2610,7 @@ async fn direct_image_submission_revalidates_sources_over_stale_pixels() {
         }))
         .expect("image request")
     };
-    let mut stale = request(&tiny_png_data_uri());
+    let mut stale = request(tiny_png_data_uri());
     media::decode_request_images(&mut stale).expect("previously valid pixels");
     stale.messages = request("data:image/png;base64,bm90IGEgcG5n").messages;
     let Err(SubmitError::InvalidRequest(error)) = engine.submit(stale) else {

@@ -463,10 +463,10 @@ impl ModelStateSnapshot {
         let mut total = 0;
         for tensor in &self.paged_tensors {
             for page in &tensor.pages {
-                if let Some(bytes) = page.portable.get() {
-                    if seen.insert(bytes.as_ptr() as usize) {
-                        total += bytes.len();
-                    }
+                if let Some(bytes) = page.portable.get()
+                    && seen.insert(bytes.as_ptr() as usize)
+                {
+                    total += bytes.len();
                 }
             }
         }
@@ -2081,17 +2081,16 @@ impl CxxGenerator {
             && prompt_snapshots
                 .iter()
                 .all(|snapshot| snapshot.token_len() != prompt_tokens.len())
-        {
-            if let Some(mut snapshot) = model.snapshot_sequence_state(
+            && let Some(mut snapshot) = model.snapshot_sequence_state(
                 sequence_id,
                 prompt_tokens.len(),
                 prompt_snapshots.last(),
-            ) {
-                snapshot.set_continuation_logits(
-                    logits.as_ref().expect("generation logits must not be null"),
-                );
-                prompt_snapshots.push(snapshot);
-            }
+            )
+        {
+            snapshot.set_continuation_logits(
+                logits.as_ref().expect("generation logits must not be null"),
+            );
+            prompt_snapshots.push(snapshot);
         }
         let prefill_time = prefill_start.elapsed();
         ffi::clear_memory_cache();
@@ -3521,7 +3520,7 @@ impl CxxGenerator {
             bytes.len()
         );
         let mut out = Vec::with_capacity(actual_len - 1);
-        for chunk in bytes.chunks_exact(4) {
+        for chunk in bytes.as_chunks::<4>().0 {
             out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
         }
 
@@ -3626,8 +3625,10 @@ mod tests {
             // vocabulary position winning.
             ffi::eval(input_ids);
             let tokens = ffi::array_to_raw_bytes(input_ids)
-                .chunks_exact(4)
-                .map(|bytes| i32::from_ne_bytes(bytes.try_into().expect("i32 token bytes")))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| i32::from_ne_bytes(*bytes))
                 .collect::<Vec<_>>();
             let mut logits = Vec::with_capacity(tokens.len() * 4);
             for token in tokens {
@@ -3803,8 +3804,10 @@ mod tests {
             ffi::eval(input_ids);
             self.forward_lengths.borrow_mut().push(len);
             let tokens = ffi::array_to_raw_bytes(input_ids)
-                .chunks_exact(4)
-                .map(|bytes| i32::from_ne_bytes(bytes.try_into().expect("i32 token bytes")))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| i32::from_ne_bytes(*bytes))
                 .collect::<Vec<_>>();
             self.seen.borrow_mut().extend(tokens);
             let total = self.seen.borrow().iter().sum::<i32>() as f32;

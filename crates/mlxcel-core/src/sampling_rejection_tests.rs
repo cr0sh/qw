@@ -232,7 +232,9 @@ fn intersect(a: &BTreeSet<usize>, b: &BTreeSet<usize>) -> BTreeSet<usize> {
 /// Read a `[..]` uint32 array back to host.
 fn u32_values(arr: &MlxArray) -> Vec<u32> {
     array_to_raw_bytes(arr)
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }
@@ -1385,7 +1387,9 @@ fn reported_probs(
 ) -> Vec<f32> {
     let probs = fused_sample_probs(batched, 1.0, top_k, top_p, min_p);
     array_to_raw_bytes(&probs)
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
         .take(vocab)
         .collect()

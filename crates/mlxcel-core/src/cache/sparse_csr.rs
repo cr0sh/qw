@@ -274,8 +274,10 @@ impl SparseSelection {
                 let as_i32 = ffi::astype(a, crate::dtype::INT32);
                 ffi::eval(&as_i32);
                 ffi::array_to_raw_bytes(&as_i32)
-                    .chunks_exact(4)
-                    .map(|c| i32::from_ne_bytes(c.try_into().unwrap_or([0; 4])))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| i32::from_ne_bytes(*c))
                     .collect()
             }
         };

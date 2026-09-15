@@ -809,7 +809,9 @@ mod tests {
         let array_f32 = ffi::astype(array, dtype::FLOAT32);
         ffi::eval(&array_f32);
         ffi::array_to_raw_bytes(&array_f32)
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
             .collect()
     }
@@ -1021,7 +1023,9 @@ mod tests {
         ffi::eval(&v_hat_f32);
         let v_hat_bytes = ffi::array_to_raw_bytes(&v_hat_f32);
         let v_hat_vec: Vec<f32> = v_hat_bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
 
@@ -1114,7 +1118,9 @@ mod tests {
         ffi::eval(&v_hat_f32);
         let v_hat_bytes = ffi::array_to_raw_bytes(&v_hat_f32);
         let v_hat_vec: Vec<f32> = v_hat_bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
 
@@ -1148,7 +1154,7 @@ mod tests {
         let v_hat_f32 = ffi::astype(&v_hat, dtype::FLOAT32);
         ffi::eval(&v_hat_f32);
         let bytes = ffi::array_to_raw_bytes(&v_hat_f32);
-        for chunk in bytes.chunks_exact(4) {
+        for chunk in bytes.as_chunks::<4>().0 {
             let val = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
             assert!(val.abs() < 1e-3, "expected ~0, got {val}");
         }
@@ -1179,7 +1185,9 @@ mod tests {
             let arr = ffi::astype(&full, dtype::FLOAT32);
             ffi::eval(&arr);
             ffi::array_to_raw_bytes(&arr)
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect::<Vec<_>>()
         };
@@ -1187,7 +1195,9 @@ mod tests {
             let arr = ffi::astype(&inverse, dtype::FLOAT32);
             ffi::eval(&arr);
             ffi::array_to_raw_bytes(&arr)
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect::<Vec<_>>()
         };

@@ -1361,7 +1361,9 @@ fn flatten_f32_local(arr: &MlxArray) -> Vec<f32> {
     eval(&a);
     let bytes = array_to_raw_bytes(&a);
     bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }
@@ -3722,7 +3724,9 @@ fn try_array_to_raw_bytes_round_trips_f32() {
     let a = from_slice_f32(&[1.0_f32, 2.0, 3.0], &[3]);
     let bytes = try_array_to_raw_bytes(&a).expect("readback of a valid array returns Ok");
     let values: Vec<f32> = bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|ch| f32::from_le_bytes([ch[0], ch[1], ch[2], ch[3]]))
         .collect();
     assert_eq!(values, vec![1.0, 2.0, 3.0]);
