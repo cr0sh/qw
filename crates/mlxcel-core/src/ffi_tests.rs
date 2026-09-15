@@ -3294,36 +3294,28 @@ fn test_wht_fp16_preserves_dtype() {
 
 // ── batched quantized KV cache mask offset regression ────────────
 
-/// `create_causal_mask_with_left_padding` (no padding) must produce the same
-/// result as `create_causal_mask` (the non-batched version).
-///
-/// This guards the fast-path branch in the function.
+/// Empty and all-zero padding preserve the cached-prefix causal boundary.
 #[test]
 fn test_create_causal_mask_with_left_padding_no_padding_matches_causal_mask() {
     let n = 3_i32;
-    let offset = 5_i32; // 5 tokens already cached
-
-    let reference = crate::utils::create_causal_mask(n, offset);
-    let tested = crate::utils::create_causal_mask_with_left_padding(n, offset, &[]);
-
-    eval(&reference);
-    eval(&tested);
-
-    // Shapes must match
-    let ref_shape = array_shape(&reference);
-    let test_shape = array_shape(&tested);
-    assert_eq!(
-        ref_shape, test_shape,
-        "shape mismatch: {ref_shape:?} vs {test_shape:?}"
-    );
-
-    // Values must match via allclose
-    let close = allclose(&reference, &tested, 1e-5, 1e-5);
-    eval(&close);
-    assert!(
-        item_bool(&close),
-        "create_causal_mask_with_left_padding(no padding) must equal create_causal_mask"
-    );
+    let offset = 5_i32;
+    for padding in [&[][..], &[0, 0][..]] {
+        let mask = crate::utils::create_causal_mask_with_left_padding(n, offset, padding);
+        eval(&mask);
+        assert_eq!(array_shape(&mask), vec![n, n + offset]);
+        assert_eq!(array_dtype(&mask), dtype::FLOAT32);
+        let values = flatten_f32_local(&mask);
+        for query in 0..n {
+            for key in 0..n + offset {
+                let expected = if key <= query + offset {
+                    0.0
+                } else {
+                    f32::NEG_INFINITY
+                };
+                assert_eq!(values[(query * (n + offset) + key) as usize], expected);
+            }
+        }
+    }
 }
 
 /// `create_causal_mask_with_left_padding` with left-padding must produce a

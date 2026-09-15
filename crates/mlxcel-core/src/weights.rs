@@ -127,10 +127,10 @@ fn extract_shards_and_total_size(json: &str) -> Result<(Vec<String>, Option<u64>
     let mut seen = std::collections::HashSet::new();
     let mut shards = Vec::new();
     for value in weight_map.values() {
-        if let Some(s) = value.as_str()
-            && seen.insert(s.to_string())
+        if let Some(name) = value.as_str()
+            && seen.insert(name)
         {
-            shards.push(s.to_string());
+            shards.push(name.to_owned());
         }
     }
 
@@ -140,13 +140,6 @@ fn extract_shards_and_total_size(json: &str) -> Result<(Vec<String>, Option<u64>
 
     shards.sort();
     Ok((shards, total_size))
-}
-
-/// Delegates to [`extract_shards_and_total_size`], discarding the total_size.
-/// Used by unit tests that were written against the original single-return-value API.
-#[cfg(test)]
-fn extract_shards_from_index_json(json: &str) -> Result<Vec<String>, String> {
-    extract_shards_and_total_size(json).map(|(shards, _)| shards)
 }
 
 // ── Safetensors header reader ─────────────────────────────────────────────────
@@ -610,7 +603,7 @@ mod tests {
             }
         }"#;
 
-        let shards = extract_shards_from_index_json(json).expect("should parse");
+        let shards = extract_shards_and_total_size(json).expect("should parse").0;
         assert_eq!(shards.len(), 3);
         assert!(shards.contains(&"model-00001-of-00003.safetensors".to_string()));
         assert!(shards.contains(&"model-00002-of-00003.safetensors".to_string()));
@@ -626,14 +619,14 @@ mod tests {
                 "c.weight": "shard-2.safetensors"
             }
         }"#;
-        let shards = extract_shards_from_index_json(json).expect("should parse");
+        let shards = extract_shards_and_total_size(json).expect("should parse").0;
         assert_eq!(shards.len(), 2);
     }
 
     #[test]
     fn test_extract_shards_missing_weight_map() {
         let json = r#"{"metadata": {"total_size": 0}}"#;
-        let result = extract_shards_from_index_json(json);
+        let result = extract_shards_and_total_size(json).map(|(shards, _)| shards);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("weight_map"));
     }
@@ -746,18 +739,15 @@ mod tests {
 
     #[test]
     fn test_extract_shards_rejects_path_traversal_in_json() {
-        // Even though extract_shards_from_index_json doesn't validate paths itself,
-        // the downstream validate_index_shards will catch these. Verify the full flow.
+        // Extraction only parses names; validation rejects traversal.
         let json = r#"{
             "weight_map": {
                 "x.weight": "../../../etc/shadow"
             }
         }"#;
-        // extract_shards succeeds (it just extracts strings)
-        let shards = extract_shards_from_index_json(json).expect("should parse");
+        let shards = extract_shards_and_total_size(json).expect("should parse").0;
         assert_eq!(shards, vec!["../../../etc/shadow"]);
 
-        // But validate_index_shards must reject it
         let dir = tempfile::tempdir().unwrap();
         let result = validate_index_shards(dir.path(), &shards);
         assert!(result.is_err());

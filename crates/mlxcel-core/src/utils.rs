@@ -90,31 +90,8 @@ pub fn slice_axis(x: &MlxArray, axis: i32, start: i32, end: i32) -> UniquePtr<Ml
 /// # Returns
 /// Mask of shape [size, size + offset] with -inf in upper triangular region
 ///
-/// Used by: decoders that materialize an explicit prefill mask instead of
-/// leaving `mask: None` for fused SDPA to apply causality itself. At this
-/// commit that is 44 non-test files under `src/models`, in four groups.
-/// Hybrid and mixed-layer stacks that build one mask at the full-attention
-/// offset: Jamba, FalconH1, NemotronH, NemotronNas, Plamo2, Qwen3Next,
-/// KimiLinear, GraniteMoeHybrid, MiniMaxM3, Lfm2, RecurrentGemma.
-/// Sliding-window, chunked and dual-attention families that build a separate
-/// global mask per forward: Gemma3, Gemma4, Gemma3n, DiffusionGemma, Cohere2,
-/// Exaone4, Olmo3, Ministral3, Mistral4, Mellum, Llama4. VLM decoders that
-/// thread a mask down from the multimodal wrapper: Qwen2VL, Qwen3VL, GLM4V,
-/// Ernie4.5MoeVL, HunyuanVL, PaddleOcrVL, FalconOcr. MLA and custom-attention
-/// decoders that add the mask to scores by hand: DeepSeekV3, DeepSeekV3.2,
-/// MiniCPM3, GptOss, AFMoE, Step3P5, LongcatFlashNgram, BailingMoeLinear,
-/// GLM4MoeLite, Qwen3.5. Outside `src/models` the callers are `lib.rs`,
-/// `layers.rs`, the tensor-parallel Llama runtime, the GLM4 pipeline stage
-/// executor, and disaggregated handoff.
-///
-/// Not used by the mainstream dense decoders (Llama3, Mixtral, Gemma, Gemma2,
-/// Cohere, Phi, GLM4, StarCoder2, Qwen3Moe, OLMoE and similar): they pass
-/// `mask: None` for `seq_len > 1` and let fused SDPA apply causality, so they
-/// are unaffected by changes here.
-///
-/// The caller set is too large to enumerate by name without going stale, so
-/// the groups above are a summary. Regenerate the exact list with
-/// `grep -rln '\bcreate_causal_mask(' src --include='*.rs'`.
+/// Used by callers that need an explicit prefill mask instead of fused SDPA's
+/// built-in causal handling.
 pub fn create_causal_mask(size: i32, offset: i32) -> UniquePtr<MlxArray> {
     additive_causal_window_mask(size, offset, None)
 }
@@ -208,6 +185,10 @@ pub fn create_causal_mask_with_left_padding(
 ) -> UniquePtr<MlxArray> {
     let total_len = n + offset;
 
+    if left_padding.is_empty() || left_padding.iter().all(|&p| p == 0) {
+        return create_causal_mask(n, offset);
+    }
+
     // ── Base causal (lower-triangular) mask ─────────────────────────────────
     // Shape: [n, total_len]  (0 = attend, -inf = mask after conversion)
     let ones = ffi::ones(&[n, total_len], dtype::FLOAT32);
@@ -216,14 +197,6 @@ pub fn create_causal_mask_with_left_padding(
     // of query row `q`.  That matches the causal condition
     // `q_pos (= q + offset) >= k_pos`.
     let causal_tril = ffi::tril(&ones, offset);
-
-    if left_padding.is_empty() || left_padding.iter().all(|&p| p == 0) {
-        // Fast path: no per-sequence padding — identical to create_causal_mask.
-        let zeros = ffi::zeros(&[n, total_len], dtype::FLOAT32);
-        let neg_inf = ffi::full_f32(&[n, total_len], f32::NEG_INFINITY, dtype::FLOAT32);
-        let bool_mask = ffi::greater(&causal_tril, &zeros);
-        return ffi::where_cond(&bool_mask, &zeros, &neg_inf);
-    }
 
     // ── Left-padding filter ─────────────────────────────────────────────────
     // For each sequence `b`, key positions `k < left_padding[b]` are padding
@@ -560,46 +533,15 @@ pub fn create_causal_mask_with_window(
     offset: i32,
     window: Option<i32>,
 ) -> UniquePtr<MlxArray> {
-    let uncapped_len = size + offset;
-
-    // When a window is specified and the K sequence would exceed the window
-    // (i.e. RotatingKVCache returns fewer than `uncapped_len` tokens), cap the
-    // mask width so it matches the actual K dimension returned by the cache.
-    //
-    // Example: size=4096, offset=0, window=1024
-    //   uncapped_len = 4096, which is > 1024.
-    //   The cache returns K of shape (B, H, 1024, D).
-    //   The score tensor is (B, H, 4096, 1024).
-    //   A mask of (4096, 4096) cannot broadcast to (1, 8, 4096, 1024) — SIGABRT.
-    //   Fix: produce mask of (4096, 1024) using adjusted tril offset.
-    let (total_len, tril_offset) = if let Some(w) = window {
-        if uncapped_len > w {
-            // Cap: take the last `w` columns of the full (size, uncapped_len) mask.
-            // Cache slot k_c holds logical key position k_c + (uncapped_len - w);
-            // query row q holds logical query position q + offset. The causal
-            // condition q + offset >= k_c + (uncapped_len - w) simplifies to
-            // q >= k_c + (size - w), so the tril diagonal offset is
-            // -(size - w) = w - size — independent of `offset`.
-            (w, w - size)
-        } else {
-            (uncapped_len, offset)
-        }
-    } else {
-        (uncapped_len, offset)
-    };
+    let (total_len, tril_offset, upper_offset) = window_mask_geometry(size, offset, window);
 
     // Create lower triangular mask (1 = attend, 0 = mask)
     let ones = ffi::ones(&[size, total_len], dtype::FLOAT32);
     let mut mask = ffi::tril(&ones, tril_offset);
 
-    // Apply sliding window upper-bound only when the mask is NOT capped.
-    // In the capped path the column range is already the window; the upper
-    // bound (q <= k + window - 1) is trivially satisfied.
-    if let Some(w) = window
-        && uncapped_len <= w
-    {
-        // Non-capped path: enforce window upper bound.
-        let upper_mask = ffi::triu(&ones, offset - w + 1);
+    // Apply the upper bound only when the key axis was not capped to `window`.
+    if let Some(upper_offset) = upper_offset {
+        let upper_mask = ffi::triu(&ones, upper_offset);
         mask = ffi::multiply(&mask, &upper_mask);
     }
 
@@ -612,6 +554,19 @@ pub fn create_causal_mask_with_window(
     let bool_mask = ffi::greater(&mask, &zeros); // mask > 0 gives bool mask
 
     ffi::where_cond(&bool_mask, &zeros, &neg_inf)
+}
+
+/// Return the key width, causal diagonal, and optional upper-bound diagonal
+/// for a mask over the cache's returned keys.
+fn window_mask_geometry(size: i32, offset: i32, window: Option<i32>) -> (i32, i32, Option<i32>) {
+    let uncapped_len = size + offset;
+    match window {
+        // Cache column k represents key k + (size + offset - w), so causality
+        // uses diagonal w - size. The capped key range already enforces the window.
+        Some(w) if uncapped_len > w => (w, w - size, None),
+        Some(w) => (uncapped_len, offset, Some(offset - w + 1)),
+        None => (uncapped_len, offset, None),
+    }
 }
 
 /// Create a sliding-window causal mask sized to the *full* key axis, without
@@ -749,27 +704,12 @@ pub fn create_causal_bool_mask_with_window(
     offset: i32,
     window: Option<i32>,
 ) -> UniquePtr<MlxArray> {
-    let uncapped_len = size + offset;
-
-    let (total_len, tril_offset) = if let Some(w) = window {
-        if uncapped_len > w {
-            // See `create_causal_mask_with_window` for the derivation:
-            // tril diagonal offset is `w - size`, independent of `offset`.
-            (w, w - size)
-        } else {
-            (uncapped_len, offset)
-        }
-    } else {
-        (uncapped_len, offset)
-    };
-
+    let (total_len, tril_offset, upper_offset) = window_mask_geometry(size, offset, window);
     let ones = ffi::ones(&[size, total_len], dtype::FLOAT32);
     let mut mask = ffi::tril(&ones, tril_offset);
 
-    if let Some(w) = window
-        && uncapped_len <= w
-    {
-        let upper_mask = ffi::triu(&ones, offset - w + 1);
+    if let Some(upper_offset) = upper_offset {
+        let upper_mask = ffi::triu(&ones, upper_offset);
         mask = ffi::multiply(&mask, &upper_mask);
     }
 
@@ -777,10 +717,7 @@ pub fn create_causal_bool_mask_with_window(
     ffi::greater(&mask, &zeros)
 }
 
-// KV Cache Utilities.
-/// Repeat key/value tensors for grouped-query attention.
-///
-/// When n_kv_heads < n_heads, we need to repeat K and V to match Q dimensions.
+/// Repeat key/value heads for grouped-query attention.
 ///
 /// # Arguments
 /// * `x` - Input tensor of shape [batch, n_kv_heads, seq_len, head_dim]
@@ -789,14 +726,8 @@ pub fn create_causal_bool_mask_with_window(
 /// # Returns
 /// Tensor of shape [batch, n_heads, seq_len, head_dim]
 ///
-/// Used by: DeepSeekV2, MiniCPM3, NemotronNas, RecurrentGemma, GLM4V,
-/// GLM4VMoe, Qwen2VL, Qwen3VL, Qwen3VLMoe, Ernie4.5MoeVL, HunyuanVL and
-/// PaddleOcrVL under `src/models`, plus the DeepSeek-OCR Qwen2 vision encoder
-/// (`src/vision/encoders/deepseekocr_qwen2.rs`) and the Qwen3-Omni MoE speech
-/// layers (`src/audio/qwen3_omni_moe/speech_layers.rs`). Most decoders never
-/// call this: fused SDPA broadcasts KV heads internally, so only models that
-/// materialize attention scores themselves need an explicit repeat. Regenerate
-/// the list with `grep -rln '\brepeat_kv(' src --include='*.rs'`.
+/// Used by attention implementations that materialize scores themselves;
+/// fused SDPA broadcasts KV heads internally.
 pub fn repeat_kv(x: &MlxArray, n_rep: i32) -> UniquePtr<MlxArray> {
     if n_rep == 1 {
         // No repetition needed — return a zero-copy view via reshape

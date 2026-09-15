@@ -99,7 +99,7 @@ pub fn divide_scalar(a: &ffi::MlxArray, scalar: f32) -> UniquePtr<ffi::MlxArray>
 /// this path is unreachable in normal usage; the guard exists so future B2
 /// integration can rely on a sane error contract.)
 ///
-/// Used by: TurboQuant cache compression (planned: cache::turbo, sub-– under).
+/// Used by TurboQuant cache compression.
 pub fn wht(x: &ffi::MlxArray) -> UniquePtr<ffi::MlxArray> {
     let shape = ffi::array_shape(x);
     let last = shape.last().copied().unwrap_or(0);
