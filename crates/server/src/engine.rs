@@ -308,16 +308,9 @@ fn cache_lookup_route(
 struct CacheBehavior {
     snapshot_route: Option<CacheSnapshotRoute>,
     lookup_route: Option<CacheSnapshotRoute>,
-    capture_checkpoints: bool,
 }
 
 impl CacheBehavior {
-    fn apply_checkpoint_policy(self, checkpoint_token_lengths: &mut Vec<usize>) {
-        if !self.capture_checkpoints {
-            checkpoint_token_lengths.clear();
-        }
-    }
-
     fn capture_final_snapshot(self) -> bool {
         self.snapshot_route.is_some()
     }
@@ -333,7 +326,6 @@ fn cache_behavior(
         return CacheBehavior {
             snapshot_route: None,
             lookup_route: None,
-            capture_checkpoints: false,
         };
     }
     let snapshot_route = cache_snapshot_route(route);
@@ -347,7 +339,6 @@ fn cache_behavior(
     CacheBehavior {
         snapshot_route,
         lookup_route,
-        capture_checkpoints: snapshot_route.is_some(),
     }
 }
 
@@ -1646,10 +1637,6 @@ impl QwenWorker {
             routed_decoder
         };
         let route = qwen_generation_route(decoder, has_images);
-        let mut checkpoint_token_lengths = Vec::new();
-        if self.prefix_cache_enabled && cache_snapshot_route(route).is_some() {
-            checkpoint_token_lengths.push(prompt_ids.len());
-        }
         debug!(
             phase = "prompt.prepared",
             prompt_tokens = prompt_ids.len(),
@@ -1665,7 +1652,11 @@ impl QwenWorker {
             #[cfg(feature = "specprefill")]
             specprefill_active,
         );
-        cache_behavior.apply_checkpoint_policy(&mut checkpoint_token_lengths);
+        let mut checkpoint_token_lengths = if cache_behavior.capture_final_snapshot() {
+            vec![prompt_ids.len()]
+        } else {
+            Vec::new()
+        };
         let cache_route = cache_behavior.snapshot_route;
         let lookup_cache_route = cache_behavior.lookup_route;
         if job.request.resume_response_id.is_some() && cache_route.is_none() {
@@ -2972,9 +2963,6 @@ mod tests {
             assert_eq!(behavior.snapshot_route, None);
             assert_eq!(behavior.lookup_route, None);
             assert!(!behavior.capture_final_snapshot());
-            let mut checkpoint_token_lengths = vec![64, 128];
-            behavior.apply_checkpoint_policy(&mut checkpoint_token_lengths);
-            assert!(checkpoint_token_lengths.is_empty());
         }
     }
 

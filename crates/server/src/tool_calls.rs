@@ -111,7 +111,6 @@ pub fn parse_assistant_output(
         );
         remaining = &remaining[TOOL_CALL_CLOSE.len()..];
         let arguments = Value::Object(arguments);
-        ensure!(arguments.is_object(), "tool arguments must be an object");
         calls.push(ParsedToolCall {
             name,
             arguments: serde_json::to_string(&arguments)?,

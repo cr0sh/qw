@@ -373,10 +373,9 @@ fn validate_schema_node(value: &mut Value, property_map: bool) -> Result<()> {
         "unevaluatedItems",
         "unevaluatedProperties",
     ];
-    let known: BTreeSet<&str> = KEYWORDS.iter().copied().collect();
     for key in object.keys() {
         ensure!(
-            known.contains(key.as_str()),
+            KEYWORDS.contains(&key.as_str()),
             "unknown JSON Schema keyword {key:?}"
         );
     }

@@ -328,9 +328,7 @@ fn init_tracing(cli: &ServerArgs) -> Result<Option<WorkerGuard>> {
 }
 
 fn resolve_prefix_cache_directory(directory: Option<PathBuf>) -> Result<PathBuf> {
-    directory
-        .map(Ok)
-        .unwrap_or_else(default_prefix_cache_directory)
+    directory.map_or_else(default_prefix_cache_directory, Ok)
 }
 pub async fn serve(cli: ServerArgs) -> Result<()> {
     validate_cli(&cli)?;

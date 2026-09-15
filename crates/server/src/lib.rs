@@ -324,12 +324,8 @@ async fn streaming_response_inner(
     );
     let events = stream::unfold(state, |mut state| async move {
         let span = state.span.clone();
-        async move {
-            let event = state.next_event().await?;
-            Some((Ok::<Event, Infallible>(event), state))
-        }
-        .instrument(span)
-        .await
+        let event = state.next_event().instrument(span).await?;
+        Some((Ok::<Event, Infallible>(event), state))
     });
     Sse::new(events).into_response()
 }
