@@ -1502,6 +1502,7 @@ impl Qwen35Model {
     }
 
     #[cfg(any(feature = "dflash2", test))]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_dflash_prefill_segment_chunked(
         &self,
         input_ids: &MlxArray,
@@ -3373,8 +3374,10 @@ mod tests {
         let mapped = Qwen35Model::map_dflash_candidate_tokens(&dflash_ids);
         mlxcel_core::eval(&mapped);
         let mapped = mlxcel_core::array_evaluated_bytes(&mapped)
-            .chunks_exact(4)
-            .map(|bytes| i32::from_ne_bytes(bytes.try_into().expect("i32 bytes")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| i32::from_ne_bytes(*bytes))
             .collect::<Vec<_>>();
         assert_eq!(mapped, [0, DFLASH_COMPACT_PREFIX - 1, 248_044, 248_069]);
 
@@ -3390,8 +3393,10 @@ mod tests {
         let mapped = Qwen35Model::map_draft_tokens(&mtp_ids);
         mlxcel_core::eval(&mapped);
         let mapped = mlxcel_core::array_evaluated_bytes(&mapped)
-            .chunks_exact(4)
-            .map(|bytes| i32::from_ne_bytes(bytes.try_into().expect("i32 bytes")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| i32::from_ne_bytes(*bytes))
             .collect::<Vec<_>>();
         assert_eq!(mapped, [0, MTP_DRAFT_PREFIX - 1, 248_044, 248_069]);
     }

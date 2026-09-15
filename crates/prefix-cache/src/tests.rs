@@ -7,11 +7,11 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Captured tracing event fields, shared with the test subscriber.
+type RecordedEvents = Option<Arc<Mutex<Vec<HashMap<String, String>>>>>;
+
 #[derive(Clone)]
-struct InfoCounter(
-    Arc<AtomicUsize>,
-    Option<Arc<Mutex<Vec<HashMap<String, String>>>>>,
-);
+struct InfoCounter(Arc<AtomicUsize>, RecordedEvents);
 
 #[derive(Default)]
 struct RecordedFields(HashMap<String, String>);
@@ -2177,7 +2177,7 @@ fn adaptive_memory_accounts_shared_checkpoint_pages_once() {
         AdaptivePrefixCache::new(namespaces(), memory_config(1_000_000)).expect("cache");
     let snapshots = paged_snapshot_chain();
     cache.insert(
-        PromptKey::text(&(0..768).map(|i| i as i32).collect::<Vec<_>>()),
+        PromptKey::text(&(0..768).collect::<Vec<_>>()),
         snapshots,
         SnapshotRoute::Baseline,
     );

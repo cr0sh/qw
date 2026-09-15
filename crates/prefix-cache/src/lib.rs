@@ -249,6 +249,9 @@ struct CacheIo {
     refresh_enqueued: Arc<AtomicBool>,
 }
 
+/// `(published blob digests with byte lengths, total blob bytes, manifest bytes)`.
+type PublicationResult = (Vec<(String, u64)>, u64, u64);
+
 struct PutCompletion {
     publication_id: u64,
     route: SnapshotRoute,
@@ -256,7 +259,7 @@ struct PutCompletion {
     images: Vec<ImageIdentity>,
     key: EntryKey,
     reserved_bytes: u64,
-    result: Result<(Vec<(String, u64)>, u64, u64), String>,
+    result: Result<PublicationResult, String>,
 }
 
 // Staging limit is max(4 * hot capacity, 64 MiB). Reservations conservatively
@@ -358,10 +361,10 @@ enum IoCommand {
         reserved_bytes: u64,
         token_ids: Vec<i32>,
         images: Vec<ImageIdentity>,
-        portable: PortablePromptSnapshot,
+        portable: Box<PortablePromptSnapshot>,
         retention: RetentionMetadata,
         expires_at_unix_ms: u64,
-        response_resume: Option<ResponseResumeMetadata>,
+        response_resume: Box<Option<ResponseResumeMetadata>>,
         reservation: Reservation,
     },
     Remove(EntryKey),
@@ -1024,7 +1027,7 @@ impl AdaptivePrefixCache {
                     route,
                     token_ids: prefix.token_ids.to_vec(),
                     images: prefix.images.to_vec(),
-                    portable,
+                    portable: Box::new(portable),
                     reserved_bytes: bytes,
                     reservation: reservation.expect("portable publication reserved"),
                     publication_id: self.publication_id,
@@ -1034,7 +1037,7 @@ impl AdaptivePrefixCache {
                         last_access_unix_ms: last_access,
                     },
                     expires_at_unix_ms: expiry,
-                    response_resume: resume,
+                    response_resume: Box::new(resume),
                 });
                 if queued {
                     self.publications.insert(key.clone(), self.publication_id);
@@ -1710,10 +1713,10 @@ fn io_loop(
                     &namespace,
                     route,
                     PromptKey::new(&token_ids, &images),
-                    portable,
+                    *portable,
                     retention,
                     expires_at_unix_ms,
-                    response_resume,
+                    *response_resume,
                     |bytes| {
                         reservation
                             .grow(bytes)

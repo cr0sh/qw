@@ -136,9 +136,11 @@ fn generate_specprefill_tokens<F: FnMut(i32) -> bool>(
             && (reuse.cached_tokens < prompt_ids.len()
                 || reuse.snapshot.continuation_logits().is_some())
     });
-    let admitted_cached_tokens = structurally_reusable
-        .then_some(requested_cached_tokens)
-        .unwrap_or(0);
+    let admitted_cached_tokens = if structurally_reusable {
+        requested_cached_tokens
+    } else {
+        0
+    };
     let dense_end = dense_prefix_end(admitted_cached_tokens, config);
     let eligible = &prompt_ids[dense_end..];
 
@@ -877,8 +879,7 @@ impl Qwen35Provider {
                     && (reuse.cached_tokens < prompt_ids.len()
                         || reuse.snapshot.continuation_logits().is_some())
             });
-            let dense_end =
-                dense_prefix_end(reusable.then_some(requested_cached).unwrap_or(0), config);
+            let dense_end = dense_prefix_end(if reusable { requested_cached } else { 0 }, config);
             if should_activate(prompt_ids.len() - dense_end, config) {
                 let mut decoder = IncrementalTextDecoder::new(&self.tokenizer);
                 let mut decode_error = None;
@@ -1148,6 +1149,7 @@ impl Qwen35Provider {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn generate_mtp_streaming<F: FnMut(&str) -> bool>(
         &mut self,
         prompt_ids: &[i32],
@@ -1278,6 +1280,7 @@ impl Qwen35Provider {
     }
 
     #[cfg(any(feature = "dflash2", test))]
+    #[allow(clippy::too_many_arguments)]
     pub fn generate_dflash2_baseline_streaming<F: FnMut(&str) -> bool>(
         &mut self,
         prompt_ids: &[i32],
@@ -1307,6 +1310,7 @@ impl Qwen35Provider {
 
     /// Generate from image-conditioned embeddings with reusable target prefixes.
     #[cfg(any(feature = "dflash2", test))]
+    #[allow(clippy::too_many_arguments)]
     pub fn generate_dflash2_multimodal_streaming<F: FnMut(&str) -> bool>(
         &mut self,
         prefill: PreparedMultimodalPrefill,
@@ -1339,6 +1343,7 @@ impl Qwen35Provider {
     }
 
     #[cfg(any(feature = "dflash2", test))]
+    #[allow(clippy::too_many_arguments)]
     fn generate_dflash2_cached_generation<F: FnMut(&str) -> bool>(
         &mut self,
         prompt_ids: &[i32],
@@ -1459,7 +1464,7 @@ impl Qwen35Provider {
         fields(max_tokens, block_size),
         err
     )]
-
+    #[allow(clippy::too_many_arguments)]
     fn generate_mtp_streaming_for_prompt<F: FnMut(&str) -> bool>(
         &mut self,
         prompt: MtpPrompt<'_>,

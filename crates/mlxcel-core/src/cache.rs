@@ -7184,7 +7184,9 @@ mod tests {
         let to_f32 = |arr: &MlxArray| {
             ffi::eval(arr);
             ffi::array_to_raw_bytes(arr)
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
                 .collect::<Vec<_>>()
         };
@@ -7296,7 +7298,9 @@ mod tests {
         let to_f32 = |arr: &MlxArray| {
             ffi::eval(arr);
             ffi::array_to_raw_bytes(arr)
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
                 .collect::<Vec<_>>()
         };
@@ -7321,7 +7325,9 @@ mod tests {
         let to_f32 = |arr: &MlxArray| {
             ffi::eval(arr);
             ffi::array_to_raw_bytes(arr)
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
                 .collect::<Vec<_>>()
         };
@@ -7366,7 +7372,9 @@ mod tests {
         let to_f32 = |arr: &MlxArray| {
             ffi::eval(arr);
             ffi::array_to_raw_bytes(arr)
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
                 .collect::<Vec<_>>()
         };
@@ -7394,7 +7402,9 @@ mod tests {
         let to_f32 = |arr: &MlxArray| {
             ffi::eval(arr);
             ffi::array_to_raw_bytes(arr)
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
                 .collect::<Vec<_>>()
         };
@@ -7424,7 +7434,9 @@ mod tests {
             let a = ffi::astype(arr, dtype::FLOAT32);
             ffi::eval(&a);
             ffi::array_to_raw_bytes(&a)
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect()
         }
@@ -7470,7 +7482,9 @@ mod tests {
             let a = ffi::astype(arr, dtype::FLOAT32);
             ffi::eval(&a);
             ffi::array_to_raw_bytes(&a)
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect()
         }
@@ -7500,7 +7514,12 @@ mod tests {
         // within one step (rounding error is at most half a step, FP16
         // storage of the scale adds a little slack).
         let check = |orig: &[f32], deq: &[f32], side: &str| {
-            for (t, (o_chunk, d_chunk)) in orig.chunks_exact(4).zip(deq.chunks_exact(4)).enumerate()
+            for (t, (o_chunk, d_chunk)) in orig
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(deq.as_chunks::<4>().0.iter())
+                .enumerate()
             {
                 let absmax = o_chunk.iter().fold(0.0_f32, |m, &x| m.max(x.abs()));
                 // Tolerance: one quantization step, with a small FP16 slack
@@ -7531,7 +7550,9 @@ mod tests {
             let a = ffi::astype(arr, dtype::FLOAT32);
             ffi::eval(&a);
             ffi::array_to_raw_bytes(&a)
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect()
         }
@@ -7605,7 +7626,9 @@ mod tests {
             let a = ffi::astype(arr, dtype::FLOAT32);
             ffi::eval(&a);
             ffi::array_to_raw_bytes(&a)
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect()
         }
@@ -7665,8 +7688,10 @@ mod tests {
 
         let check = |reference: &[f32], quant: &[f32], side: &str| {
             for (t, (r_chunk, q_chunk)) in reference
-                .chunks_exact(2)
-                .zip(quant.chunks_exact(2))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .zip(quant.as_chunks::<2>().0.iter())
                 .enumerate()
             {
                 let absmax = r_chunk.iter().fold(0.0_f32, |m, &x| m.max(x.abs()));
@@ -7782,7 +7807,9 @@ mod tests {
             let a = ffi::astype(arr, dtype::FLOAT32);
             ffi::eval(&a);
             ffi::array_to_raw_bytes(&a)
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect()
         }
@@ -7819,7 +7846,9 @@ mod tests {
         let a = ffi::astype(arr, dtype::FLOAT32);
         ffi::eval(&a);
         ffi::array_to_raw_bytes(&a)
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect()
     }
@@ -7956,7 +7985,7 @@ mod tests {
         // {1, 2, 5, 6, 7} within one INT8 quant step (scales sliced with the
         // data, not left stale).
         let deq = read_seq_f32(&fk);
-        let first_coords: Vec<f32> = deq.chunks_exact(2).map(|c| c[0]).collect();
+        let first_coords: Vec<f32> = deq.as_chunks::<2>().0.iter().map(|c| c[0]).collect();
         let expected = [1.0_f32, 2.0, 5.0, 6.0, 7.0];
         assert_eq!(first_coords.len(), expected.len());
         for (got, want) in first_coords.iter().zip(expected.iter()) {
@@ -8032,7 +8061,9 @@ mod tests {
             let a = ffi::astype(arr, dtype::FLOAT32);
             ffi::eval(&a);
             ffi::array_to_raw_bytes(&a)
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect()
         }
@@ -8176,7 +8207,9 @@ mod tests {
             let a = ffi::astype(arr, dtype::FLOAT32);
             ffi::eval(&a);
             ffi::array_to_raw_bytes(&a)
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect()
         }

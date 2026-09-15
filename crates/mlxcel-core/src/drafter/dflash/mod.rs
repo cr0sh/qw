@@ -94,12 +94,16 @@ pub(crate) fn materialize_argmax_i32_vec(argmax: &MlxArray, expected_len: usize)
     let bytes = ffi::array_to_raw_bytes(argmax);
     match itemsize {
         4 => bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .take(expected_len)
             .map(|chunk| i32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
             .collect(),
         8 => bytes
-            .chunks_exact(8)
+            .as_chunks::<8>()
+            .0
+            .iter()
             .take(expected_len)
             .map(|chunk| {
                 i64::from_ne_bytes([

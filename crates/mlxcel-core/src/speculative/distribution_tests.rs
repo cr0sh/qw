@@ -211,7 +211,9 @@ impl LanguageModel for OrbitModel {
         ffi::eval(input_ids);
         let bytes = ffi::array_to_raw_bytes(input_ids);
         let tokens: Vec<i32> = bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         for cache in caches.iter_mut() {

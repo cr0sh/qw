@@ -162,8 +162,10 @@ fn to_vec_f32(arr: &MlxArray) -> Vec<f32> {
     let as_f32 = ffi::astype(arr, dtype::FLOAT32);
     ffi::eval(&as_f32);
     ffi::array_to_raw_bytes(&as_f32)
-        .chunks_exact(4)
-        .map(|c| f32::from_ne_bytes(c.try_into().expect("4-byte chunk")))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_ne_bytes(*c))
         .collect()
 }
 

@@ -108,8 +108,7 @@ fn supported_inputs(
         && tk > 2048
         && hq % hkv == 0
         && hq / hkv <= 32
-        && dim >= 32
-        && dim <= 256
+        && (32..=256).contains(&dim)
         && dim % 32 == 0
         && (dim & (dim - 1)) == 0
         && dim as u32 == params.head_dim

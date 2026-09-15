@@ -224,8 +224,10 @@ fn fixture_matrix(qtype: GgmlQType, width: usize, rows: usize) -> Vec<u8> {
 fn raw_f32(array: &MlxArray) -> Vec<f32> {
     crate::eval(array);
     crate::array_to_raw_bytes(array)
-        .chunks_exact(4)
-        .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|bytes| f32::from_le_bytes(*bytes))
         .collect()
 }
 

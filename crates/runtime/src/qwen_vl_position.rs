@@ -145,8 +145,10 @@ mod tests {
         let positions = decode_rope_positions(8, 2, -2);
         mlxcel_core::eval(&positions);
         let values = mlxcel_core::array_to_raw_bytes(&positions)
-            .chunks_exact(4)
-            .map(|bytes| i32::from_ne_bytes(bytes.try_into().expect("i32 byte width")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| i32::from_ne_bytes(*bytes))
             .collect::<Vec<_>>();
         assert_eq!(values, vec![6, 7, 6, 7, 6, 7]);
     }

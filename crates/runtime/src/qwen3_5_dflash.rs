@@ -1360,6 +1360,7 @@ impl DFlash2DraftModel {
     /// Backbone forward over the masked draft block, returning the final
     /// normalized hidden states `[1, bs, H]` (SGLang `DFlashDraftModel.forward`
     /// + `norm`).
+    ///
     /// Project newly committed target-layer rows once, then reuse the result
     /// across every draft layer. Passing `None` is reserved for an exact
     /// projected-prefix restore whose per-layer K/V is already in `caches`.
@@ -1930,19 +1931,24 @@ impl Dflash2PromptSnapshot {
 
 fn validate_dflash2_portable_float(array: &PortableArray) -> Result<(), String> {
     let finite = match array.dtype {
-        mlxcel_core::dtype::FLOAT32 => array.bytes.chunks_exact(4).all(|bytes| {
-            f32::from_ne_bytes(bytes.try_into().expect("four-byte float")).is_finite()
-        }),
+        mlxcel_core::dtype::FLOAT32 => array
+            .bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|bytes| f32::from_ne_bytes(*bytes).is_finite()),
         mlxcel_core::dtype::FLOAT16 | mlxcel_core::dtype::BFLOAT16 => {
             let exponent_mask = if array.dtype == mlxcel_core::dtype::FLOAT16 {
                 0x7c00
             } else {
                 0x7f80
             };
-            array.bytes.chunks_exact(2).all(|bytes| {
-                u16::from_ne_bytes(bytes.try_into().expect("two-byte float")) & exponent_mask
-                    != exponent_mask
-            })
+            array
+                .bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .all(|bytes| u16::from_ne_bytes(*bytes) & exponent_mask != exponent_mask)
         }
         _ => {
             return Err(
@@ -2101,8 +2107,10 @@ fn stochastic_dflash2_walk(
     note_rule(AcceptanceRule::Stochastic);
     mlxcel_core::eval(&proposal.path);
     let draft_tokens = mlxcel_core::array_evaluated_bytes(&proposal.path)
-        .chunks_exact(4)
-        .map(|bytes| i32::from_ne_bytes(bytes.try_into().expect("i32 token bytes")))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|bytes| i32::from_ne_bytes(*bytes))
         .collect::<Vec<_>>();
     let shape = mlxcel_core::array_shape(verify_logits);
     let candidate_shape = mlxcel_core::array_shape(&proposal.candidates);
@@ -2246,6 +2254,13 @@ pub struct Qwen35Dflash2Generator {
     projected_prefix: Option<Dflash2ProjectedPrefix>,
 }
 
+/// Captured (hidden, first logits, checkpoints) state from a checkpointed prefill.
+type PrefillCheckpointState = (
+    Option<UniquePtr<MlxArray>>,
+    UniquePtr<MlxArray>,
+    Vec<Dflash2PromptSnapshot>,
+);
+
 impl Qwen35Dflash2Generator {
     /// Load the drafter from `draft_dir` and bind its embedding to the
     /// target model's (the checkpoint ships no `embed_tokens.weight`).
@@ -2273,6 +2288,7 @@ impl Qwen35Dflash2Generator {
 
     /// Constrained verification shares MTP's parser transitions, but keeps the
     /// DFlash block proposal and its original (unmasked) proposal distribution.
+    #[allow(clippy::too_many_arguments)]
     fn generate_constrained<F: FnMut(i32, Option<&[u8]>) -> bool>(
         &mut self,
         target: &Qwen35Model,
@@ -2457,8 +2473,10 @@ impl Qwen35Dflash2Generator {
                 stats.speculative_rounds += 1;
                 mlxcel_core::eval(&proposal.path);
                 let tokens = mlxcel_core::array_evaluated_bytes(&proposal.path)
-                    .chunks_exact(4)
-                    .map(|bytes| i32::from_ne_bytes(bytes.try_into().expect("token bytes")))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|bytes| i32::from_ne_bytes(*bytes))
                     .collect::<Vec<_>>();
                 // Reserve one output position for the correction/bonus. This
                 // lets atomic splices be checked before committing the parser.
@@ -2728,14 +2746,7 @@ impl Qwen35Dflash2Generator {
         checkpoint_token_lengths: &[usize],
         retain_hidden: bool,
         multimodal: Option<(&MlxArray, &MlxArray, i32)>,
-    ) -> Result<
-        (
-            Option<UniquePtr<MlxArray>>,
-            UniquePtr<MlxArray>,
-            Vec<Dflash2PromptSnapshot>,
-        ),
-        String,
-    > {
+    ) -> Result<PrefillCheckpointState, String> {
         let cached_tokens = reuse.map_or(0, |reuse| reuse.cached_tokens);
         let mut boundaries = checkpoint_token_lengths
             .iter()
@@ -2789,8 +2800,10 @@ impl Qwen35Dflash2Generator {
                 } else {
                     mlxcel_core::eval(&positions);
                     let maximum = mlxcel_core::array_evaluated_bytes(&positions)
-                        .chunks_exact(4)
-                        .map(|bytes| i32::from_ne_bytes(bytes.try_into().expect("position bytes")))
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|bytes| i32::from_ne_bytes(*bytes))
                         .max()
                         .expect("non-empty position segment");
                     maximum + 1 - token_len as i32
@@ -2853,6 +2866,7 @@ impl Qwen35Dflash2Generator {
     }
 
     /// Generate with distribution-preserving DFlash2 draft verification.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn generate_streaming_with_prefill<F: FnMut(i32, Option<&[u8]>) -> bool>(
         &mut self,
         target: &Qwen35Model,
@@ -3520,8 +3534,10 @@ mod tests {
     fn raw_i32(array: &MlxArray) -> Vec<i32> {
         mlxcel_core::eval(array);
         mlxcel_core::array_evaluated_bytes(array)
-            .chunks_exact(4)
-            .map(|bytes| i32::from_ne_bytes(bytes.try_into().expect("i32 bytes")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| i32::from_ne_bytes(*bytes))
             .collect()
     }
 
@@ -3614,8 +3630,10 @@ mod tests {
     fn raw_f32(array: &MlxArray) -> Vec<f32> {
         mlxcel_core::eval(array);
         mlxcel_core::array_evaluated_bytes(array)
-            .chunks_exact(4)
-            .map(|bytes| f32::from_ne_bytes(bytes.try_into().expect("f32 bytes")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| f32::from_ne_bytes(*bytes))
             .collect()
     }
 

@@ -41,6 +41,7 @@ use crate::utils::{align_to_na_tile, create_padded_prefill_mask};
 use cxx::UniquePtr;
 use std::borrow::Cow;
 use std::collections::HashSet;
+use std::rc::Rc;
 use std::sync::{
     Arc, OnceLock,
     atomic::{AtomicU64, Ordering},
@@ -95,7 +96,8 @@ static NEXT_SNAPSHOT_PAGE_ID: AtomicU64 = AtomicU64::new(1);
 ///
 /// The MLX handle deliberately remains inside this non-`Send` type. A page's
 /// raw representation can be moved between worker threads only through
-/// [`SnapshotPage::portable_bytes`].
+/// [`SnapshotPage::portable_bytes`], so pages are shared within a thread with
+/// [`Rc`] rather than [`Arc`].
 pub struct SnapshotPage {
     identity: u64,
     token_start: usize,
@@ -107,9 +109,9 @@ pub struct SnapshotPage {
 }
 
 impl SnapshotPage {
-    fn new(token_start: usize, token_end: usize, array: UniquePtr<MlxArray>) -> Arc<Self> {
+    fn new(token_start: usize, token_end: usize, array: UniquePtr<MlxArray>) -> Rc<Self> {
         let view = array.as_ref().expect("snapshot page must not be null");
-        Arc::new(Self {
+        Rc::new(Self {
             identity: NEXT_SNAPSHOT_PAGE_ID.fetch_add(1, Ordering::Relaxed),
             token_start,
             token_end,
@@ -127,7 +129,7 @@ impl SnapshotPage {
         shape: Vec<i32>,
         dtype: i32,
         bytes: Arc<[u8]>,
-    ) -> Result<Arc<Self>, String> {
+    ) -> Result<Rc<Self>, String> {
         let expected = shape
             .iter()
             .try_fold(1usize, |n, &d| n.checked_mul(usize::try_from(d).ok()?))
@@ -139,7 +141,7 @@ impl SnapshotPage {
             ));
         }
         let array = ffi::from_bytes(&bytes, &shape, dtype);
-        Ok(Arc::new(Self {
+        Ok(Rc::new(Self {
             identity: NEXT_SNAPSHOT_PAGE_ID.fetch_add(1, Ordering::Relaxed),
             token_start,
             token_end,
@@ -206,7 +208,7 @@ pub struct SnapshotPagedTensor {
     name: String,
     token_axis: usize,
     token_len: usize,
-    pages: Vec<Arc<SnapshotPage>>,
+    pages: Vec<Rc<SnapshotPage>>,
 }
 
 impl SnapshotPagedTensor {
@@ -219,7 +221,7 @@ impl SnapshotPagedTensor {
     pub fn token_axis(&self) -> usize {
         self.token_axis
     }
-    pub fn pages(&self) -> &[Arc<SnapshotPage>] {
+    pub fn pages(&self) -> &[Rc<SnapshotPage>] {
         &self.pages
     }
     pub fn nbytes(&self) -> usize {
@@ -409,7 +411,7 @@ impl ModelStateSnapshot {
         &mut self,
         name: impl Into<String>,
         token_axis: usize,
-        pages: Vec<Arc<SnapshotPage>>,
+        pages: Vec<Rc<SnapshotPage>>,
     ) -> Result<(), String> {
         if pages.is_empty() {
             return Err("snapshot paged tensor must contain at least one page".to_string());
@@ -463,10 +465,10 @@ impl ModelStateSnapshot {
         let mut total = 0;
         for tensor in &self.paged_tensors {
             for page in &tensor.pages {
-                if let Some(bytes) = page.portable.get() {
-                    if seen.insert(bytes.as_ptr() as usize) {
-                        total += bytes.len();
-                    }
+                if let Some(bytes) = page.portable.get()
+                    && seen.insert(bytes.as_ptr() as usize)
+                {
+                    total += bytes.len();
                 }
             }
         }
@@ -2081,17 +2083,16 @@ impl CxxGenerator {
             && prompt_snapshots
                 .iter()
                 .all(|snapshot| snapshot.token_len() != prompt_tokens.len())
-        {
-            if let Some(mut snapshot) = model.snapshot_sequence_state(
+            && let Some(mut snapshot) = model.snapshot_sequence_state(
                 sequence_id,
                 prompt_tokens.len(),
                 prompt_snapshots.last(),
-            ) {
-                snapshot.set_continuation_logits(
-                    logits.as_ref().expect("generation logits must not be null"),
-                );
-                prompt_snapshots.push(snapshot);
-            }
+            )
+        {
+            snapshot.set_continuation_logits(
+                logits.as_ref().expect("generation logits must not be null"),
+            );
+            prompt_snapshots.push(snapshot);
         }
         let prefill_time = prefill_start.elapsed();
         ffi::clear_memory_cache();
@@ -3521,7 +3522,7 @@ impl CxxGenerator {
             bytes.len()
         );
         let mut out = Vec::with_capacity(actual_len - 1);
-        for chunk in bytes.chunks_exact(4) {
+        for chunk in bytes.as_chunks::<4>().0 {
             out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
         }
 
@@ -3626,8 +3627,10 @@ mod tests {
             // vocabulary position winning.
             ffi::eval(input_ids);
             let tokens = ffi::array_to_raw_bytes(input_ids)
-                .chunks_exact(4)
-                .map(|bytes| i32::from_ne_bytes(bytes.try_into().expect("i32 token bytes")))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| i32::from_ne_bytes(*bytes))
                 .collect::<Vec<_>>();
             let mut logits = Vec::with_capacity(tokens.len() * 4);
             for token in tokens {
@@ -3803,8 +3806,10 @@ mod tests {
             ffi::eval(input_ids);
             self.forward_lengths.borrow_mut().push(len);
             let tokens = ffi::array_to_raw_bytes(input_ids)
-                .chunks_exact(4)
-                .map(|bytes| i32::from_ne_bytes(bytes.try_into().expect("i32 token bytes")))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| i32::from_ne_bytes(*bytes))
                 .collect::<Vec<_>>();
             self.seen.borrow_mut().extend(tokens);
             let total = self.seen.borrow().iter().sum::<i32>() as f32;

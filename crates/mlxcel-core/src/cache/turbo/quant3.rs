@@ -202,7 +202,7 @@ pub fn quantize_v_turbo3(
         "fp32 byte count mismatch"
     );
     let mut coords = Vec::with_capacity(coord_count);
-    for chunk in v_rot_bytes.chunks_exact(4) {
+    for chunk in v_rot_bytes.as_chunks::<4>().0 {
         coords.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
 
@@ -404,7 +404,9 @@ mod tests {
         ffi::eval(&v_hat_f32);
         let v_hat_bytes = ffi::array_to_raw_bytes(&v_hat_f32);
         let v_hat_vec: Vec<f32> = v_hat_bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
 
@@ -454,7 +456,7 @@ mod tests {
         let v_hat_f32 = ffi::astype(&v_hat, dtype::FLOAT32);
         ffi::eval(&v_hat_f32);
         let bytes = ffi::array_to_raw_bytes(&v_hat_f32);
-        for chunk in bytes.chunks_exact(4) {
+        for chunk in bytes.as_chunks::<4>().0 {
             let val = f32::from_le_bytes(c0(chunk));
             assert!(val.abs() < 1e-3, "expected ~0, got {val}");
         }

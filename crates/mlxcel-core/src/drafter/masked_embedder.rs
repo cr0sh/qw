@@ -537,7 +537,7 @@ mod tests {
         eval(&out);
         let bytes = ffi::array_to_raw_bytes(&out);
         let mut logits = [0f32; 16];
-        for (i, chunk) in bytes.chunks_exact(4).enumerate().take(16) {
+        for (i, chunk) in bytes.as_chunks::<4>().0.iter().enumerate().take(16) {
             logits[i] = f32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         }
 
@@ -584,7 +584,7 @@ mod tests {
         eval(&out);
         let bytes = ffi::array_to_raw_bytes(&out);
         let mut logits = [0f32; 16];
-        for (i, chunk) in bytes.chunks_exact(4).enumerate().take(16) {
+        for (i, chunk) in bytes.as_chunks::<4>().0.iter().enumerate().take(16) {
             logits[i] = f32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         }
         for (offset, &v) in logits.iter().enumerate().skip(8).take(8) {
@@ -661,8 +661,10 @@ mod tests {
             "shape mismatch between MaskedEmbedder and dense reference"
         );
         for (i, (mb, db)) in masked_bytes
-            .chunks_exact(4)
-            .zip(dense_bytes.chunks_exact(4))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(dense_bytes.as_chunks::<4>().0.iter())
             .enumerate()
             .take(vocab_size)
         {

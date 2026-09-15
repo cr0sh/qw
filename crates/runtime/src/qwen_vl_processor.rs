@@ -218,8 +218,10 @@ mod tests {
         );
         mlxcel_core::eval(&mlx);
         let roundtrip = mlxcel_core::array_to_raw_bytes(&mlx)
-            .chunks_exact(4)
-            .map(|bytes| f32::from_ne_bytes(bytes.try_into().expect("f32 byte width")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| f32::from_ne_bytes(*bytes))
             .collect::<Vec<_>>();
         assert_eq!(roundtrip, prepared.patches);
     }

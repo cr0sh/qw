@@ -95,7 +95,9 @@ fn flatten_fp32(arr: &MlxArray) -> Vec<f32> {
     eval(&a);
     let bytes = array_to_raw_bytes(&a);
     bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect()
 }

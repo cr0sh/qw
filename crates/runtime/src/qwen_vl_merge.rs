@@ -75,8 +75,10 @@ mod tests {
     fn values(array: &MlxArray) -> Vec<f32> {
         mlxcel_core::eval(array);
         mlxcel_core::array_to_raw_bytes(array)
-            .chunks_exact(4)
-            .map(|bytes| f32::from_ne_bytes(bytes.try_into().expect("f32 byte width")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| f32::from_ne_bytes(*bytes))
             .collect()
     }
 

@@ -358,7 +358,9 @@ mod tests {
         eval(&freqs_f32);
         let bytes = array_to_raw_bytes(&freqs_f32);
         let values: Vec<f32> = bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
         assert_eq!(values.len(), 128);
@@ -439,7 +441,9 @@ mod tests {
 
         let out_bytes = array_to_raw_bytes(&astype(&out, dtype::FLOAT32));
         let out_values: Vec<f32> = out_bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
 

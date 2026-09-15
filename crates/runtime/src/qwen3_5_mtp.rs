@@ -523,6 +523,7 @@ impl Qwen35MtpDraftModel {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draft_block_greedy_graph(
         &self,
         target: &Qwen35Model,
@@ -983,8 +984,10 @@ fn evaluated_i32_values(array: &MlxArray) -> Vec<i32> {
         "draft token graph must produce i32 token identifiers"
     );
     mlxcel_core::array_evaluated_bytes(array)
-        .chunks_exact(std::mem::size_of::<i32>())
-        .map(|bytes| i32::from_ne_bytes(bytes.try_into().expect("one i32 token")))
+        .as_chunks::<{ std::mem::size_of::<i32>() }>()
+        .0
+        .iter()
+        .map(|bytes| i32::from_ne_bytes(*bytes))
         .collect()
 }
 
@@ -995,8 +998,10 @@ fn evaluated_f32_values(array: &MlxArray) -> Vec<f32> {
         "draft confidence graph must produce f32 values"
     );
     mlxcel_core::array_evaluated_bytes(array)
-        .chunks_exact(std::mem::size_of::<f32>())
-        .map(|bytes| f32::from_ne_bytes(bytes.try_into().expect("one f32 confidence")))
+        .as_chunks::<{ std::mem::size_of::<f32>() }>()
+        .0
+        .iter()
+        .map(|bytes| f32::from_ne_bytes(*bytes))
         .collect()
 }
 
@@ -1391,8 +1396,10 @@ pub(crate) fn greedy_walk_device_proposals(
     let materialize_ids = |array: &MlxArray| {
         mlxcel_core::eval(array);
         mlxcel_core::array_evaluated_bytes(array)
-            .chunks_exact(4)
-            .map(|bytes| i32::from_ne_bytes(bytes.try_into().expect("i32 token bytes")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| i32::from_ne_bytes(*bytes))
             .collect::<Vec<_>>()
     };
     let history_independent = sampling.repetition_penalty == 1.0
@@ -2325,6 +2332,7 @@ fn capture_final_snapshot_if_requested<T>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn capture_mtp_snapshot_from_verify(
     model: &Qwen35Model,
     drafter: &Qwen35MtpDraftModel,
@@ -2507,6 +2515,7 @@ impl Qwen35MtpGenerator {
         Self
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn generate_streaming<F: FnMut(i32) -> bool>(
         &mut self,
         model: &Qwen35Model,
@@ -2582,6 +2591,7 @@ impl Qwen35MtpGenerator {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn generate_streaming_for_prefill<F: FnMut(i32) -> bool>(
         &mut self,
         model: &Qwen35Model,
@@ -4045,25 +4055,27 @@ mod tests {
 
     #[test]
     fn compact_mtp_host_sampling_replaces_only_token_bias() {
-        let mut sampling = SamplingConfig::default();
-        sampling.temperature = 0.7;
-        sampling.top_k = 23;
-        sampling.top_p = 0.8;
-        sampling.min_p = 0.04;
-        sampling.seed = Some(42);
-        sampling.repetition_penalty = 1.1;
-        sampling.dry_multiplier = 0.3;
-        sampling.dry_base = 1.6;
-        sampling.dry_allowed_length = 4;
-        sampling.dry_penalty_last_n = 64;
-        sampling.dry_sequence_breakers = vec![10, 11];
-        sampling.frequency_penalty = 0.2;
-        sampling.presence_penalty = 0.1;
-        sampling.stop_token_ids = vec![248_044, 248_046];
+        let mut sampling = SamplingConfig {
+            temperature: 0.7,
+            top_k: 23,
+            top_p: 0.8,
+            min_p: 0.04,
+            seed: Some(42),
+            repetition_penalty: 1.1,
+            dry_multiplier: 0.3,
+            dry_base: 1.6,
+            dry_allowed_length: 4,
+            dry_penalty_last_n: 64,
+            dry_sequence_breakers: vec![10, 11],
+            frequency_penalty: 0.2,
+            presence_penalty: 0.1,
+            stop_token_ids: vec![248_044, 248_046],
+            xtc_probability: 0.25,
+            xtc_threshold: 0.15,
+            xtc_special_token_ids: vec![12, 13],
+            ..Default::default()
+        };
         sampling.token_bias.insert(248_044, -2.0);
-        sampling.xtc_probability = 0.25;
-        sampling.xtc_threshold = 0.15;
-        sampling.xtc_special_token_ids = vec![12, 13];
 
         let mut compact_bias = TokenBiasMap::new();
         compact_bias.insert_byte_fragment(65_536, -2.0);
@@ -4542,8 +4554,10 @@ mod tests {
     fn array_f32(array: &MlxArray) -> Vec<f32> {
         mlxcel_core::eval(array);
         mlxcel_core::array_to_raw_bytes(array)
-            .chunks_exact(4)
-            .map(|bytes| f32::from_ne_bytes(bytes.try_into().expect("f32 bytes")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| f32::from_ne_bytes(*bytes))
             .collect()
     }
 
@@ -4575,8 +4589,10 @@ mod tests {
             decode_rope_positions(state.cache.offset, 2, state.rope_delta.expect("delta"));
         mlxcel_core::eval(&positions);
         let values = mlxcel_core::array_to_raw_bytes(&positions)
-            .chunks_exact(4)
-            .map(|bytes| i32::from_ne_bytes(bytes.try_into().expect("i32 bytes")))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| i32::from_ne_bytes(*bytes))
             .collect::<Vec<_>>();
         assert_eq!(values, [5, 6, 5, 6, 5, 6]);
     }
