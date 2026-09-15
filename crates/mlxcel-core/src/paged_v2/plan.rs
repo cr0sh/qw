@@ -156,10 +156,11 @@ impl PagedDecodeGeometry {
                 self.q_heads, self.kv_heads
             ));
         }
-        if self.n_rep() % self.q_heads_per_cta() != 0 {
+        let q_heads_per_cta = self.q_heads_per_cta();
+        if self.n_rep() % q_heads_per_cta != 0 {
             return Err(format!(
                 "paged decode v2: q_heads_per_cta {} does not divide n_rep {}",
-                self.q_heads_per_cta(),
+                q_heads_per_cta,
                 self.n_rep()
             ));
         }
