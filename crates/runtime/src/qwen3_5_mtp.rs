@@ -523,6 +523,7 @@ impl Qwen35MtpDraftModel {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draft_block_greedy_graph(
         &self,
         target: &Qwen35Model,
@@ -2331,6 +2332,7 @@ fn capture_final_snapshot_if_requested<T>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn capture_mtp_snapshot_from_verify(
     model: &Qwen35Model,
     drafter: &Qwen35MtpDraftModel,
@@ -2513,6 +2515,7 @@ impl Qwen35MtpGenerator {
         Self
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn generate_streaming<F: FnMut(i32) -> bool>(
         &mut self,
         model: &Qwen35Model,
@@ -2588,6 +2591,7 @@ impl Qwen35MtpGenerator {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn generate_streaming_for_prefill<F: FnMut(i32) -> bool>(
         &mut self,
         model: &Qwen35Model,

@@ -1502,6 +1502,7 @@ impl Qwen35Model {
     }
 
     #[cfg(any(feature = "dflash2", test))]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_dflash_prefill_segment_chunked(
         &self,
         input_ids: &MlxArray,

@@ -2288,6 +2288,7 @@ impl Qwen35Dflash2Generator {
 
     /// Constrained verification shares MTP's parser transitions, but keeps the
     /// DFlash block proposal and its original (unmasked) proposal distribution.
+    #[allow(clippy::too_many_arguments)]
     fn generate_constrained<F: FnMut(i32, Option<&[u8]>) -> bool>(
         &mut self,
         target: &Qwen35Model,
@@ -2865,6 +2866,7 @@ impl Qwen35Dflash2Generator {
     }
 
     /// Generate with distribution-preserving DFlash2 draft verification.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn generate_streaming_with_prefill<F: FnMut(i32, Option<&[u8]>) -> bool>(
         &mut self,
         target: &Qwen35Model,

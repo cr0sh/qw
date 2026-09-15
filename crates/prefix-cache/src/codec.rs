@@ -162,6 +162,7 @@ pub fn namespace_hash(p: &[&[u8]]) -> String {
     }
     hex(&h.finalize())
 }
+#[allow(clippy::too_many_arguments)]
 pub fn encode_portable(
     ns: &str,
     r: SnapshotRoute,
