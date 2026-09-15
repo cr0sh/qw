@@ -653,27 +653,22 @@ pub(crate) fn validate_resume_metadata(
     }
     Ok(())
 }
-fn flatten(
-    p: PortablePromptSnapshot,
-) -> Result<
-    (
-        String,
-        Option<String>,
-        Option<i32>,
-        Vec<(ArrayRole, PortableArray)>,
-        Vec<(ArrayRole, PortablePagedTensor)>,
-    ),
+/// Serialized snapshot parts: family, optional draft family, optional draft
+/// offset, dense arrays, paged tensors.
+type FlattenedSnapshot = (
     String,
-> {
-    fn m(
-        mut x: PortableModelState,
-        r: ArrayRole,
-        cr: ArrayRole,
-    ) -> (
+    Option<String>,
+    Option<i32>,
+    Vec<(ArrayRole, PortableArray)>,
+    Vec<(ArrayRole, PortablePagedTensor)>,
+);
+fn flatten(p: PortablePromptSnapshot) -> Result<FlattenedSnapshot, String> {
+    type PartitionedModelState = (
         String,
         Vec<(ArrayRole, PortableArray)>,
         Vec<(ArrayRole, PortablePagedTensor)>,
-    ) {
+    );
+    fn m(mut x: PortableModelState, r: ArrayRole, cr: ArrayRole) -> PartitionedModelState {
         let f = x.family;
         let mut d = x.tensors.into_iter().map(|a| (r, a)).collect::<Vec<_>>();
         if let Some(a) = x.continuation_logits.take() {

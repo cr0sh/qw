@@ -7,11 +7,11 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Captured tracing event fields, shared with the test subscriber.
+type RecordedEvents = Option<Arc<Mutex<Vec<HashMap<String, String>>>>>;
+
 #[derive(Clone)]
-struct InfoCounter(
-    Arc<AtomicUsize>,
-    Option<Arc<Mutex<Vec<HashMap<String, String>>>>>,
-);
+struct InfoCounter(Arc<AtomicUsize>, RecordedEvents);
 
 #[derive(Default)]
 struct RecordedFields(HashMap<String, String>);

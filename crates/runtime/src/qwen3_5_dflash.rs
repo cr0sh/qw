@@ -2254,6 +2254,13 @@ pub struct Qwen35Dflash2Generator {
     projected_prefix: Option<Dflash2ProjectedPrefix>,
 }
 
+/// Captured (hidden, first logits, checkpoints) state from a checkpointed prefill.
+type PrefillCheckpointState = (
+    Option<UniquePtr<MlxArray>>,
+    UniquePtr<MlxArray>,
+    Vec<Dflash2PromptSnapshot>,
+);
+
 impl Qwen35Dflash2Generator {
     /// Load the drafter from `draft_dir` and bind its embedding to the
     /// target model's (the checkpoint ships no `embed_tokens.weight`).
@@ -2738,14 +2745,7 @@ impl Qwen35Dflash2Generator {
         checkpoint_token_lengths: &[usize],
         retain_hidden: bool,
         multimodal: Option<(&MlxArray, &MlxArray, i32)>,
-    ) -> Result<
-        (
-            Option<UniquePtr<MlxArray>>,
-            UniquePtr<MlxArray>,
-            Vec<Dflash2PromptSnapshot>,
-        ),
-        String,
-    > {
+    ) -> Result<PrefillCheckpointState, String> {
         let cached_tokens = reuse.map_or(0, |reuse| reuse.cached_tokens);
         let mut boundaries = checkpoint_token_lengths
             .iter()

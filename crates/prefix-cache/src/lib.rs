@@ -249,6 +249,9 @@ struct CacheIo {
     refresh_enqueued: Arc<AtomicBool>,
 }
 
+/// `(published blob digests with byte lengths, total blob bytes, manifest bytes)`.
+type PublicationResult = (Vec<(String, u64)>, u64, u64);
+
 struct PutCompletion {
     publication_id: u64,
     route: SnapshotRoute,
