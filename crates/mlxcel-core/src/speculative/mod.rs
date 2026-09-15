@@ -240,13 +240,9 @@ pub struct SpeculativeGenerator {
     stochastic_acceptance: Option<bool>,
     /// Cached per-generator `TokenBiasMap` resolved from a `LangBiasConfig`.
     ///
-    /// **Axis B invariant**: the bias is applied **only** to the target
-    /// (main) model's sampler. The draft model must keep seeing the
-    /// unmodified policy so its candidate distribution stays aligned with
-    /// its own weights; otherwise the accept/reject comparison becomes
-    /// biased on two different policies and speculative acceptance rate
-    /// collapses. See [`Self::compose_target_sampling`] and
-    /// [`Self::draft_sampling`] — only the former injects the cached bias.
+    /// Applied only by [`Self::compose_target_sampling`]. Draft proposals use
+    /// the caller's unmodified policy; cached target bias must not alter their
+    /// proposal distribution.
     token_bias: TokenBiasMap,
     /// The one emitted token the draft model's KV cache does not hold yet.
     ///
@@ -338,18 +334,6 @@ impl SpeculativeGenerator {
         }
     }
 
-    /// Returns the sampling config used by the **draft** model.
-    ///
-    /// **Axis B**: by design this ignores the generator's cached
-    /// `token_bias`. Biasing the draft sampler would skew candidate
-    /// distribution away from the draft model's trained distribution and
-    /// collapse speculative acceptance rates (the target's accept/reject
-    /// comparison already reflects the bias on the verification side).
-    #[inline]
-    fn draft_sampling<'a>(&self, sampling: &'a SamplingConfig) -> &'a SamplingConfig {
-        sampling
-    }
-
     /// Reset generator state
     pub fn reset(&mut self) {
         for cache in &mut self.main_caches {
@@ -425,13 +409,11 @@ impl SpeculativeGenerator {
             "speculative generate requires at least one prompt token"
         );
 
-        // Axis B: compose target-only sampling once; draft sampling stays raw.
-        // `target_cow` owns the merged config when a bias is active, otherwise
-        // it borrows the caller's. `draft_sampling` always returns `sampling`
-        // unchanged — biasing the draft would collapse acceptance rate.
+        // Compose the target-only config once; draft sampling uses the caller's
+        // unmodified config so its proposal distribution stays unbiased.
         let target_cow = self.compose_target_sampling(sampling);
         let target_sampling: &SamplingConfig = target_cow.as_ref();
-        let draft_sampling: &SamplingConfig = self.draft_sampling(sampling);
+        let draft_sampling = sampling;
 
         // Set generation stream
         install_thread_local_default_stream(self.generation_stream.as_ref());
@@ -586,8 +568,7 @@ impl SpeculativeGenerator {
                     None => ffi::from_slice_i32(&[draft_token], &[1, 1]),
                 };
                 let draft_logits = draft_model.forward(&draft_input, &mut self.draft_caches, None);
-                // Axis B: draft sampler MUST NOT see the bias. See
-                // `draft_sampling` for the rationale.
+                // Cached target bias does not apply to draft proposals.
                 let tok_arr = if capture_proposal_probs {
                     // The token and `q` come out of one pre-step, which is what
                     // guarantees `q` is the distribution this very token was
@@ -1069,18 +1050,6 @@ mod tests {
         assert!(
             target.token_bias.contains(7),
             "target bias must contain id=7"
-        );
-
-        // Draft-side composition MUST remain unbiased regardless of the cached
-        // map — this is the core speculative-acceptance invariant.
-        let draft = g.draft_sampling(&caller);
-        assert!(
-            draft.token_bias.is_empty(),
-            "draft sampler must NEVER carry the cached bias (got {} entries): \
-             speculative acceptance is computed by comparing draft candidates \
-             against target sampling, and biasing the draft collapses the \
-             accept ratio",
-            draft.token_bias.len()
         );
     }
 
