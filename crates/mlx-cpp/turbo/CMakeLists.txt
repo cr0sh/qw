@@ -32,19 +32,6 @@ cmake_minimum_required(VERSION 3.16)
 project(mlxcel-turbo-kernels LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 
-# Header search paths — these are exported to consumers via target_include
-# directories so a parent CMakeLists.txt can pick this up via
-# add_subdirectory(turbo).
-set(MLXCEL_TURBO_KERNEL_HEADERS
-    ${CMAKE_CURRENT_SOURCE_DIR}/sparse_v_sdpa.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/turbo4_delegated_sdpa.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/turbo4_attention.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/paged_attention.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/paged_attention_v2.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/sampling.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/sampling_rejection.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/fused_norm.h
-    ${CMAKE_CURRENT_SOURCE_DIR}/fused_rope_append.h)
 
 set(MLXCEL_TURBO_KERNEL_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/sparse_v_sdpa.cpp
@@ -58,9 +45,6 @@ set(MLXCEL_TURBO_KERNEL_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/fused_norm.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/fused_rope_append.cpp)
 
-set(MLXCEL_TURBO_KERNEL_METAL_SOURCES
-    ${CMAKE_CURRENT_SOURCE_DIR}/sparse_v_sdpa.metal
-    ${CMAKE_CURRENT_SOURCE_DIR}/paged_attention.metal)
 
 add_library(mlxcel-turbo-kernels STATIC
     ${MLXCEL_TURBO_KERNEL_SOURCES})
