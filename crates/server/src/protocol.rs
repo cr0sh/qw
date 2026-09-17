@@ -1186,12 +1186,10 @@ fn parse_chat_user_content(
                             &["type", "text", "prompt_cache_breakpoint"],
                             &part_base,
                         )?;
-                        let text = require_nonempty_string(
-                            object.get("text"),
-                            &format!("{part_base}.text"),
-                        )?;
+                        let text =
+                            require_string_value(&part["text"], &format!("{part_base}.text"))?;
                         normalized.push(ChatContentPart::Text {
-                            text: text.to_string(),
+                            text,
                             prompt_cache_breakpoint,
                         });
                     }
@@ -1622,12 +1620,10 @@ fn parse_responses_user_content(
                 match part_type {
                     "input_text" => {
                         reject_unknown_fields(object, &["type", "text"], &part_base)?;
-                        let text = require_nonempty_string(
-                            object.get("text"),
-                            &format!("{part_base}.text"),
-                        )?;
+                        let text =
+                            require_string_value(&part["text"], &format!("{part_base}.text"))?;
                         normalized.push(ChatContentPart::Text {
-                            text: text.to_string(),
+                            text,
                             prompt_cache_breakpoint: None,
                         });
                     }

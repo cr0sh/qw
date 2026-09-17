@@ -2324,6 +2324,89 @@ fn tiny_png_data_uri() -> &'static str {
 }
 
 #[tokio::test]
+async fn text_then_image_turn_accepts_empty_text_parts() {
+    let app = router(Engine::start_fake(Some(MODEL), 8));
+    for responses in [false, true] {
+        let endpoint = if responses {
+            "/v1/responses"
+        } else {
+            "/v1/chat/completions"
+        };
+        let key = if responses { "input" } else { "messages" };
+        let mut request = json!({"model": MODEL});
+        request[key] = json!([
+            {"role":"system","content":"You are helpful."},
+            {"role":"user","content":"Hello"}
+        ]);
+        let (status, _, body) = post(app.clone(), endpoint, request.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let first: Value = serde_json::from_str(&body).expect("first response");
+        let reply = if responses {
+            &first["output"][0]["content"][0]["text"]
+        } else {
+            &first["choices"][0]["message"]["content"]
+        };
+        let history = request[key].as_array_mut().unwrap();
+        history.push(json!({"role":"assistant","content":reply}));
+        history.push(json!({"role":"user","content":[
+            {"type":if responses { "input_text" } else { "text" },"text":""},
+            if responses {
+                json!({"type":"input_image","image_url":tiny_png_data_uri()})
+            } else {
+                json!({"type":"image_url","image_url":{"url":tiny_png_data_uri()}})
+            },
+            {"type":if responses { "input_text" } else { "text" },"text":""}
+        ]}));
+        request["stream"] = json!(true);
+        let (status, _, body) = post(app.clone(), endpoint, request).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (frames, done) = parse_sse(&body);
+        if responses {
+            assert!(
+                frames
+                    .iter()
+                    .any(|frame| { frame.event.as_deref() == Some("response.completed") }),
+                "{body}"
+            );
+        } else {
+            assert!(done, "{body}");
+            assert!(
+                frames
+                    .iter()
+                    .any(|frame| { frame.data["choices"][0]["finish_reason"] == "stop" }),
+                "{body}"
+            );
+        }
+    }
+}
+
+#[test]
+fn mixed_content_still_requires_string_text() {
+    for text in [None, Some(Value::Null), Some(json!(7))] {
+        for responses in [false, true] {
+            let mut part = json!({"type":if responses { "input_text" } else { "text" }});
+            if let Some(text) = &text {
+                part["text"] = text.clone();
+            }
+            let mut request = json!({"model":MODEL});
+            let key = if responses { "input" } else { "messages" };
+            request[key] = json!([{"role":"user","content":[part, if responses {
+                json!({"type":"input_image","image_url":tiny_png_data_uri()})
+            } else {
+                json!({"type":"image_url","image_url":{"url":tiny_png_data_uri()}})
+            }]}]);
+            let result = if responses {
+                protocol::parse_responses(request)
+            } else {
+                protocol::parse_chat(request)
+            };
+            let error = result.expect_err("text must remain a required string");
+            assert_eq!(error.param, Some(format!("{key}[0].content[0].text")));
+        }
+    }
+}
+
+#[tokio::test]
 async fn image_requests_larger_than_two_mib_reach_both_endpoints() {
     let mut noise = 0x1234_5678_u32;
     let image = image::RgbImage::from_fn(768, 768, |_, _| {
