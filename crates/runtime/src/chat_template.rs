@@ -284,7 +284,7 @@ impl ChatTemplateProcessor {
                         Some(ChatMessageContent::Parts(parts)) => {
                             !parts.is_empty()
                                 && parts.iter().all(|part| match part {
-                                    ChatContentPart::Text { text, .. } => !text.is_empty(),
+                                    ChatContentPart::Text { .. } => true,
                                     ChatContentPart::ImageUrl { image_url, .. } => {
                                         !image_url.url.is_empty()
                                             && matches!(
@@ -670,6 +670,40 @@ assistant:{{ content }}
         let after = rendered.find("\"after\"").expect("trailing text");
         assert!(before < image && image < after);
         assert!(rendered.contains("\"detail\":\"auto\""));
+    }
+
+    #[test]
+    fn empty_user_text_parts_preserve_image_prompt() {
+        let processor = ChatTemplateProcessor {
+            template: IMAGE_TOOL_REPLAY_TEMPLATE.to_string(),
+            bos_token: String::new(),
+            eos_token: String::new(),
+        };
+        let mut image_message = user("unused");
+        image_message.content = Some(ChatMessageContent::Parts(vec![
+            ChatContentPart::Text {
+                text: String::new(),
+                prompt_cache_breakpoint: None,
+            },
+            ChatContentPart::ImageUrl {
+                image_url: ChatImageUrl {
+                    url: "data:image/png;base64,AA==".to_string(),
+                    detail: "auto".to_string(),
+                },
+                prompt_cache_breakpoint: None,
+            },
+            ChatContentPart::Text {
+                text: String::new(),
+                prompt_cache_breakpoint: None,
+            },
+        ]));
+        let rendered = processor
+            .render_messages(&[user("hello"), image_message], &[tool()], None, true, true)
+            .expect("render empty text around image");
+        assert_eq!(
+            rendered,
+            "user:hellouser:<|vision_start|><|image_pad|><|vision_end|>"
+        );
     }
 
     #[test]
