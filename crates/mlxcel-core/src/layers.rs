@@ -4020,7 +4020,12 @@ pub fn attention(
     softcap: f32,
     window_size: i32,
 ) -> UniquePtr<MlxArray> {
-    if let Some(chunk) = materializing_sdpa_query_chunk(q, k, v, softcap) {
+    let mask_kind = if mask.is_some() {
+        SdpaMaskKind::Array
+    } else {
+        SdpaMaskKind::None
+    };
+    if let Some(chunk) = materializing_sdpa_query_chunk(q, k, v, softcap, mask_kind) {
         return chunked_query_attention(q, k, v, scale, mask, softcap, chunk);
     }
 
@@ -4083,15 +4088,35 @@ fn attention_chunk_budget_bytes() -> usize {
     })
 }
 
+/// How an SDPA call masks its scores, as MLX's `mask_mode` sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SdpaMaskKind {
+    /// `mask_mode = ""`: no mask.
+    None,
+    /// `mask_mode = "causal"`: MLX's built-in causal mask (no mask array).
+    Causal,
+    /// `mask_mode = "array"`: an explicit boolean or additive mask array.
+    Array,
+}
+
 /// Whether the backend must materialize attention scores for this inference
 /// geometry. Keep the eligibility rules aligned with MLX's CUDA/Metal SDPA
-/// dispatch, including Metal's distinct full-query and vector kernels.
+/// dispatch, including Metal's distinct full-query, vector and split kernels.
+///
+/// Metal mirrors `ScaledDotProductAttention::use_fallback` and
+/// `has_fused_kernel` / `use_split` in
+/// `mlx/backend/metal/scaled_dot_product_attention.cpp` at the pinned MLX
+/// commit (see `crates/mlx-cpp/CMakeLists.txt`), for non-NAX GPUs, no sinks and
+/// no sliding window (QW passes neither). NAX-only fused paths (head dim 512,
+/// long causal head-dim-256 prefill from 1024 rows) are not modelled: an
+/// eligible NAX geometry that is chunked here stays correct, only chunked.
 fn sdpa_materializes_scores(
     q_shape: &[i32],
     k_shape: &[i32],
     v_shape: &[i32],
     dtype: i32,
     softcap: f32,
+    mask: SdpaMaskKind,
 ) -> bool {
     if !cfg!(feature = "cuda") && !cfg!(feature = "metal") {
         return false;
@@ -4114,14 +4139,51 @@ fn sdpa_materializes_scores(
         return false;
     }
     let q_len = q_shape[2];
-    let full_eligible = q_len > 8 && dq == dv && matches!(dq, 64 | 72 | 80 | 96 | 128);
-    let vector_head_dim =
-        (dq == dv && matches!(dq, 64 | 96 | 128 | 256)) || (dq == 192 && dv == 128);
-    let vector_eligible = q_len <= 8
-        && q_len <= k_shape[2]
-        && vector_head_dim
-        && q_len.saturating_mul(q_shape[1] / k_shape[1]) <= 32;
-    !(full_eligible || vector_eligible)
+    let k_len = k_shape[2];
+    let half_precision = dtype == crate::dtype::FLOAT16 || dtype == crate::dtype::BFLOAT16;
+    if q_len > 8 {
+        // Full-query (steel) attention. `has_fused_kernel` accepts head dims
+        // {64, 72, 80, 96, 128, 192, 256} and (96, 64); a "causal" mask needs
+        // `q_len <= k_len`. `use_fallback` then still prefers the unfused path
+        // for head dims 192 and 256, except causal self-attention of at least
+        // 2048 half-precision rows at head dim 256 on non-NAX GPUs.
+        let full_head_dim = (dq == dv && matches!(dq, 64 | 72 | 80 | 96 | 128 | 192 | 256))
+            || (dq == 96 && dv == 64);
+        let causal_fits = mask != SdpaMaskKind::Causal || q_len <= k_len;
+        let fused_large_head = !matches!(dq, 192 | 256)
+            || (dq == 256
+                && half_precision
+                && mask == SdpaMaskKind::Causal
+                && q_len >= 2048
+                && q_len == k_len);
+        return !(full_head_dim && causal_fits && fused_large_head);
+    }
+    // Vector attention (up to 8 queries): head dims {64, 96, 128, 192, 256}
+    // with matching value dim, or (192, 128) / (96, 64), and `q_len <= k_len`.
+    // Square head dim 512 is fused only for one query at GQA factor 8 with no
+    // mask array (`MLX_SDPA_D512_MIN_KL` default).
+    let gqa = q_shape[1] / k_shape[1];
+    let vector_head_dim = (dq == dv && matches!(dq, 64 | 96 | 128 | 192 | 256))
+        || (dq == dv && dq == 512 && q_len == 1 && gqa == 8 && mask != SdpaMaskKind::Array)
+        || (dq == 192 && dv == 128)
+        || (dq == 96 && dv == 64);
+    if !vector_head_dim || q_len > k_len {
+        return true;
+    }
+    let rows = q_len.saturating_mul(gqa);
+    if rows <= 32 {
+        // `use_fallback`: the unfused path is faster for square head dim 192.
+        return dq == dv && dq == 192;
+    }
+    // 33..=128 stacked rows: the `sdpa_split` kernels, for GQA models with at
+    // least 128 keys and no mask array (square head dims 64..256 only).
+    let split_eligible = rows <= 128
+        && dq == dv
+        && matches!(dq, 64 | 96 | 128 | 192 | 256)
+        && k_len >= 128
+        && k_shape[1] > 1
+        && mask != SdpaMaskKind::Array;
+    !split_eligible
 }
 
 /// Pure chunk-length math for [`materializing_sdpa_query_chunk`].
@@ -4147,8 +4209,9 @@ fn query_chunk_len(per_row_bytes: usize, q_len: i32, budget: usize) -> Option<i3
 /// matrix larger than the chunk budget, or `None` to run unchunked.
 ///
 /// Both CUDA and Metal fall back to explicit score matrices for unsupported
-/// fused-kernel geometry. In particular, Metal full-query SDPA does not support
-/// head dimension 256, even though its small-query vector kernel does.
+/// fused-kernel geometry. In particular, Metal full-query SDPA runs head
+/// dimension 256 unfused (other than long causal self-attention), even though
+/// its small-query vector kernel supports it.
 /// Chunking bounds the transient while leaving per-row results mathematically
 /// identical: softmax and the value matmul are row-independent, and every
 /// chunk still sees all keys visible to its query rows.
@@ -4157,6 +4220,7 @@ pub(crate) fn materializing_sdpa_query_chunk(
     k: &MlxArray,
     v: &MlxArray,
     softcap: f32,
+    mask: SdpaMaskKind,
 ) -> Option<i32> {
     let budget = attention_chunk_budget_bytes();
     if budget == 0 {
@@ -4173,7 +4237,7 @@ pub(crate) fn materializing_sdpa_query_chunk(
     let k_shape = ffi::array_shape(k);
     let v_shape = ffi::array_shape(v);
     let dtype = ffi::array_dtype(q);
-    if !sdpa_materializes_scores(&q_shape, &k_shape, &v_shape, dtype, softcap) {
+    if !sdpa_materializes_scores(&q_shape, &k_shape, &v_shape, dtype, softcap, mask) {
         return None;
     }
     let k_len = k_shape[2];
@@ -7098,15 +7162,12 @@ mod tests {
     #[cfg(feature = "metal")]
     #[test]
     fn metal_long_context_fallback_requires_a_bounded_query_plan() {
+        use SdpaMaskKind::{Array, Causal, None as NoMask};
+        let f16 = crate::dtype::FLOAT16;
         let q = [1, 24, 1536, 256];
         let k = [1, 4, 218_583, 256];
-        assert!(sdpa_materializes_scores(
-            &q,
-            &k,
-            &k,
-            crate::dtype::FLOAT16,
-            0.0
-        ));
+        assert!(sdpa_materializes_scores(&q, &k, &k, f16, 0.0, Causal));
+        assert!(sdpa_materializes_scores(&q, &k, &k, f16, 0.0, Array));
         let per_row = q[1] as usize * k[2] as usize * 2;
         let budget = 1024 * 1024 * 1024;
         let chunk = query_chunk_len(per_row, q[2], budget).expect("oversized Metal score matrix");
@@ -7117,16 +7178,126 @@ mod tests {
             &[1, 24, 5, 256],
             &k,
             &k,
-            crate::dtype::FLOAT16,
-            0.0
+            f16,
+            0.0,
+            Array
+        ));
+        assert!(!sdpa_materializes_scores(
+            &[1, 24, 5, 256],
+            &k,
+            &k,
+            f16,
+            0.0,
+            NoMask
         ));
         // Standard full-query head geometry must not be demoted to chunked fallback.
         assert!(!sdpa_materializes_scores(
             &[1, 24, 1536, 128],
             &[1, 4, 218_583, 128],
             &[1, 4, 218_583, 128],
-            crate::dtype::FLOAT16,
-            0.0
+            f16,
+            0.0,
+            Causal
+        ));
+        // MLX fuses causal head-dim-256 self-attention from 2048 half-precision
+        // rows on non-NAX GPUs; a continued prefill (`q_len < k_len`), a mask
+        // array, f32 or fewer rows stay unfused.
+        let self_attn = [1, 24, 2048, 256];
+        let kv = [1, 4, 2048, 256];
+        assert!(!sdpa_materializes_scores(
+            &self_attn, &kv, &kv, f16, 0.0, Causal
+        ));
+        assert!(!sdpa_materializes_scores(
+            &self_attn,
+            &kv,
+            &kv,
+            crate::dtype::BFLOAT16,
+            0.0,
+            Causal
+        ));
+        assert!(sdpa_materializes_scores(
+            &self_attn, &kv, &kv, f16, 0.0, Array
+        ));
+        assert!(sdpa_materializes_scores(
+            &self_attn,
+            &kv,
+            &kv,
+            crate::dtype::FLOAT32,
+            0.0,
+            Causal
+        ));
+        assert!(sdpa_materializes_scores(
+            &[1, 24, 2047, 256],
+            &[1, 4, 2047, 256],
+            &[1, 4, 2047, 256],
+            f16,
+            0.0,
+            Causal
+        ));
+        assert!(sdpa_materializes_scores(
+            &self_attn,
+            &[1, 4, 4096, 256],
+            &[1, 4, 4096, 256],
+            f16,
+            0.0,
+            Causal
+        ));
+        // A causal mask with more queries than keys has no fused kernel.
+        assert!(sdpa_materializes_scores(
+            &[1, 24, 64, 128],
+            &[1, 4, 32, 128],
+            &[1, 4, 32, 128],
+            f16,
+            0.0,
+            Causal
+        ));
+        // 33..=128 stacked GQA rows (here 7 x 6 = 42) reach the split kernels
+        // without a mask array and with at least 128 keys; a mask array, a
+        // short key sequence or more than 128 rows fall back.
+        let q7 = [1, 24, 7, 256];
+        assert!(!sdpa_materializes_scores(&q7, &k, &k, f16, 0.0, NoMask));
+        assert!(!sdpa_materializes_scores(&q7, &k, &k, f16, 0.0, Causal));
+        assert!(sdpa_materializes_scores(&q7, &k, &k, f16, 0.0, Array));
+        assert!(sdpa_materializes_scores(
+            &q7,
+            &[1, 4, 100, 256],
+            &[1, 4, 100, 256],
+            f16,
+            0.0,
+            NoMask
+        ));
+        assert!(sdpa_materializes_scores(
+            &[1, 64, 8, 128],
+            &[1, 2, 4096, 128],
+            &[1, 2, 4096, 128],
+            f16,
+            0.0,
+            NoMask
+        ));
+        // Square head dim 192 prefers the unfused path at every query length.
+        assert!(sdpa_materializes_scores(
+            &[1, 8, 1, 192],
+            &[1, 8, 512, 192],
+            &[1, 8, 512, 192],
+            f16,
+            0.0,
+            NoMask
+        ));
+        assert!(sdpa_materializes_scores(
+            &[1, 8, 64, 192],
+            &[1, 8, 512, 192],
+            &[1, 8, 512, 192],
+            f16,
+            0.0,
+            Causal
+        ));
+        assert!(!sdpa_materializes_scores(
+            &[1, 8, 1, 192],
+            &[1, 8, 512, 128],
+            &[1, 8, 512, 128],
+            f16,
+            0.0,
+            NoMask
         ));
     }
 

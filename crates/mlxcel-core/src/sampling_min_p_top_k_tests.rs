@@ -160,3 +160,40 @@ fn compiled_comparisons_equal_eager_on_every_dtype() {
         assert_eq!(eager0[1], 0.25);
     }
 }
+
+/// Compiled mixed-dtype arithmetic equals eager. The retired Metal
+/// `compiled.cpp` overlay cast every fused input to the op's output type; since
+/// ml-explore/mlx#4351 upstream's `cast_to<T>()` AsType emission handles the
+/// promotion itself, which this pins for half x f32 / int32 array inputs and
+/// bf16 / f32 scalar constants inside one fused kernel.
+#[test]
+fn compiled_mixed_dtype_arithmetic_equals_eager_on_every_dtype() {
+    let a_vals = [0.75f32, 0.25, -0.5, 3.0, f32::NAN, 0.0, 0.25, 1.5];
+    let b_vals = [0.25f32, 0.75, -2.25, 3.0, 1.0, -1.0, 0.5, 1.5];
+    for dt in [dtype::FLOAT32, dtype::BFLOAT16, dtype::FLOAT16] {
+        let a = astype(&from_slice_f32(&a_vals, &[2, 4]), dt);
+        let b = astype(&from_slice_f32(&b_vals, &[2, 4]), dt);
+        for graph in [3, 4] {
+            let eager = f32_values(&compile_dtype_probe_for_test(graph, &a, &b, 0));
+            assert_eq!(eager.len(), a_vals.len());
+            for mode in [1, 2] {
+                let got = f32_values(&compile_dtype_probe_for_test(graph, &a, &b, mode));
+                assert_eq!(got.len(), eager.len());
+                for (i, (g, e)) in got.iter().zip(&eager).enumerate() {
+                    assert!(
+                        (g.is_nan() && e.is_nan()) || (g - e).abs() <= 2e-3 * e.abs().max(1.0),
+                        "dtype {dt} graph {graph} mode {mode} [{i}]: {g} vs eager {e}"
+                    );
+                }
+            }
+        }
+        // Anchor eager: graph 3 = a * b + 0.5 (b exact in every dtype here),
+        // graph 4 = (a * trunc(b) - a) * 1.5.
+        let eager3 = f32_values(&compile_dtype_probe_for_test(3, &a, &b, 0));
+        assert_eq!(eager3[0], 0.75 * 0.25 + 0.5);
+        assert_eq!(eager3[2], -0.5 * -2.25 + 0.5);
+        let eager4 = f32_values(&compile_dtype_probe_for_test(4, &a, &b, 0));
+        assert_eq!(eager4[2], (-0.5 * -2.0 - -0.5) * 1.5);
+        assert_eq!(eager4[3], (3.0 * 3.0 - 3.0) * 1.5);
+    }
+}

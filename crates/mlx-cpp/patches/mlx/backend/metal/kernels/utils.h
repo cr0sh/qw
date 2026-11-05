@@ -1,4 +1,10 @@
 // Copyright © 2023-2024 Apple Inc.
+//
+// QW overlay: include <metal_simdgroup_matrix> and qualify metal::vec<IdxT, N>
+// in elem_to_loc_{2,3}_nd for OS Metal compiler compatibility (this header is
+// also compiled at runtime by the JIT).
+//
+// Modified from upstream MLX 7ca40033132dae444d45f7fc3daae57e24c13f6c mlx/backend/metal/kernels/utils.h
 
 #pragma once
 
@@ -354,6 +360,29 @@ inline complex64_t log1p(complex64_t in) {
   }
 }
 
+// https://github.com/pytorch/pytorch/blob/a82aae9d4a7827849ce50f31c4c7ee8f278d05f5/c10/metal/utils.h#L554
+inline float hypot(float x, float y) {
+  if (metal::isinf(x) || metal::isinf(y)) {
+    return metal::numeric_limits<float>::infinity();
+  }
+  if (metal::isnan(x) || metal::isnan(y)) {
+    return metal::numeric_limits<float>::quiet_NaN();
+  }
+  float a = metal::fmax(metal::fabs(x), metal::fabs(y));
+  float b = metal::fmin(metal::fabs(x), metal::fabs(y));
+  if (a == 0.0f) {
+    return 0.0f;
+  }
+  float r = (b / a) * (b / a);
+  float sqrt_1_plus_r = metal::precise::sqrt(1.0f + r);
+  float h1 = metal::sqrt(2.0f) * a;
+  float h2 = a + a * r / 2.0f;
+  float h3 = a * sqrt_1_plus_r;
+  bool is_h1 = (a == b);
+  bool is_h2 = ((sqrt_1_plus_r == 1.0f) && (r > 0.0f));
+  return metal::select(metal::select(h3, h2, is_h2), h1, is_h1);
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 // SIMD shuffle ops
 ///////////////////////////////////////////////////////////////////////////////
@@ -447,3 +476,74 @@ template <typename T, typename U>
 struct ConditionalType<true, T, U> {
   using type = T;
 };
+
+///////////////////////////////////////////////////////////////////////////////
+// Type casting utils
+///////////////////////////////////////////////////////////////////////////////
+
+template <typename U, typename T>
+inline U cast_to(T val) {
+  return static_cast<U>(val);
+}
+
+template <>
+inline bool cast_to<bool, float>(float val) {
+  return (as_type<uint32_t>(val) & 0x7FFFFFFF) != 0;
+}
+
+template <>
+inline bool cast_to<bool, bfloat16_t>(bfloat16_t val) {
+  return (as_type<uint16_t>(val) & 0x7FFF) != 0;
+}
+
+template <>
+inline bool cast_to<bool, complex64_t>(complex64_t val) {
+  return cast_to<bool, float>(val.real) || cast_to<bool, float>(val.imag);
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Row tile scheduling utils
+///////////////////////////////////////////////////////////////////////////////
+
+// helper function to identify the tile, called from gather_mm / gather_qmm
+template <int BM>
+METAL_FUNC bool schedule_row_tile(
+    const device int32_t* offsets,
+    const int num_groups,
+    const int M,
+    const int tile,
+    const uint simd_lane_id,
+    thread int& row,
+    thread int& group,
+    thread short& rows) {
+  int tiles_before = 0;
+  // each lane process an expert
+  for (int e = 0; e < num_groups; e += 32) {
+    const int g = e + simd_lane_id; // shift by lane id
+    int start = M;
+    int end = M;
+    if (g < num_groups) {
+      // start of the experts activations
+      start = offsets[g];
+      // end of the experts activations
+      end = g + 1 < num_groups ? offsets[g + 1] : M;
+    }
+    // number of tiles per expert
+    const int n = (end - start + BM - 1) / BM;
+    // the total number of tiles up to and including this expert
+    const int tiles_through = tiles_before + simd_prefix_inclusive_sum(n);
+    const ushort owner_lane = ushort(simd_sum(int(tiles_through <= tile)));
+    if (owner_lane < 32) {
+      // if true, we found an owner
+      group = e + owner_lane;
+      // fill the row to start
+      row = simd_shuffle(start, owner_lane) +
+          (tile - simd_shuffle(tiles_through - n, owner_lane)) * BM;
+      // number of valid rows in the tile
+      rows = short(min(BM, simd_shuffle(end, owner_lane) - row));
+      return true;
+    }
+    tiles_before = simd_shuffle(tiles_through, 31);
+  }
+  return false;
+}

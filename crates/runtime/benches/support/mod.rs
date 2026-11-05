@@ -106,6 +106,10 @@ fn long_context_cache_identity(context_label: &str, min_prefix_tokens: usize) ->
         std::env::consts::ARCH.as_bytes(),
         b"alternating-user-assistant-history-v1".as_slice(),
         b"bounded-mtp-fp16-65536-v1".as_slice(),
+        // The pinned MLX commit: a bump changes kernel numerics enough to flip
+        // near-tie tokens in the long decodes, so cached fixtures regenerate
+        // instead of failing the same-build identity assertions.
+        mlxcel_core::autotune::store::mlx_commit().as_bytes(),
         PROMPT.as_bytes(),
         include_bytes!("../../src/portable_snapshot.rs").as_slice(),
         include_bytes!("../../src/qwen3_5_mtp.rs").as_slice(),
