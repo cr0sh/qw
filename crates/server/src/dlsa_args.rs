@@ -4,11 +4,15 @@ use std::path::PathBuf;
 
 use anyhow::{Result, ensure};
 use clap_derive::Args;
-use qw_runtime::{DlsaMapKind, DlsaOptions, ResolvedDlsa, parse_dlsa_map_kind};
+use qw_runtime::{DlsaBackend, DlsaMapKind, DlsaOptions, ResolvedDlsa, parse_dlsa_map_kind};
 
 fn parse_map_kind(value: &str) -> Result<DlsaMapKind, String> {
     parse_dlsa_map_kind(value)
         .ok_or_else(|| format!("invalid D-LSA map kind '{value}': expected distilled or pca"))
+}
+
+fn parse_backend(value: &str) -> Result<DlsaBackend, String> {
+    DlsaBackend::parse(value).map_err(|e| e.to_string())
 }
 
 #[derive(Debug, Clone, Args)]
@@ -40,6 +44,11 @@ pub struct DlsaArgs {
     /// Buckets a query expands [default: 1024; env QW_DLSA_TOP_P].
     #[arg(long)]
     pub dlsa_top_p: Option<usize>,
+
+    /// Where the select and the read run: metal (the Metal kernels, default), mlx (the MLX
+    /// reference path) or metal-select (Metal select + MLX read, bitwise mlx); env QW_DLSA_BACKEND.
+    #[arg(long, value_name = "metal|mlx|metal-select", value_parser = parse_backend)]
+    pub dlsa_backend: Option<DlsaBackend>,
 }
 
 impl DlsaArgs {
@@ -52,6 +61,7 @@ impl DlsaArgs {
             window: self.dlsa_window,
             top_k: self.dlsa_top_k,
             top_p: self.dlsa_top_p,
+            backend: self.dlsa_backend,
         }
     }
 

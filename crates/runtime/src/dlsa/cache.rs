@@ -14,6 +14,7 @@ use mlxcel_core::{MlxArray, UniquePtr};
 
 use super::buckets::cluster_block;
 use super::config::DlsaIndexConfig;
+use super::device::{DeferredKeys, DeviceCount, DeviceMirror};
 use super::project::to_host_f32;
 
 /// Counters of the clustering work a cache did (for benchmarks; not part of its state).
@@ -31,24 +32,31 @@ pub struct DlsaCacheMemory {
     pub host_tables: usize,
     /// Host bytes allocated for the bucket tables (`>= host_tables`; vectors grow geometrically).
     pub host_tables_allocated: usize,
-    /// Retained index keys `[tail_start, len)` f32 in use.
+    /// Retained index keys `[tail_start, len)` f32 in use on the host (deferred keys excluded).
     pub tail_keys: usize,
     /// Host bytes allocated for retained index keys. After `commit` this is bounded by
     /// `max(tail_keys, 2 * window_size * index_dim * 4)` (256 KiB a layer for Qwen).
     pub tail_keys_allocated: usize,
-    /// The device copy of the centroids used for scoring, f32 (0 until the first `select`).
+    /// The device mirror of the bucket tables (f32 centroids + i32 members, allocated rows), for
+    /// scoring and the K1 select (0 until the first `select`).
     pub device_centroids: usize,
+    /// Index keys appended with `append_deferred` and not read back yet, f32 on the device
+    /// (`deferred_keys() * index_dim * 4`; 0 after a flush).
+    pub deferred_keys: usize,
 }
 
 impl DlsaCacheMemory {
-    /// Logical bytes: tables, retained keys and the device copy.
+    /// Logical bytes: tables, retained keys (host and deferred) and the device mirror.
     pub fn total(&self) -> usize {
-        self.host_tables + self.tail_keys + self.device_centroids
+        self.host_tables + self.tail_keys + self.device_centroids + self.deferred_keys
     }
 
-    /// Bytes actually held: host allocations plus the device copy.
+    /// Bytes actually held: host allocations plus the device mirror and deferred keys.
     pub fn allocated(&self) -> usize {
-        self.host_tables_allocated + self.tail_keys_allocated + self.device_centroids
+        self.host_tables_allocated
+            + self.tail_keys_allocated
+            + self.device_centroids
+            + self.deferred_keys
     }
 }
 
@@ -70,7 +78,11 @@ pub struct DlsaBucketCache {
     members: Vec<i32>,
     sizes: Vec<i32>,
     tail_keys: Vec<f32>,
-    device: Option<(UniquePtr<MlxArray>, usize)>,
+    mirror: DeviceMirror,
+    /// Keys appended on the device and not read back yet (`append_deferred`).
+    deferred: DeferredKeys,
+    /// Lazy count of the keys the Metal reads visited (`DlsaStats::keys_read`).
+    pub(super) keys_read: DeviceCount,
     stats: DlsaCacheStats,
 }
 
@@ -102,7 +114,9 @@ impl DlsaBucketCache {
             members: Vec::new(),
             sizes: Vec::new(),
             tail_keys: Vec::new(),
-            device: None,
+            mirror: DeviceMirror::default(),
+            deferred: DeferredKeys::default(),
+            keys_read: DeviceCount::default(),
             stats: DlsaCacheStats::default(),
         })
     }
@@ -152,8 +166,10 @@ impl DlsaBucketCache {
     pub fn sizes(&self) -> &[i32] {
         &self.sizes
     }
-    /// Retained index keys `[tail_start, len)`, `[len - tail_start, index_dim]` f32.
-    pub fn tail_keys(&self) -> &[f32] {
+    /// Retained index keys `[tail_start, len)`, `[len - tail_start, index_dim]` f32. Reads back
+    /// deferred keys first ([`flush`](Self::flush)); panics if they hold a non-finite value.
+    pub fn tail_keys(&mut self) -> &[f32] {
+        self.flush().expect("D-LSA deferred index keys");
         &self.tail_keys
     }
     pub fn stats(&self) -> DlsaCacheStats {
@@ -172,14 +188,16 @@ impl DlsaBucketCache {
                 * (self.centroids.capacity() + self.members.capacity() + self.sizes.capacity()),
             tail_keys: 4 * self.tail_keys.len(),
             tail_keys_allocated: 4 * self.tail_keys.capacity(),
-            device_centroids: self
-                .device
-                .as_ref()
-                .map_or(0, |(_, rows)| rows * self.cfg.index_dim * 4),
+            device_centroids: {
+                let (c, m) = self.mirror.nbytes(self.cfg.index_dim, self.cfg.bucket_cap);
+                c + m
+            },
+            deferred_keys: 4 * self.deferred.rows() * self.cfg.index_dim,
         }
     }
 
-    /// Bytes actually held (host allocations plus the device copy), [`DlsaCacheMemory::allocated`].
+    /// Bytes actually held (host allocations, the device mirror and deferred keys),
+    /// [`DlsaCacheMemory::allocated`].
     pub fn nbytes(&self) -> usize {
         self.memory().allocated()
     }
@@ -194,6 +212,7 @@ impl DlsaBucketCache {
     /// cluster every block they complete, including one completed mid-append.
     pub fn append(&mut self, index_keys: &[f32]) -> Result<()> {
         let d = self.cfg.index_dim;
+        self.flush()?;
         ensure!(
             index_keys.len().is_multiple_of(d),
             "index keys must be [L, {d}], got {} values",
@@ -261,6 +280,47 @@ impl DlsaBucketCache {
         self.append(&to_host_f32(index_keys))
     }
 
+    /// Append the index keys of the next `L` positions without reading them back, when they
+    /// close no block: they stay on the device (deferred) until something needs the host copy
+    /// ([`flush`](Self::flush): closing a block, `tail_keys`, `snapshot`, `trim`). Keys that
+    /// close a block go through [`append_mlx`](Self::append_mlx). Scoring never needs them:
+    /// only closed blocks have buckets. Their finiteness is checked at the flush.
+    pub fn append_deferred(&mut self, index_keys: &MlxArray) -> Result<()> {
+        let shape = mlxcel_core::array_shape(index_keys);
+        ensure!(
+            shape.len() == 2 && shape[1] as usize == self.cfg.index_dim,
+            "index keys must be [L, {}], got {shape:?}",
+            self.cfg.index_dim
+        );
+        let rows = shape[0] as usize;
+        ensure!(
+            self.len + rows <= i32::MAX as usize,
+            "positions overflow i32"
+        );
+        if (self.len + rows) / self.cfg.window_size > self.closed_blocks() {
+            return self.append_mlx(index_keys);
+        }
+        self.deferred.push(index_keys, rows);
+        self.len += rows;
+        Ok(())
+    }
+
+    /// Keys appended with [`append_deferred`](Self::append_deferred) and not read back yet.
+    pub fn deferred_keys(&self) -> usize {
+        self.deferred.rows()
+    }
+
+    /// Read the deferred keys back into the host tables (one sync; nothing when there are
+    /// none). Errors on a non-finite key, dropping the deferred keys (`len` falls back by them).
+    pub fn flush(&mut self) -> Result<()> {
+        let Some((keys, rows)) = self.deferred.take() else {
+            return Ok(());
+        };
+        // They lie in the open block, so this append closes nothing
+        self.len -= rows;
+        self.append(&to_host_f32(&keys))
+    }
+
     /// Accept everything appended: later rollbacks cannot go below the block holding `len`,
     /// and the keys of blocks closed before it are freed.
     pub fn commit(&mut self) {
@@ -290,6 +350,7 @@ impl DlsaBucketCache {
             "cannot roll back to {new_len}: index keys before {} were freed by a commit",
             self.tail_start
         );
+        self.flush()?;
         let rows = self.cfg.buckets_per_block() * (new_len / self.cfg.window_size);
         self.centroids.truncate(rows * self.cfg.index_dim);
         self.members.truncate(rows * self.cfg.bucket_cap);
@@ -298,10 +359,8 @@ impl DlsaBucketCache {
             .truncate((new_len - self.tail_start) * self.cfg.index_dim);
         self.len = new_len;
         self.committed = self.committed.min(new_len);
-        if self.device.as_ref().is_some_and(|(_, r)| *r > rows) {
-            // A reopened block closes again with other rows under the same row numbers
-            self.device = None;
-        }
+        // A reopened block closes again with other rows under the same row numbers
+        self.mirror.truncate(rows);
         Ok(())
     }
 
@@ -314,21 +373,34 @@ impl DlsaBucketCache {
         self.members = Vec::new();
         self.sizes = Vec::new();
         self.tail_keys = Vec::new();
-        self.device = None;
+        self.mirror.clear();
+        self.deferred.clear();
+        self.keys_read.clear();
     }
 
     /// The persistent state: bucket tables plus the open block's keys. Uncommitted state is
     /// captured as if committed (a restored cache cannot roll back past its open block).
+    /// Deferred keys are read back into it (the cache keeps them deferred); panics if they hold
+    /// a non-finite value.
     pub fn snapshot(&self) -> DlsaIndexSnapshot {
         let open_start = self.cfg.window_size * self.closed_blocks();
         let d = self.cfg.index_dim;
+        let mut open_keys = self.tail_keys[(open_start - self.tail_start) * d..].to_vec();
+        if let Some(keys) = self.deferred.get() {
+            let keys = to_host_f32(keys);
+            assert!(
+                keys.iter().all(|v| v.is_finite()),
+                "D-LSA deferred index keys hold a non-finite value"
+            );
+            open_keys.extend_from_slice(&keys);
+        }
         DlsaIndexSnapshot {
             cfg: self.cfg,
             len: self.len,
             centroids: self.centroids.clone(),
             members: self.members.clone(),
             sizes: self.sizes.clone(),
-            open_keys: self.tail_keys[(open_start - self.tail_start) * d..].to_vec(),
+            open_keys,
         }
     }
 
@@ -369,29 +441,19 @@ impl DlsaBucketCache {
         Ok(cache)
     }
 
-    /// The device copy of the first `rows` centroids (`[rows, index_dim]` f32), synced from the
-    /// host tables: grown by the rows appended since the last sync, cut after a trim.
+    /// The device mirror of the bucket tables, synced from the host tables first.
+    pub(super) fn device_mirror(&mut self) -> &DeviceMirror {
+        let (d, cap) = (self.cfg.index_dim, self.cfg.bucket_cap);
+        self.mirror.sync(&self.centroids, &self.members, d, cap);
+        &self.mirror
+    }
+
+    /// The device copy of the first `rows` centroids (`[rows, index_dim]` f32, a view of the
+    /// mirror), or `None` when there are none.
     pub(super) fn device_centroids(&mut self, rows: usize) -> Option<UniquePtr<MlxArray>> {
-        let total = self.rows();
-        if total == 0 || rows == 0 {
+        if self.rows() == 0 || rows == 0 {
             return None;
         }
-        let d = self.cfg.index_dim;
-        let synced = match self.device.take() {
-            Some((arr, r)) if r == total => arr,
-            Some((arr, r)) if r < total => {
-                let new = mlxcel_core::from_slice_f32(
-                    &self.centroids[r * d..total * d],
-                    &[(total - r) as i32, d as i32],
-                );
-                mlxcel_core::concatenate(&arr, &new, 0)
-            }
-            // After a trim (which also drops the copy) or a restore: rebuild from the host
-            _ => mlxcel_core::from_slice_f32(&self.centroids, &[total as i32, d as i32]),
-        };
-        mlxcel_core::eval(&synced);
-        let view = mlxcel_core::slice(&synced, &[0, 0], &[rows as i32, d as i32]);
-        self.device = Some((synced, total));
-        Some(view)
+        self.device_mirror().centroids(rows)
     }
 }

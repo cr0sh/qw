@@ -13,6 +13,7 @@ use mlxcel_core::{MlxArray, UniquePtr, dtype};
 
 use super::cache::DlsaBucketCache;
 use super::config::DlsaIndexConfig;
+use super::profile::{DlsaStage, lap};
 use super::project::to_host_f32;
 
 /// The read lists of `rows` queries, one list per query shared by all heads.
@@ -161,6 +162,22 @@ impl DlsaBucketCache {
         index_queries: &MlxArray,
         positions: &[usize],
     ) -> Result<(Vec<f32>, usize)> {
+        let Some((scores, stride)) = self.score_device(index_queries, positions)? else {
+            return Ok((Vec::new(), 0));
+        };
+        let host = to_host_f32(&scores);
+        lap(DlsaStage::ScoresReadback, &[]);
+        Ok((host, stride))
+    }
+
+    /// [`score_mlx`](Self::score_mlx) without the readback: the lazy `[R, stride]` f32 scores
+    /// (the same op for every backend, so their scores are identical), `None` when no row can
+    /// see a bucket.
+    pub(super) fn score_device(
+        &mut self,
+        index_queries: &MlxArray,
+        positions: &[usize],
+    ) -> Result<Option<(UniquePtr<MlxArray>, usize)>> {
         let shape = mlxcel_core::array_shape(index_queries);
         let d = self.config().index_dim;
         ensure!(
@@ -171,11 +188,13 @@ impl DlsaBucketCache {
         self.check_positions(positions)?;
         let stride = self.max_visible(positions);
         let Some(centroids) = self.device_centroids(stride) else {
-            return Ok((Vec::new(), 0));
+            return Ok(None);
         };
+        lap(DlsaStage::CentroidSync, &[&centroids]);
         let q = mlxcel_core::astype(index_queries, dtype::FLOAT32);
         let scores = mlxcel_core::matmul(&q, &mlxcel_core::transpose(&centroids));
-        Ok((to_host_f32(&scores), stride))
+        lap(DlsaStage::ScoreMatmul, &[&scores]);
+        Ok(Some((scores, stride)))
     }
 
     /// Select the read lists of rows at `positions` from `index_queries` (`[R, d]` MLX):
@@ -187,7 +206,9 @@ impl DlsaBucketCache {
         positions: &[usize],
     ) -> Result<DlsaSelection> {
         let (scores, stride) = self.score_mlx(index_queries, positions)?;
-        self.select_from_scores(&scores, stride, positions)
+        let sel = self.select_from_scores(&scores, stride, positions);
+        lap(DlsaStage::HostPick, &[]);
+        sel
     }
 
     /// [`select`](Self::select) on the host: `index_queries` `[R, d]` f32, scored by

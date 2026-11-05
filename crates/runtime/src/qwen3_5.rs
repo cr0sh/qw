@@ -54,6 +54,8 @@ const TURBO4_PACKED_MTP_THRESHOLD_TOKENS: i32 = 2_048;
 #[cfg(feature = "dlsa")]
 mod dlsa;
 #[cfg(all(test, feature = "dlsa"))]
+mod dlsa_bench;
+#[cfg(all(test, feature = "dlsa"))]
 mod dlsa_serving_tests;
 #[cfg(all(test, feature = "dlsa"))]
 mod dlsa_tests;

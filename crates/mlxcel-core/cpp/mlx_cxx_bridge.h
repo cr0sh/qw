@@ -2228,4 +2228,29 @@ size_t loaded_weights_len(const MlxLoadedWeights& w);
 rust::String loaded_weights_name(const MlxLoadedWeights& w, size_t index);
 std::unique_ptr<MlxArray> loaded_weights_take(MlxLoadedWeights& w, size_t index);
 
+// ── D-LSA (docs/dlsa.md §14) ────────────────────────────────────────────────
+// Fused top-p bucket select + expansion + window + sinks (cpp/mlx_cxx_dlsa.cpp).
+// scores [R,S] f32, members [N,cap] i32, positions [R] i32. Outputs lists
+// [R, top_k+window+sink] i32, lengths [R] i32, picked [R, top_p] i32, status
+// [R] i32. `threads` is the threadgroup size (0 = auto).
+void dlsa_select(
+    const MlxArray& scores,
+    const MlxArray& members,
+    const MlxArray& positions,
+    int32_t total_rows,
+    int32_t window,
+    int32_t sink,
+    int32_t top_k,
+    int32_t top_p,
+    int32_t bucket_cap,
+    int32_t buckets_per_block,
+    int32_t threads,
+    std::unique_ptr<MlxArray>& lists_out,
+    std::unique_ptr<MlxArray>& lengths_out,
+    std::unique_ptr<MlxArray>& picked_out,
+    std::unique_ptr<MlxArray>& status_out);
+
 } // namespace mlx_cxx
+
+// D-LSA sparse gather-attention (K2), owned by its own header.
+#include "mlx_cxx_dlsa_attention.h"

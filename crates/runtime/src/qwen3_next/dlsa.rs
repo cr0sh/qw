@@ -11,9 +11,11 @@ use mlxcel_core::{MlxArray, UniquePtr};
 
 use super::Qwen3NextAttention;
 use crate::dlsa::{
-    DlsaBucketCache, DlsaConfig, DlsaGeometry, DlsaLayerMaps, DlsaShortContext, DlsaStats,
-    gather_attention, index_keys, index_queries, masked_attention, reads_dense_key_set,
+    DeviceSelection, DlsaBackend, DlsaBucketCache, DlsaConfig, DlsaGeometry, DlsaLayerMaps,
+    DlsaSelection, DlsaShortContext, DlsaStats, gather_attention, index_keys, index_queries,
+    masked_attention, profile, reads_dense_key_set, sparse_read,
 };
+use profile::{DlsaStage, lap};
 
 /// What one layer's D-LSA forward reads and updates besides its KV cache.
 pub(crate) struct DlsaLayerStep<'a> {
@@ -28,12 +30,19 @@ pub(crate) struct DlsaLayerStep<'a> {
     pub commit: bool,
 }
 
+/// A forward's read lists: on the host (task 3 and the parity mode) or on the device.
+enum Selected {
+    Host(DlsaSelection),
+    Device(DeviceSelection),
+}
+
 impl Qwen3NextAttention {
     /// [`forward_with_position_ids`](Self::forward_with_position_ids) under D-LSA (no mask: the
     /// read is causal by construction), including `o_proj`.
     ///
     /// Panics on a broken invariant: a batch other than 1, an index cache out of step with the
-    /// KV cache, a KV cache whose slots are not positions, or a non-finite index key.
+    /// KV cache, a KV cache whose slots are not positions, or a non-finite index key (under
+    /// the Metal backend, found when the deferred keys are read back).
     pub(crate) fn forward_dlsa(
         &self,
         x: &MlxArray,
@@ -61,13 +70,33 @@ impl Qwen3NextAttention {
         step.cache.commit();
         let rows = l as usize;
 
+        let backend = step.config.backend;
+        let fenced = profile::begin(start, &[x]);
+        lap(
+            DlsaStage::Projection,
+            &[&heads.queries, &heads.keys, &heads.values, &heads.gate],
+        );
         let started = Instant::now();
         let ik = index_keys(&heads.keys, &step.maps.w_k_idx, step.geometry)
             .expect("D-LSA index keys of a full-attention layer");
-        step.cache
-            .append_mlx(&ik)
-            .expect("D-LSA bucket cache append");
+        lap(DlsaStage::IndexKeys, &[&ik]);
+        let ward_before = fenced.then(|| step.cache.stats().cluster_time);
+        // The Metal backend keeps keys that close no block on the device (no sync)
+        let appended = if backend == DlsaBackend::Metal {
+            step.cache.append_deferred(&ik)
+        } else {
+            step.cache.append_mlx(&ik)
+        };
+        appended.expect("D-LSA bucket cache append");
+        if step.cache.deferred_keys() == 0 {
+            // The append synced, so the counts of earlier forwards are ready
+            step.stats.keys_read += step.cache.take_keys_read();
+        }
         step.stats.index_time += started.elapsed();
+        if let Some(before) = ward_before {
+            let ward = step.cache.stats().cluster_time - before;
+            profile::lap_split(DlsaStage::KeyReadback, DlsaStage::Ward, ward, &[]);
+        }
 
         let index = &step.config.index;
         let dense = step.config.short_context == DlsaShortContext::DenseFallback
@@ -76,8 +105,25 @@ impl Qwen3NextAttention {
             let started = Instant::now();
             let iq = index_queries(&heads.queries, &step.maps.w_q_idx, step.geometry)
                 .expect("D-LSA index queries of a full-attention layer");
+            lap(DlsaStage::IndexQueries, &[&iq]);
             let positions: Vec<usize> = (start..start + rows).collect();
-            let sel = step.cache.select(&iq, &positions).expect("D-LSA selection");
+            let sel = match backend {
+                DlsaBackend::Mlx => step.cache.select(&iq, &positions).map(Selected::Host),
+                DlsaBackend::Metal => step
+                    .cache
+                    .select_device(&iq, &positions)
+                    .map(Selected::Device),
+                // The parity mode: device lists, read back for the task-3 read
+                DlsaBackend::MetalSelect => step
+                    .cache
+                    .select_device(&iq, &positions)
+                    .and_then(|sel| sel.to_host())
+                    .map(Selected::Host),
+            }
+            .expect("D-LSA selection");
+            if backend == DlsaBackend::MetalSelect {
+                lap(DlsaStage::ScoresReadback, &[]);
+            }
             step.stats.select_time += started.elapsed();
             sel
         });
@@ -94,33 +140,50 @@ impl Qwen3NextAttention {
             b,
             l,
         );
+        lap(DlsaStage::Rotate, &[&queries, &keys, &values]);
         let attn_out = match selection {
             None => {
                 step.stats.dense_key_set_forwards += 1;
-                self.dense_attention(&queries, keys, values, cache, None, l)
+                let out = self.dense_attention(&queries, keys, values, cache, None, l);
+                lap(DlsaStage::DenseRead, &[&out]);
+                out
             }
             Some(sel) => {
                 step.stats.sparse_forwards += 1;
                 step.stats.sparse_rows += rows as u64;
-                step.stats.keys_read += sel.lengths.iter().map(|&n| n as u64).sum::<u64>();
                 let (cache_k, cache_v) = cache.update_and_fetch(keys, values);
-                if rows == 1 {
-                    gather_attention(&queries, &cache_k, &cache_v, sel.list(0), self.scale)
-                } else {
-                    masked_attention(
-                        &queries,
-                        &cache_k,
-                        &cache_v,
-                        &sel,
-                        start,
-                        step.config.prefill_mask_rows,
-                        self.scale,
-                    )
-                }
+                lap(DlsaStage::KvFetch, &[&cache_k, &cache_v]);
+                let out = match sel {
+                    Selected::Device(sel) => {
+                        step.cache.count_keys_read(&sel);
+                        sparse_read(&queries, &cache_k, &cache_v, &sel, self.scale)
+                    }
+                    Selected::Host(sel) => {
+                        step.stats.keys_read += sel.lengths.iter().map(|&n| n as u64).sum::<u64>();
+                        if rows == 1 {
+                            gather_attention(&queries, &cache_k, &cache_v, sel.list(0), self.scale)
+                        } else {
+                            masked_attention(
+                                &queries,
+                                &cache_k,
+                                &cache_v,
+                                &sel,
+                                start,
+                                step.config.prefill_mask_rows,
+                                self.scale,
+                            )
+                        }
+                    }
+                };
+                lap(DlsaStage::Read, &[&out]);
+                out
             }
         };
         let output = self.finish(&attn_out, &heads.gate, b, l);
-        self.o_proj.forward(&output)
+        let output = self.o_proj.forward(&output);
+        lap(DlsaStage::Finish, &[&output]);
+        profile::end();
+        output
     }
 }
 
@@ -181,10 +244,22 @@ mod tests {
         Qwen3NextAttention::from_weights(&weights, &config, "attn").expect("test attention")
     }
 
-    /// The sparse read of one layer equals dense attention under a mask built on the host
-    /// from `select_host` lists of an independent bucket cache fed the same index keys.
     #[test]
     fn layer_sparse_read_matches_host_mask() {
+        for mode in [KVCacheMode::Fp16, KVCacheMode::Int8] {
+            for backend in [
+                DlsaBackend::Mlx,
+                DlsaBackend::Metal,
+                DlsaBackend::MetalSelect,
+            ] {
+                layer_sparse_read_matches_host_mask_on(backend, mode);
+            }
+        }
+    }
+
+    /// The sparse read of one layer equals dense attention under a mask built on the host
+    /// from `select_host` lists of an independent bucket cache fed the same index keys.
+    fn layer_sparse_read_matches_host_mask_on(backend: DlsaBackend, mode: KVCacheMode) {
         let attention = test_attention();
         let geometry = DlsaGeometry {
             query_heads: TEST_HEADS,
@@ -197,12 +272,13 @@ mod tests {
             map_dtype: DlsaMapDtype::F32,
             index: TEST_INDEX,
             prefill_mask_rows: 16,
+            backend,
             ..DlsaConfig::new(PathBuf::new())
         };
-        let mut kv = KVCache::new_with_mode(KVCacheMode::Fp16);
+        let mut kv = KVCache::new_with_mode(mode);
         let mut index = DlsaBucketCache::new(TEST_INDEX).unwrap();
         let mut stats = DlsaStats::default();
-        let mut ref_kv = KVCache::new_with_mode(KVCacheMode::Fp16);
+        let mut ref_kv = KVCache::new_with_mode(mode);
         let mut ref_index = DlsaBucketCache::new(TEST_INDEX).unwrap();
         let (mut expanded, mut partial) = (false, false);
         let mut start = 0usize;
@@ -277,7 +353,7 @@ mod tests {
             let diff = max_abs_diff(&to_host_f32(&got), &to_host_f32(&want));
             assert!(
                 diff < 1e-5,
-                "forward {step_no} ({rows} rows at {start}): sparse read vs host mask {diff:e}"
+                "{backend:?} {mode} forward {step_no} ({rows} rows at {start}): sparse read vs host mask {diff:e}"
             );
             start = total;
         }
@@ -287,6 +363,8 @@ mod tests {
         assert_eq!(stats.dense_key_set_forwards, 0);
         assert_eq!(index.len(), start);
         assert_eq!(index.members(), ref_index.members());
+        // Deferred keys read back to the same host keys
+        assert_eq!(index.tail_keys(), ref_index.tail_keys(), "{backend:?}");
     }
 
     /// A forward that reads the dense key set under the fallback is the dense attention itself.
@@ -300,34 +378,45 @@ mod tests {
             rotary_dim: 8,
         };
         let maps = test_layer_maps(1);
-        let config = DlsaConfig {
-            map_dtype: DlsaMapDtype::F32,
-            index: TEST_INDEX,
-            ..DlsaConfig::new(PathBuf::new())
-        };
-        let mut kv = KVCache::new_with_mode(KVCacheMode::Fp16);
-        let mut dense_kv = KVCache::new_with_mode(KVCacheMode::Fp16);
-        let mut index = DlsaBucketCache::new(TEST_INDEX).unwrap();
-        let mut stats = DlsaStats::default();
-        for (step_no, rows) in [30usize, 1, 17].into_iter().enumerate() {
-            let x = noise_array(&[1, rows as i32, HIDDEN], 900 + step_no as u64, 2.0);
-            let got = attention.forward_dlsa(
-                &x,
-                &mut kv,
-                None,
-                DlsaLayerStep {
-                    maps: &maps,
-                    geometry: &geometry,
-                    config: &config,
-                    cache: &mut index,
-                    stats: &mut stats,
-                    commit: true,
-                },
-            );
-            let want = attention.forward_with_position_ids(&x, &mut dense_kv, None, None);
-            assert_eq!(to_host_f32(&got), to_host_f32(&want), "forward {step_no}");
+        for backend in [
+            DlsaBackend::Mlx,
+            DlsaBackend::Metal,
+            DlsaBackend::MetalSelect,
+        ] {
+            let config = DlsaConfig {
+                map_dtype: DlsaMapDtype::F32,
+                index: TEST_INDEX,
+                backend,
+                ..DlsaConfig::new(PathBuf::new())
+            };
+            let mut kv = KVCache::new_with_mode(KVCacheMode::Fp16);
+            let mut dense_kv = KVCache::new_with_mode(KVCacheMode::Fp16);
+            let mut index = DlsaBucketCache::new(TEST_INDEX).unwrap();
+            let mut stats = DlsaStats::default();
+            for (step_no, rows) in [30usize, 1, 17].into_iter().enumerate() {
+                let x = noise_array(&[1, rows as i32, HIDDEN], 900 + step_no as u64, 2.0);
+                let got = attention.forward_dlsa(
+                    &x,
+                    &mut kv,
+                    None,
+                    DlsaLayerStep {
+                        maps: &maps,
+                        geometry: &geometry,
+                        config: &config,
+                        cache: &mut index,
+                        stats: &mut stats,
+                        commit: true,
+                    },
+                );
+                let want = attention.forward_with_position_ids(&x, &mut dense_kv, None, None);
+                assert_eq!(
+                    to_host_f32(&got),
+                    to_host_f32(&want),
+                    "{backend:?} forward {step_no}"
+                );
+            }
+            assert_eq!(stats.dense_key_set_forwards, 3);
+            assert_eq!(index.len(), 48);
         }
-        assert_eq!(stats.dense_key_set_forwards, 3);
-        assert_eq!(index.len(), 48);
     }
 }

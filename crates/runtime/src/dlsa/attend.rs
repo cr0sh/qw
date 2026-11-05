@@ -12,6 +12,7 @@ use std::ops::Range;
 use mlxcel_core::{MlxArray, UniquePtr};
 
 use super::config::DlsaIndexConfig;
+use super::profile::{DlsaStage, lap};
 use super::select::DlsaSelection;
 
 /// Whether a query at `last_position` (and so every query before it) reads every causal key:
@@ -36,7 +37,7 @@ fn sdpa(
 /// One query row (`q` `[1, Hq, 1, D]`) over the keys of `list` only: the listed rows of
 /// `keys`/`values` (`[1, Hkv, T, D]`) are gathered in ascending position order, then plain SDPA
 /// (GQA by head grouping, no mask: every listed key is causal).
-pub(crate) fn gather_attention(
+pub fn gather_attention(
     q: &MlxArray,
     keys: &MlxArray,
     values: &MlxArray,
@@ -51,8 +52,10 @@ pub(crate) fn gather_attention(
         "a D-LSA read list must be non-empty and within the {total} cached keys"
     );
     let idx = mlxcel_core::from_slice_i32(&sorted, &[sorted.len() as i32]);
+    lap(DlsaStage::ListUpload, &[&idx]);
     let k = mlxcel_core::take(keys, &idx, 2);
     let v = mlxcel_core::take(values, &idx, 2);
+    lap(DlsaStage::Gather, &[&k, &v]);
     sdpa(q, &k, &v, scale, None)
 }
 
@@ -90,7 +93,7 @@ pub(crate) fn list_mask(
 
 /// Every query row of `q` (`[1, Hq, L, D]`, positions `positions_start..+L`, `sel.rows == L`)
 /// over its own list, as SDPA over all cached keys under [`list_mask`], `row_block` rows a mask.
-pub(crate) fn masked_attention(
+pub fn masked_attention(
     q: &MlxArray,
     keys: &MlxArray,
     values: &MlxArray,
@@ -118,7 +121,9 @@ pub(crate) fn masked_attention(
             )
         };
         let mask = list_mask(sel, positions_start, start..stop, total, dtype);
+        lap(DlsaStage::MaskBuild, &[&mask]);
         parts.push(sdpa(&q_block, keys, values, scale, Some(&mask)));
+        lap(DlsaStage::Read, &[parts.last().expect("just pushed")]);
     }
     let mut out = parts.remove(0);
     for part in parts {

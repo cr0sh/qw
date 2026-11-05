@@ -1,10 +1,20 @@
 # D-LSA (flat design) for Qwen3.8-27B: spec for the QW port
 
-Status: roadmap tasks 0-3 and 5 done: this spec, golden fixtures in
+Status: roadmap tasks 0-5 done: this spec, golden fixtures in
 [`tests/fixtures/dlsa/`](../tests/fixtures/dlsa/README.md), the map loader (§10), the indexer core (§11), sparse
-attention in Qwen3.5's 16 full-attention layers behind `enable_dlsa` (§12), and serving integration (§13: snapshots and
-the prefix cache, MTP/DFlash2 verify and rollback, grammar, `qw serve --dlsa`). Task 4 (Metal kernels) is still open,
-so D-LSA is slower than dense (§12.6).
+attention in Qwen3.5's 16 full-attention layers behind `enable_dlsa` (§12), serving integration (§13: snapshots and
+the prefix cache, MTP/DFlash2 verify and rollback, grammar, `qw serve --dlsa`), and Metal kernels (§14).
+
+With the default Metal backend, D-LSA beats dense on the real model (fp16 KV, M4 Max):
+
+| context | prefill tok/s, D-LSA vs dense | decode ms/token, D-LSA vs dense |
+|---|---|---|
+| 32k | 235 vs 225 (1.04×) | 39.0 vs 41.2 (1.06×) |
+| 128k | 229 vs 138 (1.66×) | 39.4 vs 55.0 (1.40×) |
+| 256k | 224 vs 84 (2.65×) | 39.9 vs 86.4 (2.17×) |
+
+It is still slower where few keys are skipped: prefill chunks at about 4.6k–12k depth, and probably decode below 32k
+(§14.3-§14.4).
 
 D-LSA (Distilled Latent Sparse Attention, arXiv 2610.42147) leaves the attention kernel unchanged. It only decides which
 cached keys each query of a full-attention layer reads: the first `sink_size` keys, the last `window_size` keys, and up
@@ -990,6 +1000,7 @@ flags do not exist. `DlsaOptions::resolve(env)` takes each value from its flag, 
 | `--dlsa-window` | `QW_DLSA_WINDOW` | 512 |
 | `--dlsa-top-k` | `QW_DLSA_TOP_K` | 4096 |
 | `--dlsa-top-p` | `QW_DLSA_TOP_P` | 1024 |
+| `--dlsa-backend metal\|mlx\|metal-select` | `QW_DLSA_BACKEND` | `metal` (task 4's kernels; `mlx` is the task-3 path, `metal-select` its bitwise twin) |
 
 The map is held in bf16 with the dense fallback (short prompts, up to 4,612 tokens under the defaults, run dense
 attention bitwise). Errors name the flag or variable: an unparsable variable, a config `DlsaConfig::validate` refuses
@@ -1002,7 +1013,8 @@ cluster block size.
 - `qw serve --dlsa --no-kv-quantization`. The KV check runs on the flag (`validate_cli`) and again on the resolved
   setting, so `QW_DLSA=1` without `--no-kv-quantization` fails too.
 - The worker loads the model, enables D-LSA, then builds the prefix-cache namespaces. The D-LSA identity (`dlsa_identity`:
-  sha256 of the map file, map dtype, short-context policy and the full index config) is appended to the namespace parts
+  sha256 of the map file, map dtype, short-context policy, the read (`metal`, or `mlx` for both MLX-read backends) and
+  the full index config) is appended to the namespace parts
   **only when D-LSA is on**, so dense namespaces are byte-identical to a build without the feature; the DFlash2
   namespace inherits it.
 - Startup logs `info!(phase = "server.dlsa", map, map_sha256, kind, map_dtype, sink, window, top_k, top_p,
@@ -1097,3 +1109,250 @@ these runs (the synthetic S1 tests cover reopening).
 As §12.6 predicts, D-LSA costs decode time once reads are sparse: R5 +21-34%, the R6 needles +7-12% (MTP) and
 +5-17% (DFlash2), R3 +26-85% (most at 32k). On the dense fallback (R4) it is within noise. Task 4's kernels and
 GPU-side selection are meant to remove this cost.
+
+## 14. Metal kernels (roadmap task 4; feature `dlsa`)
+
+Task 4 moves selection and the sparse read onto the GPU. Code comments that cite "§13" for the kernels mean this
+section.
+
+### 14.1 Design
+
+- **Scores stay the task-2 matmul.** `score_device` is the same MLX f32 matmul of index queries against the device
+  centroids that task 3 reads back. So every backend ranks identical scores, and "same lists as task 3" holds by
+  construction. The centroids live in a device mirror (`dlsa/device.rs`): preallocated arrays that grow
+  geometrically and are filled with `slice_update` from the host tables. The host tables stay authoritative; a trim
+  only lowers the synced row count.
+- **K1 `dlsa_select`** (`mlxcel-core/cpp/mlx_cxx_dlsa.cpp`, `src/dlsa_kernels.rs`) runs one threadgroup per query
+  row:
+  - Each bucket gets a unique 64-bit rank key: `(ord(score) << 32) | (0x7FFFFFFF - bucket)`, with `-0.0` mapped to
+    `+0.0`.
+  - An MSD radix select over 8-bit digits (≤ 8 passes, a 256-bin threadgroup histogram each) finds the `top_p`-th
+    key, so no sampled threshold or fp32 re-scoring is needed.
+  - The keys at or above it are compacted and bitonic-sorted (the picks, best first).
+  - Expansion walks the picks in rank order: an exclusive scan of each pick's eligible member count, written while
+    below `top_k`, then the window, the sinks and `-1` padding.
+  - Output is bit-identical to `select_from_scores` on the same scores. The one deviation: a NaN ranks last and sets
+    `status` bit 0, instead of the host's error; `status` is read only at existing sync points.
+- **K2 `sparse_attention`** (`cpp/mlx_cxx_dlsa_attention.cpp`, `src/dlsa_attention.rs`) is modeled on MLX's
+  `sdpa_vector`:
+  - One threadgroup per (row, KV head) owns the G = 6 query heads of its group, so each listed K/V row is fetched
+    once for all six. The heads split 3 + 3 over simdgroups.
+  - An online softmax runs in the exp2 domain, with f32 accumulators.
+  - K/V are read through their strides: the cache's fetched view is never copied.
+  - Prefill rows (L·Hkv ≥ 160 threadgroups) run one pass with 8 simdgroups. Decode and verify rows use split-K,
+    about 512 threadgroups merged by a second kernel.
+  - Results are deterministic for fixed shapes and launch knobs.
+  - A simdgroup-matrix variant measured 117 ms vs 54 ms per 32k chunk and was dropped.
+- **Integration** (`qwen3_next/dlsa.rs`, `dlsa/gpu.rs`, `dlsa/cache.rs`): `DlsaConfig.backend` picks the backend,
+  set by `--dlsa-backend` / `QW_DLSA_BACKEND` (§13.4).
+  - `Mlx` is task 3: scores read back, host pick, masked SDPA (prefill) or take + SDPA (decode).
+  - `Metal` (the default) runs K1, then K2 on K1's device lists, with nothing read back between them.
+  - `MetalSelect` runs K1, then reads the lists back for the task-3 read. It is a parity mode that is bitwise equal
+    to `Mlx`.
+  - **Deferred decode keys** (Metal only): index keys that close no block stay on the device (`append_deferred`).
+    Anything host-side flushes them first with one readback: closing a block, `tail_keys`, `snapshot`, `trim`. So
+    decode syncs about once per 512 tokens per layer instead of twice per token per layer. Their finiteness check
+    moves to the flush.
+  - Prefill chunks always close blocks, so Ward stays on the host (see G5).
+- **Profile hooks** (`dlsa/profile.rs`): `QW_DLSA_PROFILE=1` (and optionally `QW_DLSA_PROFILE_FROM=<offset>`) ends
+  every stage of a D-LSA layer forward in an `eval` and adds its wall time to a process-wide profile. With the
+  variable unset, each hook is one atomic and thread-local check: no `eval`, timer or MLX op.
+
+### 14.2 Tests
+
+- **K1** (`mlxcel-core` `dlsa_kernels_tests`, runtime `dlsa/gpu_select_tests`): kernel == host on every fixture
+  case run as forwards would, on the fixtures' reference scores, on 72 random flat configs, and on tie-heavy scores
+  (`{-1,0,1}`, ±0, constants). Also covered: binding knobs and block edges, an empty cache, Qwen defaults at
+  6k/32k/131k/262k, `top_p` at the 2048 limit, threadgroup-size invariance, NaN status, bad arguments.
+- **K2** (`dlsa_attention` unit test, `dlsa/gpu_attend_tests`):
+  - fp16 against task 3's masked and gathered reads, both against an f64 host softmax on sampled rows;
+  - full-coverage lists equal dense causal attention;
+  - short and padded lists;
+  - a strided cache view bitwise equal to the same data made contiguous;
+  - index arithmetic at T = 262,144.
+- **Device state** (`dlsa/device_tests`): the mirror grows, trims and scores like a fresh upload; deferred keys equal
+  eager appends over random schedules, flush when a block closes and check finiteness; memory accounting counts
+  deferred keys.
+- **Model** (`qwen3_5/dlsa_tests`): `metal_select_is_bitwise_task3_and_metal_read_is_close` (every schedule, fp16 and
+  int8 KV) and `metal_greedy_tokens_equal_task3`. `qwen3_next/dlsa.rs`'s layer test also runs the sparse read against
+  a host mask on all three backends and both KV modes.
+- **Real model**:
+  - R1 `real_short_context_is_bitwise_dense` passes with the default (Metal) backend: 288 dense-key-set layer
+    forwards, 0 sparse, prefill 15.76 s both.
+  - R9 is in §14.3.
+
+### 14.3 Measurements
+
+**Setup.**
+
+- Machine: Apple M4 Max, 64 GB. Build: base `8d985ff` plus the uncommitted task-4 tree (`git diff | sha256`
+  `c6ad9730…`; diff and untracked files `4ace8e64…`), release.
+- Model `Jundot/Qwen3.8-27B-oQ4e-fp16-mtp`, fp16 KV; distilled map (sha256 `00200004…62e1`) in bf16; Qwen defaults;
+  greedy.
+- Prompt: a fixed token file, 262,144 tokens of the repo corpus (sha256 `43583dad…78b1`), cut to
+  `floor(T / 1536) · 1536` tokens: 32,256 / 130,560 / 261,120.
+- Bench: `real_dlsa_bench` (`qwen3_5/dlsa_bench.rs`), one process per context, every mode in one process. Prefill
+  goes through `forward_last_logits` in 1536-row chunks, then 32 unfenced greedy decode steps. The last 2 prefill
+  chunks and 8 extra decode steps are fenced for the stage profile.
+
+**Memory methodology.**
+
+- The tests load the model without `provider::initialize_runtime`, so MLX's free-buffer cache had no limit. At 262k
+  the process reached 57 GB next to a 24 GB VM and swapped 27 GB. Task 4's first ("before") 128k/256k runs were
+  invalidated by this and are not reported.
+- The bench now sets `MLXCEL_CACHE_LIMIT` (default 8 GiB, as serving does), clears the cache between modes, and
+  records swap before and after each mode.
+- Limits used: 8 GiB at 32k, 4 GiB at 128k, 1 GiB at 256k. The 256k dense run may lose a little to the small cache.
+- No run reported here ended with more swap in use than it started with. In 128k and the 32k runs "used" stayed
+  within 32 MB (128k: 19,161.50M → 19,129.50M over the three modes; 32k: unchanged at 19,161.50M and 19,460.62M). At
+  256k it started at 29,438.50M, left over from other work, and fell to 19,572.62M during the dense mode, then
+  19,476.62M and 19,460.62M after mlx and metal.
+
+**Real model, fp16 KV.** Speedups are relative to dense: prefill wall time, decode median.
+
+| context | mode | prefill s | prefill tok/s | ×dense | chunk s at T/4 · T/2 · 3T/4 · T | decode ms median / p90 | ×dense | peak GiB |
+|---|---|---|---|---|---|---|---|---|
+| 32k | dense | 143.2 | 225 | 1.00 | 6.3 · 6.7 · 7.1 · 7.6 | 41.2 / 41.3 | 1.00 | 19.5 |
+| | mlx (task 3) | 147.4 | 219 | 0.97 | 6.5 · 6.9 · 7.4 · 7.7 | 49.2 / 50.0 | 0.84 | 20.1 |
+| | **metal** | 137.5 | **235** | **1.04** | 6.5 · 6.6 · 6.6 · 6.6 | **39.0 / 39.3** | **1.06** | 18.8 |
+| | metal-select | 144.9 | 223 | 0.99 | 6.4 · 6.8 · 7.3 · 7.5 | 49.8 / 50.2 | 0.83 | 20.1 |
+| 128k | dense | 943.3 | 138 | 1.00 | 7.6 · 10.3 · 14.4 · 17.4 | 55.0 / 55.2 | 1.00 | 26.0 |
+| | mlx | 847.5 | 154 | 1.11 | 7.9 · 9.9 · 11.8 · 13.7 | 50.1 / 50.6 | 1.10 | 27.6 |
+| | **metal** | 569.0 | **229** | **1.66** | 6.6 · 6.8 · 6.8 · 6.9 | **39.4 / 39.6** | **1.40** | 25.1 |
+| 256k | dense | 3096.2 | 84 | 1.00 | 11.0 · 17.4 · 24.1 · 34.1 | 86.4 / 86.7 | 1.00 | 34.4 |
+| | mlx | 2903.3 | 90 | 1.07 | 10.1 · 14.2 · 25.6 · 33.3 | 51.5 / 51.8 | 1.68 | 34.3 |
+| | **metal** | 1166.6 | **224** | **2.65** | 6.7 · 6.8 · 7.0 · 7.2 | **39.9 / 40.1** | **2.17** | 34.1 |
+
+- 32k was run 3 times. Prefill tok/s dense 225–226, mlx 219–220, metal 235–236; decode median dense 41.0–41.2, mlx
+  48.9–49.2, metal 38.9–39.0 ms.
+- The first decode step after a long prefill is slow in every mode (160–270 ms at 32k, 390–410 ms at 128k, 650–800
+  ms at 256k). The medians exclude nothing.
+- "Peak" is MLX's active peak. The index adds 54 / 206 / 407 MiB at 32k / 128k / 256k. Under Metal this
+  underreports by at most one open block of deferred f32 keys per layer, a counting bug fixed after these runs.
+
+**Identity at 32k (R9).** Final-prefill logits plus 32 decode steps: 33 positions.
+
+| comparison | greedy tokens | logits |
+|---|---|---|
+| `MetalSelect` vs `Mlx` (task 3) | 33 / 33 | **bitwise equal** at all 33 positions |
+| `Metal` (K2 read) vs `Mlx` | 33 / 33 | not bitwise: max-abs 0.084 (final prefill row), 0.30 (max); mean KL 7.8e-6 nats (max 9.8e-5); top-1 agreement 1.0 |
+| dense vs `Mlx`, for scale | 33 / 33 | max-abs 1.36 / 3.42; mean KL 1.5e-3 nats (max 0.027); top-1 1.0 |
+
+In the 1a microbench below, K1's lists equal task 3's at every measured depth.
+
+**Stage breakdown, real model.** Each value is ms per full-attention layer in a fenced 1536-row chunk at depth T
+(prefill) or a fenced decode step, with % of the fenced forward.
+
+| stage | 32k mlx | 32k metal | 128k mlx | 128k metal | 256k mlx | 256k metal |
+|---|---|---|---|---|---|---|
+| qkv projection | 18.4 (3.6%) | 18.9 (4.5%) | 18.1 (2.1%) | 17.9 (4.1%) | 19.3 (1.1%) | 18.2 (3.9%) |
+| score matmul | 0.27 | 0.26 | 0.55 | 0.55 | 4.3 (0.24%) | 4.5 (0.96%) |
+| scores readback | 0.88 | — | 4.0 (0.46%) | — | 16.3 (0.89%) | — |
+| host pick / K1 select | 12.1 (2.4%) | 1.46 (0.34%) | 20.2 (2.3%) | 2.2 (0.51%) | 30.3 (1.7%) | 3.3 (0.70%) |
+| Ward | 0.88 | 0.78 | 0.71 | 0.70 | 0.75 | 0.85 |
+| KV fetch | 4.5 | 4.5 | 17.9 (2.0%) | 17.5 (4.0%) | 39.6 (2.2%) | 36.0 (7.7%) |
+| mask build | 2.6 | — | 4.1 | — | 12.9 (0.70%) | — |
+| read | 106.3 (21.0%) | **38.7 (9.1%)** | 451.1 (51.5%) | **39.8 (9.1%)** | 1338 (73.1%) | **39.3 (8.4%)** |
+| finish | 8.2 | 8.6 | 8.1 | 8.2 | 8.7 | 10.6 |
+| full-attn layers, % of forward | 43.6% | 32.7% | 67.4% | 34.8% | 84.2% | 38.7% |
+| fenced forward, s | 8.10 | 6.79 | 14.02 | 6.99 | 29.29 | 7.52 |
+
+Dense's full-attention layers take 41.0% / 74.4% / 87.0% of the fenced prefill forward at 32k / 128k / 256k. In
+decode they take 28.7% / 43.1% / 60.6%.
+
+In a decode step, the full-attention stages per layer are:
+
+| context | backend | stages, ms per layer | sum |
+|---|---|---|---|
+| 32k | mlx | key readback 0.03, score 0.13, scores readback 0.02, host pick 0.08, take 0.44, read 0.18 | 2.67 |
+| 32k | metal | key readback 0.00 (deferred), score 0.14, K1 0.18, K2 0.20 | 2.42 |
+| 256k | mlx | — | 2.98 |
+| 256k | metal | — | 2.57 |
+
+Fences inflate decode (89–97 ms fenced vs 39–52 unfenced), so the unfenced medians are the decode result. The
+mlx-to-metal gap there (10–12 ms per token) is mostly the per-layer host syncs that Metal removes.
+
+**One layer, synthetic Qwen geometry** (`examples/dlsa_indexer_bench.rs`, fp16 q/K/V, real lists from the cache,
+median of 5 runs; decode median of 25). Each cell is ms for one 1536-row chunk ending at the given depth, or one
+decode row at T.
+
+| T | depth | dense SDPA | task 3: select + masked SDPA | Metal: K1 + K2 |
+|---|---|---|---|---|
+| 32k | 8k / 16k / 24k / 32k | 25.9 / 51.9 / 77.5 / 106.1 | 6.8+27.4 / 9.3+53.6 / 10.6+77.6 / 11.7+105.6 | 1.0+38.3 / 1.4+38.4 / 1.4+38.5 / 1.5+38.6 |
+| 128k | 32k / 64k / 96k / 128k | 106.0 / 221.8 / 375.3 / 561.6 | 11.5+106.3 / 16.4+214.2 / 20.6+339.3 / 24.3+454.0 | 1.5+38.6 / 1.9+39.0 / 2.2+39.8 / 2.5+41.8 |
+| 256k | 64k / 128k / 192k / 256k | 222.7 / 561.3 / 812.1 / 1589.1 | 16.0+214.7 / 24.4+453.9 / 31.7+974.5 / 44.1+1075.4 | 1.9+38.9 / 2.5+41.6 / 3.1+44.5 / 3.8+44.9 |
+| decode | at 32k / 128k / 256k | 0.44 / 1.36 / 3.41 | 0.21+0.35 / 0.22+0.36 / 0.26+0.36 | 0.18+0.20 / 0.21+0.20 / 0.22+0.20 |
+
+The dense prefill baseline is QW's current dense path. With D = 256 and a continued prefill, MLX's SDPA materializes
+the scores in query chunks (`layers.rs` `sdpa_materializes_scores`; task 3's masked read pays the same). So part of
+the prefill gain is "flash-style sparse kernel vs materialized dense": a dense D = 256 flash kernel would narrow it.
+
+**Short sparse depths are slower than dense.** The dense fallback ends at 4,612 tokens, so chunks at depths from
+4.6k to about 12k keys run K1 + K2 and are slower than dense SDPA there. In 1a at 8k, one layer takes 1.0 + 38.3 ms
+vs 25.9 ms dense, about +13 ms. The crossover is near 12k (dense grows about 3.2 ms per 1k keys); at 16k Metal
+already wins (39.8 vs 51.9 ms).
+
+- Estimate from those per-layer numbers: 16 layers × +13 ms ≈ +0.2 s on a 6.0–6.3 s chunk at 8k, about +3%.
+  Shallower sparse chunks (4.6k–8k, where dense is cheaper still) lose up to about +6%.
+- Inside the 32k run, the real model agrees: the chunk at 8k depth took 6.5 s with Metal vs 6.3 s dense.
+- A whole short prompt (about 8k–16k) was **not measured end to end**.
+- Decode below 32k was not measured either. At 32k Metal decode beats dense, 39.0 vs 41.2 ms. Dense decode per layer
+  shrinks with T (1a: 0.44 ms at 32k), while Metal's index projections and K1 + K2 cost about 0.4 ms per layer at any
+  depth. So Metal decode may be slower than dense somewhere below 32k. Task 3's 16k decode was +26% (§13.7, R3).
+
+### 14.4 Verdict
+
+| context | prefill | decode |
+|---|---|---|
+| 32k | **Beats dense by 4%** (235 vs 225 tok/s). The read is 21% of the dense forward and K2 cuts it only 2.7×; the 48 linear-attention layers (≈ 67% of the forward) are untouched. | **Beats dense by 6%** (39.0 vs 41.2 ms). The read is cheaper than dense and no host syncs remain; task 3 lost 19% here. |
+| 128k | **Beats dense by 1.66×** (229 vs 138 tok/s). K2 stays at about 40 ms per chunk while dense grows to 17 s per chunk at T. | **Beats dense by 1.40×** (39.4 vs 55.0 ms). |
+| 256k | **Beats dense by 2.65×** (224 vs 84 tok/s). Prefill throughput is flat in T (6.7 → 7.2 s per chunk). | **Beats dense by 2.17×** (39.9 vs 86.4 ms). Metal decode is flat in T (39.0 → 39.9 ms from 32k to 256k). |
+
+What is left in the Metal path is mostly dense code:
+
+- linear layers, 4.55 s per chunk;
+- q/k/v projections, 18 ms per layer;
+- the KV fetch, 36 ms per layer at 256k (cache growth: a dense cost);
+- the K2 read itself, about 40 ms per layer.
+
+Selection is under 1% of the forward.
+
+Where D-LSA does not beat dense (Metal backend):
+
+- Prefill chunks at sparse depths of about 4.6k–12k keys: an estimated +3–6% per chunk (above). Not measured end to
+  end for short prompts.
+- Decode at contexts below 32k: may be slower than dense, not measured.
+- Prompts up to 4,612 tokens run the dense fallback and equal dense bitwise (R1).
+
+### 14.5 Gates
+
+The gates were decided from task 4's first profile (32k real model, and the 1a microbench at all three contexts).
+
+- **G1 (K2 prefill): built.** The masked read was the largest stage: 21% of the forward at 32k, 51–73% at 128k–256k
+  in the runs above.
+- **G2 (K1): built.** Select plus readback took 12–47 ms per layer per chunk and grew with T. K1 takes 1.5–3.8 ms.
+- **G3 (deferred keys): built.** Task 3 decode cost +8 ms per token at 32k with near-equal per-layer compute, which
+  means sync stalls.
+- **G4 (K2 for decode): built.** It beats take + SDPA, 0.20 vs 0.35 ms per layer.
+- **G5, GPU Ward: pruned.** Ward is 0.7–0.9 ms per layer per prefill chunk, 0.04–0.18% of the forward (0.28 ms per
+  block), far below the 3% threshold.
+- **G6, fused centroid scan: pruned.** The score matmul is 0.05–0.96% of the forward (4.5 ms per layer at 256k).
+  The scores readback, the only real cost of the scan, is gone with K1.
+
+### 14.6 Reproducing
+
+Build outside the GPU lock (`cargo test --release -p qw-runtime --features dlsa --lib --no-run`), then run one
+context per lock hold:
+
+```text
+MLXCEL_CACHE_LIMIT=<8589934592 | 4294967296 | 1073741824> QW_DLSA_BENCH_CONTEXTS=<32768 | 131072 | 262144> \
+  QW_DLSA_BENCH_MODES=dense,mlx,metal[,metal-select] QW_DLSA_BENCH_PROMPT=<token file> \
+  QW_DLSA_BENCH_OUT=<unique>.json [QW_DLSA_BENCH_LOGITS=1] \
+  ./gpu-lock -- target/release/deps/qw_runtime-<hash> qwen3_5::dlsa_bench::real_dlsa_bench --exact --ignored \
+  --nocapture --test-threads=1
+./gpu-lock -- target/release/examples/dlsa_indexer_bench --contexts <T> --modes dense,mlx,metal --out <unique>.json
+```
+
+If the prompt file is missing, the bench writes it from the corpus. `QW_DLSA_BENCH_LOGITS=1` writes the raw f32
+logits used for R9 next to the report. Each report records git sha, model config, map sha256, cache limit, swap and
+peak memory.

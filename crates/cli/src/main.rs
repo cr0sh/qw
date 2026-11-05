@@ -703,7 +703,7 @@ mod tests {
         }
     }
 
-    const DLSA_FLAGS: [&str; 7] = [
+    const DLSA_FLAGS: [&str; 8] = [
         "--dlsa ",
         "--dlsa-map ",
         "--dlsa-map-kind ",
@@ -711,6 +711,7 @@ mod tests {
         "--dlsa-window ",
         "--dlsa-top-k ",
         "--dlsa-top-p ",
+        "--dlsa-backend ",
     ];
 
     fn help_lists_flag(help: &str, flag: &str) -> bool {
