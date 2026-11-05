@@ -681,13 +681,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let link = dir.path().join("broken.safetensors");
         // Create a symlink pointing to a non-existent target
-        #[cfg(unix)]
         std::os::unix::fs::symlink("/nonexistent/target.safetensors", &link).unwrap();
-        #[cfg(not(unix))]
-        {
-            // Skip on non-unix; symlinks may require elevated permissions on Windows
-            return;
-        }
 
         let (is_sym, exists) = check_symlink(&link);
         assert!(is_sym);

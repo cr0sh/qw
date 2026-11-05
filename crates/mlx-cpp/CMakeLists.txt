@@ -54,46 +54,6 @@ function(mlx_apply_source_overlays mlx_source_dir)
     endif()
   endforeach()
   message(STATUS "Applied Metal kernel patches")
-
-  # CUDA patches: custom grouped GEMM, quantized kernels, reduce ops, binary ops.
-  # These are in patches/mlx/backend/cuda/ and only compiled for CUDA targets,
-  # so they are safe to apply unconditionally (harmless on Metal-only builds).
-  #
-  # STALE: these overlays (and patches-cuda/ below) were last synced against an
-  # MLX pin before v0.32.x and were NOT re-synced for the move to 7ca40033 (no
-  # CUDA host to verify on). patches-cuda/fast.cpp in particular is a full copy
-  # of an old fast.cpp with the pre-`window_size` SDPA signature, so a CUDA
-  # build against the current pin is expected to fail until they are re-synced
-  # or removed.
-  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/patches/mlx/backend/cuda")
-    file(GLOB_RECURSE _cuda_patch_files
-         RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}/patches"
-         "${CMAKE_CURRENT_SOURCE_DIR}/patches/mlx/backend/cuda/*")
-    foreach(_patch_file ${_cuda_patch_files})
-      configure_file(
-        "${CMAKE_CURRENT_SOURCE_DIR}/patches/${_patch_file}"
-        "${mlx_source_dir}/${_patch_file}"
-        COPYONLY)
-    endforeach()
-    message(STATUS "Applied CUDA backend patches (${_cuda_patch_files})")
-  endif()
-
-  # CUDA-only patches: bf16 type promotion and norm computation changes.
-  # These change dtype promotion rules (bf16+fp32→bf16) to avoid copy_v kernel
-  # overhead on CUDA, but break Metal precision for bf16 vision weights
-  # (e.g., SigLIP position embeddings). Apply ONLY for CUDA builds.
-  if(MLX_BUILD_CUDA AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/patches-cuda")
-    file(GLOB _cuda_only_patches
-         "${CMAKE_CURRENT_SOURCE_DIR}/patches-cuda/*.cpp")
-    foreach(_patch_file ${_cuda_only_patches})
-      get_filename_component(_fname "${_patch_file}" NAME)
-      configure_file(
-        "${_patch_file}"
-        "${mlx_source_dir}/mlx/${_fname}"
-        COPYONLY)
-    endforeach()
-    message(STATUS "Applied CUDA-only dtype/precision patches")
-  endif()
 endfunction()
 
 set(_mlx_cached_source_dir "${CMAKE_BINARY_DIR}/_deps/mlx-src")
@@ -151,35 +111,3 @@ foreach(_pf ${_all_patches})
 endforeach()
 
 add_subdirectory(${mlx_SOURCE_DIR} ${mlx_BINARY_DIR})
-
-# ----------------------------- CUDA CCCL ---------------------------------
-# Ensure MLX_CCCL_DIR is defined for CUDA JIT kernel compilation at runtime.
-# MLX only sets this for test builds, but statically linked binaries need it too.
-# Since upstream e9463bb the macro is consumed by cccl_dir() in dirs.cpp, which
-# is compiled in the dedicated mlx_dirs OBJECT target (upstream isolates the
-# dynamic defines there to avoid invalidating the compile cache), so define it
-# on mlx_dirs when that target exists and fall back to mlx otherwise.
-if(MLX_BUILD_CUDA)
-  set(_cccl_include "${CMAKE_BINARY_DIR}/_deps/cccl-src/include")
-  if(EXISTS "${_cccl_include}")
-    if(TARGET mlx_dirs)
-      target_compile_definitions(mlx_dirs
-                                 PRIVATE MLX_CCCL_DIR="${_cccl_include}")
-    else()
-      target_compile_definitions(mlx
-                                 PRIVATE MLX_CCCL_DIR="${_cccl_include}")
-    endif()
-  endif()
-
-  # CUTLASS/CuTe headers for the runtime-JIT'd quantized kernels (MLX #3706/
-  # #3576 moved qmm_sm80/sm90/naive and gather_gemm to NVRTC JIT compilation,
-  # and those kernels include <cute/...> / <cutlass/...> at runtime). Upstream
-  # only installs the headers next to installed binaries; statically linked
-  # mlxcel binaries need a compiled-in fallback for dev builds. Consumed by
-  # our jit_module.cpp overlay, which compiles into the mlx target.
-  set(_cutlass_include "${CMAKE_BINARY_DIR}/_deps/cutlass-src/include")
-  if(EXISTS "${_cutlass_include}")
-    target_compile_definitions(mlx
-                               PRIVATE MLX_CUTLASS_DIR="${_cutlass_include}")
-  endif()
-endif()

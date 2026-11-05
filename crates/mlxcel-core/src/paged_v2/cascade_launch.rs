@@ -59,15 +59,14 @@
 //!
 //! ## The merge kernel is #898's, unchanged
 //!
-//! Same contract [`crate::mla::split_kv`] documents and consumes: `v_in`
+//! Same contract as the v2 split-KV decode: `v_in`
 //! `[N, H, D]` already normalized per partial, `lse_in` `[N, H]` **in log2
 //! units**, `o_indptr` `[M + 1]` grouping contiguous rows. Both levels here are
 //! v2 launches, so their LSE is already the `m + log2(l)` the partial kernel
 //! emits and no unit conversion happens anywhere on this path. That is the
 //! silent-failure clause: a natural-log LSE still merges and returns a
-//! plausible weighted average, so `cascade_launch_tests` carries the same
-//! negative control `mla::split_kv_tests::merge_rejects_natural_log_lse_units`
-//! does, restated for cascade partials.
+//! plausible weighted average, so `cascade_launch_tests` carries a negative
+//! control for it on cascade partials.
 //!
 //! Nothing in `paged_attention_v2.cpp`, `paged_attention_v2_merge.cpp` or the
 //! FFI signature was edited for this issue.

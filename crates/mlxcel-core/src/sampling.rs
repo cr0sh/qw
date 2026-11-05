@@ -167,9 +167,6 @@ impl TokenBiasMap {
     }
 
     /// Returns `true` when a bias entry exists for `token_id`.
-    ///
-    /// Used by: `lang_analyzer::TokenLanguageIndex::to_token_bias` (B5) for
-    /// first-language-wins conflict resolution.
     pub fn contains(&self, token_id: i32) -> bool {
         self.entries.contains_key(&token_id)
     }

@@ -49,12 +49,9 @@
 //!
 //! ## Sibling modules
 //!
-//! - [`mtp`] — Multi-Token Prediction (MTP) round-loop generator for the
-//!   Gemma 4 assistant drafter family. Peer code path to
-//!   [`SpeculativeGenerator`] with fundamentally different semantics
-//!   (drafter has no own KV cache; verify is a single forward over the
-//!   whole draft block; rollback uses per-row tail-zero rather than
-//!   `trim_caches`). See [`mtp::MtpGenerator`].
+//! - [`mtp`] — the exact-greedy speculative-walk accept logic shared by the
+//!   block-drafter round loops (QW's bundled MTP and DFlash2 drivers in the
+//!   runtime crate).
 //! - [`stochastic_accept`] — the distribution-preserving acceptance rule and
 //!   its residual resample, shared by every speculative verify path.
 

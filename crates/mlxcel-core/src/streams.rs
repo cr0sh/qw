@@ -374,29 +374,6 @@ mod tests {
         );
     }
 
-    /// CUDA-gated: a trivial op runs on a non-default GPU index and produces
-    /// the correct result. Compiled only under the `cuda` feature (no Metal
-    /// build risk) and skipped on a single-GPU CUDA host. Authored for a
-    /// multi-GPU CUDA box; not exercised on this Apple/Metal machine.
-    #[cfg(feature = "cuda")]
-    #[test]
-    fn trivial_op_runs_on_non_default_gpu_index() {
-        let count = gpu_device_count();
-        if count < 2 {
-            // Single-GPU CUDA host: no second device to target.
-            return;
-        }
-        // Pin the default device to GPU 1, compute 1 + 1 there, then restore.
-        set_default_gpu_device(1).expect("index 1 valid on a multi-GPU host");
-        let a = ffi::ones(&[1], crate::dtype::FLOAT32);
-        let b = ffi::ones(&[1], crate::dtype::FLOAT32);
-        let c = ffi::add(&a, &b);
-        ffi::eval(&c);
-        let value = ffi::item_f32(&c);
-        set_default_gpu_device(0).expect("index 0 is always valid");
-        assert_eq!(value, 2.0, "1 + 1 on GPU 1 should equal 2");
-    }
-
     /// Smoke test: the TLS handle factory either succeeds (GPU build)
     /// or returns `None` cleanly (CPU-only build).
     #[test]

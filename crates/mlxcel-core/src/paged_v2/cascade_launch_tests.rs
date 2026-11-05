@@ -29,9 +29,8 @@
 //!   member-major instead of KV-head-major and every query head reads the wrong
 //!   KV head: same shapes, successful launch, wrong answer.
 //! * **LSE units.** Issue #898's merge kernel takes log2 LSE. A natural-log LSE
-//!   still merges and returns a plausible weighted average, which is what
-//!   `mla::split_kv_tests::merge_rejects_natural_log_lse_units` pins for the MLA
-//!   caller. The same control is restated here on cascade-shaped partials.
+//!   still merges and returns a plausible weighted average, so a negative
+//!   control pins it here on cascade-shaped partials.
 
 use super::*;
 use crate::cache::{PagedBlockId, PagedBlockPool, PagedKvLayout, PagedSequenceState};
@@ -544,10 +543,8 @@ fn member_major_head_stacking_reads_the_wrong_kv_head() {
 
 #[test]
 fn merge_rejects_natural_log_lse_units_on_the_cascade_path() {
-    // The same clause `mla::split_kv_tests::merge_rejects_natural_log_lse_units`
-    // pins for the MLA caller, restated on cascade partials: issue #898's merge
-    // kernel takes log2 LSE, and a natural-log LSE merges without complaint
-    // into a plausible wrong weighted average.
+    // Issue #898's merge kernel takes log2 LSE, and a natural-log LSE merges
+    // without complaint into a plausible wrong weighted average.
     let batch = CascadeBatch::new(8, 8, 2, 16, 6, &[5, 9, 21], &[], dtype::FLOAT32, 0xFEED);
     let plan = plan_for(&batch, 4);
 

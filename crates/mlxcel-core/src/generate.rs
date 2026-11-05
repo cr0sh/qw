@@ -1181,12 +1181,10 @@ pub trait LanguageModel {
     ///
     /// The default returns `None`; only targets that can pair with a
     /// lazy-bind drafter override it. Concretely, the upstream
-    /// `z-lab/Qwen3.5-4B-DFlash` checkpoint omits `embed_tokens.weight`
-    /// and the Rust DFlash drafter resolves it here during
-    /// [`crate::drafter::Drafter::bind`].
+    /// `z-lab/Qwen3.5-4B-DFlash` checkpoint omits `embed_tokens.weight`,
+    /// so a DFlash drafter resolves it from the target at bind time.
     ///
-    /// Used by: DFlash drafter lazy-bind path; Gemma 4 MTP assistant
-    /// binding; Qwen 3.5 target family; Gemma 4 target family
+    /// Used by: lazy-bind speculative drafters
     fn embed_tokens_module(&self) -> Option<crate::layers::UnifiedEmbedding> {
         None // default: not supported
     }
@@ -1797,15 +1795,6 @@ impl CxxGenerator {
     /// The bias is cached for the generator's lifetime and merged into every
     /// `SamplingConfig` handed to `generate_*` unless the caller already
     /// supplied a non-empty `token_bias` on the sampling config (caller wins).
-    ///
-    /// Callers that want to derive the map from a [`crate::LangBiasConfig`]
-    /// typically combine this with
-    /// [`crate::LangBiasConfig::resolve_token_bias`]:
-    ///
-    /// ```ignore
-    /// let bias = lang_bias_config.resolve_token_bias(tokenizer, bytes)?;
-    /// let generator = CxxGenerator::new(layers).with_token_bias(bias);
-    /// ```
     ///
     /// When `bias.is_empty()`, this method is a no-op on the sampling path —
     /// the composed `SamplingConfig` is returned by reference and `sample_*`

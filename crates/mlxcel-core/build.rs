@@ -39,8 +39,8 @@ fn main() {
         Err(err) => panic!("mlxcel-core: {err}"),
     };
 
-    // Expose the pinned MLX commit to the crate so the runtime can scope the
-    // persistent CUDA PTX cache directory by it (see ensure_persistent_ptx_cache).
+    // Expose the pinned MLX commit to the crate (`autotune::store::mlx_commit`)
+    // so the tactic store and the runtime bench fixtures are scoped by it.
     println!("cargo:rustc-env=MLXCEL_MLX_COMMIT={mlx_commit}");
 
     // Build MLX using cmake
@@ -191,11 +191,6 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=Accelerate");
     }
 
-    #[cfg(feature = "cuda")]
-    {
-        link_cuda();
-    }
-
     // Rerun if bridge files change
     println!("cargo:rerun-if-changed=src/lib.rs");
     println!("cargo:rerun-if-changed=cpp/mlx_cxx_bridge.h");
@@ -208,7 +203,6 @@ fn main() {
     println!("cargo:rerun-if-changed=metal/fused_attention_metal4.metal");
     println!("cargo:rerun-if-changed=../mlx-cpp/CMakeLists.txt");
     println!("cargo:rerun-if-changed=../mlx-cpp/patches");
-    println!("cargo:rerun-if-changed=../mlx-cpp/patches-cuda");
     // Sparse-V fused-skip Metal kernel launchers.
     println!("cargo:rerun-if-changed=../mlx-cpp/turbo/CMakeLists.txt");
     println!("cargo:rerun-if-changed=../mlx-cpp/turbo/sparse_v_sdpa.h");
@@ -237,7 +231,6 @@ fn main() {
     println!("cargo:rerun-if-changed=../mlx-cpp/turbo/fused_norm.cpp");
     println!("cargo:rerun-if-changed=../mlx-cpp/turbo/fused_rope_append.h");
     println!("cargo:rerun-if-changed=../mlx-cpp/turbo/fused_rope_append.cpp");
-    println!("cargo:rerun-if-env-changed=MLX_CUDA_ARCHITECTURES");
     println!("cargo:rerun-if-env-changed=MLXCEL_BUILD_METAL");
     println!("cargo:rerun-if-env-changed=MLXCEL_BUILD_ACCELERATE");
     println!("cargo:rerun-if-env-changed=MLXCEL_CXX_MARCH");
@@ -322,7 +315,7 @@ fn build_mlx(expected_commit: &str) -> PathBuf {
     // Platform features
     // On macOS: Metal and Accelerate are always available and enabled by default.
     // Feature flags can still override (e.g. for CPU-only testing).
-    // On Linux: CPU-only by default, CUDA opt-in via feature flag.
+    // Elsewhere: CPU-only. The CUDA backend is never built.
     config.define("MLX_BUILD_CUDA", "OFF");
 
     #[cfg(target_os = "macos")]
@@ -342,33 +335,6 @@ fn build_mlx(expected_commit: &str) -> PathBuf {
         config.define("MLX_BUILD_ACCELERATE", "OFF");
     }
 
-    #[cfg(feature = "cuda")]
-    {
-        config.define("MLX_BUILD_CUDA", "ON");
-
-        // Help CMake find CUDA toolkit
-        if let Ok(cuda_path) = env::var("CUDA_HOME") {
-            config.define("CMAKE_CUDA_COMPILER", format!("{cuda_path}/bin/nvcc"));
-        } else if PathBuf::from("/usr/local/cuda/bin/nvcc").exists() {
-            config.define("CMAKE_CUDA_COMPILER", "/usr/local/cuda/bin/nvcc");
-        }
-
-        // CUDA architecture selection. An explicitly set MLX_CUDA_ARCHITECTURES is
-        // honored verbatim (escape hatch); otherwise we auto-detect via nvidia-smi
-        // and fall back to Hopper's sm_90a.
-        //
-        // The `a` suffix is load-bearing: MLX only defines MLX_CUDA_SM90A_ENABLED
-        // (which compiles the dedicated Hopper `qmm_sm90` quantized kernel) when
-        // "90a" is in the arch list. MLX's own CMake appends that suffix for
-        // cc >= 90, but only inside its `if(NOT DEFINED MLX_CUDA_ARCHITECTURES)`
-        // branch. Because we always pass MLX_CUDA_ARCHITECTURES explicitly, that
-        // branch never runs, so we apply the same rule ourselves here and in
-        // detect_cuda_arch. See docs/installation.md (CUDA architecture selection).
-        let cuda_arch = env::var("MLX_CUDA_ARCHITECTURES")
-            .unwrap_or_else(|_| detect_cuda_arch().unwrap_or_else(|| "90a".to_string()));
-        config.define("MLX_CUDA_ARCHITECTURES", &cuda_arch);
-    }
-
     config.build()
 }
 
@@ -383,88 +349,5 @@ fn cmake_bool_from_env(name: &str) -> Option<&'static str> {
             "Invalid {name} value {:?}. Expected one of: 1/0, on/off, true/false, yes/no.",
             value
         ),
-    }
-}
-
-#[cfg(feature = "cuda")]
-fn detect_cuda_arch() -> Option<String> {
-    use std::process::Command;
-    let output = Command::new("nvidia-smi")
-        .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
-        .output()
-        .ok()?;
-    let caps = String::from_utf8_lossy(&output.stdout);
-    // Parse "X.Y" compute capabilities, convert to SM number (e.g. "9.0" -> "90"),
-    // and append the architecture-specific "a" suffix for cc >= 90 (e.g. "90a").
-    let archs: Vec<String> = caps
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            let parts: Vec<&str> = line.split('.').collect();
-            if parts.len() == 2 {
-                Some(sm_arch_with_suffix(&format!("{}{}", parts[0], parts[1])))
-            } else {
-                None
-            }
-        })
-        .collect();
-    if archs.is_empty() {
-        None
-    } else {
-        // Deduplicate
-        let mut unique = archs;
-        unique.sort();
-        unique.dedup();
-        Some(unique.join(";"))
-    }
-}
-
-/// Append CUDA's architecture-specific `a` suffix for SM >= 90, mirroring MLX's
-/// own CMake logic (`MLX_CUDA_ARCHITECTURES GREATER_EQUAL 90` -> append `a`).
-///
-/// The `a` suffix enables architecture-specific features (e.g. Hopper wgmma/TMA)
-/// the dedicated quantized kernels rely on, and it gates MLX_CUDA_SM90A_ENABLED on
-/// "90a" (not "90"). SM < 90 (e.g. Ampere sm_80/sm_86) has no `a` variant and is
-/// returned unchanged.
-#[cfg(feature = "cuda")]
-fn sm_arch_with_suffix(sm: &str) -> String {
-    match sm.parse::<u32>() {
-        Ok(n) if n >= 90 => format!("{sm}a"),
-        _ => sm.to_string(),
-    }
-}
-
-#[cfg(feature = "cuda")]
-fn link_cuda() {
-    // Find CUDA lib directory
-    let cuda_lib = if let Ok(cuda_home) = env::var("CUDA_HOME") {
-        PathBuf::from(cuda_home).join("lib64")
-    } else if PathBuf::from("/usr/local/cuda/lib64").exists() {
-        PathBuf::from("/usr/local/cuda/lib64")
-    } else {
-        panic!("Cannot find CUDA library directory. Set CUDA_HOME environment variable.");
-    };
-
-    println!("cargo:rustc-link-search=native={}", cuda_lib.display());
-
-    // CUDA runtime and math libraries
-    println!("cargo:rustc-link-lib=dylib=cudart");
-    println!("cargo:rustc-link-lib=dylib=cublas");
-    println!("cargo:rustc-link-lib=dylib=cublasLt");
-    println!("cargo:rustc-link-lib=dylib=cufft");
-
-    // CUDA driver API (cuLaunchKernel, cuModuleLoad, etc.)
-    println!("cargo:rustc-link-lib=dylib=cuda");
-
-    // cuDNN
-    println!("cargo:rustc-link-lib=dylib=cudnn");
-
-    // NVRTC for runtime compilation (JIT kernels)
-    println!("cargo:rustc-link-lib=dylib=nvrtc");
-
-    // CUDA stubs directory (for driver API on systems without GPU driver in lib path)
-    let cuda_stubs = cuda_lib.join("stubs");
-    if cuda_stubs.exists() {
-        println!("cargo:rustc-link-search=native={}", cuda_stubs.display());
     }
 }
