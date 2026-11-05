@@ -409,4 +409,50 @@ std::unique_ptr<MlxArray> steel_outputs_take_hot(Turbo4DelegatedSteelOutputs& o)
     return std::move(o.out_hot);
 }
 
+// ── Test-only compiled-vs-eager probe ─────────────────────────────────────────
+//
+// Runs one fixed graph on (a, b) eagerly (mode 0), compiled (1) or compiled
+// shapeless (2). The Metal compiled-kernel overlay used to cast comparison
+// operands to bool, so a compiled `greater_equal` returned the wrong mask; no
+// production code compiles a comparison any more, so this is the only way to
+// pin the overlay fix (upstream mlxcel d702f4e5, #2325).
+// Graph 0: where(a < b, a, b).
+// Graph 1: min-p filter, where(softmax(a) >= 0.3 * max(softmax(a)), a, lowest).
+// Graph 2: where(isnan(a), 7, a)  (isnan lowers to not_equal(a, a)).
+std::unique_ptr<MlxArray> compile_dtype_probe_for_test(
+    int32_t graph, const MlxArray& a, const MlxArray& b, int32_t mode) {
+    namespace mx = mlx::core;
+    auto fn = [graph](const std::vector<mx::array>& in) -> std::vector<mx::array> {
+        const auto& x = in[0];
+        const auto& y = in[1];
+        switch (graph) {
+            case 0:
+                return {mx::where(mx::less(x, y), x, y)};
+            case 1: {
+                auto probs = mx::softmax(x, -1);
+                auto thr = mx::multiply(mx::max(probs, -1, true), mx::array(0.3f));
+                return {mx::where(
+                    mx::greater_equal(probs, thr),
+                    x,
+                    mx::array(std::numeric_limits<float>::lowest(), x.dtype()))};
+            }
+            case 2:
+                return {mx::where(mx::isnan(x), mx::array(7.0f, x.dtype()), x)};
+            default:
+                throw std::invalid_argument("compile_dtype_probe_for_test: unknown graph");
+        }
+    };
+    std::function<std::vector<mx::array>(const std::vector<mx::array>&)> run = fn;
+    if (mode == 1) {
+        run = mx::compile(fn, /*shapeless=*/false);
+    } else if (mode == 2) {
+        run = mx::compile(fn, /*shapeless=*/true);
+    } else if (mode != 0) {
+        throw std::invalid_argument("compile_dtype_probe_for_test: mode must be 0, 1 or 2");
+    }
+    auto out = run({a.inner, b.inner});
+    mx::eval(out[0]);
+    return std::make_unique<MlxArray>(std::move(out[0]));
+}
+
 }  // namespace mlx_cxx

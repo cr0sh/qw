@@ -141,8 +141,10 @@ inline void build_kernel(
     os += fmt::format("  {0} index_{1} = ", idx_type, xname);
     if (ndim == 1) {
       int offset = i * ndim;
-      os +=
-          fmt::format("elem_to_loc_1<uint>(pos.x, in_strides[{0}]);\n", offset);
+      // idx_type, not a hard-coded uint: the large-index kernel needs int64_t
+      // (upstream mlxcel 81ba1c6a).
+      os += fmt::format(
+          "elem_to_loc_1<{0}>(pos.x, in_strides[{1}]);\n", idx_type, offset);
     } else if (ndim == 2) {
       int offset = i * ndim;
       os += fmt::format(
@@ -214,7 +216,18 @@ inline void build_kernel(
           get_type_string(x.dtype()),
           namer.get_name(x.inputs()[0]));
     } else {
-      auto out_type = get_type_string(x.dtype());
+      // An input whose type differs from out_type is cast to it. For a bool
+      // output (a comparison; isnan/isinf lower to one) out_type is the
+      // promoted input type instead: casting comparison operands to bool
+      // turned Less(0.2, 0.7) into Less(true, true), i.e. false (upstream
+      // mlxcel d702f4e5, #1792).
+      auto cast_dtype = x.dtype();
+      if (cast_dtype == bool_) {
+        for (auto& in : x.inputs()) {
+          cast_dtype = promote_types(cast_dtype, in.dtype());
+        }
+      }
+      auto out_type = get_type_string(cast_dtype);
       os += x.primitive().name();
       os += "()(";
       for (int i = 0; i < x.inputs().size() - 1; i++) {
