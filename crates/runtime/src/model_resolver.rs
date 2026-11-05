@@ -6,7 +6,6 @@ use anyhow::{Result, bail};
 /// and the runtime benchmarks use when neither `--model` nor `QW_MODEL_PATH`
 /// is given. Users override the *path* to a checkpoint, never this identifier.
 pub const DEFAULT_MODEL_IDENTIFIER: &str = "Jundot/Qwen3.8-27B-oQ4e-fp16-mtp";
-#[cfg(any(feature = "specprefill", test))]
 pub const DEFAULT_SPECPREFILL_DRAFT_MODEL_IDENTIFIER: &str = "mlx-community/Qwen3.5-0.8B-MLX-8bit";
 #[cfg(any(feature = "dflash2", test))]
 pub const DEFAULT_DFLASH2_DRAFT_MODEL_IDENTIFIER: &str = "incoai/Qwen3.8-27B-DFlash2";
@@ -69,19 +68,19 @@ pub fn resolve_model_dir(
     resolve_path(cli_override, env_override, home, DEFAULT_MODEL_IDENTIFIER)
 }
 
+fn non_empty_env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
 /// Convenience wrapper around `resolve_model_dir` that reads `QW_MODEL_PATH`
 /// and `HOME` from the process environment.
 pub fn resolve_model_path(cli_override: Option<&Path>) -> Result<PathBuf> {
-    let env_override = std::env::var_os("QW_MODEL_PATH")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from);
-    let home = std::env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from);
+    let env_override = non_empty_env_path("QW_MODEL_PATH");
+    let home = non_empty_env_path("HOME");
     resolve_model_dir(cli_override, env_override.as_deref(), home.as_deref())
 }
 
-#[cfg(any(feature = "specprefill", test))]
 fn resolve_specprefill_draft_dir(
     cli_override: Option<&Path>,
     env_override: Option<&Path>,
@@ -95,14 +94,9 @@ fn resolve_specprefill_draft_dir(
     )
 }
 
-#[cfg(any(feature = "specprefill", test))]
 pub fn resolve_specprefill_draft_path(cli_override: Option<&Path>) -> Result<PathBuf> {
-    let env_override = std::env::var_os("QW_SPECPREFILL_DRAFT_MODEL_PATH")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from);
-    let home = std::env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from);
+    let env_override = non_empty_env_path("QW_SPECPREFILL_DRAFT_MODEL_PATH");
+    let home = non_empty_env_path("HOME");
     resolve_specprefill_draft_dir(cli_override, env_override.as_deref(), home.as_deref())
 }
 
@@ -122,12 +116,8 @@ fn resolve_dflash2_draft_dir(
 
 #[cfg(any(feature = "dflash2", test))]
 pub fn resolve_dflash2_draft_path(cli_override: Option<&Path>) -> Result<PathBuf> {
-    let env_override = std::env::var_os("QW_DFLASH_DRAFT_MODEL_PATH")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from);
-    let home = std::env::var_os("HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from);
+    let env_override = non_empty_env_path("QW_DFLASH_DRAFT_MODEL_PATH");
+    let home = non_empty_env_path("HOME");
     resolve_dflash2_draft_dir(cli_override, env_override.as_deref(), home.as_deref())
 }
 

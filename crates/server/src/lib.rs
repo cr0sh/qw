@@ -8,6 +8,12 @@ mod media;
 pub mod protocol;
 mod tool_calls;
 
+#[cfg(feature = "specprefill")]
+mod specprefill_policy;
+#[cfg(not(feature = "specprefill"))]
+#[path = "specprefill_policy_disabled.rs"]
+mod specprefill_policy;
+
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -25,14 +31,25 @@ use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{Instrument, Span, debug, error, info_span, trace, warn};
 
-#[cfg(feature = "specprefill")]
-pub use engine::SpecPrefillPolicyConfig;
 use engine::{
     Admission, CompletionRecord, FailureKind, FinishReason, GeneratedToolCall, WorkerDelta,
     WorkerEvent, WorkerFailure,
 };
 pub use engine::{DecoderConfig, Engine, SubmitError};
 use protocol::{Endpoint, RequestError};
+pub use specprefill_policy::SpecPrefillPolicyConfig;
+
+// Shared input shape keeps the feature-disabled policy a no-op without cfgs at call sites.
+#[cfg_attr(not(feature = "specprefill"), allow(dead_code))]
+struct SpecPrefillRequest<'a> {
+    messages: &'a [qw_runtime::ChatMessage],
+    tools: &'a [qw_runtime::ChatTool],
+    reasoning_effort: Option<&'a str>,
+    enable_thinking: bool,
+    prompt_ids: &'a [i32],
+    has_images: bool,
+    allowed: bool,
+}
 
 // A 64 MiB image source expands to about 86 MiB of base64. Bound the complete
 // JSON body while allowing that image plus text and request metadata.

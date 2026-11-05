@@ -1,7 +1,6 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-#[cfg(feature = "specprefill")]
 use crate::SpecPrefillPolicyConfig;
 use crate::{Engine, router};
 use anyhow::{Context, Result, ensure};
@@ -161,22 +160,8 @@ pub struct ServerArgs {
     #[arg(long)]
     dflash_draft_model: Option<PathBuf>,
 
-    #[cfg(feature = "specprefill")]
-    /// Current-turn token threshold above which SpecPrefill activates.
-    #[arg(long, default_value_t = 8_000)]
-    specprefill_min_turn_tokens: usize,
-    #[cfg(feature = "specprefill")]
-    /// Fraction of score-ranked prompt chunks retained by SpecPrefill.
-    #[arg(long, default_value_t = 0.25)]
-    specprefill_keep_rate: f32,
-    #[cfg(feature = "specprefill")]
-    /// Tokens force-kept at the start of the SpecPrefill-eligible suffix.
-    #[arg(long, default_value_t = 256)]
-    specprefill_keep_first_tokens: usize,
-    #[cfg(feature = "specprefill")]
-    /// Tokens force-kept at the end of the SpecPrefill-eligible suffix.
-    #[arg(long, default_value_t = 256)]
-    specprefill_keep_last_tokens: usize,
+    #[command(flatten)]
+    specprefill: crate::specprefill_policy::SpecPrefillArgs,
     /// Disable the default 4-bit TurboQuant KV cache.
     #[arg(long)]
     no_kv_quantization: bool,
@@ -203,14 +188,8 @@ impl ServerArgs {
         }
     }
 
-    #[cfg(feature = "specprefill")]
     fn specprefill_policy(&self) -> SpecPrefillPolicyConfig {
-        SpecPrefillPolicyConfig {
-            min_turn_tokens: self.specprefill_min_turn_tokens,
-            keep_rate: self.specprefill_keep_rate,
-            keep_first_tokens: self.specprefill_keep_first_tokens,
-            keep_last_tokens: self.specprefill_keep_last_tokens,
-        }
+        self.specprefill.policy()
     }
 }
 
@@ -229,7 +208,6 @@ fn validate_cli(cli: &ServerArgs) -> Result<()> {
         cli.decoder != Decoder::Dflash2,
         "--decoder dflash requires the dflash2 build feature"
     );
-    #[cfg(feature = "specprefill")]
     cli.specprefill_policy().validate()?;
     Ok(())
 }
@@ -344,7 +322,6 @@ pub async fn serve(cli: ServerArgs) -> Result<()> {
     );
 
     let kv_cache_mode = cli.kv_cache_mode();
-    #[cfg(feature = "specprefill")]
     let specprefill_policy = cli.specprefill_policy();
     let model = resolve_model_path(cli.model.as_deref())?;
     #[cfg(feature = "dflash2")]
@@ -367,7 +344,6 @@ pub async fn serve(cli: ServerArgs) -> Result<()> {
             dflash2_draft_model: dflash_draft_model,
         },
         kv_cache_mode,
-        #[cfg(feature = "specprefill")]
         specprefill_policy,
     )?;
     let listener = tokio::net::TcpListener::bind(bind)

@@ -9,7 +9,6 @@ use std::time::Duration;
 use mlxcel_core::generate::SamplingConfig;
 #[cfg(not(feature = "dflash2"))]
 use qw_runtime::MtpGenerationStats;
-#[cfg(feature = "specprefill")]
 use qw_runtime::PrefillMode;
 #[cfg(feature = "dflash2")]
 use qw_runtime::PromptSnapshot;
@@ -148,7 +147,6 @@ fn fresh_prefill_sample(
             None,
             None,
             &[],
-            #[cfg(feature = "specprefill")]
             PrefillMode::Dense,
             |delta| {
                 black_box(delta);
@@ -413,7 +411,6 @@ fn main() {
                 None,
                 None,
                 &[],
-                #[cfg(feature = "specprefill")]
                 PrefillMode::Dense,
                 |_| true,
             )

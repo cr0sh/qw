@@ -15,7 +15,6 @@ mod qwen_vl;
 mod qwen_vl_merge;
 mod qwen_vl_position;
 mod qwen_vl_processor;
-#[cfg(any(feature = "specprefill", test))]
 mod specprefill;
 
 mod portable_snapshot;
@@ -28,7 +27,6 @@ pub use model_resolver::{
     DEFAULT_MODEL_IDENTIFIER, model_cache_path, resolve_model_dir, resolve_model_path,
     validate_identifier,
 };
-#[cfg(any(feature = "specprefill", test))]
 pub use model_resolver::{
     DEFAULT_SPECPREFILL_DRAFT_MODEL_IDENTIFIER, resolve_specprefill_draft_path,
 };
@@ -47,7 +45,7 @@ pub use provider::{
 pub use provider::{Dflash2GenerationStats, Dflash2PrefixReuse, Dflash2PromptSnapshot};
 pub use qwen_vl::{ExpandedImageTokens, insert_qwen_vl_image_tokens};
 pub use qwen_vl_processor::{PreparedImage, QwenVLProcessor};
-#[cfg(any(feature = "specprefill", test))]
 pub use specprefill::{
-    PrefillMode, SPECPREFILL_DRAFT_MODEL_IDENTIFIER, SpecPrefillConfig, SpecPrefillStats,
+    DEFAULT_KEEP_FIRST_TOKENS, DEFAULT_KEEP_LAST_TOKENS, DEFAULT_KEEP_RATE, PrefillMode,
+    SpecPrefillConfig, SpecPrefillStats,
 };
