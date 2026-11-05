@@ -29,6 +29,10 @@ sha2 = { version = "0.11", optional = true }
 name = "specprefill_experiment"
 required-features = ["specprefill"]
 
+[[example]]
+name = "dlsa_indexer_bench"
+required-features = ["dlsa"]
+
 [[bench]]
 name = "single_user_throughput"
 harness = false

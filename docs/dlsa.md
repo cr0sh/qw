@@ -1,7 +1,8 @@
 # D-LSA (flat design) for Qwen3.8-27B: spec for the QW port
 
-Status: research spec (roadmap task 0 of 6). There is no QW code yet. Golden fixtures are in
-[`tests/fixtures/dlsa/`](../tests/fixtures/dlsa/README.md).
+Status: roadmap tasks 0-2 done: this spec, golden fixtures in
+[`tests/fixtures/dlsa/`](../tests/fixtures/dlsa/README.md), the map loader (§10) and the indexer core (§11). Nothing
+is wired into a model yet (task 3).
 
 D-LSA (Distilled Latent Sparse Attention, arXiv 2610.42147) leaves the attention kernel unchanged. It only decides which
 cached keys each query of a full-attention layer reads: the first `sink_size` keys, the last `window_size` keys, and up
@@ -488,7 +489,7 @@ This section draws on the researcher's integration notes, checked against the co
      and the dims, mirroring upstream `weights.py:120-162`.
    - Decide where the converted file lives (user cache path plus a sha check; do not commit 6 MB per map).
    - Also convert the PCA map for task 6.
-2. **Indexer core** (pure MLX ops, no Metal, no model):
+2. **Indexer core** (pure MLX ops, no Metal, no model). **Done, see §11** (Ward, top-p and expansion run on the host):
    - index key/query
    - pooling
    - Ward rounds (an MLX port of `ward.py:29-90` with the kernel's tie policy, §4.3; the `ward_tie_policy` fixture pins it)
@@ -577,3 +578,184 @@ This section draws on the researcher's integration notes, checked against the co
   `QW_DLSA_SOURCE_DIR`), checks the pinned checksums and loads all 16 layers.
 - **Rope note for later tasks.** The loader is independent of rope scaling: the index reads dims 64..255, which RoPE (YaRN
   included) never touches (§1), so QW's lack of YaRN does not change what the maps read.
+
+## 11. Indexer core (roadmap task 2; feature `dlsa`)
+
+`crates/runtime/src/dlsa/`, re-exported from `qw_runtime`. No model hook yet (task 3), no Metal kernels (task 4).
+Projection and centroid scoring are MLX ops (f32 matmul). Ward, top-p and expansion run on the host in f32 with explicit
+comparators, so the tie rules are exact and readable.
+
+### 11.1 Modules
+
+| file | contents | ported from (`@5ebea73`) |
+|---|---|---|
+| `config.rs` | `DlsaIndexConfig` (+ `QWEN_DEFAULTS`, `validate()` = `design.py:257-275`, `buckets_per_block`, `pools_per_block`, `list_width`, `visible_buckets`), `DlsaGeometry` (+ `QWEN38_27B`) | `sglang/settings/design.py` |
+| `project.rs` | `concat_keys`, `group_queries`, `index_keys`, `index_queries`, `normalize_rows`, `to_host_f32` | `core/index_space.py` |
+| `ward.rs` | `pool_keys`, `ward_labels` (kernel tie policy), `WardOutcome` | `core/ward.py`, `core/kernels/triton/ward.py:154-204` |
+| `buckets.rs` | `cluster_block` -> `BlockBuckets` (centroids, members, sizes of one closed block) | `core/reference.py` `build_buckets` |
+| `cache.rs` | `DlsaBucketCache` (append, commit, trim, reset, memory, snapshot/restore, build), `DlsaIndexSnapshot` | `core/reference.py`, `sglang/index/bucket_cache.py` |
+| `select.rs` | `top_p_buckets`, `expand_buckets`, `score_buckets_host`, `DlsaSelection`, `DlsaBucketCache::{select, select_host, score_mlx, select_from_scores}` | `core/reference.py` `read`, `_read_row`, `expand_buckets` |
+| `fixtures.rs`, `indexer_tests.rs` | test-only fixture reader (sha256-checked against `manifest.json`) and the tests of §11.6 | - |
+
+### 11.2 API for the integration (tasks 3 and 5)
+
+```rust
+// One per (full-attention layer, sequence).
+let mut cache = DlsaBucketCache::new(DlsaIndexConfig::QWEN_DEFAULTS)?;
+// In forward_impl, after q_norm/k_norm, before or after RoPE (dims 64..255 are untouched):
+let ik = index_keys(&keys, &maps.w_k_idx, &DlsaGeometry::QWEN38_27B)?;    // [L, 64] f32 unit rows
+let iq = index_queries(&queries, &maps.w_q_idx, &DlsaGeometry::QWEN38_27B)?; // [L, 64] f32
+cache.append_mlx(&ik)?;                  // all L keys first: closes every block they complete
+let sel = cache.select(&iq, &positions)?; // one list per row, shared by all heads
+let lists = sel.lists_mlx();             // [L, 4612] i32, -1 padded; sel.lengths: valid entries
+cache.commit();                          // or cache.trim(accepted_len)? on a rejected verify
+```
+
+- Inputs are `[1, L, H, D]` (the `forward_impl` layout) or `[L, H, D]`, any float dtype. Keys are cast to the map's dtype
+  for the product: F32 maps reproduce the reference (parity), BF16 maps the served numerics (§4.1). F16 maps are refused.
+- `select` requires every position `< len()`: the forward's own keys must be appended first. Causality is then
+  structural (a row only scores the `visible(p)` buckets of blocks before its own; `positions` past `len` are an error).
+- `DlsaSelection { rows, width, top_p, lists, lengths, picked, visible }`: `lists` is row-major `[rows, width]` in the
+  reference's order (expansion, window, sinks); `picked` the picked bucket rows best first (`-1` padded); `list(r)` the
+  valid part of row `r`.
+- `select_host` (sequential f32 dots) is the oracle of the MLX path; on every fixture both give identical lists.
+  `score_mlx` + `select_from_scores` split scoring from the pick for benchmarks. The host pick fans out over threads once
+  `rows x visible >= 65536`.
+- `memory()` -> `DlsaCacheMemory { host_tables, host_tables_allocated, tail_keys, tail_keys_allocated, device_centroids }`:
+  logical sizes (`len`) and host allocations (`capacity`); `total()` is logical, `allocated()` (= `nbytes()`) what the
+  cache actually holds. `stats()` counts blocks, Ward rounds and clustering time.
+
+### 11.3 Tie policies as implemented
+
+- **Ward partner:** the cheapest allowed partner, the **lowest index** on an exact cost tie (strict `<` over ascending j).
+  The Gram is computed once per unordered pair and mirrored, so `cost(i, j) == cost(j, i)` bitwise.
+- **Ward final round:** mutual pairs are ranked by `(cost, partner index)` ascending and only the first `merges_left`
+  merge: the served kernel's policy (§4.3). `ward_tie_policy` gives `[0, 1, 1, 2]`, not the reference's
+  implementation-defined `[0, 1, 2, 0]`.
+- **Top-p:** `(score descending, bucket ascending)` with `partial_cmp`, so `-0.0 == +0.0` as in torch (packed ordered bits
+  would not treat them as equal; QW never packs). NaN scores are an error. `select_nth_unstable_by` plus a sort of the
+  prefix: the comparator is a total order, so unstable sorting is exact.
+- **Expansion:** the rank-order walk of the reference (not the kernels' threshold walk: same set, different order).
+- **Centroid:** the bucket's keys summed in position order (as `index_add_`), divided by `max(norm, 1e-30)` as
+  `build_buckets` does (not the `1e-12` of `normalize`; irrelevant for non-zero sums). Pools and centroids of BF16 keys
+  are summed from the keys upcast to f32, as upstream does.
+
+### 11.4 Incremental semantics, commit and rollback
+
+- `append` clusters a block as soon as its last key arrives, also mid-append, so a row later in the same forward sees it
+  (§4.8, §7.3). The cache always holds `floor(len / 512)` closed blocks; the reference's `build_buckets` over the same
+  keys gives bit-identical tables, whatever the chunking (tested).
+- The cache retains the index keys of `[tail_start, len)`, where `tail_start = 512 * floor(committed / 512)`.
+  `commit()` moves the commit point to `len` and frees the keys of blocks closed before it, and shrinks the key buffer's
+  capacity to at most two blocks (`2 x 512 x 64 x 4 B` = 256 KiB a layer), so a prefill chunk or a batch build does not
+  stay allocated. Without speculation call it after every forward: the retained keys are then the open block only
+  (`< 512 x 256 B` a layer).
+- `trim(n)` rolls back to the first `n` keys for any `tail_start <= n <= len`: it drops the bucket rows of every block
+  that ends past `n` (reopening it), truncates the keys and the commit point, and drops the device copy of the centroids
+  if rows were removed. A reopened block closes again from the retained keys plus the new ones, which is exact because
+  Ward is deterministic given the keys. `n < tail_start` is an error. So a verify forward appends its rows (possibly
+  closing a block), selects, then the caller either `commit()`s or `trim(accepted)`s and `commit()`s.
+- `reset()` empties the cache and releases every allocation. An empty cache has no buckets; a query then reads its
+  window and sinks (the reference raises in `build_buckets` there, §5).
+
+### 11.5 Snapshot layout (`DlsaIndexSnapshot`, for task 5)
+
+| field | type, shape | meaning |
+|---|---|---|
+| `cfg` | `DlsaIndexConfig` | must equal the restoring cache's config |
+| `len` | usize | keys appended (positions `0..len`) |
+| `centroids` | f32 `[rows, 64]`, `rows = 64 * floor(len / 512)` | bucket centroids, block after block |
+| `members` | i32 `[rows, 16]` | absolute member positions ascending, `-1` padded |
+| `sizes` | i32 `[rows]` | members per bucket |
+| `open_keys` | f32 `[len - 512 * floor(len / 512), 64]` | index keys of the open block |
+
+`restore(cfg, &snap)` checks the config, every length and the member range, and gives a committed cache (it cannot roll
+back past its open block; an uncommitted state is captured as if committed). No version field (AGENTS.md). Task 5 may
+instead store per-token index keys and rebuild with `DlsaBucketCache::build` (§7.4 option a): both are exact, because
+Ward is deterministic given the keys. Option (a) then needs stable stored keys: the projection's rounding depends on its
+batch size (§7.4), which changes centroids by `<= 1.5e-7` on the fixtures and no list (test
+`projection_batch_size_does_not_change_lists`), but is not bitwise.
+
+### 11.6 Tests and tolerances
+
+`./gpu-lock -- cargo test -p qw-runtime --features dlsa dlsa::` (MLX tests need Metal). Every stage is tested from the
+fixture's own inputs of that stage, then end to end. Set `DLSA_TEST_VERBOSE=1` to print every measured difference.
+
+| stage | fixtures | tolerance | measured max |
+|---|---|---|---|
+| `concat_keys`, `group_queries` from `k` / `q` (`q_rows`) | tiny, tiny_ties, short_dense, qwen_layer | 1e-5 | 0 |
+| `index_keys`, `index_queries` (MLX, F32 maps) | the same, both qwen_layer maps | 1e-5 | 4.9e-7 |
+| `pool_keys` from fixture `index_keys` | all list cases | 1e-6 | 0 |
+| Ward labels from fixture `pool_keys`, and from own pools (incl. `qwen_index_defaults`, 18 blocks of 128 pools from BF16 keys); `ward_tie_policy` | all | exact | exact |
+| centroids / members / sizes via the cache (chunks of 7, then decode) | all list cases + qwen_index_defaults | 1e-6 / exact / exact | 1.8e-7 |
+| `visible_buckets` | all | exact | exact |
+| bucket scores (MLX and host) vs fixture `bucket_scores` | all | 1e-6 | 1.2e-7 |
+| picks from fixture `bucket_scores` (tiny_ties: exact score ties) | all | exact | exact |
+| expansion from fixture picks + members, in order | all | exact | exact |
+| lists end to end from fixture index vectors (MLX == host, chunks of `2W+3`, then decode; qwen_index_defaults row by row) | all | exact, in order | exact |
+| lists end to end from raw q/k through `project.rs` and MLX selection | tiny, tiny_ties, short_dense, qwen_layer x2 | exact, in order | exact |
+| attention over the lists (fp64 CPU softmax, identity RoPE) vs `attention_out` | tiny, tiny_ties, short_dense | 1e-5 | 6.0e-7 |
+
+Why these tolerances: f32 sums of 8-64 terms in a different order differ by a few ulp of values of order 1 (`<= 5e-7`
+measured), so 1e-6 / 1e-5 leave margin without hiding a wrong formula (which errs by `>= 1e-3`). Index tables and lists
+are exact: the smallest top-p gap in the fixtures is 3.3e-6 (`real`), an order above the scoring error, and no Ward cost
+is that close; a flip would be a bug, not rounding. The bf16-map sanity test allows 3e-2 (bf16 products, measured 1.8e-3).
+
+Property and equivalence tests (host paths, seeded splitmix64, 60-80 random valid configs each, a third of them with
+`{-1, 0, 1}`-quantized vectors full of exact ties): every list against an independently written oracle (full stable sort,
+flatten-filter-truncate) and its invariants (length and padding, no duplicates, ids in `[0, p]`, window and sinks
+present and ordered, expansion only from closed blocks below the window, expansion `== min(top_k, offered)`, short
+context reads every causal key); Ward partitions (exactly `m` buckets, cap, pools whole, numbered by first pool,
+deterministic); token-by-token, random-chunk (crossing 0-2 block boundaries) and batch schedules give bit-identical
+tables and identical lists; an 8-row verify crossing a block boundary (rows from 48 on see the new block); rollback
+that reopens a block equals a fresh build and stays equal when decoding on; trim limits and commit freeing; allocation
+accounting (after a batch build + commit the key buffer is at most two blocks, the tables exactly sized; decode stays
+bounded; reset releases everything and reports 0); snapshot ->
+restore -> continue equals an uninterrupted run; the MLX device copy follows growth, trim and restore; Qwen defaults at
+6000 keys.
+
+### 11.7 Unoptimized baseline (one layer, for task 4)
+
+`crates/runtime/examples/dlsa_indexer_bench.rs`: one full-attention layer at Qwen geometry and the served defaults,
+synthetic topical bf16 q/k (as `gen_fixtures.py` makes them), the real layer-3 distilled map (from the `qwen_layer`
+fixture when no converted map is installed) in bf16. Prefill: 1536-row chunks, each projected, appended (closing blocks
+with Ward), and **every row** selected (MLX scoring, host pick), then committed. Decode: 25 steps of 1 / 3 / 8 rows at
+context T (project, append, select, then `trim(T)` as a rejected verify would), median.
+
+```text
+./gpu-lock -- cargo run --release -p qw-runtime --features dlsa --example dlsa_indexer_bench -- \
+  --contexts 32768,131072 --decode-steps 25 --out "$AGENT_SCRATCH/dlsa_indexer_bench_<sha>_<ts>.json"
+```
+
+Apple M4 Max (16 cores, 64 GB), base `3f3c6d1` + this change, release build, 2026-11-05:
+
+| measurement (one layer) | T = 32,768 | T = 131,072 |
+|---|---|---|
+| prefill indexer, tokens/s (x16 layers) | 111,400 (6,960) | 57,400 (3,590) |
+| of which: projection / append+Ward / MLX scoring / host pick+expansion (s) | 0.04 / 0.02 / 0.04 / 0.19 | 0.15 / 0.08 / 0.79 / 1.26 |
+| Ward per closed block: mean rounds, ms | 3.13, 0.28 | 3.18, 0.28 |
+| decode step, 1 row, median ms (project / score / pick) | 0.66 (0.42 / 0.17 / 0.08) | 1.35 (0.80 / 0.21 / 0.15) |
+| decode step, 3 rows (MTP), median ms | 0.72 | 0.95 |
+| decode step, 8 rows (DFlash), median ms | 1.06 | 0.86 |
+| host tables in use (f32 centroids + i32 members + sizes), B/token/layer | 40.5 | 40.5 |
+| host tables allocated after the chunked prefill (geometric growth), B/token/layer | 60.75 | 60.75 |
+| device centroid copy (f32), B/token/layer | 32.0 | 32.0 |
+| persistent in use, B/token/layer (x16 layers) | 72.5 (1,160) | 72.5 (1,160) |
+| allocated after the prefill (tables + device + key buffer), B/token/layer (x16 layers) | 100.75 (1,612) | 94.75 (1,516) |
+| served bf16 layout for comparison (§4.4), B/token/layer | 24.5 | 24.5 |
+| retained index keys in use: peak during a chunk / after commit | 384 KiB / 0 | 384 KiB / 0 |
+| key buffer allocated: peak during a chunk / after commit | 512 KiB / 256 KiB | 512 KiB / 256 KiB |
+| batch `build` of the same keys, after its commit: tables allocated / key buffer allocated | 40.5 B/token / 256 KiB | 40.5 B/token / 256 KiB |
+
+Decode medians vary by about 0.3 ms between runs (the 1-row 128k step's projection took 0.42 ms in an earlier run); the
+prefill and memory figures are stable. The batch build gives the same tables as the chunked prefill (checked by the bench).
+
+Readings for task 4:
+- The host pick and expansion dominate prefill (55% at 128k) and grow with T x visible buckets; MLX scoring includes
+  a host readback of `[1536, T/8]` f32 scores a chunk (96 MiB at 128k). A fused scan + top-p on the GPU removes both.
+- Decode costs about 1 ms a layer, half of it the projection's MLX dispatch and readback, so ~16 ms a token over the 16
+  layers, which would add ~60% to QW's ~27 ms decode step at 64k. Batching the 16 layers' projections, keeping the index
+  keys on the device and a GPU top-p are needed before this is worth serving.
+- Memory is 3x the served layout in use (4x allocated, since the tables grow geometrically) because centroids are f32 and
+  held twice (host and device). Keeping one bf16 device copy, with tables reserved to size, gives the 24.5 B/token/layer of
+  §4.4.
