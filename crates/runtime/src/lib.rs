@@ -1,4 +1,6 @@
 mod chat_template;
+#[cfg(feature = "dlsa")]
+mod dlsa;
 mod gated_delta;
 mod model_owned;
 mod model_resolver;
@@ -20,6 +22,8 @@ mod specprefill;
 mod portable_snapshot;
 pub mod provider;
 
+#[cfg(feature = "dlsa")]
+pub use dlsa::*;
 pub use mlxcel_core::cache::KVCacheMode;
 #[cfg(any(feature = "dflash2", test))]
 pub use model_resolver::{DEFAULT_DFLASH2_DRAFT_MODEL_IDENTIFIER, resolve_dflash2_draft_path};

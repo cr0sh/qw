@@ -43,6 +43,16 @@ enum Command {
 struct DownloadArgs {
     /// Hugging Face model identifier, such as Qwen/Qwen3.5-0.8B; defaults to the resolver model.
     identifier: Option<String>,
+
+    /// Download the D-LSA Qwen3.8-27B index map (checksum-pinned) and convert it; skips the model unless an identifier is given.
+    #[cfg(feature = "dlsa")]
+    #[arg(long)]
+    dlsa_map: bool,
+
+    /// Also download the training-free PCA step-0 D-LSA map.
+    #[cfg(feature = "dlsa")]
+    #[arg(long)]
+    dlsa_pca: bool,
 }
 
 #[derive(Debug, Args)]
@@ -416,6 +426,60 @@ fn download_snapshot(identifier: &str) -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
+/// Fetch the pinned upstream `.pt` with curl, verify its sha256, convert it to the torch-free
+/// safetensors map and verify the converted sha256 (see docs/dlsa.md).
+#[cfg(feature = "dlsa")]
+fn download_dlsa_map(kind: qw_runtime::DlsaMapKind) -> Result<(), Box<dyn std::error::Error>> {
+    let asset = kind.asset();
+    let home = std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| Error::new(ErrorKind::NotFound, "HOME is not set"))?;
+    let destination = qw_runtime::dlsa_map_cache_path(&home, kind);
+    if destination.is_file() && qw_runtime::verify_converted_map(&destination, kind).is_ok() {
+        eprintln!("Already downloaded {}", asset.converted_name);
+        return Ok(());
+    }
+    let source = qw_runtime::dlsa_source_cache_path(&home, kind);
+    if let Some(parent) = source.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut bytes = std::fs::read(&source).ok();
+    if bytes
+        .as_deref()
+        .is_none_or(|b| asset.verify_source(b).is_err())
+    {
+        eprintln!("Downloading {}", asset.source_name);
+        let partial = source.with_extension("pt.qw-part");
+        let status = ProcessCommand::new("curl")
+            .args(["--fail", "--location", "--show-error", "--output"])
+            .arg(&partial)
+            .arg(asset.source_url())
+            .status()
+            .map_err(|error| {
+                Error::new(
+                    error.kind(),
+                    format!("failed to run curl for D-LSA map: {error}"),
+                )
+            })?;
+        if !status.success() {
+            return Err(Error::other(format!(
+                "curl failed while downloading {} ({status})",
+                asset.source_name
+            ))
+            .into());
+        }
+        let downloaded = std::fs::read(&partial)?;
+        asset.verify_source(&downloaded)?;
+        std::fs::rename(&partial, &source)?;
+        bytes = Some(downloaded);
+    }
+    let bytes = bytes.expect("source bytes present");
+    qw_runtime::install_dlsa_map(&asset, &bytes, &destination)?;
+    eprintln!("Converted D-LSA map to {}", destination.display());
+    Ok(())
+}
+
 fn resolve_download_identifier(identifier: Option<&str>) -> &str {
     identifier.unwrap_or(DEFAULT_MODEL_IDENTIFIER)
 }
@@ -423,7 +487,22 @@ fn resolve_download_identifier(identifier: Option<&str>) -> &str {
 async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Command::Download(args) => {
-            download_snapshot(resolve_download_identifier(args.identifier.as_deref()))?;
+            #[cfg(feature = "dlsa")]
+            let only_maps = (args.dlsa_map || args.dlsa_pca) && args.identifier.is_none();
+            #[cfg(not(feature = "dlsa"))]
+            let only_maps = false;
+            if !only_maps {
+                download_snapshot(resolve_download_identifier(args.identifier.as_deref()))?;
+            }
+            #[cfg(feature = "dlsa")]
+            {
+                if args.dlsa_map {
+                    download_dlsa_map(qw_runtime::DlsaMapKind::Distilled)?;
+                }
+                if args.dlsa_pca {
+                    download_dlsa_map(qw_runtime::DlsaMapKind::PcaStep0)?;
+                }
+            }
         }
         Command::Stats => {
             print!("{}", stats_report()?);
