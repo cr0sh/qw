@@ -87,6 +87,10 @@ pub struct DlsaStats {
     pub index_time: Duration,
     /// Scoring, top-p pick and expansion.
     pub select_time: Duration,
+    /// Verify rollbacks that dropped index keys (model-level events, not per layer).
+    pub rollbacks: u64,
+    /// Of those, rollbacks that reopened a closed cluster block (its keys rejected).
+    pub reopened_blocks: u64,
 }
 
 /// D-LSA state of one loaded model: maps, and one bucket cache per full-attention layer for the

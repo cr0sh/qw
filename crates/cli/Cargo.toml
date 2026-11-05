@@ -9,7 +9,7 @@ publish = false
 default = ["dflash2"]
 dflash2 = ["qw-runtime/dflash2", "qw-server/dflash2"]
 specprefill = ["qw-runtime/specprefill", "qw-server/specprefill"]
-dlsa = ["qw-runtime/dlsa"]
+dlsa = ["qw-runtime/dlsa", "qw-server/dlsa"]
 
 [[bin]]
 name = "qw"

@@ -491,6 +491,8 @@ async fn measure_real_responses_prefix_latency(mode: Qwen35GenerationMode) {
         },
         KVCacheMode::Turbo4,
         SpecPrefillPolicyConfig::default(),
+        #[cfg(feature = "dlsa")]
+        None,
     )
     .expect("start real Qwen engine");
     let app = router(engine);
@@ -2536,6 +2538,35 @@ async fn chat_and_responses_preserve_mixed_image_order_buffered_and_streamed() {
         }),
         "{body}"
     );
+}
+
+#[tokio::test]
+async fn dlsa_server_answers_image_requests_with_400() {
+    let app = router(Engine::start_fake(Some(MODEL), 8).with_dlsa_for_test());
+    for (path, request) in [
+        (
+            "/v1/chat/completions",
+            json!({"model":MODEL,"messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":tiny_png_data_uri()}}]}]}),
+        ),
+        (
+            "/v1/responses",
+            json!({"model":MODEL,"input":[{"role":"user","content":[{"type":"input_image","image_url":tiny_png_data_uri()}]}]}),
+        ),
+    ] {
+        let (status, _, body) = post(app.clone(), path, request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: {body}");
+        let error: Value = serde_json::from_str(&body).expect("error response");
+        let message = error["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("D-LSA"), "{path}: {body}");
+    }
+    // Text requests are still served
+    let (status, _, body) = post(
+        app,
+        "/v1/chat/completions",
+        json!({"model":MODEL,"messages":[{"role":"user","content":"hi"}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }
 
 #[tokio::test]

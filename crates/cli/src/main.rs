@@ -113,15 +113,9 @@ struct GenerateArgs {
     #[arg(long)]
     seed: Option<u64>,
 
-    /// Enable D-LSA sparse attention in the full-attention layers (baseline decoder only).
     #[cfg(feature = "dlsa")]
-    #[arg(long)]
-    dlsa: bool,
-
-    /// Converted D-LSA map; defaults to QW_DLSA_MAP_PATH or the `qw download --dlsa-map` cache.
-    #[cfg(feature = "dlsa")]
-    #[arg(long, requires = "dlsa")]
-    dlsa_map: Option<PathBuf>,
+    #[command(flatten)]
+    dlsa: qw_server::DlsaArgs,
 }
 
 impl GenerateArgs {
@@ -552,17 +546,24 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
             #[cfg(not(feature = "dflash2"))]
             let dflash_draft_model: Option<PathBuf> = None;
+            #[cfg(feature = "dlsa")]
+            let dlsa = args.dlsa.resolve(qw_server::dlsa_process_env)?;
             let model = qw_runtime::resolve_model_path(args.model.as_deref())?;
             eprintln!("Loading model from {}", model.display());
             let mut provider = Qwen35Provider::load(&model, KVCacheMode::Fp16)?;
             #[cfg(feature = "dlsa")]
-            if args.dlsa {
-                let config = qw_runtime::DlsaConfig::resolve(
-                    qw_runtime::DlsaMapKind::Distilled,
-                    args.dlsa_map.as_deref(),
-                )?;
-                eprintln!("Enabling D-LSA with map {}", config.map_path.display());
-                provider.enable_dlsa(config)?;
+            if let Some(dlsa) = dlsa {
+                let index = dlsa.config.index;
+                eprintln!(
+                    "Enabling D-LSA ({:?} map {}, sink {}, window {}, top_k {}, top_p {})",
+                    dlsa.kind,
+                    dlsa.config.map_path.display(),
+                    index.sink_size,
+                    index.window_size,
+                    index.top_k,
+                    index.top_p
+                );
+                provider.enable_dlsa(dlsa.config)?;
             }
             let stdout = std::io::stdout();
             let mut stdout = stdout.lock();
@@ -702,48 +703,98 @@ mod tests {
         }
     }
 
+    const DLSA_FLAGS: [&str; 7] = [
+        "--dlsa ",
+        "--dlsa-map ",
+        "--dlsa-map-kind ",
+        "--dlsa-sink ",
+        "--dlsa-window ",
+        "--dlsa-top-k ",
+        "--dlsa-top-p ",
+    ];
+
+    fn help_lists_flag(help: &str, flag: &str) -> bool {
+        help.lines().any(|line| {
+            let line = line.trim_start();
+            line == flag.trim_end() || line.starts_with(flag)
+        })
+    }
+
     #[test]
-    fn generate_help_lists_dlsa_flags_only_with_the_feature() {
-        let help = Cli::try_parse_from(["qw", "generate", "--help"])
-            .expect_err("generate help exits through clap")
-            .to_string();
-        #[cfg(feature = "dlsa")]
-        {
-            assert!(
-                help.lines().any(|line| line.trim() == "--dlsa"
-                    || line.trim_start().starts_with("--dlsa ")),
-                "{help}"
-            );
-            assert!(help.contains("--dlsa-map"), "{help}");
-            let cli = Cli::try_parse_from([
-                "qw",
-                "generate",
-                "--prompt",
-                "hi",
-                "--dlsa",
-                "--dlsa-map",
-                "/tmp/map.safetensors",
-            ])
-            .expect("parse D-LSA flags");
-            let Command::Generate(args) = cli.command else {
-                panic!("generate");
-            };
-            assert!(args.dlsa);
-            assert_eq!(
-                args.dlsa_map.as_deref(),
-                Some(Path::new("/tmp/map.safetensors"))
-            );
-            // A map path alone does not enable D-LSA silently
-            assert!(
-                Cli::try_parse_from(["qw", "generate", "--prompt", "hi", "--dlsa-map", "/m"])
-                    .is_err()
-            );
+    fn generate_and_serve_help_list_dlsa_flags_only_with_the_feature() {
+        for command in ["generate", "serve"] {
+            let help = Cli::try_parse_from(["qw", command, "--help"])
+                .expect_err("help exits through clap")
+                .to_string();
+            for flag in DLSA_FLAGS {
+                assert_eq!(
+                    help_lists_flag(&help, flag),
+                    cfg!(feature = "dlsa"),
+                    "{command} {flag}: {help}"
+                );
+            }
         }
         #[cfg(not(feature = "dlsa"))]
-        {
-            assert!(!help.contains("--dlsa"), "{help}");
-            assert!(Cli::try_parse_from(["qw", "generate", "--prompt", "hi", "--dlsa"]).is_err());
-        }
+        assert!(Cli::try_parse_from(["qw", "generate", "--prompt", "hi", "--dlsa"]).is_err());
+    }
+
+    #[cfg(feature = "dlsa")]
+    #[test]
+    fn generate_parses_and_resolves_dlsa_flags() {
+        let map = std::env::temp_dir().join(format!("qw-cli-dlsa-map-{}", std::process::id()));
+        std::fs::write(&map, b"map").unwrap();
+        let cli = Cli::try_parse_from([
+            "qw",
+            "generate",
+            "--prompt",
+            "hi",
+            "--top-k",
+            "20",
+            "--dlsa",
+            "--dlsa-map",
+            map.to_str().unwrap(),
+            "--dlsa-map-kind",
+            "pca",
+            "--dlsa-sink",
+            "8",
+            "--dlsa-window",
+            "256",
+            "--dlsa-top-k",
+            "2048",
+            "--dlsa-top-p",
+            "512",
+        ])
+        .expect("parse D-LSA flags");
+        let Command::Generate(args) = cli.command else {
+            panic!("generate");
+        };
+        // The sampling top-k is a separate flag
+        assert_eq!(args.top_k, Some(20));
+        let resolved = args
+            .dlsa
+            .resolve(|name| (name == "QW_DLSA_TOP_P").then(|| "64".to_string()))
+            .expect("resolve")
+            .expect("enabled");
+        assert_eq!(resolved.kind, qw_runtime::DlsaMapKind::PcaStep0);
+        assert_eq!(resolved.config.map_path, map);
+        let index = resolved.config.index;
+        assert_eq!(
+            (index.sink_size, index.window_size, index.top_k, index.top_p),
+            (8, 256, 2048, 512)
+        );
+        assert!(
+            Cli::try_parse_from(["qw", "generate", "--prompt", "hi", "--dlsa-map-kind", "big"])
+                .is_err()
+        );
+        // A map path alone does not enable D-LSA silently
+        let cli = Cli::try_parse_from(["qw", "generate", "--prompt", "hi", "--dlsa-map", "/m"])
+            .expect("parse");
+        let Command::Generate(args) = cli.command else {
+            panic!("generate");
+        };
+        let err = args.dlsa.resolve(|_| None).unwrap_err().to_string();
+        assert!(err.contains("--dlsa-map requires --dlsa"), "{err}");
+        std::fs::remove_file(map).unwrap();
     }
 
     #[test]

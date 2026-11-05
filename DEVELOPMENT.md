@@ -583,3 +583,114 @@ Keep benchmark output and result files uniquely named when worktrees share the
 repository. Do not treat historical measurements as current quality or
 throughput baselines; publish a result only after it has been reproduced
 against the current implementation.
+
+## D-LSA
+
+D-LSA sparse attention ([`docs/dlsa.md`](docs/dlsa.md)) is behind the `dlsa`
+feature of `qw-runtime`, `qw-server` and `qw-cli` and is off by default. With the
+feature off nothing changes; with it built but not enabled, dense paths and
+prefix-cache namespaces are byte-identical to a build without it.
+
+### Feature-matrix checks
+
+The project check builds default features only, so D-LSA code is not compiled
+by it. Before submitting D-LSA work, also run clippy across the matrix (Cargo
+writes serialized by the build lock, as for every shared-`target/` command):
+
+```bash
+cargo clippy --workspace --all-targets
+cargo clippy --workspace --all-targets --no-default-features
+cargo clippy --workspace --all-targets --features qw-runtime/dlsa,qw-server/dlsa,qw-cli/dlsa
+cargo clippy --workspace --all-targets --features qw-runtime/specprefill,qw-server/specprefill,qw-cli/specprefill
+cargo clippy --workspace --all-targets --features qw-runtime/dlsa,qw-server/dlsa,qw-cli/dlsa,qw-runtime/specprefill,qw-server/specprefill,qw-cli/specprefill
+```
+
+and the tests, under the GPU lock:
+
+```bash
+./gpu-lock -- cargo test -p qw-runtime --features dlsa --lib
+./gpu-lock -- cargo test -p qw-runtime --features dlsa,specprefill --lib
+./gpu-lock -- cargo test -p qw-runtime --lib          # D-LSA off: the dense dflash/mtp rollback tests
+./gpu-lock -- cargo test -p qw-server --features dlsa
+./gpu-lock -- cargo test -p qw-cli --features dlsa
+./gpu-lock -- cargo test -p qw-server -p qw-cli -p qw-prefix-cache
+```
+
+### Tests
+
+Synthetic tests use a 4-layer hybrid with full attention at layers 1 and 3 and
+the small index `TEST_INDEX` (window 16), so a few hundred tokens cross many
+cluster blocks. They need Metal but no checkpoint.
+
+| Where | Tests |
+| --- | --- |
+| `dlsa::*` | indexer core: Ward, buckets, selection, attention reads, map loading |
+| `dlsa::options` | flag/env precedence through an injected lookup, error naming, the prefix-cache identity |
+| `qwen3_5::dlsa_tests` | model integration (task 3): dense fallback bitwise, covering top-k vs dense, prefill/decode consistency, refusals |
+| `qwen3_5::dlsa_serving_tests` T1-T5 | index state in snapshots: restore continues bitwise (70/64/10 tokens), portable round trip, restore == rebuild, invalidation, exact extra bytes |
+| `qwen3_5::dlsa_serving_tests` S1-S5 | verify and rollback through a block boundary (4- and 8-row blocks, seeded random accepts, fp16 and int8), covering greedy speculation and MTP generation == dense, DFlash2 verify/rollback/continuation, snapshot after a partial rollback, constrained MTP generation == dense |
+| `provider::dlsa`, `qw-server`, `qw-cli` | refusal messages; flags and help with and without the feature; `--dlsa` needs `--no-kv-quantization`; namespaces; SpecPrefill never allowed; images get 400 |
+
+Real-model tests are ignored by default. They use `Jundot/Qwen3.8-27B-oQ4e-fp16-mtp`
+(fp16 KV), the DFlash2 drafter where needed, and the converted distilled map
+(`qw download --dlsa-map`; `QW_DLSA_MAP_KIND=pca` selects the PCA map). Run them
+one at a time in release:
+
+```bash
+./gpu-lock -- cargo test --release -p qw-runtime --features dlsa --lib -- \
+  qwen3_5::dlsa_tests::real qwen3_5::dlsa_serving_tests::real real_dlsa_constrained \
+  --ignored --test-threads=1 --nocapture
+```
+
+| Test | Checks |
+| --- | --- |
+| R1 `real_short_context_is_bitwise_dense` | 4k tokens on the dense fallback == D-LSA off, bitwise |
+| R2 `real_needle_16k_32k` | baseline needle at 16k and 32k |
+| R3 `real_logits_vs_dense` | perplexity, KL and top-1 agreement against dense at 16k/32k |
+| R4 `real_speculative_short_context_matches_dense` | ~4k tokens: MTP and DFlash2 tokens == D-LSA off |
+| R5 `real_speculative_covering_matches_dense` | ~8k tokens, sparse with a covering top-k: 64 MTP and DFlash2 tokens == dense |
+| R6 `real_speculative_needle_16k_32k` | needle with MTP and DFlash2; acceptance, decode speed, reopened blocks |
+| R7 `real_snapshot_restore_is_bitwise` | 16k prompt snapshotted at 12,288 and restored (also portable): bitwise |
+| R8 `real_dlsa_constrained_prompt_bases_restore_after_splice_and_rollback` | DFlash2 grammar prompt bases restore after a splice and a rollback, D-LSA on |
+
+### Snapshot layout and invalidation
+
+Under D-LSA, `capture_sequence_state` appends dense (never paged) tensors after
+the KV and GDN state, for each full-attention layer `i`:
+
+| Name | Dtype, shape | Present |
+| --- | --- | --- |
+| `layer.{i}.dlsa.len` | i32 `[1]` | always |
+| `layer.{i}.dlsa.centroids` | f32 `[rows, 64]` | when `rows > 0` (a cluster block closed) |
+| `layer.{i}.dlsa.members` | i32 `[rows, bucket_cap]` | when `rows > 0` |
+| `layer.{i}.dlsa.sizes` | i32 `[rows]` | when `rows > 0` |
+| `layer.{i}.dlsa.open_keys` | f32 `[open, 64]` | when the open block holds keys |
+| `meta.dlsa.index` | i32 `[8]`: window, sink, top_k, top_p, pool, bucket, cap, index_dim | once |
+
+`rows = floor(len / window) * (window / bucket_size)` and `open = len mod window`.
+The tables are conditional rather than empty because the portable codec rejects
+zero-sized dims, and dense rather than paged because they are per block, not
+per token. Capture gives `None` when an index is out of step with the token
+length.
+
+Restore checks the exact tensor name set, so a dense snapshot is refused by a
+D-LSA model and the reverse. It also checks `meta.dlsa.index` against the
+model's index config and every `len` against the snapshot length, and rebuilds
+every layer (rejecting an out-of-range member) before replacing any state. The
+server never gets that far for mismatched entries: its prefix-cache namespace
+includes the D-LSA identity (map sha256, map dtype, index config, short-context
+policy) only when D-LSA is on.
+
+### Commit and rollback
+
+`forward_dlsa` commits the index at the **start** of every forward, which
+accepts whatever the previous forward left after any rollback. Prefill and
+decode forwards (including the DFlash2 prefill/continuation loop
+`forward_dflash_prefill_segment_chunked`) also commit at the end; the
+speculative verify loops (`forward_mtp_verify`, `forward_dflash_verify`) pass
+`commit = false`, so
+`rollback_mtp_verify` can trim the index to the accepted length and reopen a
+cluster block the rejected rows closed. After every rollback each index length
+equals its KV offset (asserted). Any new path that writes the full-attention
+KV cache under D-LSA must go through `forward_layer_dlsa` and keep that
+lockstep, or the next forward panics on the `index.len() == offset` check.
