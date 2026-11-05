@@ -234,7 +234,13 @@ and unconstrained requests.
 Attention geometries without a native fused SDPA kernel use query tiling when
 their score matrix exceeds `MLXCEL_ATTENTION_CHUNK_BUDGET_MB` (existing default:
 1024 MiB; 0 disables it). This includes Metal multi-query attention with head
-dimension 256. Each tile retains the same visible key prefix and causal offset;
+dimension 256 for every prefill that continues a cache: MLX (pinned at
+7ca40033) fuses head-dim-256 attention only for causal self-attention of at
+least 2048 half-precision rows with no mask array, which the default Metal
+prefill chunk (1536) never produces. `sdpa_materializes_scores` in
+`crates/mlxcel-core/src/layers.rs` mirrors MLX's `use_fallback` for the pinned
+commit; re-derive it on every pin bump. Each tile retains the same visible key
+prefix and causal offset;
 Metal evaluates and detaches its output before constructing the next tile so
 lazy graphs do not retain every tile's transient score buffers together.
 The budget covers raw attention scores, not total process or GPU memory.

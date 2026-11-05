@@ -3269,7 +3269,8 @@ pub fn causal_attention(
     // dispatch; supported fused geometries continue through unchanged.
     // `k_len >= q_len` preserves bottom-right causal alignment when slicing.
     if k_len >= q_len
-        && let Some(chunk) = layers::materializing_sdpa_query_chunk(q, k, v, 0.0)
+        && let Some(chunk) =
+            layers::materializing_sdpa_query_chunk(q, k, v, 0.0, layers::SdpaMaskKind::Causal)
     {
         return layers::chunked_causal_attention(q, k, v, scale, chunk);
     }

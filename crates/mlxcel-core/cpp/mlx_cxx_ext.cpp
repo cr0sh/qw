@@ -102,7 +102,7 @@ std::unique_ptr<MlxArray> fused_metal4_attention(
     // selection (including M5 NAX full/vector kernels) remains active.
     (void)use_metal4;
     return std::make_unique<MlxArray>(mlx::core::fast::scaled_dot_product_attention(
-        q.inner, k.inner, v.inner, scale, mask_mode, mask_opt
+        q.inner, k.inner, v.inner, scale, /*window_size=*/-1, mask_mode, mask_opt
     ));
 }
 
@@ -415,10 +415,15 @@ std::unique_ptr<MlxArray> steel_outputs_take_hot(Turbo4DelegatedSteelOutputs& o)
 // shapeless (2). The Metal compiled-kernel overlay used to cast comparison
 // operands to bool, so a compiled `greater_equal` returned the wrong mask; no
 // production code compiles a comparison any more, so this is the only way to
-// pin the overlay fix (upstream mlxcel d702f4e5, #2325).
+// pin the overlay fix (upstream mlxcel d702f4e5, #2325). The overlay was retired
+// with the MLX pin at 7ca40033 (ml-explore/mlx#4351 `cast_to` for fused
+// AsType); graphs 3 and 4 mix input dtypes inside one fused kernel to pin that
+// upstream emission promotes them correctly without it.
 // Graph 0: where(a < b, a, b).
 // Graph 1: min-p filter, where(softmax(a) >= 0.3 * max(softmax(a)), a, lowest).
 // Graph 2: where(isnan(a), 7, a)  (isnan lowers to not_equal(a, a)).
+// Graph 3: a * float32(b) + bfloat16(0.5)  (half x f32 array, + bf16 scalar).
+// Graph 4: (a * int32(b) - a) * float32(1.5)  (half x int32 array, f32 scalar).
 std::unique_ptr<MlxArray> compile_dtype_probe_for_test(
     int32_t graph, const MlxArray& a, const MlxArray& b, int32_t mode) {
     namespace mx = mlx::core;
@@ -438,6 +443,14 @@ std::unique_ptr<MlxArray> compile_dtype_probe_for_test(
             }
             case 2:
                 return {mx::where(mx::isnan(x), mx::array(7.0f, x.dtype()), x)};
+            case 3:
+                return {mx::add(
+                    mx::multiply(x, mx::astype(y, mx::float32)),
+                    mx::array(0.5f, mx::bfloat16))};
+            case 4:
+                return {mx::multiply(
+                    mx::subtract(mx::multiply(x, mx::astype(y, mx::int32)), x),
+                    mx::array(1.5f, mx::float32))};
             default:
                 throw std::invalid_argument("compile_dtype_probe_for_test: unknown graph");
         }

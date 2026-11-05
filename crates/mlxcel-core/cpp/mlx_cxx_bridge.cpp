@@ -2264,12 +2264,14 @@ namespace {
             auto gate = mlx::core::gather_qmm(
                 x, gate_w, gate_s, std::optional<array>(gate_b),
                 std::nullopt, std::optional<array>(rhs_indices),
-                transpose, group_size, bits, "affine", sorted_indices);
+                transpose, group_size, bits, "affine", /*global_scale=*/std::nullopt,
+                sorted_indices);
 
             auto up = mlx::core::gather_qmm(
                 x, up_w, up_s, std::optional<array>(up_b),
                 std::nullopt, std::optional<array>(rhs_indices),
-                transpose, group_size, bits, "affine", sorted_indices);
+                transpose, group_size, bits, "affine", /*global_scale=*/std::nullopt,
+                sorted_indices);
 
             // GeGLU: Python mlx-lm uses nn.gelu_approx(gate) * up.
             auto activated = mlx::core::multiply(gelu_tanh_approx(gate), up);
@@ -2277,7 +2279,8 @@ namespace {
             auto down = mlx::core::gather_qmm(
                 activated, down_w, down_s, std::optional<array>(down_b),
                 std::nullopt, std::optional<array>(rhs_indices),
-                transpose, group_size, bits, "affine", sorted_indices);
+                transpose, group_size, bits, "affine", /*global_scale=*/std::nullopt,
+                sorted_indices);
 
             return {down};
         };
@@ -2338,12 +2341,12 @@ std::unique_ptr<MlxArray> compiled_switch_qgeglu_forward(
         x.inner, gate_w.inner, gate_s.inner, gb_opt,
         std::nullopt, rhs_opt, true,
         std::optional<int>(group_size), std::optional<int>(bits),
-        mode_str, false);
+        mode_str, /*global_scale=*/std::nullopt, false);
     auto up = mlx::core::gather_qmm(
         x.inner, up_w.inner, up_s.inner, ub_opt,
         std::nullopt, rhs_opt, true,
         std::optional<int>(group_size), std::optional<int>(bits),
-        mode_str, false);
+        mode_str, /*global_scale=*/std::nullopt, false);
 
     auto activated = mlx::core::multiply(gelu_tanh_approx(gate), up);
 
@@ -2351,7 +2354,7 @@ std::unique_ptr<MlxArray> compiled_switch_qgeglu_forward(
         activated, down_w.inner, down_s.inner, db_opt,
         std::nullopt, rhs_opt, true,
         std::optional<int>(group_size), std::optional<int>(bits),
-        mode_str, false);
+        mode_str, /*global_scale=*/std::nullopt, false);
 
     return std::make_unique<MlxArray>(std::move(down));
 }
@@ -2976,13 +2979,13 @@ std::unique_ptr<MlxArray> gather_qmm(
             x.inner, w.inner, scales.inner, biases_opt,
             lhs_opt, rhs_opt, transpose,
             std::optional<int>(group_size), std::optional<int>(bits),
-            "affine", sorted_indices));
+            "affine", /*global_scale=*/std::nullopt, sorted_indices));
     }
     return std::make_unique<MlxArray>(mlx::core::gather_qmm(
         x.inner, w.inner, scales.inner, biases_opt,
         lhs_opt, rhs_opt, transpose,
         std::optional<int>(group_size), std::optional<int>(bits),
-        std::string(mode.data(), mode.size()), sorted_indices));
+        std::string(mode.data(), mode.size()), /*global_scale=*/std::nullopt, sorted_indices));
 }
 
 std::unique_ptr<MlxArray> quantized_matmul(
@@ -3487,7 +3490,7 @@ std::unique_ptr<MlxArray> fast_scaled_dot_product_attention(
         mask_mode = "array";
     }
     return std::make_unique<MlxArray>(mlx::core::fast::scaled_dot_product_attention(
-        q.inner, k.inner, v.inner, scale, mask_mode, mask_opt
+        q.inner, k.inner, v.inner, scale, /*window_size=*/-1, mask_mode, mask_opt
     ));
 }
 
@@ -3518,7 +3521,7 @@ std::unique_ptr<MlxArray> fast_scaled_dot_product_attention_with_sinks(
     }
     std::optional<array> sinks_opt = sinks ? std::optional(sinks->inner) : std::nullopt;
     return std::make_unique<MlxArray>(mlx::core::fast::scaled_dot_product_attention(
-        q.inner, k.inner, v.inner, scale, mask_mode, mask_opt, sinks_opt
+        q.inner, k.inner, v.inner, scale, /*window_size=*/-1, mask_mode, mask_opt, sinks_opt
     ));
 }
 
@@ -3530,7 +3533,7 @@ std::unique_ptr<MlxArray> fast_scaled_dot_product_attention_causal(
     float scale
 ) {
     return std::make_unique<MlxArray>(mlx::core::fast::scaled_dot_product_attention(
-        q.inner, k.inner, v.inner, scale, "causal", std::nullopt
+        q.inner, k.inner, v.inner, scale, /*window_size=*/-1, "causal", std::nullopt
     ));
 }
 
@@ -3631,7 +3634,7 @@ std::unique_ptr<MlxArray> paged_decode_attention_dense_compat(
              static_cast<int>(q_shape[3])}
         );
         auto attn_i = mlx::core::fast::scaled_dot_product_attention(
-            q_i, key_visible, value_visible, scale, "", std::nullopt
+            q_i, key_visible, value_visible, scale, /*window_size=*/-1, "", std::nullopt
         );
         outputs.push_back(std::move(attn_i));
     }
@@ -3772,7 +3775,7 @@ std::unique_ptr<MlxArray> paged_decode_attention_rotating_compat(
              static_cast<int>(q_shape[3])}
         );
         auto attn_i = mlx::core::fast::scaled_dot_product_attention(
-            q_i, key_visible, value_visible, scale, "", std::nullopt
+            q_i, key_visible, value_visible, scale, /*window_size=*/-1, "", std::nullopt
         );
         outputs.push_back(std::move(attn_i));
     }
@@ -4180,7 +4183,7 @@ void fused_causal_prefill_attention(
     k = mlx::core::fast::rope(k, rope_dims, false, rope_base, 1.0f, 0);
 
     auto attn = mlx::core::fast::scaled_dot_product_attention(
-        q, k, v, scale, "causal", std::nullopt);
+        q, k, v, scale, /*window_size=*/-1, "causal", std::nullopt);
 
     attn = transpose(attn, {0, 2, 1, 3});
     attn = reshape(attn, {batch_size, seq_len, q_cols});

@@ -16,21 +16,34 @@ set(MLX_BUILD_BENCHMARKS OFF)
 set(MLX_BUILD_PYTHON_BINDINGS OFF)
 
 function(mlx_apply_source_overlays mlx_source_dir)
-  # Metal patches: JIT type promotion fix + kernel utils (SIMD group matrix).
+  # Metal overlays, re-synced against the pinned MLX commit (GIT_TAG below).
   #
-  # The SDPA / steel-attention overlays (scaled_dot_product_attention.cpp,
-  # scaled_dot_product_attention.metal, steel_attention.metal,
-  # steel_attention_nax.metal) were dropped when the MLX pin moved to
-  # v0.31.2 — that release already carries the NAX fixes we had been
-  # carrying locally (`#3361 int16 overflow in SDPA NAX mask indexing`,
-  # `#3422 Speed up NAX split-K`, `#3419 Segmented mm nax kernel`). Removing
-  # the patches keeps our build binary-equivalent to the upstream Python
-  # wheel and simplifies future upstream syncs.
-  # The steel/gemm/mma.h overlay (issue #217: upstream safe-load fix
-  # cherry-pick, PRs #3560/#3565) was retired when the pin moved to
-  # 2026-06-11 upstream main, which carries the fix natively (issue #222).
+  # Remaining overlay:
+  # - mlx/backend/metal/kernels/utils.h: the pinned file plus two hunks,
+  #   `#include <metal_simdgroup_matrix>` and `metal::vec<IdxT, N>`
+  #   qualification in elem_to_loc_{2,3}_nd (OS Metal compiler compatibility;
+  #   this header is also compiled at runtime by the JIT). Its header line
+  #   names the upstream base commit; on a pin bump, 3-way merge it from that
+  #   base to the new pin (`git merge-file`) and update the line.
+  #
+  # Retired overlays:
+  # - mlx/backend/metal/compiled.cpp (input `static_cast` for mixed-dtype
+  #   fused kernels, bool-output promotion, `elem_to_loc_1<idx_type>`): retired
+  #   with the move to 7ca40033. MLX ops promote their own inputs before
+  #   compilation, upstream emits `elem_to_loc_1<idx_type>` natively, and
+  #   ml-explore/mlx#4351 (c793734e, in v0.32.2+) made fused AsType use
+  #   `cast_to<T>()`, so upstream emission is correct without the cast.
+  #   `compiled_*_equal_eager_on_every_dtype` in mlxcel-core guards this.
+  # - The SDPA / steel-attention overlays (scaled_dot_product_attention.cpp,
+  #   scaled_dot_product_attention.metal, steel_attention.metal,
+  #   steel_attention_nax.metal) were dropped when the MLX pin moved to
+  #   v0.31.2 — that release already carries the NAX fixes we had been
+  #   carrying locally (`#3361 int16 overflow in SDPA NAX mask indexing`,
+  #   `#3422 Speed up NAX split-K`, `#3419 Segmented mm nax kernel`).
+  # - The steel/gemm/mma.h overlay (issue #217: upstream safe-load fix
+  #   cherry-pick, PRs #3560/#3565) was retired when the pin moved to
+  #   2026-06-11 upstream main, which carries the fix natively (issue #222).
   set(_metal_patch_files
-      "mlx/backend/metal/compiled.cpp"
       "mlx/backend/metal/kernels/utils.h")
   foreach(_patch_file ${_metal_patch_files})
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/patches/${_patch_file}")
@@ -45,6 +58,13 @@ function(mlx_apply_source_overlays mlx_source_dir)
   # CUDA patches: custom grouped GEMM, quantized kernels, reduce ops, binary ops.
   # These are in patches/mlx/backend/cuda/ and only compiled for CUDA targets,
   # so they are safe to apply unconditionally (harmless on Metal-only builds).
+  #
+  # STALE: these overlays (and patches-cuda/ below) were last synced against an
+  # MLX pin before v0.32.x and were NOT re-synced for the move to 7ca40033 (no
+  # CUDA host to verify on). patches-cuda/fast.cpp in particular is a full copy
+  # of an old fast.cpp with the pre-`window_size` SDPA signature, so a CUDA
+  # build against the current pin is expected to fail until they are re-synced
+  # or removed.
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/patches/mlx/backend/cuda")
     file(GLOB_RECURSE _cuda_patch_files
          RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}/patches"
@@ -97,7 +117,10 @@ else()
     # Keep this GIT_TAG as the single source of truth for the MLX pin. The
     # dependency-free parser in crates/mlxcel-core/build_support/mlx_pin.rs reads
     # this FetchContent declaration and requires one full 40-character commit SHA.
-    GIT_TAG 3a6219917e4535575ce5bce2fc2ba27a483a709b)
+    # 7ca40033 = v0.32.4 + 35 (2026-10): carries the Metal fence / eval-cleanup
+    # deadlock fixes (#4552, #4556, #4689), sdpa_split (#4723), 6-16-row qmv
+    # kernels (#4712/#4728) and f32 gates in fast::gated_delta_update (#4760).
+    GIT_TAG 7ca40033132dae444d45f7fc3daae57e24c13f6c)
 
   # Use FetchContent_Populate + add_subdirectory so we can apply source
   # overlays before the MLX build system processes the files.
