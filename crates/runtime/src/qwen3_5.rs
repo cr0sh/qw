@@ -51,6 +51,10 @@ pub(crate) const DFLASH_CONTROL_END: i32 = 248_070;
 pub(crate) const DFLASH_COMPACT_TOKEN_COUNT: i32 =
     DFLASH_COMPACT_PREFIX + DFLASH_CONTROL_END - DFLASH_CONTROL_START;
 const TURBO4_PACKED_MTP_THRESHOLD_TOKENS: i32 = 2_048;
+#[cfg(feature = "dlsa")]
+mod dlsa;
+#[cfg(all(test, feature = "dlsa"))]
+mod dlsa_tests;
 #[cfg(any(feature = "specprefill", test))]
 mod specprefill;
 
@@ -996,6 +1000,9 @@ pub struct Qwen35Model {
     /// MRoPE position state retained for the Qwen3.5 text path.
     mrope_state: MRopeState,
     initial_prefill_complete: AtomicBool,
+    /// D-LSA sparse attention for the full-attention layers; off unless enabled.
+    #[cfg(feature = "dlsa")]
+    dlsa: Option<crate::dlsa::DlsaRuntime>,
 }
 
 impl Qwen35Model {
@@ -1012,6 +1019,16 @@ impl Qwen35Model {
             mlxcel_core::array_shape(input_ids)[1],
             self.initial_prefill_complete.load(Ordering::Relaxed),
         );
+        #[cfg(feature = "dlsa")]
+        if let Some(dlsa) = &self.dlsa {
+            return self.forward_backbone_dlsa(
+                dlsa,
+                input_ids,
+                input_embeddings,
+                caches,
+                position_ids,
+            );
+        }
         let mut hidden = input_embeddings
             .map(mlxcel_core::copy)
             .unwrap_or_else(|| self.embed_tokens.forward(input_ids));
@@ -1218,6 +1235,8 @@ impl Qwen35Model {
     where
         F: FnMut(i32, i32, &MlxArray),
     {
+        #[cfg(feature = "dlsa")]
+        self.dlsa_refusal("MTP prefill")?;
         self.reset_runtime_state();
         let shape = mlxcel_core::array_shape(input_ids);
         let prompt_len = shape[1];
@@ -1300,6 +1319,8 @@ impl Qwen35Model {
     where
         F: FnMut(&MlxArray, &MlxArray),
     {
+        #[cfg(feature = "dlsa")]
+        self.dlsa_refusal("MTP suffix prefill")?;
         let shape = mlxcel_core::array_shape(input_ids);
         let suffix_len = shape[1];
         if suffix_len == 0 {
@@ -1341,6 +1362,8 @@ impl Qwen35Model {
     }
 
     pub(crate) fn forward_mtp_verify(&self, input_ids: &MlxArray) -> Qwen35MtpVerifyOutput {
+        #[cfg(feature = "dlsa")]
+        self.refuse_dlsa("MTP verify");
         let rope_delta = self.mrope_state.rope_delta();
         let (output, offset) = self.sequence_state.with_internal(|caches| {
             let mut hidden = self.embed_tokens.forward(input_ids);
@@ -1397,6 +1420,8 @@ impl Qwen35Model {
         input_ids: &MlxArray,
         target_layer_ids: &[usize],
     ) -> Qwen35DflashVerifyOutput {
+        #[cfg(feature = "dlsa")]
+        self.refuse_dlsa("DFlash2 verify");
         let rope_delta = self.mrope_state.rope_delta();
         let (output, offset) = self.sequence_state.with_internal(|caches| {
             let mut hidden = self.embed_tokens.forward(input_ids);
@@ -1485,6 +1510,8 @@ impl Qwen35Model {
         configured: usize,
         multimodal: Option<(&MlxArray, &MlxArray, i32)>,
     ) -> std::result::Result<Qwen35DflashPrefill, String> {
+        #[cfg(feature = "dlsa")]
+        self.dlsa_refusal("DFlash2 prefill")?;
         if reset {
             self.reset_runtime_state();
         }
@@ -1645,6 +1672,8 @@ impl Qwen35Model {
         block_size: usize,
         materialize: bool,
     ) -> Qwen35RollbackPlan {
+        #[cfg(feature = "dlsa")]
+        self.refuse_dlsa("MTP/DFlash2 rollback");
         let plan = self.sequence_state.with_internal(|caches| {
             let verify_offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
             let plan = rollback_plan(verify_offset, accepted, block_size);
@@ -1751,6 +1780,11 @@ impl Qwen35Model {
         previous: Option<&ModelStateSnapshot>,
         persistent: bool,
     ) -> Option<ModelStateSnapshot> {
+        #[cfg(feature = "dlsa")]
+        if self.dlsa.is_some() {
+            // The index state is not part of the snapshot yet (D-LSA task 5)
+            return None;
+        }
         let token_len_i32 = i32::try_from(token_len).ok()?;
         let mut snapshot = ModelStateSnapshot::new(QWEN35_SNAPSHOT_FAMILY, token_len);
         push_snapshot_i32(
@@ -2184,6 +2218,8 @@ impl Qwen35Model {
             vision: None,
             sequence_state: ModelOwnedSequenceState::new(internal_caches),
             mrope_state: MRopeState::new(),
+            #[cfg(feature = "dlsa")]
+            dlsa: None,
         })
     }
 }
@@ -2762,12 +2798,20 @@ impl LanguageModel for Qwen35Model {
         self.sequence_state
             .replace_internal(self.make_internal_caches());
         self.mrope_state.clear();
+        #[cfg(feature = "dlsa")]
+        if let Some(dlsa) = &self.dlsa {
+            dlsa.reset();
+        }
         if let Some(mtp) = &self.mtp {
             mtp.reset();
         }
     }
 
     fn supports_snapshot_reuse(&self) -> bool {
+        #[cfg(feature = "dlsa")]
+        if self.dlsa.is_some() {
+            return false;
+        }
         true
     }
 
@@ -2785,6 +2829,13 @@ impl LanguageModel for Qwen35Model {
         _seq_id: SequenceId,
         snapshot: &ModelStateSnapshot,
     ) -> std::result::Result<(), String> {
+        #[cfg(feature = "dlsa")]
+        if self.dlsa.is_some() {
+            return Err(
+                "Qwen3.5 snapshots do not carry D-LSA index state yet (D-LSA task 5); disable D-LSA to reuse prefixes"
+                    .to_string(),
+            );
+        }
         if snapshot.family() != QWEN35_SNAPSHOT_FAMILY {
             return Err(format!(
                 "Qwen3.5 snapshot family mismatch: expected {QWEN35_SNAPSHOT_FAMILY}, got {}",

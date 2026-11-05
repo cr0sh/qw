@@ -1,8 +1,8 @@
 # D-LSA (flat design) for Qwen3.8-27B: spec for the QW port
 
-Status: roadmap tasks 0-2 done: this spec, golden fixtures in
-[`tests/fixtures/dlsa/`](../tests/fixtures/dlsa/README.md), the map loader (§10) and the indexer core (§11). Nothing
-is wired into a model yet (task 3).
+Status: roadmap tasks 0-3 done: this spec, golden fixtures in
+[`tests/fixtures/dlsa/`](../tests/fixtures/dlsa/README.md), the map loader (§10), the indexer core (§11) and sparse
+attention in Qwen3.5's 16 full-attention layers behind `enable_dlsa` (§12; baseline decoder, fp16/int8 KV only).
 
 D-LSA (Distilled Latent Sparse Attention, arXiv 2610.42147) leaves the attention kernel unchanged. It only decides which
 cached keys each query of a full-attention layer reads: the first `sink_size` keys, the last `window_size` keys, and up
@@ -759,3 +759,147 @@ Readings for task 4:
 - Memory is 3x the served layout in use (4x allocated, since the tables grow geometrically) because centroids are f32 and
   held twice (host and device). Keeping one bf16 device copy, with tables reserved to size, gives the 24.5 B/token/layer of
   §4.4.
+
+## 12. Model integration (roadmap task 3; feature `dlsa`)
+
+### 12.1 API
+
+```rust
+let config = DlsaConfig::resolve(DlsaMapKind::Distilled, None)?; // CLI override, QW_DLSA_MAP_PATH, then the cache
+provider.enable_dlsa(config)?;      // or Qwen35Model::enable_dlsa; resets the sequence
+provider.dlsa_stats();              // Option<DlsaStats>, counters per full-attention *layer* forward
+provider.dlsa_memory_bytes();       // bucket caches of the current sequence
+provider.disable_dlsa();            // dense again, fresh sequence
+```
+
+`qw generate --dlsa [--dlsa-map <PATH>]` (built with `--features dlsa`) enables it on the fp16 model `qw generate` loads
+and prints the stats to stderr. Server flags are task 5.
+
+`DlsaConfig { map_path, map_dtype (Bf16, as served; F32 for parity), index (QWEN_DEFAULTS), short_context
+(DenseFallback; Sparse only for tests), prefill_mask_rows (256) }`. `validate` checks the index config, `index_dim == 64`
+and `prefill_mask_rows > 0`; loading checks the map against the checkpoint's full-attention layers and
+`kv_heads * (head_dim - rotary_dim)`. D-LSA is a property of the loaded model and its one sequence, not of a request: a
+per-request switch would leave the bucket cache built from a different prefix.
+
+### 12.2 What a full-attention layer does (`qwen3_next/dlsa.rs`)
+
+`Qwen3NextAttention::forward_impl` is split into `project_heads`, `rotate`, `dense_attention` and `finish` with the same
+ops in the same order; the dense path calls exactly these. `forward_dlsa`, for `L` rows at offset `o`:
+
+1. `project_heads` (q/k/v, gate, q_norm/k_norm). The index reads q/k here, **after the norms and before RoPE** (§4.1).
+2. Asserts batch 1, `kv.live_len() == kv.offset` (slots are positions) and `index.len() == o`.
+3. `index_keys` and `append_mlx`, always, also on the dense fallback, so later forwards find every block clustered.
+4. Dense fallback when `short_context == DenseFallback` and the chunk's **last** row reads the dense key set:
+   `p < top_k + window + sink && visible(p) <= top_p` (`reads_dense_key_set`; 4,612 keys under the defaults). The
+   predicate is monotone in `p`, so every earlier row reads it too. Otherwise `index_queries` and `select` for `o..o+L`.
+5. `commit` (no speculation in this path), then `rotate`.
+6. Dense: the unchanged `dense_attention`. Sparse: `update_and_fetch` (fp16 or dequantized int8 `[1,4,T,256]`), then
+   - decode (`L == 1`): the list sorted ascending, `take` along the key axis, SDPA without a mask (GQA by head grouping);
+   - prefill: row blocks of `prefill_mask_rows`; each an additive mask `[1,1,rb,T]` in the q dtype (0 on listed keys,
+     -inf elsewhere; `-1` pads replaced by the row's own position, which every list holds), built by `put_along_axis`
+     of zeros into a -inf array as wide as the block's longest list, then SDPA over all cached keys. Additive masks
+     match the `create_causal_mask` callers; the C++ bridge casts float masks to Q's dtype.
+7. `finish` (gate) and `o_proj`.
+
+Linear (GatedDeltaNet) layers, embeddings, norms and the LM head are untouched.
+
+### 12.3 Support matrix and refusals
+
+| feature | under D-LSA |
+|---|---|
+| fp16, int8 KV | supported |
+| turbo4, fp16+turbo4, fp16+turbo3, turbo4-delegated | refused at `enable_dlsa` (names the mode, says to load fp16) |
+| decoder `auto` | resolves to baseline (info log) |
+| decoder `mtp`, `dflash` | refused ("use --decoder baseline") |
+| SpecPrefill, prefix reuse (`cached_tokens > 0`), cached benchmarks | refused by the provider |
+| image prompts | refused by the provider (nothing in the index blocks mrope; untested) |
+| snapshots | `supports_snapshot_reuse() == false`, capture gives `None`, restore errs |
+| grammar constraints | expected to work (with snapshot reuse off the generator keeps no snapshot); not tested yet |
+| model-level MTP / DFlash2 prefill, verify, rollback, SpecPrefill sparse prefill | `Err` or panic with a message |
+
+Task 5 lifts the speculative, snapshot and serving refusals.
+
+### 12.4 Tests
+
+`./gpu-lock -- cargo test -p qw-runtime --features dlsa --lib`, synthetic (4-layer hybrid, full attention at 1 and 3,
+4 q / 2 kv heads, head_dim 32, f32 maps; index `window 16, sink 2, top_k 32, top_p 8, pool 2, bucket 4, cap 8`, so
+forwards past position 47 are sparse):
+
+| test | checks | tolerance |
+|---|---|---|
+| `dlsa::attend` (5) | gathered and masked reads vs an f64 host softmax; full lists vs dense causal; mask row blocks 1/7/256; pads; the 4,612 boundary | 1e-5 (1e-6 blocks) |
+| `short_context_is_bitwise_dense` | 40-token prefill + 8 decodes == D-LSA off; index holds 48 keys | bitwise |
+| `covering_top_k_matches_dense` | `top_k 512, top_p 128`, `Sparse`: 310 tokens in chunks of 64/37 + 10 decodes, fp16 and int8; every row reads its whole context | allclose 1e-4 / 1e-5 |
+| `layer_sparse_read_matches_host_mask` | one layer, L = 120, 37, 1, 1, 37, 1, vs dense SDPA under a host mask from `select_host` of an independent cache; expansion non-empty, lists partial | 1e-5 |
+| `dense_key_set_forward_is_bitwise_dense` | one layer under the fallback == `forward_with_position_ids` | bitwise |
+| `decode_prefill_consistency` | 260 tokens as 1 forward, 100 + 160 decodes, chunks of 37: logits; members, sizes; centroids | 1e-4; exact; 1e-6 |
+| `refusals_and_snapshot_guards`, `reset_...`, `disable_...` | §12.3; reset empties the index and reproduces outputs bitwise; disable is bitwise dense | |
+
+The comparison helpers reject non-finite values on either side. Mutations seen to fail: dropping the own key from the
+gathered read (5 tests), and testing the fallback on the chunk's first row instead of its last (T3, T4).
+
+### 12.5 Real model
+
+Ignored tests in `qwen3_5/dlsa_tests.rs`, `mod real`:
+
+```text
+./gpu-lock -- cargo test --release -p qw-runtime --features dlsa --lib real_ -- --ignored --test-threads=1 --nocapture
+```
+
+Model `Jundot/Qwen3.8-27B-oQ4e-fp16-mtp` (4-bit oQ4e, fp16 KV), distilled map in bf16 (`QW_DLSA_MAP_KIND=pca` for the
+PCA step-0 map), QWEN_DEFAULTS. Text: the repository's `docs/*.md` then `crates/runtime/src/**/*.rs` ("repo"), or
+`crates/mlxcel-core/src/**/*.rs` ("core"), sorted, D-LSA files excluded, truncated by tokens. Apple M4 Max (64 GB),
+base `4341216` + this change, release build, 2026-11-05.
+
+**R1 `real_short_context_is_bitwise_dense`**: 4,000 tokens (1536-token chunks) + 16 greedy steps. The final prefill
+position's logits and each decode step's logits are bitwise equal to D-LSA off, and the tokens are identical; 288 layer forwards, all on the
+fallback. Prefill 15.75 s both, 16 steps 0.72 s dense / 0.69 s D-LSA.
+
+**R2 `real_needle_16k_32k`**: needle "The vault code is 7291-ALPHA." at 25% depth, then the question, chat template,
+thinking off, 48 greedy tokens through `generate_baseline_streaming`.
+
+| prompt | dense answer | D-LSA answer | prefill dense | prefill D-LSA |
+|---|---|---|---|---|
+| 16,322 tokens | `7291-ALPHA` | `7291-ALPHA` | 67.5 s (242 tok/s) | 69.3 s (236 tok/s) |
+| 32,706 tokens | `7291-ALPHA` | `7291-ALPHA` | 144.3 s (227 tok/s) | 151.6 s (216 tok/s) |
+
+An explicit MTP request then errs. The provider's `decode_time` here is not decode speed: when generation stops at EOS,
+`CxxGenerator::generate_streaming_controlled` resets the model and re-runs prompt + generated tokens in one forward to
+align the final state (`mlxcel-core/src/generate.rs`, the `aligned_token_len != final_token_len` branch), dense and
+D-LSA alike (72 s / 75 s at 16k for 7 tokens). That replay is also the one forward the R2 stats saw (16,328 rows a
+layer, 3,961 keys a row at 16k, 4,287 at 32k). Decode speed is measured in R3.
+
+**R3 `real_logits_vs_dense`**: prefill all but the last 512 tokens (1536-token chunks), teacher-force the last 512 in
+128-row forwards, then 32 greedy decode steps; NLL over the 511 scored rows.
+
+| prompt | ppl dense | ppl D-LSA | ratio | mean KL(dense‖D-LSA), nats | top-1 agreement | greedy tokens equal |
+|---|---|---|---|---|---|---|
+| repo 16k | 2.6435 | 2.6477 | 1.0016 | 0.00091 | 0.9922 | 32 / 32 |
+| repo 32k | 1.1763 | 1.1821 | 1.0049 | 0.00340 | 0.9922 | 32 / 32 |
+| core 16k | 1.2320 | 1.2351 | 1.0025 | 0.00338 | 0.9941 | 32 / 32 |
+
+The asserted thresholds are provisional: ppl ratio <= 1.10 and top-1 >= 0.90; all three pass with a wide margin. Task 6
+sets the real acceptance criteria (RULER, more and longer prompts).
+
+| prompt | prefill dense | prefill D-LSA | decode dense | decode D-LSA | index memory |
+|---|---|---|---|---|---|
+| repo 16k | 65.5 s | 67.2 s (+3%) | 39.7 ms/token | 50.1 ms/token (+26%) | 27.2 MiB |
+| repo 32k | 152.3 s | 156.7 s (+3%) | 49.9 ms/token | 81.5 ms/token (+63%) | 50.4 MiB |
+| core 16k | 66.9 s | 76.7 s (+15%) | 41.1 ms/token | 54.1 ms/token (+32%) | 27.2 MiB |
+
+Single runs; the 128-row tail timings varied by 2x between runs (2.5-7.0 s), so read prefill differences under ~5% as
+noise. Every prefill row past 4,612 read 4,612 keys.
+
+### 12.6 Costs and what task 4 must fix
+
+- **No speedup yet, by design.** The prefill read is a mask over all T keys, so SDPA still computes every score; decode
+  gathers 4,612 keys but then pays the indexer. D-LSA on is slower than dense at 16-32k (prefill +3-15%, decode
+  +26-63%). The dense path itself is unchanged (R1, and the bitwise synthetic tests).
+- **Host syncs per layer.** `append_mlx` and `select` read back to the host in each of the 16 layers, so every forward
+  splits into 16 evaluated segments. `DlsaStats::index_time` includes the evaluation of the layer's inputs that the
+  first readback forces, so it is mostly model compute, not indexing; `select_time` (1.7-5 s per 16-32k prefill) is
+  the indexer's own cost.
+- Decode overhead grows with T (+10 ms at 16k, +32 ms at 32k): scoring all visible centroids, the host top-p and the
+  per-layer sync. A GPU scan + top-p, batched projections and a gathered sparse prefill kernel are task 4.
+- Masks are `rb x T` in the q dtype: 16 MiB a 256-row block at 32k, 128 MiB at 262k.
+- The index holds about 1.6 KiB/token over the 16 layers (50 MiB at 32k), §11.7.

@@ -8,6 +8,7 @@
 //! flat-design indexer core: projection, pooling, Ward, the bucket cache and selection
 //! (`docs/dlsa.md` §4, §11).
 
+mod attend;
 mod buckets;
 mod cache;
 mod config;
@@ -15,10 +16,13 @@ mod convert;
 mod loader;
 mod project;
 mod resolve;
+mod runtime;
 mod select;
 mod torch_pt;
 mod ward;
 
+pub use attend::reads_dense_key_set;
+pub(crate) use attend::{gather_attention, masked_attention};
 pub use buckets::{BlockBuckets, CENTROID_NORM_FLOOR, cluster_block};
 pub use cache::{DlsaBucketCache, DlsaCacheMemory, DlsaCacheStats, DlsaIndexSnapshot};
 pub use config::{DlsaGeometry, DlsaIndexConfig, TOP_P_LIMIT};
@@ -34,6 +38,8 @@ pub use resolve::{
     DLSA_MAP_ENV, DlsaAsset, DlsaMapKind, dlsa_map_cache_path, dlsa_source_cache_path,
     resolve_dlsa_map_path, verify_converted_map,
 };
+pub(crate) use runtime::DlsaRuntime;
+pub use runtime::{DlsaConfig, DlsaShortContext, DlsaStats};
 pub use torch_pt::{TorchTensorF32, read_f32_tensor_dict};
 
 /// Upstream commit the spec, the map format and the pinned assets refer to.
@@ -45,5 +51,7 @@ pub const INDEX_DIM: usize = 64;
 mod fixtures;
 #[cfg(test)]
 mod indexer_tests;
+#[cfg(test)]
+pub(crate) mod test_model;
 #[cfg(test)]
 mod tests;
