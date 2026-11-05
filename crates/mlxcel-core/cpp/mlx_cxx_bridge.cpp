@@ -332,21 +332,48 @@ size_t array_buffer_nbytes(const MlxArray& arr) {
 }
 
 // Array data access (scalar extraction).
-float item_f32(const MlxArray& arr) {
-    return const_cast<array&>(arr.inner).item<float>();
+//
+// `array::item<T>()` is a raw reinterpret with no dtype check, so `item<float>()`
+// on a bfloat16 scalar reads 4 bytes from a 2-byte buffer. Dispatch on the real
+// dtype and convert instead (upstream mlxcel 8b1359a7, #1907).
+namespace {
+
+template <typename Out>
+Out item_scalar(const MlxArray& arr) {
+    auto& a = const_cast<array&>(arr.inner);
+    switch (a.dtype().val()) {
+        case bool_.val(): return static_cast<Out>(a.item<bool>());
+        case uint8.val(): return static_cast<Out>(a.item<uint8_t>());
+        case uint16.val(): return static_cast<Out>(a.item<uint16_t>());
+        case uint32.val(): return static_cast<Out>(a.item<uint32_t>());
+        case uint64.val(): return static_cast<Out>(a.item<uint64_t>());
+        case int8.val(): return static_cast<Out>(a.item<int8_t>());
+        case int16.val(): return static_cast<Out>(a.item<int16_t>());
+        case int32.val(): return static_cast<Out>(a.item<int32_t>());
+        case int64.val(): return static_cast<Out>(a.item<int64_t>());
+        case float16.val():
+            return static_cast<Out>(static_cast<float>(a.item<float16_t>()));
+        case float32.val(): return static_cast<Out>(a.item<float>());
+        case float64.val(): return static_cast<Out>(a.item<double>());
+        case bfloat16.val():
+            return static_cast<Out>(static_cast<float>(a.item<bfloat16_t>()));
+        case complex64.val():
+            return static_cast<Out>(a.item<complex64_t>().real());
+        default:
+            throw std::invalid_argument(
+                "item_scalar: unhandled dtype; add it to the dispatch above");
+    }
 }
 
-int32_t item_i32(const MlxArray& arr) {
-    return const_cast<array&>(arr.inner).item<int32_t>();
-}
+}  // namespace
 
-int64_t item_i64(const MlxArray& arr) {
-    return const_cast<array&>(arr.inner).item<int64_t>();
-}
+float item_f32(const MlxArray& arr) { return item_scalar<float>(arr); }
 
-bool item_bool(const MlxArray& arr) {
-    return const_cast<array&>(arr.inner).item<bool>();
-}
+int32_t item_i32(const MlxArray& arr) { return item_scalar<int32_t>(arr); }
+
+int64_t item_i64(const MlxArray& arr) { return item_scalar<int64_t>(arr); }
+
+bool item_bool(const MlxArray& arr) { return item_scalar<bool>(arr); }
 
 rust::Vec<uint8_t> array_to_raw_bytes(const MlxArray& arr) {
     // Ensure the array is evaluated and contiguous
@@ -4561,33 +4588,11 @@ namespace {
     }
 }
 
-// Compiled min-p filtering fused into a single kernel.
-namespace {
-    using CompiledFilterFn =
-        std::function<std::vector<array>(const std::vector<array>&)>;
-
-    static CompiledFilterFn get_compiled_min_p_filter() {
-        // Backend is process-constant, so capture the gate once at build time.
-        // Non-Metal fills the sentinel in x's dtype so no per-step AsType is
-        // inserted on the scalar under the CUDA bf16 promotion patch (issue
-        // #636); Metal keeps the bare f32 sentinel exactly as before.
-        const bool single_dtype_scalars = !mlx::core::metal::is_available();
-        auto fn = [single_dtype_scalars](
-                      const std::vector<array>& inputs) -> std::vector<array> {
-            const auto& x = inputs[0];
-            const auto& min_p_arr = inputs[1];
-            auto probs = mlx::core::softmax(x, -1);
-            auto max_prob = mlx::core::max(probs, -1, true);
-            auto threshold = mlx::core::multiply(max_prob, min_p_arr);
-            auto mask = mlx::core::greater_equal(probs, threshold);
-            auto fill_scalar = single_dtype_scalars
-                ? mlx::core::array(std::numeric_limits<float>::lowest(), x.dtype())
-                : mlx::core::array(std::numeric_limits<float>::lowest());
-            return {mlx::core::where(mask, x, fill_scalar)};
-        };
-        return mlx::core::compile(fn, true);
-    }
-}
+// The min-p filter used to be a `mlx::core::compile`d callable. On Metal the
+// compiled-kernel overlay cast comparison operands to bool, so the compiled
+// `greater_equal(probs, threshold)` was always true and min-p filtered nothing.
+// It now runs as plain ops inside `fused_sample_filter_logits` (upstream mlxcel
+// 6ecf756e, #1391), and the overlay cast is fixed too (upstream d702f4e5).
 
 // Env kill switch for the Gumbel-max sampling kernel (#900). Falsy disables
 // and restores the `random::categorical` path exactly. Read once per process
@@ -5088,7 +5093,11 @@ static mlx::core::array fused_sample_filter_logits(
             mask, in, sampler_scalar(std::numeric_limits<float>::lowest()));
     };
 
-    const bool use_top_k = top_k > 0;
+    // Top-k at or above the vocabulary keeps every token, so it is inactive
+    // (upstream mlxcel d078601b, #2254). `argpartition` throws when
+    // `kth >= shape(axis)`, and this chain runs under non-`Result` bridge
+    // functions, so the throw would abort the process on one request.
+    const bool use_top_k = top_k > 0 && top_k < x.shape(-1);
     const bool use_top_p = top_p > 0.0f && top_p < 1.0f;
 
     if (rejection_semantics && use_top_k && use_top_p) {
@@ -5106,22 +5115,14 @@ static mlx::core::array fused_sample_filter_logits(
         }
     }
 
-    // Min-p filtering — compiled kernel
+    // Min-p filtering: drop tokens whose probability is below min_p * p_max.
     if (min_p > 0.0f && min_p < 1.0f) {
-        // Leaked on purpose, and it is not an oversight. The compiled callable
-        // holds handles into MLX's process-global compile cache, and a plain
-        // function-local static would be destroyed during `exit` in an order
-        // C++ leaves unspecified relative to that cache. Destroying it after
-        // the cache is gone is a null dereference inside
-        // `__cxa_finalize_ranges`: `examples/rejection_sampling_microbench`
-        // exited 139 after printing a complete, correct table, and the fault
-        // reproduced with nothing in the process but one
-        // `fused_sample_categorical` call carrying a min-p. The object is
-        // process-lifetime by construction, so never destroying it is the fix
-        // rather than a workaround.
-        static auto* compiled_fn = new CompiledFilterFn(get_compiled_min_p_filter());
-        auto result = (*compiled_fn)({x, sampler_scalar(min_p)});
-        x = std::move(result[0]);
+        auto probs = mlx::core::softmax(x, -1);
+        auto max_prob = mlx::core::max(probs, -1, true);
+        auto threshold = mlx::core::multiply(max_prob, sampler_scalar(min_p));
+        auto mask = mlx::core::greater_equal(probs, threshold);
+        x = mlx::core::where(
+            mask, x, sampler_scalar(std::numeric_limits<float>::lowest()));
     }
 
     return x;

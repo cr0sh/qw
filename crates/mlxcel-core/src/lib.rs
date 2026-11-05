@@ -2073,6 +2073,16 @@ mod ffi {
         /// for the graph that produces the given pair of arrays.
         fn astype_breakdown_pair(a: &MlxArray, b: &MlxArray) -> String;
 
+        /// Test-only: run fixed graph 0 (`where(a < b, a, b)`), 1 (min-p
+        /// filter) or 2 (`where(isnan(a), 7, a)`) eagerly (`mode` 0), compiled
+        /// (1) or compiled shapeless (2), and return the evaluated output.
+        fn compile_dtype_probe_for_test(
+            graph: i32,
+            a: &MlxArray,
+            b: &MlxArray,
+            mode: i32,
+        ) -> UniquePtr<MlxArray>;
+
         /// Set default stream for subsequent operations
         fn set_default_stream(stream: &MlxStream);
 
@@ -3428,6 +3438,12 @@ mod sampling_gumbel_tests;
 #[cfg(test)]
 #[path = "sampling_rejection_tests.rs"]
 mod sampling_rejection_tests;
+
+// min-p filters on every dtype (compiled-kernel overlay cast bug) and a `top_k`
+// at or above the vocabulary is "no top-k" instead of an `argpartition` abort.
+#[cfg(test)]
+#[path = "sampling_min_p_top_k_tests.rs"]
+mod sampling_min_p_top_k_tests;
 
 // Numeric-parity, Gemma `(1 + w)` convention, kill-switch and greedy-argmax
 // tests for the fused residual-add RMSNorm kernel (#905). GPU-only; they skip

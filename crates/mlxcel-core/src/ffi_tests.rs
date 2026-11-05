@@ -3921,3 +3921,28 @@ fn dequantize_commutes_with_output_axis_slice_on_strided_inputs() {
         );
     }
 }
+
+/// `item_*` convert on the array's real dtype instead of reinterpreting bytes
+/// (upstream mlxcel 8b1359a7, #1907). `item<float>()` on a bf16/f16 scalar used
+/// to read 4 bytes out of a 2-byte buffer. Every value is exactly representable
+/// in bf16, f16 and f32.
+#[test]
+fn item_scalars_convert_on_the_arrays_dtype() {
+    for dt in [dtype::BFLOAT16, dtype::FLOAT16, dtype::FLOAT32] {
+        let v = astype(&from_slice_f32(&[8.125], &[1]), dt);
+        let v = reshape(&v, &[]);
+        assert_eq!(item_f32(&v), 8.125, "item_f32 dtype {dt}");
+        assert_eq!(item_i32(&v), 8, "item_i32 dtype {dt}");
+        assert_eq!(item_i64(&v), 8, "item_i64 dtype {dt}");
+        assert!(item_bool(&v), "item_bool dtype {dt}");
+        let z = reshape(&astype(&from_slice_f32(&[0.0], &[1]), dt), &[]);
+        assert!(!item_bool(&z), "item_bool zero dtype {dt}");
+    }
+    // Wider integer dtypes: item_i32 used to read the low word of an int64.
+    let big = reshape(&from_slice_i64(&[-5], &[1]), &[]);
+    assert_eq!(item_i32(&big), -5);
+    assert_eq!(item_f32(&big), -5.0);
+    let i = reshape(&from_slice_i32(&[7], &[1]), &[]);
+    assert_eq!(item_i64(&i), 7);
+    assert_eq!(item_f32(&i), 7.0);
+}

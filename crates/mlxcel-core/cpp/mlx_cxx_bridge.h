@@ -1278,6 +1278,11 @@ uint64_t count_astype_nodes_pair(const MlxArray& a, const MlxArray& b);
 // Human-readable AsType breakdown (counts + per src->dst dtype pair) for a pair.
 rust::String astype_breakdown_pair(const MlxArray& a, const MlxArray& b);
 
+// Test-only (mlx_cxx_ext.cpp): run fixed graph `graph` on (a, b) eagerly
+// (mode 0), compiled (1) or compiled shapeless (2) and return the output.
+std::unique_ptr<MlxArray> compile_dtype_probe_for_test(
+    int32_t graph, const MlxArray& a, const MlxArray& b, int32_t mode);
+
 // Set default stream for subsequent operations
 void set_default_stream(const MlxStream& stream);
 
