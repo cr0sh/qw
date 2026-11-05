@@ -195,6 +195,8 @@ impl Qwen35Model {
         dense_prefix_end: usize,
         selected_indices: &[usize],
     ) -> std::result::Result<(UniquePtr<MlxArray>, usize), String> {
+        #[cfg(feature = "dlsa")]
+        self.dlsa_refusal("SpecPrefill")?;
         self.reset_runtime_state();
         let cached_tokens =
             crate::specprefill::admitted_cached_tokens(prefix_reuse.as_ref(), prompt_ids.len());

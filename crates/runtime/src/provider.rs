@@ -32,6 +32,8 @@ use crate::qwen3_5_mtp::Qwen35MtpGenerator;
 pub use crate::qwen3_5_mtp::{MtpGenerationStats, MtpPrefixReuse, MtpPromptSnapshot};
 use crate::specprefill::{PrefillMode, SpecPrefillStats};
 
+#[cfg(feature = "dlsa")]
+mod dlsa;
 #[cfg(any(feature = "specprefill", test))]
 mod specprefill;
 
@@ -567,6 +569,8 @@ impl Qwen35Provider {
         enable_thinking: bool,
         images: &[PreparedImage],
     ) -> Result<PreparedMultimodalPrefill> {
+        #[cfg(feature = "dlsa")]
+        self.refuse_under_dlsa("image prompts")?;
         ensure!(
             !images.is_empty(),
             "image prefill requires at least one image"
@@ -681,6 +685,8 @@ impl Qwen35Provider {
         mut on_delta: F,
     ) -> Result<BaselineGeneration> {
         self.validate_context_budget(prompt_ids.len(), max_tokens)?;
+        #[cfg(feature = "dlsa")]
+        self.refuse_baseline_options_under_dlsa(prefix_reuse.as_ref(), &prefill_mode)?;
         #[cfg(not(any(feature = "specprefill", test)))]
         let _ = prefill_mode;
         #[cfg(any(feature = "specprefill", test))]
@@ -816,6 +822,8 @@ impl Qwen35Provider {
         mut on_delta: F,
     ) -> Result<BaselineGeneration> {
         self.validate_context_budget(prefill.prompt_ids.len(), max_tokens)?;
+        #[cfg(feature = "dlsa")]
+        self.refuse_under_dlsa("image prompts")?;
         self.model
             .prepare_mrope(&prefill.position_ids, prefill.rope_delta);
         let buffer_output = constraint.is_some();
@@ -959,6 +967,8 @@ impl Qwen35Provider {
         draft_dir: &Path,
     ) -> Result<Dflash2PromptSnapshot> {
         self.validate_context_budget(prompt_ids.len(), 0)?;
+        #[cfg(feature = "dlsa")]
+        self.refuse_under_dlsa("the DFlash2 decoder")?;
         if self.dflash2_generator.is_none() {
             self.dflash2_generator = Some(
                 crate::qwen3_5_dflash::Qwen35Dflash2Generator::new(&self.model, draft_dir)
@@ -1111,6 +1121,8 @@ impl Qwen35Provider {
         mut on_delta: F,
     ) -> Result<(BaselineGeneration, Dflash2GenerationStats)> {
         self.validate_context_budget(prompt_ids.len(), max_tokens)?;
+        #[cfg(feature = "dlsa")]
+        self.refuse_under_dlsa("the DFlash2 decoder")?;
         if self.dflash2_generator.is_none() {
             self.dflash2_generator = Some(
                 crate::qwen3_5_dflash::Qwen35Dflash2Generator::new(&self.model, draft_dir)
@@ -1229,6 +1241,8 @@ impl Qwen35Provider {
         mut on_delta: F,
         capture_final_snapshot: bool,
     ) -> Result<(BaselineGeneration, MtpGenerationStats)> {
+        #[cfg(feature = "dlsa")]
+        self.refuse_under_dlsa("the MTP decoder")?;
         ensure!(block_size >= 2, "MTP block size must be at least 2");
         ensure!(
             self.mtp_generator.is_some(),
@@ -1414,6 +1428,8 @@ impl Qwen35Provider {
         on_delta: F,
     ) -> Result<GenerationOutput> {
         let (prompt_ids, sampling) = self.prepare_generation(request)?;
+        #[cfg(feature = "dlsa")]
+        let mode = self.dlsa_generation_mode(mode)?;
         let dflash2_available =
             cfg!(feature = "dflash2") && dflash2_draft_dir.is_some_and(Path::is_dir);
         let decoder = select_qwen35_decoder(mode, self.mtp_generator.is_some(), dflash2_available)
@@ -1505,6 +1521,8 @@ impl Qwen35Provider {
         on_delta: F,
     ) -> Result<(GenerationOutput, Option<MtpGenerationStats>)> {
         let (prompt_ids, sampling) = self.prepare_generation(request)?;
+        #[cfg(feature = "dlsa")]
+        let mode = self.dlsa_generation_mode(mode)?;
         let use_mtp = self.resolve_generation_mode(mode)?
             && !(mode == Qwen35GenerationMode::Automatic && request.max_tokens == 1);
         if !use_mtp {
@@ -1558,6 +1576,8 @@ impl Qwen35Provider {
         on_delta: F,
     ) -> Result<(GenerationOutput, Duration, Option<MtpGenerationStats>)> {
         let (prompt_ids, sampling) = self.prepare_generation(request)?;
+        #[cfg(feature = "dlsa")]
+        let mode = self.dlsa_generation_mode(mode)?;
         if !self.resolve_generation_mode(mode)? {
             let generation = self.generate_baseline_streaming(
                 &prompt_ids,
@@ -1615,6 +1635,8 @@ impl Qwen35Provider {
         mode: Qwen35GenerationMode,
         on_delta: F,
     ) -> Result<(BaselineGeneration, Option<MtpGenerationStats>)> {
+        #[cfg(feature = "dlsa")]
+        self.refuse_under_dlsa("cached prefix benchmarks")?;
         match (mode, snapshot) {
             (Qwen35GenerationMode::Baseline, snapshot) => {
                 let snapshot = match snapshot {

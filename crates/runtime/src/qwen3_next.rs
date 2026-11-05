@@ -23,6 +23,11 @@ use mlxcel_core::{MlxArray, UniquePtr, concatenate};
 use serde::Deserialize;
 use std::collections::HashMap;
 
+#[cfg(feature = "dlsa")]
+mod dlsa;
+#[cfg(feature = "dlsa")]
+pub(crate) use dlsa::DlsaLayerStep;
+
 // Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TensorQuantization {
@@ -123,6 +128,16 @@ pub(crate) struct Qwen3NextAttention {
     mrope: InterleavedMRoPE,
 }
 
+/// One attention forward's heads before RoPE (see `Qwen3NextAttention::project_heads`).
+struct ProjectedHeads {
+    b: i32,
+    l: i32,
+    queries: UniquePtr<MlxArray>,
+    keys: UniquePtr<MlxArray>,
+    values: UniquePtr<MlxArray>,
+    gate: UniquePtr<MlxArray>,
+}
+
 impl Qwen3NextAttention {
     pub(crate) fn forward_with_position_ids(
         &self,
@@ -173,6 +188,27 @@ impl Qwen3NextAttention {
         position_ids: Option<&MlxArray>,
         capture_query: bool,
     ) -> (UniquePtr<MlxArray>, Option<UniquePtr<MlxArray>>) {
+        let heads = self.project_heads(x);
+        let (b, l) = (heads.b, heads.l);
+        let (queries, keys, values) = self.rotate(
+            &heads.queries,
+            &heads.keys,
+            &heads.values,
+            cache.offset,
+            position_ids,
+            b,
+            l,
+        );
+
+        let captured_query = capture_query.then(|| mlxcel_core::share(&queries));
+
+        let attn_out = self.dense_attention(&queries, keys, values, cache, mask, l);
+        (self.finish(&attn_out, &heads.gate, b, l), captured_query)
+    }
+
+    /// The Q/K/V projections, the gate, and the Q/K norms. Queries and keys are
+    /// normalized and not yet rotated; all three are `[B, L, heads, D]`.
+    fn project_heads(&self, x: &MlxArray) -> ProjectedHeads {
         let shape = mlxcel_core::array_shape(x);
         let b = shape[0];
         let l = shape[1];
@@ -203,13 +239,36 @@ impl Qwen3NextAttention {
 
         let queries = self.q_norm.forward(&queries);
         let keys = self.k_norm.forward(&keys);
+        ProjectedHeads {
+            b,
+            l,
+            queries,
+            keys,
+            values,
+            gate,
+        }
+    }
 
+    /// Transpose to `[B, H, L, D]` and apply RoPE (or the prepared MRoPE) at `offset`.
+    #[allow(clippy::too_many_arguments)]
+    fn rotate(
+        &self,
+        queries: &MlxArray,
+        keys: &MlxArray,
+        values: &MlxArray,
+        offset: i32,
+        position_ids: Option<&MlxArray>,
+        b: i32,
+        l: i32,
+    ) -> (
+        UniquePtr<MlxArray>,
+        UniquePtr<MlxArray>,
+        UniquePtr<MlxArray>,
+    ) {
         // Transpose to [B, H, L, D]
-        let mut queries = mlxcel_core::transpose_axes(&queries, &[0, 2, 1, 3]);
-        let mut keys = mlxcel_core::transpose_axes(&keys, &[0, 2, 1, 3]);
-        let values = mlxcel_core::transpose_axes(&values, &[0, 2, 1, 3]);
-
-        let offset = cache.offset;
+        let mut queries = mlxcel_core::transpose_axes(queries, &[0, 2, 1, 3]);
+        let mut keys = mlxcel_core::transpose_axes(keys, &[0, 2, 1, 3]);
+        let values = mlxcel_core::transpose_axes(values, &[0, 2, 1, 3]);
         if let Some(position_ids) = position_ids {
             let (cosine, sine) = self.mrope.forward(position_ids);
             let dtype = mlxcel_core::array_dtype(&queries);
@@ -251,40 +310,52 @@ impl Qwen3NextAttention {
             keys =
                 mlxcel_core::fast_rope(&keys, self.rope_dims, false, self.rope_base, 1.0, offset);
         }
+        (queries, keys, values)
+    }
 
-        let captured_query = capture_query.then(|| mlxcel_core::share(&queries));
-
+    /// The dense attention over the cache: appends `keys`/`values` and reads every cached key.
+    fn dense_attention(
+        &self,
+        queries: &MlxArray,
+        keys: UniquePtr<MlxArray>,
+        values: UniquePtr<MlxArray>,
+        cache: &mut KVCache,
+        mask: Option<&MlxArray>,
+        l: i32,
+    ) -> UniquePtr<MlxArray> {
         let causal_attention = l > 1 && mask.is_none();
         // Packed Turbo4 is specialized for long-context MTP verification;
         // other multi-token calls retain bottom-right causal SDPA semantics.
-        let attn_out = if cache.mode == KVCacheMode::Turbo4 {
+        if cache.mode == KVCacheMode::Turbo4 {
             if causal_attention {
-                cache.update_and_turbo4_causal_attention(&queries, keys, values, self.scale)
+                cache.update_and_turbo4_causal_attention(queries, keys, values, self.scale)
             } else {
-                cache.update_and_turbo4_attention(&queries, keys, values, self.scale, mask)
+                cache.update_and_turbo4_attention(queries, keys, values, self.scale, mask)
             }
         } else {
             let (cache_k, cache_v) = cache.update_and_fetch(keys, values);
             if causal_attention {
-                mlxcel_core::causal_attention(&queries, &cache_k, &cache_v, self.scale, 0.0, 0)
+                mlxcel_core::causal_attention(queries, &cache_k, &cache_v, self.scale, 0.0, 0)
             } else {
                 let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
                 unsafe {
                     mlxcel_core::layers::attention_from_ptr(
-                        &queries, &cache_k, &cache_v, self.scale, mask_ptr, 0.0, 0,
+                        queries, &cache_k, &cache_v, self.scale, mask_ptr, 0.0, 0,
                     )
                 }
             }
-        };
+        }
+    }
 
+    /// `[B, H, L, D]` attention output to the gated `[B, L, H * D]` input of `o_proj`.
+    fn finish(&self, attn_out: &MlxArray, gate: &MlxArray, b: i32, l: i32) -> UniquePtr<MlxArray> {
         // Transpose back and reshape
-        let output = mlxcel_core::transpose_axes(&attn_out, &[0, 2, 1, 3]);
+        let output = mlxcel_core::transpose_axes(attn_out, &[0, 2, 1, 3]);
         let output = mlxcel_core::reshape(&output, &[b, l, -1]);
 
         // Apply sigmoid gating to output
-        let gate_sigmoid = mlxcel_core::sigmoid(&gate);
-        let gated = mlxcel_core::multiply(&output, &gate_sigmoid);
-        (gated, captured_query)
+        let gate_sigmoid = mlxcel_core::sigmoid(gate);
+        mlxcel_core::multiply(&output, &gate_sigmoid)
     }
 
     pub(crate) fn from_weights(
