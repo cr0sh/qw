@@ -4,6 +4,7 @@ use std::sync::{Arc, mpsc as std_mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::SpecPrefillPolicyConfig;
 use anyhow::{Context, Result, ensure};
 use mlxcel_core::generate::{GenerationStopReason, PrefixReuse};
 use qw_prefix_cache::{
@@ -12,7 +13,7 @@ use qw_prefix_cache::{
 };
 #[cfg(test)]
 use qw_runtime::ChatContentRef;
-#[cfg(any(feature = "specprefill", test))]
+#[cfg(test)]
 use qw_runtime::ChatMessage;
 #[cfg(feature = "dflash2")]
 use qw_runtime::Dflash2PrefixReuse;
@@ -20,8 +21,6 @@ use qw_runtime::{
     KVCacheMode, MtpPrefixReuse, PromptSnapshot, Qwen35GenerationMode, Qwen35Provider,
     SamplingOptions, select_qwen35_decoder,
 };
-#[cfg(feature = "specprefill")]
-use qw_runtime::{PrefillMode, SpecPrefillConfig};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{Span, debug, error, info, info_span, trace, warn};
@@ -120,102 +119,6 @@ pub(super) fn log_generation_metrics(
         prefix_reused_tokens = metrics.prefix_reused_tokens,
     );
 }
-#[cfg(feature = "specprefill")]
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SpecPrefillPolicyConfig {
-    pub min_turn_tokens: usize,
-    pub keep_rate: f32,
-    pub keep_first_tokens: usize,
-    pub keep_last_tokens: usize,
-}
-
-#[cfg(feature = "specprefill")]
-impl Default for SpecPrefillPolicyConfig {
-    fn default() -> Self {
-        Self {
-            min_turn_tokens: 8_000,
-            keep_rate: 0.25,
-            keep_first_tokens: 256,
-            keep_last_tokens: 256,
-        }
-    }
-}
-
-#[cfg(feature = "specprefill")]
-impl SpecPrefillPolicyConfig {
-    pub(crate) fn validate(self) -> Result<()> {
-        ensure!(
-            self.min_turn_tokens > 0,
-            "--specprefill-min-turn-tokens must be greater than zero"
-        );
-        ensure!(
-            self.keep_rate.is_finite() && self.keep_rate > 0.0 && self.keep_rate <= 1.0,
-            "--specprefill-keep-rate must be in (0, 1]"
-        );
-        Ok(())
-    }
-}
-
-#[cfg(feature = "specprefill")]
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct CurrentTurnPolicy {
-    current_turn_tokens: Option<usize>,
-    prefill_mode: PrefillMode,
-}
-
-#[cfg(feature = "specprefill")]
-fn messages_before_model_input_turn(messages: &[ChatMessage]) -> Option<&[ChatMessage]> {
-    let boundary = if messages
-        .last()
-        .is_some_and(|message| message.role == "tool")
-    {
-        messages
-            .iter()
-            .rposition(|message| message.role != "tool")
-            .map_or(0, |index| index + 1)
-    } else {
-        messages
-            .iter()
-            .rposition(|message| message.role == "user")?
-    };
-    let preceding = &messages[..boundary];
-    preceding
-        .iter()
-        .any(|message| message.role == "assistant")
-        .then_some(preceding)
-}
-
-#[cfg(feature = "specprefill")]
-fn current_turn_policy(
-    prompt_ids: &[i32],
-    preceding_ids: Option<&[i32]>,
-    specprefill_allowed: bool,
-    config: SpecPrefillPolicyConfig,
-) -> CurrentTurnPolicy {
-    let Some(preceding_ids) = preceding_ids.filter(|ids| prompt_ids.starts_with(ids)) else {
-        return CurrentTurnPolicy {
-            current_turn_tokens: None,
-            prefill_mode: PrefillMode::Dense,
-        };
-    };
-    let current_turn_tokens = prompt_ids.len() - preceding_ids.len();
-    let prefill_mode = if specprefill_allowed && current_turn_tokens > config.min_turn_tokens {
-        PrefillMode::SpecPrefill(SpecPrefillConfig {
-            min_tokens: config.min_turn_tokens,
-            keep_rate: config.keep_rate,
-            protected_prefix_tokens: preceding_ids.len(),
-            keep_first_tokens: config.keep_first_tokens,
-            keep_last_tokens: config.keep_last_tokens,
-        })
-    } else {
-        PrefillMode::Dense
-    };
-    CurrentTurnPolicy {
-        current_turn_tokens: Some(current_turn_tokens),
-        prefill_mode,
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct DecoderConfig {
     pub mode: Qwen35GenerationMode,
@@ -294,10 +197,9 @@ fn decoded_image_digest(width: u32, height: u32, rgb: &[u8]) -> String {
 
 fn cache_lookup_route(
     route: QwenGenerationRoute,
-    #[cfg(feature = "specprefill")] mtp_available: bool,
-    #[cfg(feature = "specprefill")] specprefill_active: bool,
+    mtp_available: bool,
+    specprefill_active: bool,
 ) -> Option<CacheSnapshotRoute> {
-    #[cfg(feature = "specprefill")]
     if route == QwenGenerationRoute::BaselineText && mtp_available && specprefill_active {
         return Some(CacheSnapshotRoute::Mtp);
     }
@@ -319,8 +221,8 @@ impl CacheBehavior {
 fn cache_behavior(
     route: QwenGenerationRoute,
     prefix_cache_enabled: bool,
-    #[cfg(feature = "specprefill")] mtp_available: bool,
-    #[cfg(feature = "specprefill")] specprefill_active: bool,
+    mtp_available: bool,
+    specprefill_active: bool,
 ) -> CacheBehavior {
     if !prefix_cache_enabled {
         return CacheBehavior {
@@ -329,13 +231,7 @@ fn cache_behavior(
         };
     }
     let snapshot_route = cache_snapshot_route(route);
-    let lookup_route = cache_lookup_route(
-        route,
-        #[cfg(feature = "specprefill")]
-        mtp_available,
-        #[cfg(feature = "specprefill")]
-        specprefill_active,
-    );
+    let lookup_route = cache_lookup_route(route, mtp_available, specprefill_active);
     CacheBehavior {
         snapshot_route,
         lookup_route,
@@ -732,11 +628,12 @@ fn lookahead_route(
     }
     // Sparse-prefill policy depends on history tokenization. Leave those requests
     // to the ordinary owner-thread preparation rather than guess a namespace.
-    #[cfg(feature = "specprefill")]
-    if matches!(
-        decoder,
-        Qwen35GenerationMode::Automatic | Qwen35GenerationMode::Baseline
-    ) {
+    if crate::specprefill_policy::ENABLED
+        && matches!(
+            decoder,
+            Qwen35GenerationMode::Automatic | Qwen35GenerationMode::Baseline
+        )
+    {
         return None;
     }
     let decoder = select_qwen35_decoder(decoder, mtp_available, dflash2_available).ok()?;
@@ -765,6 +662,7 @@ pub struct Engine {
 }
 
 impl Engine {
+    #[allow(clippy::too_many_arguments)]
     pub fn start_qwen(
         model_path: PathBuf,
         model_id: Option<String>,
@@ -773,12 +671,11 @@ impl Engine {
         mtp_k: usize,
         decoder: DecoderConfig,
         kv_cache_mode: KVCacheMode,
-        #[cfg(feature = "specprefill")] specprefill_policy: SpecPrefillPolicyConfig,
+        specprefill_policy: SpecPrefillPolicyConfig,
     ) -> Result<Self> {
         cache_config.validate().map_err(anyhow::Error::msg)?;
         validate_mtp_k(mtp_k)?;
         decoder.validate()?;
-        #[cfg(feature = "specprefill")]
         specprefill_policy.validate()?;
         let (jobs_tx, jobs_rx) = mpsc::channel(JOB_QUEUE_CAPACITY);
         let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
@@ -792,7 +689,6 @@ impl Engine {
                     mtp_k,
                     decoder,
                     kv_cache_mode,
-                    #[cfg(feature = "specprefill")]
                     specprefill_policy,
                 ) {
                     Ok(mut worker) => {
@@ -1243,7 +1139,6 @@ pub enum SubmitError {
 }
 
 struct QwenWorker {
-    #[cfg(feature = "specprefill")]
     specprefill_policy: SpecPrefillPolicyConfig,
     provider: Qwen35Provider,
     grammar: GrammarFactory,
@@ -1286,11 +1181,10 @@ impl QwenWorker {
         mtp_k: usize,
         decoder: DecoderConfig,
         kv_cache_mode: KVCacheMode,
-        #[cfg(feature = "specprefill")] specprefill_policy: SpecPrefillPolicyConfig,
+        specprefill_policy: SpecPrefillPolicyConfig,
     ) -> Result<Self> {
         validate_mtp_k(mtp_k)?;
         decoder.validate()?;
-        #[cfg(feature = "specprefill")]
         specprefill_policy.validate()?;
         let provider = Qwen35Provider::load(model_path, kv_cache_mode)?;
         select_qwen35_decoder(
@@ -1366,7 +1260,6 @@ impl QwenWorker {
             AdaptivePrefixCache::new(namespaces, cache_config).map_err(anyhow::Error::msg)?;
         Ok(Self {
             provider,
-            #[cfg(feature = "specprefill")]
             specprefill_policy,
             grammar,
             prefix_cache,
@@ -1583,54 +1476,28 @@ impl QwenWorker {
                 return;
             }
         };
-        #[cfg(feature = "specprefill")]
-        let preceding_ids = if has_images {
-            None
-        } else if let Some(messages) = messages_before_model_input_turn(&job.request.messages) {
-            match self.provider.tokenize_history(
-                messages,
-                effective_tools,
+        let specprefill_policy = crate::specprefill_policy::resolve_for_request(
+            &self.provider,
+            crate::SpecPrefillRequest {
+                messages: &job.request.messages,
+                tools: effective_tools,
                 reasoning_effort,
                 enable_thinking,
-            ) {
-                Ok(ids) => Some(ids),
-                Err(error) => {
-                    warn!(phase = "specprefill.policy", error = %error);
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        #[cfg(feature = "specprefill")]
-        let specprefill_policy = current_turn_policy(
-            &prompt_ids,
-            preceding_ids.as_deref(),
-            !has_images
-                && constraint.is_none()
-                && job.request.resume_response_id.is_none()
-                && matches!(
-                    self.decoder.mode,
-                    Qwen35GenerationMode::Automatic | Qwen35GenerationMode::Baseline
-                )
-                && routed_decoder != Qwen35GenerationMode::Dflash2,
+                prompt_ids: &prompt_ids,
+                has_images,
+                allowed: !has_images
+                    && constraint.is_none()
+                    && job.request.resume_response_id.is_none()
+                    && matches!(
+                        self.decoder.mode,
+                        Qwen35GenerationMode::Automatic | Qwen35GenerationMode::Baseline
+                    )
+                    && routed_decoder != Qwen35GenerationMode::Dflash2,
+            },
             self.specprefill_policy,
         );
-        #[cfg(feature = "specprefill")]
-        let specprefill_active =
-            matches!(specprefill_policy.prefill_mode, PrefillMode::SpecPrefill(_));
-        #[cfg(feature = "specprefill")]
-        debug!(
-            phase = "specprefill.policy",
-            current_turn_tokens = specprefill_policy.current_turn_tokens.unwrap_or(0),
-            current_turn_boundary_valid = specprefill_policy.current_turn_tokens.is_some(),
-            prefill_mode = ?specprefill_policy.prefill_mode,
-            specprefill_active,
-        );
-        #[cfg(feature = "specprefill")]
+        let specprefill_active = specprefill_policy.active();
         let force_baseline_for_specprefill = specprefill_active;
-        #[cfg(not(feature = "specprefill"))]
-        let force_baseline_for_specprefill = false;
         let decoder = if force_baseline_for_specprefill {
             Qwen35GenerationMode::Baseline
         } else {
@@ -1647,9 +1514,7 @@ impl QwenWorker {
         let cache_behavior = cache_behavior(
             route,
             self.prefix_cache_enabled,
-            #[cfg(feature = "specprefill")]
             mtp_available,
-            #[cfg(feature = "specprefill")]
             specprefill_active,
         );
         let mut checkpoint_token_lengths = if cache_behavior.capture_final_snapshot() {
@@ -1979,31 +1844,33 @@ impl QwenWorker {
                 mtp_available,
                 self.decoder.dflash2_available(),
             )
-                && let Ok(tokens) = text_prompt_ids(
-                    provider,
-                    &next.job.request,
-                    next.job.request.enable_thinking,
-                )
-                    && !next.job.cancelled.load(Ordering::Acquire)
-                        && provider
-                            .validate_context_budget(tokens.len(), next.job.request.max_tokens)
-                            .is_ok()
-                    {
-                        cache.prefetch(PromptKey::text(&tokens), next_route);
-                        debug!(
-                            event = "cache.prefetch.issued",
-                            response_id = %job.admission.response_id,
-                            next_response_id = %next.job.admission.response_id,
-                            route = ?next_route,
-                            prompt_tokens = tokens.len(),
-                        );
-                        next.prompt_ids = Some(tokens);
-                    }
+            && let Ok(tokens) = text_prompt_ids(
+                provider,
+                &next.job.request,
+                next.job.request.enable_thinking,
+            )
+            && !next.job.cancelled.load(Ordering::Acquire)
+            && provider
+                .validate_context_budget(tokens.len(), next.job.request.max_tokens)
+                .is_ok()
+        {
+            cache.prefetch(PromptKey::text(&tokens), next_route);
+            debug!(
+                event = "cache.prefetch.issued",
+                response_id = %job.admission.response_id,
+                next_response_id = %next.job.admission.response_id,
+                route = ?next_route,
+                prompt_tokens = tokens.len(),
+            );
+            next.prompt_ids = Some(tokens);
+        }
         let mut emit_delta = |fragment: &str| {
             if let Some(next) = next.as_deref_mut()
-                && next.job.cancelled.load(Ordering::Acquire) && next.prompt_ids.take().is_some() {
-                    cache.clear_prefetch();
-                }
+                && next.job.cancelled.load(Ordering::Acquire)
+                && next.prompt_ids.take().is_some()
+            {
+                cache.clear_prefetch();
+            }
             if job.cancelled.load(Ordering::Acquire) {
                 return false;
             }
@@ -2086,7 +1953,6 @@ impl QwenWorker {
                     .as_mut()
                     .map(|value| value as &mut dyn mlxcel_core::generate::TokenConstraint),
                 &checkpoint_token_lengths,
-                #[cfg(feature = "specprefill")]
                 specprefill_policy.prefill_mode,
                 &mut emit_delta,
             ),
@@ -2755,169 +2621,6 @@ mod tests {
         assert_eq!(parsed.tool_calls[0].name, "weather");
     }
 
-    #[cfg(feature = "specprefill")]
-    fn message(role: &str) -> ChatMessage {
-        ChatMessage {
-            role: role.to_string(),
-            name: None,
-            content: None,
-            reasoning_content: None,
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-        }
-    }
-
-    #[cfg(feature = "specprefill")]
-    #[test]
-    fn initial_system_developer_and_user_input_has_no_later_turn_boundary() {
-        for messages in [
-            vec![message("user")],
-            vec![message("system"), message("user")],
-            vec![message("system"), message("developer"), message("user")],
-        ] {
-            assert!(messages_before_model_input_turn(&messages).is_none());
-        }
-        assert_eq!(
-            current_turn_policy(&[1, 2, 3], None, true, Default::default()).prefill_mode,
-            PrefillMode::Dense
-        );
-    }
-
-    #[cfg(feature = "specprefill")]
-    #[test]
-    fn second_user_input_is_a_later_model_input_turn() {
-        let messages = [
-            message("system"),
-            message("user"),
-            message("assistant"),
-            message("user"),
-        ];
-        let preceding =
-            messages_before_model_input_turn(&messages).expect("assistant precedes second user");
-        assert_eq!(preceding.len(), 3);
-    }
-
-    #[cfg(feature = "specprefill")]
-    #[test]
-    fn trailing_tool_results_form_one_later_model_input_turn() {
-        let single = [
-            message("system"),
-            message("user"),
-            message("assistant"),
-            message("tool"),
-        ];
-        assert_eq!(
-            messages_before_model_input_turn(&single)
-                .expect("tool result follows model output")
-                .len(),
-            3
-        );
-
-        let parallel = [
-            message("system"),
-            message("user"),
-            message("assistant"),
-            message("tool"),
-            message("tool"),
-        ];
-        assert_eq!(
-            messages_before_model_input_turn(&parallel)
-                .expect("parallel tool results follow model output")
-                .len(),
-            3
-        );
-    }
-
-    #[cfg(feature = "specprefill")]
-    #[test]
-    fn assistant_absent_keeps_user_and_tool_input_dense() {
-        assert!(
-            messages_before_model_input_turn(&[
-                message("system"),
-                message("developer"),
-                message("user"),
-            ])
-            .is_none()
-        );
-        assert!(
-            messages_before_model_input_turn(&[
-                message("system"),
-                message("user"),
-                message("tool"),
-            ])
-            .is_none()
-        );
-    }
-
-    #[cfg(feature = "specprefill")]
-    #[test]
-    fn tool_turn_threshold_is_strict_and_protects_exact_history() {
-        let config = SpecPrefillPolicyConfig {
-            min_turn_tokens: 512,
-            ..Default::default()
-        };
-        let preceding_ids = vec![11; 37];
-        for current_turn_tokens in [512, 513, 580, 1_948] {
-            let mut prompt_ids = preceding_ids.clone();
-            prompt_ids.resize(preceding_ids.len() + current_turn_tokens, 20);
-            let policy = current_turn_policy(&prompt_ids, Some(&preceding_ids), true, config);
-            assert_eq!(policy.current_turn_tokens, Some(current_turn_tokens));
-            if current_turn_tokens == 512 {
-                assert_eq!(policy.prefill_mode, PrefillMode::Dense);
-            } else {
-                assert_eq!(
-                    policy.prefill_mode,
-                    PrefillMode::SpecPrefill(SpecPrefillConfig {
-                        min_tokens: 512,
-                        keep_rate: 0.25,
-                        protected_prefix_tokens: preceding_ids.len(),
-                        keep_first_tokens: 256,
-                        keep_last_tokens: 256,
-                    })
-                );
-            }
-        }
-    }
-
-    #[cfg(feature = "specprefill")]
-    #[test]
-    fn invalid_boundary_or_ineligible_route_stays_dense() {
-        let config = SpecPrefillPolicyConfig {
-            min_turn_tokens: 1,
-            ..Default::default()
-        };
-        for preceding in [vec![9, 9], vec![1, 2, 3, 4]] {
-            let policy = current_turn_policy(&[1, 2, 3], Some(&preceding), true, config);
-            assert_eq!(policy.current_turn_tokens, None);
-            assert_eq!(policy.prefill_mode, PrefillMode::Dense);
-        }
-        let disallowed = current_turn_policy(&[1, 2, 3], Some(&[1]), false, config);
-        assert_eq!(disallowed.current_turn_tokens, Some(2));
-        assert_eq!(disallowed.prefill_mode, PrefillMode::Dense);
-    }
-
-    #[cfg(feature = "specprefill")]
-    #[test]
-    fn configured_policy_values_flow_to_runtime_config() {
-        let config = SpecPrefillPolicyConfig {
-            min_turn_tokens: 2,
-            keep_rate: 0.4,
-            keep_first_tokens: 0,
-            keep_last_tokens: 64,
-        };
-        let policy = current_turn_policy(&[1, 2, 3, 4], Some(&[1]), true, config);
-        assert_eq!(
-            policy.prefill_mode,
-            PrefillMode::SpecPrefill(SpecPrefillConfig {
-                min_tokens: 2,
-                keep_rate: 0.4,
-                protected_prefix_tokens: 1,
-                keep_first_tokens: 0,
-                keep_last_tokens: 64,
-            })
-        );
-    }
-
     #[test]
     fn decoder_config_fails_closed_only_for_explicit_unavailable_dflash() {
         let unavailable =
@@ -2948,21 +2651,13 @@ mod tests {
             #[cfg(feature = "dflash2")]
             QwenGenerationRoute::Dflash2Multimodal,
         ] {
-            let behavior = cache_behavior(
-                route,
-                false,
-                #[cfg(feature = "specprefill")]
-                true,
-                #[cfg(feature = "specprefill")]
-                false,
-            );
+            let behavior = cache_behavior(route, false, true, false);
             assert_eq!(behavior.snapshot_route, None);
             assert_eq!(behavior.lookup_route, None);
             assert!(!behavior.capture_final_snapshot());
         }
     }
 
-    #[cfg(feature = "specprefill")]
     #[test]
     fn specprefill_over_mtp_looks_up_the_mtp_target_snapshot() {
         let sparse_route = qwen_generation_route(Qwen35GenerationMode::Baseline, false);
@@ -2987,38 +2682,6 @@ mod tests {
             cache_behavior(QwenGenerationRoute::BaselineMultimodal, true, true, true).lookup_route,
             None
         );
-    }
-
-    #[cfg(feature = "specprefill")]
-    #[test]
-    fn specprefill_policy_validation_accepts_zero_edges_and_rejects_invalid_admission() {
-        assert!(
-            SpecPrefillPolicyConfig {
-                keep_first_tokens: 0,
-                keep_last_tokens: 0,
-                ..Default::default()
-            }
-            .validate()
-            .is_ok()
-        );
-        assert!(
-            SpecPrefillPolicyConfig {
-                min_turn_tokens: 0,
-                ..Default::default()
-            }
-            .validate()
-            .is_err()
-        );
-        for keep_rate in [0.0, 1.01, f32::NAN] {
-            assert!(
-                SpecPrefillPolicyConfig {
-                    keep_rate,
-                    ..Default::default()
-                }
-                .validate()
-                .is_err()
-            );
-        }
     }
 
     #[test]

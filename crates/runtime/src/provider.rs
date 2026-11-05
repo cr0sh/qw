@@ -1,24 +1,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::Duration;
-#[cfg(any(feature = "specprefill", test))]
-use std::time::Instant;
 
 use anyhow::{Context, Result, ensure};
 use mlxcel_core::cache::KVCacheMode;
 use mlxcel_core::generate::{
     ControlledGeneration, CxxGenerator, GenerationStopReason, LanguageModel, ModelStateSnapshot,
     PrefixReuse, SamplingConfig, TokenConstraint,
-};
-#[cfg(any(feature = "specprefill", test))]
-use mlxcel_core::generation_policy::{
-    initial_token_history, merged_eos_token_ids, seed_rng_if_needed,
-};
-#[cfg(any(feature = "specprefill", test))]
-use mlxcel_core::loop_detection::detect_repetition_loop;
-#[cfg(any(feature = "specprefill", test))]
-use mlxcel_core::sampling::{
-    SamplerState, sample_token_optimized, sample_token_optimized_with_state,
 };
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
@@ -42,11 +30,10 @@ pub use crate::qwen3_5_dflash::{
 };
 use crate::qwen3_5_mtp::Qwen35MtpGenerator;
 pub use crate::qwen3_5_mtp::{MtpGenerationStats, MtpPrefixReuse, MtpPromptSnapshot};
+use crate::specprefill::{PrefillMode, SpecPrefillStats};
+
 #[cfg(any(feature = "specprefill", test))]
-use crate::specprefill::{
-    PrefillMode, SpecPrefillConfig, SpecPrefillStats, dense_prefix_end, score_tokens,
-    select_target_indices, should_activate,
-};
+mod specprefill;
 
 const DEFAULT_MTP_BLOCK_SIZE: usize = 3;
 
@@ -105,127 +92,6 @@ fn log_generation_metrics(
         elapsed_ms = decode_time.as_secs_f64() * 1_000.0,
         tokens_per_second = tokens_per_second(completion_tokens, decode_time),
     );
-}
-#[cfg(any(feature = "specprefill", test))]
-struct SparseGeneration {
-    token_ids: Vec<i32>,
-    stop_reason: GenerationStopReason,
-    cached_tokens: usize,
-    prefill_time: Duration,
-    decode_time: Duration,
-    stats: SpecPrefillStats,
-}
-
-#[cfg(any(feature = "specprefill", test))]
-#[allow(clippy::too_many_arguments)]
-fn generate_specprefill_tokens<F: FnMut(i32) -> bool>(
-    model: &Qwen35Model,
-    draft: &Qwen35Model,
-    prompt_ids: &[i32],
-    max_tokens: usize,
-    sampling: &SamplingConfig,
-    prefix_reuse: Option<PrefixReuse<'_>>,
-    config: SpecPrefillConfig,
-    mut on_token: F,
-) -> Result<SparseGeneration> {
-    let requested_cached_tokens = prefix_reuse.as_ref().map_or(0, |reuse| reuse.cached_tokens);
-    let structurally_reusable = prefix_reuse.as_ref().is_some_and(|reuse| {
-        reuse.cached_tokens > 0
-            && reuse.cached_tokens <= prompt_ids.len()
-            && reuse.snapshot.token_len() == reuse.cached_tokens
-            && (reuse.cached_tokens < prompt_ids.len()
-                || reuse.snapshot.continuation_logits().is_some())
-    });
-    let admitted_cached_tokens = if structurally_reusable {
-        requested_cached_tokens
-    } else {
-        0
-    };
-    let dense_end = dense_prefix_end(admitted_cached_tokens, config);
-    let eligible = &prompt_ids[dense_end..];
-
-    let scoring_start = Instant::now();
-    let importance = score_tokens(draft, eligible)?;
-    let draft_scoring_time = scoring_start.elapsed();
-    let selected = select_target_indices(&importance, dense_end, prompt_ids.len(), config);
-
-    let target_start = Instant::now();
-    let (mut logits, cached_tokens) = model
-        .specprefill_sparse_prefill(prompt_ids, prefix_reuse, dense_end, &selected)
-        .map_err(anyhow::Error::msg)
-        .context("sparse target prefill failed")?;
-    mlxcel_core::eval(&logits);
-    let target_prefill_time = target_start.elapsed();
-
-    let mut effective_sampling = sampling.clone();
-    effective_sampling
-        .prompt_token_count
-        .get_or_insert(prompt_ids.len());
-    effective_sampling
-        .token_bias
-        .suppress_tokens(&model.output_suppressed_token_ids());
-    seed_rng_if_needed(&effective_sampling);
-    let eos_tokens =
-        merged_eos_token_ids(model.eos_token_ids(), &effective_sampling.stop_token_ids);
-    let needs_history = effective_sampling.needs_token_history();
-    let mut token_history = initial_token_history(prompt_ids, needs_history);
-    let mut sampler_state: Option<SamplerState> = None;
-    let mut generated = Vec::with_capacity(max_tokens);
-    let mut stop_reason = GenerationStopReason::MaxTokens;
-    let decode_start = Instant::now();
-
-    while generated.len() < max_tokens {
-        let (token, _) = if needs_history {
-            sample_token_optimized_with_state(
-                &logits,
-                &effective_sampling,
-                &token_history,
-                &mut sampler_state,
-            )
-        } else {
-            sample_token_optimized(&logits, &effective_sampling, &token_history)
-        };
-        mlxcel_core::eval(&token);
-        let token_id = mlxcel_core::item_i32(&token);
-        if eos_tokens.contains(&token_id) {
-            stop_reason = GenerationStopReason::Eos;
-            break;
-        }
-        generated.push(token_id);
-        if needs_history {
-            token_history.push(token_id);
-        }
-        if !on_token(token_id) {
-            stop_reason = GenerationStopReason::CallbackCancelled;
-            break;
-        }
-        if detect_repetition_loop(&generated, &effective_sampling.loop_detection) {
-            stop_reason = GenerationStopReason::RepetitionLoop;
-            break;
-        }
-        if generated.len() == max_tokens {
-            break;
-        }
-        logits = model.specprefill_decode(token_id, prompt_ids.len() + generated.len() - 1);
-    }
-    let decode_time = decode_start.elapsed();
-    let stats = SpecPrefillStats {
-        draft_tokens: eligible.len(),
-        eligible_target_tokens: eligible.len(),
-        selected_target_tokens: selected.len(),
-        protected_target_tokens: dense_end.saturating_sub(cached_tokens),
-        cached_target_tokens: cached_tokens,
-        draft_scoring_time,
-        target_prefill_time,
-    };
-    Ok(SparseGeneration {
-        token_ids: generated,
-        stop_reason,
-        cached_tokens,
-        prefill_time: target_prefill_time,
-        decode_time,
-        stats,
-    })
 }
 
 #[derive(Debug, Clone)]
@@ -293,7 +159,6 @@ pub struct BaselineGeneration {
     pub prefill_time: Duration,
     /// Wall time spent sampling and forwarding generated tokens.
     pub decode_time: Duration,
-    #[cfg(any(feature = "specprefill", test))]
     pub specprefill_stats: Option<SpecPrefillStats>,
 }
 
@@ -486,17 +351,7 @@ impl GenerationDefaults {
 impl Qwen35Provider {
     pub fn load(model_dir: impl AsRef<Path>, kv_cache_mode: KVCacheMode) -> Result<Self> {
         #[cfg(feature = "specprefill")]
-        {
-            let draft_model_dir = crate::resolve_specprefill_draft_path(None)?;
-            return Self::load_with_specprefill_draft(model_dir, &draft_model_dir, kv_cache_mode)
-                .with_context(|| {
-                    format!(
-                        "failed to load required SpecPrefill draft at {}; rerun `qw download {}`",
-                        draft_model_dir.display(),
-                        crate::DEFAULT_MODEL_IDENTIFIER
-                    )
-                });
-        }
+        return Self::load_with_required_draft(model_dir, kv_cache_mode);
         #[cfg(not(feature = "specprefill"))]
         Self::load_target_only(model_dir.as_ref(), kv_cache_mode)
     }
@@ -553,36 +408,6 @@ impl Qwen35Provider {
             dflash2_generator: None,
             vision_processor,
         })
-    }
-
-    #[cfg(any(feature = "specprefill", test))]
-    pub fn load_with_specprefill_draft(
-        model_dir: impl AsRef<Path>,
-        draft_model_dir: impl AsRef<Path>,
-        kv_cache_mode: KVCacheMode,
-    ) -> Result<Self> {
-        let mut provider = Self::load_target_only(model_dir.as_ref(), kv_cache_mode)?;
-        let draft_model_dir = draft_model_dir.as_ref();
-        let draft_tokenizer_path = draft_model_dir.join("tokenizer.json");
-        ensure!(
-            draft_tokenizer_path.is_file(),
-            "missing SpecPrefill draft tokenizer {}",
-            draft_tokenizer_path.display()
-        );
-        let draft_tokenizer = Tokenizer::from_file(&draft_tokenizer_path)
-            .map_err(anyhow::Error::msg)
-            .with_context(|| {
-                format!(
-                    "failed to load SpecPrefill draft tokenizer {}",
-                    draft_tokenizer_path.display()
-                )
-            })?;
-        ensure!(
-            provider.tokenizer.get_vocab(true) == draft_tokenizer.get_vocab(true),
-            "target and SpecPrefill draft tokenizer vocabularies are incompatible"
-        );
-        provider.specprefill_draft = Some(Qwen35Model::load_specprefill_draft(draft_model_dir)?);
-        Ok(provider)
     }
 
     pub fn tokenizer(&self) -> &Tokenizer {
@@ -852,100 +677,30 @@ impl Qwen35Provider {
         prefix_reuse: Option<PrefixReuse<'_>>,
         constraint: Option<&mut dyn TokenConstraint>,
         checkpoint_token_lengths: &[usize],
-        #[cfg(any(feature = "specprefill", test))] prefill_mode: PrefillMode,
+        prefill_mode: PrefillMode,
         mut on_delta: F,
     ) -> Result<BaselineGeneration> {
         self.validate_context_budget(prompt_ids.len(), max_tokens)?;
+        #[cfg(not(any(feature = "specprefill", test)))]
+        let _ = prefill_mode;
         #[cfg(any(feature = "specprefill", test))]
-        if let PrefillMode::SpecPrefill(config) = prefill_mode {
-            config.validate(prompt_ids.len())?;
-            ensure!(
-                constraint.is_none(),
-                "SpecPrefill does not support token constraints"
+        if let PrefillMode::SpecPrefill(config) = prefill_mode
+            && let Some(plan) = self.plan_specprefill(
+                prompt_ids,
+                max_tokens,
+                constraint.is_some(),
+                prefix_reuse.as_ref(),
+                config,
+            )?
+        {
+            return self.generate_specprefill(
+                plan,
+                prompt_ids,
+                max_tokens,
+                sampling,
+                prefix_reuse,
+                on_delta,
             );
-            ensure!(
-                !prompt_ids.is_empty(),
-                "prompt token sequence must not be empty"
-            );
-            ensure!(max_tokens > 0, "max_tokens must be greater than zero");
-            let draft = self.specprefill_draft.as_ref().context(
-                "SpecPrefill capability is unavailable because no draft model is loaded",
-            )?;
-            let requested_cached = prefix_reuse.as_ref().map_or(0, |reuse| reuse.cached_tokens);
-            let reusable = prefix_reuse.as_ref().is_some_and(|reuse| {
-                reuse.cached_tokens > 0
-                    && reuse.cached_tokens <= prompt_ids.len()
-                    && reuse.snapshot.token_len() == reuse.cached_tokens
-                    && (reuse.cached_tokens < prompt_ids.len()
-                        || reuse.snapshot.continuation_logits().is_some())
-            });
-            let dense_end = dense_prefix_end(if reusable { requested_cached } else { 0 }, config);
-            if should_activate(prompt_ids.len() - dense_end, config) {
-                let mut decoder = IncrementalTextDecoder::new(&self.tokenizer);
-                let mut decode_error = None;
-                let mut callback_active = true;
-                let sparse = generate_specprefill_tokens(
-                    &self.model,
-                    draft,
-                    prompt_ids,
-                    max_tokens,
-                    sampling,
-                    prefix_reuse,
-                    config,
-                    |token_id| match decoder.push(token_id) {
-                        Ok(delta) => {
-                            if delta.is_empty() {
-                                true
-                            } else {
-                                callback_active = on_delta(&delta);
-                                callback_active
-                            }
-                        }
-                        Err(error) => {
-                            decode_error = Some(error);
-                            false
-                        }
-                    },
-                )?;
-                if let Some(error) = decode_error {
-                    return Err(error);
-                }
-                let final_delta = decoder.finish()?;
-                if callback_active && !final_delta.is_empty() {
-                    let _ = on_delta(&final_delta);
-                }
-                let completion_tokens = sparse.token_ids.len();
-                debug!(
-                    route = "specprefill",
-                    draft_scoring_ms = sparse.stats.draft_scoring_time.as_secs_f64() * 1_000.0,
-                    target_prefill_ms = sparse.stats.target_prefill_time.as_secs_f64() * 1_000.0,
-                    selected_tokens = sparse.stats.selected_target_tokens,
-                    eligible_tokens = sparse.stats.eligible_target_tokens,
-                    "completed sparse prefill generation"
-                );
-                log_generation_metrics(
-                    "specprefill",
-                    prompt_ids.len(),
-                    completion_tokens,
-                    sparse.cached_tokens,
-                    sparse.prefill_time,
-                    sparse.decode_time,
-                );
-                return Ok(BaselineGeneration {
-                    text: decoder.emitted,
-                    token_ids: sparse.token_ids,
-                    prompt_tokens: prompt_ids.len(),
-                    completion_tokens,
-                    cached_tokens: sparse.cached_tokens,
-                    finish_outcome: sparse.stop_reason,
-                    prompt_snapshots: Vec::new(),
-                    final_snapshot: None,
-                    prefill_time: sparse.prefill_time,
-                    decode_time: sparse.decode_time,
-                    #[cfg(any(feature = "specprefill", test))]
-                    specprefill_stats: Some(sparse.stats),
-                });
-            }
         }
         self.model.clear_prepared_mrope();
         let buffer_output = constraint.is_some();
@@ -1037,7 +792,6 @@ impl Qwen35Provider {
             final_snapshot: controlled.final_snapshot.map(PromptSnapshot::Baseline),
             prefill_time,
             decode_time,
-            #[cfg(any(feature = "specprefill", test))]
             specprefill_stats: None,
         })
     }
@@ -1144,7 +898,6 @@ impl Qwen35Provider {
             final_snapshot: None,
             prefill_time,
             decode_time,
-            #[cfg(any(feature = "specprefill", test))]
             specprefill_stats: None,
         })
     }
@@ -1451,7 +1204,6 @@ impl Qwen35Provider {
                 final_snapshot: generation.final_snapshot.map(PromptSnapshot::Dflash2),
                 prefill_time: stats.prefill_time,
                 decode_time: stats.decode_time,
-                #[cfg(any(feature = "specprefill", test))]
                 specprefill_stats: None,
             },
             stats,
@@ -1631,7 +1383,6 @@ impl Qwen35Provider {
                 final_snapshot: generated.final_snapshot.map(PromptSnapshot::Mtp),
                 prefill_time,
                 decode_time,
-                #[cfg(any(feature = "specprefill", test))]
                 specprefill_stats: None,
             },
             generated.stats,
@@ -1691,7 +1442,6 @@ impl Qwen35Provider {
                 None,
                 None,
                 &[],
-                #[cfg(any(feature = "specprefill", test))]
                 PrefillMode::Dense,
                 on_delta,
             )?,
@@ -1765,7 +1515,6 @@ impl Qwen35Provider {
                 None,
                 None,
                 &[],
-                #[cfg(any(feature = "specprefill", test))]
                 PrefillMode::Dense,
                 on_delta,
             )?;
@@ -1817,7 +1566,6 @@ impl Qwen35Provider {
                 None,
                 None,
                 &[],
-                #[cfg(any(feature = "specprefill", test))]
                 PrefillMode::Dense,
                 on_delta,
             )?;
@@ -1885,7 +1633,6 @@ impl Qwen35Provider {
                     }),
                     None,
                     &[],
-                    #[cfg(any(feature = "specprefill", test))]
                     PrefillMode::Dense,
                     on_delta,
                 )?;
@@ -2166,6 +1913,7 @@ fn load_generation_defaults(model_dir: &Path) -> Result<GenerationDefaults> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SpecPrefillConfig;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Instant;
 
