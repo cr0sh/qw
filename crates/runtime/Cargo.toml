@@ -9,6 +9,7 @@ publish = false
 default = ["dflash2"]
 dflash2 = []
 specprefill = []
+dlsa = ["dep:sha2"]
 
 [dependencies]
 anyhow.workspace = true
@@ -21,6 +22,7 @@ serde.workspace = true
 serde_json.workspace = true
 tokenizers.workspace = true
 tracing.workspace = true
+sha2 = { version = "0.11", optional = true }
 
 
 [[example]]

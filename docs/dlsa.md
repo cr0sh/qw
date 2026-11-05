@@ -541,3 +541,39 @@ This section draws on the researcher's integration notes, checked against the co
 | speedups large only at very long context | ✓ (72.4× / 42.5× is one layer at 10M, README.md:21) |
 | `.json` sidecars | ✗ not published |
 | index taken pre-RoPE, post-QK-norm, last 192 dims, gate unused | ✓ (`qwen3_5.py:115-123`, `index_space.py:8-11`) |
+
+## 10. Map files, download and loader (roadmap task 1; feature `dlsa`)
+
+- **Decision (container).** The released `.pt` is a torch zip with a pickle. `qw-runtime` reads it with a minimal built-in
+  reader (`crates/runtime/src/dlsa/torch_pt.rs`: stored zip entries plus a whitelist pickle VM that accepts only
+  `_rebuild_tensor_v2` over `FloatStorage` and `OrderedDict`; it never executes anything). No new dependency beyond `sha2`
+  (already in the lockfile), optional under `dlsa`. So `qw download` needs neither Python nor torch.
+- **Decision (converted format).** safetensors, since QW already uses it for weights and `safetensors` is a dependency.
+  Tensors `layers.<i>.w_q_idx` / `layers.<i>.w_k_idx`, **F32** `[768, 64]` (lossless; the loader casts to bf16, which is what
+  upstream serves, or keeps F32 for reference runs: `DlsaMapDtype`). One metadata key `qw_dlsa_map` holds a JSON object
+  (`format`, `source_asset`, `source_sha256`, `upstream_commit`, `index_dim`, `input_dim`, `layers`); a single key keeps the
+  output byte-deterministic (safetensors writes multi-key metadata in hash order).
+- **Hosting.** Nothing is committed or mirrored. `qw download --dlsa-map [--dlsa-pca]` (with no model identifier it skips
+  the model) downloads the upstream release asset with `curl` (URL `https://github.com/Prefrontal-AI/latent-sparse-attention/releases/download/d-lsa-weights-v1/<asset>`),
+  checks its size and sha256, converts it in Rust, checks the converted sha256 and writes it atomically to
+  `~/.cache/qw/dlsa/<asset>.safetensors` (the `.pt` stays beside it). Pins live in `dlsa/resolve.rs`:
+
+  | map | source sha256 (`.pt`) | converted sha256 (`.safetensors`, 6,294,584 B) |
+  |---|---|---|
+  | distilled (served) | `24cee934f969756db228a8df7f2bc7613979b63ac3b1d5ac3d9aa42e4339bb9b` | `00200004e8ab6cadb2738dbc466230b542fecc592e138be6c31f29d16e0462e1` |
+  | PCA step-0 | `baaa28cb00b4378b3d33e02dc971e2781482d5c4d45e29e9140143bdf7832e65` | `03dbc21117cb96c6c18f13bc4eacb6c44eb5733e9787d5c5b127ab365362f9fb` |
+
+- **Resolution** (`resolve_dlsa_map_path(kind, cli_override)`): CLI path, then `QW_DLSA_MAP_PATH`, then the cache file. Only the
+  cache file is checked against its pinned sha256; an explicit override is trusted but structurally validated by the loader.
+  Errors name the missing path and the command to run, or the expected and actual checksum.
+- **Loader** (`DlsaMaps::load(path, &DlsaLayout, DlsaMapDtype)`): `DlsaLayout::from_qwen35_config` derives the full-attention
+  layer ids and `input_dim = kv_heads * (head_dim - rotary_dim)` from the checkpoint config (3, 7, ..., 63 and 768 for
+  Qwen3.8-27B). It errors if the file's layers differ from that set (missing or unexpected), a tensor is not F32
+  `[input_dim, 64]`, or the file is not a QW map.
+- **Independent check.** `tests/fixtures/dlsa/verify_map_conversion.py` (stdlib only, no torch) compares every converted tensor
+  byte-for-byte with the `.pt`. Both real maps pass.
+- **Tests.** `cargo test -p qw-runtime --features dlsa dlsa` (synthetic archive, layout/shape/checksum errors). The
+  `#[ignore]` test `real_maps_convert_to_pinned_checksums_and_load` converts the real files (from `~/.cache/qw/dlsa` or
+  `QW_DLSA_SOURCE_DIR`), checks the pinned checksums and loads all 16 layers.
+- **Rope note for later tasks.** The loader is independent of rope scaling: the index reads dims 64..255, which RoPE (YaRN
+  included) never touches (§1), so QW's lack of YaRN does not change what the maps read.
