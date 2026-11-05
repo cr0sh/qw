@@ -27,6 +27,53 @@ pub enum DlsaShortContext {
     Sparse,
 }
 
+/// Where the sparse forward selects and reads (`docs/dlsa.md` §14.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DlsaBackend {
+    /// Task 3: scores read back, host pick and expansion, masked SDPA (prefill) or take + SDPA
+    /// (decode). The oracle the Metal paths are checked against.
+    Mlx,
+    /// The Metal kernels: K1 select on the device, K2 sparse read, deferred decode index keys.
+    #[default]
+    Metal,
+    /// K1 select, then the lists read back and the task-3 MLX read: bit-identical to
+    /// [`Mlx`](Self::Mlx) (a parity mode; it syncs every forward).
+    MetalSelect,
+}
+
+impl DlsaBackend {
+    /// `mlx`, `metal` or `metal-select`.
+    pub fn parse(name: &str) -> Result<Self> {
+        match name.trim() {
+            "mlx" => Ok(Self::Mlx),
+            "metal" => Ok(Self::Metal),
+            "metal-select" => Ok(Self::MetalSelect),
+            other => anyhow::bail!("unknown D-LSA backend {other:?} (mlx, metal, metal-select)"),
+        }
+    }
+
+    /// The backend named by `QW_DLSA_BACKEND`, else the default ([`Metal`](Self::Metal)).
+    pub fn from_env() -> Result<Self> {
+        match std::env::var(super::DLSA_BACKEND_ENV) {
+            Ok(name) if !name.trim().is_empty() => Self::parse(&name),
+            _ => Ok(Self::default()),
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Mlx => "mlx",
+            Self::Metal => "metal",
+            Self::MetalSelect => "metal-select",
+        }
+    }
+
+    /// Whether the select runs on the device (K1).
+    pub fn device_select(self) -> bool {
+        self != Self::Mlx
+    }
+}
+
 /// How D-LSA runs on a loaded model.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DlsaConfig {
@@ -38,10 +85,13 @@ pub struct DlsaConfig {
     pub short_context: DlsaShortContext,
     /// Query rows one additive read mask covers in a prefill chunk (`rows x T` mask bytes).
     pub prefill_mask_rows: usize,
+    /// Where the select and the read run; `Mlx` is the task-3 oracle.
+    pub backend: DlsaBackend,
 }
 
 impl DlsaConfig {
-    /// Defaults: bf16 maps, the Qwen indexer defaults, the dense fallback, 256-row masks.
+    /// Defaults: bf16 maps, the Qwen indexer defaults, the dense fallback, 256-row masks, the
+    /// Metal backend.
     pub fn new(map_path: PathBuf) -> Self {
         Self {
             map_path,
@@ -49,12 +99,17 @@ impl DlsaConfig {
             index: DlsaIndexConfig::QWEN_DEFAULTS,
             short_context: DlsaShortContext::DenseFallback,
             prefill_mask_rows: 256,
+            backend: DlsaBackend::default(),
         }
     }
 
-    /// Defaults on the map that `resolve_dlsa_map_path` finds (CLI override, env, cache).
+    /// Defaults on the map that `resolve_dlsa_map_path` finds (CLI override, env, cache), with
+    /// the backend `QW_DLSA_BACKEND` names (default Metal).
     pub fn resolve(kind: DlsaMapKind, map_override: Option<&Path>) -> Result<Self> {
-        Ok(Self::new(resolve_dlsa_map_path(kind, map_override)?))
+        Ok(Self {
+            backend: DlsaBackend::from_env()?,
+            ..Self::new(resolve_dlsa_map_path(kind, map_override)?)
+        })
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -172,11 +227,18 @@ impl DlsaRuntime {
         state.1 = DlsaStats::default();
     }
 
+    /// The counters, with the keys the Metal reads visited resolved (one sync for them).
     pub(crate) fn stats(&self) -> DlsaStats {
-        self.state.borrow().1
+        let mut state = self.state.borrow_mut();
+        let (caches, stats) = &mut *state;
+        for cache in caches.iter_mut() {
+            stats.keys_read += cache.keys_read.take();
+        }
+        *stats
     }
 
-    /// Bytes the bucket caches hold (host allocations plus device centroids); maps excluded.
+    /// Bytes the bucket caches hold (host allocations, device mirrors and deferred keys); maps
+    /// excluded.
     pub(crate) fn memory_bytes(&self) -> usize {
         self.state
             .borrow()

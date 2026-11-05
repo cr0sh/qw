@@ -751,6 +751,7 @@ mod tests {
             "--dlsa-window <DLSA_WINDOW>",
             "--dlsa-top-k <DLSA_TOP_K>",
             "--dlsa-top-p <DLSA_TOP_P>",
+            "--dlsa-backend <metal|mlx|metal-select>",
         ] {
             assert!(help.contains(option), "{option}: {help}");
         }
@@ -778,6 +779,8 @@ mod tests {
             "2048",
             "--dlsa-top-p",
             "512",
+            "--dlsa-backend",
+            "mlx",
         ])
         .expect("CLI");
         validate_cli(&cli.args).expect("fp16 D-LSA");
@@ -792,6 +795,7 @@ mod tests {
             (options.sink, options.window, options.top_k, options.top_p),
             (Some(8), Some(256), Some(2048), Some(512))
         );
+        assert_eq!(options.backend, Some(qw_runtime::DlsaBackend::Mlx));
 
         let error = TestCli::try_parse_from(["qw-server", "--dlsa-map-kind", "other"])
             .expect_err("bad kind")

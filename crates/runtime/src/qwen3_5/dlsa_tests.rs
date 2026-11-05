@@ -17,7 +17,9 @@ use crate::dlsa::test_model::{
     TEST_HEAD_DIM, TEST_HEADS, TEST_INDEX, TEST_KV_HEADS, allclose_excess, noise, noise_array,
     test_maps,
 };
-use crate::dlsa::{DlsaConfig, DlsaIndexConfig, DlsaMapDtype, DlsaShortContext, to_host_f32};
+use crate::dlsa::{
+    DlsaBackend, DlsaConfig, DlsaIndexConfig, DlsaMapDtype, DlsaShortContext, to_host_f32,
+};
 
 pub(super) const HIDDEN: i32 = 64;
 pub(super) const VOCAB: i32 = 64;
@@ -121,13 +123,49 @@ pub(super) fn dlsa_test_model(mode: KVCacheMode) -> Qwen35Model {
     Qwen35Model::from_weights(&weights, &config, mode).expect("small hybrid weights")
 }
 
+/// Every backend: the task-3 oracle, the Metal kernels, and the parity mode.
+pub(super) const BACKENDS: [DlsaBackend; 3] = [
+    DlsaBackend::Mlx,
+    DlsaBackend::Metal,
+    DlsaBackend::MetalSelect,
+];
+
+/// The test config on the backend `QW_DLSA_BACKEND` names (default Metal), so the tests that do
+/// not loop over [`BACKENDS`] (the serving tests among them) run under any backend.
 pub(super) fn test_config(index: DlsaIndexConfig, short_context: DlsaShortContext) -> DlsaConfig {
     DlsaConfig {
         map_dtype: DlsaMapDtype::F32,
         index,
         short_context,
         prefill_mask_rows: 24,
+        backend: DlsaBackend::from_env().expect("QW_DLSA_BACKEND"),
         ..DlsaConfig::new(PathBuf::new())
+    }
+}
+
+/// `(rtol, atol)` for a backend's logits against task 3 or dense: `fp16` as given; the Metal
+/// read under int8 KV 1e-3, as a K2 rounding difference (~1e-5) can move a later layer's key
+/// across an int8 quantization step.
+pub(super) fn metal_tolerance(
+    mode: KVCacheMode,
+    backend: DlsaBackend,
+    fp16: (f32, f32),
+) -> (f32, f32) {
+    if backend == DlsaBackend::Metal && mode == KVCacheMode::Int8 {
+        (1e-3, 1e-3)
+    } else {
+        fp16
+    }
+}
+
+pub(super) fn backend_config(
+    index: DlsaIndexConfig,
+    short_context: DlsaShortContext,
+    backend: DlsaBackend,
+) -> DlsaConfig {
+    DlsaConfig {
+        backend,
+        ..test_config(index, short_context)
     }
 }
 
@@ -201,18 +239,20 @@ fn short_context_is_bitwise_dense() {
     let toks = tokens(48, 1);
     let sched = schedule(&[40], 8);
     let dense = run(&dlsa_test_model(KVCacheMode::Fp16), &toks, &sched);
-    let model = dlsa_model(
-        KVCacheMode::Fp16,
-        test_config(TEST_INDEX, DlsaShortContext::DenseFallback),
-    );
-    let got = run(&model, &toks, &sched);
-    assert_bitwise(&got, &dense, "dense fallback");
-    let stats = model.dlsa_stats().unwrap();
-    assert_eq!(stats.sparse_forwards, 0);
-    assert_eq!(stats.dense_key_set_forwards, 2 * sched.len() as u64);
-    // The index is built all along, so later forwards find the blocks clustered
-    assert_eq!(dlsa_lens(&model), vec![48, 48]);
-    assert!(model.dlsa_memory_bytes() > 0);
+    for backend in BACKENDS {
+        let model = dlsa_model(
+            KVCacheMode::Fp16,
+            backend_config(TEST_INDEX, DlsaShortContext::DenseFallback, backend),
+        );
+        let got = run(&model, &toks, &sched);
+        assert_bitwise(&got, &dense, &format!("dense fallback ({backend:?})"));
+        let stats = model.dlsa_stats().unwrap();
+        assert_eq!(stats.sparse_forwards, 0);
+        assert_eq!(stats.dense_key_set_forwards, 2 * sched.len() as u64);
+        // The index is built all along, so later forwards find the blocks clustered
+        assert_eq!(dlsa_lens(&model), vec![48, 48]);
+        assert!(model.dlsa_memory_bytes() > 0);
+    }
 }
 
 #[test]
@@ -226,59 +266,158 @@ fn covering_top_k_matches_dense() {
     let sched = schedule(&[64, 37, 64, 37, 64, 34], 10);
     for mode in [KVCacheMode::Fp16, KVCacheMode::Int8] {
         let dense = run(&dlsa_test_model(mode), &toks, &sched);
-        let model = dlsa_model(mode, test_config(covering, DlsaShortContext::Sparse));
-        let got = run(&model, &toks, &sched);
-        assert_allclose(
-            &got,
-            &dense,
-            1e-4,
-            1e-5,
-            &format!("covering top-k ({mode})"),
-        );
-        let stats = model.dlsa_stats().unwrap();
-        assert_eq!(stats.dense_key_set_forwards, 0);
-        assert_eq!(stats.sparse_forwards, 2 * sched.len() as u64);
-        // Every row read its whole causal context
-        let rows = toks.len() as u64;
-        assert_eq!(stats.sparse_rows, 2 * rows);
-        assert_eq!(stats.keys_read, 2 * rows * (rows + 1) / 2);
+        for backend in BACKENDS {
+            let model = dlsa_model(
+                mode,
+                backend_config(covering, DlsaShortContext::Sparse, backend),
+            );
+            let got = run(&model, &toks, &sched);
+            eprintln!(
+                "covering top-k ({mode}, {backend:?}): max abs vs dense {:e}, max |dense| {:e}",
+                crate::dlsa::test_model::max_abs_diff(&got, &dense),
+                dense.iter().fold(0f32, |m, v| m.max(v.abs()))
+            );
+            // K2 rounds differently from SDPA (about 1e-5 here); under int8 KV a later
+            // layer's quantization can turn that into one quantization step of a key
+            let (rtol, atol) = metal_tolerance(mode, backend, (1e-4, 1e-5));
+            assert_allclose(
+                &got,
+                &dense,
+                rtol,
+                atol,
+                &format!("covering top-k ({mode}, {backend:?})"),
+            );
+            let stats = model.dlsa_stats().unwrap();
+            assert_eq!(stats.dense_key_set_forwards, 0);
+            assert_eq!(stats.sparse_forwards, 2 * sched.len() as u64);
+            // Every row read its whole causal context
+            let rows = toks.len() as u64;
+            assert_eq!(stats.sparse_rows, 2 * rows);
+            assert_eq!(stats.keys_read, 2 * rows * (rows + 1) / 2, "{backend:?}");
+        }
     }
+}
+
+/// The schedules of `decode_prefill_consistency`.
+fn consistency_schedules() -> [Vec<usize>; 3] {
+    [
+        vec![260],
+        schedule(&[100], 160),
+        schedule(&[37, 37, 37, 37, 37, 37, 37], 1),
+    ]
 }
 
 #[test]
 fn decode_prefill_consistency() {
     let toks = tokens(260, 3);
-    let schedules = [
-        vec![260],
-        schedule(&[100], 160),
-        schedule(&[37, 37, 37, 37, 37, 37, 37], 1),
-    ];
-    let config = test_config(TEST_INDEX, DlsaShortContext::DenseFallback);
-    let mut reference: Option<(Vec<f32>, Qwen35Model)> = None;
-    for sched in &schedules {
-        let model = dlsa_model(KVCacheMode::Fp16, config.clone());
-        let logits = run(&model, &toks, sched);
-        assert_eq!(dlsa_lens(&model), vec![260, 260]);
-        let Some((ref_logits, ref_model)) = &reference else {
-            let stats = model.dlsa_stats().unwrap();
-            assert_eq!(stats.sparse_forwards, 2, "one sparse forward a layer");
-            reference = Some((logits, model));
-            continue;
-        };
-        let what = format!("schedule of {} forwards", sched.len());
-        assert_allclose(&logits, ref_logits, 1e-4, 1e-4, &what);
-        let a = model.dlsa.as_ref().unwrap().state.borrow();
-        let b = ref_model.dlsa.as_ref().unwrap().state.borrow();
-        for (layer, (x, y)) in a.0.iter().zip(&b.0).enumerate() {
-            assert_eq!(x.members(), y.members(), "{what}: layer {layer} members");
-            assert_eq!(x.sizes(), y.sizes(), "{what}: layer {layer} sizes");
-            let diff = crate::dlsa::test_model::max_abs_diff(x.centroids(), y.centroids());
-            assert!(
-                diff <= 1e-6,
-                "{what}: layer {layer} centroids differ by {diff:e}"
-            );
+    for backend in BACKENDS {
+        let config = backend_config(TEST_INDEX, DlsaShortContext::DenseFallback, backend);
+        let mut reference: Option<(Vec<f32>, Qwen35Model)> = None;
+        for sched in &consistency_schedules() {
+            let model = dlsa_model(KVCacheMode::Fp16, config.clone());
+            let logits = run(&model, &toks, sched);
+            assert_eq!(dlsa_lens(&model), vec![260, 260]);
+            let Some((ref_logits, ref_model)) = &reference else {
+                let stats = model.dlsa_stats().unwrap();
+                assert_eq!(stats.sparse_forwards, 2, "one sparse forward a layer");
+                reference = Some((logits, model));
+                continue;
+            };
+            let what = format!("{backend:?}: schedule of {} forwards", sched.len());
+            assert_allclose(&logits, ref_logits, 1e-4, 1e-4, &what);
+            let mut a = model.dlsa.as_ref().unwrap().state.borrow_mut();
+            let mut b = ref_model.dlsa.as_ref().unwrap().state.borrow_mut();
+            for (layer, (x, y)) in a.0.iter_mut().zip(b.0.iter_mut()).enumerate() {
+                assert_eq!(x.members(), y.members(), "{what}: layer {layer} members");
+                assert_eq!(x.sizes(), y.sizes(), "{what}: layer {layer} sizes");
+                let diff = crate::dlsa::test_model::max_abs_diff(x.centroids(), y.centroids());
+                assert!(
+                    diff <= 1e-6,
+                    "{what}: layer {layer} centroids differ by {diff:e}"
+                );
+                let diff = crate::dlsa::test_model::max_abs_diff(x.tail_keys(), y.tail_keys());
+                assert!(
+                    diff <= 1e-6,
+                    "{what}: layer {layer} tail keys differ by {diff:e}"
+                );
+            }
         }
     }
+}
+
+/// Metal select + the task-3 MLX read gives the task-3 logits bit for bit, on every schedule
+/// and both KV modes; the Metal read is close to them.
+#[test]
+fn metal_select_is_bitwise_task3_and_metal_read_is_close() {
+    let toks = tokens(260, 3);
+    for mode in [KVCacheMode::Fp16, KVCacheMode::Int8] {
+        for sched in &consistency_schedules() {
+            let logits = |backend| {
+                let config = backend_config(TEST_INDEX, DlsaShortContext::DenseFallback, backend);
+                let model = dlsa_model(mode, config);
+                let logits = run(&model, &toks, sched);
+                (logits, model.dlsa_stats().unwrap())
+            };
+            let (task3, task3_stats) = logits(DlsaBackend::Mlx);
+            let what = format!("{mode}, {} forwards", sched.len());
+            let (parity, parity_stats) = logits(DlsaBackend::MetalSelect);
+            assert_bitwise(
+                &parity,
+                &task3,
+                &format!("metal select + mlx read ({what})"),
+            );
+            assert_eq!(parity_stats.keys_read, task3_stats.keys_read, "{what}");
+            let (metal, metal_stats) = logits(DlsaBackend::Metal);
+            let (rtol, atol) = metal_tolerance(mode, DlsaBackend::Metal, (1e-4, 1e-4));
+            assert_allclose(&metal, &task3, rtol, atol, &format!("metal ({what})"));
+            assert_eq!(metal_stats.keys_read, task3_stats.keys_read, "{what}");
+            assert_eq!(metal_stats.sparse_rows, task3_stats.sparse_rows, "{what}");
+        }
+    }
+}
+
+/// Greedy tokens of `steps` decode steps after a chunked prefill of `prompt`.
+fn greedy(model: &Qwen35Model, prompt: &[i32], chunk: usize, steps: usize) -> Vec<i32> {
+    let argmax = |logits: &[f32]| {
+        let last = &logits[logits.len() - VOCAB as usize..];
+        (0..VOCAB as usize).fold(0, |best, i| if last[i] > last[best] { i } else { best }) as i32
+    };
+    let mut last = Vec::new();
+    for part in prompt.chunks(chunk) {
+        let input = mlxcel_core::from_slice_i32(part, &[1, part.len() as i32]);
+        last = to_host_f32(&model.forward(&input, &mut [], None));
+    }
+    let mut out = Vec::with_capacity(steps);
+    for _ in 0..steps {
+        let token = argmax(&last);
+        out.push(token);
+        let input = mlxcel_core::from_slice_i32(&[token], &[1, 1]);
+        last = to_host_f32(&model.forward(&input, &mut [], None));
+    }
+    out
+}
+
+#[test]
+fn metal_greedy_tokens_equal_task3() {
+    let prompt = tokens(150, 7);
+    let run_backend = |backend| {
+        let config = backend_config(TEST_INDEX, DlsaShortContext::DenseFallback, backend);
+        let model = dlsa_model(KVCacheMode::Fp16, config);
+        let tokens = greedy(&model, &prompt, 48, 60);
+        assert!(model.dlsa_stats().unwrap().sparse_forwards > 0);
+        tokens
+    };
+    let task3 = run_backend(DlsaBackend::Mlx);
+    assert_eq!(
+        run_backend(DlsaBackend::Metal),
+        task3,
+        "metal greedy tokens"
+    );
+    assert_eq!(
+        run_backend(DlsaBackend::MetalSelect),
+        task3,
+        "parity greedy tokens"
+    );
 }
 
 #[test]
@@ -408,17 +547,19 @@ fn refusals_and_snapshot_guards() {
 fn reset_restarts_the_index_and_reproduces_outputs() {
     let toks = tokens(130, 5);
     let sched = schedule(&[70, 50], 10);
-    let model = dlsa_model(
-        KVCacheMode::Fp16,
-        test_config(TEST_INDEX, DlsaShortContext::DenseFallback),
-    );
-    let first = run(&model, &toks, &sched);
-    assert!(model.dlsa_stats().unwrap().sparse_forwards > 0);
-    model.reset_runtime_state();
-    assert_eq!(dlsa_lens(&model), vec![0, 0]);
-    assert_eq!(model.dlsa_stats().unwrap(), Default::default());
-    let second = run(&model, &toks, &sched);
-    assert_bitwise(&second, &first, "after reset");
+    for backend in BACKENDS {
+        let model = dlsa_model(
+            KVCacheMode::Fp16,
+            backend_config(TEST_INDEX, DlsaShortContext::DenseFallback, backend),
+        );
+        let first = run(&model, &toks, &sched);
+        assert!(model.dlsa_stats().unwrap().sparse_forwards > 0);
+        model.reset_runtime_state();
+        assert_eq!(dlsa_lens(&model), vec![0, 0]);
+        assert_eq!(model.dlsa_stats().unwrap(), Default::default());
+        let second = run(&model, &toks, &sched);
+        assert_bitwise(&second, &first, &format!("after reset ({backend:?})"));
+    }
 }
 
 #[test]
@@ -426,19 +567,21 @@ fn disable_restores_bitwise_dense() {
     let toks = tokens(120, 6);
     let sched = schedule(&[60, 50], 10);
     let dense = run(&dlsa_test_model(KVCacheMode::Fp16), &toks, &sched);
-    let mut model = dlsa_model(
-        KVCacheMode::Fp16,
-        test_config(TEST_INDEX, DlsaShortContext::DenseFallback),
-    );
-    let sparse = run(&model, &toks, &sched);
-    assert!(
-        allclose_excess(&sparse, &dense, 1e-4, 1e-4) > 0.0,
-        "the sparse run should differ from dense at this sparsity"
-    );
-    model.disable_dlsa();
-    assert!(!model.dlsa_enabled());
-    let got = run(&model, &toks, &sched);
-    assert_bitwise(&got, &dense, "after disable");
+    for backend in BACKENDS {
+        let mut model = dlsa_model(
+            KVCacheMode::Fp16,
+            backend_config(TEST_INDEX, DlsaShortContext::DenseFallback, backend),
+        );
+        let sparse = run(&model, &toks, &sched);
+        assert!(
+            allclose_excess(&sparse, &dense, 1e-4, 1e-4) > 0.0,
+            "the sparse run should differ from dense at this sparsity"
+        );
+        model.disable_dlsa();
+        assert!(!model.dlsa_enabled());
+        let got = run(&model, &toks, &sched);
+        assert_bitwise(&got, &dense, &format!("after disable ({backend:?})"));
+    }
 }
 
 /// Real-model checks with the released map (`docs/dlsa.md` §12). Run one at a time:

@@ -107,6 +107,11 @@ fn main() {
         // values rather than written through.
         .file("../mlx-cpp/turbo/fused_norm.cpp")
         .file("../mlx-cpp/turbo/fused_rope_append.cpp")
+        // D-LSA kernels (docs/dlsa.md §14.1): the fused top-p bucket select +
+        // expansion (`dlsa_select`) and the sparse gather attention over the
+        // selected read lists (`dlsa_sparse_attention`).
+        .file("cpp/mlx_cxx_dlsa.cpp")
+        .file("cpp/mlx_cxx_dlsa_attention.cpp")
         .include(&mlx_include)
         .include("cpp")
         .include("../mlx-cpp/turbo")
@@ -200,6 +205,9 @@ fn main() {
     println!("cargo:rerun-if-changed=cpp/mlx_cxx_ggml.cpp");
     println!("cargo:rerun-if-changed=cpp/mlx_cxx_nemotron.cpp");
     println!("cargo:rerun-if-changed=cpp/mlx_cxx_ext.cpp");
+    println!("cargo:rerun-if-changed=cpp/mlx_cxx_dlsa.cpp");
+    println!("cargo:rerun-if-changed=cpp/mlx_cxx_dlsa_attention.h");
+    println!("cargo:rerun-if-changed=cpp/mlx_cxx_dlsa_attention.cpp");
     println!("cargo:rerun-if-changed=metal/fused_attention_metal4.metal");
     println!("cargo:rerun-if-changed=../mlx-cpp/CMakeLists.txt");
     println!("cargo:rerun-if-changed=../mlx-cpp/patches");

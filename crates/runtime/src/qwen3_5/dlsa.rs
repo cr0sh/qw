@@ -60,6 +60,7 @@ impl Qwen35Model {
             map_dtype = ?runtime.config.map_dtype,
             index = ?runtime.config.index,
             short_context = ?runtime.config.short_context,
+            backend = runtime.config.backend.name(),
             layers = runtime.layer_ordinal.len(),
             "D-LSA enabled"
         );
@@ -374,7 +375,13 @@ impl Qwen35Model {
     /// counters are kept: they cover the model's forwards, not the sequence.
     pub(super) fn install_dlsa_caches(&self, caches: Option<Vec<DlsaBucketCache>>) {
         if let (Some(dlsa), Some(caches)) = (&self.dlsa, caches) {
-            dlsa.state.borrow_mut().0 = caches;
+            let mut state = dlsa.state.borrow_mut();
+            let (old, stats) = &mut *state;
+            // Keep the replaced indexes' lazy key counts (one sync, at a restore)
+            for cache in old.iter_mut() {
+                stats.keys_read += cache.take_keys_read();
+            }
+            *old = caches;
         }
     }
 }

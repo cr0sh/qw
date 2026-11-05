@@ -12,7 +12,7 @@ use tracing::warn;
 use super::config::DlsaIndexConfig;
 use super::convert::sha256_hex;
 use super::resolve::{DLSA_MAP_ENV, DlsaMapKind, resolve_dir};
-use super::runtime::DlsaConfig;
+use super::runtime::{DlsaBackend, DlsaConfig};
 
 /// `1`/`true` enables D-LSA, `0`/`false` leaves it off.
 pub const DLSA_ENV: &str = "QW_DLSA";
@@ -22,6 +22,8 @@ pub const DLSA_SINK_ENV: &str = "QW_DLSA_SINK";
 pub const DLSA_WINDOW_ENV: &str = "QW_DLSA_WINDOW";
 pub const DLSA_TOP_K_ENV: &str = "QW_DLSA_TOP_K";
 pub const DLSA_TOP_P_ENV: &str = "QW_DLSA_TOP_P";
+/// `mlx`, `metal` (default) or `metal-select`: where the select and the read run.
+pub const DLSA_BACKEND_ENV: &str = "QW_DLSA_BACKEND";
 
 /// The window the released maps were distilled at; it is also the cluster block size.
 pub const DISTILLED_WINDOW: usize = 512;
@@ -53,6 +55,8 @@ pub struct DlsaOptions {
     pub top_k: Option<usize>,
     /// `--dlsa-top-p`.
     pub top_p: Option<usize>,
+    /// `--dlsa-backend`.
+    pub backend: Option<DlsaBackend>,
 }
 
 /// A resolved D-LSA setting: the config to enable and the map kind it was resolved for.
@@ -105,6 +109,7 @@ impl DlsaOptions {
             (self.window.is_some(), "--dlsa-window"),
             (self.top_k.is_some(), "--dlsa-top-k"),
             (self.top_p.is_some(), "--dlsa-top-p"),
+            (self.backend.is_some(), "--dlsa-backend"),
         ]
         .into_iter()
         .filter_map(|(given, flag)| given.then_some(flag))
@@ -165,7 +170,16 @@ impl DlsaOptions {
             DLSA_TOP_P_ENV,
             defaults.top_p,
         )?;
+        let backend = match self.backend {
+            Some(backend) => backend,
+            None => match non_empty(&env, DLSA_BACKEND_ENV) {
+                Some(raw) => DlsaBackend::parse(&raw)
+                    .with_context(|| format!("{DLSA_BACKEND_ENV} is invalid"))?,
+                None => DlsaBackend::default(),
+            },
+        };
         let mut config = DlsaConfig::new(PathBuf::new());
+        config.backend = backend;
         config.index = DlsaIndexConfig {
             window_size: window,
             sink_size: sink,
@@ -199,7 +213,9 @@ impl DlsaOptions {
 }
 
 /// What a prefix-cache entry built under D-LSA depends on: the map file's bytes, the map dtype,
-/// the index config and the short-context policy.
+/// the index config, the short-context policy and the read (the Metal read rounds differently
+/// from the MLX one, so their KV never mix; Metal select + MLX read is bitwise the MLX path
+/// and shares its entries).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DlsaIdentity {
     pub map_sha256: String,
@@ -218,9 +234,13 @@ pub fn dlsa_identity(config: &DlsaConfig) -> Result<DlsaIdentity> {
     let map_sha256 = map_sha256(&config.map_path)?;
     let index = &config.index;
     let bytes = format!(
-        "qw-dlsa;map_sha256={map_sha256};map_dtype={:?};short_context={:?};window={};sink={};top_k={};top_p={};index_dim={};pool={};bucket={};cap={}",
+        "qw-dlsa;map_sha256={map_sha256};map_dtype={:?};short_context={:?};read={};window={};sink={};top_k={};top_p={};index_dim={};pool={};bucket={};cap={}",
         config.map_dtype,
         config.short_context,
+        match config.backend {
+            DlsaBackend::Mlx | DlsaBackend::MetalSelect => "mlx",
+            DlsaBackend::Metal => "metal",
+        },
         index.window_size,
         index.sink_size,
         index.top_k,
@@ -455,12 +475,58 @@ mod tests {
         let mut config = DlsaConfig::new(a.clone());
         config.map_dtype = DlsaMapDtype::F32;
         assert_ne!(base, dlsa_identity(&config).unwrap());
-        let mut config = DlsaConfig::new(a);
+        let mut config = DlsaConfig::new(a.clone());
         config.short_context = DlsaShortContext::Sparse;
         assert_ne!(base, dlsa_identity(&config).unwrap());
+        // The default (Metal) read never shares KV with the MLX read; the parity mode does
+        assert_eq!(DlsaConfig::new(a.clone()).backend, DlsaBackend::Metal);
+        let on = |backend| {
+            let mut config = DlsaConfig::new(a.clone());
+            config.backend = backend;
+            dlsa_identity(&config).unwrap()
+        };
+        assert_ne!(base, on(DlsaBackend::Mlx));
+        assert_eq!(on(DlsaBackend::Mlx), on(DlsaBackend::MetalSelect));
         let err = dlsa_identity(&DlsaConfig::new(dir.join("missing")))
             .unwrap_err()
             .to_string();
         assert!(err.contains("cannot read D-LSA map"), "{err}");
+    }
+
+    #[test]
+    fn backend_comes_from_the_flag_then_the_variable() {
+        let dir = tmp("backend");
+        let map = map_file(&dir, "m.safetensors", b"m");
+        let on = DlsaOptions {
+            enabled: true,
+            map_path: Some(map),
+            ..Default::default()
+        };
+        let backend = |options: &DlsaOptions, pairs: &[(&str, &str)]| {
+            options.resolve(env(pairs)).unwrap().unwrap().config.backend
+        };
+        assert_eq!(backend(&on, &[]), DlsaBackend::Metal);
+        assert_eq!(
+            backend(&on, &[(DLSA_BACKEND_ENV, "metal-select")]),
+            DlsaBackend::MetalSelect
+        );
+        let mlx = DlsaOptions {
+            backend: Some(DlsaBackend::Mlx),
+            ..on.clone()
+        };
+        assert_eq!(
+            backend(&mlx, &[(DLSA_BACKEND_ENV, "metal")]),
+            DlsaBackend::Mlx
+        );
+        let err = on.resolve(env(&[(DLSA_BACKEND_ENV, "cuda")])).unwrap_err();
+        assert!(format!("{err:#}").contains(DLSA_BACKEND_ENV), "{err:#}");
+        let err = DlsaOptions {
+            backend: Some(DlsaBackend::Mlx),
+            ..Default::default()
+        }
+        .resolve(env(&[]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--dlsa-backend requires --dlsa"), "{err}");
     }
 }

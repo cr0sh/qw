@@ -2949,6 +2949,49 @@ mod ffi {
 
         /// Take (move out) the i-th weight array, leaving the slot empty
         fn loaded_weights_take(w: Pin<&mut MlxLoadedWeights>, index: usize) -> UniquePtr<MlxArray>;
+
+        // ── D-LSA (docs/dlsa.md §14) ──────────────────────────────────────
+        /// D-LSA fused top-p bucket select + expansion (K1); see `dlsa_kernels.rs`.
+        fn dlsa_select(
+            scores: &MlxArray,
+            members: &MlxArray,
+            positions: &MlxArray,
+            total_rows: i32,
+            window: i32,
+            sink: i32,
+            top_k: i32,
+            top_p: i32,
+            bucket_cap: i32,
+            buckets_per_block: i32,
+            threads: i32,
+            lists_out: &mut UniquePtr<MlxArray>,
+            lengths_out: &mut UniquePtr<MlxArray>,
+            picked_out: &mut UniquePtr<MlxArray>,
+            status_out: &mut UniquePtr<MlxArray>,
+        ) -> Result<()>;
+
+        /// D-LSA fused sparse gather-attention (K2); see `dlsa_attention.rs`.
+        fn dlsa_sparse_attention(
+            q: &MlxArray,
+            k: &MlxArray,
+            v: &MlxArray,
+            lists: &MlxArray,
+            lengths: &MlxArray,
+            scale: f32,
+        ) -> Result<UniquePtr<MlxArray>>;
+
+        /// The same with explicit launch knobs (tests/benches): `parts` 0 = auto, 1 = one pass, >1 = split-K partitions;
+        /// `simdgroups` 0 = auto.
+        fn dlsa_sparse_attention_with(
+            q: &MlxArray,
+            k: &MlxArray,
+            v: &MlxArray,
+            lists: &MlxArray,
+            lengths: &MlxArray,
+            scale: f32,
+            parts: i32,
+            simdgroups: i32,
+        ) -> Result<UniquePtr<MlxArray>>;
     }
 }
 
@@ -3347,6 +3390,12 @@ pub mod autotune;
 // Public so that the correctness harness under `examples/` and the follow-up
 // production wiring (#899) can drive the plan and the launch directly.
 pub mod paged_v2;
+
+// D-LSA kernels (docs/dlsa.md §14.1): the fused bucket select (K1) and the
+// sparse gather attention over its read lists (K2). Used only by qw-runtime's
+// `dlsa` feature.
+pub mod dlsa_attention;
+pub mod dlsa_kernels;
 
 // Crate-wide helpers for `#[cfg(test)]` paths. Provides the single shared
 // `ENV_LOCK` that every env-mutating test in this crate must acquire; see `test_support::env_lock` for the rationale. `pub(crate)` so
