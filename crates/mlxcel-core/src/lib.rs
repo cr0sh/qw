@@ -2986,51 +2986,17 @@ pub use sampling_dispatch::{
     reset_sampling_dispatch,
 };
 
-// Re-export Axis B language-steering types so downstream consumers (CLI, server, B6–B8)
-// can use them without referencing the internal module path.
-pub use lang_analyzer::{
-    ExceptionConfig, InclusionPolicy, LangAnalyzerError, LangBiasConfig, LangBiasSet, LanguageCode,
-};
-
-// Re-export the shared mlxcel cache-root resolver (`${MLXCEL_CACHE_DIR:-$HOME/.cache/mlxcel}`)
-// so downstream crates (e.g. the `mlxcel` CLI downloader's global model store, issue #93)
-// derive their on-disk locations from the exact same root and env-var semantics the
-// tokenizer language-analysis disk cache already uses.
-pub use lang_analyzer::cache_root;
-
-/// Default the CUDA NVRTC PTX cache to a persistent, MLX-pin-scoped directory
-/// under the mlxcel cache root, unless `MLX_PTX_CACHE_DIR` is already set.
+/// Resolve the mlxcel cache root directory.
 ///
-/// MLX's own default places the JIT cache in the system temp dir
-/// (`$TMPDIR/mlx/<version>/ptx`), which is cleared on reboot, so the first-run
-/// kernel compilation is paid again every boot. A persistent location pays it
-/// once per machine. The directory is scoped by the pinned MLX commit because
-/// the cache is keyed only by kernel name and is not validated against the
-/// kernel source, so entries must not survive an MLX upgrade. No-op on non-CUDA
-/// builds, when `MLX_PTX_CACHE_DIR` is already set, and when the cache root
-/// cannot be resolved. Call once at startup before the first inference.
-pub fn ensure_persistent_ptx_cache() {
-    if !cfg!(feature = "cuda") {
-        return;
-    }
-    if std::env::var_os("MLX_PTX_CACHE_DIR").is_some() {
-        return;
-    }
-    let Some(root) = cache_root() else {
-        return;
-    };
-    let commit = env!("MLXCEL_MLX_COMMIT");
-    let scope = &commit[..commit.len().min(12)];
-    let dir = root.join("cuda-ptx").join(scope);
-    if std::fs::create_dir_all(&dir).is_ok() {
-        // SAFETY: set_var mutates the process-global environment and is unsound
-        // only under a concurrent getenv/setenv on another thread. Per this
-        // function's documented contract, all in-tree callers invoke it once at
-        // startup right after CLI parsing (src/main.rs, src/bin/mlx_server.rs),
-        // before the first CUDA NVRTC JIT compile, any model load, or any worker
-        // thread touches the environment, so no other thread is accessing it here.
-        unsafe { std::env::set_var("MLX_PTX_CACHE_DIR", &dir) };
-    }
+/// Reads `MLXCEL_CACHE_DIR` from the environment; falls back to
+/// `$HOME/.cache/mlxcel` via [`dirs::home_dir`]. Returns `None` only when
+/// neither `MLXCEL_CACHE_DIR` nor a home directory can be determined.
+///
+/// Used by: the autotune tactic store (`autotune::store::TacticStore::from_cache_root`)
+pub fn cache_root() -> Option<std::path::PathBuf> {
+    std::env::var_os("MLXCEL_CACHE_DIR")
+        .map(std::path::PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|h| h.join(".cache/mlxcel")))
 }
 
 fn use_single_query_maskless_path() -> bool {
@@ -3350,14 +3316,6 @@ pub mod sampling_dispatch;
 // Speculative decoding
 pub mod speculative;
 
-// Drafter trait + DrafterKind enum + model_type auto-detection. Foundational scaffolding for the Gemma 4 MTP and Qwen 3.5
-// DFlash drafter ports. Concrete drafter impls land.
-// The existing classic `SpeculativeGenerator` above is unchanged — MTP and
-// DFlash are peer code paths, not replacements.
-// TODO: wrap the existing SpeculativeGenerator in a
-// Drafter-trait adapter so the round-loop drivers can dispatch uniformly.
-pub mod drafter;
-
 // Generation-time stream selection and installation wrappers.
 // Public so that the server batch scheduler can install its own generation stream.
 pub mod streams;
@@ -3377,20 +3335,11 @@ pub mod memory;
 // Currently: proportional RoPE used by Gemma 4 full-attention layers.
 pub mod rope_proportional;
 
-// Unicode-script classifier and language-steering index for Axis B.
-// Public so that mlxcel (the main crate) and downstream sub-issues (B3–B8)
-// can consume it without further structural changes.
-pub mod lang_analyzer;
-
 // Shape-bucketed kernel autotuner (issue #906): the TunableOp contract, the
 // median-of-N profiling harness, the persistent tactic cache, and the first
 // consumers. Default off; see the module docs for the precedence chain.
 // Public so that the `mlxcel tune` CLI subcommand can drive it offline.
 pub mod autotune;
-
-// Last-level-cache-aware rotating buffers for microbenchmarks (issue #906).
-// Public so that the harnesses under `examples/` can defeat cache warming.
-pub mod bench_rotation;
 
 // Paged-attention decode v2: CSR page table, cross-CTA split-KV, and the
 // variable-length merge kernel (issue #898). Default off; selected by
@@ -3399,17 +3348,9 @@ pub mod bench_rotation;
 // production wiring (#899) can drive the plan and the launch directly.
 pub mod paged_v2;
 
-// Matrix-absorbed MLA decode over a compressed-latent KV cache (issue #907).
-// Default off; selected by `MLXCEL_MLA_ABSORBED=1` at family load time. Public
-// so the DeepSeek-family model code in the `mlxcel` crate and the benchmark
-// harness under `examples/` can build the fold, wrap the latent cache, and
-// drive both decode paths directly. Stage 2 reuses issue #898's merge kernel
-// unchanged; see `mla::split_kv`.
-pub mod mla;
-
 // Crate-wide helpers for `#[cfg(test)]` paths. Provides the single shared
 // `ENV_LOCK` that every env-mutating test in this crate must acquire; see `test_support::env_lock` for the rationale. `pub(crate)` so
-// that test modules at any depth (e.g. `crate::lang_analyzer::cache::tests`)
+// that test modules at any depth (e.g. `crate::cache::sparse_v_tests`)
 // can name it as `crate::test_support::env_lock`.
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -3455,17 +3396,6 @@ mod sampling_min_p_top_k_tests;
 #[cfg(test)]
 #[path = "gpu_exclusivity_tests.rs"]
 mod gpu_exclusivity_tests;
-
-// Guard against running this suite multi-threaded on the CUDA backend (issue
-// #1048). The libtest default of one thread per core drives MLX concurrently and
-// takes the process down with SIGABRT partway through, at a different test and
-// with a different CUDA error each run, so the abort reads as "whichever test
-// was running is broken". Disabling graph capture does not help; only
-// serializing does. CUDA-only: the Metal hazard is the cross-process one in
-// #1008, which `gpu_exclusivity_tests` above covers.
-#[cfg(all(test, feature = "cuda"))]
-#[path = "cuda_test_serialization_tests.rs"]
-mod cuda_test_serialization_tests;
 
 #[cfg(test)]
 #[path = "fused_norm_parity_tests.rs"]

@@ -230,7 +230,7 @@ impl Embedding {
     /// (DFlash) that lazy-bind the target's embedding table at `bind()`
     /// time instead of loading their own `embed_tokens.weight`.
     ///
-    /// Used by: DFlash drafter lazy-bind path (`Drafter::bind`)
+    /// Used by: DFlash2 drafter lazy-bind path (`qw-runtime`)
     pub fn clone_shared(&self) -> Self {
         Self {
             weight: ffi::copy(&self.weight),
@@ -379,7 +379,7 @@ impl QuantizedEmbedding {
     /// weight / scales / biases buffers (lazy-array share via `ffi::copy`,
     /// no element copy).
     ///
-    /// Used by: DFlash drafter lazy-bind path (`Drafter::bind`)
+    /// Used by: DFlash2 drafter lazy-bind path (`qw-runtime`)
     pub fn clone_shared(&self) -> Self {
         Self {
             weight: ffi::copy(&self.weight),
@@ -468,13 +468,12 @@ impl UnifiedEmbedding {
     /// This is the lazy-bind primitive used by speculative drafters whose
     /// checkpoint omits `embed_tokens.weight` and instead resolve it from
     /// the target at `bind()` time — most notably the upstream
-    /// `z-lab/Qwen3.5-4B-DFlash` checkpoint (see
-    /// `crate::drafter::dflash::DFlashDraftModel`). The drafter holds the
+    /// `z-lab/Qwen3.5-4B-DFlash` checkpoint. The drafter holds the
     /// returned handle for the lifetime of the speculative session; it
     /// stays valid independently of the target because MLX arrays are
     /// reference-counted.
     ///
-    /// Used by: DFlash drafter lazy-bind path (`Drafter::bind`)
+    /// Used by: DFlash2 drafter lazy-bind path (`qw-runtime`)
     pub fn clone_shared(&self) -> Self {
         match self {
             Self::Quantized(e) => Self::Quantized(e.clone_shared()),
@@ -488,10 +487,7 @@ impl UnifiedEmbedding {
     /// For quantized embeddings this is the packed quantized weight (not yet
     /// dequantized). Callers that need the dequantized weight for a matmul
     /// should use [`Self::as_linear`] instead; this accessor is provided for
-    /// use-cases that need to pass the weight reference to an external op
-    /// (e.g. [`crate::drafter::masked_embedder::MaskedEmbedder::forward`]).
-    ///
-    /// Used by: Gemma4AssistantDraftModel (centroid/MaskedEmbedder LM head path)
+    /// use-cases that need to pass the weight reference to an external op.
     pub fn weight(&self) -> &MlxArray {
         match self {
             Self::Quantized(e) => e.weight.as_ref().expect("non-null quantized weight"),
@@ -4100,8 +4096,8 @@ pub(crate) enum SdpaMaskKind {
 }
 
 /// Whether the backend must materialize attention scores for this inference
-/// geometry. Keep the eligibility rules aligned with MLX's CUDA/Metal SDPA
-/// dispatch, including Metal's distinct full-query, vector and split kernels.
+/// geometry. Keep the eligibility rules aligned with MLX's Metal SDPA dispatch,
+/// including its distinct full-query, vector and split kernels.
 ///
 /// Metal mirrors `ScaledDotProductAttention::use_fallback` and
 /// `has_fused_kernel` / `use_split` in
@@ -4118,7 +4114,7 @@ fn sdpa_materializes_scores(
     softcap: f32,
     mask: SdpaMaskKind,
 ) -> bool {
-    if !cfg!(feature = "cuda") && !cfg!(feature = "metal") {
+    if !cfg!(feature = "metal") {
         return false;
     }
     if softcap > 0.0 {
@@ -4127,14 +4123,6 @@ fn sdpa_materializes_scores(
     let (Some(&dq), Some(&dv)) = (q_shape.last(), v_shape.last()) else {
         return false;
     };
-    if cfg!(feature = "cuda") {
-        let flash_eligible = dq % 8 == 0
-            && dq <= 128
-            && dv % 8 == 0
-            && dv <= 128
-            && (dtype == crate::dtype::FLOAT16 || dtype == crate::dtype::BFLOAT16);
-        return !flash_eligible;
-    }
     if q_shape.len() != 4 || k_shape.len() != 4 || k_shape[1] <= 0 {
         return false;
     }

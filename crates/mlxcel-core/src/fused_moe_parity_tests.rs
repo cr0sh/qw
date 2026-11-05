@@ -45,10 +45,7 @@
 //! `mx.fast.cuda_kernel`, so the tests skip (return early) on CPU-only builds,
 //! matching the convention of the fused paged-decode tests in `ffi_tests.rs`.
 //!
-//! Run on CUDA (GB10 etc.):
-//!   MLX_CUDA_ARCHITECTURES=121 cargo test -p mlxcel-core --release \
-//!     --features cuda fused_moe_geglu
-//! Run on Apple Silicon:
+//! Run:
 //!   cargo test -p mlxcel-core --release fused_moe_geglu
 
 use super::*;

@@ -26,10 +26,6 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use super::bucket::{MAX_BUCKET_DIM, ShapeBucket, powers_of_two_up_to, round_up_pow2};
-use super::ops::cuda_kernel_knobs::{
-    QMV_MAX_ROWS_HARD, TILE_M_CAP_BLACKWELL, TILE_M_CAP_DEFAULT, TILE_M_MIN, default_tile_m,
-    max_rows_candidates, tile_m_candidates,
-};
 use super::ops::paged_decode_splits::split_candidates;
 use super::profile::{
     Measurement, ProfileConfig, ProfileResult, ProfileTimer, median, median_absolute_deviation,
@@ -944,33 +940,4 @@ fn paged_decode_split_candidates_cover_the_budget_ceiling() {
     assert_eq!(split_candidates(28), vec![1, 2, 4, 8, 16, 28]);
     assert_eq!(split_candidates(1), vec![1]);
     assert_eq!(split_candidates(0), vec![1]);
-}
-
-#[test]
-fn qmm_tile_default_mirrors_the_kernel_formula() {
-    // make_cta_tiler: max(16, min(cap, next_power_of_2(m))).
-    assert_eq!(default_tile_m(1, TILE_M_CAP_DEFAULT), TILE_M_MIN);
-    assert_eq!(default_tile_m(100, TILE_M_CAP_DEFAULT), 64);
-    assert_eq!(default_tile_m(8192, TILE_M_CAP_DEFAULT), 64);
-    assert_eq!(default_tile_m(8192, TILE_M_CAP_BLACKWELL), 128);
-    assert_eq!(default_tile_m(33, TILE_M_CAP_BLACKWELL), 64);
-}
-
-#[test]
-fn qmm_tile_candidates_stop_at_the_arch_cap() {
-    assert_eq!(tile_m_candidates(TILE_M_CAP_DEFAULT), vec![16, 32, 64]);
-    assert_eq!(
-        tile_m_candidates(TILE_M_CAP_BLACKWELL),
-        vec![16, 32, 64, 128]
-    );
-    // A nonsense cap still yields the minimum tile rather than an empty set.
-    assert_eq!(tile_m_candidates(0), vec![16]);
-}
-
-#[test]
-fn qmv_multirow_candidates_span_the_documented_window() {
-    let c = max_rows_candidates();
-    assert_eq!(c.first().copied(), Some(1));
-    assert_eq!(c.last().copied(), Some(QMV_MAX_ROWS_HARD));
-    assert_eq!(c.len(), QMV_MAX_ROWS_HARD as usize);
 }

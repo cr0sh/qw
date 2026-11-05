@@ -194,18 +194,8 @@ pub fn recommended_wired_limit(system_memory_bytes: u64, metal_recommended_bytes
 /// Default periodic decode-loop cache-clear cadence, in generated tokens.
 ///
 /// On Metal, trimming the MLX buffer cache every 256 tokens is cheap and
-/// matches Python mlx-lm. On CUDA, dropping cached buffers forces the CUDA
-/// memory pool to reallocate on the next step and defeats MLX's CUDA-graph
-/// executable cache (graph reuse depends on stable buffer addresses;
-/// ml-explore/mlx#2358), so the periodic clear is a net loss. Issue #627
-/// disables it by default on CUDA and bounds the cache via [`set_cache_limit`]
-/// (`MLXCEL_CACHE_LIMIT`) instead. `0` means "never clear on cadence".
-#[cfg(feature = "cuda")]
-pub const DEFAULT_CACHE_CLEAR_INTERVAL: usize = 0;
-/// Default periodic decode-loop cache-clear cadence, in generated tokens.
-/// See the `cuda` variant for the rationale; on Metal/CPU the cheap 256-token
-/// trim used by Python mlx-lm is kept.
-#[cfg(not(feature = "cuda"))]
+/// matches Python mlx-lm. `0` (via `MLXCEL_CACHE_CLEAR_INTERVAL`) means
+/// "never clear on cadence".
 pub const DEFAULT_CACHE_CLEAR_INTERVAL: usize = 256;
 
 const CACHE_CLEAR_INTERVAL_ENV: &str = "MLXCEL_CACHE_CLEAR_INTERVAL";

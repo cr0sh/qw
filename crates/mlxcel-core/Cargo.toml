@@ -13,18 +13,14 @@ crate-type = ["lib"]
 default = []
 metal = []
 accelerate = []
-cuda = []
 
 [dependencies]
 cxx = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-unicode-script = "0.5"
 smallvec = { version = "1.13", features = ["serde"] }
 sha2 = "0.11"
 thiserror = "2.0"
-tokenizers = "0.22.2"
-postcard = { version = "1", features = ["alloc"] }
 dirs = "6"
 libm = "0.2"
 tracing = "0.1"
