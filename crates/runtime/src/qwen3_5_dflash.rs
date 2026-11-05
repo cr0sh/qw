@@ -4380,12 +4380,33 @@ mod tests {
     #[test]
     #[ignore = "requires real QW_MODEL_PATH and QW_DFLASH_DRAFT_MODEL_PATH checkpoints"]
     fn real_model_constrained_prompt_bases_restore_after_splice_and_rollback() {
+        constrained_prompt_bases_restore_after_splice_and_rollback(crate::KVCacheMode::Turbo4);
+    }
+
+    /// R8 of D-LSA task 5: the same with D-LSA on (fp16 KV, the distilled map).
+    #[cfg(feature = "dlsa")]
+    #[test]
+    #[ignore = "requires real QW_MODEL_PATH and QW_DFLASH_DRAFT_MODEL_PATH checkpoints and the converted D-LSA map"]
+    fn real_dlsa_constrained_prompt_bases_restore_after_splice_and_rollback() {
+        constrained_prompt_bases_restore_after_splice_and_rollback(crate::KVCacheMode::Fp16);
+    }
+
+    /// The parser-boundary restore checks, on a Turbo4 target (packed attention), or on an
+    /// fp16 target with D-LSA on (feature `dlsa`).
+    fn constrained_prompt_bases_restore_after_splice_and_rollback(mode: crate::KVCacheMode) {
         use mlxcel_core::generate::ConstraintCommit;
 
         let model_dir = crate::resolve_model_path(None).expect("resolve target");
         let draft_dir = crate::resolve_dflash2_draft_path(None).expect("resolve drafter");
-        let target =
-            Qwen35Model::load(&model_dir, crate::KVCacheMode::Turbo4).expect("load target");
+        #[allow(unused_mut)]
+        let mut target = Qwen35Model::load(&model_dir, mode).expect("load target");
+        let dlsa = mode != crate::KVCacheMode::Turbo4;
+        #[cfg(feature = "dlsa")]
+        if dlsa {
+            let config =
+                crate::DlsaConfig::resolve(crate::DlsaMapKind::Distilled, None).expect("D-LSA map");
+            target.enable_dlsa(config).expect("enable D-LSA");
+        }
         let mut generator = Qwen35Dflash2Generator::new(&target, &draft_dir).expect("load drafter");
         let tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
             .expect("load target tokenizer");
@@ -4504,14 +4525,20 @@ mod tests {
                     assert_eq!(generated.token_ids, expected);
                     assert_eq!(constraint.committed, expected);
                     let final_snapshot = generated.final_snapshot.expect("final snapshot");
+                    let attention = if dlsa { "keys" } else { "k_packed" };
                     assert!(
                         (0..target.config.num_hidden_layers).any(|index| {
                             final_snapshot
                                 .target
-                                .paged_tensor(&format!("layer.{index}.k_packed"))
+                                .paged_tensor(&format!("layer.{index}.{attention}"))
                                 .is_some()
                         }),
-                        "fixture must exercise packed Turbo4 attention"
+                        "fixture must exercise {attention} attention storage"
+                    );
+                    assert_eq!(
+                        final_snapshot.target.tensor("meta.dlsa.index").is_some(),
+                        dlsa,
+                        "D-LSA index state in the snapshot"
                     );
                     let mut continuation_prompt = prompt.to_vec();
                     continuation_prompt.extend_from_slice(expected);

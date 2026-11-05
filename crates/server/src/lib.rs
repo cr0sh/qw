@@ -8,6 +8,11 @@ mod media;
 pub mod protocol;
 mod tool_calls;
 
+#[cfg(feature = "dlsa")]
+mod dlsa_args;
+#[cfg(feature = "dlsa")]
+pub use dlsa_args::{DlsaArgs, process_env as dlsa_process_env};
+
 #[cfg(feature = "specprefill")]
 mod specprefill_policy;
 #[cfg(not(feature = "specprefill"))]

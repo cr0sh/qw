@@ -54,6 +54,8 @@ const TURBO4_PACKED_MTP_THRESHOLD_TOKENS: i32 = 2_048;
 #[cfg(feature = "dlsa")]
 mod dlsa;
 #[cfg(all(test, feature = "dlsa"))]
+mod dlsa_serving_tests;
+#[cfg(all(test, feature = "dlsa"))]
 mod dlsa_tests;
 #[cfg(any(feature = "specprefill", test))]
 mod specprefill;
@@ -1020,14 +1022,8 @@ impl Qwen35Model {
             self.initial_prefill_complete.load(Ordering::Relaxed),
         );
         #[cfg(feature = "dlsa")]
-        if let Some(dlsa) = &self.dlsa {
-            return self.forward_backbone_dlsa(
-                dlsa,
-                input_ids,
-                input_embeddings,
-                caches,
-                position_ids,
-            );
+        if self.dlsa.is_some() {
+            return self.forward_backbone_dlsa(input_ids, input_embeddings, caches, position_ids);
         }
         let mut hidden = input_embeddings
             .map(mlxcel_core::copy)
@@ -1236,7 +1232,9 @@ impl Qwen35Model {
         F: FnMut(i32, i32, &MlxArray),
     {
         #[cfg(feature = "dlsa")]
-        self.dlsa_refusal("MTP prefill")?;
+        if input_embeddings.is_some() || position_ids.is_some() {
+            self.dlsa_refusal("MTP image prefill")?;
+        }
         self.reset_runtime_state();
         let shape = mlxcel_core::array_shape(input_ids);
         let prompt_len = shape[1];
@@ -1319,8 +1317,6 @@ impl Qwen35Model {
     where
         F: FnMut(&MlxArray, &MlxArray),
     {
-        #[cfg(feature = "dlsa")]
-        self.dlsa_refusal("MTP suffix prefill")?;
         let shape = mlxcel_core::array_shape(input_ids);
         let suffix_len = shape[1];
         if suffix_len == 0 {
@@ -1362,8 +1358,6 @@ impl Qwen35Model {
     }
 
     pub(crate) fn forward_mtp_verify(&self, input_ids: &MlxArray) -> Qwen35MtpVerifyOutput {
-        #[cfg(feature = "dlsa")]
-        self.refuse_dlsa("MTP verify");
         let rope_delta = self.mrope_state.rope_delta();
         let (output, offset) = self.sequence_state.with_internal(|caches| {
             let mut hidden = self.embed_tokens.forward(input_ids);
@@ -1381,14 +1375,27 @@ impl Qwen35Model {
             let mut gdn_states = Vec::with_capacity(self.layers.len());
             for (layer_idx, (layer, cache)) in self.layers.iter().zip(caches.iter_mut()).enumerate()
             {
-                hidden = layer.forward_with_capture(
+                #[cfg(feature = "dlsa")]
+                let sparse = self.forward_layer_dlsa(
                     layer_idx,
                     &hidden,
-                    None,
                     cache,
                     position_ids.as_deref(),
-                    &mut gdn_states,
+                    false,
                 );
+                #[cfg(not(feature = "dlsa"))]
+                let sparse = None;
+                hidden = match sparse {
+                    Some(hidden) => hidden,
+                    None => layer.forward_with_capture(
+                        layer_idx,
+                        &hidden,
+                        None,
+                        cache,
+                        position_ids.as_deref(),
+                        &mut gdn_states,
+                    ),
+                };
             }
             let normalized = self.norm.forward(&hidden);
             // Only draft proposals may use a restricted vocabulary. Verification
@@ -1420,8 +1427,6 @@ impl Qwen35Model {
         input_ids: &MlxArray,
         target_layer_ids: &[usize],
     ) -> Qwen35DflashVerifyOutput {
-        #[cfg(feature = "dlsa")]
-        self.refuse_dlsa("DFlash2 verify");
         let rope_delta = self.mrope_state.rope_delta();
         let (output, offset) = self.sequence_state.with_internal(|caches| {
             let mut hidden = self.embed_tokens.forward(input_ids);
@@ -1440,14 +1445,27 @@ impl Qwen35Model {
             let mut gdn_states = Vec::new();
             for (layer_idx, (layer, cache)) in self.layers.iter().zip(caches.iter_mut()).enumerate()
             {
-                hidden = layer.forward_with_capture(
+                #[cfg(feature = "dlsa")]
+                let sparse = self.forward_layer_dlsa(
                     layer_idx,
                     &hidden,
-                    None,
                     cache,
                     position_ids.as_deref(),
-                    &mut gdn_states,
+                    false,
                 );
+                #[cfg(not(feature = "dlsa"))]
+                let sparse = None;
+                hidden = match sparse {
+                    Some(hidden) => hidden,
+                    None => layer.forward_with_capture(
+                        layer_idx,
+                        &hidden,
+                        None,
+                        cache,
+                        position_ids.as_deref(),
+                        &mut gdn_states,
+                    ),
+                };
                 if target_layer_ids.contains(&layer_idx) {
                     hidden_by_layer.push(mlxcel_core::share(&hidden));
                 }
@@ -1511,7 +1529,9 @@ impl Qwen35Model {
         multimodal: Option<(&MlxArray, &MlxArray, i32)>,
     ) -> std::result::Result<Qwen35DflashPrefill, String> {
         #[cfg(feature = "dlsa")]
-        self.dlsa_refusal("DFlash2 prefill")?;
+        if multimodal.is_some() {
+            self.dlsa_refusal("DFlash2 image prefill")?;
+        }
         if reset {
             self.reset_runtime_state();
         }
@@ -1564,7 +1584,20 @@ impl Qwen35Model {
                 for (layer_idx, (layer, cache)) in
                     self.layers.iter().zip(caches.iter_mut()).enumerate()
                 {
-                    h = layer.forward(&h, None, cache, position_ids.as_deref());
+                    #[cfg(feature = "dlsa")]
+                    let sparse = self.forward_layer_dlsa(
+                        layer_idx,
+                        &h,
+                        cache,
+                        position_ids.as_deref(),
+                        true,
+                    );
+                    #[cfg(not(feature = "dlsa"))]
+                    let sparse = None;
+                    h = match sparse {
+                        Some(h) => h,
+                        None => layer.forward(&h, None, cache, position_ids.as_deref()),
+                    };
                     if let Some(capture_idx) = target_layer_ids.iter().position(|&t| t == layer_idx)
                     {
                         // Trim before copying so a short retained window does
@@ -1672,8 +1705,6 @@ impl Qwen35Model {
         block_size: usize,
         materialize: bool,
     ) -> Qwen35RollbackPlan {
-        #[cfg(feature = "dlsa")]
-        self.refuse_dlsa("MTP/DFlash2 rollback");
         let plan = self.sequence_state.with_internal(|caches| {
             let verify_offset = caches.first().map(Qwen3NextCache::offset).unwrap_or(0);
             let plan = rollback_plan(verify_offset, accepted, block_size);
@@ -1684,6 +1715,8 @@ impl Qwen35Model {
                     cache.trim(plan.trim);
                 }
             }
+            #[cfg(feature = "dlsa")]
+            self.rollback_dlsa(caches, plan.final_offset);
 
             for snapshot in gdn_states {
                 let Some(Qwen3NextCache::Linear(cache)) = caches.get_mut(snapshot.layer_idx) else {
@@ -1780,11 +1813,6 @@ impl Qwen35Model {
         previous: Option<&ModelStateSnapshot>,
         persistent: bool,
     ) -> Option<ModelStateSnapshot> {
-        #[cfg(feature = "dlsa")]
-        if self.dlsa.is_some() {
-            // The index state is not part of the snapshot yet (D-LSA task 5)
-            return None;
-        }
         let token_len_i32 = i32::try_from(token_len).ok()?;
         let mut snapshot = ModelStateSnapshot::new(QWEN35_SNAPSHOT_FAMILY, token_len);
         push_snapshot_i32(
@@ -1848,6 +1876,10 @@ impl Qwen35Model {
             true
         });
         if !complete {
+            return None;
+        }
+        #[cfg(feature = "dlsa")]
+        if !self.push_dlsa_snapshot(&mut snapshot, token_len) {
             return None;
         }
         snapshot.materialize();
@@ -2640,12 +2672,15 @@ fn validate_snapshot_tensor_names(
     snapshot: &ModelStateSnapshot,
     layers: &[Qwen35DecoderLayer],
     kv_cache_mode: KVCacheMode,
+    dlsa_names: Vec<String>,
 ) -> std::result::Result<(), String> {
     let mut expected = BTreeSet::from([
         "meta.layer_count".to_string(),
         "mrope.position".to_string(),
         "mrope.rope_delta".to_string(),
     ]);
+    // The D-LSA index state (empty when D-LSA is off), so the name set stays exact
+    expected.extend(dlsa_names);
     if snapshot.tensor("mrope.position_ids").is_some() {
         expected.insert("mrope.position_ids".to_string());
     }
@@ -2808,10 +2843,6 @@ impl LanguageModel for Qwen35Model {
     }
 
     fn supports_snapshot_reuse(&self) -> bool {
-        #[cfg(feature = "dlsa")]
-        if self.dlsa.is_some() {
-            return false;
-        }
         true
     }
 
@@ -2829,13 +2860,6 @@ impl LanguageModel for Qwen35Model {
         _seq_id: SequenceId,
         snapshot: &ModelStateSnapshot,
     ) -> std::result::Result<(), String> {
-        #[cfg(feature = "dlsa")]
-        if self.dlsa.is_some() {
-            return Err(
-                "Qwen3.5 snapshots do not carry D-LSA index state yet (D-LSA task 5); disable D-LSA to reuse prefixes"
-                    .to_string(),
-            );
-        }
         if snapshot.family() != QWEN35_SNAPSHOT_FAMILY {
             return Err(format!(
                 "Qwen3.5 snapshot family mismatch: expected {QWEN35_SNAPSHOT_FAMILY}, got {}",
@@ -2849,7 +2873,14 @@ impl LanguageModel for Qwen35Model {
         {
             return Err("Qwen3.5 snapshot layer count does not match the loaded model".to_string());
         }
-        validate_snapshot_tensor_names(snapshot, &self.layers, self.kv_cache_mode)?;
+        #[cfg(feature = "dlsa")]
+        let dlsa_names = self.dlsa_snapshot_names(snapshot, snapshot.token_len())?;
+        #[cfg(not(feature = "dlsa"))]
+        let dlsa_names = Vec::new();
+        validate_snapshot_tensor_names(snapshot, &self.layers, self.kv_cache_mode, dlsa_names)?;
+        // Every index is rebuilt and checked before any state is replaced
+        #[cfg(feature = "dlsa")]
+        let dlsa_caches = self.restore_dlsa_caches(snapshot)?;
 
         let mut restored = Vec::with_capacity(self.layers.len());
         for (index, layer) in self.layers.iter().enumerate() {
@@ -2995,6 +3026,8 @@ impl LanguageModel for Qwen35Model {
             value => Some(value),
         };
         self.sequence_state.replace_internal(restored);
+        #[cfg(feature = "dlsa")]
+        self.install_dlsa_caches(dlsa_caches);
         self.mrope_state
             .restore(position, snapshot.tensor("mrope.position_ids"), rope_delta);
         // A restored prefix can still be inside initial prefill. Its caller

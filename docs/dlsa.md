@@ -1,8 +1,10 @@
 # D-LSA (flat design) for Qwen3.8-27B: spec for the QW port
 
-Status: roadmap tasks 0-3 done: this spec, golden fixtures in
-[`tests/fixtures/dlsa/`](../tests/fixtures/dlsa/README.md), the map loader (§10), the indexer core (§11) and sparse
-attention in Qwen3.5's 16 full-attention layers behind `enable_dlsa` (§12; baseline decoder, fp16/int8 KV only).
+Status: roadmap tasks 0-3 and 5 done: this spec, golden fixtures in
+[`tests/fixtures/dlsa/`](../tests/fixtures/dlsa/README.md), the map loader (§10), the indexer core (§11), sparse
+attention in Qwen3.5's 16 full-attention layers behind `enable_dlsa` (§12), and serving integration (§13: snapshots and
+the prefix cache, MTP/DFlash2 verify and rollback, grammar, `qw serve --dlsa`). Task 4 (Metal kernels) is still open,
+so D-LSA is slower than dense (§12.6).
 
 D-LSA (Distilled Latent Sparse Attention, arXiv 2610.42147) leaves the attention kernel unchanged. It only decides which
 cached keys each query of a full-attention layer reads: the first `sink_size` keys, the last `window_size` keys, and up
@@ -773,7 +775,7 @@ provider.disable_dlsa();            // dense again, fresh sequence
 ```
 
 `qw generate --dlsa [--dlsa-map <PATH>]` (built with `--features dlsa`) enables it on the fp16 model `qw generate` loads
-and prints the stats to stderr. Server flags are task 5.
+and prints the stats to stderr. The serving flags, env and server integration are §13.
 
 `DlsaConfig { map_path, map_dtype (Bf16, as served; F32 for parity), index (QWEN_DEFAULTS), short_context
 (DenseFallback; Sparse only for tests), prefill_mask_rows (256) }`. `validate` checks the index config, `index_dim == 64`
@@ -817,7 +819,8 @@ Linear (GatedDeltaNet) layers, embeddings, norms and the LM head are untouched.
 | grammar constraints | expected to work (with snapshot reuse off the generator keeps no snapshot); not tested yet |
 | model-level MTP / DFlash2 prefill, verify, rollback, SpecPrefill sparse prefill | `Err` or panic with a message |
 
-Task 5 lifts the speculative, snapshot and serving refusals.
+This is the matrix task 3 shipped. Task 5 lifted the speculative, snapshot and serving refusals; the current matrix is
+§13.1.
 
 ### 12.4 Tests
 
@@ -903,3 +906,194 @@ noise. Every prefill row past 4,612 read 4,612 keys.
   per-layer sync. A GPU scan + top-p, batched projections and a gathered sparse prefill kernel are task 4.
 - Masks are `rb x T` in the q dtype: 16 MiB a 256-row block at 32k, 128 MiB at 262k.
 - The index holds about 1.6 KiB/token over the 16 layers (50 MiB at 32k), §11.7.
+
+## 13. Serving integration (roadmap task 5; feature `dlsa`)
+
+### 13.1 Support matrix
+
+| feature | under D-LSA |
+|---|---|
+| fp16 KV | supported, including snapshots and the prefix cache (memory and filesystem tiers) |
+| int8 KV | supported; no snapshots (Int8 has none without D-LSA either) |
+| turbo4 and the other packed modes | refused at `enable_dlsa`; `qw serve --dlsa` without `--no-kv-quantization` is a startup error naming the flag |
+| decoders baseline, MTP, DFlash2, `auto` | supported; `auto` selects as without D-LSA |
+| grammar-constrained decoding (all decoders) | supported; snapshots and rollback are index-aware (S5, R8) |
+| SpecPrefill | refused: its kept slots are not positions (§7.1, item 4). The server never selects it under D-LSA and logs that once at startup; a runtime call with `PrefillMode::SpecPrefill` errs |
+| image prompts | refused: `supports_image_inputs()` is false, so the server answers 400 with a D-LSA-specific message; model-level multimodal entry points err |
+| per-request switch | none: D-LSA is a property of the loaded model (§12.1) |
+
+### 13.2 Snapshots
+
+`capture_sequence_state` appends, after the KV and GatedDeltaNet state, dense tensors (`push_tensor`, never paged) for
+each full-attention layer `i`, from `DlsaBucketCache::snapshot()`:
+
+| name | dtype, shape | present |
+|---|---|---|
+| `layer.{i}.dlsa.len` | i32 `[1]` | always |
+| `layer.{i}.dlsa.centroids` | f32 `[rows, index_dim]` | `rows > 0` |
+| `layer.{i}.dlsa.members` | i32 `[rows, bucket_cap]` | `rows > 0` |
+| `layer.{i}.dlsa.sizes` | i32 `[rows]` | `rows > 0` |
+| `layer.{i}.dlsa.open_keys` | f32 `[open, index_dim]` | `open > 0` |
+| `meta.dlsa.index` | i32 `[8]`: window, sink, top_k, top_p, pool, bucket, cap, index_dim | once |
+
+with `rows = floor(len / W) * (W / bucket_size)` and `open = len mod W`. Why this shape:
+
+- `array_from_portable` rejects zero-sized dims (`portable_snapshot.rs`), so empty tables are absent, not empty.
+- The DFlash2 manifest requires every paged tensor's `token_len` to equal the snapshot's (`prefix-cache/src/codec.rs`),
+  and bucket rows are per block, not per token, so the tables are dense.
+- f32 keeps the restore bitwise.
+
+The tables cost about 650 B/token over the 16 layers (40.5 B/token/layer for closed blocks, plus 256 B per open key per
+layer), about 1% of the fp16 KV (64 KiB/token). Each snapshot copies them; there is no page sharing.
+
+Capture returns `None` while any index length differs from the token length. `supports_snapshot_reuse()` is true under
+D-LSA.
+
+**Invalidation.** Restore checks the exact name set it derives from the model's D-LSA state and each layer's
+`dlsa.len`, so a dense model rejects D-LSA snapshots and a D-LSA model rejects dense ones. Under D-LSA it then checks
+`meta.dlsa.index` against the model's index config and every `len` against the snapshot length, and rebuilds every
+layer with `DlsaBucketCache::restore` (which rejects out-of-range members) before replacing any state. The rebuilt
+caches are installed only after the KV restore succeeded; the stats are kept. In the server a restore error fails the
+request, so the prefix-cache namespace keeps D-LSA and dense entries apart (§13.5).
+
+### 13.3 Verify and rollback
+
+`forward_dlsa` commits the index at the **start** of every forward, accepting what the previous forward left after
+any rollback, and again at the end only when `DlsaLayerStep::commit` is true. The loops outside
+`forward_backbone_with_inputs` route their full-attention layers through one dispatch, `forward_layer_dlsa`: the verify
+loops `forward_mtp_verify` and `forward_dflash_verify` with `commit = false`, the DFlash2 prefill/continuation loop
+`forward_dflash_prefill_segment_chunked` with `commit = true`. Linear layers and the DFlash hidden capture are
+unchanged, and with D-LSA off the loops run their unchanged dense code. So a rollback of the latest verify can always
+reach `final_offset >= tail_start`, and the uncommitted keys stay bounded by one forward.
+
+`rollback_mtp_verify` trims the KV caches by the plan, then trims every index to `final_offset`, reopening a cluster
+block that rejected rows had closed, and asserts `index.len() == kv.offset` in every layer. `DlsaStats::rollbacks`
+counts rollbacks that dropped index keys and `reopened_blocks` those that reopened a block.
+
+Tolerances in the tests: members and sizes exact, centroids within 1e-6 (projection batch rounding, §11.5), logits
+allclose 1e-4 (fp16). A multi-row verify reads through a mask and a decode through a gather, so their rounding differs;
+with int8 KV the multi-row read already differs without D-LSA, and the int8 tests allow 5e-3 on logits and 1e-4 on
+centroids.
+
+### 13.4 Flags and environment
+
+`qw serve` and `qw generate` (built with `--features dlsa`) share `qw_server::DlsaArgs`; without the feature the
+flags do not exist. `DlsaOptions::resolve(env)` takes each value from its flag, then its variable, then
+`QWEN_DEFAULTS`; the environment is read through an injected lookup.
+
+| flag | variable | default |
+|---|---|---|
+| `--dlsa` | `QW_DLSA` (`1/true/yes/on`, `0/false/no/off`) | off |
+| `--dlsa-map` | `QW_DLSA_MAP_PATH` | the verified cache file of the map kind |
+| `--dlsa-map-kind distilled\|pca` | `QW_DLSA_MAP_KIND` | `distilled` |
+| `--dlsa-sink` | `QW_DLSA_SINK` | 4 |
+| `--dlsa-window` | `QW_DLSA_WINDOW` | 512 |
+| `--dlsa-top-k` | `QW_DLSA_TOP_K` | 4096 |
+| `--dlsa-top-p` | `QW_DLSA_TOP_P` | 1024 |
+
+The map is held in bf16 with the dense fallback (short prompts, up to 4,612 tokens under the defaults, run dense
+attention bitwise). Errors name the flag or variable: an unparsable variable, a config `DlsaConfig::validate` refuses
+(the message lists each knob with its source), a `--dlsa-*` flag without `--dlsa`/`QW_DLSA`, a missing or corrupt
+map. A window other than 512 is accepted with a warning: the maps were distilled at 512, and the window is also the
+cluster block size.
+
+### 13.5 Server
+
+- `qw serve --dlsa --no-kv-quantization`. The KV check runs on the flag (`validate_cli`) and again on the resolved
+  setting, so `QW_DLSA=1` without `--no-kv-quantization` fails too.
+- The worker loads the model, enables D-LSA, then builds the prefix-cache namespaces. The D-LSA identity (`dlsa_identity`:
+  sha256 of the map file, map dtype, short-context policy and the full index config) is appended to the namespace parts
+  **only when D-LSA is on**, so dense namespaces are byte-identical to a build without the feature; the DFlash2
+  namespace inherits it.
+- Startup logs `info!(phase = "server.dlsa", map, map_sha256, kind, map_dtype, sink, window, top_k, top_p,
+  short_context, "D-LSA armed")`, and, in a `specprefill` build, that SpecPrefill is disabled.
+- SpecPrefill's eligibility predicate (`specprefill_allowed`) is false under D-LSA.
+- Image requests get HTTP 400: "image inputs are not supported while D-LSA sparse attention is enabled on this server".
+- Each request logs `debug!(phase = "dlsa.request")` with the `DlsaStats` counters (dense-key-set and sparse forwards,
+  sparse rows, keys read, rollbacks, reopened blocks, index and select time) and `index_bytes`.
+
+### 13.6 Tests
+
+Synthetic, in `qwen3_5/dlsa_serving_tests.rs` (`./gpu-lock -- cargo test -p qw-runtime --features dlsa --lib`):
+
+| test | checks |
+|---|---|
+| T1 `snapshot_restore_continues_bitwise` | capture at 70, 64 and 10 tokens; restore into a fresh model and after a reset; 20 decodes bitwise, tables bitwise |
+| T2 `snapshot_survives_portable_round_trip` | the persisted (portable) form restores identically |
+| T3 `snapshot_restore_equals_rebuild` | restore + continue == a fresh prefill in another chunk schedule |
+| T4 `snapshot_invalidation` | dense <-> D-LSA, other index config, out-of-range member, wrong length all err; capture `None` out of step |
+| T5 `snapshot_dlsa_bytes` | the D-LSA tensors cost exactly their table bytes |
+| S1 `rollback_through_block_boundary`, `rollback_random_rounds` | 4- and 8-row verifies closing a block, rolled back to 0, 1, partial or all rows; 200 seeded tokens at widths 3 and 8, fp16 and int8; lockstep after every round |
+| S2 `covering_greedy_speculation_matches_dense`, `covering_mtp_generation_matches_dense` | covering top-k: greedy speculation and a synthetic MTP head give the dense and the sequential tokens |
+| S3 `dflash_verify_rollback_continuation` | DFlash2 verify, rollback and continuation at model level |
+| S4 `snapshot_after_partial_rollback` | a snapshot after a partial rollback restores and continues bitwise |
+| S5 `constrained_mtp_generation_matches_dense` | constrained MTP generation with forced rejections and a splice == dense |
+
+Server and CLI (`cargo test -p qw-server --features dlsa`, `-p qw-cli --features dlsa`, and without the feature): flag
+parsing and help, env precedence and error naming (`dlsa::options`), the KV refusal, namespaces (dense unchanged, D-LSA
+distinct per config), the SpecPrefill predicate, and the image 400.
+
+Real model (ignored; the model, map and text conventions of §12.5, plus the DFlash2 drafter):
+
+```text
+./gpu-lock -- cargo test --release -p qw-runtime --features dlsa --lib -- \
+  qwen3_5::dlsa_serving_tests::real real_dlsa_constrained --ignored --test-threads=1 --nocapture
+```
+
+R4 `real_speculative_short_context_matches_dense` (~4k, defaults), R5 `real_speculative_covering_matches_dense` (~8k,
+`Sparse`, top_k 8192, top_p 1024), R6 `real_speculative_needle_16k_32k`, R7 `real_snapshot_restore_is_bitwise` (16k,
+snapshot at 12,288), R8 `real_dlsa_constrained_prompt_bases_restore_after_splice_and_rollback`
+(`qwen3_5_dflash.rs`).
+
+### 13.7 Measurements
+
+Apple M4 Max (16 cores, 64 GB), base `89b4778` + this change, release build, 2026-11-05. Model
+`Jundot/Qwen3.8-27B-oQ4e-fp16-mtp` (fp16 KV), distilled map in bf16, drafter `incoai/Qwen3.8-27B-DFlash2`, greedy. All
+eight real tests (R1-R8) pass. Decode is ms/token, dense vs D-LSA; acceptance likewise.
+
+| test | decoder | tokens | acceptance | decode ms/token | rollbacks / reopened |
+|---|---|---|---|---|---|
+| R4, 4,000 tokens, defaults (all forwards on the dense fallback), 64 tokens | MTP | equal | 0.830 / 0.830 | 20.0 / 20.6 | 7 / 0 |
+| | DFlash2 | equal | 0.647 / 0.688 | 26.9 / 26.4 | 13 / 0 |
+| R5, 8,000 tokens, `Sparse`, top_k 8192, top_p 1024 (464 sparse layer forwards), 64 tokens | MTP | equal | 0.889 / 0.889 | 18.1 / 24.2 | 5 / 0 |
+| | DFlash2 | equal | 0.857 / 0.855 | 20.0 / 24.1 | 5 / 0 |
+| R6 needle, 16,322 tokens, defaults, 48 tokens | MTP | `7291-ALPHA` both | 1.000 / 1.000 | 24.7 / 26.5 | 1 / 0 |
+| | DFlash2 | `7291-ALPHA` both | 0.556 / 0.455 | 44.9 / 52.6 | 3 / 0 |
+| R6 needle, 32,706 tokens | MTP | `7291-ALPHA` both | 1.000 / 1.000 | 24.6 / 27.6 | 1 / 0 |
+| | DFlash2 | `7291-ALPHA` both | 0.455 / 0.556 | 52.2 / 54.7 | 3 / 0 |
+
+DFlash2's acceptance counters vary between runs with identical tokens (R4); R6's answers are 7 tokens, so its
+acceptance differences are noise. R5 found no divergence, so no margin was printed. No rollback reopened a block in
+these runs (the synthetic S1 tests cover reopening).
+
+- **R7**: a 16,384-token prompt snapshotted at 12,288, restored (in memory and through the portable form), the rest
+  prefilled, 32 greedy tokens: logits and tokens bitwise equal to the uninterrupted run. The snapshot is 850.4 MiB,
+  almost all fp16 KV; the D-LSA tables add about 0.6 KiB/token over the 16 layers (~1%).
+- **R8**: the DFlash2 constrained prompt bases restore after a splice and a rollback with D-LSA on; the final snapshot
+  carries `meta.dlsa.index`.
+- **Regressions (§12.5)**: R1 bitwise (prefill 15.76 s vs 15.75 s dense; index 7.8 MiB). R2 `7291-ALPHA` at 16k and
+  32k (prefill 67.6 / 69.4 s and 144.4 / 148.4 s). R3:
+
+| prompt | ppl ratio | mean KL, nats | top-1 agreement | greedy tokens equal | decode ms/token dense / D-LSA | index MiB |
+|---|---|---|---|---|---|---|
+| repo 16k | 1.0017 | 0.00090 | 0.9961 | 32 / 32 | 39.5 / 49.8 | 27.2 |
+| repo 32k | 1.0042 | 0.00260 | 0.9980 | 20 / 32 | 47.7 / 88.2 | 50.4 |
+| core 16k | 1.0025 | 0.00330 | 0.9941 | 32 / 32 | 40.2 / 53.8 | 27.2 |
+
+**Server smoke** (`qw serve --dlsa --no-kv-quantization`, a 29,307-token prompt, 64 tokens):
+
+- the `D-LSA armed` line shows sink 4, window 512, top_k 4096, top_p 1024, `DenseFallback`, `Bf16` and the pinned
+  map sha256 (`00200004e8ab…62e1`);
+- baseline, `mtp` and `dflash` each answer identically on a repeat, with `cached_tokens` 29,307; the request time
+  drops from about 135 s to 7.7 / 5.9 / 6.1 s. After a restart the filesystem tier gives the same output, again with
+  `cached_tokens` 29,307;
+- `json_schema` returns valid JSON under all three decoders;
+- an image request gets HTTP 400 "image inputs are not supported while D-LSA sparse attention is enabled on this
+  server";
+- without `--no-kv-quantization` the server exits 1 with "D-LSA (--dlsa or QW_DLSA) requires
+  --no-kv-quantization…";
+- the SpecPrefill-disabled line was not checked: that build had no `specprefill` feature.
+
+As §12.6 predicts, D-LSA costs decode time once reads are sparse: R5 +21-34%, the R6 needles +7-12% (MTP) and
++5-17% (DFlash2), R3 +26-85% (most at 32k). On the dense fallback (R4) it is within noise. Task 4's kernels and
+GPU-side selection are meant to remove this cost.

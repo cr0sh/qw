@@ -142,6 +142,71 @@ either threshold remains dense. Among eligible tokens, scoring selects chunks
 according to the keep rate while forcing the configured number of initial and
 final eligible tokens to remain. DFlash2 and other non-baseline routes remain dense.
 
+## D-LSA (experimental)
+
+D-LSA ([Distilled Latent Sparse Attention](https://github.com/Prefrontal-AI/latent-sparse-attention))
+is optional sparse attention for the full-attention layers of Qwen3.8-27B. The
+attention kernel is unchanged; a small learned index picks which cached keys
+each query reads: the first `sink` keys, the last `window` keys, and up to
+`top_k` long-range keys. Prompts short enough to read every key (up to 4,612
+tokens under the defaults) run the unchanged dense attention, bit for bit.
+The design and the port are documented in [`docs/dlsa.md`](docs/dlsa.md).
+
+It is off by default and absent from default builds. Build with the feature,
+download the checksum-pinned index map once, and start the server on an fp16
+KV cache:
+
+```bash
+cargo build --release -p qw-cli --features dlsa
+qw download --dlsa-map          # add --dlsa-pca for the training-free PCA map
+qw serve --dlsa --no-kv-quantization
+qw generate --dlsa --prompt "..."   # qw generate always uses an fp16 KV cache
+```
+
+| Flag | Environment | Default |
+| --- | --- | --- |
+| `--dlsa` | `QW_DLSA` (`1`/`true` enables, `0`/`false` leaves it off) | off |
+| `--dlsa-map <PATH>` | `QW_DLSA_MAP_PATH` | the `qw download --dlsa-map` cache under `~/.cache/qw/dlsa/` |
+| `--dlsa-map-kind distilled\|pca` | `QW_DLSA_MAP_KIND` | `distilled` (which cached map to use when no path is given) |
+| `--dlsa-sink <N>` | `QW_DLSA_SINK` | `4` |
+| `--dlsa-window <N>` | `QW_DLSA_WINDOW` | `512` (also the cluster block size; the maps were distilled at 512, other values warn) |
+| `--dlsa-top-k <N>` | `QW_DLSA_TOP_K` | `4096` |
+| `--dlsa-top-p <N>` | `QW_DLSA_TOP_P` | `1024` (buckets a query expands, at most 2048) |
+
+A flag wins over its variable, which wins over the default. The map is held in
+bf16. D-LSA is a property of the loaded model; there is no per-request switch.
+
+Startup errors, each naming what to fix: a `--dlsa-*` setting without
+`--dlsa` (or `QW_DLSA=1`); an invalid value (the message names the flag or
+variable it came from); a missing map ("run `qw download --dlsa-map` or set
+QW_DLSA_MAP_PATH"); a cached map whose sha256 differs from the pinned one;
+and, for the server, D-LSA without `--no-kv-quantization`.
+
+| Feature | Under D-LSA |
+| --- | --- |
+| fp16 KV (`--no-kv-quantization`) | supported, with snapshots and the prefix cache |
+| int8 KV (runtime API only) | supported, without snapshots (as without D-LSA) |
+| Turbo4 KV (the server default) | refused: `qw serve --dlsa` without `--no-kv-quantization` fails at startup |
+| decoders `baseline`, `mtp`, `dflash`, `auto` | supported; `auto` selects as usual |
+| grammar-constrained output (`json_schema`, tools) | supported |
+| SpecPrefill | never used: the server logs once that it is disabled; its kept KV slots are not token positions, which the index needs |
+| image inputs | refused with HTTP 400 ("image inputs are not supported while D-LSA sparse attention is enabled on this server") |
+
+**Prefix cache.** Snapshots carry the index state next to the KV cache, so the
+memory and filesystem tiers work under D-LSA as they do without it (the index
+adds about 1% to an fp16 snapshot). The cache namespace includes a D-LSA
+identity (the map file's sha256, map dtype, index settings and short-context
+policy), so snapshots from a dense server, or from one with other D-LSA
+settings, are never restored; dense namespaces are unchanged by the feature.
+
+At startup the server logs one `D-LSA armed` line (`phase="server.dlsa"`) with
+the map path, its sha256, kind, dtype and the index settings; each request logs
+`phase="dlsa.request"` at debug level with the index counters and bytes.
+
+D-LSA is currently slower than dense attention: the selection runs on the host
+and the sparse read is not a fused kernel yet. Measured costs are in
+[`docs/dlsa.md`](docs/dlsa.md) §12.6 and §13.
+
 ## Historical performance
 
 Latest complete `cargo bench` results (tokens/s), with the implementation at

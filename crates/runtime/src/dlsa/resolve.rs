@@ -121,7 +121,7 @@ fn non_empty_env_path(name: &str) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn resolve_dir(
+pub(super) fn resolve_dir(
     kind: DlsaMapKind,
     cli_override: Option<&Path>,
     env_override: Option<&Path>,

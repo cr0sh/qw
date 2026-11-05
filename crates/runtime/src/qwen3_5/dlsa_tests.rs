@@ -19,12 +19,12 @@ use crate::dlsa::test_model::{
 };
 use crate::dlsa::{DlsaConfig, DlsaIndexConfig, DlsaMapDtype, DlsaShortContext, to_host_f32};
 
-const HIDDEN: i32 = 64;
-const VOCAB: i32 = 64;
+pub(super) const HIDDEN: i32 = 64;
+pub(super) const VOCAB: i32 = 64;
 const LAYERS: usize = 4;
-const FULL_LAYERS: [usize; 2] = [1, 3];
+pub(super) const FULL_LAYERS: [usize; 2] = [1, 3];
 
-fn dlsa_test_model(mode: KVCacheMode) -> Qwen35Model {
+pub(super) fn dlsa_test_model(mode: KVCacheMode) -> Qwen35Model {
     let config: Qwen35Config = serde_json::from_value(serde_json::json!({
         "model_type": "qwen3_5_text",
         "max_position_embeddings": 4096,
@@ -121,7 +121,7 @@ fn dlsa_test_model(mode: KVCacheMode) -> Qwen35Model {
     Qwen35Model::from_weights(&weights, &config, mode).expect("small hybrid weights")
 }
 
-fn test_config(index: DlsaIndexConfig, short_context: DlsaShortContext) -> DlsaConfig {
+pub(super) fn test_config(index: DlsaIndexConfig, short_context: DlsaShortContext) -> DlsaConfig {
     DlsaConfig {
         map_dtype: DlsaMapDtype::F32,
         index,
@@ -131,7 +131,7 @@ fn test_config(index: DlsaIndexConfig, short_context: DlsaShortContext) -> DlsaC
     }
 }
 
-fn dlsa_model(mode: KVCacheMode, config: DlsaConfig) -> Qwen35Model {
+pub(super) fn dlsa_model(mode: KVCacheMode, config: DlsaConfig) -> Qwen35Model {
     let mut model = dlsa_test_model(mode);
     model
         .enable_dlsa_with_maps(config, test_maps(&FULL_LAYERS))
@@ -139,14 +139,14 @@ fn dlsa_model(mode: KVCacheMode, config: DlsaConfig) -> Qwen35Model {
     model
 }
 
-fn tokens(n: usize, seed: u64) -> Vec<i32> {
+pub(super) fn tokens(n: usize, seed: u64) -> Vec<i32> {
     (0..n as u64)
         .map(|i| ((noise(i, seed) + 0.5) * VOCAB as f32) as i32 % VOCAB)
         .collect()
 }
 
 /// Every row's logits of `forward` calls over `schedule`, concatenated `[sum(schedule), VOCAB]`.
-fn run(model: &Qwen35Model, tokens: &[i32], schedule: &[usize]) -> Vec<f32> {
+pub(super) fn run(model: &Qwen35Model, tokens: &[i32], schedule: &[usize]) -> Vec<f32> {
     assert_eq!(schedule.iter().sum::<usize>(), tokens.len());
     let mut out = Vec::with_capacity(tokens.len() * VOCAB as usize);
     let mut at = 0;
@@ -160,7 +160,7 @@ fn run(model: &Qwen35Model, tokens: &[i32], schedule: &[usize]) -> Vec<f32> {
 }
 
 /// `prefill` tokens in chunks, then single-token decode steps.
-fn schedule(chunks: &[usize], decode: usize) -> Vec<usize> {
+pub(super) fn schedule(chunks: &[usize], decode: usize) -> Vec<usize> {
     chunks
         .iter()
         .copied()
@@ -168,12 +168,12 @@ fn schedule(chunks: &[usize], decode: usize) -> Vec<usize> {
         .collect()
 }
 
-fn dlsa_lens(model: &Qwen35Model) -> Vec<usize> {
+pub(super) fn dlsa_lens(model: &Qwen35Model) -> Vec<usize> {
     model.dlsa.as_ref().expect("D-LSA on").cache_lens()
 }
 
 #[track_caller]
-fn assert_bitwise(actual: &[f32], expected: &[f32], what: &str) {
+pub(super) fn assert_bitwise(actual: &[f32], expected: &[f32], what: &str) {
     assert_eq!(actual.len(), expected.len(), "{what}: length");
     assert!(
         actual.iter().chain(expected).all(|v| v.is_finite()),
@@ -188,7 +188,7 @@ fn assert_bitwise(actual: &[f32], expected: &[f32], what: &str) {
 }
 
 #[track_caller]
-fn assert_allclose(actual: &[f32], expected: &[f32], rtol: f32, atol: f32, what: &str) {
+pub(super) fn assert_allclose(actual: &[f32], expected: &[f32], rtol: f32, atol: f32, what: &str) {
     let excess = allclose_excess(actual, expected, rtol, atol);
     assert!(
         excess <= 0.0,
@@ -338,32 +338,66 @@ fn refusals_and_snapshot_guards() {
         .restore_sequence_state(seq, &snapshot)
         .expect("dense restore");
 
-    // On: no snapshots, no speculative entry points
+    // On: snapshots carry the index; a dense snapshot is refused, and so are image prefills
     model
         .enable_dlsa_with_maps(config, test_maps(&FULL_LAYERS))
         .expect("enable D-LSA");
     run(&model, &toks, &[20]);
-    assert!(!model.supports_snapshot_reuse());
-    assert!(model.capture_sequence_state(20, None, true).is_none());
+    assert!(model.supports_snapshot_reuse());
+    let sparse_snapshot = model
+        .capture_sequence_state(20, None, true)
+        .expect("D-LSA snapshot");
     let err = model
         .restore_sequence_state(seq, &snapshot)
-        .expect_err("restore under D-LSA");
+        .expect_err("a dense snapshot under D-LSA");
     assert!(err.contains("D-LSA"), "{err}");
+    model
+        .restore_sequence_state(seq, &sparse_snapshot)
+        .expect("D-LSA restore");
+    assert_eq!(dlsa_lens(&model), vec![20, 20]);
     let input = mlxcel_core::from_slice_i32(&toks, &[1, 20]);
+    let embeddings = model.embed_tokens.forward(&input);
+    let positions = mlxcel_core::from_slice_i32(
+        &(0..3).flat_map(|_| 0..20).collect::<Vec<i32>>(),
+        &[3, 1, 20],
+    );
     let err = model
+        .forward_dflash_prefill_segment_chunked(
+            &input,
+            &[0, 1],
+            4,
+            true,
+            true,
+            8,
+            Some((&embeddings, &positions, 0)),
+        )
+        .err()
+        .expect("DFlash2 image prefill under D-LSA");
+    assert!(err.contains("D-LSA"), "{err}");
+    let err = model
+        .forward_mtp_prefill_chunks(
+            &input,
+            Some(&embeddings),
+            Some(&positions),
+            Some(0),
+            |_, _, _| {},
+        )
+        .err()
+        .expect("MTP image prefill under D-LSA");
+    assert!(err.contains("D-LSA"), "{err}");
+    // Text prefills and verifies run, and keep the index in step
+    model
         .forward_dflash_prefill_segment(&input, &[0, 1], 4, true, true)
-        .err()
         .expect("DFlash2 prefill under D-LSA");
-    assert!(err.contains("D-LSA"), "{err}");
-    let err = model
+    model
         .forward_mtp_text_suffix_chunks(&input, |_, _| {})
-        .err()
-        .expect("MTP prefill under D-LSA");
-    assert!(err.contains("D-LSA"), "{err}");
-    let verify = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        model.forward_mtp_verify(&input);
-    }));
-    assert!(verify.is_err(), "MTP verify must refuse D-LSA");
+        .expect("MTP suffix prefill under D-LSA");
+    assert_eq!(dlsa_lens(&model), vec![40, 40]);
+    let block = mlxcel_core::from_slice_i32(&toks[..4], &[1, 4]);
+    let verify = model.forward_mtp_verify(&block);
+    assert_eq!(dlsa_lens(&model), vec![44, 44]);
+    model.rollback_mtp_verify(&verify.gdn_states, 1, 4, true);
+    assert_eq!(dlsa_lens(&model), vec![42, 42]);
 
     model.disable_dlsa();
     assert!(model.supports_snapshot_reuse());
@@ -411,7 +445,7 @@ fn disable_restores_bitwise_dense() {
 /// `./gpu-lock -- cargo test --release -p qw-runtime --features dlsa --lib real_ -- --ignored
 /// --test-threads=1 --nocapture`. `QW_MODEL_PATH` / `QW_DLSA_MAP_PATH` override the default
 /// cache paths; `QW_DLSA_MAP_KIND=pca` uses the PCA step-0 map instead of the distilled one.
-mod real {
+pub(super) mod real {
     use std::path::Path;
     use std::time::{Duration, Instant};
 
@@ -425,8 +459,8 @@ mod real {
     };
     use crate::specprefill::PrefillMode;
 
-    const PREFILL_CHUNK: usize = 1536;
-    const NEEDLE: &str = "The vault code is 7291-ALPHA.";
+    pub(in crate::qwen3_5) const PREFILL_CHUNK: usize = 1536;
+    pub(in crate::qwen3_5) const NEEDLE: &str = "The vault code is 7291-ALPHA.";
 
     fn map_kind() -> DlsaMapKind {
         match std::env::var("QW_DLSA_MAP_KIND").as_deref() {
@@ -436,7 +470,7 @@ mod real {
     }
 
     /// The checkpoint and the converted map, checked first so a missing file fails at once.
-    fn real_inputs() -> (PathBuf, DlsaConfig) {
+    pub(in crate::qwen3_5) fn real_inputs() -> (PathBuf, DlsaConfig) {
         let model = crate::resolve_model_path(None).expect(
             "QW_MODEL_PATH or the default model cache must hold the Qwen3.8-27B checkpoint",
         );
@@ -484,7 +518,7 @@ mod real {
         text.replace("<|", "< |")
     }
 
-    fn repo_text() -> String {
+    pub(in crate::qwen3_5) fn repo_text() -> String {
         corpus(&["docs", "crates/runtime/src"], &["md", "rs"])
     }
 
@@ -492,7 +526,7 @@ mod real {
         corpus(&["crates/mlxcel-core/src"], &["rs"])
     }
 
-    fn encode(tokenizer: &Tokenizer, text: &str, n: usize) -> Vec<i32> {
+    pub(in crate::qwen3_5) fn encode(tokenizer: &Tokenizer, text: &str, n: usize) -> Vec<i32> {
         let ids: Vec<i32> = tokenizer
             .encode(text, false)
             .expect("encode")
@@ -504,15 +538,15 @@ mod real {
         ids[..n].to_vec()
     }
 
-    fn load_tokenizer(model_dir: &Path) -> Tokenizer {
+    pub(in crate::qwen3_5) fn load_tokenizer(model_dir: &Path) -> Tokenizer {
         Tokenizer::from_file(model_dir.join("tokenizer.json")).expect("tokenizer")
     }
 
-    fn host_logits(logits: &MlxArray) -> Vec<f32> {
+    pub(in crate::qwen3_5) fn host_logits(logits: &MlxArray) -> Vec<f32> {
         to_host_f32(logits)
     }
 
-    fn argmax(logits: &[f32]) -> i32 {
+    pub(in crate::qwen3_5) fn argmax(logits: &[f32]) -> i32 {
         let mut best = 0;
         for (i, &v) in logits.iter().enumerate() {
             assert!(v.is_finite(), "non-finite logit {v} at {i}");
@@ -524,7 +558,7 @@ mod real {
     }
 
     /// Prefill `tokens` in chunks through `forward_last_logits`; the last chunk's last logits.
-    fn prefill(model: &Qwen35Model, tokens: &[i32]) -> UniquePtr<MlxArray> {
+    pub(in crate::qwen3_5) fn prefill(model: &Qwen35Model, tokens: &[i32]) -> UniquePtr<MlxArray> {
         let mut last = None;
         for chunk in tokens.chunks(PREFILL_CHUNK) {
             let input = mlxcel_core::from_slice_i32(chunk, &[1, chunk.len() as i32]);
@@ -537,7 +571,7 @@ mod real {
     }
 
     /// A fresh greedy run: the prefill's last logits and each decode step's, and the tokens.
-    fn greedy(
+    pub(in crate::qwen3_5) fn greedy(
         model: &Qwen35Model,
         prompt: &[i32],
         steps: usize,
@@ -609,7 +643,9 @@ mod real {
         }
     }
 
-    fn greedy_sampling(provider: &Qwen35Provider) -> mlxcel_core::generate::SamplingConfig {
+    pub(in crate::qwen3_5) fn greedy_sampling(
+        provider: &Qwen35Provider,
+    ) -> mlxcel_core::generate::SamplingConfig {
         provider.baseline_sampling(
             false,
             SamplingOptions {
@@ -623,7 +659,7 @@ mod real {
     }
 
     /// A chat prompt of about `target` tokens: repository text with the needle at 25% depth.
-    fn needle_prompt(provider: &Qwen35Provider, target: usize) -> Vec<i32> {
+    pub(in crate::qwen3_5) fn needle_prompt(provider: &Qwen35Provider, target: usize) -> Vec<i32> {
         let tokenizer = provider.tokenizer();
         // This file and the docs name the code; the haystack must not
         let text = repo_text().replace("7291", "0000");
@@ -732,7 +768,7 @@ mod real {
                 eprintln!("R2 {target}: dense did not find the needle either");
             }
         }
-        // An explicit MTP request is refused while D-LSA is on
+        // An explicit MTP request runs while D-LSA is on (task 5 lifted the refusal)
         let request = GenerationRequest {
             prompt: "Hello".to_string(),
             max_tokens: 4,
@@ -747,10 +783,11 @@ mod real {
             frequency_penalty: None,
             seed: Some(0),
         };
-        let err = provider
+        let (output, stats) = provider
             .generate_streaming_in_mode(&request, Qwen35GenerationMode::Mtp, |_| true)
-            .expect_err("MTP under D-LSA");
-        assert!(err.to_string().contains("D-LSA"), "{err}");
+            .expect("MTP under D-LSA");
+        assert!(stats.is_some(), "the MTP decoder ran");
+        assert!(!output.token_ids.is_empty());
     }
 
     /// Per-row log-softmax of the teacher-forced last `tail` tokens, in 128-row pieces

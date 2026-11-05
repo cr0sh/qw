@@ -162,6 +162,9 @@ pub struct ServerArgs {
 
     #[command(flatten)]
     specprefill: crate::specprefill_policy::SpecPrefillArgs,
+    #[cfg(feature = "dlsa")]
+    #[command(flatten)]
+    dlsa: crate::DlsaArgs,
     /// Disable the default 4-bit TurboQuant KV cache.
     #[arg(long)]
     no_kv_quantization: bool,
@@ -203,6 +206,8 @@ fn validate_cli(cli: &ServerArgs) -> Result<()> {
         "--prefix-cache-filesystem-bytes must be greater than zero"
     );
     ensure!(cli.mtp_k >= 2, "--mtp-k must be at least 2");
+    #[cfg(feature = "dlsa")]
+    crate::dlsa_args::require_unquantized_kv(cli.dlsa.dlsa, cli.no_kv_quantization)?;
     #[cfg(not(feature = "dflash2"))]
     ensure!(
         cli.decoder != Decoder::Dflash2,
@@ -323,6 +328,10 @@ pub async fn serve(cli: ServerArgs) -> Result<()> {
 
     let kv_cache_mode = cli.kv_cache_mode();
     let specprefill_policy = cli.specprefill_policy();
+    #[cfg(feature = "dlsa")]
+    let dlsa = cli.dlsa.resolve(crate::dlsa_process_env)?;
+    #[cfg(feature = "dlsa")]
+    crate::dlsa_args::require_unquantized_kv(dlsa.is_some(), cli.no_kv_quantization)?;
     let model = resolve_model_path(cli.model.as_deref())?;
     #[cfg(feature = "dflash2")]
     let dflash_draft_model = resolve_dflash2_draft_path(cli.dflash_draft_model.as_deref())?;
@@ -345,6 +354,8 @@ pub async fn serve(cli: ServerArgs) -> Result<()> {
         },
         kv_cache_mode,
         specprefill_policy,
+        #[cfg(feature = "dlsa")]
+        dlsa,
     )?;
     let listener = tokio::net::TcpListener::bind(bind)
         .await
@@ -720,6 +731,95 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "dlsa"))]
+    #[test]
+    fn cli_omits_dlsa_controls_without_feature() {
+        let help = TestCli::command().render_long_help().to_string();
+        assert!(!help.contains("--dlsa"), "{help}");
+        assert!(TestCli::try_parse_from(["qw-server", "--dlsa"]).is_err());
+    }
+
+    #[cfg(feature = "dlsa")]
+    #[test]
+    fn cli_parses_dlsa_flags_and_requires_unquantized_kv() {
+        let help = TestCli::command().render_long_help().to_string();
+        for option in [
+            "--dlsa\n",
+            "--dlsa-map <DLSA_MAP>",
+            "--dlsa-map-kind <distilled|pca>",
+            "--dlsa-sink <DLSA_SINK>",
+            "--dlsa-window <DLSA_WINDOW>",
+            "--dlsa-top-k <DLSA_TOP_K>",
+            "--dlsa-top-p <DLSA_TOP_P>",
+        ] {
+            assert!(help.contains(option), "{option}: {help}");
+        }
+        let off = TestCli::try_parse_from(["qw-server"]).expect("CLI");
+        assert!(!off.args.dlsa.dlsa);
+        validate_cli(&off.args).expect("D-LSA off");
+
+        let quantized = TestCli::try_parse_from(["qw-server", "--dlsa"]).expect("CLI");
+        let message = validate_cli(&quantized.args).unwrap_err().to_string();
+        assert!(message.contains("--no-kv-quantization"), "{message}");
+
+        let cli = TestCli::try_parse_from([
+            "qw-server",
+            "--dlsa",
+            "--no-kv-quantization",
+            "--dlsa-map",
+            "/tmp/map.safetensors",
+            "--dlsa-map-kind",
+            "distilled",
+            "--dlsa-sink",
+            "8",
+            "--dlsa-window",
+            "256",
+            "--dlsa-top-k",
+            "2048",
+            "--dlsa-top-p",
+            "512",
+        ])
+        .expect("CLI");
+        validate_cli(&cli.args).expect("fp16 D-LSA");
+        let options = cli.args.dlsa.options();
+        assert!(options.enabled);
+        assert_eq!(
+            options.map_path.as_deref(),
+            Some(std::path::Path::new("/tmp/map.safetensors"))
+        );
+        assert_eq!(options.map_kind, Some(qw_runtime::DlsaMapKind::Distilled));
+        assert_eq!(
+            (options.sink, options.window, options.top_k, options.top_p),
+            (Some(8), Some(256), Some(2048), Some(512))
+        );
+
+        let error = TestCli::try_parse_from(["qw-server", "--dlsa-map-kind", "other"])
+            .expect_err("bad kind")
+            .to_string();
+        assert!(error.contains("--dlsa-map-kind"), "{error}");
+        let error = TestCli::try_parse_from(["qw-server", "--dlsa-top-k", "many"])
+            .expect_err("bad top-k")
+            .to_string();
+        assert!(error.contains("--dlsa-top-k"), "{error}");
+
+        // QW_DLSA=1 enables it as the flag does, and the KV check applies to it
+        let env_on = TestCli::try_parse_from(["qw-server"]).expect("CLI");
+        let error = env_on
+            .args
+            .dlsa
+            .resolve(|name| (name == "QW_DLSA").then(|| "1".to_string()))
+            .unwrap_err()
+            .to_string();
+        // Enabled, it looks for the cached map, and the injected env has no HOME
+        assert!(error.contains("HOME is not set"), "{error}");
+        assert!(env_on.args.dlsa.resolve(|_| None).unwrap().is_none());
+        let message = crate::dlsa_args::require_unquantized_kv(true, false)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("QW_DLSA"), "{message}");
+        crate::dlsa_args::require_unquantized_kv(true, true).expect("fp16");
+        crate::dlsa_args::require_unquantized_kv(false, false).expect("off");
+    }
     #[cfg(not(feature = "specprefill"))]
     #[test]
     fn cli_omits_specprefill_controls_without_feature() {

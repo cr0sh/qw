@@ -22,6 +22,10 @@ pub(crate) struct DlsaLayerStep<'a> {
     pub config: &'a DlsaConfig,
     pub cache: &'a mut DlsaBucketCache,
     pub stats: &'a mut DlsaStats,
+    /// Commit the index at the end of this forward (prefill, decode). A verify forward passes
+    /// `false`, so a rollback can still reopen a block it closed; every forward first commits
+    /// what the previous one left after any rollback.
+    pub commit: bool,
 }
 
 impl Qwen3NextAttention {
@@ -53,6 +57,8 @@ impl Qwen3NextAttention {
             "the D-LSA index holds {} keys but the KV cache {start}: a restore or rollback bypassed it",
             step.cache.len()
         );
+        // Accept what the previous forward left (after any rollback)
+        step.cache.commit();
         let rows = l as usize;
 
         let started = Instant::now();
@@ -75,8 +81,9 @@ impl Qwen3NextAttention {
             step.stats.select_time += started.elapsed();
             sel
         });
-        // No speculation in this path: every forward is accepted
-        step.cache.commit();
+        if step.commit {
+            step.cache.commit();
+        }
 
         let (queries, keys, values) = self.rotate(
             &heads.queries,
@@ -212,6 +219,7 @@ mod tests {
                     config: &config,
                     cache: &mut index,
                     stats: &mut stats,
+                    commit: true,
                 },
             );
 
@@ -313,6 +321,7 @@ mod tests {
                     config: &config,
                     cache: &mut index,
                     stats: &mut stats,
+                    commit: true,
                 },
             );
             let want = attention.forward_with_position_ids(&x, &mut dense_kv, None, None);

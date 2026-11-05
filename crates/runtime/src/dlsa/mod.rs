@@ -14,6 +14,7 @@ mod cache;
 mod config;
 mod convert;
 mod loader;
+mod options;
 mod project;
 mod resolve;
 mod runtime;
@@ -34,6 +35,10 @@ pub use ward::{WARD_MAX_ROUNDS, WardOutcome, pool_keys, ward_labels, ward_labels
 
 pub use convert::{METADATA_KEY, convert_pt_to_safetensors, install_dlsa_map, sha256_hex};
 pub use loader::{DlsaLayerMaps, DlsaLayout, DlsaMapDtype, DlsaMaps};
+pub use options::{
+    DISTILLED_WINDOW, DLSA_ENV, DLSA_MAP_KIND_ENV, DLSA_SINK_ENV, DLSA_TOP_K_ENV, DLSA_TOP_P_ENV,
+    DLSA_WINDOW_ENV, DlsaIdentity, DlsaOptions, ResolvedDlsa, dlsa_identity, parse_dlsa_map_kind,
+};
 pub use resolve::{
     DLSA_MAP_ENV, DlsaAsset, DlsaMapKind, dlsa_map_cache_path, dlsa_source_cache_path,
     resolve_dlsa_map_path, verify_converted_map,

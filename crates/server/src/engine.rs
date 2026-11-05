@@ -659,6 +659,7 @@ pub struct Engine {
     jobs: mpsc::Sender<Job>,
     configured_model_id: Option<Arc<str>>,
     supports_image_inputs: bool,
+    dlsa_enabled: bool,
 }
 
 impl Engine {
@@ -672,6 +673,7 @@ impl Engine {
         decoder: DecoderConfig,
         kv_cache_mode: KVCacheMode,
         specprefill_policy: SpecPrefillPolicyConfig,
+        #[cfg(feature = "dlsa")] dlsa: Option<qw_runtime::ResolvedDlsa>,
     ) -> Result<Self> {
         cache_config.validate().map_err(anyhow::Error::msg)?;
         validate_mtp_k(mtp_k)?;
@@ -690,10 +692,12 @@ impl Engine {
                     decoder,
                     kv_cache_mode,
                     specprefill_policy,
+                    #[cfg(feature = "dlsa")]
+                    dlsa,
                 ) {
                     Ok(mut worker) => {
                         let supports_image_inputs = worker.provider.supports_image_inputs();
-                        let _ = ready_tx.send(Ok(supports_image_inputs));
+                        let _ = ready_tx.send(Ok((supports_image_inputs, worker.dlsa_enabled())));
                         worker.run(jobs_rx);
                     }
                     Err(error) => {
@@ -702,13 +706,14 @@ impl Engine {
                 }
             })
             .context("failed to spawn generation thread")?;
-        let supports_image_inputs = ready_rx
+        let (supports_image_inputs, dlsa_enabled) = ready_rx
             .recv()
             .context("generation thread exited during startup")??;
         Ok(Self {
             jobs: jobs_tx,
             configured_model_id: model_id.map(Arc::from),
             supports_image_inputs,
+            dlsa_enabled,
         })
     }
 
@@ -730,7 +735,7 @@ impl Engine {
                 .any(|message| message.image_urls().next().is_some())
         {
             return Err(SubmitError::InvalidRequest(RequestError::new(
-                "model does not support image inputs",
+                image_input_refusal(self.dlsa_enabled),
                 request.image_params.first().cloned(),
             )));
         }
@@ -1127,7 +1132,16 @@ impl Engine {
             jobs: jobs_tx,
             configured_model_id: model_id.map(Arc::from),
             supports_image_inputs: true,
+            dlsa_enabled: false,
         }
+    }
+
+    /// The fake engine as a D-LSA server reports itself: image inputs refused.
+    #[cfg(test)]
+    pub fn with_dlsa_for_test(mut self) -> Self {
+        self.supports_image_inputs = false;
+        self.dlsa_enabled = true;
+        self
     }
 }
 
@@ -1173,7 +1187,94 @@ fn collect_job_batch_with_wait<T>(
     batch
 }
 
+/// The prefix-cache namespaces of a loaded model. `base` holds what every route shares (model
+/// config, tokenizer, template, KV mode). The D-LSA identity is appended only when D-LSA is on, so
+/// dense namespaces are unchanged by the feature.
+fn cache_namespaces(
+    base: &[&[u8]],
+    dlsa_identity: Option<&[u8]>,
+    #[cfg(feature = "dflash2")] dflash2_draft_config: &[u8],
+) -> CacheNamespaces {
+    let namespace_parts = |route: &'static [u8]| {
+        let mut parts = base.to_vec();
+        parts.push(route);
+        parts.extend(dlsa_identity);
+        namespace_hash(&parts)
+    };
+    CacheNamespaces {
+        baseline: namespace_parts(b"baseline"),
+        mtp: namespace_parts(b"mtp"),
+        #[cfg(feature = "dflash2")]
+        dflash2: namespace_hash(&[namespace_parts(b"dflash2").as_bytes(), dflash2_draft_config]),
+    }
+}
+
+const DLSA_IMAGE_REFUSAL: &str =
+    "image inputs are not supported while D-LSA sparse attention is enabled on this server";
+
+fn image_input_refusal(dlsa_enabled: bool) -> &'static str {
+    if dlsa_enabled {
+        DLSA_IMAGE_REFUSAL
+    } else {
+        "model does not support image inputs"
+    }
+}
+
+/// Whether a request may use SpecPrefill at all; the policy then decides by length. Never under
+/// D-LSA: SpecPrefill's KV slots are not positions, which the index requires.
+fn specprefill_allowed(
+    has_images: bool,
+    constrained: bool,
+    resuming: bool,
+    configured_decoder: Qwen35GenerationMode,
+    routed_decoder: Qwen35GenerationMode,
+    dlsa_enabled: bool,
+) -> bool {
+    !has_images
+        && !constrained
+        && !resuming
+        && matches!(
+            configured_decoder,
+            Qwen35GenerationMode::Automatic | Qwen35GenerationMode::Baseline
+        )
+        && routed_decoder != Qwen35GenerationMode::Dflash2
+        && !dlsa_enabled
+}
+
+/// Enable D-LSA on the loaded provider and log its settings; returns the namespace identity.
+#[cfg(feature = "dlsa")]
+fn enable_dlsa(provider: &mut Qwen35Provider, dlsa: qw_runtime::ResolvedDlsa) -> Result<Vec<u8>> {
+    let qw_runtime::ResolvedDlsa { config, kind } = dlsa;
+    let identity = qw_runtime::dlsa_identity(&config)?;
+    let map = config.map_path.display().to_string();
+    let (index, map_dtype, short_context) = (config.index, config.map_dtype, config.short_context);
+    provider
+        .enable_dlsa(config)
+        .context("failed to enable D-LSA")?;
+    info!(
+        phase = "server.dlsa",
+        map = %map,
+        map_sha256 = %identity.map_sha256,
+        kind = ?kind,
+        map_dtype = ?map_dtype,
+        sink = index.sink_size,
+        window = index.window_size,
+        top_k = index.top_k,
+        top_p = index.top_p,
+        short_context = ?short_context,
+        "D-LSA armed"
+    );
+    if crate::specprefill_policy::ENABLED {
+        info!(
+            phase = "server.dlsa",
+            "SpecPrefill is disabled while D-LSA is on: its KV slots are not positions"
+        );
+    }
+    Ok(identity.as_bytes().to_vec())
+}
+
 impl QwenWorker {
+    #[allow(clippy::too_many_arguments)]
     fn load(
         model_path: &Path,
         cache_config: CacheConfig,
@@ -1182,11 +1283,20 @@ impl QwenWorker {
         decoder: DecoderConfig,
         kv_cache_mode: KVCacheMode,
         specprefill_policy: SpecPrefillPolicyConfig,
+        #[cfg(feature = "dlsa")] dlsa: Option<qw_runtime::ResolvedDlsa>,
     ) -> Result<Self> {
         validate_mtp_k(mtp_k)?;
         decoder.validate()?;
         specprefill_policy.validate()?;
-        let provider = Qwen35Provider::load(model_path, kv_cache_mode)?;
+        #[cfg_attr(not(feature = "dlsa"), allow(unused_mut))]
+        let mut provider = Qwen35Provider::load(model_path, kv_cache_mode)?;
+        #[cfg(feature = "dlsa")]
+        let dlsa_identity = match dlsa {
+            Some(dlsa) => Some(enable_dlsa(&mut provider, dlsa)?),
+            None => None,
+        };
+        #[cfg(not(feature = "dlsa"))]
+        let dlsa_identity: Option<Vec<u8>> = None;
         select_qwen35_decoder(
             decoder.mode,
             provider.has_mtp(),
@@ -1231,31 +1341,24 @@ impl QwenWorker {
         let selected_template =
             selected_template.context("loaded provider has no selected chat template")?;
         let cache_mode = format!("{kv_cache_mode:?}");
-        let namespace_parts = |route: &'static [u8]| {
-            namespace_hash(&[
+        #[cfg(feature = "dflash2")]
+        let dflash2_draft_config = if decoder.dflash2_available() {
+            std::fs::read(decoder.dflash2_draft_model.join("config.json"))
+                .context("failed to read DFlash2 config for prefix cache namespace")?
+        } else {
+            Vec::new()
+        };
+        let namespaces = cache_namespaces(
+            &[
                 &config_bytes,
                 &tokenizer_bytes,
                 &selected_template,
                 cache_mode.as_bytes(),
-                route,
-            ])
-        };
-        #[cfg(feature = "dflash2")]
-        let dflash2_namespace = {
-            let draft_config = if decoder.dflash2_available() {
-                std::fs::read(decoder.dflash2_draft_model.join("config.json"))
-                    .context("failed to read DFlash2 config for prefix cache namespace")?
-            } else {
-                Vec::new()
-            };
-            namespace_hash(&[namespace_parts(b"dflash2").as_bytes(), &draft_config])
-        };
-        let namespaces = CacheNamespaces {
-            baseline: namespace_parts(b"baseline"),
-            mtp: namespace_parts(b"mtp"),
+            ],
+            dlsa_identity.as_deref(),
             #[cfg(feature = "dflash2")]
-            dflash2: dflash2_namespace,
-        };
+            &dflash2_draft_config,
+        );
         let prefix_cache =
             AdaptivePrefixCache::new(namespaces, cache_config).map_err(anyhow::Error::msg)?;
         Ok(Self {
@@ -1267,6 +1370,17 @@ impl QwenWorker {
             mtp_k,
             decoder,
         })
+    }
+
+    fn dlsa_enabled(&self) -> bool {
+        #[cfg(feature = "dlsa")]
+        {
+            self.provider.dlsa_enabled()
+        }
+        #[cfg(not(feature = "dlsa"))]
+        {
+            false
+        }
     }
     fn run(&mut self, mut jobs: mpsc::Receiver<Job>) {
         while let Some(first) = jobs.blocking_recv() {
@@ -1334,7 +1448,7 @@ impl QwenWorker {
             send_failure(
                 &job,
                 FailureKind::InvalidRequest,
-                "model does not support image inputs".to_string(),
+                image_input_refusal(self.dlsa_enabled()).to_string(),
                 job.request.image_params.first().cloned(),
             );
             return;
@@ -1485,14 +1599,14 @@ impl QwenWorker {
                 enable_thinking,
                 prompt_ids: &prompt_ids,
                 has_images,
-                allowed: !has_images
-                    && constraint.is_none()
-                    && job.request.resume_response_id.is_none()
-                    && matches!(
-                        self.decoder.mode,
-                        Qwen35GenerationMode::Automatic | Qwen35GenerationMode::Baseline
-                    )
-                    && routed_decoder != Qwen35GenerationMode::Dflash2,
+                allowed: specprefill_allowed(
+                    has_images,
+                    constraint.is_some(),
+                    job.request.resume_response_id.is_some(),
+                    self.decoder.mode,
+                    routed_decoder,
+                    self.dlsa_enabled(),
+                ),
             },
             self.specprefill_policy,
         );
@@ -1990,6 +2104,21 @@ impl QwenWorker {
             cached_tokens = generated.cached_tokens,
             stop_reason = ?generated.finish_outcome,
         );
+        #[cfg(feature = "dlsa")]
+        if let Some(stats) = self.provider.dlsa_stats() {
+            debug!(
+                phase = "dlsa.request",
+                dense_key_set_forwards = stats.dense_key_set_forwards,
+                sparse_forwards = stats.sparse_forwards,
+                sparse_rows = stats.sparse_rows,
+                keys_read = stats.keys_read,
+                rollbacks = stats.rollbacks,
+                reopened_blocks = stats.reopened_blocks,
+                index_ms = stats.index_time.as_secs_f64() * 1e3,
+                select_ms = stats.select_time.as_secs_f64() * 1e3,
+                index_bytes = self.provider.dlsa_memory_bytes(),
+            );
+        }
         let prior_metadata = resume_entry.as_ref().map(|resume| resume.metadata.clone());
         let mut combined_token_ids = prior_metadata
             .as_ref()
@@ -2289,6 +2418,93 @@ fn new_admission(endpoint: Endpoint) -> Admission {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn namespaces_for(dlsa_identity: Option<&[u8]>) -> CacheNamespaces {
+        cache_namespaces(
+            &[b"config", b"tokenizer", b"template", b"Fp16"],
+            dlsa_identity,
+            #[cfg(feature = "dflash2")]
+            b"draft-config",
+        )
+    }
+
+    fn all(namespaces: &CacheNamespaces) -> Vec<String> {
+        #[cfg_attr(not(feature = "dflash2"), allow(unused_mut))]
+        let mut all = vec![namespaces.baseline.clone(), namespaces.mtp.clone()];
+        #[cfg(feature = "dflash2")]
+        all.push(namespaces.dflash2.clone());
+        all
+    }
+
+    #[test]
+    fn dense_namespaces_are_unchanged_and_dlsa_ones_are_distinct() {
+        let dense = namespaces_for(None);
+        // What the server hashed before D-LSA existed, part for part
+        let legacy =
+            |route: &[u8]| namespace_hash(&[b"config", b"tokenizer", b"template", b"Fp16", route]);
+        assert_eq!(dense.baseline, legacy(b"baseline"));
+        assert_eq!(dense.mtp, legacy(b"mtp"));
+        #[cfg(feature = "dflash2")]
+        assert_eq!(
+            dense.dflash2,
+            namespace_hash(&[legacy(b"dflash2").as_bytes(), b"draft-config"])
+        );
+        let one = namespaces_for(Some(b"qw-dlsa;map_sha256=a;top_k=4096"));
+        let other = namespaces_for(Some(b"qw-dlsa;map_sha256=a;top_k=2048"));
+        for ((dense, one), other) in all(&dense).into_iter().zip(all(&one)).zip(all(&other)) {
+            assert_ne!(dense, one);
+            assert_ne!(one, other);
+        }
+        assert_eq!(
+            all(&one),
+            all(&namespaces_for(Some(b"qw-dlsa;map_sha256=a;top_k=4096")))
+        );
+    }
+
+    #[test]
+    fn specprefill_is_never_allowed_under_dlsa() {
+        use Qwen35GenerationMode::{Automatic, Baseline, Dflash2, Mtp};
+        assert!(specprefill_allowed(
+            false, false, false, Automatic, Baseline, false
+        ));
+        assert!(specprefill_allowed(
+            false, false, false, Baseline, Baseline, false
+        ));
+        assert!(specprefill_allowed(
+            false, false, false, Automatic, Mtp, false
+        ));
+        for (configured, routed) in [
+            (Automatic, Baseline),
+            (Baseline, Baseline),
+            (Automatic, Mtp),
+        ] {
+            assert!(!specprefill_allowed(
+                false, false, false, configured, routed, true
+            ));
+        }
+        assert!(!specprefill_allowed(
+            true, false, false, Automatic, Baseline, false
+        ));
+        assert!(!specprefill_allowed(
+            false, true, false, Automatic, Baseline, false
+        ));
+        assert!(!specprefill_allowed(
+            false, false, true, Automatic, Baseline, false
+        ));
+        assert!(!specprefill_allowed(false, false, false, Mtp, Mtp, false));
+        assert!(!specprefill_allowed(
+            false, false, false, Automatic, Dflash2, false
+        ));
+    }
+
+    #[test]
+    fn image_refusal_names_dlsa_only_when_on() {
+        assert!(image_input_refusal(true).contains("D-LSA"));
+        assert_eq!(
+            image_input_refusal(false),
+            "model does not support image inputs"
+        );
+    }
 
     fn lookahead_request() -> CompletionRequest {
         crate::protocol::parse_chat(serde_json::json!({
