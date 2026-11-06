@@ -1,0 +1,212 @@
+{
+ "label": "dlsa",
+ "model": "qwen3.8-27b",
+ "max_tokens": 4096,
+ "request": {
+  "model": "qwen3.8-27b",
+  "temperature": 0.0,
+  "top_p": 1.0,
+  "max_tokens": 4096,
+  "chat_template_kwargs": {
+   "enable_thinking": false
+  }
+ },
+ "invocations": [
+  {
+   "started_at": "2026-11-06T15:42:26.206Z",
+   "note": "qw serve --dlsa --no-kv-quantization (distilled map, metal, dense_below 12288), decoder auto, fp16 KV, oQ4e, M4 Max",
+   "base_url": "http://127.0.0.1:8011",
+   "data_root": "/Users/namjh/.the-agent/scratch/main/lead-32b0ba32/ruler-data",
+   "rows": 10,
+   "lengths": [
+    32768
+   ],
+   "tasks": [
+    "niah_single_1",
+    "niah_single_2",
+    "niah_single_3",
+    "niah_multikey_1",
+    "niah_multikey_2",
+    "niah_multikey_3",
+    "niah_multiquery",
+    "niah_multivalue",
+    "vt",
+    "cwe",
+    "fwe",
+    "qa_squad",
+    "qa_hotpot"
+   ],
+   "concurrency": 1,
+   "timeout": 14400,
+   "harness": "cccbf65",
+   "server_models": {
+    "unavailable": "HTTPError: HTTP Error 404: Not Found"
+   },
+   "data": {
+    "niah_single_1_32768": {
+     "sha256": "d1bd5d972bdcea3c44c71f714f4e6827df4580583443fbbed256846aed05e51d",
+     "prompt_set_hash": "ab01e07ba2f417cf",
+     "manifest_sha256": "d1bd5d972bdcea3c44c71f714f4e6827df4580583443fbbed256846aed05e51d"
+    },
+    "niah_single_2_32768": {
+     "sha256": "321595a522c9d174a620fae2a111df118e3712f4a9eee592a5b3bf0cfdbc01cf",
+     "prompt_set_hash": "cba9069fbb906877",
+     "manifest_sha256": "321595a522c9d174a620fae2a111df118e3712f4a9eee592a5b3bf0cfdbc01cf"
+    },
+    "niah_single_3_32768": {
+     "sha256": "0d49cdd0d8b9905d56782bc3b54bc5b3167863f5a6c9e66978df7503769930db",
+     "prompt_set_hash": "bad77fe2dfc2808d",
+     "manifest_sha256": "0d49cdd0d8b9905d56782bc3b54bc5b3167863f5a6c9e66978df7503769930db"
+    },
+    "niah_multikey_1_32768": {
+     "sha256": "f8e553d2c1d812e424ec8023feb4f100db8bbd2f89d3b71ceaae537253d28f96",
+     "prompt_set_hash": "b6fc2c0ec6bbdb64",
+     "manifest_sha256": "f8e553d2c1d812e424ec8023feb4f100db8bbd2f89d3b71ceaae537253d28f96"
+    },
+    "niah_multikey_2_32768": {
+     "sha256": "f0f9cd844d30ee4092662b3e8e721ee77fca56f890b5e5478435aef69f29132e",
+     "prompt_set_hash": "2747e55aebb5ec37",
+     "manifest_sha256": "f0f9cd844d30ee4092662b3e8e721ee77fca56f890b5e5478435aef69f29132e"
+    },
+    "niah_multikey_3_32768": {
+     "sha256": "28fb1235ae2032aeaa05a77c8274542e6394a42a45cccace7848e17577e3c536",
+     "prompt_set_hash": "0d6b224407a8c345",
+     "manifest_sha256": "28fb1235ae2032aeaa05a77c8274542e6394a42a45cccace7848e17577e3c536"
+    },
+    "niah_multiquery_32768": {
+     "sha256": "84d23735b940479e1dabc4666cc7609e7dc58251cee0f00883e84dcd6990a076",
+     "prompt_set_hash": "332037dad8da206c",
+     "manifest_sha256": "84d23735b940479e1dabc4666cc7609e7dc58251cee0f00883e84dcd6990a076"
+    },
+    "niah_multivalue_32768": {
+     "sha256": "f0964ef48fc251974123382465542348834f671ae865bcaa164ddd344c3d6168",
+     "prompt_set_hash": "52da060a512f1f9c",
+     "manifest_sha256": "f0964ef48fc251974123382465542348834f671ae865bcaa164ddd344c3d6168"
+    },
+    "vt_32768": {
+     "sha256": "567f748ebf4a867fb3b98c93ae2ac446a7d9cc1afca1997973cefd45567bd139",
+     "prompt_set_hash": "40aa276f909890c5",
+     "manifest_sha256": "567f748ebf4a867fb3b98c93ae2ac446a7d9cc1afca1997973cefd45567bd139"
+    },
+    "cwe_32768": {
+     "sha256": "82f1a0bcbe74ba9e54bac367738212c3d5eb914a29ec64bc29dc25ee424fbdae",
+     "prompt_set_hash": "713474f5bfbf86c9",
+     "manifest_sha256": "82f1a0bcbe74ba9e54bac367738212c3d5eb914a29ec64bc29dc25ee424fbdae"
+    },
+    "fwe_32768": {
+     "sha256": "1380c080fd567500acb5614361cdd5af265ff86355f4f0c8f218664710e69b83",
+     "prompt_set_hash": "b051c17d534349f9",
+     "manifest_sha256": "1380c080fd567500acb5614361cdd5af265ff86355f4f0c8f218664710e69b83"
+    },
+    "qa_squad_32768": {
+     "sha256": "e0211f5bbf7ebd60dfa119e2f6ddb95e6dde837653182fe91e98e9e5ed836fef",
+     "prompt_set_hash": "798be48aac450a45",
+     "manifest_sha256": "e0211f5bbf7ebd60dfa119e2f6ddb95e6dde837653182fe91e98e9e5ed836fef"
+    },
+    "qa_hotpot_32768": {
+     "sha256": "9ad8570b060e7202c1ff884031193860c6509da0633c9f8f7bc7e9003c52fd8b",
+     "prompt_set_hash": "94946618ac250f18",
+     "manifest_sha256": "9ad8570b060e7202c1ff884031193860c6509da0633c9f8f7bc7e9003c52fd8b"
+    }
+   }
+  },
+  {
+   "started_at": "2026-11-06T20:49:21.638Z",
+   "note": "4k identity check",
+   "base_url": "http://127.0.0.1:8011",
+   "data_root": "/Users/namjh/.the-agent/scratch/main/lead-32b0ba32/ruler-data",
+   "rows": 2,
+   "lengths": [
+    4096
+   ],
+   "tasks": [
+    "niah_single_1",
+    "niah_single_2",
+    "niah_single_3",
+    "niah_multikey_1",
+    "niah_multikey_2",
+    "niah_multikey_3",
+    "niah_multiquery",
+    "niah_multivalue",
+    "vt",
+    "cwe",
+    "fwe",
+    "qa_squad",
+    "qa_hotpot"
+   ],
+   "concurrency": 1,
+   "timeout": 14400,
+   "harness": "cccbf65",
+   "server_models": {
+    "unavailable": "HTTPError: HTTP Error 404: Not Found"
+   },
+   "data": {
+    "niah_single_1_4096": {
+     "sha256": "1181d487020256b272e938f3fe1e7dd236976544b0960a73cc4bca14ffe68e23",
+     "prompt_set_hash": "e1b43c2e896b58c2",
+     "manifest_sha256": "1181d487020256b272e938f3fe1e7dd236976544b0960a73cc4bca14ffe68e23"
+    },
+    "niah_single_2_4096": {
+     "sha256": "a370b209f31412f12828e42110561d03fd7c0787b557c1762e0f36a90e9f0396",
+     "prompt_set_hash": "2a420506780a268b",
+     "manifest_sha256": "a370b209f31412f12828e42110561d03fd7c0787b557c1762e0f36a90e9f0396"
+    },
+    "niah_single_3_4096": {
+     "sha256": "2091c8689d1e716adcfb324a22a146c305c414e51399c9c1cfdd8ffc92dc867b",
+     "prompt_set_hash": "52eca9a935500d15",
+     "manifest_sha256": "2091c8689d1e716adcfb324a22a146c305c414e51399c9c1cfdd8ffc92dc867b"
+    },
+    "niah_multikey_1_4096": {
+     "sha256": "8067ea7c9eb7e283423f9de44411fd4d930827a5716ab0cf8047a14a4e64546b",
+     "prompt_set_hash": "04168c730b23e6d7",
+     "manifest_sha256": "8067ea7c9eb7e283423f9de44411fd4d930827a5716ab0cf8047a14a4e64546b"
+    },
+    "niah_multikey_2_4096": {
+     "sha256": "efabb64b1ef9495ac9b87b32dfeb7308bd38862c1aea15b276ee6bf38b054e21",
+     "prompt_set_hash": "28cce2900441aa95",
+     "manifest_sha256": "efabb64b1ef9495ac9b87b32dfeb7308bd38862c1aea15b276ee6bf38b054e21"
+    },
+    "niah_multikey_3_4096": {
+     "sha256": "755591e40ed060d7d70f5f37da9edef408fd8e595e8ca4caeddd7fa6af0745af",
+     "prompt_set_hash": "a13e609f8b5a2221",
+     "manifest_sha256": "755591e40ed060d7d70f5f37da9edef408fd8e595e8ca4caeddd7fa6af0745af"
+    },
+    "niah_multiquery_4096": {
+     "sha256": "2e36abfe9c0bb9c6bc0823548efd067e2a36f8758e6af085f2c9aefc0b0dc6f1",
+     "prompt_set_hash": "30f0ba2a86afc411",
+     "manifest_sha256": "2e36abfe9c0bb9c6bc0823548efd067e2a36f8758e6af085f2c9aefc0b0dc6f1"
+    },
+    "niah_multivalue_4096": {
+     "sha256": "5665bc44411d52e4c90897b0c670d938b2c94fb0d347875e17b59931485a189f",
+     "prompt_set_hash": "954dde9d5058f141",
+     "manifest_sha256": "5665bc44411d52e4c90897b0c670d938b2c94fb0d347875e17b59931485a189f"
+    },
+    "vt_4096": {
+     "sha256": "410ed554a4750b8f48947d642b03b4c464667c997d48bfb8c6d3fc375312f5b6",
+     "prompt_set_hash": "c8359ce339fc2c4b",
+     "manifest_sha256": "410ed554a4750b8f48947d642b03b4c464667c997d48bfb8c6d3fc375312f5b6"
+    },
+    "cwe_4096": {
+     "sha256": "96f58c7e0ad048348a4af88ef7b26123fbeed6f9791c5248f68055c3b6f00721",
+     "prompt_set_hash": "6af093493bf5d2ca",
+     "manifest_sha256": "96f58c7e0ad048348a4af88ef7b26123fbeed6f9791c5248f68055c3b6f00721"
+    },
+    "fwe_4096": {
+     "sha256": "fa8893e5cd5c78b361a9966c2c457de96e66a8cd284fb62d1499ee14336e1036",
+     "prompt_set_hash": "cd519e0abf479b61",
+     "manifest_sha256": "fa8893e5cd5c78b361a9966c2c457de96e66a8cd284fb62d1499ee14336e1036"
+    },
+    "qa_squad_4096": {
+     "sha256": "e788b25b5afadb3ab9b599a13c92ac98815ea2c84d7407af183dc5797d2b75fb",
+     "prompt_set_hash": "4e01e879c0879cd4",
+     "manifest_sha256": "e788b25b5afadb3ab9b599a13c92ac98815ea2c84d7407af183dc5797d2b75fb"
+    },
+    "qa_hotpot_4096": {
+     "sha256": "80ae92f0abddfe062e7f855d7ca6502943b80e6187fc803cb5f35420095c716d",
+     "prompt_set_hash": "c3392f2ab92b2ec8",
+     "manifest_sha256": "80ae92f0abddfe062e7f855d7ca6502943b80e6187fc803cb5f35420095c716d"
+    }
+   }
+  }
+ ]
+}
