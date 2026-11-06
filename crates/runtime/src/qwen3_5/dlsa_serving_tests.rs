@@ -471,6 +471,135 @@ fn rollback_random_rounds() {
     }
 }
 
+/// `dense_below` inside the sparse range of the tiny model: past the dense key set (positions
+/// 50 on), so rows between there and the threshold would read partial lists if the policy were
+/// per forward.
+const THRESHOLD: usize = 96;
+
+fn threshold_config() -> DlsaConfig {
+    DlsaConfig {
+        dense_below: THRESHOLD,
+        ..test_config(TEST_INDEX, DlsaShortContext::DenseFallback)
+    }
+}
+
+fn argmax_rows(logits: &[f32]) -> Vec<i32> {
+    rows(logits).map(argmax).collect()
+}
+
+/// The `dense_below` policy is per row: a prefill chunk that crosses the threshold gives the
+/// logits (within the multi-row tolerance) and greedy tokens of a single-token run, on every
+/// backend, and the index of both is the same.
+#[test]
+fn dense_below_chunk_matches_single_tokens_across_the_threshold() {
+    assert!(!crate::dlsa::reads_dense_key_set(&TEST_INDEX, 60));
+    let toks = tokens(130, 51);
+    for backend in super::dlsa_tests::BACKENDS {
+        let config = DlsaConfig {
+            backend,
+            ..threshold_config()
+        };
+        // 60..110 crosses the threshold: 36 rows below it, 14 past it
+        let block = dlsa_model(KVCacheMode::Fp16, config.clone());
+        let got = run(&block, &toks, &[60, 50, 20]);
+        let single = dlsa_model(KVCacheMode::Fp16, config);
+        let want = run(&single, &toks, &schedule(&[60], 70));
+        let what = format!("{backend:?}: chunk vs single tokens");
+        assert_allclose(&got, &want, 1e-4, 1e-4, &what);
+        assert_eq!(
+            argmax_rows(&got),
+            argmax_rows(&want),
+            "{what}: greedy tokens"
+        );
+        assert_tables(&index_tables(&block), &index_tables(&single), 1e-6, &what);
+        assert!(
+            block.dlsa_stats().unwrap().sparse_forwards > 0,
+            "{what}: no sparse read"
+        );
+    }
+}
+
+/// MTP-style 3-row and DFlash-style 8-row verifies with seeded rollbacks, through the
+/// threshold: the speculative run equals the sequential one fed the accepted tokens (logits,
+/// greedy tokens, tables, and a continuation), so a rollback across the threshold leaves the
+/// state a single-token run would have.
+#[test]
+fn dense_below_verify_and_rollback_across_the_threshold() {
+    for (width, dflash) in [(3usize, false), (8, true)] {
+        let prefix = tokens(70, 61);
+        let (mut rounds, mut at, mut crossed) = (Vec::new(), prefix.len(), 0);
+        let mut i = 0u64;
+        while at < THRESHOLD + 40 {
+            let accepted = (((noise(i, 62) + 0.5) * width as f32) as usize).min(width - 1);
+            crossed += usize::from(at < THRESHOLD && at + width > THRESHOLD);
+            rounds.push((tokens(width, 200 + i), accepted));
+            at += accepted + 1;
+            i += 1;
+        }
+        assert!(
+            crossed > 0,
+            "width {width}: no verify crossed the threshold"
+        );
+        let what = format!("width {width}");
+        check_rollback(
+            KVCacheMode::Fp16,
+            threshold_config(),
+            &prefix,
+            &rounds,
+            dflash,
+            &what,
+        );
+        let (kept, spec) = speculate(
+            &dlsa_model(KVCacheMode::Fp16, threshold_config()),
+            &prefix,
+            &rounds,
+            dflash,
+        );
+        let reference = sequential(
+            &dlsa_model(KVCacheMode::Fp16, threshold_config()),
+            &prefix,
+            &kept,
+        );
+        assert_eq!(
+            argmax_rows(&spec),
+            argmax_rows(&reference),
+            "{what}: greedy tokens"
+        );
+    }
+}
+
+/// A snapshot taken below the threshold restores and continues through it (a crossing chunk,
+/// then decodes) bitwise like the uninterrupted run; one taken past it as well.
+#[test]
+fn dense_below_snapshot_restore_across_the_threshold() {
+    let toks = tokens(140, 71);
+    for at in [80usize, 110] {
+        let model = dlsa_model(KVCacheMode::Fp16, threshold_config());
+        run(&model, &toks[..at], &chunks(at));
+        let snapshot = model
+            .capture_sequence_state(at, None, true)
+            .expect("snapshot");
+        let tail = &toks[at..];
+        let sched = schedule(&[30], tail.len() - 30);
+        let want = run(&model, tail, &sched);
+        let restored = dlsa_model(KVCacheMode::Fp16, threshold_config());
+        restored
+            .restore_sequence_state(seq(), &snapshot)
+            .expect("restore");
+        assert_bitwise(
+            &run(&restored, tail, &sched),
+            &want,
+            &format!("restore at {at}"),
+        );
+        assert_tables(
+            &index_tables(&restored),
+            &index_tables(&model),
+            0.0,
+            "restore",
+        );
+    }
+}
+
 /// S3: DFlash2 verify, rollback and continuation at model level (the text part of
 /// `dflash_multimodal_chunks_and_rollback_preserve_image_context`), with the verify closing a
 /// block that the rollback reopens.

@@ -12,8 +12,8 @@ use mlxcel_core::{MlxArray, UniquePtr};
 use super::Qwen3NextAttention;
 use crate::dlsa::{
     DeviceSelection, DlsaBackend, DlsaBucketCache, DlsaConfig, DlsaGeometry, DlsaLayerMaps,
-    DlsaSelection, DlsaShortContext, DlsaStats, gather_attention, index_keys, index_queries,
-    masked_attention, profile, reads_dense_key_set, sparse_read,
+    DlsaSelection, DlsaStats, causal_attention, gather_attention, index_keys, index_queries,
+    masked_attention, profile, sparse_read,
 };
 use profile::{DlsaStage, lap};
 
@@ -98,15 +98,22 @@ impl Qwen3NextAttention {
             profile::lap_split(DlsaStage::KeyReadback, DlsaStage::Ward, ward, &[]);
         }
 
-        let index = &step.config.index;
-        let dense = step.config.short_context == DlsaShortContext::DenseFallback
-            && reads_dense_key_set(index, start + rows - 1);
-        let selection = (!dense).then(|| {
+        // The policy is per row: rows below `dense_below` read every causal key. A forward
+        // entirely in that range (or on the dense key set) runs the unchanged dense attention;
+        // one that crosses it reads its lower rows causally and selects for the rest.
+        let dense_rows = step.config.dense_rows(start, rows);
+        let selection = (dense_rows < rows).then(|| {
             let started = Instant::now();
             let iq = index_queries(&heads.queries, &step.maps.w_q_idx, step.geometry)
                 .expect("D-LSA index queries of a full-attention layer");
+            let iq = if dense_rows == 0 {
+                iq
+            } else {
+                let width = mlxcel_core::array_shape(&iq)[1];
+                mlxcel_core::slice(&iq, &[dense_rows as i32, 0], &[rows as i32, width])
+            };
             lap(DlsaStage::IndexQueries, &[&iq]);
-            let positions: Vec<usize> = (start..start + rows).collect();
+            let positions: Vec<usize> = (start + dense_rows..start + rows).collect();
             let sel = match backend {
                 DlsaBackend::Mlx => step.cache.select(&iq, &positions).map(Selected::Host),
                 DlsaBackend::Metal => step
@@ -149,26 +156,40 @@ impl Qwen3NextAttention {
                 out
             }
             Some(sel) => {
+                let sparse = rows - dense_rows;
                 step.stats.sparse_forwards += 1;
-                step.stats.sparse_rows += rows as u64;
+                step.stats.sparse_rows += sparse as u64;
                 let (cache_k, cache_v) = cache.update_and_fetch(keys, values);
                 lap(DlsaStage::KvFetch, &[&cache_k, &cache_v]);
+                let q_rows = |from: usize, to: usize| {
+                    let shape = mlxcel_core::array_shape(&queries);
+                    mlxcel_core::slice(
+                        &queries,
+                        &[0, 0, from as i32, 0],
+                        &[shape[0], shape[1], to as i32, shape[3]],
+                    )
+                };
+                let sparse_q = if dense_rows == 0 {
+                    mlxcel_core::share(&queries)
+                } else {
+                    q_rows(dense_rows, rows)
+                };
                 let out = match sel {
                     Selected::Device(sel) => {
                         step.cache.count_keys_read(&sel);
-                        sparse_read(&queries, &cache_k, &cache_v, &sel, self.scale)
+                        sparse_read(&sparse_q, &cache_k, &cache_v, &sel, self.scale)
                     }
                     Selected::Host(sel) => {
                         step.stats.keys_read += sel.lengths.iter().map(|&n| n as u64).sum::<u64>();
-                        if rows == 1 {
-                            gather_attention(&queries, &cache_k, &cache_v, sel.list(0), self.scale)
+                        if sparse == 1 {
+                            gather_attention(&sparse_q, &cache_k, &cache_v, sel.list(0), self.scale)
                         } else {
                             masked_attention(
-                                &queries,
+                                &sparse_q,
                                 &cache_k,
                                 &cache_v,
                                 &sel,
-                                start,
+                                start + dense_rows,
                                 step.config.prefill_mask_rows,
                                 self.scale,
                             )
@@ -176,7 +197,20 @@ impl Qwen3NextAttention {
                     }
                 };
                 lap(DlsaStage::Read, &[&out]);
-                out
+                if dense_rows == 0 {
+                    out
+                } else {
+                    // The rows below `dense_below` of a forward that crosses it (not counted
+                    // in `sparse_rows` or `keys_read`)
+                    let below = causal_attention(
+                        &q_rows(0, dense_rows),
+                        &cache_k,
+                        &cache_v,
+                        start,
+                        self.scale,
+                    );
+                    mlxcel_core::concatenate(&below, &out, 2)
+                }
             }
         };
         let output = self.finish(&attn_out, &heads.gate, b, l);
@@ -272,6 +306,7 @@ mod tests {
             map_dtype: DlsaMapDtype::F32,
             index: TEST_INDEX,
             prefill_mask_rows: 16,
+            dense_below: 0,
             backend,
             ..DlsaConfig::new(PathBuf::new())
         };
@@ -417,6 +452,88 @@ mod tests {
             }
             assert_eq!(stats.dense_key_set_forwards, 3);
             assert_eq!(index.len(), 48);
+        }
+    }
+
+    /// `dense_below`: forwards ending below it run the dense attention bitwise although their
+    /// rows would read sparse lists; a forward that crosses it reads its rows below causally
+    /// (dense up to rounding) and its other rows sparse; the index is built throughout.
+    #[test]
+    fn dense_below_runs_dense_until_the_threshold() {
+        let attention = test_attention();
+        let geometry = DlsaGeometry {
+            query_heads: TEST_HEADS,
+            kv_heads: TEST_KV_HEADS,
+            head_dim: TEST_HEAD_DIM,
+            rotary_dim: 8,
+        };
+        let maps = test_layer_maps(1);
+        for backend in [
+            DlsaBackend::Mlx,
+            DlsaBackend::Metal,
+            DlsaBackend::MetalSelect,
+        ] {
+            let config = DlsaConfig {
+                map_dtype: DlsaMapDtype::F32,
+                index: TEST_INDEX,
+                prefill_mask_rows: 16,
+                dense_below: 160,
+                backend,
+                ..DlsaConfig::new(PathBuf::new())
+            };
+            assert!(!config.reads_dense(160) && config.reads_dense(159));
+            assert!(
+                !crate::dlsa::reads_dense_key_set(&TEST_INDEX, 119),
+                "the schedule must reach sparse depths before the threshold"
+            );
+            let mut kv = KVCache::new_with_mode(KVCacheMode::Fp16);
+            let mut dense_kv = KVCache::new_with_mode(KVCacheMode::Fp16);
+            let mut index = DlsaBucketCache::new(TEST_INDEX).unwrap();
+            let mut stats = DlsaStats::default();
+            let mut start = 0;
+            // Ends at 119, 149, 150, 151 (dense); then 152..=195 crosses the threshold (rows
+            // 152..=159 read every causal key, the rest sparse lists); then 196 (sparse)
+            for (step_no, rows) in [120usize, 30, 1, 1, 44, 1].into_iter().enumerate() {
+                let x = noise_array(&[1, rows as i32, HIDDEN], 700 + step_no as u64, 2.0);
+                let got = attention.forward_dlsa(
+                    &x,
+                    &mut kv,
+                    None,
+                    DlsaLayerStep {
+                        maps: &maps,
+                        geometry: &geometry,
+                        config: &config,
+                        cache: &mut index,
+                        stats: &mut stats,
+                        commit: true,
+                    },
+                );
+                let want = attention.forward_with_position_ids(&x, &mut dense_kv, None, None);
+                let (got, want) = (to_host_f32(&got), to_host_f32(&want));
+                let below = config.dense_rows(start, rows);
+                let split = below * HIDDEN as usize;
+                if below == rows {
+                    assert_eq!(got, want, "{backend:?} forward {step_no}: dense below");
+                } else {
+                    // The causal read of the rows below equals dense up to rounding
+                    let diff = max_abs_diff(&got[..split], &want[..split]);
+                    assert!(
+                        diff < 1e-5,
+                        "{backend:?} forward {step_no}: rows below {diff:e}"
+                    );
+                    assert_ne!(
+                        got[split..],
+                        want[split..],
+                        "{backend:?} forward {step_no}: sparse past it"
+                    );
+                }
+                start += rows;
+            }
+            assert_eq!(config.dense_rows(152, 44), 8);
+            assert_eq!(stats.dense_key_set_forwards, 4, "{backend:?}");
+            assert_eq!(stats.sparse_forwards, 2, "{backend:?}");
+            assert_eq!(stats.sparse_rows, 36 + 1, "{backend:?}");
+            assert_eq!(index.len(), start);
         }
     }
 }

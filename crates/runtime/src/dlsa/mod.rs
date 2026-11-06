@@ -25,7 +25,7 @@ mod select;
 mod torch_pt;
 mod ward;
 
-pub use attend::{gather_attention, masked_attention, reads_dense_key_set};
+pub use attend::{causal_attention, gather_attention, masked_attention, reads_dense_key_set};
 pub use buckets::{BlockBuckets, CENTROID_NORM_FLOOR, cluster_block};
 pub use cache::{DlsaBucketCache, DlsaCacheMemory, DlsaCacheStats, DlsaIndexSnapshot};
 pub use config::{DlsaGeometry, DlsaIndexConfig, TOP_P_LIMIT};
@@ -39,16 +39,16 @@ pub use ward::{WARD_MAX_ROUNDS, WardOutcome, pool_keys, ward_labels, ward_labels
 pub use convert::{METADATA_KEY, convert_pt_to_safetensors, install_dlsa_map, sha256_hex};
 pub use loader::{DlsaLayerMaps, DlsaLayout, DlsaMapDtype, DlsaMaps};
 pub use options::{
-    DISTILLED_WINDOW, DLSA_BACKEND_ENV, DLSA_ENV, DLSA_MAP_KIND_ENV, DLSA_SINK_ENV, DLSA_TOP_K_ENV,
-    DLSA_TOP_P_ENV, DLSA_WINDOW_ENV, DlsaIdentity, DlsaOptions, ResolvedDlsa, dlsa_identity,
-    parse_dlsa_map_kind,
+    DISTILLED_WINDOW, DLSA_BACKEND_ENV, DLSA_DENSE_BELOW_ENV, DLSA_ENV, DLSA_MAP_KIND_ENV,
+    DLSA_SINK_ENV, DLSA_TOP_K_ENV, DLSA_TOP_P_ENV, DLSA_WINDOW_ENV, DlsaIdentity, DlsaOptions,
+    ResolvedDlsa, dlsa_identity, parse_dlsa_map_kind,
 };
 pub use resolve::{
     DLSA_MAP_ENV, DlsaAsset, DlsaMapKind, dlsa_map_cache_path, dlsa_source_cache_path,
     resolve_dlsa_map_path, verify_converted_map,
 };
 pub(crate) use runtime::DlsaRuntime;
-pub use runtime::{DlsaBackend, DlsaConfig, DlsaShortContext, DlsaStats};
+pub use runtime::{DLSA_DENSE_BELOW_DEFAULT, DlsaBackend, DlsaConfig, DlsaShortContext, DlsaStats};
 pub use torch_pt::{TorchTensorF32, read_f32_tensor_dict};
 
 /// Upstream commit the spec, the map format and the pinned assets refer to.
@@ -59,12 +59,12 @@ pub const INDEX_DIM: usize = 64;
 #[cfg(test)]
 mod fixtures;
 #[cfg(test)]
+mod gpu_attend_tests;
+#[cfg(test)]
+mod gpu_select_tests;
+#[cfg(test)]
 mod indexer_tests;
 #[cfg(test)]
 pub(crate) mod test_model;
 #[cfg(test)]
 mod tests;
-#[cfg(test)]
-mod gpu_select_tests;
-#[cfg(test)]
-mod gpu_attend_tests;

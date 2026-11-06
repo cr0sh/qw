@@ -751,6 +751,7 @@ mod tests {
             "--dlsa-window <DLSA_WINDOW>",
             "--dlsa-top-k <DLSA_TOP_K>",
             "--dlsa-top-p <DLSA_TOP_P>",
+            "--dlsa-dense-below <TOKENS>",
             "--dlsa-backend <metal|mlx|metal-select>",
         ] {
             assert!(help.contains(option), "{option}: {help}");
@@ -779,6 +780,8 @@ mod tests {
             "2048",
             "--dlsa-top-p",
             "512",
+            "--dlsa-dense-below",
+            "16384",
             "--dlsa-backend",
             "mlx",
         ])
@@ -794,6 +797,16 @@ mod tests {
         assert_eq!(
             (options.sink, options.window, options.top_k, options.top_p),
             (Some(8), Some(256), Some(2048), Some(512))
+        );
+        assert_eq!(options.dense_below, Some(16384));
+        assert_eq!(
+            TestCli::try_parse_from(["qw-server"])
+                .unwrap()
+                .args
+                .dlsa
+                .options()
+                .dense_below,
+            None
         );
         assert_eq!(options.backend, Some(qw_runtime::DlsaBackend::Mlx));
 

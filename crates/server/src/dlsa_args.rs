@@ -45,6 +45,11 @@ pub struct DlsaArgs {
     #[arg(long)]
     pub dlsa_top_p: Option<usize>,
 
+    /// Query rows at positions below this many keys read every causal key (dense); sparse reads start there, where
+    /// they beat dense [default: 12288; 0: only the dense-key-set rule; env QW_DLSA_DENSE_BELOW].
+    #[arg(long, value_name = "TOKENS")]
+    pub dlsa_dense_below: Option<usize>,
+
     /// Where the select and the read run: metal (the Metal kernels, default), mlx (the MLX
     /// reference path) or metal-select (Metal select + MLX read, bitwise mlx); env QW_DLSA_BACKEND.
     #[arg(long, value_name = "metal|mlx|metal-select", value_parser = parse_backend)]
@@ -61,6 +66,7 @@ impl DlsaArgs {
             window: self.dlsa_window,
             top_k: self.dlsa_top_k,
             top_p: self.dlsa_top_p,
+            dense_below: self.dlsa_dense_below,
             backend: self.dlsa_backend,
         }
     }

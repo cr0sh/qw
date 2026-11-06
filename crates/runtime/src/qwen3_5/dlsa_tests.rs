@@ -138,6 +138,8 @@ pub(super) fn test_config(index: DlsaIndexConfig, short_context: DlsaShortContex
         index,
         short_context,
         prefill_mask_rows: 24,
+        // The tiny model's contexts sit far below the serving threshold
+        dense_below: 0,
         backend: DlsaBackend::from_env().expect("QW_DLSA_BACKEND"),
         ..DlsaConfig::new(PathBuf::new())
     }
@@ -621,7 +623,13 @@ pub(super) mod real {
             "the converted D-LSA map (run `qw download --dlsa-map`, or set QW_DLSA_MAP_PATH)",
         );
         eprintln!("model {} map {}", model.display(), map.display());
-        (model, DlsaConfig::new(map))
+        // The sparse read from the dense-key-set boundary on, as tasks 3-5 measured it; the
+        // served `dense_below` default would run these 16k-32k prompts mostly dense
+        let config = DlsaConfig {
+            dense_below: 0,
+            ..DlsaConfig::new(map)
+        };
+        (model, config)
     }
 
     /// Deterministic long text: files of `dirs` (relative to the repository root), each sorted
