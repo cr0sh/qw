@@ -74,6 +74,11 @@ impl DlsaBackend {
     }
 }
 
+/// The default [`DlsaConfig::dense_below`]: under the Metal backend a 1536-row prefill chunk
+/// ending below about 12k keys runs faster dense than sparse on an M4 Max, and above it sparse
+/// wins (`docs/dlsa.md` §15.3).
+pub const DLSA_DENSE_BELOW_DEFAULT: usize = 12_288;
+
 /// How D-LSA runs on a loaded model.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DlsaConfig {
@@ -83,6 +88,13 @@ pub struct DlsaConfig {
     pub map_dtype: DlsaMapDtype,
     pub index: DlsaIndexConfig,
     pub short_context: DlsaShortContext,
+    /// With [`DlsaShortContext::DenseFallback`], query rows at positions below this read every
+    /// causal key although they would read a sparse list: sparse reads start where they beat
+    /// dense (`docs/dlsa.md` §15.7). Per row ([`dense_rows`](Self::dense_rows)): a forward
+    /// wholly below runs the unchanged dense attention (bitwise), one that crosses it reads its
+    /// rows below through a causal mask (dense up to rounding). The index is still built. 0
+    /// leaves only the dense-key-set rule (§4.7).
+    pub dense_below: usize,
     /// Query rows one additive read mask covers in a prefill chunk (`rows x T` mask bytes).
     pub prefill_mask_rows: usize,
     /// Where the select and the read run; `Mlx` is the task-3 oracle.
@@ -90,16 +102,40 @@ pub struct DlsaConfig {
 }
 
 impl DlsaConfig {
-    /// Defaults: bf16 maps, the Qwen indexer defaults, the dense fallback, 256-row masks, the
-    /// Metal backend.
+    /// Defaults: bf16 maps, the Qwen indexer defaults, the dense fallback below
+    /// [`DLSA_DENSE_BELOW_DEFAULT`], 256-row masks, the Metal backend.
     pub fn new(map_path: PathBuf) -> Self {
         Self {
             map_path,
             map_dtype: DlsaMapDtype::Bf16,
             index: DlsaIndexConfig::QWEN_DEFAULTS,
             short_context: DlsaShortContext::DenseFallback,
+            dense_below: DLSA_DENSE_BELOW_DEFAULT,
             prefill_mask_rows: 256,
             backend: DlsaBackend::default(),
+        }
+    }
+
+    /// Whether a forward over positions `..=last_position` runs the unchanged dense attention:
+    /// under [`DlsaShortContext::DenseFallback`], every row reads the dense key set (§4.7) or
+    /// sits below [`dense_below`](Self::dense_below).
+    pub fn reads_dense(&self, last_position: usize) -> bool {
+        self.short_context == DlsaShortContext::DenseFallback
+            && (last_position < self.dense_below
+                || super::attend::reads_dense_key_set(&self.index, last_position))
+    }
+
+    /// How many leading rows of a forward over positions `start..start + rows` read every causal
+    /// key: all of them when [`reads_dense`](Self::reads_dense) holds, else the rows below
+    /// [`dense_below`](Self::dense_below) (the policy is per row, so a verify block or a chunk
+    /// that crosses the threshold reads its rows as single-token forwards would).
+    pub fn dense_rows(&self, start: usize, rows: usize) -> usize {
+        if rows == 0 || self.reads_dense(start + rows - 1) {
+            rows
+        } else if self.short_context == DlsaShortContext::DenseFallback {
+            self.dense_below.saturating_sub(start).min(rows)
+        } else {
+            0
         }
     }
 

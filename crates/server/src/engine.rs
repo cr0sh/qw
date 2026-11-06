@@ -1247,7 +1247,12 @@ fn enable_dlsa(provider: &mut Qwen35Provider, dlsa: qw_runtime::ResolvedDlsa) ->
     let qw_runtime::ResolvedDlsa { config, kind } = dlsa;
     let identity = qw_runtime::dlsa_identity(&config)?;
     let map = config.map_path.display().to_string();
-    let (index, map_dtype, short_context) = (config.index, config.map_dtype, config.short_context);
+    let (index, map_dtype, short_context, dense_below) = (
+        config.index,
+        config.map_dtype,
+        config.short_context,
+        config.dense_below,
+    );
     provider
         .enable_dlsa(config)
         .context("failed to enable D-LSA")?;
@@ -1262,6 +1267,7 @@ fn enable_dlsa(provider: &mut Qwen35Provider, dlsa: qw_runtime::ResolvedDlsa) ->
         top_k = index.top_k,
         top_p = index.top_p,
         short_context = ?short_context,
+        dense_below,
         "D-LSA armed"
     );
     if crate::specprefill_policy::ENABLED {

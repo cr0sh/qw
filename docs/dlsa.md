@@ -1000,10 +1000,13 @@ flags do not exist. `DlsaOptions::resolve(env)` takes each value from its flag, 
 | `--dlsa-window` | `QW_DLSA_WINDOW` | 512 |
 | `--dlsa-top-k` | `QW_DLSA_TOP_K` | 4096 |
 | `--dlsa-top-p` | `QW_DLSA_TOP_P` | 1024 |
+| `--dlsa-dense-below <TOKENS>` | `QW_DLSA_DENSE_BELOW` | 12288 (task 6, §15.7): query rows at positions below it read every causal key; 0 keeps only the dense-key-set rule |
 | `--dlsa-backend metal\|mlx\|metal-select` | `QW_DLSA_BACKEND` | `metal` (task 4's kernels; `mlx` is the task-3 path, `metal-select` its bitwise twin) |
 
-The map is held in bf16 with the dense fallback (short prompts, up to 4,612 tokens under the defaults, run dense
-attention bitwise). Errors name the flag or variable: an unparsable variable, a config `DlsaConfig::validate` refuses
+The map is held in bf16 with the dense fallback: a forward runs the unchanged dense attention (bitwise) when its
+rows read the dense key set (up to 4,612 tokens under the defaults) or all sit below `--dlsa-dense-below`. A forward
+that crosses the threshold reads its rows below it over every causal key and its other rows sparse (§15.7; the
+index is built throughout). Errors name the flag or variable: an unparsable variable, a config `DlsaConfig::validate` refuses
 (the message lists each knob with its source), a `--dlsa-*` flag without `--dlsa`/`QW_DLSA`, a missing or corrupt
 map. A window other than 512 is accepted with a warning: the maps were distilled at 512, and the window is also the
 cluster block size.
@@ -1013,7 +1016,7 @@ cluster block size.
 - `qw serve --dlsa --no-kv-quantization`. The KV check runs on the flag (`validate_cli`) and again on the resolved
   setting, so `QW_DLSA=1` without `--no-kv-quantization` fails too.
 - The worker loads the model, enables D-LSA, then builds the prefix-cache namespaces. The D-LSA identity (`dlsa_identity`:
-  sha256 of the map file, map dtype, short-context policy, the read (`metal`, or `mlx` for both MLX-read backends) and
+  sha256 of the map file, map dtype, short-context policy, `dense_below`, the read (`metal`, or `mlx` for both MLX-read backends) and
   the full index config) is appended to the namespace parts
   **only when D-LSA is on**, so dense namespaces are byte-identical to a build without the feature; the DFlash2
   namespace inherits it.
@@ -1355,4 +1358,389 @@ MLXCEL_CACHE_LIMIT=<8589934592 | 4294967296 | 1073741824> QW_DLSA_BENCH_CONTEXTS
 
 If the prompt file is missing, the bench writes it from the corpus. `QW_DLSA_BENCH_LOGITS=1` writes the raw f32
 logits used for R9 next to the report. Each report records git sha, model config, map sha256, cache limit, swap and
-peak memory.
+peak memory. These runs predate `dense_below` (§15.7); to reproduce them now, set `QW_DLSA_DENSE_BELOW=0`.
+
+## 15. Evaluation (roadmap task 6)
+
+This section measures the final implementation (task 4's Metal kernels, task 5's serving integration) against
+dense attention on one machine. The focus is prefill throughput. RULER is not run here; it is task 7. **Accuracy at
+scale is unverified until task 7 runs.** §15.5 is a cheap sanity check only, and it already shows two
+documents where D-LSA diverges from dense.
+
+### 15.1 Setup
+
+- **Machine.** Apple M4 Max (16 cores, 64 GB), 2026-11-06.
+- **Build.** Base `56490f7` plus this task's bench extension, uncommitted (`git diff | sha256` `2a5f3a6e…`),
+  release, `--features dlsa`.
+  - At the time of the main runs `dense_below` did not exist, so every D-LSA mode read sparse from the
+    dense-key-set boundary (4,612) on, as tasks 3–5 did. That equals today's `QW_DLSA_DENSE_BELOW=0`.
+  - The §15.7 runs use the final tree with the 12,288 default; the §15.6 diagnostics use `QW_DLSA_DENSE_BELOW=0`.
+- **Model and maps.**
+  - Model `Jundot/Qwen3.8-27B-oQ4e-fp16-mtp` (4-bit oQ4e, `config.json` sha256 `7a063b70…`), fp16 KV.
+  - Distilled map (sha256 `00200004… 62e1`) in bf16. PCA step-0 map (`03dbc211…f9fb`, fetched with
+    `qw download --dlsa-map --dlsa-pca`) in bf16.
+  - Qwen defaults: sink 4, window 512, top_k 4096, top_p 1024. Backend `metal`.
+- **Prompts.**
+  - Task 4's token file: 262,144 tokens of the repository corpus, not cycled, sha256 `43583dad…78b1`.
+  - Each repetition is a different "document": the prompt starts at token offset 0, 65,536 or 131,072 of the file.
+  - The prompt is `floor((T - 1) / 1536) · 1536` tokens (3,072 / 7,680 / 10,752 / 15,360 / 23,040 / 32,256 /
+    64,512 / 130,560 / 261,120). Five needles are written into it (§15.5).
+  - Prefill runs in 1536-row chunks through `forward_last_logits`.
+- **Repetitions.**
+  - 4k–64k: 3 documents (offsets 0, 65,536, 131,072).
+  - 128k: 2 (offsets 0 and 131,072).
+  - 256k: 1 (offset 0). Task 4's run (§14.3: 84 / 224 tok/s, same prompt, earlier tree) is a second sample.
+  - Dense and D-LSA run in the same process, on the same prompt, back to back, so ratios are paired.
+- **Memory.**
+  - `MLXCEL_CACHE_LIMIT` 8 GiB up to 64k, 4 GiB at 128k, 1 GiB at 256k (as §14.3).
+  - Swap "used" was 19.1–19.4 GB, left over from earlier work, and **never grew** during a mode: every run's
+    after-value is equal to or below its before-value. No run swapped.
+- **Thermal.** `pmset -g therm`, before and after every mode, reported no thermal or performance warning level
+  and no CPU power limit.
+- **Bench.** `real_dlsa_bench`, extended (`qwen3_5/dlsa_bench.rs`, module docs). Why the extension rather than
+  `single_user_throughput`:
+  - That bench has fixed fresh/10k/64k fixtures, a cached-prefix prefill, and no D-LSA switch.
+  - The real bench already sweeps contexts, runs every mode in one process, holds the stage profile, and records
+    the cache limit and swap.
+  - What it adds, per mode:
+    - a teacher-forced 256-row tail (§15.5);
+    - five needles plus a prefix-cache hit (§15.4);
+    - the MTP and DFlash2 generators (§15.4);
+    - a `metal-pca` mode;
+    - `pmset`.
+- **Results.** The raw reports (minified) are in `eval/dlsa/task6/`, with `summarize.py`, which produced every
+  table below.
+- **GPU time.** About 8.5 h including §15.6–15.7, one context per `./gpu-lock` hold.
+
+### 15.2 Prefill
+
+Prefill tok/s is prompt tokens over the whole chunked prefill. That includes the final logits readback, so it is also
+the time to first token (TTFT); the fenced profile chunks (the last 2) are included too. Each cell gives the median
+and the range over documents; the ratio is per document, metal over dense.
+
+| context | prompt | docs | dense tok/s | D-LSA metal tok/s | metal / dense | TTFT dense / metal | peak GiB dense / metal | index B/token |
+|---|---|---|---|---|---|---|---|---|
+| 4k | 3,072 | 3 | 244.1 (239–247) | 250.7 (250–252) | 1.031 (1.013–1.047) | 12.6 / 12.3 s | 17.4 / 17.2 | 2,013 |
+| 8k | 7,680 | 3 | 249.8 (249–250) | 243.9 (244–244) | **0.977** (0.976–0.978) | 30.7 / 31.5 s | 17.7 / 17.7 | 2,266 |
+| 12k | 10,752 | 3 | 247.1 (247–247) | 241.2 (241–241) | **0.976** (0.976–0.976) | 43.5 / 44.6 s | 17.9 / 17.7 | 2,106 |
+| 16k | 15,360 | 3 | 242.7 (243–243) | 239.2 (239–239) | **0.986** (0.985–0.986) | 63.3 / 64.2 s | 18.5 / 17.8 | 1,993 |
+| 24k | 23,040 | 3 | 234.7 (235–235) | 237.3 (237–237) | 1.010 (1.010–1.011) | 98.2 / 97.1 s | 18.7 / 18.3 | 1,783 |
+| 32k | 32,256 | 3 | 225.4 (225–225) | 235.9 (236–236) | 1.047 (1.046–1.048) | 143.1 / 136.7 s | 19.5 / 18.8 | 1,768 |
+| 64k | 64,512 | 3 | 198.4 (198–199) | 232.9 (233–233) | 1.174 (1.171–1.176) | 325.2 / 277.0 s | 21.5 / 20.8 | 1,703 |
+| 128k | 130,560 | 2 | 138.5 (138–138) | 229.2 (229–229) | **1.656** (1.655–1.657) | 943.0 / 569.6 s | 26.0 / 25.3 | 1,650 |
+| 256k | 261,120 | 1 (+§14.3) | 83.9 (§14.3: 84) | 223.2 (§14.3: 224) | **2.661** | 3113 / 1170 s | 34.4 / 33.7 | 1,634 |
+
+Notes on the table:
+
+- **Noise.** Spreads are under 0.5% except dense at 4k (239–247). There D-LSA is bitwise dense (every forward
+  is on the dense key set), so the 4k "gain" is noise: dense runs first in each process and pays the warm-up.
+- **Peak.** "Peak" is MLX's active peak during the prefill, model included. D-LSA's is slightly lower from 16k on,
+  because it skips the dense SDPA's score materialization.
+- **Index.** "Index B/token" is the bucket cache (host tables plus the device mirror) after the prefill, over the
+  16 layers: about 1.6–2.3 KiB a token, 404 MiB at 256k.
+- **Snapshots.** The D-LSA tables add exactly 648 B/token to a snapshot at every length (dense 66–91 KB/token,
+  mostly fp16 KV), about 1%, as §13.2 predicted.
+- **PCA map.** `metal-pca` prefill equals `metal` within 0.1% (32k: 236.0, 64k: 232.7, 128k: 229.2 tok/s). It
+  runs the same kernels on the same shapes; only the lists differ.
+
+**Crossover.**
+
+- **End to end**, D-LSA (with sparse reads from 4,612 on) overtakes dense between 16k (0.986) and 24k (1.010),
+  at about 20k tokens.
+- **Per chunk** it happens earlier. The chunk times of the 32k runs, metal / dense, by chunk start:
+  - 4.6k: 1.056; 6.1k: 1.044; 7.7k: 1.032; 9.2k: 1.021; 10.8k: 1.008;
+  - 12.3k: 0.995; 13.8k: 0.978; 15.4k: 0.949; 24.6k: 0.883; 27.6k: 0.868.
+  - So a 1536-row chunk wins once it starts at about 12k keys, as task 4 estimated from the 1a microbench
+    (§14.3).
+- Below that, every sparse chunk pays K2's fixed ~38 ms per layer, where dense SDPA is cheaper. The short
+  prompts (8k–16k) lose 1.4–2.4% because they are mostly such chunks.
+
+**Decomposition** (Metal, the 2 fenced chunks at the end of the prefill, ms per full-attention layer, first
+document). The categories:
+
+- indexing/clustering: index key and query projections, key readback, Ward, centroid sync;
+- scoring/selection: score matmul, K1;
+- attention read: K2;
+- other attention: input, q/k/v projections, RoPE, KV fetch, gate and o_proj.
+
+| context | indexing / clustering | scoring / selection | attention read (K2) | other attention | full-attn layer incl. MLP | dense full-attn layer | linear-attn layers, % of forward | fenced forward s, dense / metal |
+|---|---|---|---|---|---|---|---|---|
+| 8k | 2.1 | 1.3 | 38.3 | 27.9 | 132.1 | 109.3 | 68% | 6.32 / 6.65 |
+| 16k | 2.3 | 1.5 | 38.3 | 29.0 | 133.8 | 134.9 | 68% | 6.71 / 6.69 |
+| 32k | 2.8 | 1.7 | 38.6 | 31.3 | 137.6 | 202.1 | 67% | 7.80 / 6.77 |
+| 64k | 2.4 | 2.0 | 39.3 | 36.5 | 143.5 | 320.1 | 66% | 9.69 / 6.85 |
+| 128k | 2.3 | 2.8 | 40.5 | 45.3 | 153.7 | 827.6 | 65% | 17.81 / 7.03 |
+| 256k | 2.9 | 7.7 | 39.4 | 68.0 | 183.1 | 1919.6 | 61% | 35.30 / 7.54 |
+
+What the decomposition shows:
+
+- **Selection is cheap.** Indexing plus selection is 3.4–10.6 ms per layer: 0.8–2.3% of the forward.
+- **K2 is flat in T** at 38–40 ms per layer.
+- **The growing part is the KV fetch.** Inside "other attention", the fetch rises from 1 ms (8k) to 36 ms (256k)
+  per layer.
+- **The linear layers dominate.** The 48 linear-attention (Gated DeltaNet) layers are 61–68% of every D-LSA
+  forward, about 4.5 s of a 6.7–7.5 s chunk. They are untouched by D-LSA and bound throughput at about 230
+  tok/s at any length.
+
+### 15.3 Decode (baseline greedy)
+
+32 unfenced greedy steps after the tail. Each cell is the median step, then the median over documents.
+
+| context | dense ms/token | D-LSA ms/token | metal / dense |
+|---|---|---|---|
+| 4k | 36.9 | 37.1 | 1.00 |
+| 8k | 37.8 | 39.0 | 1.03 |
+| 12k | 38.2 | 38.9 | 1.02 |
+| 16k | 38.9 | 39.1 | 1.00 |
+| 24k | 39.9 | 38.8 | 0.97 |
+| 32k | 41.1 | 38.9 | 0.95 |
+| 64k | 45.9 | 39.2 | 0.85 |
+| 128k | 55.2 | 39.5 | 0.72 |
+| 256k | 86.6 | 39.9 | 0.46 |
+
+- D-LSA decode is flat (37–40 ms). Dense grows with T.
+- The decode crossover is about 16k. Below it D-LSA costs up to 3% (8k), which `dense_below` removes (§15.7).
+
+### 15.4 Interactions
+
+**Prefix-cache hit.**
+
+- After the prefill, the bench snapshots the state (`snapshot_sequence_state`, as the server's prefix cache does).
+- For each needle it then restores the snapshot, prefills a question of about 25 tokens, and reads the first
+  logits. That is the TTFT of a second request sharing the whole prompt as a prefix.
+- Medians over 5 needles × documents:
+
+| context | 4k | 8k | 16k | 32k | 64k | 128k |
+|---|---|---|---|---|---|---|
+| hit TTFT dense, ms | 156 | 169 | 191 | 245 | 335 | 545 |
+| hit TTFT D-LSA, ms | 157 | 170 | 173 | 183 | 202 | 241 |
+| restore dense / D-LSA, ms | 3 / 5 | 3 / 5 | 3 / 6 | 6 / 6 | 4 / 8 | 4 / 10 |
+
+- The restore, which rebuilds the D-LSA tables, adds 2–6 ms.
+- The question's forward is where D-LSA wins: a short forward at depth T costs dense O(T), while D-LSA reads
+  4,612 keys. A prefix hit at 128k answers 2.3× sooner under D-LSA.
+- Task 5's server smoke (§13.7) covers the MTP and DFlash2 prefix-cache paths.
+
+**SpecPrefill.** Refused under D-LSA by design (§13.1): its kept slots are not positions. The server never
+selects it while D-LSA is on, so there is nothing to measure.
+
+**Speculative decoders.**
+
+- `Qwen35MtpGenerator` (block 3) and `Qwen35Dflash2Generator` from a fresh state, on the same prompts, document 0
+  only.
+- 64 greedy tokens with EOS suppressed: the prompts end mid-file, and an early EOS otherwise ended some runs after
+  one token, dense as well as D-LSA.
+- The prefill column is the generator's own prefill, a second, independent TTFT sample.
+
+| context | decoder | prefill s, dense / D-LSA | decode ms/token, dense / D-LSA | acceptance, dense / D-LSA |
+|---|---|---|---|---|
+| 8k | MTP | 30.8 / 31.5 | 19.0 / 19.3 | 0.909 / 0.909 |
+| 8k | DFlash2 | 30.6 / 31.3 | 24.9 / 24.6 | 0.662 / 0.705 |
+| 16k | MTP | 63.6 / 64.5 | 27.1 / 26.4 | 0.630 / 0.686 |
+| 16k | DFlash2 | 63.2 / 64.1 | 37.4 / 36.5 | 0.370 / 0.382 |
+| 32k | MTP | 144.0 / 138.3 | 22.6 / 21.3 | 0.932 / 0.911 |
+| 32k | DFlash2 | 142.8 / 136.6 | 28.3 / 25.5 | 0.726 / 0.754 |
+| 64k | MTP | 328.6 / 283.7 | 28.5 / 23.1 | 0.932 / 0.955 |
+| 64k | DFlash2 | 324.7 / 277.3 | 31.7 / 27.6 | 0.783 / 0.778 |
+| 128k | MTP | 971.6 / 598.7 | 49.4 / 36.2 | 0.812 / 0.812 |
+
+What the decoders show:
+
+- **Acceptance is not hurt.** Across runs it moves by at most ±0.06, both ways. The drafts only see what the
+  target accepted, and D-LSA's target logits stay close to dense (§15.5).
+- **Speculative decode gains like baseline decode.** D-LSA saves 13–27% per token from 32k on (MTP at 128k:
+  36.2 vs 49.4 ms) and is within noise below.
+- **DFlash2 is never faster than MTP here.** On these code prompts MTP wins at every length; that is a property of
+  the drafter, not of D-LSA.
+- The DFlash2 runs at 128k were skipped for time.
+
+**Multi-row forwards.** The teacher-forced tail (256 rows in two 128-row forwards, the shape of a long verify or
+prefix continuation) took, dense / D-LSA: 1.18 / 1.24 s at 8k, 1.45 / 1.27 s at 32k, 2.38 / 1.27 s at 128k,
+5.38 / 1.37 s at 256k.
+
+### 15.5 Quality sanity (not RULER)
+
+**Teacher-forced tail.**
+
+- After the prefill, the next 256 file tokens are teacher-forced in 128-row forwards; the 255 rows with a known
+  next token are scored.
+- Per row: KL(dense ‖ D-LSA) over the full vocabulary, top-1 agreement with dense, and the perplexity ratio.
+- The cells list each document (doc 0 / doc 1 / doc 2, by offset 0 / 65,536 / 131,072):
+
+| context | ppl ratio | mean KL, nats | max KL | top-1 agreement |
+|---|---|---|---|---|
+| 4k | 1.000 / 1.000 / 1.000 (bitwise dense) | 0 | 0 | 1.000 |
+| 8k | 1.002 / 0.998 / 1.002 | 0.0020 / 0.0010 / 0.0009 | 0.44 | 0.984–0.996 |
+| 12k | 1.002 / 1.000 / 0.999 | 0.0005 / 0.0011 / 0.0023 | 0.16 | 0.988–1.000 |
+| 16k | 0.997 / 0.995 / 1.003 | 0.0021 / 0.0014 / 0.0024 | 0.05 | 0.980–0.996 |
+| 24k | 0.998 / 0.997 / 0.998 | 0.0016 / 0.0083 / 0.0046 | 0.66 | 0.961–0.992 |
+| 32k | 1.004 / 1.007 / 0.996 | 0.0036 / 0.0054 / 0.0031 | 0.18 | 0.969–1.000 |
+| 64k | 1.018 / **1.082** / 1.012 | 0.0086 / **0.508** / 0.0119 | **24.9** | 0.973 / **0.898** / 0.969 |
+| 128k | 1.036 / — / **0.822** | 0.0178 / — / **0.465** | **21.2** | 0.961 / — / 0.933 |
+| 256k | 1.002 | 0.0054 | 0.16 | 0.988 |
+| PCA map, doc 0: 32k / 64k / 128k | 1.004 / 1.020 / 1.038 | 0.0047 / 0.0086 / 0.0214 | 0.30 | 0.976 / 0.984 / 0.961 |
+
+**Needles.**
+
+- Five lines "The secret code of the {amber, cobalt, crimson, jade, violet} vault is {4821-KESTREL, …}." are
+  written at 10/30/50/70/90% depth. Each question ("Question: What is the secret code of the amber vault?
+  Answer: The secret code of the amber vault is") is answered greedily from a restored snapshot (12 tokens).
+- A needle counts when the answer starts with the code.
+- Dense and D-LSA found 15/15 at every context from 4k to 32k. No needles at 256k: there is no snapshot there,
+  for memory.
+- At 64k doc 1, dense itself found 0/5 and D-LSA 1/5. Both switched into chat mode (`<|im_end|><|im_start|>…`,
+  a raw-completion prompt over a corpus full of chat-template code). Docs 0 and 2 were 5/5 for both.
+- At 128k doc 0 both found 5/5. At **128k doc 2, dense found 5/5 and D-LSA 2/5**: the amber (10% depth), jade
+  (70%) and violet (90%) answers left for chat mode.
+- The PCA map found 5/5 on doc 0 at 32k, 64k and 128k.
+- Answers beyond the code (the 12-token text) equal dense in 15/15 runs at 4k–8k and in 9–14/15 at 12k–64k.
+
+**Reading.**
+
+- No gross breakage: no 4-bit interaction of the kind that would wreck every prompt.
+  - Up to 32k every document stays within 1% perplexity, mean KL under 0.01 nats and top-1 at 0.96 or above.
+  - 256k doc 0 is equally close.
+- But **two of the five long documents (64k doc 1, 128k doc 2) diverge clearly**: mean KL about 0.5 nats, some
+  rows above 20 nats, top-1 0.90–0.93. On one of them D-LSA misses needles that dense finds.
+- Doc 0 also drifts slowly with length (ppl ratio 1.004 → 1.018 → 1.036 at 32k / 64k / 128k): top_k = 4096
+  covers a shrinking share of the context.
+- The PCA step-0 map is no worse than the distilled one on these documents. That is unexpected and needs RULER
+  (task 7) to judge.
+
+### 15.6 Divergence diagnostics
+
+The two divergent documents were rerun with task 3's `mlx` backend added. That backend does a host pick and
+MLX's masked SDPA, and it is the oracle the Metal kernels were checked against (§14.2). Same prompts, needles and
+tail; `QW_DLSA_DENSE_BELOW=0`.
+
+| document | mode | prefill tok/s | tail ppl | mean KL | max KL | top-1 | rows with KL > 1 | needles |
+|---|---|---|---|---|---|---|---|---|
+| 64k doc 1 | dense | 198.0 | 4.541 | — | — | — | — | 0/5 |
+| | mlx | 193.7 | 4.774 | 0.508 | 26.1 | 0.898 | 17 of 255 | 1/5 |
+| | metal | 232.8 | 4.913 | 0.508 | 24.9 | 0.898 | 16 of 255 | 1/5 |
+| 128k doc 2 | dense | 138.7 | 3.091 | — | — | — | — | 5/5 |
+| | mlx | 154.1 | 2.616 | 0.482 | 21.7 | 0.929 | 14 of 255 | 2/5 |
+| | metal | 229.6 | 2.540 | 0.465 | 21.2 | 0.933 | 13 of 255 | 2/5 |
+
+- **Not the Metal kernels.** `mlx` and `metal` diverge from dense on the same rows (row indices agree, KL within
+  about 10%) and miss the same needles (amber, jade and violet at 128k).
+  - The Metal runs reproduce the main runs' numbers exactly; the bench is deterministic.
+  - So the cause is shared by both paths: the selection itself (index projections through the bf16 map, Ward
+    buckets, centroid scores, top_p/top_k). That is either the algorithm's behavior on these documents with this
+    4-bit checkpoint, or a defect in the shared index code. The golden fixtures (tasks 0–2) only check that code
+    at fixture sizes, not at 64k–128k.
+- **Where it hits.** The divergence is concentrated: 13–17 rows of 255 carry nearly all the KL.
+  - The 64k ones are identifier continuations in code (`pool_k`, `pool_v`, `PagedDecodeOutcome` after `Paged`,
+    `launched`): tokens a dense model copies from earlier occurrences.
+  - The other rows agree closely, which suggests the copy source is missing from the selected list, not that
+    reads are wrong in general.
+- **Perplexity can move either way.** At 128k D-LSA's tail perplexity is *lower* than dense (2.54 vs 3.09), while
+  top-1 agreement is only 0.93. Perplexity ratios alone would not have flagged this document.
+- **Follow-up for task 7.** This is a candidate for task 7 to study, together with RULER's retrieval tasks. Also
+  worth checking there: a run with the bf16 checkpoint, if one fits in memory, to separate the 4-bit interaction
+  from the algorithm, and the upstream reference on one of these documents.
+
+### 15.7 Decision and the `dense_below` threshold
+
+**Recommendation: keep D-LSA opt-in (`--dlsa`), and when it is on, read sparse only from 12,288 keys on
+(implemented: `dense_below`, default 12,288).** Not default-on:
+
+- **Accuracy at scale is unverified.** Two of five long documents diverge (§15.5–15.6), and RULER (task 7) has
+  not run.
+- **The KV setting conflicts.** D-LSA needs `--no-kv-quantization`, while the server's default KV cache is
+  TurboQuant, which D-LSA refuses (§13.1). Default-on would silently change the KV mode, or fail.
+- **Short prompts gain nothing.** Prefill gains only from about 20k tokens; most requests are shorter.
+
+**The threshold.**
+
+- `DlsaConfig::dense_below` (`--dlsa-dense-below <TOKENS>`, `QW_DLSA_DENSE_BELOW`, default 12,288, 0 = the old
+  rule) is a **per-row** policy (`DlsaConfig::dense_rows`): a query row at a position below it reads every
+  causal key, a row at or past it its sparse list. So a verify block or a chunk reads each row as single-token
+  forwards would, and a rollback or a snapshot restore never depends on how the rows were batched. The index is
+  built throughout, so later forwards read sparse lists as before.
+- **Semantics.**
+  - A forward with every row below the threshold (or on the dense key set) runs the unchanged dense attention:
+    bitwise dense.
+  - A forward that crosses it splits its rows. The rows below run `causal_attention`, SDPA over the fetched
+    cache under an additive causal mask, which equals dense attention up to rounding, not bitwise. The rows past
+    it select and read as before (K2, or the task-3 masked/gathered read).
+  - Multi-row and single-row reads already round differently under D-LSA (§13.3). The tests hold block vs single
+    tokens to the same 1e-4 tolerance, with greedy tokens equal.
+- 12,288 is the measured per-chunk crossover (§15.2): the first chunk that starts at 12,288 is 0.5% faster
+  sparse, and the one before, at 10,752, is 0.8% slower.
+- It also covers the decode crossover (about 16k) to within 1 ms.
+- It is part of the prefix-cache identity (`dense_below=` in `dlsa_identity`) and of the `D-LSA armed` log line.
+- With the feature off nothing changes; dense namespaces are unaffected.
+- **The measurements below are unaffected by the per-row split.** No measured forward crossed 12,288:
+  - the prompts are whole 1536-row chunks, and 12,288 = 8 · 1536;
+  - decode is single-row;
+  - the teacher-forced tails sit wholly below or wholly above the threshold;
+  - the speculative decoders were not run with the threshold.
+  The split only adds an SDPA over at most one verify block or chunk per sequence.
+- Tests (each fails with a per-forward decision, shown by reverting `dense_rows`, except the restore test, which
+  checks consistency):
+  - `qwen3_next::dlsa::tests::dense_below_runs_dense_until_the_threshold` (layer, all three backends): forwards
+    below the threshold are bitwise dense. A crossing forward's rows below match dense within 1e-5 and its other
+    rows read sparse; `sparse_rows` counts only those.
+  - `qwen3_5::dlsa_serving_tests::dense_below_chunk_matches_single_tokens_across_the_threshold` (model, all
+    backends): a chunk crossing the threshold vs single tokens, logits within 1e-4, greedy tokens and index
+    tables equal.
+  - `…::dense_below_verify_and_rollback_across_the_threshold`: 3-row (MTP) and 8-row (DFlash2) verifies with
+    seeded rollbacks through the threshold vs the sequential run. Logits, greedy tokens, tables and a 20-token
+    continuation all agree.
+  - `…::dense_below_snapshot_restore_across_the_threshold`: snapshots below and past the threshold restore and
+    continue through it bitwise like the uninterrupted run.
+  - `dlsa::options::tests::dense_below_comes_from_the_flag_then_the_variable`, the identity test, and the
+    `qw-server` and `qw-cli` flag parsing and help tests.
+- The other synthetic tests and the real-model tests R1–R9 set `dense_below: 0`, so they keep exercising the
+  sparse path at their (short) lengths.
+
+Measured with the threshold (document 0, same prompts and needles):
+
+| context | dense tok/s | D-LSA tok/s | ratio | decode dense / D-LSA, ms | tail mean KL | needles |
+|---|---|---|---|---|---|---|
+| 8k | 249.8 | 248.5 | 0.995 | 37.7 / 37.8 | 0 (bitwise) | 5/5 |
+| 12k | 247.1 | 245.8 | 0.995 | 38.2 / 38.3 | 0 (bitwise) | 5/5 |
+| 16k | 242.7 | 242.1 | 0.998 | 39.0 / 39.1 | 0.0021 | 5/5 |
+| 24k | 234.9 | 239.1 | **1.018** | 40.0 / 39.0 | 0.0017 | 5/5 |
+| 32k | 225.6 | 237.3 | **1.052** | 41.2 / 38.9 | 0.0036 | 5/5 |
+
+Against the main runs:
+
+- **Short prompts.** The 2.2–2.4% loss at 8k–12k shrinks to 0.5%, which is the index build (about 2.3 ms per
+  layer and chunk) that later sparse forwards need.
+- **Longer prompts.** 24k and 32k gain a little more (1.018 vs 1.010, 1.052 vs 1.047), since their first 8 chunks
+  no longer pay K2.
+- **Decode** at 8k–16k now equals dense.
+
+**What would still pay off** (in order):
+
+1. **The linear-attention layers.** They are 61–68% of a D-LSA prefill forward and cap prefill near 230 tok/s.
+   This is dense code outside D-LSA; it is the only route to large further prefill gains.
+2. **The KV fetch** (`update_and_fetch`). It grows to 36 ms per layer at 256k, now the largest growing D-LSA
+   stage. K2 could read the cache in place without the fetched view's copy.
+3. **K2 for short sparse depths.** About 38 ms per layer regardless of list length or depth. A kernel that is
+   cheaper below about 12k keys would let `dense_below` drop, and push the crossover down. A dense D = 256
+   flash kernel would also shrink the dense baseline's lead there (§14.3).
+4. **Not worth it:** K1, Ward and the score matmul. Together they are under 2.5% of the forward at every length
+   (G5/G6 stay pruned).
+
+### 15.8 Reproducing
+
+Build outside the GPU lock as in §14.6, then one context per lock hold:
+
+```text
+MLXCEL_CACHE_LIMIT=<8 GiB up to 64k | 4 GiB at 128k | 1 GiB at 256k> QW_DLSA_BENCH_CONTEXTS=<T> \
+  QW_DLSA_BENCH_MODES=dense,metal[,metal-pca] QW_DLSA_BENCH_OFFSET=<0 | 65536 | 131072> \
+  QW_DLSA_BENCH_TAIL=256 QW_DLSA_BENCH_NEEDLES=1 [QW_DLSA_BENCH_SPEC=mtp,dflash2] [QW_DLSA_DENSE_BELOW=0] \
+  QW_DLSA_BENCH_PROMPT=<token file> QW_DLSA_BENCH_OUT=<unique>.json \
+  ./gpu-lock -- target/release/deps/qw_runtime-<hash> qwen3_5::dlsa_bench::real_dlsa_bench --exact --ignored \
+  --nocapture --test-threads=1
+python3 eval/dlsa/task6/summarize.py <directory of reports>
+```
+
+Notes:
+
+- No needles at 256k: the snapshot would add 16 GiB next to a 34 GiB peak.
+- The report's `dlsa_stats` counts only the last needle's forwards (each restore starts a fresh sequence). The
+  prefill's index bytes are recorded separately.

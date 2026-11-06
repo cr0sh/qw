@@ -132,6 +132,35 @@ pub fn masked_attention(
     out
 }
 
+/// Every query row of `q` (`[1, Hq, L, D]`, positions `positions_start..+L`) over all its causal
+/// keys: SDPA over the cached keys under an additive causal mask. The rows of a forward that
+/// crosses `DlsaConfig::dense_below` below it; equal to the dense attention up to rounding.
+pub fn causal_attention(
+    q: &MlxArray,
+    keys: &MlxArray,
+    values: &MlxArray,
+    positions_start: usize,
+    scale: f32,
+) -> UniquePtr<MlxArray> {
+    let rows = mlxcel_core::array_shape(q)[2];
+    let total = mlxcel_core::array_shape(keys)[2];
+    let dtype = mlxcel_core::array_dtype(q);
+    let start = positions_start as i32;
+    let query = mlxcel_core::reshape(&mlxcel_core::arange_i32(start, start + rows, 1), &[rows, 1]);
+    let key = mlxcel_core::reshape(&mlxcel_core::arange_i32(0, total, 1), &[1, total]);
+    let future = mlxcel_core::greater(&key, &query);
+    let mask = mlxcel_core::where_cond(
+        &future,
+        &mlxcel_core::full_f32(&[rows, total], f32::NEG_INFINITY, dtype),
+        &mlxcel_core::zeros(&[rows, total], dtype),
+    );
+    let mask = mlxcel_core::reshape(&mask, &[1, 1, rows, total]);
+    lap(DlsaStage::MaskBuild, &[&mask]);
+    let out = sdpa(q, keys, values, scale, Some(&mask));
+    lap(DlsaStage::DenseRead, &[&out]);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

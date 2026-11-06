@@ -12,7 +12,7 @@ use tracing::warn;
 use super::config::DlsaIndexConfig;
 use super::convert::sha256_hex;
 use super::resolve::{DLSA_MAP_ENV, DlsaMapKind, resolve_dir};
-use super::runtime::{DlsaBackend, DlsaConfig};
+use super::runtime::{DLSA_DENSE_BELOW_DEFAULT, DlsaBackend, DlsaConfig};
 
 /// `1`/`true` enables D-LSA, `0`/`false` leaves it off.
 pub const DLSA_ENV: &str = "QW_DLSA";
@@ -22,6 +22,8 @@ pub const DLSA_SINK_ENV: &str = "QW_DLSA_SINK";
 pub const DLSA_WINDOW_ENV: &str = "QW_DLSA_WINDOW";
 pub const DLSA_TOP_K_ENV: &str = "QW_DLSA_TOP_K";
 pub const DLSA_TOP_P_ENV: &str = "QW_DLSA_TOP_P";
+/// Query rows below this many keys read every causal key (`DlsaConfig::dense_below`); 0 disables it.
+pub const DLSA_DENSE_BELOW_ENV: &str = "QW_DLSA_DENSE_BELOW";
 /// `mlx`, `metal` (default) or `metal-select`: where the select and the read run.
 pub const DLSA_BACKEND_ENV: &str = "QW_DLSA_BACKEND";
 
@@ -55,6 +57,8 @@ pub struct DlsaOptions {
     pub top_k: Option<usize>,
     /// `--dlsa-top-p`.
     pub top_p: Option<usize>,
+    /// `--dlsa-dense-below`.
+    pub dense_below: Option<usize>,
     /// `--dlsa-backend`.
     pub backend: Option<DlsaBackend>,
 }
@@ -109,6 +113,7 @@ impl DlsaOptions {
             (self.window.is_some(), "--dlsa-window"),
             (self.top_k.is_some(), "--dlsa-top-k"),
             (self.top_p.is_some(), "--dlsa-top-p"),
+            (self.dense_below.is_some(), "--dlsa-dense-below"),
             (self.backend.is_some(), "--dlsa-backend"),
         ]
         .into_iter()
@@ -170,6 +175,13 @@ impl DlsaOptions {
             DLSA_TOP_P_ENV,
             defaults.top_p,
         )?;
+        let (dense_below, _) = knob(
+            self.dense_below,
+            "--dlsa-dense-below",
+            &env,
+            DLSA_DENSE_BELOW_ENV,
+            DLSA_DENSE_BELOW_DEFAULT,
+        )?;
         let backend = match self.backend {
             Some(backend) => backend,
             None => match non_empty(&env, DLSA_BACKEND_ENV) {
@@ -180,6 +192,7 @@ impl DlsaOptions {
         };
         let mut config = DlsaConfig::new(PathBuf::new());
         config.backend = backend;
+        config.dense_below = dense_below;
         config.index = DlsaIndexConfig {
             window_size: window,
             sink_size: sink,
@@ -234,9 +247,10 @@ pub fn dlsa_identity(config: &DlsaConfig) -> Result<DlsaIdentity> {
     let map_sha256 = map_sha256(&config.map_path)?;
     let index = &config.index;
     let bytes = format!(
-        "qw-dlsa;map_sha256={map_sha256};map_dtype={:?};short_context={:?};read={};window={};sink={};top_k={};top_p={};index_dim={};pool={};bucket={};cap={}",
+        "qw-dlsa;map_sha256={map_sha256};map_dtype={:?};short_context={:?};dense_below={};read={};window={};sink={};top_k={};top_p={};index_dim={};pool={};bucket={};cap={}",
         config.map_dtype,
         config.short_context,
+        config.dense_below,
         match config.backend {
             DlsaBackend::Mlx | DlsaBackend::MetalSelect => "mlx",
             DlsaBackend::Metal => "metal",
@@ -478,6 +492,9 @@ mod tests {
         let mut config = DlsaConfig::new(a.clone());
         config.short_context = DlsaShortContext::Sparse;
         assert_ne!(base, dlsa_identity(&config).unwrap());
+        let mut config = DlsaConfig::new(a.clone());
+        config.dense_below = 0;
+        assert_ne!(base, dlsa_identity(&config).unwrap());
         // The default (Metal) read never shares KV with the MLX read; the parity mode does
         assert_eq!(DlsaConfig::new(a.clone()).backend, DlsaBackend::Metal);
         let on = |backend| {
@@ -528,5 +545,44 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("--dlsa-backend requires --dlsa"), "{err}");
+    }
+
+    #[test]
+    fn dense_below_comes_from_the_flag_then_the_variable() {
+        let dir = tmp("dense-below");
+        let map = map_file(&dir, "m.safetensors", b"m");
+        let on = DlsaOptions {
+            enabled: true,
+            map_path: Some(map),
+            ..Default::default()
+        };
+        let dense_below = |options: &DlsaOptions, pairs: &[(&str, &str)]| {
+            options
+                .resolve(env(pairs))
+                .unwrap()
+                .unwrap()
+                .config
+                .dense_below
+        };
+        assert_eq!(dense_below(&on, &[]), DLSA_DENSE_BELOW_DEFAULT);
+        assert_eq!(dense_below(&on, &[(DLSA_DENSE_BELOW_ENV, "0")]), 0);
+        let flag = DlsaOptions {
+            dense_below: Some(32_768),
+            ..on.clone()
+        };
+        assert_eq!(dense_below(&flag, &[(DLSA_DENSE_BELOW_ENV, "0")]), 32_768);
+        let err = on
+            .resolve(env(&[(DLSA_DENSE_BELOW_ENV, "16k")]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(DLSA_DENSE_BELOW_ENV), "{err}");
+        let err = DlsaOptions {
+            dense_below: Some(0),
+            ..Default::default()
+        }
+        .resolve(env(&[]))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("--dlsa-dense-below requires --dlsa"), "{err}");
     }
 }
