@@ -1,9 +1,13 @@
 # D-LSA (flat design) for Qwen3.8-27B: spec for the QW port
 
-Status: roadmap tasks 0-5 done: this spec, golden fixtures in
+Status: roadmap tasks 0-7 done: this spec, golden fixtures in
 [`tests/fixtures/dlsa/`](../tests/fixtures/dlsa/README.md), the map loader (§10), the indexer core (§11), sparse
 attention in Qwen3.5's 16 full-attention layers behind `enable_dlsa` (§12), serving integration (§13: snapshots and
-the prefix cache, MTP/DFlash2 verify and rollback, grammar, `qw serve --dlsa`), and Metal kernels (§14).
+the prefix cache, MTP/DFlash2 verify and rollback, grammar, `qw serve --dlsa`), Metal kernels (§14), the throughput
+evaluation and the `dense_below` threshold (§15), and RULER accuracy (§16). On a RULER subsample (10 rows per task)
+at 32k, no task degrades under D-LSA: identical scores on 12 of 13 tasks, cwe +0.010 (2 of 130 rows change score, one
+each way), mean 0.968 for both (upstream's bf16 D-LSA: 0.968). 64k and longer are not measured, and D-LSA stays
+opt-in (§16.5).
 
 With the default Metal backend, D-LSA beats dense on the real model (fp16 KV, M4 Max):
 
@@ -489,6 +493,7 @@ This section draws on the researcher's integration notes, checked against the co
    pinned by sha256.
 9. **Snapshot complexity** (§7.4) and interaction with SpecPrefill (positions ≠ slots). Exclude SpecPrefill.
 10. **Accuracy evidence is upstream's.** RULER 0.968 at 32k is on H200 bf16 with YaRN 40. Nothing is verified on QW yet.
+    (Since measured on QW at 4k and 32k: §16.)
 
 ## 9. Roadmap refinement
 
@@ -1363,8 +1368,8 @@ peak memory. These runs predate `dense_below` (§15.7); to reproduce them now, s
 ## 15. Evaluation (roadmap task 6)
 
 This section measures the final implementation (task 4's Metal kernels, task 5's serving integration) against
-dense attention on one machine. The focus is prefill throughput. RULER is not run here; it is task 7. **Accuracy at
-scale is unverified until task 7 runs.** §15.5 is a cheap sanity check only, and it already shows two
+dense attention on one machine. The focus is prefill throughput. RULER is not run here; it is task 7, in §16.
+**Accuracy at scale was unverified until then.** §15.5 is a cheap sanity check only, and it already shows two
 documents where D-LSA diverges from dense.
 
 ### 15.1 Setup
@@ -1605,7 +1610,7 @@ prefix continuation) took, dense / D-LSA: 1.18 / 1.24 s at 8k, 1.45 / 1.27 s at 
 - Doc 0 also drifts slowly with length (ppl ratio 1.004 → 1.018 → 1.036 at 32k / 64k / 128k): top_k = 4096
   covers a shrinking share of the context.
 - The PCA step-0 map is no worse than the distilled one on these documents. That is unexpected and needs RULER
-  (task 7) to judge.
+  (task 7) to judge; §16 ran the distilled map only.
 
 ### 15.6 Divergence diagnostics
 
@@ -1638,7 +1643,8 @@ tail; `QW_DLSA_DENSE_BELOW=0`.
   top-1 agreement is only 0.93. Perplexity ratios alone would not have flagged this document.
 - **Follow-up for task 7.** This is a candidate for task 7 to study, together with RULER's retrieval tasks. Also
   worth checking there: a run with the bf16 checkpoint, if one fits in memory, to separate the 4-bit interaction
-  from the algorithm, and the upstream reference on one of these documents.
+  from the algorithm, and the upstream reference on one of these documents. (§16 ran RULER at 4k and 32k only;
+  these documents remain open.)
 
 ### 15.7 Decision and the `dense_below` threshold
 
@@ -1646,7 +1652,8 @@ tail; `QW_DLSA_DENSE_BELOW=0`.
 (implemented: `dense_below`, default 12,288).** Not default-on:
 
 - **Accuracy at scale is unverified.** Two of five long documents diverge (§15.5–15.6), and RULER (task 7) has
-  not run.
+  not run. (§16 has since run it at 4k and 32k: no task degrades at 32k, cwe +0.010; 64k and longer remain
+  unmeasured.)
 - **The KV setting conflicts.** D-LSA needs `--no-kv-quantization`, while the server's default KV cache is
   TurboQuant, which D-LSA refuses (§13.1). Default-on would silently change the KV mode, or fail.
 - **Short prompts gain nothing.** Prefill gains only from about 20k tokens; most requests are shorter.
@@ -1744,3 +1751,202 @@ Notes:
 - No needles at 256k: the snapshot would add 16 GiB next to a 34 GiB peak.
 - The report's `dlsa_stats` counts only the last needle's forwards (each restore starts a fresh sequence). The
   prefill's index bytes are recorded separately.
+
+## 16. RULER accuracy (roadmap task 7)
+
+This section runs upstream's RULER protocol (13 tasks, 4k and 32k) against `qw serve`, dense and with `--dlsa`, on a
+subsample of the rows. The harness and the protocol are in
+[`eval/dlsa/ruler/README.md`](../eval/dlsa/ruler/README.md); every number below comes from the result files in
+[`eval/dlsa/ruler/results/task7/`](../eval/dlsa/ruler/results/task7/): `summary.md` and `summary.json`
+(`summarize.py`), the per-row records `dense/*.jsonl` and `dlsa/*.jsonl` (with the reply text), and
+`server-log-{dense,dlsa}.json` (`server_log_stats.py`, per request). The upstream reference is README.md:180 at
+`5ebea73`: Qwen3.8-27B D-LSA (Flat), bf16 on one H200, 100 rows per task, 0.974 at 4k and 0.968 at 32k (the paper's
+columns: 0.975 / 0.966).
+
+### 16.1 Setup
+
+- **Machine.** Apple M4 Max (64 GB), 2026-11-06.
+- **Build.** `cccbf65` (this task's base; also the harness's `git describe` in each `meta.json`), release,
+  `--features dlsa`.
+- **Model.** `Jundot/Qwen3.8-27B-oQ4e-fp16-mtp` (4-bit oQ4e), fp16 KV (`--no-kv-quantization`), decoder `auto`. Auto
+  chose DFlash2 (drafter `incoai/Qwen3.8-27B-DFlash2`) for every request of both servers: 546 of 546
+  `decoder.selected` events, route `dflash2` in every `server-log-*.json` entry.
+- **Servers.**
+  - Dense: `qw serve --no-kv-quantization`.
+  - D-LSA: `qw serve --dlsa --no-kv-quantization`, the served defaults (§13.4, §15.7). Its `D-LSA armed` line: the
+    distilled map (sha256 `00200004…62e1`), bf16, backend `metal`, sink 4, window 512, top_k 4096, top_p 1024,
+    short context `DenseFallback`, `dense_below` 12,288.
+  - Both: `MLXCEL_CACHE_LIMIT` 8 GiB, prefix cache on as shipped. It reused nothing at 32k (`cached_tokens` 0 in every
+    row) and 15 tokens per row on average in the dense 4k run (0 in the D-LSA 4k run).
+- **Where D-LSA is active.** The 4k prompts (mean 3,716 tokens) are all below 4,612, so every forward reads the dense
+  key set: the server log shows 0 sparse forwards in all 26 D-LSA 4k requests. The 32k prompts (mean 32,026 tokens)
+  read sparse from position 12,288 on. The log's `sparse_forwards` counts full-attention layer forwards (16 per model
+  forward, `DlsaStats` in `crates/runtime/src/dlsa/runtime.rs`), prefill chunks and DFlash2 verify forwards alike:
+  128 dense-key-set forwards (8 model forwards) in every 32k request, and 192–18,208 sparse ones, from a
+  1-token reply to a 4,096-token cwe reply with 1,124 verify rounds. The index is 54–75 MiB per request (mean 56).
+- **Data.** Upstream's RULER sets for Qwen3.8-27B, regenerated with upstream's generators (`prepare_ruler.py`:
+  NVIDIA/RULER @ `c3f5e3b4` with upstream's patch, seed 42, tokenizer `Qwen/Qwen3.8-27b`, tokenizers 0.23.2):
+  13 tasks × {4096, 32768} × 100 rows. All 30 pinned prompt-set hashes of upstream's `hashes_qwen38_27b.json`
+  match (`prepare_ruler.py --check-hashes`: 30/30).
+- **Protocol.** Upstream's (eval/dlsa/ruler/README.md): one user message, `input` + `gen_prefix` (with a single
+  space only where the seam has none), greedy (temperature 0, top_p 1), max_tokens 4096,
+  `chat_template_kwargs.enable_thinking=false`, substring scoring (`string_match_all`; `string_match_part` for
+  qa_squad and qa_hotpot), replies cut at max_tokens scored as they are, the length's score the mean of the 13 task
+  scores.
+- **Rows.** The first N rows of each file (an N-row set is a prefix of the 100-row set, so a larger run later reuses
+  these rows):
+
+| config | 4k rows per task | 32k rows per task | GPU time |
+|---|---|---|---|
+| dense | 20 (260 rows) | 10 (130 rows) | 6.8 h (4k 1.45 h, 32k 5.35 h) |
+| D-LSA | 2 (26 rows, an identity check) | 10 (130 rows) | 5.3 h (4k 0.15 h, 32k 5.12 h) |
+
+- **Why a subsample.** The full protocol is 100 rows per task. On this machine a 32k row takes about 145 s and rows
+  share no prefix, so 100 rows cost about 7 h at 4k and 52 h at 32k per configuration, about 110 h for dense and
+  D-LSA at both lengths. The user chose this scope (dense 20/10 rows, D-LSA 10 rows at 32k plus 2 at 4k) out of three
+  offered; no PCA map and no 64k.
+- **Statistical power.** At 10 rows a task score moves in steps of 0.1, and its binomial standard error is up to
+  about 0.16. The worst case for the 13-task mean is about 0.04. On these rows, where only cwe, qa_squad and
+  qa_hotpot vary, the mean's empirical standard error is about 0.014 at 32k for both servers. The paper publishes
+  no dense RULER number as text (its Figure 11 shows dense and D-LSA within a point or two of each other at 4k–32k),
+  and a gap of that size is below either error. So the run can detect gross degradation only, and the sensitive
+  instrument is the row-paired comparison: the same rows under both servers (§16.3).
+
+### 16.2 Scores
+
+Task scores; n is the number of rows. "paired" means the rows both servers finished (at 32k all 10; at 4k the first
+2), where dense's 4k paired mean is 0.954.
+
+| task | 4k dense (20) | 4k D-LSA (2) | 32k dense (10) | 32k D-LSA (10) |
+|---|---|---|---|---|
+| niah_single_1/2/3, niah_multikey_1/2/3, niah_multiquery, niah_multivalue | 1.000 each | 1.000 each | 1.000 each | 1.000 each |
+| vt | 1.000 | 1.000 | 1.000 | 1.000 |
+| cwe | 0.945 | 0.900 | 0.980 | **0.990** |
+| fwe | 1.000 | 1.000 | 1.000 | 1.000 |
+| qa_squad | 0.900 | 1.000 | 0.800 | 0.800 |
+| qa_hotpot | 0.650 | 0.500 | 0.800 | 0.800 |
+| **mean** | **0.961** | 0.954 (= dense on the same rows) | **0.968** | **0.968** |
+| upstream D-LSA bf16 (README.md:180) | 0.974 | | 0.968 | |
+| difference to upstream | −0.013 | | −0.000 | +0.000 |
+
+- **32k.** No task degrades under D-LSA: scores are identical on 12 of 13 tasks, and cwe is +0.010 (0.980 → 0.990,
+  two rows changing, one each way, §16.3). The means are 0.968 for both (paired delta +0.001), equal to the upstream
+  D-LSA mean to three digits. At this row count that agreement with upstream is a property of the sample, not a
+  measured match.
+- **4k.** Dense reads 0.961, 0.013 below upstream's 0.974. D-LSA plays no part in that gap: upstream's 4k run reads
+  the dense key set too (§4.7), and on the paired check D-LSA was inactive here (0 sparse forwards, bitwise dense):
+  its 2 rows per task score exactly as dense on the same rows (0.954 both) and every reply is byte-identical to dense
+  (26 of 26). What the −0.013 is made of stays unresolved. It compares QW's first 20 rows per task with upstream's
+  100-row aggregate, on the 4-bit oQ4e checkpoint and QW against bf16 on upstream's SGLang fork and an H200; the row
+  sample alone could explain it, and there is no paired bf16 baseline. Separating quantization from the sample and
+  the stack would take the same rows on the bf16 checkpoint, which was not run (27B bf16 weights alone are about
+  54 GB on this 64 GB machine).
+
+### 16.3 Row-level agreement (32k, 130 rows)
+
+| task | rows whose score differs | rows whose reply text differs |
+|---|---|---|
+| niah_single_2 | 0 | 1 |
+| niah_single_3 | 0 | 3 |
+| niah_multikey_2 | 0 | 3 |
+| niah_multikey_3 | 0 | 4 |
+| niah_multiquery | 0 | 1 |
+| vt | 0 | 2 |
+| cwe | **2** (row 3: 1.0 → 0.9; row 5: 0.8 → 1.0) | 10 |
+| niah_single_1, niah_multikey_1, niah_multivalue, fwe, qa_squad, qa_hotpot | 0 | 0 |
+| **total** | **2 of 130**, one each way | **24 of 130** |
+
+- **Scores.** Only two rows change score, both cwe, one down and one up. In row 3 both replies were cut at
+  max_tokens. In row 5 dense's reply was cut and D-LSA's finished.
+- **The 14 non-cwe text differences** are phrasing or formatting around the same correct answer:
+  - "mentioned in the text" vs "mentioned in the provided text" (niah_single_2 row 7, niah_single_3 rows 1 and 7);
+  - a colon and line break before the uuid (niah_single_3 row 6);
+  - a bold vs a plain uuid (niah_multikey_3 rows 2, 3, 5, 9; D-LSA plain);
+  - a bare number (dense) vs a full sentence (D-LSA) in niah_multikey_2 rows 2, 5, 9;
+  - the full sentence (dense) vs the bare variable list (D-LSA) in vt rows 2 and 7;
+  - a shorter list heading in niah_multiquery row 7.
+- **cwe differs in all 10 rows.** The model answers cwe with a long word-counting transcript. Under D-LSA it takes a
+  different route from the first sentence on: every pair parts at character 42 ("we must count" vs "we first
+  count", row 5 "we count"). cwe prompts are a random word stream, where the selected key set plausibly changes the
+  hidden states even when the answer does not; the scores agree in 8 of the 10 rows.
+- **qa_squad and qa_hotpot**: identical replies in all 20 rows.
+- **cwe runaway.** cwe replies were cut at max_tokens in 11 of 20 dense 4k rows, 1 of 2 D-LSA 4k rows, 8 of 10
+  dense 32k rows and 8 of 10 D-LSA 32k rows (`summary.md`, "Errors and replies cut at max_tokens"); no other task
+  was ever cut, and no row errored. They are scored as upstream does, by substring over the cut reply. Such a row
+  decodes 4,096 tokens: a cut row takes 91 s on average at 4k (the 4k median row is 16.2 s, hence the mean of
+  20.1 s) and 219–237 s at 32k (the median is 137–145 s).
+- **Against §15.5–15.6.** Nothing like the two divergent documents shows up on RULER at 32k. Those were at 64k and
+  128k, where top_k 4096 covers a smaller share of the context, and they remain unexplained here: 64k was not run.
+
+### 16.4 Decoder and timing
+
+Per request from `server-log-*.json`, joined to the rows by response id. Medians over requests; acceptance is
+accepted over proposed draft tokens summed over the length's requests.
+
+| | 4k dense | 4k D-LSA | 32k dense | 32k D-LSA |
+|---|---|---|---|---|
+| requests | 260 | 26 | 130 | 130 |
+| prefill tok/s (median) | 253.8 | 252.6 | 226.5 | 238.3 (1.05×) |
+| decode tok/s (median, DFlash2) | 41.4 | 38.3 | 31.6 | 35.0 |
+| row latency s, mean / median | 20.1 / 16.2 | 21.0 / 16.3 | 148.2 / 144.7 | 141.7 / 137.5 |
+| DFlash2 acceptance, all rows | 0.918 | 0.926 | 0.850 | 0.857 |
+| acceptance, rows with ≤ 200 decoded tokens | 0.806 (240) | 0.793 (24) | 0.728 (120) | 0.737 (120) |
+
+- **Prefill** at 32k gains 1.05×, as §15.2 measured on the bench (1.047).
+- **Acceptance** is unchanged by D-LSA, as §15.4 found: within 0.013 at both lengths, with and without the cwe
+  runaways (the 4k D-LSA figures are 26 rows). Together with §16.3 this shows that the multi-row verify under D-LSA
+  does not change what is scored.
+- **Cost of the full protocol** (`summarize.py --extrapolate 100`, each task's mean row time × 100): 7.3 h (dense)
+  and 7.6 h (D-LSA) at 4k, 53.5 h and 51.2 h at 32k, per configuration.
+
+### 16.5 Reading and decision
+
+- **At 32k no RULER task degrades under D-LSA in this sample.** On the 4-bit checkpoint with the served defaults:
+  identical scores on 12 of 13 tasks, cwe +0.010; paired delta +0.001; 2 of 130 rows change score (both cwe, one each
+  way); 106 of 130 replies identical and the other non-cwe ones only reworded. The mean equals upstream's bf16 D-LSA
+  mean.
+- **At 4k dense is 0.013 below upstream**, with D-LSA inactive (bitwise dense). Whether that is the 4-bit checkpoint,
+  the 20-row sample or the serving stack is not resolved (§16.2).
+- **Limits.**
+  - At 10 rows per task the run cannot resolve differences in the mean below about 0.03.
+  - It says nothing about 64k–256k, where §15.5–15.6 saw two documents diverge.
+  - The distilled map only; the PCA map was not run.
+- **Decision: keep D-LSA opt-in.** Accuracy is no longer the reason against enabling it at contexts up to 32k. The
+  other blockers of §15.7 are untouched: D-LSA needs `--no-kv-quantization` while the server defaults to TurboQuant,
+  and prompts below about 20k gain nothing.
+- **Before any default-on:** RULER at 64k and 128k, the two divergent documents of §15.6, and the full 100 rows at
+  32k. A 100-row 32k run costs about 52 h per configuration; the harness resumes, so the rows here count toward it
+  (raise `--rows` on the same `--out`).
+
+### 16.6 Reproducing
+
+The RULER data is not committed (167 MB for the 26 files); regenerate it with `prepare_ruler.py` and check it with
+`--check-hashes` (eval/dlsa/ruler/README.md). One server at a time, through the GPU lock. The debug filter makes
+the DFlash2 statistics and the per-request D-LSA counters appear in the stdout log, which `server_log_stats.py`
+reads:
+
+```text
+RUST_LOG=info,qw_server::engine=debug,qw_runtime::provider=debug MLXCEL_CACHE_LIMIT=8589934592 \
+  ./gpu-lock -- qw serve [--dlsa] --no-kv-quantization --bind 127.0.0.1:8011 --no-file-logging \
+  --output-format json > serve-<dense|dlsa>.log 2>&1
+
+# dense server
+python3 eval/dlsa/ruler/run_ruler.py --base-url http://127.0.0.1:8011 --data-root DATA --out results/dense \
+  --label dense --lengths 4096 --rows 20 --note "..."
+python3 eval/dlsa/ruler/run_ruler.py --base-url http://127.0.0.1:8011 --data-root DATA --out results/dense \
+  --label dense --lengths 32768 --rows 10 --note "..."
+# D-LSA server
+python3 eval/dlsa/ruler/run_ruler.py --base-url http://127.0.0.1:8011 --data-root DATA --out results/dlsa \
+  --label dlsa --lengths 32768 --rows 10 --note "..."
+python3 eval/dlsa/ruler/run_ruler.py --base-url http://127.0.0.1:8011 --data-root DATA --out results/dlsa \
+  --label dlsa --lengths 4096 --rows 2 --note "4k identity check"
+
+python3 eval/dlsa/ruler/summarize.py --runs dense=results/dense dlsa=results/dlsa --extrapolate 100 \
+  --json results/summary.json > results/summary.md
+python3 eval/dlsa/ruler/server_log_stats.py serve-dense.log --json results/server-log-dense.json
+python3 eval/dlsa/ruler/server_log_stats.py serve-dlsa.log --json results/server-log-dlsa.json
+```
+
+Each run's `meta.json` records the invocations (rows, lengths, server URL, note, harness commit) and each data
+file's sha256 and prompt-set hash. The split of the server-log numbers by length in §16.4 joins each log entry's
+`id` to the rows' `response_id`.

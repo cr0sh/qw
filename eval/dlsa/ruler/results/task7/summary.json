@@ -1,0 +1,1010 @@
+{
+ "scores": [
+  {
+   "length": 4096,
+   "labels": [
+    "dense",
+    "dlsa"
+   ],
+   "tasks": [
+    {
+     "task": "niah_single_1",
+     "own": [
+      1.0,
+      1.0
+     ],
+     "n": [
+      20,
+      2
+     ],
+     "paired_n": 2,
+     "paired": [
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "task": "niah_single_2",
+     "own": [
+      1.0,
+      1.0
+     ],
+     "n": [
+      20,
+      2
+     ],
+     "paired_n": 2,
+     "paired": [
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "task": "niah_single_3",
+     "own": [
+      1.0,
+      1.0
+     ],
+     "n": [
+      20,
+      2
+     ],
+     "paired_n": 2,
+     "paired": [
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "task": "niah_multikey_1",
+     "own": [
+      1.0,
+      1.0
+     ],
+     "n": [
+      20,
+      2
+     ],
+     "paired_n": 2,
+     "paired": [
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "task": "niah_multikey_2",
+     "own": [
+      1.0,
+      1.0
+     ],
+     "n": [
+      20,
+      2
+     ],
+     "paired_n": 2,
+     "paired": [
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "task": "niah_multikey_3",
+     "own": [
+      1.0,
+      1.0
+     ],
+     "n": [
+      20,
+      2
+     ],
+     "paired_n": 2,
+     "paired": [
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "task": "niah_multiquery",
+     "own": [
+      1.0,
+      1.0
+     ],
+     "n": [
+      20,
+      2
+     ],
+     "paired_n": 2,
+     "paired": [
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "task": "niah_multivalue",
+     "own": [
+      1.0,
+      1.0
+     ],
+     "n": [
+      20,
+      2
+     ],
+     "paired_n": 2,
+     "paired": [
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "task": "vt",
+     "own": [
+      1.0,
+      1.0
+     ],
+     "n": [
+      20,
+      2
+     ],
+     "paired_n": 2,
+     "paired": [
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "task": "cwe",
+     "own": [
+      0.945,
+      0.9
+     ],
+     "n": [
+      20,
+      2
+     ],
+     "paired_n": 2,
+     "paired": [
+      0.9,
+      0.9
+     ]
+    },
+    {
+     "task": "fwe",
+     "own": [
+      1.0,
+      1.0
+     ],
+     "n": [
+      20,
+      2
+     ],
+     "paired_n": 2,
+     "paired": [
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "task": "qa_squad",
+     "own": [
+      0.9,
+      1.0
+     ],
+     "n": [
+      20,
+      2
+     ],
+     "paired_n": 2,
+     "paired": [
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "task": "qa_hotpot",
+     "own": [
+      0.65,
+      0.5
+     ],
+     "n": [
+      20,
+      2
+     ],
+     "paired_n": 2,
+     "paired": [
+      0.5,
+      0.5
+     ]
+    }
+   ],
+   "own_mean": [
+    0.9611538461538461,
+    0.9538461538461539
+   ],
+   "own_tasks": [
+    13,
+    13
+   ],
+   "paired_mean": [
+    0.9538461538461539,
+    0.9538461538461539
+   ],
+   "paired_tasks": 13,
+   "paper": 0.974
+  },
+  {
+   "length": 32768,
+   "labels": [
+    "dense",
+    "dlsa"
+   ],
+   "tasks": [
+    {
+     "task": "niah_single_1",
+     "own": [
+      1.0,
+      1.0
+     ],
+     "n": [
+      10,
+      10
+     ],
+     "paired_n": 10,
+     "paired": [
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "task": "niah_single_2",
+     "own": [
+      1.0,
+      1.0
+     ],
+     "n": [
+      10,
+      10
+     ],
+     "paired_n": 10,
+     "paired": [
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "task": "niah_single_3",
+     "own": [
+      1.0,
+      1.0
+     ],
+     "n": [
+      10,
+      10
+     ],
+     "paired_n": 10,
+     "paired": [
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "task": "niah_multikey_1",
+     "own": [
+      1.0,
+      1.0
+     ],
+     "n": [
+      10,
+      10
+     ],
+     "paired_n": 10,
+     "paired": [
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "task": "niah_multikey_2",
+     "own": [
+      1.0,
+      1.0
+     ],
+     "n": [
+      10,
+      10
+     ],
+     "paired_n": 10,
+     "paired": [
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "task": "niah_multikey_3",
+     "own": [
+      1.0,
+      1.0
+     ],
+     "n": [
+      10,
+      10
+     ],
+     "paired_n": 10,
+     "paired": [
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "task": "niah_multiquery",
+     "own": [
+      1.0,
+      1.0
+     ],
+     "n": [
+      10,
+      10
+     ],
+     "paired_n": 10,
+     "paired": [
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "task": "niah_multivalue",
+     "own": [
+      1.0,
+      1.0
+     ],
+     "n": [
+      10,
+      10
+     ],
+     "paired_n": 10,
+     "paired": [
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "task": "vt",
+     "own": [
+      1.0,
+      1.0
+     ],
+     "n": [
+      10,
+      10
+     ],
+     "paired_n": 10,
+     "paired": [
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "task": "cwe",
+     "own": [
+      0.98,
+      0.99
+     ],
+     "n": [
+      10,
+      10
+     ],
+     "paired_n": 10,
+     "paired": [
+      0.98,
+      0.99
+     ]
+    },
+    {
+     "task": "fwe",
+     "own": [
+      1.0,
+      1.0
+     ],
+     "n": [
+      10,
+      10
+     ],
+     "paired_n": 10,
+     "paired": [
+      1.0,
+      1.0
+     ]
+    },
+    {
+     "task": "qa_squad",
+     "own": [
+      0.8,
+      0.8
+     ],
+     "n": [
+      10,
+      10
+     ],
+     "paired_n": 10,
+     "paired": [
+      0.8,
+      0.8
+     ]
+    },
+    {
+     "task": "qa_hotpot",
+     "own": [
+      0.8,
+      0.8
+     ],
+     "n": [
+      10,
+      10
+     ],
+     "paired_n": 10,
+     "paired": [
+      0.8,
+      0.8
+     ]
+    }
+   ],
+   "own_mean": [
+    0.9676923076923077,
+    0.9684615384615385
+   ],
+   "own_tasks": [
+    13,
+    13
+   ],
+   "paired_mean": [
+    0.9676923076923077,
+    0.9684615384615385
+   ],
+   "paired_tasks": 13,
+   "paper": 0.968
+  }
+ ],
+ "timing": [
+  {
+   "label": "dense",
+   "length": 4096,
+   "rows": 260,
+   "errors": 0,
+   "mean_latency_s": 20.0991,
+   "median_latency_s": 16.2275,
+   "mean_prompt_tokens": 3716.096153846154,
+   "mean_completion_tokens": 284.24615384615385,
+   "mean_cached_tokens": 15.26923076923077,
+   "latency_sum_h": 1.4516016666666665,
+   "span_h": 1.4516425,
+   "estimate_h": 7.258008333333333,
+   "estimate_rows": 100
+  },
+  {
+   "label": "dlsa",
+   "length": 4096,
+   "rows": 26,
+   "errors": 0,
+   "mean_latency_s": 21.02273076923077,
+   "median_latency_s": 16.346,
+   "mean_prompt_tokens": 3733.9615384615386,
+   "mean_completion_tokens": 322.5,
+   "mean_cached_tokens": 0,
+   "latency_sum_h": 0.15183083333333333,
+   "span_h": 0.15183472222222222,
+   "estimate_h": 7.591541666666666,
+   "estimate_rows": 100
+  },
+  {
+   "label": "dense",
+   "length": 32768,
+   "rows": 130,
+   "errors": 0,
+   "mean_latency_s": 148.1861846153846,
+   "median_latency_s": 144.6935,
+   "mean_prompt_tokens": 32026.361538461537,
+   "mean_completion_tokens": 286.6384615384615,
+   "mean_cached_tokens": 0,
+   "latency_sum_h": 5.351167777777778,
+   "span_h": 5.351224722222222,
+   "estimate_h": 53.51167777777778,
+   "estimate_rows": 100
+  },
+  {
+   "label": "dlsa",
+   "length": 32768,
+   "rows": 130,
+   "errors": 0,
+   "mean_latency_s": 141.65153076923076,
+   "median_latency_s": 137.497,
+   "mean_prompt_tokens": 32026.361538461537,
+   "mean_completion_tokens": 334.61538461538464,
+   "mean_cached_tokens": 0,
+   "latency_sum_h": 5.115194166666667,
+   "span_h": 5.115243333333334,
+   "estimate_h": 51.151941666666666,
+   "estimate_rows": 100
+  }
+ ],
+ "flagged": [
+  {
+   "label": "dense",
+   "length": 4096,
+   "task": "cwe",
+   "index": 0,
+   "issue": "finish_reason=length",
+   "completion_tokens": 4096,
+   "score": 0.8
+  },
+  {
+   "label": "dense",
+   "length": 4096,
+   "task": "cwe",
+   "index": 3,
+   "issue": "finish_reason=length",
+   "completion_tokens": 4096,
+   "score": 0.8
+  },
+  {
+   "label": "dense",
+   "length": 4096,
+   "task": "cwe",
+   "index": 4,
+   "issue": "finish_reason=length",
+   "completion_tokens": 4096,
+   "score": 1.0
+  },
+  {
+   "label": "dense",
+   "length": 4096,
+   "task": "cwe",
+   "index": 5,
+   "issue": "finish_reason=length",
+   "completion_tokens": 4096,
+   "score": 1.0
+  },
+  {
+   "label": "dense",
+   "length": 4096,
+   "task": "cwe",
+   "index": 6,
+   "issue": "finish_reason=length",
+   "completion_tokens": 4096,
+   "score": 1.0
+  },
+  {
+   "label": "dense",
+   "length": 4096,
+   "task": "cwe",
+   "index": 7,
+   "issue": "finish_reason=length",
+   "completion_tokens": 4096,
+   "score": 0.7
+  },
+  {
+   "label": "dense",
+   "length": 4096,
+   "task": "cwe",
+   "index": 9,
+   "issue": "finish_reason=length",
+   "completion_tokens": 4096,
+   "score": 1.0
+  },
+  {
+   "label": "dense",
+   "length": 4096,
+   "task": "cwe",
+   "index": 10,
+   "issue": "finish_reason=length",
+   "completion_tokens": 4096,
+   "score": 0.6
+  },
+  {
+   "label": "dense",
+   "length": 4096,
+   "task": "cwe",
+   "index": 14,
+   "issue": "finish_reason=length",
+   "completion_tokens": 4096,
+   "score": 1.0
+  },
+  {
+   "label": "dense",
+   "length": 4096,
+   "task": "cwe",
+   "index": 17,
+   "issue": "finish_reason=length",
+   "completion_tokens": 4096,
+   "score": 1.0
+  },
+  {
+   "label": "dense",
+   "length": 4096,
+   "task": "cwe",
+   "index": 18,
+   "issue": "finish_reason=length",
+   "completion_tokens": 4096,
+   "score": 1.0
+  },
+  {
+   "label": "dense",
+   "length": 32768,
+   "task": "cwe",
+   "index": 1,
+   "issue": "finish_reason=length",
+   "completion_tokens": 4096,
+   "score": 1.0
+  },
+  {
+   "label": "dense",
+   "length": 32768,
+   "task": "cwe",
+   "index": 3,
+   "issue": "finish_reason=length",
+   "completion_tokens": 4096,
+   "score": 1.0
+  },
+  {
+   "label": "dense",
+   "length": 32768,
+   "task": "cwe",
+   "index": 4,
+   "issue": "finish_reason=length",
+   "completion_tokens": 4096,
+   "score": 1.0
+  },
+  {
+   "label": "dense",
+   "length": 32768,
+   "task": "cwe",
+   "index": 5,
+   "issue": "finish_reason=length",
+   "completion_tokens": 4096,
+   "score": 0.8
+  },
+  {
+   "label": "dense",
+   "length": 32768,
+   "task": "cwe",
+   "index": 6,
+   "issue": "finish_reason=length",
+   "completion_tokens": 4096,
+   "score": 1.0
+  },
+  {
+   "label": "dense",
+   "length": 32768,
+   "task": "cwe",
+   "index": 7,
+   "issue": "finish_reason=length",
+   "completion_tokens": 4096,
+   "score": 1.0
+  },
+  {
+   "label": "dense",
+   "length": 32768,
+   "task": "cwe",
+   "index": 8,
+   "issue": "finish_reason=length",
+   "completion_tokens": 4096,
+   "score": 1.0
+  },
+  {
+   "label": "dense",
+   "length": 32768,
+   "task": "cwe",
+   "index": 9,
+   "issue": "finish_reason=length",
+   "completion_tokens": 4096,
+   "score": 1.0
+  },
+  {
+   "label": "dlsa",
+   "length": 4096,
+   "task": "cwe",
+   "index": 0,
+   "issue": "finish_reason=length",
+   "completion_tokens": 4096,
+   "score": 0.8
+  },
+  {
+   "label": "dlsa",
+   "length": 32768,
+   "task": "cwe",
+   "index": 0,
+   "issue": "finish_reason=length",
+   "completion_tokens": 4096,
+   "score": 1.0
+  },
+  {
+   "label": "dlsa",
+   "length": 32768,
+   "task": "cwe",
+   "index": 2,
+   "issue": "finish_reason=length",
+   "completion_tokens": 4096,
+   "score": 1.0
+  },
+  {
+   "label": "dlsa",
+   "length": 32768,
+   "task": "cwe",
+   "index": 3,
+   "issue": "finish_reason=length",
+   "completion_tokens": 4096,
+   "score": 0.9
+  },
+  {
+   "label": "dlsa",
+   "length": 32768,
+   "task": "cwe",
+   "index": 4,
+   "issue": "finish_reason=length",
+   "completion_tokens": 4096,
+   "score": 1.0
+  },
+  {
+   "label": "dlsa",
+   "length": 32768,
+   "task": "cwe",
+   "index": 6,
+   "issue": "finish_reason=length",
+   "completion_tokens": 4096,
+   "score": 1.0
+  },
+  {
+   "label": "dlsa",
+   "length": 32768,
+   "task": "cwe",
+   "index": 7,
+   "issue": "finish_reason=length",
+   "completion_tokens": 4096,
+   "score": 1.0
+  },
+  {
+   "label": "dlsa",
+   "length": 32768,
+   "task": "cwe",
+   "index": 8,
+   "issue": "finish_reason=length",
+   "completion_tokens": 4096,
+   "score": 1.0
+  },
+  {
+   "label": "dlsa",
+   "length": 32768,
+   "task": "cwe",
+   "index": 9,
+   "issue": "finish_reason=length",
+   "completion_tokens": 4096,
+   "score": 1.0
+  }
+ ],
+ "agreement": [
+  {
+   "a": "dense",
+   "b": "dlsa",
+   "length": 4096,
+   "tasks": [
+    {
+     "task": "niah_single_1",
+     "paired_n": 2,
+     "score_differs": 0,
+     "b_lower": [],
+     "b_higher": [],
+     "content_differs": 0
+    },
+    {
+     "task": "niah_single_2",
+     "paired_n": 2,
+     "score_differs": 0,
+     "b_lower": [],
+     "b_higher": [],
+     "content_differs": 0
+    },
+    {
+     "task": "niah_single_3",
+     "paired_n": 2,
+     "score_differs": 0,
+     "b_lower": [],
+     "b_higher": [],
+     "content_differs": 0
+    },
+    {
+     "task": "niah_multikey_1",
+     "paired_n": 2,
+     "score_differs": 0,
+     "b_lower": [],
+     "b_higher": [],
+     "content_differs": 0
+    },
+    {
+     "task": "niah_multikey_2",
+     "paired_n": 2,
+     "score_differs": 0,
+     "b_lower": [],
+     "b_higher": [],
+     "content_differs": 0
+    },
+    {
+     "task": "niah_multikey_3",
+     "paired_n": 2,
+     "score_differs": 0,
+     "b_lower": [],
+     "b_higher": [],
+     "content_differs": 0
+    },
+    {
+     "task": "niah_multiquery",
+     "paired_n": 2,
+     "score_differs": 0,
+     "b_lower": [],
+     "b_higher": [],
+     "content_differs": 0
+    },
+    {
+     "task": "niah_multivalue",
+     "paired_n": 2,
+     "score_differs": 0,
+     "b_lower": [],
+     "b_higher": [],
+     "content_differs": 0
+    },
+    {
+     "task": "vt",
+     "paired_n": 2,
+     "score_differs": 0,
+     "b_lower": [],
+     "b_higher": [],
+     "content_differs": 0
+    },
+    {
+     "task": "cwe",
+     "paired_n": 2,
+     "score_differs": 0,
+     "b_lower": [],
+     "b_higher": [],
+     "content_differs": 0
+    },
+    {
+     "task": "fwe",
+     "paired_n": 2,
+     "score_differs": 0,
+     "b_lower": [],
+     "b_higher": [],
+     "content_differs": 0
+    },
+    {
+     "task": "qa_squad",
+     "paired_n": 2,
+     "score_differs": 0,
+     "b_lower": [],
+     "b_higher": [],
+     "content_differs": 0
+    },
+    {
+     "task": "qa_hotpot",
+     "paired_n": 2,
+     "score_differs": 0,
+     "b_lower": [],
+     "b_higher": [],
+     "content_differs": 0
+    }
+   ]
+  },
+  {
+   "a": "dense",
+   "b": "dlsa",
+   "length": 32768,
+   "tasks": [
+    {
+     "task": "niah_single_1",
+     "paired_n": 10,
+     "score_differs": 0,
+     "b_lower": [],
+     "b_higher": [],
+     "content_differs": 0
+    },
+    {
+     "task": "niah_single_2",
+     "paired_n": 10,
+     "score_differs": 0,
+     "b_lower": [],
+     "b_higher": [],
+     "content_differs": 1
+    },
+    {
+     "task": "niah_single_3",
+     "paired_n": 10,
+     "score_differs": 0,
+     "b_lower": [],
+     "b_higher": [],
+     "content_differs": 3
+    },
+    {
+     "task": "niah_multikey_1",
+     "paired_n": 10,
+     "score_differs": 0,
+     "b_lower": [],
+     "b_higher": [],
+     "content_differs": 0
+    },
+    {
+     "task": "niah_multikey_2",
+     "paired_n": 10,
+     "score_differs": 0,
+     "b_lower": [],
+     "b_higher": [],
+     "content_differs": 3
+    },
+    {
+     "task": "niah_multikey_3",
+     "paired_n": 10,
+     "score_differs": 0,
+     "b_lower": [],
+     "b_higher": [],
+     "content_differs": 4
+    },
+    {
+     "task": "niah_multiquery",
+     "paired_n": 10,
+     "score_differs": 0,
+     "b_lower": [],
+     "b_higher": [],
+     "content_differs": 1
+    },
+    {
+     "task": "niah_multivalue",
+     "paired_n": 10,
+     "score_differs": 0,
+     "b_lower": [],
+     "b_higher": [],
+     "content_differs": 0
+    },
+    {
+     "task": "vt",
+     "paired_n": 10,
+     "score_differs": 0,
+     "b_lower": [],
+     "b_higher": [],
+     "content_differs": 2
+    },
+    {
+     "task": "cwe",
+     "paired_n": 10,
+     "score_differs": 2,
+     "b_lower": [
+      3
+     ],
+     "b_higher": [
+      5
+     ],
+     "content_differs": 10
+    },
+    {
+     "task": "fwe",
+     "paired_n": 10,
+     "score_differs": 0,
+     "b_lower": [],
+     "b_higher": [],
+     "content_differs": 0
+    },
+    {
+     "task": "qa_squad",
+     "paired_n": 10,
+     "score_differs": 0,
+     "b_lower": [],
+     "b_higher": [],
+     "content_differs": 0
+    },
+    {
+     "task": "qa_hotpot",
+     "paired_n": 10,
+     "score_differs": 0,
+     "b_lower": [],
+     "b_higher": [],
+     "content_differs": 0
+    }
+   ]
+  }
+ ]
+}

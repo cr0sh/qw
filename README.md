@@ -172,6 +172,8 @@ qw generate --dlsa --prompt "..."   # qw generate always uses an fp16 KV cache
 | `--dlsa-window <N>` | `QW_DLSA_WINDOW` | `512` (also the cluster block size; the maps were distilled at 512, other values warn) |
 | `--dlsa-top-k <N>` | `QW_DLSA_TOP_K` | `4096` |
 | `--dlsa-top-p <N>` | `QW_DLSA_TOP_P` | `1024` (buckets a query expands, at most 2048) |
+| `--dlsa-dense-below <TOKENS>` | `QW_DLSA_DENSE_BELOW` | `12288` (query rows below this position read every causal key; `0` keeps only the dense-key-set rule) |
+| `--dlsa-backend metal\|mlx\|metal-select` | `QW_DLSA_BACKEND` | `metal` (the Metal kernels; `mlx` is the reference path) |
 
 A flag wins over its variable, which wins over the default. The map is held in
 bf16. D-LSA is a property of the loaded model; there is no per-request switch.
@@ -203,9 +205,17 @@ At startup the server logs one `D-LSA armed` line (`phase="server.dlsa"`) with
 the map path, its sha256, kind, dtype and the index settings; each request logs
 `phase="dlsa.request"` at debug level with the index counters and bytes.
 
-D-LSA is currently slower than dense attention: the selection runs on the host
-and the sparse read is not a fused kernel yet. Measured costs are in
-[`docs/dlsa.md`](docs/dlsa.md) §12.6 and §13.
+With the Metal kernels, D-LSA is faster than dense attention from about 20k
+tokens on (prefill 1.05× at 32k, 1.66× at 128k, 2.66× at 256k; decode flat at
+~39 ms/token) and within 0.5% below that, where `--dlsa-dense-below` (default
+12,288) keeps the dense read. Measurements are in
+[`docs/dlsa.md`](docs/dlsa.md) §15.
+
+Accuracy: on a RULER subsample (upstream's protocol, 13 tasks, 10 rows per task)
+at 32k, no task degrades under D-LSA with the defaults: scores are identical on
+12 of 13 tasks and cwe is +0.010 (two rows change, one each way), mean 0.968
+for both, equal to upstream's bf16 D-LSA result. Longer contexts are not
+measured yet, so it stays opt-in; see [`docs/dlsa.md`](docs/dlsa.md) §16.
 
 ## Historical performance
 
