@@ -1,0 +1,18 @@
+# sha256 of the checkpoints used (default resolver paths), computed 2026-11-07T08:34:11Z
+c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041  Jundot/Qwen3.8-27B-oQ4e-fp16-mtp/chat_template.jinja
+7a063b70e128d238784dce2c594cb7e0f714f44c4387975c99acc8fcf6511eb5  Jundot/Qwen3.8-27B-oQ4e-fp16-mtp/config.json
+e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e  Jundot/Qwen3.8-27B-oQ4e-fp16-mtp/generation_config.json
+a9d356d7bdf1ef4949e3e748e95b8e10ad9d4e2e838eddc38a0a7b6b94d1db8d  Jundot/Qwen3.8-27B-oQ4e-fp16-mtp/merges.txt
+25fa8b66b59c8635854e9eb12770221428f665bd2d9a277483e0ddd1defd9f9e  Jundot/Qwen3.8-27B-oQ4e-fp16-mtp/model-00001-of-00004.safetensors
+5b17e327f9090a478e9103cb30ccb53b410f4823734685977409bf1aa590f82c  Jundot/Qwen3.8-27B-oQ4e-fp16-mtp/model-00002-of-00004.safetensors
+f71b190fa329581fe9d7da1ce49bd2511b7f21e39137b9528b10a7afde4cb43d  Jundot/Qwen3.8-27B-oQ4e-fp16-mtp/model-00003-of-00004.safetensors
+b546fb17ad4c3c8ca303384007aba5d1867a15fde5694cbeba348e26974c630f  Jundot/Qwen3.8-27B-oQ4e-fp16-mtp/model-00004-of-00004.safetensors
+171e364a24c4f35ff57d5aca0ed5e0134263c07933018b7ef3883d1730db8a13  Jundot/Qwen3.8-27B-oQ4e-fp16-mtp/model.safetensors.index.json
+227e01dc5f6ca34426ac47f0f8584f929ac1a7e0024f53062d0de38edf86a157  Jundot/Qwen3.8-27B-oQ4e-fp16-mtp/oq_imatrix_report.json
+27225450ac9c6529872ee1924fcb0962ff5634834f817040f444118116f4e516  Jundot/Qwen3.8-27B-oQ4e-fp16-mtp/preprocessor_config.json
+80707e3cabfe2c5d5c6bb350ae810f3aeed8676b439ff82d84c228cd1538e712  Jundot/Qwen3.8-27B-oQ4e-fp16-mtp/README.md
+b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27  Jundot/Qwen3.8-27B-oQ4e-fp16-mtp/tokenizer_config.json
+0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3  Jundot/Qwen3.8-27B-oQ4e-fp16-mtp/tokenizer.json
+ce99b4cb2983d118806ce0a8b777a35b093e2000a503ebde25853284c9dfa003  Jundot/Qwen3.8-27B-oQ4e-fp16-mtp/vocab.json
+873e3556509b0da06e29654ba00d4944888d4b5e8a33afde25f7eb27d321e980  incoai/Qwen3.8-27B-DFlash2/config.json
+67fc76d68dc5a9415511a4f394ef744d67510cd20e93b37cc2cc7d28e4bab65c  incoai/Qwen3.8-27B-DFlash2/model.safetensors

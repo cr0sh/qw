@@ -9,16 +9,18 @@ at 32k, no task degrades under D-LSA: identical scores on 12 of 13 tasks, cwe +0
 each way), mean 0.968 for both (upstream's bf16 D-LSA: 0.968). 64k and longer are not measured, and D-LSA stays
 opt-in (§16.5).
 
-With the default Metal backend, D-LSA beats dense on the real model (fp16 KV, M4 Max):
+With the default Metal backend and `dense_below` 12,288, D-LSA beats dense on the real model from about 20k tokens
+(fp16 KV, M4 Max; §15.2, §15.3, §15.7):
 
 | context | prefill tok/s, D-LSA vs dense | decode ms/token, D-LSA vs dense |
 |---|---|---|
-| 32k | 235 vs 225 (1.04×) | 39.0 vs 41.2 (1.06×) |
-| 128k | 229 vs 138 (1.66×) | 39.4 vs 55.0 (1.40×) |
-| 256k | 224 vs 84 (2.65×) | 39.9 vs 86.4 (2.17×) |
+| 32k | 237.3 vs 225.6 (1.05×) | 38.9 vs 41.1 (1.06×) |
+| 128k | 229.2 vs 138.5 (1.66×) | 39.5 vs 55.2 (1.40×) |
+| 256k | 223.2 vs 83.9 (2.66×) | 39.9 vs 86.6 (2.17×) |
 
-It is still slower where few keys are skipped: prefill chunks at about 4.6k–12k depth, and probably decode below 32k
-(§14.3-§14.4).
+Below that, `dense_below` keeps the dense read: prefill at 8k–16k is within 0.5% of dense (the index build) and
+decode equals dense (§15.7). The 32k prefill row is §15.7's run with the threshold; the 128k and 256k rows are §15.2's,
+measured before it. §14.3–§14.4 hold task 4's earlier measurements, taken before the threshold existed (historical).
 
 D-LSA (Distilled Latent Sparse Attention, arXiv 2610.42147) leaves the attention kernel unchanged. It only decides which
 cached keys each query of a full-attention layer reads: the first `sink_size` keys, the last `window_size` keys, and up

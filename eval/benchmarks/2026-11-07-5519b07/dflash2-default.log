@@ -1,0 +1,24 @@
+# command: ./gpu-lock -- cargo bench -p qw-runtime --bench single_user_throughput
+# cwd: /Users/namjh/dev/personal/the-agent/.agent/task-worktrees/95b871a9 (worktree of /Users/namjh/dev/personal/qwr, target -> /Users/namjh/dev/personal/qwr/target)
+# commit: 5519b07947bab98b4b4f4b66081f26350d14f5cc
+# worktree clean: 0 tracked changes
+# start: 2026-11-07T08:09:17Z
+# machine: Mac16,9 Apple M4 Max, 64 GiB, macOS 27.2 (26B123)
+# rustc: rustc 1.99.1 (58cf8f9c3 2026-10-13) (Homebrew)
+# env QW_*/MLXCEL_*: 
+gpu-lock: acquired /Users/namjh/.cache/qw/gpu_lock; holder pid=78305 session=TMUX_PANE=%0 command=cargo bench -p qw-runtime --bench single_user_throughput
+    Finished `bench` profile [optimized] target(s) in 0.06s
+     Running benches/single_user_throughput.rs (target/release/deps/single_user_throughput-46f627649d756b84)
+BENCHMARK_CONFIG speculative_engine=dflash2 warmup_repetitions=1 timed_repetitions=3
+MTP_LONG_CONTEXT_PROFILE context=10k tokens=128 prefix_tokens=10337 accepted=82 proposed=90 acceptance=91.11% forwards=46 draft_ms=98.907 verify_ms=2348.566 walk_ms=17.698 reconcile_ms=84.425 materializations=1 snapshots=0
+LONG_CONTEXT_FIXTURE_CACHE stored path=/Users/namjh/dev/personal/the-agent/.agent/task-worktrees/95b871a9/crates/runtime/../../target/qw-bench-fixtures/long_10k_mtp_k3.bin
+MTP_LONG_CONTEXT_PROFILE context=64k tokens=128 prefix_tokens=64297 accepted=80 proposed=94 acceptance=85.11% forwards=48 draft_ms=131.834 verify_ms=3292.870 walk_ms=18.665 reconcile_ms=176.062 materializations=1 snapshots=0
+LONG_CONTEXT_FIXTURE_CACHE stored path=/Users/namjh/dev/personal/the-agent/.agent/task-worktrees/95b871a9/crates/runtime/../../target/qw-bench-fixtures/long_64k_mtp_k3.bin
+BENCHMARK_RESULT label=single_user_prefill/fresh_qwen context_tokens=0 tokens_per_repetition=4341 processed_tokens=13023 repetitions=3 elapsed_seconds=51.221173 mean_seconds=17.073724 stddev_seconds=0.001181 tokens_per_second=254.250
+BENCHMARK_RESULT label=single_user_prefill/long_10k_qwen context_tokens=10337 tokens_per_repetition=288 processed_tokens=864 repetitions=3 elapsed_seconds=3.716007 mean_seconds=1.238669 stddev_seconds=0.000169 tokens_per_second=232.508
+BENCHMARK_RESULT label=single_user_prefill/long_64k_qwen context_tokens=64297 tokens_per_repetition=288 processed_tokens=864 repetitions=3 elapsed_seconds=5.556329 mean_seconds=1.852110 stddev_seconds=0.000711 tokens_per_second=155.498
+BENCHMARK_RESULT label=single_user_decode/fresh_dflash2 context_tokens=0 tokens_per_repetition=127 processed_tokens=381 repetitions=3 elapsed_seconds=6.958836 mean_seconds=2.319612 stddev_seconds=0.018472 tokens_per_second=54.751
+BENCHMARK_RESULT label=single_user_decode/long_10k_dflash2 context_tokens=10337 tokens_per_repetition=127 processed_tokens=381 repetitions=3 elapsed_seconds=7.199010 mean_seconds=2.399670 stddev_seconds=0.017363 tokens_per_second=52.924
+BENCHMARK_RESULT label=single_user_decode/long_64k_dflash2 context_tokens=64297 tokens_per_repetition=127 processed_tokens=381 repetitions=3 elapsed_seconds=10.631979 mean_seconds=3.543993 stddev_seconds=0.059257 tokens_per_second=35.835
+# exit: 0
+# end: 2026-11-07T08:24:36Z

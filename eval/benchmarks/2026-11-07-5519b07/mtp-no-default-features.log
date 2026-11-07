@@ -1,0 +1,34 @@
+# command: ./gpu-lock -- cargo bench -p qw-runtime --bench single_user_throughput --no-default-features
+# cwd: /Users/namjh/dev/personal/the-agent/.agent/task-worktrees/95b871a9 (worktree of /Users/namjh/dev/personal/qwr, target -> /Users/namjh/dev/personal/qwr/target)
+# commit: 5519b07947bab98b4b4f4b66081f26350d14f5cc
+# tracked source changes vs commit outside README.md/DEVELOPMENT.md: 0
+# start: 2026-11-07T08:24:54Z
+# machine: Mac16,9 Apple M4 Max, 64 GiB, macOS 27.2 (26B123)
+# rustc: rustc 1.99.1 (58cf8f9c3 2026-10-13) (Homebrew)
+# env QW_*/MLXCEL_*: 
+gpu-lock: acquired /Users/namjh/.cache/qw/gpu_lock; holder pid=78907 session=TMUX_PANE=%0 command=cargo bench -p qw-runtime --bench single_user_throughput --no-default-features
+warning: constant `DRAFT_MODEL_ENV` is never used
+  --> crates/runtime/benches/support/mod.rs:24:11
+   |
+24 | pub const DRAFT_MODEL_ENV: &str = "QW_DFLASH_DRAFT_MODEL_PATH";
+   |           ^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `qw-runtime` (bench "single_user_throughput") generated 1 warning
+    Finished `bench` profile [optimized] target(s) in 0.20s
+     Running benches/single_user_throughput.rs (target/release/deps/single_user_throughput-5151490943908280)
+BENCHMARK_CONFIG speculative_engine=bundled_mtp_k3 warmup_repetitions=1 timed_repetitions=3
+MTP_LONG_CONTEXT_PROFILE context=10k tokens=128 prefix_tokens=10337 accepted=82 proposed=90 acceptance=91.11% forwards=46 draft_ms=95.264 verify_ms=2163.066 walk_ms=16.611 reconcile_ms=78.872 materializations=1 snapshots=0
+LONG_CONTEXT_FIXTURE_CACHE stored path=/Users/namjh/dev/personal/the-agent/.agent/task-worktrees/95b871a9/crates/runtime/../../target/qw-bench-fixtures/long_10k_mtp_k3.bin
+MTP_LONG_CONTEXT_PROFILE context=64k tokens=128 prefix_tokens=64297 accepted=80 proposed=94 acceptance=85.11% forwards=48 draft_ms=135.353 verify_ms=3385.375 walk_ms=22.079 reconcile_ms=167.371 materializations=1 snapshots=0
+LONG_CONTEXT_FIXTURE_CACHE stored path=/Users/namjh/dev/personal/the-agent/.agent/task-worktrees/95b871a9/crates/runtime/../../target/qw-bench-fixtures/long_64k_mtp_k3.bin
+MTP_PROFILE tokens=128 accepted=80 proposed=95 acceptance=84.21% forwards=48 draft_ms=85.463 verify_ms=1995.351 walk_ms=17.163 reconcile_ms=63.826 materializations=1 snapshots=0
+BENCHMARK_RESULT label=single_user_prefill/fresh_qwen context_tokens=0 tokens_per_repetition=4341 processed_tokens=13023 repetitions=3 elapsed_seconds=51.217570 mean_seconds=17.072523 stddev_seconds=0.000710 tokens_per_second=254.268
+BENCHMARK_RESULT label=single_user_prefill/long_10k_qwen context_tokens=10337 tokens_per_repetition=288 processed_tokens=864 repetitions=3 elapsed_seconds=3.714021 mean_seconds=1.238007 stddev_seconds=0.000938 tokens_per_second=232.632
+BENCHMARK_RESULT label=single_user_prefill/long_64k_qwen context_tokens=64297 tokens_per_repetition=288 processed_tokens=864 repetitions=3 elapsed_seconds=5.550171 mean_seconds=1.850057 stddev_seconds=0.000498 tokens_per_second=155.671
+BENCHMARK_RESULT label=single_user_decode/fresh_mtp_k3 context_tokens=0 tokens_per_repetition=127 processed_tokens=381 repetitions=3 elapsed_seconds=6.488431 mean_seconds=2.162810 stddev_seconds=0.003279 tokens_per_second=58.720
+BENCHMARK_RESULT label=single_user_decode/long_10k_mtp_k3 context_tokens=10337 tokens_per_repetition=127 processed_tokens=381 repetitions=3 elapsed_seconds=7.122032 mean_seconds=2.374011 stddev_seconds=0.037531 tokens_per_second=53.496
+BENCHMARK_RESULT label=single_user_decode/long_64k_mtp_k3 context_tokens=64297 tokens_per_repetition=127 processed_tokens=381 repetitions=3 elapsed_seconds=11.027747 mean_seconds=3.675916 stddev_seconds=0.163955 tokens_per_second=34.549
+# exit: 0
+# end: 2026-11-07T08:33:58Z

@@ -10,6 +10,9 @@ QW stores its user cache below `~/.cache/qw`:
 
 - model snapshots are under `~/.cache/qw/models`;
 - persistent prefix snapshots are under `~/.cache/qw/checkpoint` by default;
+- D-LSA maps from `qw download --dlsa-map` / `--dlsa-pca` are under
+  `~/.cache/qw/dlsa` (builds with the `dlsa` feature);
+- the server's daily trace log files are under `~/.cache/qw/log`;
 - `qw stats` reports total, model, and checkpoint cache usage plus resolver
   status.
 
@@ -407,10 +410,11 @@ environment, credentials, model-server setup, dataset reuse, fresh runs, native
 resume, and verification commands. That file is the canonical operational guide;
 `eval/run_tau3_banking.py` is the configuration-only launcher.
 
-The reference workflow uses unmodified EvalScope 1.11.0 and official Tau2 v1.0.0
-(`17e07b1da2bbc0cadfddeea36412686e0604127b`). Repository-owned generation,
-scoring, retry, and persistence hooks are removed. Earlier custom-adapter
-campaigns remain diagnostics, not reference results.
+The reference workflow uses unmodified EvalScope 1.11.1 and the pinned Tau2
+fork in `eval/tau2-bench` (upstream v1.0.1 plus one cherry-pick and a
+reasoning-history repair; see [the runbook](eval/README.md#prerequisites)).
+Repository-owned generation, scoring, retry, and persistence hooks are removed.
+Earlier custom-adapter campaigns remain diagnostics, not reference results.
 
 ## Shared worktrees
 
@@ -436,6 +440,10 @@ and output assertions. The default feature uses DFlash2; `--no-default-features`
 uses bundled MTP. Both variants use the same fixture filenames with different
 identities, so pair baseline/candidate runs within one variant before switching,
 and preserve the fixture inputs and `BENCHMARK_RESULT` rows.
+The README's Performance table comes from both variants at one commit; its raw
+logs, commands, and checkpoint hashes are kept under
+`eval/benchmarks/<date>-<commit>/` (currently
+[`eval/benchmarks/2026-11-07-5519b07/`](eval/benchmarks/2026-11-07-5519b07/)).
 
 ## DFlash2 optimization trials — 2026-09-12
 
