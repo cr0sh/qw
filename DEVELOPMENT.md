@@ -45,8 +45,8 @@ capacity setup, genuine misses, and aggregate events do not identify one entry.
 The worker prepares the immediate next eligible text request already collected
 in its FIFO batch and starts portable cache prefetch before current generation.
 Successful prompt preparation is reused at that request's turn. Late arrivals,
-response continuations, structured/multimodal requests, and history-dependent
-sparse-prefill configurations retain ordinary lookup behavior. This is not GPU
+response continuations, and structured/multimodal requests retain ordinary
+lookup behavior. This is not GPU
 batching or a guarantee that every boundary has prefetched state.
 
 Prefetch performs bounded reads and portable validation/decoding on the I/O
@@ -601,15 +601,12 @@ writes serialized by the build lock, as for every shared-`target/` command):
 cargo clippy --workspace --all-targets
 cargo clippy --workspace --all-targets --no-default-features
 cargo clippy --workspace --all-targets --features qw-runtime/dlsa,qw-server/dlsa,qw-cli/dlsa
-cargo clippy --workspace --all-targets --features qw-runtime/specprefill,qw-server/specprefill,qw-cli/specprefill
-cargo clippy --workspace --all-targets --features qw-runtime/dlsa,qw-server/dlsa,qw-cli/dlsa,qw-runtime/specprefill,qw-server/specprefill,qw-cli/specprefill
 ```
 
 and the tests, under the GPU lock:
 
 ```bash
 ./gpu-lock -- cargo test -p qw-runtime --features dlsa --lib
-./gpu-lock -- cargo test -p qw-runtime --features dlsa,specprefill --lib
 ./gpu-lock -- cargo test -p qw-runtime --lib          # D-LSA off: the dense dflash/mtp rollback tests
 ./gpu-lock -- cargo test -p qw-server --features dlsa
 ./gpu-lock -- cargo test -p qw-cli --features dlsa
@@ -629,7 +626,7 @@ cluster blocks. They need Metal but no checkpoint.
 | `qwen3_5::dlsa_tests` | model integration (task 3): dense fallback bitwise, covering top-k vs dense, prefill/decode consistency, refusals |
 | `qwen3_5::dlsa_serving_tests` T1-T5 | index state in snapshots: restore continues bitwise (70/64/10 tokens), portable round trip, restore == rebuild, invalidation, exact extra bytes |
 | `qwen3_5::dlsa_serving_tests` S1-S5 | verify and rollback through a block boundary (4- and 8-row blocks, seeded random accepts, fp16 and int8), covering greedy speculation and MTP generation == dense, DFlash2 verify/rollback/continuation, snapshot after a partial rollback, constrained MTP generation == dense |
-| `provider::dlsa`, `qw-server`, `qw-cli` | refusal messages; flags and help with and without the feature; `--dlsa` needs `--no-kv-quantization`; namespaces; SpecPrefill never allowed; images get 400 |
+| `provider::dlsa`, `qw-server`, `qw-cli` | refusal messages; flags and help with and without the feature; `--dlsa` needs `--no-kv-quantization`; namespaces; images get 400 |
 
 Real-model tests are ignored by default. They use `Jundot/Qwen3.8-27B-oQ4e-fp16-mtp`
 (fp16 KV), the DFlash2 drafter where needed, and the converted distilled map

@@ -1,7 +1,6 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use crate::SpecPrefillPolicyConfig;
 use crate::{Engine, router};
 use anyhow::{Context, Result, ensure};
 use clap_derive::{Args as DeriveArgs, ValueEnum};
@@ -160,8 +159,6 @@ pub struct ServerArgs {
     #[arg(long)]
     dflash_draft_model: Option<PathBuf>,
 
-    #[command(flatten)]
-    specprefill: crate::specprefill_policy::SpecPrefillArgs,
     #[cfg(feature = "dlsa")]
     #[command(flatten)]
     dlsa: crate::DlsaArgs,
@@ -190,10 +187,6 @@ impl ServerArgs {
             KVCacheMode::Turbo4
         }
     }
-
-    fn specprefill_policy(&self) -> SpecPrefillPolicyConfig {
-        self.specprefill.policy()
-    }
 }
 
 fn validate_cli(cli: &ServerArgs) -> Result<()> {
@@ -213,7 +206,6 @@ fn validate_cli(cli: &ServerArgs) -> Result<()> {
         cli.decoder != Decoder::Dflash2,
         "--decoder dflash requires the dflash2 build feature"
     );
-    cli.specprefill_policy().validate()?;
     Ok(())
 }
 
@@ -327,7 +319,6 @@ pub async fn serve(cli: ServerArgs) -> Result<()> {
     );
 
     let kv_cache_mode = cli.kv_cache_mode();
-    let specprefill_policy = cli.specprefill_policy();
     #[cfg(feature = "dlsa")]
     let dlsa = cli.dlsa.resolve(crate::dlsa_process_env)?;
     #[cfg(feature = "dlsa")]
@@ -353,7 +344,6 @@ pub async fn serve(cli: ServerArgs) -> Result<()> {
             dflash2_draft_model: dflash_draft_model,
         },
         kv_cache_mode,
-        specprefill_policy,
         #[cfg(feature = "dlsa")]
         dlsa,
     )?;
@@ -837,69 +827,6 @@ mod tests {
         crate::dlsa_args::require_unquantized_kv(true, true).expect("fp16");
         crate::dlsa_args::require_unquantized_kv(false, false).expect("off");
     }
-    #[cfg(not(feature = "specprefill"))]
-    #[test]
-    fn cli_omits_specprefill_controls_without_feature() {
-        let help = TestCli::command().render_long_help().to_string();
-        assert!(!help.contains("--specprefill-"), "{help}");
-    }
-
-    #[cfg(feature = "specprefill")]
-    #[test]
-    fn cli_configures_specprefill_policy() {
-        let defaults =
-            TestCli::try_parse_from(["qw-server", "--model", "/tmp/checkpoint"]).expect("CLI");
-        let policy = defaults.args.specprefill_policy();
-        assert_eq!(policy.min_turn_tokens, 8_000);
-        assert_eq!(policy.keep_rate, 0.25);
-        assert_eq!(policy.keep_first_tokens, 256);
-        assert_eq!(policy.keep_last_tokens, 256);
-        validate_cli(&defaults.args).expect("default SpecPrefill policy");
-
-        let custom = TestCli::try_parse_from([
-            "qw-server",
-            "--model",
-            "/tmp/checkpoint",
-            "--specprefill-min-turn-tokens",
-            "12000",
-            "--specprefill-keep-rate",
-            "0.4",
-            "--specprefill-keep-first-tokens",
-            "0",
-            "--specprefill-keep-last-tokens",
-            "64",
-        ])
-        .expect("custom SpecPrefill CLI");
-        let policy = custom.args.specprefill_policy();
-        assert_eq!(policy.min_turn_tokens, 12_000);
-        assert_eq!(policy.keep_rate, 0.4);
-        assert_eq!(policy.keep_first_tokens, 0);
-        assert_eq!(policy.keep_last_tokens, 64);
-        validate_cli(&custom.args).expect("custom SpecPrefill policy");
-
-        let invalid_threshold =
-            TestCli::try_parse_from(["qw-server", "--specprefill-min-turn-tokens", "0"])
-                .expect("threshold reaches startup validation");
-        assert!(validate_cli(&invalid_threshold.args).is_err());
-
-        for rate in ["0", "1.1", "NaN"] {
-            let invalid_rate =
-                TestCli::try_parse_from(["qw-server", "--specprefill-keep-rate", rate])
-                    .expect("keep rate reaches startup validation");
-            assert!(validate_cli(&invalid_rate.args).is_err(), "rate={rate}");
-        }
-
-        let help = TestCli::command().render_long_help().to_string();
-        for option in [
-            "--specprefill-min-turn-tokens",
-            "--specprefill-keep-rate",
-            "--specprefill-keep-first-tokens",
-            "--specprefill-keep-last-tokens",
-        ] {
-            assert!(help.contains(option), "{help}");
-        }
-    }
-
     #[test]
     fn cli_parses_and_validates_mtp_k() {
         let default =

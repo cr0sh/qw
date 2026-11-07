@@ -9,7 +9,6 @@ use std::time::Duration;
 use mlxcel_core::generate::SamplingConfig;
 #[cfg(not(feature = "dflash2"))]
 use qw_runtime::MtpGenerationStats;
-use qw_runtime::PrefillMode;
 #[cfg(feature = "dflash2")]
 use qw_runtime::PromptSnapshot;
 use qw_runtime::provider::Qwen35GenerationMode;
@@ -140,19 +139,10 @@ fn fresh_prefill_sample(
     expected_token_ids: &[i32],
 ) -> Duration {
     let output = provider
-        .generate_baseline_streaming(
-            prompt_ids,
-            1,
-            sampling,
-            None,
-            None,
-            &[],
-            PrefillMode::Dense,
-            |delta| {
-                black_box(delta);
-                true
-            },
-        )
+        .generate_baseline_streaming(prompt_ids, 1, sampling, None, None, &[], |delta| {
+            black_box(delta);
+            true
+        })
         .expect("benchmark fresh target prefill");
     assert_eq!(
         output.token_ids, expected_token_ids,
@@ -404,16 +394,7 @@ fn main() {
             },
         );
         let warmup = provider
-            .generate_baseline_streaming(
-                &prompt_ids,
-                1,
-                &sampling,
-                None,
-                None,
-                &[],
-                PrefillMode::Dense,
-                |_| true,
-            )
+            .generate_baseline_streaming(&prompt_ids, 1, &sampling, None, None, &[], |_| true)
             .expect("warm up fresh target prefill");
         let expected_token_ids = warmup.token_ids.clone();
         black_box(warmup);

@@ -146,25 +146,8 @@ impl Qwen3NextAttention {
         mask: Option<&MlxArray>,
         position_ids: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        let (output, _) = self.forward_impl(x, cache, mask, position_ids, false);
+        let output = self.forward_impl(x, cache, mask, position_ids);
         self.o_proj.forward(&output)
-    }
-
-    #[cfg(any(feature = "specprefill", test))]
-    /// Draft-lookahead entry point used by SpecPrefill. The captured tensor is
-    /// the normalized, post-RoPE query in `[B, H, L, D]` layout.
-    pub(crate) fn forward_with_query_capture(
-        &self,
-        x: &MlxArray,
-        cache: &mut KVCache,
-        mask: Option<&MlxArray>,
-        position_ids: Option<&MlxArray>,
-    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
-        let (output, queries) = self.forward_impl(x, cache, mask, position_ids, true);
-        (
-            self.o_proj.forward(&output),
-            queries.expect("query capture was requested"),
-        )
     }
 
     /// Verify-only entry point. Multi-token blocks use bottom-right causal
@@ -176,7 +159,7 @@ impl Qwen3NextAttention {
         mask: Option<&MlxArray>,
         position_ids: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        let (output, _) = self.forward_impl(x, cache, mask, position_ids, false);
+        let output = self.forward_impl(x, cache, mask, position_ids);
         self.o_proj.forward(&output)
     }
 
@@ -186,8 +169,7 @@ impl Qwen3NextAttention {
         cache: &mut KVCache,
         mask: Option<&MlxArray>,
         position_ids: Option<&MlxArray>,
-        capture_query: bool,
-    ) -> (UniquePtr<MlxArray>, Option<UniquePtr<MlxArray>>) {
+    ) -> UniquePtr<MlxArray> {
         let heads = self.project_heads(x);
         let (b, l) = (heads.b, heads.l);
         let (queries, keys, values) = self.rotate(
@@ -200,10 +182,8 @@ impl Qwen3NextAttention {
             l,
         );
 
-        let captured_query = capture_query.then(|| mlxcel_core::share(&queries));
-
         let attn_out = self.dense_attention(&queries, keys, values, cache, mask, l);
-        (self.finish(&attn_out, &heads.gate, b, l), captured_query)
+        self.finish(&attn_out, &heads.gate, b, l)
     }
 
     /// The Q/K/V projections, the gate, and the Q/K norms. Queries and keys are

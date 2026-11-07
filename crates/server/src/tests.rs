@@ -490,7 +490,6 @@ async fn measure_real_responses_prefix_latency(mode: Qwen35GenerationMode) {
             dflash2_draft_model: std::path::PathBuf::new(),
         },
         KVCacheMode::Turbo4,
-        SpecPrefillPolicyConfig::default(),
         #[cfg(feature = "dlsa")]
         None,
     )

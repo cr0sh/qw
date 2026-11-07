@@ -100,48 +100,6 @@ The `dflash` option requires a build with the `dflash2` feature and an
 available draft checkpoint. Use `--help` for the options enabled by the
 current build.
 
-## SpecPrefill
-
-SpecPrefill is an optional sparse-prefill mode. It is off by default; build the
-CLI with the feature enabled to expose it:
-
-```bash
-cargo build -p qw-cli --features specprefill
-```
-
-The draft checkpoint is `mlx-community/Qwen3.5-0.8B-MLX-8bit`. It is resolved
-from the model cache at
-`~/.cache/qw/models/mlx-community/Qwen3.5-0.8B-MLX-8bit`; download it with:
-
-```bash
-qw download mlx-community/Qwen3.5-0.8B-MLX-8bit
-```
-
-Override its location with `QW_SPECPREFILL_DRAFT_MODEL_PATH`. There is no
-SpecPrefill draft-path CLI option. The feature build requires this draft at
-startup, and validates its pinned architecture when loading it.
-
-When built with `specprefill`, `qw serve` accepts these policy options:
-
-- `--specprefill-min-turn-tokens` (default `8000`)
-- `--specprefill-keep-rate` (default `0.25`)
-- `--specprefill-keep-first-tokens` (default `256`)
-- `--specprefill-keep-last-tokens` (default `256`)
-
-The server considers SpecPrefill only on the baseline route for an eligible,
-text-only, unconstrained request without a resume. Prior messages before the
-current user turn or trailing tool-result group must include an assistant turn,
-and their tokenized history must be an exact prefix of the prompt. That history
-prefix is protected and remains dense. The current-turn threshold is strict
-(`>`), so a turn exactly at the configured threshold stays dense. The eligible
-suffix is also only sparse-prefilled when
-its token count exceeds the configured runtime minimum. The server sets that
-minimum from `--specprefill-min-turn-tokens` (default `8000`); the runtime
-configuration default when used directly is `min_tokens = 8192`. Equality at
-either threshold remains dense. Among eligible tokens, scoring selects chunks
-according to the keep rate while forcing the configured number of initial and
-final eligible tokens to remain. DFlash2 and other non-baseline routes remain dense.
-
 ## D-LSA (experimental)
 
 D-LSA ([Distilled Latent Sparse Attention](https://github.com/Prefrontal-AI/latent-sparse-attention))
@@ -191,7 +149,6 @@ and, for the server, D-LSA without `--no-kv-quantization`.
 | Turbo4 KV (the server default) | refused: `qw serve --dlsa` without `--no-kv-quantization` fails at startup |
 | decoders `baseline`, `mtp`, `dflash`, `auto` | supported; `auto` selects as usual |
 | grammar-constrained output (`json_schema`, tools) | supported |
-| SpecPrefill | never used: the server logs once that it is disabled; its kept KV slots are not token positions, which the index needs |
 | image inputs | refused with HTTP 400 ("image inputs are not supported while D-LSA sparse attention is enabled on this server") |
 
 **Prefix cache.** Snapshots carry the index state next to the KV cache, so the

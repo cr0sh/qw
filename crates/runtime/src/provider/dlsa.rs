@@ -2,13 +2,12 @@
 //
 //! The provider's D-LSA switch and the request paths it refuses (`docs/dlsa.md` §12, §13). D-LSA
 //! is a property of the loaded model; while it is on, every decoder (baseline, MTP, DFlash2),
-//! prefix reuse and snapshots work, and SpecPrefill and image prompts are refused.
+//! prefix reuse and snapshots work, and image prompts are refused.
 
 use anyhow::{Result, bail};
 
 use super::Qwen35Provider;
 use crate::dlsa::{DlsaConfig, DlsaStats};
-use crate::specprefill::PrefillMode;
 
 fn refusal(what: &str) -> String {
     format!("D-LSA does not support {what}; disable D-LSA (start without --dlsa) to use it")
@@ -48,15 +47,6 @@ impl Qwen35Provider {
         }
         Ok(())
     }
-
-    /// SpecPrefill keeps a subset of the prompt in the KV cache, so its slots are not positions,
-    /// which the index requires (`docs/dlsa.md` §7.1.4).
-    pub(super) fn refuse_prefill_mode_under_dlsa(&self, prefill_mode: &PrefillMode) -> Result<()> {
-        if matches!(prefill_mode, PrefillMode::SpecPrefill(_)) {
-            self.refuse_under_dlsa("SpecPrefill (its KV slots are not positions)")?;
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -65,9 +55,9 @@ mod tests {
 
     #[test]
     fn refusals_name_what_is_refused() {
-        let message = refusal("SpecPrefill");
+        let message = refusal("image prompts");
         assert!(
-            message.contains("D-LSA") && message.contains("SpecPrefill"),
+            message.contains("D-LSA") && message.contains("image prompts"),
             "{message}"
         );
         assert!(!message.contains("task"), "{message}");

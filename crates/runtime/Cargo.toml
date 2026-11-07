@@ -8,7 +8,6 @@ publish = false
 [features]
 default = ["dflash2"]
 dflash2 = []
-specprefill = []
 dlsa = ["dep:sha2"]
 
 [dependencies]
@@ -24,10 +23,6 @@ tokenizers.workspace = true
 tracing.workspace = true
 sha2 = { version = "0.11", optional = true }
 
-
-[[example]]
-name = "specprefill_experiment"
-required-features = ["specprefill"]
 
 [[example]]
 name = "dlsa_indexer_bench"
