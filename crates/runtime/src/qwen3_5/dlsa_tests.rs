@@ -602,7 +602,6 @@ pub(super) mod real {
         ChatMessage, ChatMessageContent, GenerationRequest, Qwen35GenerationMode, Qwen35Provider,
         SamplingOptions,
     };
-    use crate::specprefill::PrefillMode;
 
     pub(in crate::qwen3_5) const PREFILL_CHUNK: usize = 1536;
     pub(in crate::qwen3_5) const NEEDLE: &str = "The vault code is 7291-ALPHA.";
@@ -877,16 +876,7 @@ pub(super) mod real {
                     provider.disable_dlsa();
                 }
                 let generation = provider
-                    .generate_baseline_streaming(
-                        &prompt,
-                        48,
-                        &sampling,
-                        None,
-                        None,
-                        &[],
-                        PrefillMode::Dense,
-                        |_| true,
-                    )
+                    .generate_baseline_streaming(&prompt, 48, &sampling, None, None, &[], |_| true)
                     .expect("generate");
                 let label = if dlsa { "D-LSA" } else { "dense" };
                 eprintln!(

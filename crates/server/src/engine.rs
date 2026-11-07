@@ -4,7 +4,6 @@ use std::sync::{Arc, mpsc as std_mpsc};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::SpecPrefillPolicyConfig;
 use anyhow::{Context, Result, ensure};
 use mlxcel_core::generate::{GenerationStopReason, PrefixReuse};
 use qw_prefix_cache::{
@@ -195,46 +194,22 @@ fn decoded_image_digest(width: u32, height: u32, rgb: &[u8]) -> String {
     ])
 }
 
-fn cache_lookup_route(
-    route: QwenGenerationRoute,
-    mtp_available: bool,
-    specprefill_active: bool,
-) -> Option<CacheSnapshotRoute> {
-    if route == QwenGenerationRoute::BaselineText && mtp_available && specprefill_active {
-        return Some(CacheSnapshotRoute::Mtp);
-    }
-    cache_snapshot_route(route)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CacheBehavior {
-    snapshot_route: Option<CacheSnapshotRoute>,
-    lookup_route: Option<CacheSnapshotRoute>,
+    route: Option<CacheSnapshotRoute>,
 }
 
 impl CacheBehavior {
     fn capture_final_snapshot(self) -> bool {
-        self.snapshot_route.is_some()
+        self.route.is_some()
     }
 }
 
-fn cache_behavior(
-    route: QwenGenerationRoute,
-    prefix_cache_enabled: bool,
-    mtp_available: bool,
-    specprefill_active: bool,
-) -> CacheBehavior {
-    if !prefix_cache_enabled {
-        return CacheBehavior {
-            snapshot_route: None,
-            lookup_route: None,
-        };
-    }
-    let snapshot_route = cache_snapshot_route(route);
-    let lookup_route = cache_lookup_route(route, mtp_available, specprefill_active);
+fn cache_behavior(route: QwenGenerationRoute, prefix_cache_enabled: bool) -> CacheBehavior {
     CacheBehavior {
-        snapshot_route,
-        lookup_route,
+        route: prefix_cache_enabled
+            .then(|| cache_snapshot_route(route))
+            .flatten(),
     }
 }
 
@@ -626,16 +601,6 @@ fn lookahead_route(
     {
         return None;
     }
-    // Sparse-prefill policy depends on history tokenization. Leave those requests
-    // to the ordinary owner-thread preparation rather than guess a namespace.
-    if crate::specprefill_policy::ENABLED
-        && matches!(
-            decoder,
-            Qwen35GenerationMode::Automatic | Qwen35GenerationMode::Baseline
-        )
-    {
-        return None;
-    }
     let decoder = select_qwen35_decoder(decoder, mtp_available, dflash2_available).ok()?;
     cache_snapshot_route(qwen_generation_route(decoder, false))
 }
@@ -663,7 +628,7 @@ pub struct Engine {
 }
 
 impl Engine {
-    #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(feature = "dlsa", allow(clippy::too_many_arguments))]
     pub fn start_qwen(
         model_path: PathBuf,
         model_id: Option<String>,
@@ -672,13 +637,11 @@ impl Engine {
         mtp_k: usize,
         decoder: DecoderConfig,
         kv_cache_mode: KVCacheMode,
-        specprefill_policy: SpecPrefillPolicyConfig,
         #[cfg(feature = "dlsa")] dlsa: Option<qw_runtime::ResolvedDlsa>,
     ) -> Result<Self> {
         cache_config.validate().map_err(anyhow::Error::msg)?;
         validate_mtp_k(mtp_k)?;
         decoder.validate()?;
-        specprefill_policy.validate()?;
         let (jobs_tx, jobs_rx) = mpsc::channel(JOB_QUEUE_CAPACITY);
         let (ready_tx, ready_rx) = std_mpsc::sync_channel(1);
         thread::Builder::new()
@@ -691,7 +654,6 @@ impl Engine {
                     mtp_k,
                     decoder,
                     kv_cache_mode,
-                    specprefill_policy,
                     #[cfg(feature = "dlsa")]
                     dlsa,
                 ) {
@@ -1153,7 +1115,6 @@ pub enum SubmitError {
 }
 
 struct QwenWorker {
-    specprefill_policy: SpecPrefillPolicyConfig,
     provider: Qwen35Provider,
     grammar: GrammarFactory,
     prefix_cache: AdaptivePrefixCache,
@@ -1220,27 +1181,6 @@ fn image_input_refusal(dlsa_enabled: bool) -> &'static str {
     }
 }
 
-/// Whether a request may use SpecPrefill at all; the policy then decides by length. Never under
-/// D-LSA: SpecPrefill's KV slots are not positions, which the index requires.
-fn specprefill_allowed(
-    has_images: bool,
-    constrained: bool,
-    resuming: bool,
-    configured_decoder: Qwen35GenerationMode,
-    routed_decoder: Qwen35GenerationMode,
-    dlsa_enabled: bool,
-) -> bool {
-    !has_images
-        && !constrained
-        && !resuming
-        && matches!(
-            configured_decoder,
-            Qwen35GenerationMode::Automatic | Qwen35GenerationMode::Baseline
-        )
-        && routed_decoder != Qwen35GenerationMode::Dflash2
-        && !dlsa_enabled
-}
-
 /// Enable D-LSA on the loaded provider and log its settings; returns the namespace identity.
 #[cfg(feature = "dlsa")]
 fn enable_dlsa(provider: &mut Qwen35Provider, dlsa: qw_runtime::ResolvedDlsa) -> Result<Vec<u8>> {
@@ -1270,17 +1210,10 @@ fn enable_dlsa(provider: &mut Qwen35Provider, dlsa: qw_runtime::ResolvedDlsa) ->
         dense_below,
         "D-LSA armed"
     );
-    if crate::specprefill_policy::ENABLED {
-        info!(
-            phase = "server.dlsa",
-            "SpecPrefill is disabled while D-LSA is on: its KV slots are not positions"
-        );
-    }
     Ok(identity.as_bytes().to_vec())
 }
 
 impl QwenWorker {
-    #[allow(clippy::too_many_arguments)]
     fn load(
         model_path: &Path,
         cache_config: CacheConfig,
@@ -1288,12 +1221,10 @@ impl QwenWorker {
         mtp_k: usize,
         decoder: DecoderConfig,
         kv_cache_mode: KVCacheMode,
-        specprefill_policy: SpecPrefillPolicyConfig,
         #[cfg(feature = "dlsa")] dlsa: Option<qw_runtime::ResolvedDlsa>,
     ) -> Result<Self> {
         validate_mtp_k(mtp_k)?;
         decoder.validate()?;
-        specprefill_policy.validate()?;
         #[cfg_attr(not(feature = "dlsa"), allow(unused_mut))]
         let mut provider = Qwen35Provider::load(model_path, kv_cache_mode)?;
         #[cfg(feature = "dlsa")]
@@ -1369,7 +1300,6 @@ impl QwenWorker {
             AdaptivePrefixCache::new(namespaces, cache_config).map_err(anyhow::Error::msg)?;
         Ok(Self {
             provider,
-            specprefill_policy,
             grammar,
             prefix_cache,
             prefix_cache_enabled,
@@ -1585,7 +1515,7 @@ impl QwenWorker {
         sampling.prompt_token_count = Some(prompt_ids.len());
         let mtp_available =
             self.provider.has_mtp() && std::env::var_os("QW_BENCH_DISABLE_MTP").is_none();
-        let routed_decoder = match select_qwen35_decoder(
+        let decoder = match select_qwen35_decoder(
             self.decoder.mode,
             mtp_available,
             self.decoder.dflash2_available(),
@@ -1596,33 +1526,6 @@ impl QwenWorker {
                 return;
             }
         };
-        let specprefill_policy = crate::specprefill_policy::resolve_for_request(
-            &self.provider,
-            crate::SpecPrefillRequest {
-                messages: &job.request.messages,
-                tools: effective_tools,
-                reasoning_effort,
-                enable_thinking,
-                prompt_ids: &prompt_ids,
-                has_images,
-                allowed: specprefill_allowed(
-                    has_images,
-                    constraint.is_some(),
-                    job.request.resume_response_id.is_some(),
-                    self.decoder.mode,
-                    routed_decoder,
-                    self.dlsa_enabled(),
-                ),
-            },
-            self.specprefill_policy,
-        );
-        let specprefill_active = specprefill_policy.active();
-        let force_baseline_for_specprefill = specprefill_active;
-        let decoder = if force_baseline_for_specprefill {
-            Qwen35GenerationMode::Baseline
-        } else {
-            routed_decoder
-        };
         let route = qwen_generation_route(decoder, has_images);
         debug!(
             phase = "prompt.prepared",
@@ -1631,19 +1534,13 @@ impl QwenWorker {
             tool_count = effective_tools.len(),
         );
 
-        let cache_behavior = cache_behavior(
-            route,
-            self.prefix_cache_enabled,
-            mtp_available,
-            specprefill_active,
-        );
+        let cache_behavior = cache_behavior(route, self.prefix_cache_enabled);
         let mut checkpoint_token_lengths = if cache_behavior.capture_final_snapshot() {
             vec![prompt_ids.len()]
         } else {
             Vec::new()
         };
-        let cache_route = cache_behavior.snapshot_route;
-        let lookup_cache_route = cache_behavior.lookup_route;
+        let cache_route = cache_behavior.route;
         if job.request.resume_response_id.is_some() && cache_route.is_none() {
             send_failure(
                 &job,
@@ -1745,12 +1642,12 @@ impl QwenWorker {
             debug!(
                 event = "cache.prefetch.boundary",
                 response_id = %job.admission.response_id,
-                route = ?lookup_cache_route,
+                route = ?cache_route,
                 prompt_tokens = generation_prompt_ids.len(),
             );
         }
         let hit = if resume_entry.is_none() {
-            lookup_cache_route.and_then(|route| {
+            cache_route.and_then(|route| {
                 cache.lookup(
                     PromptKey::new(&generation_prompt_ids, &image_identities),
                     route,
@@ -1874,7 +1771,7 @@ impl QwenWorker {
             .map_or(reused_tokens, |reuse| reuse.cached_tokens);
         let cache_source = if resume_entry.is_some() {
             "response_resume"
-        } else if lookup_cache_route.is_none() {
+        } else if cache_route.is_none() {
             "disabled"
         } else if reused_tokens > 0 {
             "prefix_hit"
@@ -2073,7 +1970,6 @@ impl QwenWorker {
                     .as_mut()
                     .map(|value| value as &mut dyn mlxcel_core::generate::TokenConstraint),
                 &checkpoint_token_lengths,
-                specprefill_policy.prefill_mode,
                 &mut emit_delta,
             ),
         };
@@ -2468,42 +2364,6 @@ mod tests {
     }
 
     #[test]
-    fn specprefill_is_never_allowed_under_dlsa() {
-        use Qwen35GenerationMode::{Automatic, Baseline, Dflash2, Mtp};
-        assert!(specprefill_allowed(
-            false, false, false, Automatic, Baseline, false
-        ));
-        assert!(specprefill_allowed(
-            false, false, false, Baseline, Baseline, false
-        ));
-        assert!(specprefill_allowed(
-            false, false, false, Automatic, Mtp, false
-        ));
-        for (configured, routed) in [
-            (Automatic, Baseline),
-            (Baseline, Baseline),
-            (Automatic, Mtp),
-        ] {
-            assert!(!specprefill_allowed(
-                false, false, false, configured, routed, true
-            ));
-        }
-        assert!(!specprefill_allowed(
-            true, false, false, Automatic, Baseline, false
-        ));
-        assert!(!specprefill_allowed(
-            false, true, false, Automatic, Baseline, false
-        ));
-        assert!(!specprefill_allowed(
-            false, false, true, Automatic, Baseline, false
-        ));
-        assert!(!specprefill_allowed(false, false, false, Mtp, Mtp, false));
-        assert!(!specprefill_allowed(
-            false, false, false, Automatic, Dflash2, false
-        ));
-    }
-
-    #[test]
     fn image_refusal_names_dlsa_only_when_on() {
         assert!(image_input_refusal(true).contains("D-LSA"));
         assert_eq!(
@@ -2565,20 +2425,6 @@ mod tests {
             ),
             None
         );
-    }
-
-    #[cfg(feature = "specprefill")]
-    #[test]
-    fn lookahead_does_not_guess_history_dependent_sparse_prefill_namespace() {
-        for decoder in [
-            Qwen35GenerationMode::Automatic,
-            Qwen35GenerationMode::Baseline,
-        ] {
-            assert_eq!(
-                lookahead_route(&lookahead_request(), false, true, decoder, true, false,),
-                None
-            );
-        }
     }
 
     #[test]
@@ -2873,37 +2719,27 @@ mod tests {
             #[cfg(feature = "dflash2")]
             QwenGenerationRoute::Dflash2Multimodal,
         ] {
-            let behavior = cache_behavior(route, false, true, false);
-            assert_eq!(behavior.snapshot_route, None);
-            assert_eq!(behavior.lookup_route, None);
+            let behavior = cache_behavior(route, false);
+            assert_eq!(behavior.route, None);
             assert!(!behavior.capture_final_snapshot());
         }
     }
 
     #[test]
-    fn specprefill_over_mtp_looks_up_the_mtp_target_snapshot() {
-        let sparse_route = qwen_generation_route(Qwen35GenerationMode::Baseline, false);
-        assert_eq!(sparse_route, QwenGenerationRoute::BaselineText);
-        let sparse_behavior = cache_behavior(sparse_route, true, true, true);
-        assert_eq!(sparse_behavior.lookup_route, Some(CacheSnapshotRoute::Mtp));
-        assert_eq!(
-            sparse_behavior.snapshot_route,
-            Some(CacheSnapshotRoute::Baseline)
-        );
-        assert!(sparse_behavior.capture_final_snapshot());
-
-        assert_eq!(
-            cache_behavior(QwenGenerationRoute::MtpText, true, true, false).lookup_route,
-            Some(CacheSnapshotRoute::Mtp)
-        );
-        assert_eq!(
-            cache_behavior(QwenGenerationRoute::BaselineText, true, false, true).lookup_route,
-            Some(CacheSnapshotRoute::Baseline)
-        );
-        assert_eq!(
-            cache_behavior(QwenGenerationRoute::BaselineMultimodal, true, true, true).lookup_route,
-            None
-        );
+    fn enabled_prefix_cache_uses_the_decoder_route_namespace() {
+        for (route, expected) in [
+            (
+                QwenGenerationRoute::BaselineText,
+                Some(CacheSnapshotRoute::Baseline),
+            ),
+            (QwenGenerationRoute::MtpText, Some(CacheSnapshotRoute::Mtp)),
+            (QwenGenerationRoute::BaselineMultimodal, None),
+            (QwenGenerationRoute::MtpMultimodal, None),
+        ] {
+            let behavior = cache_behavior(route, true);
+            assert_eq!(behavior.route, expected);
+            assert_eq!(behavior.capture_final_snapshot(), expected.is_some());
+        }
     }
 
     #[test]

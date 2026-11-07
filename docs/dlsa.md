@@ -28,8 +28,7 @@ to `top_k` long-range keys picked through a small learned index. This document s
 **Source.** <https://github.com/Prefrontal-AI/latent-sparse-attention>, Apache-2.0, pinned at commit
 **`5ebea732d639576d2a7579b0de40e6252f9001f5`** (2026-11-04). Citations `path:line` refer to that commit:
 `src/lsa/...` for upstream code and `configs/...` for upstream configs. QW citations refer to this repo at `782b61b`.
-Code ported from upstream must carry `SPDX-License-Identifier: Apache-2.0` and an "Adapted from …@5ebea73" header, as
-the SpecPrefill files do.
+Code ported from upstream must carry `SPDX-License-Identifier: Apache-2.0` and an "Adapted from …@5ebea73" header.
 
 > **Correction to the task brief: the index dim is 64, not 2048.** In the map's name, "d2048" is the distillation's
 > *target depth* (`run.objective.target_depth: 2048`, `configs/training/distillation/qwen38_27b/long_16k_1m_heavy_key_and_query_d2048.yaml:52-54`).
@@ -387,7 +386,7 @@ This section draws on the researcher's integration notes, checked against the co
 
 1. **Where q/k are available pre-RoPE.**
    - `Qwen3NextAttention::forward_impl` (`crates/runtime/src/qwen3_next.rs:168-288`) is the single path for prefill
-     chunks, decode, MTP verify, DFlash2 verify and SpecPrefill.
+     chunks, decode, MTP verify and DFlash2 verify.
    - After `q_norm`/`k_norm` (`:204-205`), `queries [B,L,24,256]` and `keys [B,L,4,256]` are exactly the upstream inputs.
    - Even after RoPE (`:212-253`, `fast_rope(.., 64, traditional=false, ..)` or the mrope branch on `[..., :64]`), dims
      64..255 are untouched. So the index can be computed either before or after the rotation.
@@ -406,8 +405,8 @@ This section draws on the researcher's integration notes, checked against the co
    - Turbo4 demotion (`demote_fp16_to_turbo4`, `cache.rs:3591-3605`) does not touch it, because the index never reads the KV.
 4. **Selection.** Per query row: score `visible(p)` centroids, pack (score, bucket) keys, top-p, expand, add window and sinks
    (§4.5). Positions are **logical token positions**.
-   - SpecPrefill keeps keys at cache slots ≠ positions (`qwen3_5/specprefill.rs:219-240`). D-LSA and SpecPrefill should be
-     mutually exclusive.
+   - Cache slots must equal positions. (SpecPrefill, a former QW sparse-prefill mode that kept keys at slots ≠ positions
+     and so could not be combined with D-LSA, has since been removed from QW.)
 5. **Restricted attention.**
    - Fp16 decode: `take` the list rows of K/V `[1,4,T,256]` → `[1,4,4612,256]`, then plain SDPA (no mask, since all rows
      are causal), or reuse `paged_v2::run_sparse_decode` (`mlxcel-core/src/paged_v2/sparse.rs`). That kernel needs q_len 1,
@@ -418,7 +417,7 @@ This section draws on the researcher's integration notes, checked against the co
      materializes scores anyway. A speedup needs a new Metal sparse-prefill kernel (task 4).
    - The current chunk's K must be in the cache before the read. `update_and_fetch` already does that in Fp16. The Turbo4
      fused update+attend calls need splitting.
-6. **Feature gating** (as SpecPrefill does):
+6. **Feature gating**:
    - A cargo feature `dlsa` in `qw-runtime`, forwarded by the server/cli crates.
    - Code under `#[cfg(any(feature = "dlsa", test))]`, a server flag stub when the feature is off, and an off-by-default
      runtime switch.
@@ -491,7 +490,7 @@ This section draws on the researcher's integration notes, checked against the co
 7. **MLX sort stability and tie rules** (§4.5) must be enforced explicitly.
 8. **Map container:** the `.pt` is a torch pickle and there are no sidecars. A conversion step is required, and it must be
    pinned by sha256.
-9. **Snapshot complexity** (§7.4) and interaction with SpecPrefill (positions ≠ slots). Exclude SpecPrefill.
+9. **Snapshot complexity** (§7.4).
 10. **Accuracy evidence is upstream's.** RULER 0.968 at 32k is on H200 bf16 with YaRN 40. Nothing is verified on QW yet.
     (Since measured on QW at 4k and 32k: §16.)
 
@@ -522,7 +521,7 @@ This section draws on the researcher's integration notes, checked against the co
    - Short-context policy: either accept numerical (not bitwise) dense equivalence below 4,612 tokens, or route those
      forwards through the unchanged dense path for bit identity (§4.7).
    - Fp16 decode via gather + SDPA, Turbo4 decode via packed gather. Prefill via mask (parity only).
-   - Refuse MTP/DFlash/SpecPrefill when `dlsa` is on, as upstream does.
+   - Refuse MTP/DFlash when `dlsa` is on, as upstream does.
    - `qwen_layer` attention parity tests, an `#[ignore]` real-checkpoint parity test (Fp16), and a dense bit-identity test
      with the flag off.
    - **Add an early go/no-go microbenchmark**: decode gather+SDPA vs dense at 128k/262k in Fp16 and Turbo4, before task 4.
@@ -828,11 +827,11 @@ Linear (GatedDeltaNet) layers, embeddings, norms and the LM head are untouched.
 | turbo4, fp16+turbo4, fp16+turbo3, turbo4-delegated | refused at `enable_dlsa` (names the mode, says to load fp16) |
 | decoder `auto` | resolves to baseline (info log) |
 | decoder `mtp`, `dflash` | refused ("use --decoder baseline") |
-| SpecPrefill, prefix reuse (`cached_tokens > 0`), cached benchmarks | refused by the provider |
+| prefix reuse (`cached_tokens > 0`), cached benchmarks | refused by the provider |
 | image prompts | refused by the provider (nothing in the index blocks mrope; untested) |
 | snapshots | `supports_snapshot_reuse() == false`, capture gives `None`, restore errs |
 | grammar constraints | expected to work (with snapshot reuse off the generator keeps no snapshot); not tested yet |
-| model-level MTP / DFlash2 prefill, verify, rollback, SpecPrefill sparse prefill | `Err` or panic with a message |
+| model-level MTP / DFlash2 prefill, verify, rollback | `Err` or panic with a message |
 
 This is the matrix task 3 shipped. Task 5 lifted the speculative, snapshot and serving refusals; the current matrix is
 §13.1.
@@ -933,7 +932,6 @@ noise. Every prefill row past 4,612 read 4,612 keys.
 | turbo4 and the other packed modes | refused at `enable_dlsa`; `qw serve --dlsa` without `--no-kv-quantization` is a startup error naming the flag |
 | decoders baseline, MTP, DFlash2, `auto` | supported; `auto` selects as without D-LSA |
 | grammar-constrained decoding (all decoders) | supported; snapshots and rollback are index-aware (S5, R8) |
-| SpecPrefill | refused: its kept slots are not positions (§7.1, item 4). The server never selects it under D-LSA and logs that once at startup; a runtime call with `PrefillMode::SpecPrefill` errs |
 | image prompts | refused: `supports_image_inputs()` is false, so the server answers 400 with a D-LSA-specific message; model-level multimodal entry points err |
 | per-request switch | none: D-LSA is a property of the loaded model (§12.1) |
 
@@ -1026,8 +1024,7 @@ cluster block size.
   **only when D-LSA is on**, so dense namespaces are byte-identical to a build without the feature; the DFlash2
   namespace inherits it.
 - Startup logs `info!(phase = "server.dlsa", map, map_sha256, kind, map_dtype, sink, window, top_k, top_p,
-  short_context, "D-LSA armed")`, and, in a `specprefill` build, that SpecPrefill is disabled.
-- SpecPrefill's eligibility predicate (`specprefill_allowed`) is false under D-LSA.
+  short_context, "D-LSA armed")`.
 - Image requests get HTTP 400: "image inputs are not supported while D-LSA sparse attention is enabled on this server".
 - Each request logs `debug!(phase = "dlsa.request")` with the `DlsaStats` counters (dense-key-set and sparse forwards,
   sparse rows, keys read, rollbacks, reopened blocks, index and select time) and `index_bytes`.
@@ -1051,7 +1048,7 @@ Synthetic, in `qwen3_5/dlsa_serving_tests.rs` (`./gpu-lock -- cargo test -p qw-r
 
 Server and CLI (`cargo test -p qw-server --features dlsa`, `-p qw-cli --features dlsa`, and without the feature): flag
 parsing and help, env precedence and error naming (`dlsa::options`), the KV refusal, namespaces (dense unchanged, D-LSA
-distinct per config), the SpecPrefill predicate, and the image 400.
+distinct per config), and the image 400.
 
 Real model (ignored; the model, map and text conventions of §12.5, plus the DFlash2 drafter):
 
@@ -1112,7 +1109,6 @@ these runs (the synthetic S1 tests cover reopening).
   server";
 - without `--no-kv-quantization` the server exits 1 with "D-LSA (--dlsa or QW_DLSA) requires
   --no-kv-quantization…";
-- the SpecPrefill-disabled line was not checked: that build had no `specprefill` feature.
 
 As §12.6 predicts, D-LSA costs decode time once reads are sparse: R5 +21-34%, the R6 needles +7-12% (MTP) and
 +5-17% (DFlash2), R3 +26-85% (most at 32k). On the dense fallback (R4) it is within noise. Task 4's kernels and
@@ -1526,8 +1522,8 @@ What the decomposition shows:
   4,612 keys. A prefix hit at 128k answers 2.3× sooner under D-LSA.
 - Task 5's server smoke (§13.7) covers the MTP and DFlash2 prefix-cache paths.
 
-**SpecPrefill.** Refused under D-LSA by design (§13.1): its kept slots are not positions. The server never
-selects it while D-LSA is on, so there is nothing to measure.
+**SpecPrefill.** SpecPrefill, a sparse-prefill mode that kept KV slots ≠ positions and was therefore always refused
+under D-LSA, has since been removed from QW. There is nothing to measure.
 
 **Speculative decoders.**
 

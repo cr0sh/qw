@@ -89,7 +89,7 @@ impl Qwen35Model {
     }
 
     /// `Err` when D-LSA is on, for entry points whose positions are not token positions (image
-    /// MRoPE prompts, SpecPrefill's kept slots): the index would be built from the wrong keys.
+    /// MRoPE prompts): the index would be built from the wrong keys.
     pub(crate) fn dlsa_refusal(&self, what: &str) -> std::result::Result<(), String> {
         if self.dlsa.is_some() {
             return Err(format!(

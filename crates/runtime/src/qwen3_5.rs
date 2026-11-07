@@ -59,8 +59,6 @@ mod dlsa_bench;
 mod dlsa_serving_tests;
 #[cfg(all(test, feature = "dlsa"))]
 mod dlsa_tests;
-#[cfg(any(feature = "specprefill", test))]
-mod specprefill;
 
 fn compact_rows(array: &MlxArray, prefix_len: i32, padded_len: i32) -> UniquePtr<MlxArray> {
     let columns = mlxcel_core::array_shape(array)[1];

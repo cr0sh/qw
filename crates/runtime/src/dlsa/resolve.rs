@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 
 use super::convert::sha256_hex;
 
-/// Environment override for the converted map path (mirrors `QW_SPECPREFILL_DRAFT_MODEL_PATH`).
+/// Environment override for the converted map path.
 pub const DLSA_MAP_ENV: &str = "QW_DLSA_MAP_PATH";
 
 const RELEASE_BASE_URL: &str =

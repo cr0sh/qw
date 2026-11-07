@@ -17,7 +17,6 @@ mod qwen_vl;
 mod qwen_vl_merge;
 mod qwen_vl_position;
 mod qwen_vl_processor;
-mod specprefill;
 
 mod portable_snapshot;
 pub mod provider;
@@ -30,9 +29,6 @@ pub use model_resolver::{DEFAULT_DFLASH2_DRAFT_MODEL_IDENTIFIER, resolve_dflash2
 pub use model_resolver::{
     DEFAULT_MODEL_IDENTIFIER, model_cache_path, resolve_model_dir, resolve_model_path,
     validate_identifier,
-};
-pub use model_resolver::{
-    DEFAULT_SPECPREFILL_DRAFT_MODEL_IDENTIFIER, resolve_specprefill_draft_path,
 };
 pub use portable_snapshot::{
     PortableArray, PortableModelState, PortablePage, PortablePagedTensor, PortablePromptSnapshot,
@@ -49,7 +45,3 @@ pub use provider::{
 pub use provider::{Dflash2GenerationStats, Dflash2PrefixReuse, Dflash2PromptSnapshot};
 pub use qwen_vl::{ExpandedImageTokens, insert_qwen_vl_image_tokens};
 pub use qwen_vl_processor::{PreparedImage, QwenVLProcessor};
-pub use specprefill::{
-    DEFAULT_KEEP_FIRST_TOKENS, DEFAULT_KEEP_LAST_TOKENS, DEFAULT_KEEP_RATE, PrefillMode,
-    SpecPrefillConfig, SpecPrefillStats,
-};

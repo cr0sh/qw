@@ -30,12 +30,9 @@ pub use crate::qwen3_5_dflash::{
 };
 use crate::qwen3_5_mtp::Qwen35MtpGenerator;
 pub use crate::qwen3_5_mtp::{MtpGenerationStats, MtpPrefixReuse, MtpPromptSnapshot};
-use crate::specprefill::{PrefillMode, SpecPrefillStats};
 
 #[cfg(feature = "dlsa")]
 mod dlsa;
-#[cfg(any(feature = "specprefill", test))]
-mod specprefill;
 
 const DEFAULT_MTP_BLOCK_SIZE: usize = 3;
 
@@ -161,7 +158,6 @@ pub struct BaselineGeneration {
     pub prefill_time: Duration,
     /// Wall time spent sampling and forwarding generated tokens.
     pub decode_time: Duration,
-    pub specprefill_stats: Option<SpecPrefillStats>,
 }
 
 pub struct PreparedMultimodalPrefill {
@@ -297,8 +293,6 @@ pub fn select_qwen35_decoder(
 pub struct Qwen35Provider {
     model: Qwen35Model,
     tokenizer: Tokenizer,
-    #[cfg(any(feature = "specprefill", test))]
-    specprefill_draft: Option<Qwen35Model>,
     chat_template: ChatTemplateProcessor,
     defaults: GenerationDefaults,
     generator: CxxGenerator,
@@ -352,9 +346,6 @@ impl GenerationDefaults {
 
 impl Qwen35Provider {
     pub fn load(model_dir: impl AsRef<Path>, kv_cache_mode: KVCacheMode) -> Result<Self> {
-        #[cfg(feature = "specprefill")]
-        return Self::load_with_required_draft(model_dir, kv_cache_mode);
-        #[cfg(not(feature = "specprefill"))]
         Self::load_target_only(model_dir.as_ref(), kv_cache_mode)
     }
 
@@ -403,8 +394,6 @@ impl Qwen35Provider {
             chat_template,
             defaults,
             generator,
-            #[cfg(any(feature = "specprefill", test))]
-            specprefill_draft: None,
             mtp_generator,
             #[cfg(any(feature = "dflash2", test))]
             dflash2_generator: None,
@@ -685,33 +674,9 @@ impl Qwen35Provider {
         prefix_reuse: Option<PrefixReuse<'_>>,
         constraint: Option<&mut dyn TokenConstraint>,
         checkpoint_token_lengths: &[usize],
-        prefill_mode: PrefillMode,
         mut on_delta: F,
     ) -> Result<BaselineGeneration> {
         self.validate_context_budget(prompt_ids.len(), max_tokens)?;
-        #[cfg(feature = "dlsa")]
-        self.refuse_prefill_mode_under_dlsa(&prefill_mode)?;
-        #[cfg(not(any(feature = "specprefill", test)))]
-        let _ = prefill_mode;
-        #[cfg(any(feature = "specprefill", test))]
-        if let PrefillMode::SpecPrefill(config) = prefill_mode
-            && let Some(plan) = self.plan_specprefill(
-                prompt_ids,
-                max_tokens,
-                constraint.is_some(),
-                prefix_reuse.as_ref(),
-                config,
-            )?
-        {
-            return self.generate_specprefill(
-                plan,
-                prompt_ids,
-                max_tokens,
-                sampling,
-                prefix_reuse,
-                on_delta,
-            );
-        }
         self.model.clear_prepared_mrope();
         let buffer_output = constraint.is_some();
         let mut decoder = IncrementalTextDecoder::new(&self.tokenizer);
@@ -802,7 +767,6 @@ impl Qwen35Provider {
             final_snapshot: controlled.final_snapshot.map(PromptSnapshot::Baseline),
             prefill_time,
             decode_time,
-            specprefill_stats: None,
         })
     }
 
@@ -910,7 +874,6 @@ impl Qwen35Provider {
             final_snapshot: None,
             prefill_time,
             decode_time,
-            specprefill_stats: None,
         })
     }
 
@@ -1220,7 +1183,6 @@ impl Qwen35Provider {
                 final_snapshot: generation.final_snapshot.map(PromptSnapshot::Dflash2),
                 prefill_time: stats.prefill_time,
                 decode_time: stats.decode_time,
-                specprefill_stats: None,
             },
             stats,
         ))
@@ -1403,7 +1365,6 @@ impl Qwen35Provider {
                 final_snapshot: generated.final_snapshot.map(PromptSnapshot::Mtp),
                 prefill_time,
                 decode_time,
-                specprefill_stats: None,
             },
             generated.stats,
         ))
@@ -1462,7 +1423,6 @@ impl Qwen35Provider {
                 None,
                 None,
                 &[],
-                PrefillMode::Dense,
                 on_delta,
             )?,
             Qwen35GenerationMode::Mtp => {
@@ -1535,7 +1495,6 @@ impl Qwen35Provider {
                 None,
                 None,
                 &[],
-                PrefillMode::Dense,
                 on_delta,
             )?;
             return Ok((
@@ -1586,7 +1545,6 @@ impl Qwen35Provider {
                 None,
                 None,
                 &[],
-                PrefillMode::Dense,
                 on_delta,
             )?;
             return Ok((
@@ -1653,7 +1611,6 @@ impl Qwen35Provider {
                     }),
                     None,
                     &[],
-                    PrefillMode::Dense,
                     on_delta,
                 )?;
                 Ok((generation, None))
@@ -1933,7 +1890,6 @@ fn load_generation_defaults(model_dir: &Path) -> Result<GenerationDefaults> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SpecPrefillConfig;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Instant;
 
@@ -2310,71 +2266,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires real target and SpecPrefill draft checkpoints at their configured or default cache paths"]
-    fn real_model_dense_specprefill_dense_has_no_position_state_leakage() {
-        let model_dir = crate::resolve_model_path(None).expect("resolve target checkpoint");
-        let draft_dir = crate::resolve_specprefill_draft_path(None)
-            .expect("resolve SpecPrefill draft checkpoint");
-        let mut provider =
-            Qwen35Provider::load_with_specprefill_draft(model_dir, draft_dir, KVCacheMode::Fp16)
-                .expect("load target and SpecPrefill draft");
-        let prompt = provider
-            .tokenizer
-            .encode(
-                "Operational record: all systems nominal; preserve this context. ".repeat(1024),
-                true,
-            )
-            .expect("encode long prompt")
-            .get_ids()
-            .iter()
-            .map(|&id| id as i32)
-            .collect::<Vec<_>>();
-        let sampling = SamplingConfig::greedy();
-        let dense_before = provider
-            .generate_baseline_streaming(
-                &prompt,
-                8,
-                &sampling,
-                None,
-                None,
-                &[],
-                PrefillMode::Dense,
-                |_| true,
-            )
-            .expect("first dense generation");
-        let sparse = provider
-            .generate_baseline_streaming(
-                &prompt,
-                8,
-                &sampling,
-                None,
-                None,
-                &[],
-                PrefillMode::SpecPrefill(SpecPrefillConfig {
-                    min_tokens: 512,
-                    keep_rate: 0.30,
-                    protected_prefix_tokens: 0,
-                    ..Default::default()
-                }),
-                |_| true,
-            )
-            .expect("sparse generation");
-        assert!(sparse.specprefill_stats.is_some());
-        let dense_after = provider
-            .generate_baseline_streaming(
-                &prompt,
-                8,
-                &sampling,
-                None,
-                None,
-                &[],
-                PrefillMode::Dense,
-                |_| true,
-            )
-            .expect("second dense generation");
-        assert_eq!(dense_before.token_ids, dense_after.token_ids);
-    }
-    #[test]
     #[ignore = "requires the real bundled-MTP checkpoint at QW_MODEL_PATH or the default model cache path"]
     fn real_model_mtp_prefix_reuse_matches_cold_and_reduces_ttft() {
         let model_dir = crate::resolve_model_path(None)
@@ -2476,16 +2367,7 @@ mod tests {
             .expect("warm MTP generation");
 
         let baseline_cold = provider
-            .generate_baseline_streaming(
-                &full_ids,
-                32,
-                &sampling,
-                None,
-                None,
-                &[],
-                PrefillMode::Dense,
-                |_| true,
-            )
+            .generate_baseline_streaming(&full_ids, 32, &sampling, None, None, &[], |_| true)
             .expect("cold baseline generation");
         let mtp_snapshot = PromptSnapshot::Mtp(snapshot);
         let (baseline_warm, baseline_stats) = provider

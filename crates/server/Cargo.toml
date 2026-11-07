@@ -8,7 +8,6 @@ publish = false
 [features]
 default = ["dflash2"]
 dflash2 = ["qw-runtime/dflash2", "qw-prefix-cache/dflash2"]
-specprefill = ["qw-runtime/specprefill"]
 dlsa = ["qw-runtime/dlsa"]
 
 [[bin]]

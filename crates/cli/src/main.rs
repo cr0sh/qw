@@ -834,7 +834,6 @@ mod tests {
         assert_eq!(direct.reasoning_effort.as_deref(), Some("medium"));
     }
 
-    #[cfg(feature = "specprefill")]
     #[test]
     fn serve_accepts_server_options() {
         let cli = Cli::try_parse_from([
@@ -854,14 +853,6 @@ mod tests {
             "8192",
             "--mtp-k",
             "5",
-            "--specprefill-min-turn-tokens",
-            "12000",
-            "--specprefill-keep-rate",
-            "0.4",
-            "--specprefill-keep-first-tokens",
-            "0",
-            "--specprefill-keep-last-tokens",
-            "64",
             "--no-kv-quantization",
             "--output-format",
             "json",
@@ -890,28 +881,6 @@ mod tests {
             "{serve_help}"
         );
         assert!(serve_help.contains("--mtp-k"), "{serve_help}");
-        #[cfg(feature = "specprefill")]
-        assert!(
-            serve_help.contains("--specprefill-min-turn-tokens"),
-            "{serve_help}"
-        );
-        #[cfg(feature = "specprefill")]
-        assert!(
-            serve_help.contains("--specprefill-keep-rate"),
-            "{serve_help}"
-        );
-        #[cfg(feature = "specprefill")]
-        assert!(
-            serve_help.contains("--specprefill-keep-first-tokens"),
-            "{serve_help}"
-        );
-        #[cfg(feature = "specprefill")]
-        assert!(
-            serve_help.contains("--specprefill-keep-last-tokens"),
-            "{serve_help}"
-        );
-        #[cfg(not(feature = "specprefill"))]
-        assert!(!serve_help.contains("--specprefill-"), "{serve_help}");
         assert!(serve_help.contains("--no-kv-quantization"), "{serve_help}");
         assert!(serve_help.contains("--output-format"), "{serve_help}");
     }
